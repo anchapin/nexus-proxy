@@ -15,7 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math"
 	"net/http"
 	"os"
@@ -63,7 +63,10 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
 			return fmt.Errorf("rag: create examples dir %q: %w", dir, mkErr)
 		}
-		log.Printf("[RAG INDEXER]: Created %s directory. Drop golden code snippets here!", dir)
+		slog.Info("rag created examples directory",
+			slog.String("dir", dir),
+			slog.String("hint", "drop golden code snippets here"),
+		)
 		return nil
 	}
 
@@ -79,12 +82,12 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 		path := filepath.Join(dir, f.Name())
 		content, err := os.ReadFile(path)
 		if err != nil {
-			log.Printf("[RAG ERROR]: read %s: %v", f.Name(), err)
+			slog.Error("rag read file", slog.String("filename", f.Name()), slog.Any("err", err))
 			continue
 		}
 		emb, err := s.embedder.Embed(ctx, string(content))
 		if err != nil {
-			log.Printf("[RAG ERROR]: embed %s: %v", f.Name(), err)
+			slog.Error("rag embed file", slog.String("filename", f.Name()), slog.Any("err", err))
 			continue
 		}
 		s.examples = append(s.examples, FewShotExample{
@@ -92,7 +95,7 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 			Content:   string(content),
 			Embedding: emb,
 		})
-		log.Printf("[RAG INDEXER]: Indexed %s successfully.", f.Name())
+		slog.Info("rag indexed", slog.String("filename", f.Name()))
 	}
 	return nil
 }

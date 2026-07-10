@@ -7,6 +7,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -98,6 +99,13 @@ type Config struct {
 	// don't trample each other.
 	TelemetryPath string
 	MetricsDBPath string
+
+	// Structured logging (issue #3). LogLevel maps NEXUS_LOG_LEVEL
+	// ("debug" | "info" | "warn" | "error") to a slog.Level. LogFormat
+	// maps NEXUS_LOG_FORMAT ("json" | "text") to a slog.Handler; json
+	// is the production default, text is friendlier for local dev.
+	LogLevel  slog.Level
+	LogFormat LogFormat
 }
 
 // DefaultMetricsDBPath returns the canonical metrics DB location:
@@ -263,6 +271,13 @@ func Load() (Config, error) {
 
 	cfg.QualityEnabled = cfg.QualityConcurrency > 0
 
+	// Structured logging (issue #3). Defaults match the production
+	// expectation: JSON to stderr at info level. Operators flip on
+	// debug by setting NEXUS_LOG_LEVEL=debug, and switch to a
+	// human-friendly text handler with NEXUS_LOG_FORMAT=text.
+	cfg.LogLevel = parseLogLevel(os.Getenv("NEXUS_LOG_LEVEL"))
+	cfg.LogFormat = parseLogFormat(os.Getenv("NEXUS_LOG_FORMAT"))
+
 	return cfg, nil
 }
 
@@ -293,6 +308,22 @@ func (c Config) TelemetryEnabled() bool { return c.TelemetryPath != "" }
 // MetricsEnabled reports whether the SQLite metrics store should be
 // opened. Disabled when MetricsDBPath is empty.
 func (c Config) MetricsEnabled() bool { return c.MetricsDBPath != "" }
+
+// NewLogger returns a *slog.Logger configured per LogLevel / LogFormat,
+// always writing to stderr. Centralising the construction in config
+// keeps main.go free of slog option plumbing and lets tests construct
+// matching loggers (issue #3).
+func (c Config) NewLogger() *slog.Logger {
+	opts := &slog.HandlerOptions{Level: c.LogLevel}
+	var h slog.Handler
+	switch c.LogFormat {
+	case LogFormatText:
+		h = slog.NewTextHandler(os.Stderr, opts)
+	default:
+		h = slog.NewJSONHandler(os.Stderr, opts)
+	}
+	return slog.New(h)
+}
 
 func getEnv(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
@@ -345,6 +376,58 @@ func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("config: %s must be a duration (e.g. 8s, 2m): %w", key, err)
 	}
 	return d, nil
+}
+
+// LogFormat is the wire format for the structured logger. JSON is the
+// production default; Text is friendlier for local development (issue #3).
+type LogFormat int
+
+const (
+	LogFormatJSON LogFormat = iota
+	LogFormatText
+)
+
+// String renders the LogFormat as the canonical env-var spelling.
+func (f LogFormat) String() string {
+	switch f {
+	case LogFormatJSON:
+		return "json"
+	case LogFormatText:
+		return "text"
+	default:
+		return "unknown"
+	}
+}
+
+// parseLogLevel maps NEXUS_LOG_LEVEL to a slog.Level. Unknown / unset
+// values fall back to slog.LevelInfo so a stock `.env.example` boots at
+// the same verbosity as before (issue #3).
+func parseLogLevel(raw string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error", "err":
+		return slog.LevelError
+	case "", "info":
+		return slog.LevelInfo
+	default:
+		return slog.LevelInfo
+	}
+}
+
+// parseLogFormat maps NEXUS_LOG_FORMAT to a LogFormat. Unknown / unset
+// values fall back to LogFormatJSON.
+func parseLogFormat(raw string) LogFormat {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "text":
+		return LogFormatText
+	case "", "json":
+		return LogFormatJSON
+	default:
+		return LogFormatJSON
+	}
 }
 
 const (

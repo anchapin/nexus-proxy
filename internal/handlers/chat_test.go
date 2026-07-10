@@ -1,11 +1,12 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -718,9 +719,6 @@ func TestChatTelemetryJSONLRecorderEndToEnd(t *testing.T) {
 	}
 }
 
-// Suppress unused import in case of partial test runs.
-var _ = log.Println
-
 // qualityRecordingObserver is a QualityObserver test double that
 // appends each QualityEvent it sees. Safe for concurrent use.
 type qualityRecordingObserver struct {
@@ -1020,5 +1018,112 @@ func TestWriteJSONError(t *testing.T) {
 	}
 	if env.Error["type"] != "Request Entity Too Large" {
 		t.Errorf("type = %q, want %q", env.Error["type"], "Request Entity Too Large")
+	}
+}
+
+// captureSlog swaps in a JSON slog handler writing to a buffer for the
+// duration of fn, then restores the previous default. Returns the captured
+// output (one JSON object per line). Used by issue #3 acceptance tests
+// that assert on structured fields like `route=local`.
+func captureSlog(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	fn()
+	return buf.String()
+}
+
+// TestChatEmitsSlogRouteLocal verifies the structured migration of
+// router decision logs: a low-complexity prompt should produce a
+// `dsl match` line with `route=local` (issue #3 acceptance criteria).
+func TestChatEmitsSlogRouteLocal(t *testing.T) {
+	deps, rt := baseDeps(t)
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
+	})
+
+	var output string
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	output = captureSlog(t, func() {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		rw := httptest.NewRecorder()
+		Chat(deps).ServeHTTP(rw, req)
+		if rw.Code != http.StatusOK {
+			t.Errorf("status = %d, want 200", rw.Code)
+		}
+	})
+
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) == 0 || lines[0] == "" {
+		t.Fatalf("no slog output captured: %q", output)
+	}
+	var foundDSL bool
+	for _, line := range lines {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("invalid slog line %q: %v", line, err)
+		}
+		msg, _ := rec["msg"].(string)
+		if msg != "dsl match" {
+			continue
+		}
+		if route, _ := rec["route"].(string); route == string(router.RouteLocal) {
+			foundDSL = true
+			if rid, _ := rec["request_id"].(string); rid == "" {
+				t.Errorf("dsl match line missing request_id: %s", line)
+			}
+		}
+	}
+	if !foundDSL {
+		t.Fatalf("no dsl match log line with route=local in: %s", output)
+	}
+}
+
+// TestChatEmitsSlogGuardrailVram verifies the guardrail path emits the
+// expected structured fields (issue #3 acceptance criteria #2): a
+// too-large prompt should produce a `guardrail forced frontier` line
+// with `reason=vram` and a positive `estimated_tokens`.
+func TestChatEmitsSlogGuardrailVram(t *testing.T) {
+	deps, rt := baseDeps(t)
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("frontier stream"))
+	})
+
+	// 30000 char prompt / 4 = 7500 > 6000 guardrail.
+	largeUser := strings.Repeat("a", 30000)
+	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
+
+	output := captureSlog(t, func() {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		rw := httptest.NewRecorder()
+		Chat(deps).ServeHTTP(rw, req)
+	})
+
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) == 0 || lines[0] == "" {
+		t.Fatalf("no slog output captured: %q", output)
+	}
+	var foundGuardrail bool
+	for _, line := range lines {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("invalid slog line %q: %v", line, err)
+		}
+		msg, _ := rec["msg"].(string)
+		if msg != "guardrail forced frontier" {
+			continue
+		}
+		reason, _ := rec["reason"].(string)
+		tokens, _ := rec["estimated_tokens"].(float64) // JSON numbers decode to float64
+		if reason == "vram" && tokens > 0 {
+			foundGuardrail = true
+		}
+	}
+	if !foundGuardrail {
+		t.Fatalf("no guardrail forced frontier log line (reason=vram, estimated_tokens>0) in: %s", output)
 	}
 }

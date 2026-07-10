@@ -29,7 +29,7 @@ package metrics
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -117,14 +117,16 @@ type Store interface {
 }
 
 // Logger is the seam Store implementations use to surface internal
-// warnings (e.g. dropped writes, decode errors). Defaults to the
-// stdlib log.Printf; tests inject a silent / capture target.
+// warnings (e.g. dropped writes, decode errors). Defaults to a slog
+// bridge that preserves the printf-style ergonomics of the original
+// stdlib log target; tests inject a silent / capture target (issue #3).
 type Logger func(format string, args ...any)
 
-// stdLogger is the package default — bracketed prefix keeps the
-// existing logging convention used elsewhere in the project.
+// stdLogger is the package default — routes internal warnings through
+// slog at WARN level. The bracketed prefix is dropped (issue #3) so a
+// JSON operator sees plain structured attrs.
 var stdLogger Logger = func(format string, args ...any) {
-	log.Printf("[METRICS "+format+"]", args...)
+	slog.Warn(fmt.Sprintf(format, args...))
 }
 
 // Open creates a Store backed by a SQLite database at path. The parent

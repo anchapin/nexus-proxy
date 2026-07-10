@@ -17,7 +17,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -155,14 +155,23 @@ func (r *JSONLRecorder) run() {
 	defer close(r.done)
 	for rec := range r.ch {
 		if err := writeJSONLine(r.bw, rec); err != nil {
-			log.Printf("[TELEMETRY ERROR]: write %s: %v", r.path, err)
+			slog.Error("telemetry write",
+				slog.String("path", r.path),
+				slog.Any("err", err),
+			)
 		}
 	}
 	if err := r.bw.Flush(); err != nil {
-		log.Printf("[TELEMETRY ERROR]: flush %s: %v", r.path, err)
+		slog.Error("telemetry flush",
+			slog.String("path", r.path),
+			slog.Any("err", err),
+		)
 	}
 	if err := r.file.Close(); err != nil {
-		log.Printf("[TELEMETRY ERROR]: close %s: %v", r.path, err)
+		slog.Error("telemetry close",
+			slog.String("path", r.path),
+			slog.Any("err", err),
+		)
 	}
 }
 
@@ -177,7 +186,10 @@ func (r *JSONLRecorder) Record(rec Record) {
 	case r.ch <- rec:
 	default:
 		r.dropped.Add(1)
-		log.Printf("[TELEMETRY WARN]: buffer full, dropped record request_id=%s", rec.RequestID)
+		slog.Warn("telemetry buffer full, dropped record",
+			slog.String("request_id", rec.RequestID),
+			slog.String("route", rec.Route),
+		)
 	}
 }
 

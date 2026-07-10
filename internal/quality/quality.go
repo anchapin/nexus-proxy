@@ -29,7 +29,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -270,7 +270,10 @@ func (v *ShellVerifier) Submit(e Event) bool {
 		return true
 	default:
 		v.dropped.Add(1)
-		log.Printf("[QUALITY DROP]: queue full, dropping edit request_id=%s path=%q", e.RequestID, e.Path)
+		slog.Warn("quality queue full, dropped edit",
+			slog.String("request_id", e.RequestID),
+			slog.String("path", e.Path),
+		)
 		return false
 	}
 }
