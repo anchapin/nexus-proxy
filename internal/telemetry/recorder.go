@@ -1,0 +1,266 @@
+// Package telemetry captures per-request performance metrics for the proxy.
+//
+// The chat handler emits one Record per request after the upstream response
+// completes. Records are pushed onto a buffered channel consumed by a
+// background goroutine so the request path never blocks on persistence.
+// If the buffer fills (disk stall or fatal write error) the overflow is
+// dropped with a log warning rather than stalling user requests.
+//
+// The Recorder interface is deliberately minimal so the production store
+// can be swapped from this v0 JSON-lines append-only file for a SQLite
+// backend (tracked in issue #4) without touching callers.
+package telemetry
+
+import (
+	"bufio"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// bufferedChannelSize caps the in-flight queue per recorder. Each record
+// serialises to ~1 KB of JSON so this is ~1 MB worst-case memory and is
+// more than enough to absorb request bursts without ever blocking callers.
+const bufferedChannelSize = 1024
+
+// writeBufferSize is the size of the bufio.Writer used inside JSONLRecorder.
+// Larger than a single record so most rows flush via the background loop's
+// explicit Flush call rather than the bufio auto-flush threshold.
+const writeBufferSize = 16 << 10
+
+// Record is the row written for every proxied request. Times are stored in
+// milliseconds; TTFTMs is 0 for non-streaming responses (TTFT is undefined
+// when the harness requested a single buffered reply).
+type Record struct {
+	Timestamp      time.Time `json:"timestamp"`
+	RequestID      string    `json:"request_id"`
+	Model          string    `json:"model"`
+	Route          string    `json:"route"`
+	InputTokens    int       `json:"input_tokens"`
+	OutputTokens   int       `json:"output_tokens"`
+	TTFTMs         int64     `json:"ttft_ms"`
+	TotalLatencyMs int64     `json:"total_latency_ms"`
+	TPS            float64   `json:"tps"`
+	Streaming      bool      `json:"streaming"`
+	Error          string    `json:"error,omitempty"`
+}
+
+// EstimateTokens returns the cheap "4 chars per token" heuristic used
+// across the proxy (router VRAM guardrail, telemetry input). Centralising
+// the rule here keeps the two call sites consistent.
+func EstimateTokens(s string) int {
+	if len(s) <= 0 {
+		return 0
+	}
+	return len(s) / 4
+}
+
+// ComputeTPS derives tokens-per-second from output tokens and the generation
+// phase (total latency minus time-to-first-token). Returns 0 when the
+// generation window is non-positive or no tokens were produced. Units are
+// tokens / second.
+func ComputeTPS(outputTokens int, ttftMs, totalMs int64) float64 {
+	if outputTokens <= 0 || totalMs <= 0 {
+		return 0
+	}
+	genMs := totalMs - ttftMs
+	if genMs <= 0 {
+		return 0
+	}
+	return float64(outputTokens) * 1000.0 / float64(genMs)
+}
+
+// Recorder persists records. Implementations MUST NOT block Record callers;
+// they should drop, buffer, or shed load and never stall the response path.
+type Recorder interface {
+	Record(r Record)
+	Close() error
+}
+
+// Compile-time interface compliance checks.
+var (
+	_ Recorder = Noop{}
+	_ Recorder = (*JSONLRecorder)(nil)
+)
+
+// Noop discards every record. Useful for tests and when persistence is
+// disabled by configuration (NEXUS_TELEMETRY_PATH="").
+type Noop struct{}
+
+// Record implements Recorder.
+func (Noop) Record(Record) {}
+
+// Close implements Recorder.
+func (Noop) Close() error { return nil }
+
+// JSONLRecorder appends one JSON object per line to a file. The file is
+// opened in append mode and the parent directory is created on demand.
+type JSONLRecorder struct {
+	ch      chan Record
+	path    string
+	file    *os.File
+	bw      *bufio.Writer
+	wg      sync.WaitGroup
+	dropped atomic.Uint64
+	closed  atomic.Bool
+	done    chan struct{} // closed by run() on exit
+}
+
+// NewJSONLRecorder opens path (creating the parent directory if needed)
+// and starts the background goroutine that drains the buffer.
+func NewJSONLRecorder(path string) (*JSONLRecorder, error) {
+	if path == "" {
+		return nil, fmt.Errorf("telemetry: empty path")
+	}
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("telemetry: mkdir %q: %w", dir, err)
+		}
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("telemetry: open %q: %w", path, err)
+	}
+	r := &JSONLRecorder{
+		ch:   make(chan Record, bufferedChannelSize),
+		path: path,
+		file: f,
+		bw:   bufio.NewWriterSize(f, writeBufferSize),
+		done: make(chan struct{}),
+	}
+	r.wg.Add(1)
+	go r.run()
+	return r, nil
+}
+
+// Path returns the on-disk path this recorder writes to.
+func (r *JSONLRecorder) Path() string { return r.path }
+
+// Dropped returns the number of records dropped because the buffer was
+// full. Tests assert on this to verify the non-blocking contract.
+func (r *JSONLRecorder) Dropped() uint64 { return r.dropped.Load() }
+
+// run is the background consumer. It exits cleanly when Close signals
+// shutdown; queued records are drained before the file is closed.
+func (r *JSONLRecorder) run() {
+	defer r.wg.Done()
+	defer close(r.done)
+	for rec := range r.ch {
+		if err := writeJSONLine(r.bw, rec); err != nil {
+			log.Printf("[TELEMETRY ERROR]: write %s: %v", r.path, err)
+		}
+	}
+	if err := r.bw.Flush(); err != nil {
+		log.Printf("[TELEMETRY ERROR]: flush %s: %v", r.path, err)
+	}
+	if err := r.file.Close(); err != nil {
+		log.Printf("[TELEMETRY ERROR]: close %s: %v", r.path, err)
+	}
+}
+
+// Record enqueues rec for asynchronous persistence. If the buffer is full
+// (consumer stalled on I/O) the record is dropped, the dropped counter is
+// incremented, and a warning is logged. The call never blocks.
+func (r *JSONLRecorder) Record(rec Record) {
+	if r.closed.Load() {
+		return
+	}
+	select {
+	case r.ch <- rec:
+	default:
+		r.dropped.Add(1)
+		log.Printf("[TELEMETRY WARN]: buffer full, dropped record request_id=%s", rec.RequestID)
+	}
+}
+
+// Close signals the background goroutine to drain and exit. Safe to call
+// once; subsequent calls are no-ops. Blocks until the goroutine returns,
+// guaranteeing all queued records reach disk.
+func (r *JSONLRecorder) Close() error {
+	if !r.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	close(r.ch)
+	r.wg.Wait()
+	return nil
+}
+
+func writeJSONLine(w *bufio.Writer, rec Record) error {
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write(b); err != nil {
+		return err
+	}
+	if err := w.WriteByte('\n'); err != nil {
+		return err
+	}
+	return nil
+}
+
+// NewRequestID returns a 16-hex-char identifier unique enough for log
+// correlation. Stdlib-only — avoids pulling in a UUID dependency just for
+// telemetry tags.
+func NewRequestID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("req-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// WriteHook fires once with the wall-clock time of the first Write call
+// into the wrapped ResponseWriter. Used by the handler to measure TTFT.
+type WriteHook func(time.Time)
+
+// ObservingWriter wraps an http.ResponseWriter, fires hook on the first
+// Write, and counts total bytes written. Header() and WriteHeader() pass
+// through; Flush() forwards to the inner writer when it implements
+// http.Flusher (so Stream's flusher assertion still succeeds on real
+// writers but degrades to a no-op on non-flushers like httptest.Recorder).
+type ObservingWriter struct {
+	http.ResponseWriter
+	hook     WriteHook
+	wrote    atomic.Bool
+	bytesOut atomic.Uint64
+}
+
+// NewObservingWriter wraps inner. hook may be nil; if so, only byte counts
+// are tracked.
+func NewObservingWriter(inner http.ResponseWriter, hook WriteHook) *ObservingWriter {
+	return &ObservingWriter{ResponseWriter: inner, hook: hook}
+}
+
+// Write fires the first-write hook (if not yet fired) and updates the
+// byte counter before delegating to the inner writer.
+func (o *ObservingWriter) Write(b []byte) (int, error) {
+	if o.wrote.CompareAndSwap(false, true) && o.hook != nil {
+		o.hook(time.Now())
+	}
+	o.bytesOut.Add(uint64(len(b)))
+	return o.ResponseWriter.Write(b)
+}
+
+// BytesOut returns the cumulative number of bytes written to the underlying
+// ResponseWriter.
+func (o *ObservingWriter) BytesOut() uint64 { return o.bytesOut.Load() }
+
+// Flush forwards to the inner writer when it implements http.Flusher.
+// Defining Flush here (rather than relying on embedding) lets Stream's
+// `w.(http.Flusher)` assertion succeed against the wrapper; the inner
+// no-op behaviour preserves the existing "non-flusher errors" test for
+// direct Stream callers.
+func (o *ObservingWriter) Flush() {
+	if f, ok := o.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}

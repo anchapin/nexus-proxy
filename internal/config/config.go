@@ -61,6 +61,14 @@ type Config struct {
 	// Middleware prompts
 	MetaPrompt string // appended to system prompt by prompt_engine
 	TOONNotice string // appended when TOON compression is applied
+
+	// Telemetry
+	//
+	// TelemetryPath is the on-disk JSON-lines log written by the
+	// background telemetry goroutine. An empty value disables recording
+	// (the handler installs a Noop recorder). Parent directories are
+	// created on demand.
+	TelemetryPath string
 }
 
 // Load reads configuration from environment variables, applying defaults
@@ -82,6 +90,7 @@ func Load() (Config, error) {
 		ExamplesDir:    getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
 		MetaPrompt:     defaultMetaPrompt,
 		TOONNotice:     defaultTOONNotice,
+		TelemetryPath:  getEnvAllowEmpty("NEXUS_TELEMETRY_PATH", "./nexus-telemetry.jsonl"),
 	}
 
 	threshold, err := getEnvFloat("NEXUS_RAG_THRESHOLD", 0.55)
@@ -169,8 +178,22 @@ func Load() (Config, error) {
 // routing will return 401s if attempted.
 func (c Config) FrontierEnabled() bool { return c.FrontierKey != "" }
 
+// TelemetryEnabled reports whether the on-disk recorder should be started.
+// Disabled when TelemetryPath is empty.
+func (c Config) TelemetryEnabled() bool { return c.TelemetryPath != "" }
+
 func getEnv(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
+		return v
+	}
+	return def
+}
+
+// getEnvAllowEmpty is like getEnv but returns the empty string when the
+// caller has explicitly set the variable to "". Used for the telemetry path
+// so operators can disable recording with NEXUS_TELEMETRY_PATH="".
+func getEnvAllowEmpty(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok {
 		return v
 	}
 	return def

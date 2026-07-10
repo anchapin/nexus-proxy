@@ -1,21 +1,25 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"testing"
-
-	"context"
+	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
+	"github.com/anchapin/nexus-proxy/internal/telemetry"
 	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
 
@@ -51,6 +55,7 @@ func baseDeps(t *testing.T) (Deps, *upstream.RecordingTransport) {
 		RAG:             store,
 		SLM:             router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, 1, client),
 		FormattingRegex: regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate)\b`),
+		Recorder:        telemetry.Noop{},
 	}
 	return deps, rt
 }
@@ -502,7 +507,216 @@ func (f *flushableRW) Flush() {
 }
 
 // Suppress unused import in case of partial test runs.
-var (
-	_ = log.Println
-	_ = sync.Mutex{}
-)
+// capturingRecorder collects records synchronously into a slice. It exists
+// only in tests; production code never blocks on Record().
+type capturingRecorder struct {
+	mu      sync.Mutex
+	records []telemetry.Record
+}
+
+func (c *capturingRecorder) Record(r telemetry.Record) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.records = append(c.records, r)
+}
+
+func (c *capturingRecorder) Close() error { return nil }
+
+func (c *capturingRecorder) Snapshot() []telemetry.Record {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]telemetry.Record, len(c.records))
+	copy(out, c.records)
+	return out
+}
+
+// TestChatEmitsTelemetryRowWithCorrectRoute is the acceptance test for
+// issue #16: a successful proxied request must produce exactly one
+// telemetry record, with non-zero latency, the correct route captured at
+// routing-decision time, and the model that the upstream call used.
+func TestChatEmitsTelemetryRowWithCorrectRoute(t *testing.T) {
+	deps, rt := baseDeps(t)
+	rec := &capturingRecorder{}
+	deps.Recorder = rec
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		// Sleep briefly so the in-memory test always observes non-zero
+		// latency. Production traffic trivially clears this bar via the
+		// network round-trip; the assertion below is what the issue's
+		// acceptance criteria actually require.
+		time.Sleep(2 * time.Millisecond)
+		// Cascade (issue #14) forces stream=false + parses the response
+		// as a non-streaming chat completion; return a valid OpenAI-
+		// compatible JSON body.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"hi there"},"finish_reason":"stop"}]}`))
+	})
+
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d", rw.Code)
+	}
+
+	// Drain the handler's async record() — the handler invokes Record
+	// synchronously, so by the time ServeHTTP returns the record is
+	// already captured.
+	records := rec.Snapshot()
+	if len(records) != 1 {
+		t.Fatalf("got %d records, want 1", len(records))
+	}
+	got := records[0]
+	if got.Route != string(router.RouteLocal) {
+		t.Errorf("Route = %q, want %q", got.Route, router.RouteLocal)
+	}
+	if got.Model != "qwen3-coder:8b" {
+		t.Errorf("Model = %q, want qwen3-coder:8b", got.Model)
+	}
+	if got.RequestID == "" {
+		t.Error("RequestID empty")
+	}
+	if got.TotalLatencyMs <= 0 {
+		t.Errorf("TotalLatencyMs = %d, want > 0", got.TotalLatencyMs)
+	}
+	if got.OutputTokens <= 0 {
+		t.Errorf("OutputTokens = %d, want > 0", got.OutputTokens)
+	}
+	if !got.Streaming {
+		t.Error("Streaming = false, want true (default streaming request)")
+	}
+	if got.Error != "" {
+		t.Errorf("Error = %q, want empty", got.Error)
+	}
+	if got.TTFTMs < 0 {
+		t.Errorf("TTFTMs = %d, want >= 0", got.TTFTMs)
+	}
+}
+
+// TestChatTelemetryTTFTZeroForNonStreaming ensures TTFT is recorded as 0
+// (per issue spec) when the harness explicitly opts out of streaming.
+func TestChatTelemetryTTFTZeroForNonStreaming(t *testing.T) {
+	deps, rt := baseDeps(t)
+	rec := &capturingRecorder{}
+	deps.Recorder = rec
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Millisecond) // ensure elapsed > 0 so TTFT-vs-total comparison is meaningful
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`))
+	})
+	body := `{"stream":false,"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d", rw.Code)
+	}
+	records := rec.Snapshot()
+	if len(records) != 1 {
+		t.Fatalf("got %d records, want 1", len(records))
+	}
+	if records[0].Streaming {
+		t.Error("Streaming = true, want false for non-streaming request")
+	}
+	if records[0].TTFTMs != 0 {
+		t.Errorf("TTFTMs = %d, want 0 for non-streaming", records[0].TTFTMs)
+	}
+	if records[0].TotalLatencyMs <= 0 {
+		t.Errorf("TotalLatencyMs = %d, want > 0", records[0].TotalLatencyMs)
+	}
+}
+
+// TestChatTelemetryRecordsError exercises the upstream-error path: a row
+// is still emitted (just with Error set) so failed requests are visible
+// in the dashboard.
+func TestChatTelemetryRecordsError(t *testing.T) {
+	deps, _ := baseDeps(t)
+	// Replace the recording transport with one that fails at the transport
+	// layer so the cascade returns an error (HTTP non-2xx is NOT a
+	// transport error — only RoundTrip failures are).
+	deps.Client = &http.Client{Transport: errTransport{}}
+	rec := &capturingRecorder{}
+	deps.Recorder = rec
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	records := rec.Snapshot()
+	if len(records) != 1 {
+		t.Fatalf("got %d records, want 1", len(records))
+	}
+	if records[0].Error == "" {
+		t.Error("Error empty, want non-empty for upstream failure")
+	}
+	if records[0].Route != string(router.RouteLocal) {
+		t.Errorf("Route = %q, want local", records[0].Route)
+	}
+}
+
+// errTransport always returns a transport error so the cascade surfaces
+// the failure path. RecordingTransport can't simulate this — its RoundTrip
+// always returns a *http.Response — so we swap in our own client.
+type errTransport struct{}
+
+func (errTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return nil, errors.New("simulated network down")
+}
+
+// TestChatTelemetryJSONLRecorderEndToEnd wires the production
+// JSONLRecorder through the full handler and asserts the on-disk row
+// matches what we expect. This is the cross-package integration test the
+// issue's acceptance criteria point to.
+func TestChatTelemetryJSONLRecorderEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tel.jsonl")
+	r, err := telemetry.NewJSONLRecorder(path)
+	if err != nil {
+		t.Fatalf("NewJSONLRecorder: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+
+	deps, rt := baseDeps(t)
+	deps.Recorder = r
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("frontier stream"))
+	})
+	// Large prompt -> guardrail forces FRONTIER route.
+	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 30000) + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	// Close drains the channel + flushes the file.
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("got %d lines, want 1: %q", len(lines), data)
+	}
+	var row telemetry.Record
+	if err := json.Unmarshal([]byte(lines[0]), &row); err != nil {
+		t.Fatalf("unmarshal: %v body=%q", err, lines[0])
+	}
+	if row.Route != string(router.RouteFrontier) {
+		t.Errorf("Route = %q, want frontier", row.Route)
+	}
+	if row.TotalLatencyMs <= 0 {
+		t.Errorf("TotalLatencyMs = %d, want > 0", row.TotalLatencyMs)
+	}
+	if row.RequestID == "" {
+		t.Error("RequestID empty")
+	}
+	if row.Model == "" {
+		t.Error("Model empty")
+	}
+}
+
+// Suppress unused import in case of partial test runs.
+var _ = log.Println

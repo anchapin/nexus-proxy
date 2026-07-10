@@ -12,11 +12,14 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/middleware"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
+	"github.com/anchapin/nexus-proxy/internal/telemetry"
 	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
 
@@ -67,6 +70,12 @@ type Deps struct {
 	// Sample/Enqueue entry points.
 	JudgeObserver JudgeObserver
 
+	// Recorder receives one record per proxied request. Never nil at
+	// runtime: Chat() installs telemetry.Noop{} when the caller
+	// passes a zero value, so downstream code can invoke Record
+	// unconditionally without a nil-check.
+	Recorder telemetry.Recorder
+
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
 	// copy used for sampling is bounded. Zero uses DefaultObservedCap.
@@ -92,11 +101,21 @@ const DefaultObservedCap = 256 * 1024 // 256 KiB
 // JudgeObserver (when configured) with a LocalCompletion event. The
 // observer may decide to enqueue the request for judge scoring; the
 // handler does not wait on the observer.
+//
+// Every proxied request — success, failure, or short-circuit — emits
+// exactly one telemetry.Record via Recorder so the issue #16 dashboard
+// can answer "what fraction of traffic failed in the last hour?".
 func Chat(d Deps) http.Handler {
 	if d.maxObservedBytes <= 0 {
 		d.maxObservedBytes = DefaultObservedCap
 	}
+	if d.Recorder == nil {
+		d.Recorder = telemetry.Noop{}
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := requestID(r)
+		started := time.Now()
+
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 			return
@@ -149,20 +168,39 @@ func Chat(d Deps) http.Handler {
 			route = dec
 		}
 
+		// Decide streaming up-front so the telemetry row reflects what the
+		// client actually asked for. The current Stream implementation
+		// streams either way; honoring the flag here keeps TTFT semantics
+		// honest and prepares us for issue #10 (which will switch on this).
+		streaming := true
+		if s, ok := body["stream"].(bool); ok && !s {
+			streaming = false
+		}
+
+		// Wrap the response writer so we can capture TTFT and byte counts
+		// without affecting upstream.Stream's flusher contract.
+		var firstWriteAt atomic.Int64 // unix nano; 0 means "no write yet"
+		obs := telemetry.NewObservingWriter(w, func(t time.Time) {
+			firstWriteAt.CompareAndSwap(0, t.UnixNano())
+		})
+
+		var model string
+		var upErr error
 		switch route {
 		case router.RouteFusion:
 			log.Println("[FUSION]: Spinning up model panel...")
-			err := upstream.Panel(
-				w, d.Client,
+			upErr = upstream.Panel(
+				obs, d.Client,
 				d.Config.OllamaURL, d.Config.LocalModel,
 				d.Config.FrontierURL, d.Config.FrontierModel,
 				d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
 				body, latestPrompt, d.Config.FusionTimeout,
 			)
-			if err != nil {
-				log.Printf("[FUSION ERROR]: %v", err)
+			if upErr != nil {
+				log.Printf("[FUSION ERROR]: %v", upErr)
 				http.Error(w, "Upstream error", http.StatusBadGateway)
 			}
+			model = d.Config.FrontierModel
 
 		case router.RouteLocal:
 			body["model"] = d.Config.LocalModel
@@ -184,42 +222,48 @@ func Chat(d Deps) http.Handler {
 				Timeout:       d.Config.CascadeTimeout,
 			})
 
-			// Tee the response into a bounded buffer so the judge
-			// observer (issue #15) can score it after the client
-			// stream is fully flushed. The buffer cap matches the
-			// dep's configured ceiling — overflow drops silently
-			// (the observer sees a truncated body, which is better
-			// than OOMing the proxy). The full body is still streamed
-			// to the client via captureWriter.
-			rw := http.ResponseWriter(w)
+			// Writer chain (outermost first):
+			//   cascade.Run -> captureWriter (judge tee) ->
+			//   ObservingWriter (telemetry byte count + TTFT) ->
+			//   underlying ResponseWriter.
+			// captureWriter is only installed when JudgeObserver is set;
+			// otherwise the cascade writes directly through obs.
+			rw := http.ResponseWriter(obs)
 			var cap *captureWriter
 			if d.JudgeObserver != nil {
-				cap = newCaptureWriter(w, d.maxObservedBytes)
+				cap = newCaptureWriter(obs, d.maxObservedBytes)
 				rw = cap
 			}
 			res, err := cas.Run(rw, d.Client, body)
 			logCascadeTelemetry(res, err)
 			if err != nil {
 				log.Printf("[UPSTREAM ERROR]: %v", err)
+				upErr = err
 				http.Error(w, "Upstream error", http.StatusBadGateway)
-				return
-			}
-			if d.JudgeObserver != nil && res.Succeeded {
-				d.JudgeObserver.Submit(LocalCompletion{
-					RequestID:   requestID(r),
-					Instruction: latestPrompt,
-					Output:      cap.Buffer(),
-					LocalModel:  d.Config.LocalModel,
-				})
+				// fall through: telemetry Record still fires below so
+				// the failed request shows up in the dashboard.
+			} else {
+				model = d.Config.LocalModel
+				if d.JudgeObserver != nil && res.Succeeded {
+					d.JudgeObserver.Submit(LocalCompletion{
+						RequestID:   reqID,
+						Instruction: latestPrompt,
+						Output:      cap.Buffer(),
+						LocalModel:  d.Config.LocalModel,
+					})
+				}
 			}
 
 		default:
-			if err := upstream.Stream(w, d.Client,
-				d.Config.FrontierURL, d.Config.FrontierKey, body); err != nil {
-				log.Printf("[UPSTREAM ERROR]: %v", err)
+			model = d.Config.FrontierModel
+			if upErr = upstream.Stream(obs, d.Client,
+				d.Config.FrontierURL, d.Config.FrontierKey, body); upErr != nil {
+				log.Printf("[UPSTREAM ERROR]: %v", upErr)
 				http.Error(w, "Upstream error", http.StatusBadGateway)
 			}
 		}
+
+		d.Recorder.Record(buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr))
 	})
 }
 
@@ -309,3 +353,40 @@ var (
 	_ http.ResponseWriter = (*captureWriter)(nil)
 	_ http.Flusher        = (*captureWriter)(nil)
 )
+
+func buildRecord(
+	requestID string,
+	started time.Time,
+	firstWriteNano int64,
+	bytesOut uint64,
+	streaming bool,
+	route router.Route,
+	model, latestPrompt string,
+	upErr error,
+) telemetry.Record {
+	totalMs := time.Since(started).Milliseconds()
+	var ttftMs int64
+	if streaming && firstWriteNano > 0 {
+		ttftMs = time.Unix(0, firstWriteNano).Sub(started).Milliseconds()
+		if ttftMs < 0 {
+			ttftMs = 0
+		}
+	}
+	outputTokens := int(bytesOut / 4)
+	rec := telemetry.Record{
+		Timestamp:      time.Now().UTC(),
+		RequestID:      requestID,
+		Model:          model,
+		Route:          string(route),
+		InputTokens:    telemetry.EstimateTokens(latestPrompt),
+		OutputTokens:   outputTokens,
+		TTFTMs:         ttftMs,
+		TotalLatencyMs: totalMs,
+		Streaming:      streaming,
+	}
+	rec.TPS = telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
+	if upErr != nil {
+		rec.Error = upErr.Error()
+	}
+	return rec
+}

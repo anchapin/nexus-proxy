@@ -1,11 +1,12 @@
 // Command nexus is the entry point for the Nexus Proxy. It loads
 // configuration from the environment, constructs the chat handler with its
-// collaborators (RAG store, SLM client, formatting regex), and serves
-// /v1/chat/completions.
+// collaborators (RAG store, SLM client, formatting regex, judge observer,
+// telemetry recorder), and serves /v1/chat/completions.
 package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -19,11 +20,13 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/judge"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
+	"github.com/anchapin/nexus-proxy/internal/telemetry"
 )
 
 const (
 	formattingRegexPattern = `(?i)\b(css|format|docstring|lint|typo|boilerplate)\b`
 	bootRAGTimeout         = 30 * time.Second
+	shutdownTimeout        = 10 * time.Second
 )
 
 func main() {
@@ -85,6 +88,13 @@ func main() {
 		log.Println("[BOOT]: judge disabled (sample rate <= 0 or no API key)")
 	}
 
+	recorder := buildRecorder(cfg)
+	defer func() {
+		if err := recorder.Close(); err != nil {
+			log.Printf("[TELEMETRY ERROR]: close: %v", err)
+		}
+	}()
+
 	mux := http.NewServeMux()
 	mux.Handle("/v1/chat/completions", handlers.Chat(handlers.Deps{
 		Config:          cfg,
@@ -93,6 +103,7 @@ func main() {
 		SLM:             slm,
 		FormattingRegex: re,
 		JudgeObserver:   judgeObs,
+		Recorder:        recorder,
 	}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))
@@ -107,7 +118,9 @@ func main() {
 
 	// Graceful shutdown: stop accepting new connections, drain
 	// in-flight requests, then drain the judge queue so we don't
-	// lose pending JudgeScore records.
+	// lose pending JudgeScore records. The telemetry recorder is
+	// closed via the deferred call above so it always flushes,
+	// even on log.Fatalf.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -118,14 +131,30 @@ func main() {
 				log.Printf("[SHUTDOWN WARN]: judge close: %v", err)
 			}
 		}
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
+		if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("[SHUTDOWN WARN]: server: %v", err)
 		}
 	}()
 
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server: %v", err)
 	}
+}
+
+// buildRecorder constructs the telemetry recorder from config. A disabled
+// TelemetryPath returns a Noop so the handler can stay recorder-agnostic.
+func buildRecorder(cfg config.Config) telemetry.Recorder {
+	if !cfg.TelemetryEnabled() {
+		log.Println("[TELEMETRY]: disabled (NEXUS_TELEMETRY_PATH is empty)")
+		return telemetry.Noop{}
+	}
+	r, err := telemetry.NewJSONLRecorder(cfg.TelemetryPath)
+	if err != nil {
+		log.Printf("[TELEMETRY ERROR]: recorder init failed (%v); falling back to Noop", err)
+		return telemetry.Noop{}
+	}
+	log.Printf("[TELEMETRY]: recording to %s", r.Path())
+	return r
 }
