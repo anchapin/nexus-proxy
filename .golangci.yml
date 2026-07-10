@@ -1,0 +1,41 @@
+# Nexus Proxy lint configuration.
+#
+# Conservative starter set: catches bugs and obvious smells without fighting
+# formatter choices. Tighten or loosen per project taste over time.
+
+run:
+  timeout: 5m
+
+linters:
+  disable-all: true
+  enable:
+    # Bug catchers
+    - errcheck       # unchecked errors
+    - gosimple       # simplifications
+    - govet          # stdlib vet
+    - ineffassign    # unused assignments
+    - staticcheck    # broad static analysis
+    - unused         # unused identifiers
+
+    # Style / hygiene
+    - gofmt          # canonical formatting
+    - goimports      # import grouping
+    - misspell       # typos in comments/strings
+    - revive         # golint replacement
+
+  settings:
+    revive:
+      rules:
+        - name: package-comments
+          disabled: true # cmd/ packages don't need doc comments
+
+issues:
+  exclude-rules:
+    # Tests commonly use package-level helpers and short identifiers.
+    - path: _test\.go
+      linters:
+        - errcheck
+        - revive
+
+  # Don't fail on TODO comments in early-stage code; revisit later.
+  exclude: ['TODO\(']
