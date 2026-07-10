@@ -1439,3 +1439,203 @@ func TestChatEmitsSlogGuardrailVram(t *testing.T) {
 		t.Fatalf("no guardrail forced frontier log line (reason=vram, estimated_tokens>0) in: %s", output)
 	}
 }
+
+// fakeBudgetObserver is a programmable BudgetObserver for the
+// dynamic-guardrail tests in issue #6. The Tokens/Source fields can
+// be swapped at runtime; Snapshot returns what the chat handler saw
+// on the most recent read.
+type fakeBudgetObserver struct {
+	mu     sync.Mutex
+	Tokens int
+	Source string
+	calls  int
+}
+
+func (f *fakeBudgetObserver) BudgetTokens() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	return f.Tokens
+}
+
+func (f *fakeBudgetObserver) BudgetSource() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.Source
+}
+
+func (f *fakeBudgetObserver) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// TestChatDynamicBudgetOverridesStaticGuardrail verifies the boot
+// contract for issue #6: when a BudgetObserver reports a small
+// per-request budget, the guardrail triggers a frontier reroute
+// even though the static NEXUS_TOKEN_GUARDRAIL (6000) would have
+// permitted the same prompt. The probe must be consulted on every
+// request so thermal-throttle / model-swap events take effect.
+func TestChatDynamicBudgetOverridesStaticGuardrail(t *testing.T) {
+	deps, rt := baseDeps(t)
+	deps.BudgetObserver = &fakeBudgetObserver{Tokens: 100, Source: "ollama-ps+amd-sysfs"}
+
+	// 1000 chars / 4 = 250 tokens. Static guardrail (6000) would have
+	// permitted it; dynamic budget (100) blocks it.
+	prompt := strings.Repeat("a", 1000)
+	body := `{"messages":[{"role":"user","content":"` + prompt + `"}]}`
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("frontier stream"))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if len(rt.Calls()) != 1 {
+		t.Fatalf("expected 1 upstream call, got %d", len(rt.Calls()))
+	}
+	if rt.Calls()[0].URL != "http://frontier.local" {
+		t.Errorf("routed to %s, want frontier (dynamic budget should have tripped)", rt.Calls()[0].URL)
+	}
+	if obs, _ := deps.BudgetObserver.(*fakeBudgetObserver); obs.callCount() == 0 {
+		t.Error("BudgetObserver was never consulted")
+	}
+}
+
+// TestChatDynamicBudgetAllowsSmallPrompt confirms the dynamic
+// budget lets a small prompt through to local Ollama, while still
+// being consulted (issue #6: the probe must be consulted on every
+// request — thermal-throttle / model-swap events take effect
+// without waiting for a restart).
+func TestChatDynamicBudgetAllowsSmallPrompt(t *testing.T) {
+	deps, rt := baseDeps(t)
+	deps.BudgetObserver = &fakeBudgetObserver{Tokens: 4096, Source: "ollama-ps+amd-sysfs"}
+
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
+	})
+
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rw.Code)
+	}
+	if len(rt.Calls()) != 1 || rt.Calls()[0].URL != "http://ollama.local/v1/chat/completions" {
+		t.Fatalf("calls = %+v, want one ollama.local call", rt.Calls())
+	}
+	if obs, _ := deps.BudgetObserver.(*fakeBudgetObserver); obs.callCount() == 0 {
+		t.Error("BudgetObserver was never consulted")
+	}
+}
+
+// TestChatZeroBudgetFallsBackToStaticGuardrail pins down the
+// acceptance criterion "a zero / unset probe falls back to the
+// static NEXUS_TOKEN_GUARDRAIL" (issue #6). When the probe returns
+// 0, the handler must behave as before the issue landed.
+func TestChatZeroBudgetFallsBackToStaticGuardrail(t *testing.T) {
+	deps, rt := baseDeps(t)
+	deps.BudgetObserver = &fakeBudgetObserver{Tokens: 0, Source: "static-fallback"}
+
+	// 30000 char prompt / 4 = 7500 > static guardrail (6000) -> frontier.
+	largeUser := strings.Repeat("a", 30000)
+	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("frontier stream"))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rt.Calls()[0].URL != "http://frontier.local" {
+		t.Errorf("routed to %s, want frontier (static guardrail must still trip)", rt.Calls()[0].URL)
+	}
+}
+
+// TestChatNilBudgetObserverFallsBackToStaticGuardrail mirrors the
+// zero-budget test but exercises the wiring path where no probe is
+// installed at all (e.g. binary built without NEXUS_PROBE_INTERVAL).
+func TestChatNilBudgetObserverFallsBackToStaticGuardrail(t *testing.T) {
+	deps, rt := baseDeps(t)
+	deps.BudgetObserver = nil
+
+	// 30000 char prompt / 4 = 7500 > static guardrail (6000) -> frontier.
+	largeUser := strings.Repeat("a", 30000)
+	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("frontier stream"))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rt.Calls()[0].URL != "http://frontier.local" {
+		t.Errorf("routed to %s, want frontier (no probe -> static guardrail still trips)", rt.Calls()[0].URL)
+	}
+}
+
+// TestChatDynamicBudgetSlogEmitsSource verifies the guardrail log
+// line carries the budget source label so operators can confirm
+// whether the dynamic probe or the static fallback took the call.
+func TestChatDynamicBudgetSlogEmitsSource(t *testing.T) {
+	deps, rt := baseDeps(t)
+	deps.BudgetObserver = &fakeBudgetObserver{Tokens: 100, Source: "ollama-ps+amd-sysfs"}
+
+	largeUser := strings.Repeat("a", 1000)
+	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("frontier stream"))
+	})
+
+	output := captureSlog(t, func() {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		rw := httptest.NewRecorder()
+		Chat(deps).ServeHTTP(rw, req)
+	})
+
+	var found bool
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+		if rec["msg"] != "guardrail forced frontier" {
+			continue
+		}
+		if src, _ := rec["budget_source"].(string); src == "ollama-ps+amd-sysfs" {
+			if budget, _ := rec["budget_tokens"].(float64); budget == 100 {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no guardrail line with budget_source=ollama-ps+amd-sysfs budget_tokens=100 in: %s", output)
+	}
+}
+
+// TestBudgetObserverFuncNilClosures verifies the BudgetObserverFunc
+// adapter degrades gracefully when the underlying closures are nil
+// (mirrors main.go's wiring when only one of the probe knobs is set).
+func TestBudgetObserverFuncNilClosures(t *testing.T) {
+	var b BudgetObserverFunc // both Tokens and Source nil
+	if b.BudgetTokens() != 0 {
+		t.Errorf("nil Tokens must return 0")
+	}
+	if b.BudgetSource() != "static" {
+		t.Errorf("nil Source must return \"static\", got %q", b.BudgetSource())
+	}
+
+	b = BudgetObserverFunc{Tokens: func() int { return 4096 }}
+	if b.BudgetTokens() != 4096 {
+		t.Errorf("Tokens = %d, want 4096", b.BudgetTokens())
+	}
+	if got := b.BudgetSource(); got != "static" {
+		t.Errorf("Source with nil closure must return \"static\", got %q", got)
+	}
+}

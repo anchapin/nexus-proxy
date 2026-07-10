@@ -59,6 +59,17 @@ type Config struct {
 	HealthBreakerThreshold int           // consecutive failures before trip (3)
 	HealthProbeTimeout     time.Duration // per-probe HTTP timeout (5s)
 
+	// Hardware-aware VRAM probe (issue #6). The probe replaces the
+	// static NEXUS_TOKEN_GUARDRAIL with a live measurement of the
+	// loaded model's context_length (Ollama /api/ps) and free VRAM
+	// (AMD sysfs). The chat handler uses the most recent budget;
+	// when the probe is disabled or returns zero, the handler
+	// falls back to the static TokenGuardrail value.
+	ProbeEnabled       bool          // true iff ProbePollInterval > 0
+	ProbePollInterval  time.Duration // background re-probe cadence (60s); 0 disables polling
+	ProbeTimeout       time.Duration // per-probe HTTP timeout (5s)
+	ProbeBytesPerToken int           // VRAM->token heuristic (256 KiB per token)
+
 	// HTTP request body cap (issue #11). The chat handler applies this
 	// with http.MaxBytesReader before reading the request body, so an
 	// oversized POST cannot exhaust proxy memory before the guardrail
@@ -218,6 +229,35 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.HealthProbeTimeout = healthProbe
+
+	// Hardware-aware VRAM probe (issue #6). Defaults: 60s poll,
+	// 5s per-probe timeout, 256 KiB per token heuristic (which
+	// works out to ~32k tokens of safe headroom on an 8 GiB GPU).
+	// Set NEXUS_PROBE_INTERVAL to "0" to disable periodic polling
+	// entirely; the boot probe still runs synchronously once. When
+	// the probe is disabled or returns zero (Ollama down + no AMD
+	// sysfs), the chat handler falls back to TokenGuardrail.
+	probeInterval, err := getEnvDuration("NEXUS_PROBE_INTERVAL", 60*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ProbePollInterval = probeInterval
+
+	probeTimeout, err := getEnvDuration("NEXUS_PROBE_TIMEOUT", 5*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ProbeTimeout = probeTimeout
+
+	probeBytes, err := getEnvInt("NEXUS_PROBE_BYTES_PER_TOKEN", 256*1024)
+	if err != nil {
+		return cfg, err
+	}
+	if probeBytes < 0 {
+		probeBytes = 0
+	}
+	cfg.ProbeBytesPerToken = probeBytes
+	cfg.ProbeEnabled = cfg.ProbePollInterval > 0
 
 	// Hard request-body cap (issue #11). Default 1 MiB matches typical
 	// OpenAI-compatible request sizes; the chat handler wraps r.Body

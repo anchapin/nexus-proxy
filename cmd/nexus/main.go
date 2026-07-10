@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
 	"log/slog"
@@ -21,6 +22,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/judge"
 	"github.com/anchapin/nexus-proxy/internal/metrics"
+	"github.com/anchapin/nexus-proxy/internal/probe"
 	"github.com/anchapin/nexus-proxy/internal/quality"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
@@ -81,6 +83,33 @@ func main() {
 		}()
 	} else {
 		slog.Info("ollama health poller disabled (NEXUS_HEALTH_POLL_INTERVAL=0)")
+	}
+
+	// Hardware-aware VRAM probe (issue #6). Replaces the static
+	// NEXUS_TOKEN_GUARDRAIL with a live measurement of the loaded
+	// Ollama model's context_length (via /api/ps) and the AMD GPU
+	// sysfs VRAM nodes. The manager performs an initial blocking
+	// probe so the first proxied request after boot already sees the
+	// dynamic budget, then re-polls on the configured cadence. When
+	// the probe is disabled (NEXUS_PROBE_INTERVAL=0) the manager
+	// still runs the boot probe once and the chat handler falls
+	// back to the static value when it produces no budget.
+	probeImpl := probe.NewOllamaProbe(cfg.OllamaURL, http.DefaultClient)
+	probeImpl.BytesPerToken = cfg.ProbeBytesPerToken
+	probeMgr := probe.NewManager(probeImpl, cfg.ProbePollInterval, cfg.ProbeTimeout)
+	go probeMgr.Run(context.Background())
+	defer func() {
+		if err := probeMgr.Close(); err != nil {
+			slog.Warn("probe manager close", slog.Any("err", err))
+		}
+	}()
+	if cfg.ProbePollInterval > 0 {
+		slog.Info("vram probe enabled",
+			slog.Duration("interval", cfg.ProbePollInterval),
+			slog.Duration("timeout", cfg.ProbeTimeout),
+		)
+	} else {
+		slog.Info("vram probe polling disabled (NEXUS_PROBE_INTERVAL=0); boot snapshot only")
 	}
 
 	// Async LLM-as-a-judge evaluator (issue #15). The handler never
@@ -236,10 +265,20 @@ func main() {
 		MetricsObserver: metricsObs,
 		Recorder:        recorder,
 		Health:          hpoller,
+		BudgetObserver:  budgetObserver(probeMgr),
 	}))
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("ok"))
-	})
+
+	// /healthz returns a small JSON document so operators can see
+	// the dynamic VRAM budget without scraping logs (issue #6).
+	// Status code is always 200 when the binary is alive; the body
+	// carries the bootstrap state (`ollama_healthy`,
+	// `budget_tokens`, `budget_source`). Compose/K8s liveness probes
+	// that pipe `curl /healthz` into grep will still match the
+	// `"status":"ok"` field.
+	mux.HandleFunc("/healthz", healthzHandler(hpoller, probeMgr, cfg))
+	slog.Info("healthz endpoint serves dynamic budget JSON",
+		slog.String("ollama_url", cfg.OllamaURL),
+	)
 
 	slog.Info("starting nexus proxy",
 		slog.String("addr", cfg.Addr),
@@ -340,4 +379,79 @@ func buildMetrics(cfg config.Config) (metrics.Store, handlers.MetricsObserver) {
 		})
 	})
 	return store, obs
+}
+
+// budgetObserver adapts the probe.Manager atomic snapshot into the
+// handler-facing BudgetObserver (issue #6). Keeping the adapter here
+// — rather than importing probe from handlers — preserves the
+// dependency direction: handlers stays free of the probe import;
+// only main.go knows both sides.
+//
+// When the manager is nil (defensive — NewManager panics on nil
+// probe but a wiring mistake should never panic the binary) the
+// adapter returns 0 / "static-fallback" so the handler falls back
+// to the operator-configured NEXUS_TOKEN_GUARDRAIL.
+func budgetObserver(mgr *probe.Manager) handlers.BudgetObserver {
+	if mgr == nil {
+		return handlers.BudgetObserverFunc{
+			Tokens: func() int { return 0 },
+			Source: func() string { return string(probe.SourceStatic) },
+		}
+	}
+	return handlers.BudgetObserverFunc{
+		Tokens: func() int { return mgr.Get().Tokens },
+		Source: func() string {
+			src := mgr.Get().Source
+			if src == "" {
+				return string(probe.SourceStatic)
+			}
+			return string(src)
+		},
+	}
+}
+
+// healthzHandler returns the /healthz handler. Status code is
+// always 200 when the binary is alive; the JSON body carries the
+// per-request VRAM budget, the source label, the fallback value
+// the operator configured, and whether the local Ollama poller
+// considers Ollama healthy (nil hpoller -> true, matches the
+// health.Health nil-safe contract).
+func healthzHandler(hpoller *health.Health, mgr *probe.Manager, cfg config.Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+
+		budget := probe.Budget{Source: probe.SourceStatic}
+		if mgr != nil {
+			budget = mgr.Get()
+		}
+		// When the probe has no budget to offer (still booting,
+		// disabled, or every signal unavailable) we echo the
+		// operator-configured TokenGuardrail so /healthz always
+		// reports a concrete number operators can grep against.
+		displayTokens := budget.Tokens
+		source := string(budget.Source)
+		if displayTokens <= 0 {
+			displayTokens = cfg.TokenGuardrail
+			source = string(probe.SourceStatic)
+		}
+		resp := struct {
+			Status         string `json:"status"`
+			OllamaHealthy  bool   `json:"ollama_healthy"`
+			BudgetTokens   int    `json:"budget_tokens"`
+			BudgetSource   string `json:"budget_source"`
+			FreeVRAMBytes  int64  `json:"free_vram_bytes,omitempty"`
+			ModelContext   int    `json:"model_context,omitempty"`
+			StaticFallback int    `json:"static_fallback_tokens"`
+		}{
+			Status:         "ok",
+			OllamaHealthy:  hpoller == nil || hpoller.IsLocalHealthy(),
+			BudgetTokens:   displayTokens,
+			BudgetSource:   source,
+			FreeVRAMBytes:  budget.FreeVRAMBytes,
+			ModelContext:   budget.ModelContext,
+			StaticFallback: cfg.TokenGuardrail,
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}
 }

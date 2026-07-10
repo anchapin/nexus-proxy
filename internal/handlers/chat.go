@@ -129,6 +129,50 @@ type MetricsObserverFunc func(MetricsEvent)
 // Submit implements MetricsObserver.
 func (f MetricsObserverFunc) Submit(e MetricsEvent) { f(e) }
 
+// BudgetObserver is the dynamic VRAM-budget hook the chat handler
+// consults before falling back to the static `NEXUS_TOKEN_GUARDRAIL`
+// (issue #6).
+//
+// Implementations must be safe to call concurrently from many request
+// goroutines. BudgetTokens should return the most recent probe
+// measurement; when no probe is configured or the last probe was
+// disabled, BudgetTokens returns <= 0 and the handler transparently
+// falls back to the static value configured by the operator.
+//
+// BudgetSource is a short human-readable label (e.g. "ollama-ps",
+// "amd-sysfs", "ollama-ps+amd-sysfs", "static-fallback") used in log
+// lines and in /healthz so operators can see what is driving the
+// budget at a glance.
+type BudgetObserver interface {
+	BudgetTokens() int
+	BudgetSource() string
+}
+
+// BudgetObserverFunc adapts two plain functions to the BudgetObserver
+// interface so wiring from main.go stays a one-liner. Either closure
+// may be nil; nil Tokens treats the observer as "no budget", nil
+// Source returns "static".
+type BudgetObserverFunc struct {
+	Tokens func() int
+	Source func() string
+}
+
+// BudgetTokens implements BudgetObserver.
+func (b BudgetObserverFunc) BudgetTokens() int {
+	if b.Tokens == nil {
+		return 0
+	}
+	return b.Tokens()
+}
+
+// BudgetSource implements BudgetObserver.
+func (b BudgetObserverFunc) BudgetSource() string {
+	if b.Source == nil {
+		return "static"
+	}
+	return b.Source()
+}
+
 // Deps bundles the collaborators the chat handler needs. Wiring them
 // explicitly makes the handler trivial to unit-test with stubs.
 type Deps struct {
@@ -184,6 +228,15 @@ type Deps struct {
 	// treated as "always healthy" so unit tests and tools that do
 	// not wire the poller still work unchanged.
 	Health *health.Health
+
+	// BudgetObserver is the dynamic VRAM-budget hook (issue #6).
+	// When non-nil and BudgetTokens returns a positive value, the
+	// handler uses that as the guardrail budget instead of
+	// Config.TokenGuardrail. BudgetTokens <=0 (or a nil observer)
+	// falls back to the static NEXUS_TOKEN_GUARDRAIL value so the
+	// handler behaves identically to before issue #6 when no
+	// probe is wired.
+	BudgetObserver BudgetObserver
 
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
@@ -304,9 +357,25 @@ func Chat(d Deps) http.Handler {
 		latestPrompt = middleware.ExtractLatestUserPrompt(messages)
 
 		var route router.Route
-		if g, hit := router.Guardrail(latestPrompt, d.Config.TokenGuardrail); hit {
+		// VRAM-aware guardrail (issue #6). When the
+		// BudgetObserver is wired and reports a positive budget,
+		// the dynamic measurement wins; otherwise we fall back to
+		// the operator-configured NEXUS_TOKEN_GUARDRAIL. The source
+		// label travels with the log line so operators can confirm
+		// which path was taken without digging through the source.
+		guardrailBudget := d.Config.TokenGuardrail
+		guardrailSource := "static-fallback"
+		if d.BudgetObserver != nil {
+			if dyn := d.BudgetObserver.BudgetTokens(); dyn > 0 {
+				guardrailBudget = dyn
+				guardrailSource = d.BudgetObserver.BudgetSource()
+			}
+		}
+		if g, hit := router.Guardrail(latestPrompt, guardrailBudget); hit {
 			slog.Info("guardrail forced frontier",
 				slog.String("reason", "vram"),
+				slog.String("budget_source", guardrailSource),
+				slog.Int("budget_tokens", guardrailBudget),
 				slog.Int("estimated_tokens", len(latestPrompt)/4),
 				slog.String("request_id", reqID),
 			)
