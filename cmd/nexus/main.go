@@ -18,6 +18,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/handlers"
 	"github.com/anchapin/nexus-proxy/internal/judge"
+	"github.com/anchapin/nexus-proxy/internal/quality"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
@@ -95,6 +96,60 @@ func main() {
 		}
 	}()
 
+	// Async AST/compiler verifier (issue #13). The handler never
+	// imports internal/quality; we plug a closure in that maps the
+	// handler's QualityEvent shape to the verifier's Event shape
+	// and dispatches via the verifier's non-blocking Submit. The
+	// verifier is dormant when QualityConcurrency is non-positive
+	// — same pattern as the judge, so the handler is unaffected
+	// when the operator leaves the verifier disabled.
+	var (
+		verifier *quality.ShellVerifier
+		qualityO handlers.QualityObserver
+	)
+	if cfg.QualityEnabled {
+		verifier = quality.NewShellVerifier(quality.Config{
+			Concurrency: cfg.QualityConcurrency,
+			QueueDepth:  cfg.QualityQueueDepth,
+			Timeout:     cfg.QualityTimeout,
+			StderrCap:   cfg.QualityStderrCap,
+			Observer: quality.ObserverFunc(func(v quality.Verdict) {
+				// Sink: forward to the telemetry row keyed by
+				// request id (issue #16 will materialise this
+				// in the SQLite schema). For now we log the
+				// verdict so operators can confirm the worker
+				// is doing real work.
+				if v.Err != nil {
+					log.Printf("[QUALITY]: request=%s path=%q root=%q pass=%v exit=%d err=%v",
+						v.Event.RequestID, v.Event.Path, v.RepoRoot, v.Pass, v.ExitCode, v.Err)
+					return
+				}
+				log.Printf("[QUALITY]: request=%s path=%q root=%q kind=%s pass=%v exit=%d duration=%dms",
+					v.Event.RequestID, v.Event.Path, v.RepoRoot, v.Kind, v.Pass, v.ExitCode, v.DurationMs)
+			}),
+		})
+		qualityO = handlers.QualityObserverFunc(func(e handlers.QualityEvent) {
+			if !verifier.Submit(quality.Event{
+				RequestID: e.RequestID,
+				Path:      e.Path,
+				ToolName:  e.ToolName,
+			}) {
+				log.Printf("[QUALITY DROP]: queue full, dropped %s path=%q", e.RequestID, e.Path)
+			}
+		})
+		log.Printf("[BOOT]: quality verifier enabled (concurrency=%d queue=%d timeout=%s)",
+			cfg.QualityConcurrency, cfg.QualityQueueDepth, cfg.QualityTimeout)
+	} else {
+		log.Println("[BOOT]: quality verifier disabled (concurrency <= 0)")
+	}
+	defer func() {
+		if verifier != nil {
+			if err := verifier.Close(); err != nil {
+				log.Printf("[SHUTDOWN WARN]: quality verifier: %v", err)
+			}
+		}
+	}()
+
 	mux := http.NewServeMux()
 	mux.Handle("/v1/chat/completions", handlers.Chat(handlers.Deps{
 		Config:          cfg,
@@ -103,6 +158,7 @@ func main() {
 		SLM:             slm,
 		FormattingRegex: re,
 		JudgeObserver:   judgeObs,
+		QualityObserver: qualityO,
 		Recorder:        recorder,
 	}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {

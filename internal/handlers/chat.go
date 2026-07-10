@@ -52,6 +52,34 @@ type JudgeObserverFunc func(LocalCompletion)
 // Submit implements JudgeObserver.
 func (f JudgeObserverFunc) Submit(c LocalCompletion) { f(c) }
 
+// QualityEvent is emitted to the QualityObserver hook each time the
+// handler detects a tool call in an upstream response that looks like
+// a file edit (write_file, edit_file, apply_patch, ...). It mirrors
+// the Event type in internal/quality — the handler does not import
+// that package so the dependency direction stays one-way (cmd/nexus
+// adapts between the two shapes).
+type QualityEvent struct {
+	RequestID string // correlates to the chat handler's request id
+	Path      string // path of the edited file
+	ToolName  string // write_file, edit_file, apply_patch, ...
+}
+
+// QualityObserver is the hook the chat handler invokes with detected
+// edits. Like the JudgeObserver, it must be safe to call from many
+// goroutines and must not block; the verifier does the heavy work
+// asynchronously and only the Submit call happens on the request
+// goroutine.
+type QualityObserver interface {
+	Submit(QualityEvent)
+}
+
+// QualityObserverFunc adapts a plain function to the QualityObserver
+// interface so wiring from main.go stays a one-liner.
+type QualityObserverFunc func(QualityEvent)
+
+// Submit implements QualityObserver.
+func (f QualityObserverFunc) Submit(e QualityEvent) { f(e) }
+
 // Deps bundles the collaborators the chat handler needs. Wiring them
 // explicitly makes the handler trivial to unit-test with stubs.
 type Deps struct {
@@ -69,6 +97,17 @@ type Deps struct {
 	// a closure that adapts LocalCompletion to the judge's
 	// Sample/Enqueue entry points.
 	JudgeObserver JudgeObserver
+
+	// QualityObserver is optional. When non-nil, the handler scans
+	// the captured upstream body for tool-call patterns that look
+	// like file edits (write_file / edit_file / apply_patch / ...)
+	// and dispatches one QualityEvent per detected file path.
+	// The scan runs on the request goroutine AFTER the response
+	// has been fully streamed; it adds negligible overhead and
+	// never blocks the response path. The handler does not import
+	// the quality package; main.go wires a closure that forwards
+	// to the verifier's Submit.
+	QualityObserver QualityObserver
 
 	// Recorder receives one record per proxied request. Never nil at
 	// runtime: Chat() installs telemetry.Noop{} when the caller
@@ -101,6 +140,13 @@ const DefaultObservedCap = 256 * 1024 // 256 KiB
 // JudgeObserver (when configured) with a LocalCompletion event. The
 // observer may decide to enqueue the request for judge scoring; the
 // handler does not wait on the observer.
+//
+// Likewise, when QualityObserver is configured, the handler scans
+// the captured response body for tool-call envelopes that look like
+// file edits (write_file / edit_file / apply_patch / ...) and
+// forwards a QualityEvent per detected path. The verifier (cmd/nexus)
+// runs `cargo check` / `npx tsc` asynchronously and dispatches the
+// verdict back via its own observer hook.
 //
 // Every proxied request — success, failure, or short-circuit — emits
 // exactly one telemetry.Record via Recorder so the issue #16 dashboard
@@ -223,14 +269,15 @@ func Chat(d Deps) http.Handler {
 			})
 
 			// Writer chain (outermost first):
-			//   cascade.Run -> captureWriter (judge tee) ->
+			//   cascade.Run -> captureWriter (judge + quality tee) ->
 			//   ObservingWriter (telemetry byte count + TTFT) ->
 			//   underlying ResponseWriter.
-			// captureWriter is only installed when JudgeObserver is set;
-			// otherwise the cascade writes directly through obs.
+			// captureWriter is only installed when at least one
+			// observer is set; otherwise the cascade writes
+			// directly through obs with zero overhead.
 			rw := http.ResponseWriter(obs)
 			var cap *captureWriter
-			if d.JudgeObserver != nil {
+			if d.JudgeObserver != nil || d.QualityObserver != nil {
 				cap = newCaptureWriter(obs, d.maxObservedBytes)
 				rw = cap
 			}
@@ -244,13 +291,18 @@ func Chat(d Deps) http.Handler {
 				// the failed request shows up in the dashboard.
 			} else {
 				model = d.Config.LocalModel
-				if d.JudgeObserver != nil && res.Succeeded {
-					d.JudgeObserver.Submit(LocalCompletion{
-						RequestID:   reqID,
-						Instruction: latestPrompt,
-						Output:      cap.Buffer(),
-						LocalModel:  d.Config.LocalModel,
-					})
+				if res.Succeeded && cap != nil {
+					if d.JudgeObserver != nil {
+						d.JudgeObserver.Submit(LocalCompletion{
+							RequestID:   reqID,
+							Instruction: latestPrompt,
+							Output:      cap.Buffer(),
+							LocalModel:  d.Config.LocalModel,
+						})
+					}
+					if d.QualityObserver != nil {
+						emitDetectedEdits(cap.Buffer(), reqID, d.QualityObserver)
+					}
 				}
 			}
 
@@ -353,6 +405,131 @@ var (
 	_ http.ResponseWriter = (*captureWriter)(nil)
 	_ http.Flusher        = (*captureWriter)(nil)
 )
+
+// qualityEditNames is the set of tool names the handler treats as
+// "this might have written a file". Mirrors internal/quality so the
+// two stay in sync; the handler intentionally does not import the
+// quality package (matching the AGENTS.md dependency rule for judge).
+//
+// Detection is liberal on purpose: the verifier's project-detection
+// step filters false positives (e.g. a write_file on a path inside a
+// non-project directory scores 0 but does not fail).
+var qualityEditNames = []string{
+	"write_file",
+	"edit_file",
+	"apply_patch",
+	"create_file",
+	"patch_file",
+	"update_file",
+	"write",
+	"edit",
+	"patch",
+}
+
+// qualityEditNameRe anchors on a known edit tool name inside a JSON
+// payload. Operates on the post-stripJSONEscapes window, so the
+// regex itself is plain — escape tolerance isn't necessary.
+var qualityEditNameRe = regexp.MustCompile(
+	`"name"\s*:\s*"(?:` + joinBars(qualityEditNames) + `)"`,
+)
+
+// qualityPathRe matches the first path-shaped field in a window.
+// Captures the bare value with JSON-quote termination.
+var qualityPathRe = regexp.MustCompile(
+	`"(?:path|filePath|file_path|filepath)"\s*:\s*"([^"]+)"`,
+)
+
+// qualityPathWindowBytes bounds how far past a tool-name match we
+// look for the path field. 4 KiB is comfortably larger than any real
+// OpenCode tool call.
+const qualityPathWindowBytes = 4 * 1024
+
+// emitDetectedEdits scans body for tool-call envelopes whose name
+// matches qualityEditNames and forwards one QualityEvent per unique
+// path via obs. Body is the captured upstream response (already
+// bounded by maxObservedBytes); obs must be safe to call from many
+// goroutines — the verifier does its own queueing.
+//
+// The function is O(len(body)) and best-effort: malformed JSON,
+// missing fields, or windows that don't contain a path field are
+// silently skipped. Deduplication is per-call, by path.
+func emitDetectedEdits(body, reqID string, obs QualityObserver) {
+	if obs == nil || body == "" {
+		return
+	}
+	cleaned := stripJSONEscapes(body)
+	seen := make(map[string]bool, 4)
+	for _, idxs := range qualityEditNameRe.FindAllStringIndex(cleaned, -1) {
+		start := idxs[0]
+		end := start + qualityPathWindowBytes
+		if end > len(cleaned) {
+			end = len(cleaned)
+		}
+		window := cleaned[start:end]
+		path := firstPath(window)
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		obs.Submit(QualityEvent{
+			RequestID: reqID,
+			Path:      path,
+			ToolName:  "edit", // best-effort label; verifier doesn't depend on the exact name
+		})
+	}
+}
+
+// stripJSONEscapes reverses the small subset of escape sequences a
+// tool-call envelope might carry after JSON encoding. We don't pull
+// in encoding/json because that would force the handler to
+// round-trip the whole response body to find a handful of patterns.
+// File paths essentially never contain the other escape targets (\n,
+// \t, etc.) — the few edge cases that slip through are caught at
+// project-detection time and score 0.
+func stripJSONEscapes(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c == '\\' && i+1 < len(s) {
+			next := s[i+1]
+			if next == '"' || next == '\\' || next == '/' {
+				b.WriteByte(next)
+				i++
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// firstPath pulls the first plausible path-looking field out of
+// window. Exported as a small package-level helper so chat_test.go
+// can call it without re-implementing the regex.
+func firstPath(window string) string {
+	if m := qualityPathRe.FindStringSubmatch(window); len(m) >= 2 && m[1] != "" {
+		return m[1]
+	}
+	return ""
+}
+
+// joinBars concatenates names with "|" for use inside a regex
+// alternation. stdlib does not export the equivalent helper from
+// regexp so we keep the trivial inline version rather than pull in
+// strings.Join (which would still need a trim on the trailing bar).
+func joinBars(parts []string) string {
+	out := ""
+	for i, p := range parts {
+		if i > 0 {
+			out += "|"
+		}
+		out += p
+	}
+	return out
+}
 
 func buildRecord(
 	requestID string,
