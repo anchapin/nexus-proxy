@@ -93,6 +93,80 @@ Drop code snippets into `few_shot_examples/`. They're indexed at boot via
 `nomic-embed-text` and injected into prompts whose cosine similarity is
 above `NEXUS_RAG_THRESHOLD` (default 0.55).
 
+## Docker
+
+A multi-stage `Dockerfile` ships at the repo root: stage 1 builds a static
+binary in `golang:1.21-alpine` and stage 2 copies it into
+[`gcr.io/distroless/static-debian12:nonroot`](https://github.com/GoogleContainerTools/distroless).
+The final image runs as UID 65532 with no shell and no package manager,
+uses env-only configuration, and listens on `:8000`. Final image size is
+well under 30 MB.
+
+### Run the prebuilt image
+
+```bash
+docker run --rm -p 8000:8000 \
+  -e NEXUS_FRONTIER_API_KEY=sk-... \
+  -e NEXUS_OLLAMA_URL=http://host.docker.internal:11434 \
+  ghcr.io/anchapin/nexus-proxy:latest
+```
+
+Then point your agent at `http://localhost:8000/v1` (see
+[Point your agent at the proxy](#point-your-agent-at-the-proxy)).
+
+`host.docker.internal` is how the container reaches Ollama running on
+the host. On Linux without Docker Desktop you may need
+`--add-host=host.docker.internal:host-gateway` on the `docker run` line.
+
+### Build it locally
+
+```bash
+docker build -t nexus-proxy:dev .
+docker run --rm -p 8000:8000 \
+  -e NEXUS_FRONTIER_API_KEY=sk-... \
+  nexus-proxy:dev
+```
+
+### Compose (proxy + Ollama)
+
+For a fully-local stack, including Ollama in the same network:
+
+```bash
+NEXUS_FRONTIER_API_KEY=sk-... docker compose up -d
+docker compose exec ollama ollama pull qwen3-coder:4b qwen3-coder:8b nomic-embed-text
+```
+
+The proxy container talks to the `ollama` service by name over the
+compose network — leave `NEXUS_OLLAMA_URL` unset and the default in
+`docker-compose.yml` will kick in.
+
+### Health check
+
+The proxy serves `GET /healthz` returning `ok`. The Dockerfile uses
+`HEALTHCHECK NONE` (distroless has no shell/curl) so orchestrators like
+Kubernetes or Compose should probe `/healthz` from outside the image.
+For Compose users, the bundled `ollama` service already healthchecks
+itself; the proxy's own liveness is the operator's responsibility.
+
+### Persisting state
+
+Two paths the proxy writes to at runtime:
+
+| Path (env var)            | Default                       | Persist with |
+| ------------------------- | ----------------------------- | ------------ |
+| `NEXUS_TELEMETRY_PATH`    | `./nexus-telemetry.jsonl`     | `/tmp` in the container is writable but not persisted — bind-mount `/tmp` or set the env var to a mounted volume |
+| `NEXUS_EXAMPLES_DIR`      | `./few_shot_examples`         | Bind-mount a host directory so your curated snippets survive container restarts |
+
+Example:
+
+```bash
+docker run --rm -p 8000:8000 \
+  -v "$PWD/few_shot_examples:/few_shot_examples" \
+  -e NEXUS_EXAMPLES_DIR=/few_shot_examples \
+  -e NEXUS_FRONTIER_API_KEY=sk-... \
+  nexus-proxy:dev
+```
+
 ## Architecture
 
 ```
