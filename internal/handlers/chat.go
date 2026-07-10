@@ -189,6 +189,17 @@ type Deps struct {
 	SLM             *router.SLMClient
 	FormattingRegex *regexp.Regexp
 
+	// Confidence is the optional judge-guided adaptive routing store
+	// (issue #47). When non-nil the handler categorizes the prompt,
+	// looks up the local model's historical confidence for that
+	// category, and passes it to the SLM via DecideWithConfidence so a
+	// low-confidence category biases toward frontier. When nil (the
+	// default, and always when the judge is disabled) the handler uses
+	// the plain neutral Decide path — routing is byte-for-byte identical
+	// to the pre-issue-47 behaviour. The handler talks to router, never
+	// judge; main.go bridges JudgeScore -> RecordOutcome.
+	Confidence router.ConfidenceStore
+
 	// JudgeObserver is optional. When nil, the handler does not
 	// buffer the streamed response for judge sampling — every
 	// request takes the fast path with zero added overhead.
@@ -395,7 +406,29 @@ func Chat(d Deps) http.Handler {
 			route = r2
 		} else {
 			slog.Debug("dsl bypassed, asking slm", slog.String("request_id", reqID))
-			dec, err := d.SLM.Decide(r.Context(), latestPrompt)
+			// Judge-guided adaptive routing (issue #47). When a
+			// confidence store is wired we categorize the prompt and
+			// feed the local model's historical confidence for that
+			// category into the SLM, biasing toward frontier for
+			// categories the local model has handled poorly. When no
+			// store is wired (judge disabled) we take the plain
+			// neutral Decide path so routing is unchanged.
+			var (
+				dec router.Route
+				err error
+			)
+			if d.Confidence != nil {
+				category := router.Categorize(latestPrompt)
+				confidence := d.Confidence.LocalConfidence(category)
+				slog.Debug("adaptive routing confidence",
+					slog.String("category", category),
+					slog.Float64("confidence", confidence),
+					slog.String("request_id", reqID),
+				)
+				dec, err = d.SLM.DecideWithConfidence(r.Context(), latestPrompt, confidence)
+			} else {
+				dec, err = d.SLM.Decide(r.Context(), latestPrompt)
+			}
 			if err != nil {
 				slog.Error("slm error, defaulting to frontier",
 					slog.Any("err", err),
