@@ -42,6 +42,36 @@ jobs:
           path: coverage.txt
           retention-days: 7
 
+  bench:
+    # Non-blocking benchmark smoke run (issue #36). Uses -benchtime=100ms
+    # via `make bench-short` so the whole suite stays under 30 s. Compare
+    # the uploaded bench.txt against docs/BENCHMARKS.md for drift.
+    name: bench (smoke)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: make bench-short
+        run: make bench-short | tee bench.txt
+
+      - name: Upload benchmark output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench
+          path: bench.txt
+          retention-days: 7
+
   lint:
     name: golangci-lint
     runs-on: ubuntu-latest
