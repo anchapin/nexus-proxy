@@ -106,9 +106,24 @@ func Chat(d Deps) http.Handler {
 			}
 
 		case router.RouteLocal:
-			body["model"] = d.Config.LocalModel
-			if err := upstream.Stream(w, d.Client,
-				d.Config.OllamaURL+"/v1/chat/completions", "", body); err != nil {
+			// Cascade: try local Ollama first, fall back to configured
+			// frontier endpoints (frontier, then z.ai) on retryable
+			// failures. Cascade is rebuilt per request so config changes
+			// take effect without restarting the process (issue #14).
+			cas := upstream.BuildLocalCascade(upstream.CascadeConfig{
+				LocalURL:      d.Config.OllamaURL,
+				LocalModel:    d.Config.LocalModel,
+				FrontierURL:   d.Config.FrontierURL,
+				FrontierModel: d.Config.FrontierModel,
+				FrontierKey:   d.Config.FrontierKey,
+				ZAIURL:        d.Config.ZAIURL,
+				ZAIModel:      d.Config.ZAIModel,
+				ZAIKey:        d.Config.ZAIKey,
+				Timeout:       d.Config.CascadeTimeout,
+			})
+			res, err := cas.Run(w, d.Client, body)
+			logCascadeTelemetry(res, err)
+			if err != nil {
 				log.Printf("[UPSTREAM ERROR]: %v", err)
 				http.Error(w, "Upstream error", http.StatusBadGateway)
 			}
@@ -121,4 +136,12 @@ func Chat(d Deps) http.Handler {
 			}
 		}
 	})
+}
+
+// logCascadeTelemetry emits the route_attempted / attempts line for the
+// cascade. Once issue #16 wires a real metrics store this becomes the
+// place to publish a structured event; for now it's plain log.Println.
+func logCascadeTelemetry(res upstream.CascadeResult, err error) {
+	log.Printf("[CASCADE TELEMETRY]: route_attempted=%s attempts=%d served_by=%s success=%v err=%v",
+		res.RouteAttempted, res.Attempts, res.ServedBy, res.Succeeded, err)
 }

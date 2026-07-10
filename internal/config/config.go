@@ -30,6 +30,11 @@ type Config struct {
 	FrontierModel string // "gpt-4o"
 	FrontierKey   string // required for actual frontier traffic; may be empty in dev
 
+	// Z.ai fallback (optional second frontier endpoint for the local-route cascade)
+	ZAIURL   string // "https://api.z.ai/v1/chat/completions"
+	ZAIModel string // "glm-4.6"
+	ZAIKey   string // empty == skipped from cascade
+
 	// RAG
 	ExamplesDir  string  // "./few_shot_examples"
 	RAGThreshold float64 // cosine similarity cutoff for retrieval (0.55)
@@ -38,6 +43,7 @@ type Config struct {
 	TokenGuardrail int           // estimated tokens above this force frontier (6000)
 	SLMTimeout     time.Duration // Qwen3-Coder routing timeout (8s)
 	FusionTimeout  time.Duration // per-panel-member fetch timeout (120s)
+	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
 
 	// Middleware prompts
 	MetaPrompt string // appended to system prompt by prompt_engine
@@ -57,6 +63,9 @@ func Load() (Config, error) {
 		FrontierURL:    getEnv("NEXUS_FRONTIER_URL", "https://api.openai.com/v1/chat/completions"),
 		FrontierModel:  getEnv("NEXUS_FRONTIER_MODEL", "gpt-4o"),
 		FrontierKey:    getEnv("NEXUS_FRONTIER_API_KEY", ""),
+		ZAIURL:         getEnv("NEXUS_ZAI_URL", "https://api.z.ai/v1/chat/completions"),
+		ZAIModel:       getEnv("NEXUS_ZAI_MODEL", "glm-4.6"),
+		ZAIKey:         getEnv("NEXUS_ZAI_API_KEY", ""),
 		ExamplesDir:    getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
 		MetaPrompt:     defaultMetaPrompt,
 		TOONNotice:     defaultTOONNotice,
@@ -85,6 +94,12 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.FusionTimeout = fusionTimeout
+
+	cascadeTimeout, err := getEnvDuration("NEXUS_CASCADE_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.CascadeTimeout = cascadeTimeout
 
 	return cfg, nil
 }
