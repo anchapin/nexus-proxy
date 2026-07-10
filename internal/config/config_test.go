@@ -27,6 +27,19 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.SLMTimeout != 8*time.Second {
 		t.Errorf("SLMTimeout = %v, want 8s", cfg.SLMTimeout)
 	}
+	// Probe defaults (issue #6).
+	if cfg.ProbePollInterval != 60*time.Second {
+		t.Errorf("ProbePollInterval = %v, want 60s", cfg.ProbePollInterval)
+	}
+	if cfg.ProbeTimeout != 5*time.Second {
+		t.Errorf("ProbeTimeout = %v, want 5s", cfg.ProbeTimeout)
+	}
+	if cfg.ProbeBytesPerToken != 256*1024 {
+		t.Errorf("ProbeBytesPerToken = %d, want 262144", cfg.ProbeBytesPerToken)
+	}
+	if !cfg.ProbeEnabled {
+		t.Error("ProbeEnabled = false, want true with default interval")
+	}
 	if cfg.RAGThreshold != 0.55 {
 		t.Errorf("RAGThreshold = %v, want 0.55", cfg.RAGThreshold)
 	}
@@ -66,6 +79,9 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("NEXUS_ZAI_API_KEY", "zai-test")
 	t.Setenv("NEXUS_ZAI_MODEL", "glm-4.5")
 	t.Setenv("NEXUS_TELEMETRY_PATH", "")
+	t.Setenv("NEXUS_PROBE_INTERVAL", "120s")
+	t.Setenv("NEXUS_PROBE_TIMEOUT", "2s")
+	t.Setenv("NEXUS_PROBE_BYTES_PER_TOKEN", "131072")
 
 	cfg, err := Load()
 	if err != nil {
@@ -98,6 +114,15 @@ func TestLoadOverrides(t *testing.T) {
 	if cfg.TelemetryEnabled() {
 		t.Error("TelemetryEnabled = true with empty path, want false")
 	}
+	if cfg.ProbePollInterval != 120*time.Second {
+		t.Errorf("ProbePollInterval = %v, want 120s", cfg.ProbePollInterval)
+	}
+	if cfg.ProbeTimeout != 2*time.Second {
+		t.Errorf("ProbeTimeout = %v, want 2s", cfg.ProbeTimeout)
+	}
+	if cfg.ProbeBytesPerToken != 131072 {
+		t.Errorf("ProbeBytesPerToken = %d, want 131072", cfg.ProbeBytesPerToken)
+	}
 }
 
 func TestLoadTelemetryDisabledByEmptyPath(t *testing.T) {
@@ -122,6 +147,37 @@ func TestLoadTelemetryPathHonoursOverride(t *testing.T) {
 	}
 	if !cfg.TelemetryEnabled() {
 		t.Error("TelemetryEnabled = false, want true with explicit path")
+	}
+}
+
+func TestLoadProbeDisabledByZeroInterval(t *testing.T) {
+	t.Setenv("NEXUS_PROBE_INTERVAL", "0")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ProbeEnabled {
+		t.Error("ProbeEnabled = true, want false when NEXUS_PROBE_INTERVAL=0")
+	}
+}
+
+func TestLoadProbeInvalidValues(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+		val  string
+	}{
+		{"bad interval", "NEXUS_PROBE_INTERVAL", "forever"},
+		{"bad timeout", "NEXUS_PROBE_TIMEOUT", "ten seconds"},
+		{"bad bytes per token", "NEXUS_PROBE_BYTES_PER_TOKEN", "lots"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.key, tc.val)
+			if _, err := Load(); err == nil {
+				t.Errorf("expected error for %s=%s", tc.key, tc.val)
+			}
+		})
 	}
 }
 
