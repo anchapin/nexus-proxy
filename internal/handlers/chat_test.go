@@ -1097,8 +1097,7 @@ func TestChatEmitsSlogGuardrailVram(t *testing.T) {
 	largeUser := strings.Repeat("a", 30000)
 	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
 
-	var output string
-	output = captureSlog(t, func() {
+	output := captureSlog(t, func() {
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 		rw := httptest.NewRecorder()
 		Chat(deps).ServeHTTP(rw, req)
