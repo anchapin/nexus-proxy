@@ -1,0 +1,38 @@
+# Go build artifacts
+/harness_agnostic_go_router_proxy
+/harness_agnostic_go_router_proxy.exe
+/nexus
+/nexus.exe
+*.exe
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# Dependency dirs (only relevant once go.mod / go.sum exist)
+/vendor/
+
+# Local config & secrets (Phase 1 plans to add these)
+.env
+.env.local
+config.yaml
+config.local.yaml
+
+# User RAG content — auto-created at runtime, never source-controlled
+/few_shot_examples/
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
