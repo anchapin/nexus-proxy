@@ -20,9 +20,9 @@ type Config struct {
 	Addr string // ":8000"
 
 	// Local Ollama
-	OllamaURL     string // "http://localhost:11434"
-	RouterModel   string // "qwen3-coder:4b"
-	LocalModel    string // "qwen3-coder:8b"
+	OllamaURL      string // "http://localhost:11434"
+	RouterModel    string // "qwen3-coder:4b"
+	LocalModel     string // "qwen3-coder:8b"
 	EmbeddingModel string // "nomic-embed-text"
 
 	// Frontier API (OpenAI-compatible)
@@ -31,7 +31,7 @@ type Config struct {
 	FrontierKey   string // required for actual frontier traffic; may be empty in dev
 
 	// RAG
-	ExamplesDir string // "./few_shot_examples"
+	ExamplesDir  string  // "./few_shot_examples"
 	RAGThreshold float64 // cosine similarity cutoff for retrieval (0.55)
 
 	// Routing

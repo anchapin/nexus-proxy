@@ -62,9 +62,9 @@ func TestDSL(t *testing.T) {
 
 func TestToLowerASCII(t *testing.T) {
 	cases := map[string]string{
-		"":         "",
-		"abc":      "abc",
-		"ABC":      "abc",
+		"":          "",
+		"abc":       "abc",
+		"ABC":       "abc",
 		"Hello, 世界": "hello, 世界",
 		"  MIX  ":   "  mix  ",
 	}

@@ -13,7 +13,7 @@ import (
 type rtFunc func(*http.Request) (*http.Response, error)
 
 func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-func (f rtFunc) Do(r *http.Request) (*http.Response, error)       { return f(r) }
+func (f rtFunc) Do(r *http.Request) (*http.Response, error)        { return f(r) }
 
 // recordingRW captures writes + flushes for streaming tests.
 type recordingRW struct {
@@ -27,7 +27,7 @@ func newRW() *recordingRW {
 	return &recordingRW{header: http.Header{}, body: &strings.Builder{}}
 }
 
-func (r *recordingRW) Header() http.Header        { return r.header }
+func (r *recordingRW) Header() http.Header         { return r.header }
 func (r *recordingRW) Write(b []byte) (int, error) { return r.body.Write(b) }
 func (r *recordingRW) WriteHeader(s int)           { r.status = s }
 func (r *recordingRW) Flush()                      { r.flushes++ }
@@ -204,7 +204,7 @@ type nonFlushRW struct {
 	body   *strings.Builder
 }
 
-func (r *nonFlushRW) Header() http.Header        { return r.header }
+func (r *nonFlushRW) Header() http.Header         { return r.header }
 func (r *nonFlushRW) Write(b []byte) (int, error) { return r.body.Write(b) }
 func (r *nonFlushRW) WriteHeader(int)             {}
 
