@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 
 	"context"
@@ -313,5 +314,195 @@ func TestChatTOONCompressionAppliesNotice(t *testing.T) {
 	}
 }
 
+// recordingObserver is a JudgeObserver test double that just appends
+// every completion it sees to a slice. Safe for concurrent use.
+type recordingObserver struct {
+	mu   sync.Mutex
+	seen []LocalCompletion
+}
+
+func (r *recordingObserver) Submit(c LocalCompletion) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen = append(r.seen, c)
+}
+
+func (r *recordingObserver) Snapshot() []LocalCompletion {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]LocalCompletion, len(r.seen))
+	copy(out, r.seen)
+	return out
+}
+
+func TestChatLocalRouteInvokesObserverWithInstructionAndOutput(t *testing.T) {
+	deps, rt := baseDeps(t)
+	obs := &recordingObserver{}
+	deps.JudgeObserver = obs
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		// Cascade (issue #14) consumes a non-streaming JSON body and
+		// re-emits it as a single SSE chunk via writeSSEResponse.
+		_, _ = w.Write([]byte(`{"model":"qwen3-coder:8b","choices":[{"message":{"content":"hello world"}}]}`))
+	})
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	got := obs.Snapshot()
+	if len(got) != 1 {
+		t.Fatalf("observer saw %d events, want 1", len(got))
+	}
+	c := got[0]
+	if c.RequestID == "" {
+		t.Error("RequestID should be populated")
+	}
+	if !strings.Contains(c.Instruction, "please fix the css") {
+		t.Errorf("Instruction = %q", c.Instruction)
+	}
+	if !strings.Contains(c.Output, "hello world") {
+		t.Errorf("Output should contain streamed body, got %q", c.Output)
+	}
+	if c.LocalModel != "qwen3-coder:8b" {
+		t.Errorf("LocalModel = %q, want qwen3-coder:8b", c.LocalModel)
+	}
+	// The original stream body must still be visible to the client —
+	// the observer is a tee, not a sink.
+	if !strings.Contains(rw.Body.String(), "hello world") {
+		t.Errorf("client body should contain streamed content, got %q", rw.Body.String())
+	}
+}
+
+func TestChatLocalRouteObserverNilSkipsCapture(t *testing.T) {
+	// When no observer is configured we must NOT pay the
+	// capture-buffer cost. The streamed body is forwarded verbatim
+	// and the test should not observe any side effects beyond that.
+	deps, rt := baseDeps(t)
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		// Cascade consumer: non-streaming JSON; the cascade's
+		// writeSSEResponse re-emits the content as a single SSE chunk.
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"plain streamed body"}}]}`))
+	})
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if !strings.Contains(rw.Body.String(), "plain streamed body") {
+		t.Errorf("body = %q", rw.Body.String())
+	}
+}
+
+func TestChatNonLocalRouteDoesNotInvokeObserver(t *testing.T) {
+	// Fusion / Frontier routes must NOT fire the observer: the
+	// judge is explicitly scoped to local outputs.
+	deps, rt := baseDeps(t)
+	obs := &recordingObserver{}
+	deps.JudgeObserver = obs
+	rt.OnAny(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})
+	body := `{"messages":[{"role":"user","content":"design the system architecture"}]}` // fusion
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if got := len(obs.Snapshot()); got != 0 {
+		t.Errorf("observer saw %d events on fusion, want 0", got)
+	}
+
+	obs = &recordingObserver{}
+	deps.JudgeObserver = obs
+	body = `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 30000) + `"}]}` // guardrail -> frontier
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw = httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if got := len(obs.Snapshot()); got != 0 {
+		t.Errorf("observer saw %d events on frontier, want 0", got)
+	}
+}
+
+func TestChatObserverHonoursRequestIDHeader(t *testing.T) {
+	deps, rt := baseDeps(t)
+	obs := &recordingObserver{}
+	deps.JudgeObserver = obs
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		// Cascade consumer: non-streaming JSON.
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	})
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("X-Request-Id", "abc-123")
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	got := obs.Snapshot()
+	if len(got) != 1 {
+		t.Fatalf("got %d events", len(got))
+	}
+	if got[0].RequestID != "abc-123" {
+		t.Errorf("RequestID = %q, want abc-123", got[0].RequestID)
+	}
+}
+
+func TestCaptureWriterBoundsBuffer(t *testing.T) {
+	// Confirm that writes past the cap still reach the client but
+	// the internal buffer stops growing. This is what protects the
+	// proxy from a runaway local model OOMing the observer.
+	underlying := httptest.NewRecorder()
+	const cap = 16
+	cw := newCaptureWriter(underlying, cap)
+	cw.Header().Set("X-Test", "1")
+	cw.WriteHeader(200)
+	if _, err := cw.Write([]byte("0123456789")); err != nil {
+		t.Fatalf("first Write: %v", err)
+	}
+	// First write (10 bytes) fits inside the cap.
+	if got := cw.Buffer(); len(got) != 10 {
+		t.Errorf("after first Write, Buffer len = %d, want 10", len(got))
+	}
+	if _, err := cw.Write([]byte("ABCDEFGHIJ")); err != nil {
+		t.Fatalf("second Write: %v", err)
+	}
+	// Second write would push the buffer past the cap, so we stop
+	// buffering (but still forward to the client).
+	if got := cw.Buffer(); len(got) > cap {
+		t.Errorf("after second Write, Buffer len = %d, exceeds cap %d", len(got), cap)
+	}
+	if !strings.Contains(underlying.Body.String(), "0123456789ABCDEFGHIJ") {
+		t.Errorf("client body missing appended chunks: %q", underlying.Body.String())
+	}
+	// A further write must not grow the buffer at all.
+	if _, err := cw.Write([]byte("more bytes")); err != nil {
+		t.Fatalf("third Write: %v", err)
+	}
+	if got := cw.Buffer(); len(got) > cap {
+		t.Errorf("Buffer grew past cap: %d", len(got))
+	}
+}
+
+func TestCaptureWriterFlushes(t *testing.T) {
+	// upstream.Stream calls Flush after every chunk; the wrapper
+	// must propagate that so SSE framing reaches the client.
+	flushable := &flushableRW{ResponseWriter: httptest.NewRecorder()}
+	cw := newCaptureWriter(flushable, 64)
+	cw.Flush()
+	if flushable.flushCount != 1 {
+		t.Errorf("Flush did not propagate, count = %d", flushable.flushCount)
+	}
+}
+
+type flushableRW struct {
+	http.ResponseWriter
+	flushCount int
+}
+
+func (f *flushableRW) Flush() {
+	f.flushCount++
+	if r, ok := f.ResponseWriter.(http.Flusher); ok {
+		r.Flush()
+	}
+}
+
 // Suppress unused import in case of partial test runs.
-var _ = log.Println
+var (
+	_ = log.Println
+	_ = sync.Mutex{}
+)

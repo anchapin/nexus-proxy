@@ -17,16 +17,15 @@ codebase now follows standard Go layout.
 cmd/nexus/                 # main: wires config + handlers + starts HTTP
 internal/
   config/                  # env loading, defaults, validation
-  handlers/                # chat.go: HTTP entry point for /v1/chat/completions
-  middleware/              # toon.go, prompt_engine.go (prompt transforms)
+  handlers/                # chat.go: HTTP entry point
+  middleware/              # toon.go, prompt_engine.go
   router/                  # dsl.go, slm.go, guardrails
   upstream/                # stream.go, fusion.go (panel + arbiter)
   rag/                     # in-memory vector store + Ollama embedder
+  judge/                   # async LLM-as-a-judge evaluator (issue #15)
 few_shot_examples/         # (gitignored) user-curated snippets
 .env.example               # all env vars with safe defaults
 Makefile                   # build / test / lint / ci
-.github/workflows/ci.yml   # CI: vet, build, test -race, golangci-lint
-.golangci.yml              # lint config
 ```
 
 ## Build / run / test
@@ -119,7 +118,43 @@ In `internal/handlers/chat.go`:
   missing (`Store.IndexDir`). It's gitignored.
 - Tests use `httptest` + a `RecordingTransport` helper in
   `internal/upstream/recording.go` to record and replay HTTP calls.
-  All 73 tests run in <1s with `-race`.
+  All tests run in <2s with `-race`.
+
+## Async LLM-as-a-Judge (issue #15)
+
+`internal/judge` is the async quality evaluator. It samples ~10% of
+completed `RouteLocal` requests and asks a frontier endpoint for a
+1–5 score on the model's output. Tunables (all env vars):
+
+| Variable                    | Default                       | Purpose                                  |
+| --------------------------- | ----------------------------- | ---------------------------------------- |
+| `NEXUS_JUDGE_URL`           | z.ai, falls back to frontier  | Judge endpoint                           |
+| `NEXUS_JUDGE_MODEL`         | `NEXUS_FRONTIER_MODEL`        | Judge model name                         |
+| `NEXUS_JUDGE_API_KEY`       | `NEXUS_FRONTIER_API_KEY`      | Bearer token (may be empty in dev)       |
+| `NEXUS_JUDGE_SAMPLE_RATE`   | `0.1`                         | Fraction of completed local requests     |
+| `NEXUS_JUDGE_CONCURRENCY`   | `2`                           | Max simultaneous judge calls             |
+| `NEXUS_JUDGE_QUEUE`         | `64`                          | Buffered channel size; overflow drops    |
+| `NEXUS_JUDGE_TIMEOUT`       | `30s`                         | Per-call timeout                         |
+| `NEXUS_JUDGE_COST_PER_1K`   | `0.002`                       | USD per 1k tokens for cost estimates     |
+
+The judge is **always disabled when `NEXUS_JUDGE_SAMPLE_RATE <= 0`**,
+so a stock `.env.example` boots with the evaluator dormant. The chat
+hot path is unaffected when the judge is dormant.
+
+**Dependency rule.** `internal/handlers` and `internal/upstream` must
+never import `internal/judge`. The handler exposes a
+`JudgeObserver` hook (function-typed) on `handlers.Deps`, and
+`cmd/nexus/main.go` plugs in a closure that adapts to the judge's
+`Sample`/`Enqueue` entry points. This keeps the hot path lean and
+unit-testable without spinning up a worker pool.
+
+**Persistence.** `internal/judge` exposes a tiny `Storage` interface;
+today it is backed by an in-memory `MemoryStorage`. Issue #16
+(SQLite-backed telemetry) will provide a SQLite implementation that
+satisfies the same interface. The judge stores a structured
+`JudgeScore` record (request id, score 1–5, raw response, prompt/
+output token estimates, USD cost) so the future PR can persist it
+without changing the wire shape.
 
 ## Where to extend
 
@@ -132,6 +167,8 @@ For new behaviour, add tests first and follow the existing layout:
 | New routing rule                     | `internal/router`                |
 | Different upstream protocol          | `internal/upstream`              |
 | New HTTP endpoint                    | `internal/handlers`              |
+| Judge scoring / sampling logic       | `internal/judge`                 |
+| Judge persistence (SQLite, etc.)     | `internal/judge` (Storage impl)  |
 
 Existing functions map 1:1 to those packages. The handler is the only
 public entry point — keep middleware and router free of `net/http`

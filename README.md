@@ -30,6 +30,14 @@ complexity.
   2. SLM fallback (Qwen3-Coder-4B) for anything the DSL doesn't catch.
   3. Fusion panel — local and frontier run in parallel; a frontier
      arbiter synthesizes the final answer.
+- **Async LLM-as-a-Judge.** Samples ~10% of completed local-route
+  requests and asks a frontier endpoint for a 1–5 score on the
+  model's output. Bounded concurrency (default 2 simultaneous calls)
+  and a buffered drop-on-overflow queue so the judge can never stall
+  the chat hot path. Disabled by default; enable via
+  `NEXUS_JUDGE_SAMPLE_RATE > 0`. The judge output is a structured
+  `JudgeScore` record ready to be persisted by a future telemetry
+  layer.
 
 ## Quickstart
 
@@ -96,6 +104,7 @@ internal/
   router/                  # dsl.go, slm.go, guardrails
   upstream/                # stream.go, fusion.go (panel + arbiter)
   rag/                     # in-memory vector store + Ollama embedder
+  judge/                   # async LLM-as-a-judge evaluator
 few_shot_examples/         # (gitignored) user-curated snippets
 .env.example               # all env vars with safe defaults
 Makefile                   # build / test / lint / ci
@@ -138,6 +147,10 @@ defaults. The most useful ones:
 | `NEXUS_RAG_THRESHOLD`     | `0.55`                        | Cosine similarity floor for RAG injection |
 | `NEXUS_SLM_TIMEOUT`       | `8s`                          | Qwen3-Coder routing call timeout         |
 | `NEXUS_FUSION_TIMEOUT`    | `120s`                        | Per-panel-member timeout in fusion       |
+| `NEXUS_JUDGE_SAMPLE_RATE` | `0.1`                         | Fraction of local-route completions judged |
+| `NEXUS_JUDGE_CONCURRENCY` | `2`                           | Max simultaneous judge calls            |
+| `NEXUS_JUDGE_URL`         | z.ai (fallback frontier)      | Judge endpoint                          |
+| `NEXUS_JUDGE_API_KEY`     | `NEXUS_FRONTIER_API_KEY`      | Judge bearer token                      |
 
 ## Status
 
