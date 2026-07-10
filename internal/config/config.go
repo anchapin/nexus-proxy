@@ -48,6 +48,21 @@ type Config struct {
 	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
 	ArbiterTimeout time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
+	// Fusion progressive delivery (issue #48). When enabled and the
+	// harness requests a streaming response, the chat handler
+	// dispatches route=fusion to upstream.PanelStreaming instead of
+	// the legacy Panel. PanelStreaming races both panel members,
+	// streams the first to complete as a speculative OpenAI-
+	// compatible SSE chunk, then either terminates (agreement) or
+	// streams the arbiter's synthesis as additional chunks
+	// (disagreement). FusionAgreementThreshold is the Jaccard
+	// similarity cutoff above which the arbiter is skipped; the
+	// value is clamped into [0, 1] by upstream.PanelStreaming so a
+	// misconfigured operator can't disable the agreement-skip path
+	// entirely (negative) or always skip it (>1).
+	FusionProgressiveDelivery bool    // true iff NEXUS_FUSION_PROGRESSIVE is unset or "true" (default true)
+	FusionAgreementThreshold  float64 // Jaccard ratio [0,1] above which arbiter is skipped (default 0.85)
+
 	// Health (issue #8). The chat handler consults
 	// internal/health.Health before issuing local-bound requests;
 	// when Ollama is unreachable it short-circuits to frontier
@@ -205,6 +220,19 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.ArbiterTimeout = arbiterTimeout
+
+	// Fusion progressive delivery (issue #48). Defaults to ON so a
+	// stock `.env.example` boots into the new behaviour; operators
+	// who want to opt out (e.g. to A/B test against the old
+	// blocking Panel) set NEXUS_FUSION_PROGRESSIVE=false. An empty
+	// or unparseable value falls back to the default rather than
+	// failing boot, since the knob is purely an optimisation.
+	cfg.FusionProgressiveDelivery = parseBoolEnv("NEXUS_FUSION_PROGRESSIVE", true)
+	agreementThreshold, err := getEnvFloat("NEXUS_FUSION_AGREEMENT_THRESHOLD", 0.85)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.FusionAgreementThreshold = agreementThreshold
 
 	// Ollama health poller (issue #8). Defaults: 30s poll cadence,
 	// 3-failure breaker, 5s per-probe HTTP timeout. Set
@@ -451,6 +479,27 @@ func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("config: %s must be a duration (e.g. 8s, 2m): %w", key, err)
 	}
 	return d, nil
+}
+
+// parseBoolEnv maps a string env value to a bool with the supplied
+// default. Accepts the canonical spellings (true/false, 1/0, yes/no,
+// on/off) case-insensitively; an empty / unparseable value falls back
+// to def rather than failing boot. Used for the opt-in feature flag
+// NEXUS_FUSION_PROGRESSIVE (issue #48) where falling back to the
+// default is the safest failure mode.
+func parseBoolEnv(key string, def bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	default:
+		return def
+	}
 }
 
 // LogFormat is the wire format for the structured logger. JSON is the

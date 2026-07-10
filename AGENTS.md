@@ -86,6 +86,32 @@ Route constants are `router.RouteLocal`, `router.RouteFrontier`,
 | Otherwise                                                     | SLM decides |
 | SLM call fails, times out, or returns invalid JSON            | `frontier` (safe default) |
 
+## Fusion progressive delivery (issue #48)
+
+`route=fusion` no longer blocks until both panel members complete.
+`upstream.PanelStreaming` (in `internal/upstream/upstream.go`) races
+the local + frontier fetches, streams the first to complete as a
+speculative OpenAI-compatible SSE chunk tagged with `X-Nexus-Fusion-
+Progressive: true`, then either:
+
+- emits `data: [DONE]\n\n` when both members' Jaccard similarity is
+  `>= NEXUS_FUSION_AGREEMENT_THRESHOLD` (default 0.85) — arbiter
+  is **not** invoked; the user has already received the answer;
+- streams the arbiter's synthesis as additional SSE chunks after
+  the speculative one when the two members diverge (the "append"
+  disagreement mode).
+
+The legacy blocking `Panel` path remains for `stream=false`
+harness requests and for operators who opt out via
+`NEXUS_FUSION_PROGRESSIVE=false`. Both paths share the same
+arbiter timeout (`NEXUS_ARBITER_TIMEOUT`) and the same per-fetch
+timeout (`NEXUS_FUSION_TIMEOUT`); the only difference is whether
+the user sees bytes before the arbiter runs.
+
+`fusion_arbiter_skipped` is exposed on the telemetry record (and
+the SQLite metrics row) so the dashboard can report the fraction
+of fusion traffic that achieved agreement.
+
 ## TOON compression gotchas
 
 `middleware.SerializeToTOON` rewrites JSON arrays into a CSV-like TOON
@@ -174,6 +200,7 @@ For new behaviour, add tests first and follow the existing layout:
 | New routing rule                     | `internal/router`                |
 | Different upstream protocol          | `internal/upstream`              |
 | New HTTP endpoint                    | `internal/handlers`              |
+| Fusion agreement / progressive logic | `internal/upstream` (PanelStreaming) |
 | Judge scoring / sampling logic       | `internal/judge`                 |
 | Judge persistence (SQLite, etc.)     | `internal/judge` (Storage impl)  |
 | New metric field or storage backend  | `internal/telemetry`             |

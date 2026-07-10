@@ -39,18 +39,26 @@ const writeBufferSize = 16 << 10
 // Record is the row written for every proxied request. Times are stored in
 // milliseconds; TTFTMs is 0 for non-streaming responses (TTFT is undefined
 // when the harness requested a single buffered reply).
+//
+// FusionArbiterSkipped (issue #48) is true only for route=fusion
+// requests that streamed the speculative panel-member answer and
+// terminated without invoking the arbiter. False in every other
+// case — including the legacy (non-progressive) Panel path, where
+// the arbiter is always invoked. The dashboard joins on this flag
+// to report "fraction of fusion traffic that achieved agreement".
 type Record struct {
-	Timestamp      time.Time `json:"timestamp"`
-	RequestID      string    `json:"request_id"`
-	Model          string    `json:"model"`
-	Route          string    `json:"route"`
-	InputTokens    int       `json:"input_tokens"`
-	OutputTokens   int       `json:"output_tokens"`
-	TTFTMs         int64     `json:"ttft_ms"`
-	TotalLatencyMs int64     `json:"total_latency_ms"`
-	TPS            float64   `json:"tps"`
-	Streaming      bool      `json:"streaming"`
-	Error          string    `json:"error,omitempty"`
+	Timestamp            time.Time `json:"timestamp"`
+	RequestID            string    `json:"request_id"`
+	Model                string    `json:"model"`
+	Route                string    `json:"route"`
+	InputTokens          int       `json:"input_tokens"`
+	OutputTokens         int       `json:"output_tokens"`
+	TTFTMs               int64     `json:"ttft_ms"`
+	TotalLatencyMs       int64     `json:"total_latency_ms"`
+	TPS                  float64   `json:"tps"`
+	Streaming            bool      `json:"streaming"`
+	FusionArbiterSkipped bool      `json:"fusion_arbiter_skipped,omitempty"`
+	Error                string    `json:"error,omitempty"`
 }
 
 // EstimateTokens returns the cheap "4 chars per token" heuristic used

@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS requests (
     total_latency_ms INTEGER NOT NULL DEFAULT 0,
     tps REAL NOT NULL DEFAULT 0,
     streaming INTEGER NOT NULL DEFAULT 1,
+    fusion_arbiter_skipped INTEGER NOT NULL DEFAULT 0,
     error TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
@@ -58,8 +59,8 @@ const insertSQL = `INSERT INTO requests
     (timestamp, request_id, route, model,
      input_tokens, output_tokens, toon_savings_tokens,
      rag_injected, rag_filename, estimated_cost_usd,
-     ttft_ms, total_latency_ms, tps, streaming, error)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     ttft_ms, total_latency_ms, tps, streaming, fusion_arbiter_skipped, error)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // SQLiteStore is the production Store implementation (issue #4).
 // Writes are funnelled through a buffered channel and a single
@@ -214,11 +215,16 @@ func (s *SQLiteStore) writeOne(req Request) {
 	if req.Streaming {
 		streaming = 1
 	}
+	fusionArbiterSkipped := 0
+	if req.FusionArbiterSkipped {
+		fusionArbiterSkipped = 1
+	}
 	_, err := s.db.ExecContext(ctx, insertSQL,
 		ts.UTC(), req.RequestID, route, model,
 		req.InputTokens, req.OutputTokens, req.TOONSavingsTokens,
 		ragInjected, req.RAGFilename, req.EstimatedCostUSD,
-		req.TTFTMs, req.TotalLatencyMs, req.TPS, streaming, req.Error,
+		req.TTFTMs, req.TotalLatencyMs, req.TPS, streaming,
+		fusionArbiterSkipped, req.Error,
 	)
 	if err != nil {
 		s.logger("ERROR: insert request_id=%s: %v", req.RequestID, err)
@@ -308,17 +314,18 @@ func (s *SQLiteStore) Close() error {
 // not returned (the handler has long since left).
 func (s *SQLiteStore) Record(r telemetry.Record) {
 	_ = s.RecordRequest(Request{
-		Timestamp:      r.Timestamp,
-		RequestID:      r.RequestID,
-		Route:          r.Route,
-		Model:          r.Model,
-		InputTokens:    r.InputTokens,
-		OutputTokens:   r.OutputTokens,
-		TTFTMs:         r.TTFTMs,
-		TotalLatencyMs: r.TotalLatencyMs,
-		TPS:            r.TPS,
-		Streaming:      r.Streaming,
-		Error:          r.Error,
+		Timestamp:            r.Timestamp,
+		RequestID:            r.RequestID,
+		Route:                r.Route,
+		Model:                r.Model,
+		InputTokens:          r.InputTokens,
+		OutputTokens:         r.OutputTokens,
+		TTFTMs:               r.TTFTMs,
+		TotalLatencyMs:       r.TotalLatencyMs,
+		TPS:                  r.TPS,
+		Streaming:            r.Streaming,
+		FusionArbiterSkipped: r.FusionArbiterSkipped,
+		Error:                r.Error,
 		// TOONSavingsTokens / RAGInjected / RAGFilename /
 		// EstimatedCostUSD default zero — populated by callers
 		// that explicitly use RecordRequest.

@@ -93,6 +93,12 @@ func (f QualityObserverFunc) Submit(e QualityEvent) { f(e) }
 // Mirrors internal/metrics.Request so a tiny adapter in main.go can
 // forward directly without translation — kept here as a separate
 // type so the handlers package stays free of the metrics import.
+//
+// FusionArbiterSkipped (issue #48) is true only for route=fusion
+// requests that streamed the speculative panel-member answer and
+// terminated without invoking the arbiter (panel agreement, or one
+// member failed). False in every other case so the dashboard can
+// report the "fusion agreement rate" as a single ratio.
 type MetricsEvent struct {
 	Timestamp         time.Time
 	RequestID         string
@@ -104,12 +110,13 @@ type MetricsEvent struct {
 	RAGFilename       string
 	EstimatedCostUSD  float64
 
-	OutputTokens   int
-	TTFTMs         int64
-	TotalLatencyMs int64
-	TPS            float64
-	Streaming      bool
-	Error          string
+	OutputTokens         int
+	TTFTMs               int64
+	TotalLatencyMs       int64
+	TPS                  float64
+	Streaming            bool
+	FusionArbiterSkipped bool
+	Error                string
 }
 
 // MetricsObserver is the hook the chat handler invokes once per
@@ -451,18 +458,50 @@ func Chat(d Deps) http.Handler {
 
 		var model string
 		var upErr error
+		var fusionArbiterSkipped bool
 		switch route {
 		case router.RouteFusion:
 			slog.Info("starting fusion panel", slog.String("request_id", reqID))
-			upErr = upstream.Panel(
-				obs, d.Client,
-				d.Config.OllamaURL, d.Config.LocalModel,
-				d.Config.FrontierURL, d.Config.FrontierModel,
-				d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
-				body, latestPrompt, d.Config.FusionTimeout,
-				d.Config.ArbiterTimeout,
-				skipLocal,
-			)
+			// Issue #48: progressive delivery. When the operator
+			// has not opted out and the harness asked for SSE
+			// (streaming=true), dispatch to PanelStreaming instead
+			// of the legacy Panel. The streaming path races the
+			// two panel members, streams the first to complete as
+			// a speculative OpenAI-compatible SSE chunk, and only
+			// invokes the arbiter when the second member
+			// disagrees. The legacy Panel path remains unchanged
+			// for stream=false / NEXUS_FUSION_PROGRESSIVE=false.
+			if streaming && d.Config.FusionProgressiveDelivery {
+				var outcome upstream.PanelOutcome
+				outcome, upErr = upstream.PanelStreaming(
+					obs, d.Client,
+					d.Config.OllamaURL, d.Config.LocalModel,
+					d.Config.FrontierURL, d.Config.FrontierModel,
+					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
+					body, latestPrompt, d.Config.FusionTimeout,
+					d.Config.ArbiterTimeout,
+					skipLocal,
+					d.Config.FusionAgreementThreshold,
+				)
+				fusionArbiterSkipped = outcome.ArbiterSkipped
+				if outcome.ArbiterSkipped {
+					slog.Info("fusion arbiter skipped",
+						slog.String("source", outcome.Source),
+						slog.Float64("similarity", outcome.Similarity),
+						slog.String("request_id", reqID),
+					)
+				}
+			} else {
+				upErr = upstream.Panel(
+					obs, d.Client,
+					d.Config.OllamaURL, d.Config.LocalModel,
+					d.Config.FrontierURL, d.Config.FrontierModel,
+					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
+					body, latestPrompt, d.Config.FusionTimeout,
+					d.Config.ArbiterTimeout,
+					skipLocal,
+				)
+			}
 			if upErr != nil {
 				slog.Error("fusion error",
 					slog.Any("err", upErr),
@@ -634,28 +673,29 @@ func Chat(d Deps) http.Handler {
 			}
 		}
 		outputTokens := int(obs.BytesOut() / 4)
-		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr)
+		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr, fusionArbiterSkipped)
 		if d.MetricsObserver != nil {
 			postCompressionChars := totalMessageChars(messages)
 			savings := totalTokenSavings(preCompressionChars, postCompressionChars)
 			cost := frontierCostEstimate(string(route), model, telemetry.EstimateTokens(latestPrompt), d.Config.JudgeCostPer1KUSD)
 			tps := telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 			d.MetricsObserver.Submit(MetricsEvent{
-				Timestamp:         rec.Timestamp,
-				RequestID:         reqID,
-				Route:             string(route),
-				Model:             model,
-				InputTokens:       rec.InputTokens,
-				TOONSavingsTokens: savings,
-				RAGInjected:       ragInjected,
-				RAGFilename:       ragFilename,
-				EstimatedCostUSD:  cost,
-				OutputTokens:      outputTokens,
-				TTFTMs:            ttftMs,
-				TotalLatencyMs:    totalMs,
-				TPS:               tps,
-				Streaming:         streaming,
-				Error:             rec.Error,
+				Timestamp:            rec.Timestamp,
+				RequestID:            reqID,
+				Route:                string(route),
+				Model:                model,
+				InputTokens:          rec.InputTokens,
+				TOONSavingsTokens:    savings,
+				RAGInjected:          ragInjected,
+				RAGFilename:          ragFilename,
+				EstimatedCostUSD:     cost,
+				OutputTokens:         outputTokens,
+				TTFTMs:               ttftMs,
+				TotalLatencyMs:       totalMs,
+				TPS:                  tps,
+				Streaming:            streaming,
+				FusionArbiterSkipped: fusionArbiterSkipped,
+				Error:                rec.Error,
 			})
 		} else {
 			d.Recorder.Record(rec)
@@ -907,6 +947,7 @@ func buildRecord(
 	route router.Route,
 	model, latestPrompt string,
 	upErr error,
+	fusionArbiterSkipped bool,
 ) telemetry.Record {
 	totalMs := time.Since(started).Milliseconds()
 	var ttftMs int64
@@ -918,15 +959,16 @@ func buildRecord(
 	}
 	outputTokens := int(bytesOut / 4)
 	rec := telemetry.Record{
-		Timestamp:      time.Now().UTC(),
-		RequestID:      requestID,
-		Model:          model,
-		Route:          string(route),
-		InputTokens:    telemetry.EstimateTokens(latestPrompt),
-		OutputTokens:   outputTokens,
-		TTFTMs:         ttftMs,
-		TotalLatencyMs: totalMs,
-		Streaming:      streaming,
+		Timestamp:            time.Now().UTC(),
+		RequestID:            requestID,
+		Model:                model,
+		Route:                string(route),
+		InputTokens:          telemetry.EstimateTokens(latestPrompt),
+		OutputTokens:         outputTokens,
+		TTFTMs:               ttftMs,
+		TotalLatencyMs:       totalMs,
+		Streaming:            streaming,
+		FusionArbiterSkipped: fusionArbiterSkipped,
 	}
 	rec.TPS = telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 	if upErr != nil {

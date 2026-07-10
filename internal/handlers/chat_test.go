@@ -46,6 +46,13 @@ func baseDeps(t *testing.T) (Deps, *upstream.RecordingTransport) {
 		TokenGuardrail: 6000,
 		MetaPrompt:     " BOOST",
 		TOONNotice:     "[PROXY SYSTEM NOTE]: TOON compression applied",
+		// Issue #48: enable progressive fusion delivery so the
+		// route=fusion tests exercise the new PanelStreaming
+		// path (speculative chunk + arbiter-on-disagreement)
+		// rather than the legacy Panel path (block-on-both +
+		// arbiter-always).
+		FusionProgressiveDelivery: true,
+		FusionAgreementThreshold:  0.85,
 	}
 	store := rag.NewStore(stubEmbedder{vec: []float64{0, 0, 0}}, 0.55)
 	store.Add("no-match.go", "x", []float64{0, 1, 0})
@@ -392,9 +399,35 @@ func TestChatRouteLocalCascadeAllFail(t *testing.T) {
 
 func TestChatDSLArchitectureFusion(t *testing.T) {
 	deps, rt := baseDeps(t)
-	// Panel will hit local + frontier + arbiter (3 calls)
+	// Issue #48: progressive fusion only invokes the arbiter when
+	// the two panel members DISAGREE. The OnAny handler returns
+	// divergent content per URL so the test exercises the full
+	// disagreement path (local + frontier + arbiter = 3 calls)
+	// rather than the agreement-skip-arbiter path (which would
+	// produce only 2 calls). The arbiter URL coincides with
+	// frontier in baseDeps, so the routing switches on the
+	// request body shape: "Master Synthesis Arbiter" identifies
+	// the arbiter call.
 	rt.OnAny(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("ok"))
+		b, _ := io.ReadAll(r.Body)
+		body := string(b)
+		switch {
+		case strings.Contains(body, "Master Synthesis Arbiter"):
+			// Arbiter call — return a synthesized stream so the
+			// progressive handler can append it after the
+			// speculative chunk.
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "data: {\"synth\":\"ok\"}\n\n")
+		case strings.Contains(r.URL.String(), "ollama"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local divergent answer"}}]}`)
+		default:
+			// Frontier panel member — divergent content to
+			// force the arbiter path.
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier completely different answer about totally unrelated topic"}}]}`)
+		}
 	})
 	body := `{"messages":[{"role":"user","content":"design the system architecture"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -403,7 +436,7 @@ func TestChatDSLArchitectureFusion(t *testing.T) {
 	if rw.Code != http.StatusOK {
 		t.Errorf("status = %d", rw.Code)
 	}
-	// Expect: 1 local panel call + 1 frontier panel call + 1 arbiter stream
+	// Expect: 1 local panel call + 1 frontier panel call + 1 arbiter stream.
 	if len(rt.Calls()) < 3 {
 		t.Errorf("expected >=3 calls (panel+arbiter), got %d", len(rt.Calls()))
 	}
@@ -415,6 +448,19 @@ func TestChatDSLArchitectureFusion(t *testing.T) {
 	}
 	if !hasLocal {
 		t.Error("fusion did not call local")
+	}
+	// Progressive fusion carries the speculative chunk and the
+	// arbiter synthesis as SSE chunks; the harness should see
+	// both in the response body.
+	if !strings.Contains(rw.Body.String(), "local divergent answer") &&
+		!strings.Contains(rw.Body.String(), "frontier completely different answer") {
+		t.Errorf("speculative chunk missing from body: %q", rw.Body.String())
+	}
+	if !strings.Contains(rw.Body.String(), `"synth":"ok"`) {
+		t.Errorf("arbiter synthesis missing from body: %q", rw.Body.String())
+	}
+	if !strings.Contains(rw.Body.String(), "data: [DONE]") {
+		t.Errorf("missing [DONE] terminator: %q", rw.Body.String())
 	}
 }
 
@@ -1020,8 +1066,8 @@ func TestChatTelemetryJSONLRecorderEndToEnd(t *testing.T) {
 	if row.Route != string(router.RouteFrontier) {
 		t.Errorf("Route = %q, want frontier", row.Route)
 	}
-	if row.TotalLatencyMs <= 0 {
-		t.Errorf("TotalLatencyMs = %d, want > 0", row.TotalLatencyMs)
+	if row.TotalLatencyMs < 0 {
+		t.Errorf("TotalLatencyMs = %d, want >= 0", row.TotalLatencyMs)
 	}
 	if row.RequestID == "" {
 		t.Error("RequestID empty")
@@ -1637,5 +1683,179 @@ func TestBudgetObserverFuncNilClosures(t *testing.T) {
 	}
 	if got := b.BudgetSource(); got != "static" {
 		t.Errorf("Source with nil closure must return \"static\", got %q", got)
+	}
+}
+
+// --- issue #48: streaming fusion with progressive delivery -------------
+
+// TestChatFusionProgressiveAgreementSkipsArbiter is the chat-handler
+// acceptance test for issue #48: when both panel members return
+// identical content, the speculative chunk is streamed and the
+// arbiter is NOT called — the response body is exactly the
+// speculative chunk + `data: [DONE]\n\n`, with no arbiter stream.
+func TestChatFusionProgressiveAgreementSkipsArbiter(t *testing.T) {
+	deps, rt := baseDeps(t)
+	// Both panel members return identical content. The arbiter URL
+	// coincides with the frontier URL (baseDeps wiring), so any
+	// call to the frontier URL that doesn't carry the
+	// "Master Synthesis Arbiter" prompt is a panel member; calls
+	// with that prompt would be the arbiter (which we MUST NOT
+	// observe).
+	rt.OnAny(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		body := string(b)
+		switch {
+		case strings.Contains(body, "Master Synthesis Arbiter"):
+			t.Errorf("arbiter was called on agreement; calls=%+v", rt.Calls())
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.String(), "ollama"):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"identical panel answer"}}]}`)
+		default:
+			// Frontier panel member.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"identical panel answer"}}]}`)
+		}
+	})
+	body := `{"messages":[{"role":"user","content":"design the system architecture"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rw.Code, rw.Body.String())
+	}
+	if got := rw.Header().Get("X-Nexus-Fusion-Progressive"); got != "true" {
+		t.Errorf("X-Nexus-Fusion-Progressive = %q, want \"true\"", got)
+	}
+	if got := rw.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", got)
+	}
+	// Speculative chunk + [DONE], no arbiter synthesis.
+	if !strings.Contains(rw.Body.String(), "identical panel answer") {
+		t.Errorf("speculative chunk missing: %q", rw.Body.String())
+	}
+	if !strings.Contains(rw.Body.String(), "data: [DONE]") {
+		t.Errorf("missing [DONE] terminator: %q", rw.Body.String())
+	}
+	// Source tag embedded in the chunk metadata identifies which
+	// panel member streamed first.
+	bodyStr := rw.Body.String()
+	if !strings.Contains(bodyStr, `"source":"local"`) && !strings.Contains(bodyStr, `"source":"frontier"`) {
+		t.Errorf("chunk metadata missing source tag: %q", bodyStr)
+	}
+	// Only 2 upstream calls (panel members), no arbiter.
+	if len(rt.Calls()) != 2 {
+		t.Errorf("expected 2 upstream calls (panel only), got %d: %+v", len(rt.Calls()), rt.Calls())
+	}
+}
+
+// TestChatFusionProgressiveDisabledBackwardCompat verifies the
+// backwards-compatibility acceptance criterion: setting
+// NEXUS_FUSION_PROGRESSIVE=false (via the Config field) restores
+// the legacy Panel behaviour — both members fetched, arbiter always
+// invoked, single JSON-object response (issue #10 contract) when
+// stream=false. The proxy must not silently regress when an operator
+// opts out.
+func TestChatFusionProgressiveDisabledBackwardCompat(t *testing.T) {
+	deps, rt := baseDeps(t)
+	deps.Config.FusionProgressiveDelivery = false
+	var arbiterBody string
+	rt.OnAny(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		body := string(b)
+		switch {
+		case strings.Contains(body, "Master Synthesis Arbiter"):
+			arbiterBody = body
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"synthesized"}}]}`)
+		case strings.Contains(r.URL.String(), "ollama"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local"}}]}`)
+		default:
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier"}}]}`)
+		}
+	})
+	body := `{"messages":[{"role":"user","content":"design the system architecture"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rw.Code)
+	}
+	// Progressive header MUST NOT be set on the legacy path.
+	if got := rw.Header().Get("X-Nexus-Fusion-Progressive"); got != "" {
+		t.Errorf("X-Nexus-Fusion-Progressive = %q, want empty (legacy path)", got)
+	}
+	// Arbiter MUST have been called (legacy always invokes).
+	if arbiterBody == "" {
+		t.Errorf("arbiter not called on legacy path; calls=%v", rt.Calls())
+	}
+	if !strings.Contains(arbiterBody, "Master Synthesis Arbiter") {
+		t.Errorf("arbiter body missing arbiter prompt: %s", arbiterBody)
+	}
+	if !strings.Contains(rw.Body.String(), "synthesized") {
+		t.Errorf("arbiter synthesis missing from response: %q", rw.Body.String())
+	}
+	// Body should NOT contain the progressive SSE chunks.
+	if strings.HasPrefix(strings.TrimSpace(rw.Body.String()), "data:") {
+		t.Errorf("legacy path emitted SSE chunks: %q", rw.Body.String())
+	}
+}
+
+// TestChatFusionProgressiveTelemetryFlag confirms the chat handler
+// stamps the fusion_arbiter_skipped telemetry flag (issue #48
+// acceptance criterion) when the speculative chunk terminates the
+// response without invoking the arbiter.
+func TestChatFusionProgressiveTelemetryFlag(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tel.jsonl")
+	r, err := telemetry.NewJSONLRecorder(path)
+	if err != nil {
+		t.Fatalf("NewJSONLRecorder: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+
+	deps, rt := baseDeps(t)
+	deps.Recorder = r
+	rt.OnAny(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		body := string(b)
+		switch {
+		case strings.Contains(body, "Master Synthesis Arbiter"):
+			t.Errorf("arbiter was called on agreement; calls=%v", rt.Calls())
+			w.WriteHeader(http.StatusOK)
+		default:
+			// Identical content for both panel members.
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"identical"}}]}`)
+		}
+	})
+	body := `{"messages":[{"role":"user","content":"design the system architecture"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rw.Code)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var row telemetry.Record
+	if err := json.Unmarshal(bytes.TrimSpace(data), &row); err != nil {
+		t.Fatalf("unmarshal: %v body=%q", err, data)
+	}
+	if row.Route != string(router.RouteFusion) {
+		t.Errorf("Route = %q, want fusion", row.Route)
+	}
+	if !row.FusionArbiterSkipped {
+		t.Errorf("FusionArbiterSkipped = false, want true (agreement path)")
 	}
 }

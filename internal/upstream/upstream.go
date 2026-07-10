@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 )
@@ -350,4 +351,266 @@ func withDefault(d time.Duration) time.Duration {
 		return 120 * time.Second
 	}
 	return d
+}
+
+// PanelOutcome describes the runtime path PanelStreaming took. The chat
+// handler reads it to record telemetry (issue #48 acceptance: the
+// dashboard must be able to report what fraction of fusion requests
+// achieved agreement and skipped the arbiter).
+type PanelOutcome struct {
+	// ArbiterSkipped is true when the two panel members agreed
+	// (SimilarityRatio >= agreementThreshold) OR when only one
+	// member returned content (the other errored, or skipLocal
+	// ran the frontier-only path). In both cases the speculative
+	// answer was streamed to the user without invoking the arbiter.
+	ArbiterSkipped bool
+	// Source identifies the panel member that streamed first:
+	// "local", "frontier", or "" when no member returned content.
+	// "frontier" in the skipLocal degraded path (issue #8).
+	Source string
+	// Similarity is the Jaccard ratio between the two panel
+	// members' contents. 0 when fewer than two members returned
+	// content.
+	Similarity float64
+}
+
+// PanelStreaming runs the fusion panel with progressive delivery
+// (issue #48). It launches both panel members in parallel — identical
+// to Panel — but the first member to return is streamed to the user
+// immediately as a speculative OpenAI-compatible SSE chunk tagged with
+// the source name in the chunk metadata. The second member then
+// arrives:
+//
+//   - Agreement (SimilarityRatio >= agreementThreshold): the response
+//     terminates with `data: [DONE]\n\n`. The arbiter is NOT invoked.
+//     The user sees the faster member's output and the proxy pays no
+//     arbiter cost.
+//   - Disagreement: the arbiter runs as today and its synthesis is
+//     streamed as ADDITIONAL SSE chunks after the speculative one,
+//     then `data: [DONE]\n\n`. This is the "append" disagreement mode
+//     documented in the issue; "replace" / "diff" modes are out of
+//     scope for this change and would require a separate spec.
+//   - One member errored (or skipLocal is true): the successful
+//     member's content is streamed and the response terminates. No
+//     arbiter is invoked — the speculative answer IS the answer.
+//
+// For non-streaming harness requests (body["stream"] == false) the
+// call is delegated to Panel so the existing single
+// chatCompletionResponse JSON-object shape is preserved (issue #10).
+//
+// agreementThreshold is in [0,1]; values < 0 are clamped to 0 (every
+// disagreement runs the arbiter) and values > 1 are clamped to 1
+// (the arbiter is always skipped when both members succeed).
+func PanelStreaming(
+	w http.ResponseWriter,
+	client Client,
+	localBaseURL, localModel, frontierURL, frontierModel string,
+	arbiterURL, arbiterKey, arbiterModel string,
+	body map[string]interface{},
+	latestPrompt string,
+	perFetchTimeout time.Duration,
+	arbiterTimeout time.Duration,
+	skipLocal bool,
+	agreementThreshold float64,
+) (PanelOutcome, error) {
+	var outcome PanelOutcome
+
+	// Non-streaming fallback. The handler should already have routed
+	// stream=false to Panel directly, but we double-check here so the
+	// contract is enforced at the function boundary: a caller that
+	// hands PanelStreaming a stream=false body gets the existing
+	// JSON-object response shape (issue #10).
+	if s, ok := body["stream"].(bool); ok && !s {
+		if err := Panel(w, client,
+			localBaseURL, localModel, frontierURL, frontierModel,
+			arbiterURL, arbiterKey, arbiterModel,
+			body, latestPrompt, perFetchTimeout, arbiterTimeout,
+			skipLocal); err != nil {
+			return outcome, err
+		}
+		return outcome, nil
+	}
+
+	// Clamp the threshold into [0, 1] so a misconfigured operator
+	// can't accidentally disable the agreement-skip path entirely
+	// (negative) or always skip it regardless of similarity (>1).
+	if agreementThreshold < 0 {
+		agreementThreshold = 0
+	} else if agreementThreshold > 1 {
+		agreementThreshold = 1
+	}
+
+	// SSE response headers must be set before the first Write. We
+	// commit them now so the speculative chunk goes out with the
+	// correct Content-Type regardless of which member wins.
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Nexus-Fusion-Progressive", "true")
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	results := make(chan PanelResult, 2)
+	if skipLocal {
+		// Issue #8: synthetic local failure so the arbiter-style
+		// code paths below degrade cleanly. The handler sets
+		// X-Nexus-Degraded=true; we don't duplicate the header here.
+		results <- PanelResult{
+			Source: "local",
+			Err:    errors.New("ollama unavailable (degraded)"),
+		}
+	} else {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
+			defer cancel()
+			c, err := FetchPanel(ctx, client,
+				localBaseURL+"/v1/chat/completions", "", localModel, body)
+			results <- PanelResult{Source: "local", Content: c, Err: err}
+		}()
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
+		defer cancel()
+		c, err := FetchPanel(ctx, client,
+			frontierURL, "", frontierModel, body)
+		results <- PanelResult{Source: "frontier", Content: c, Err: err}
+	}()
+	first := <-results
+	second := <-results
+
+	// Both members errored — there's nothing speculative to deliver.
+	// Surface the upstream errors so the handler renders a 502 with
+	// context. The legacy Panel path tolerates one failed member by
+	// passing the error through to the arbiter; in progressive mode
+	// the only sensible fallback is to fail the request.
+	if first.Err != nil && second.Err != nil {
+		return outcome, fmt.Errorf("fusion: both members failed: local=%v; frontier=%v",
+			first.Err, second.Err)
+	}
+
+	// Pick the member that produced content. If one errored the other
+	// wins outright; if both succeeded, the "first to arrive" stays
+	// as the speculative source and we compare against the other.
+	winner := first
+	if first.Err != nil {
+		winner = second
+	}
+	outcome.Source = winner.Source
+
+	if err := streamPanelResultAsSSE(w, winner); err != nil {
+		return outcome, fmt.Errorf("fusion: stream speculative: %w", err)
+	}
+
+	// One-member case (the other errored, or skipLocal ran frontier
+	// alone). The speculative answer IS the answer; no arbiter.
+	if first.Err != nil || second.Err != nil {
+		outcome.ArbiterSkipped = true
+		if err := writeSSEDone(w); err != nil {
+			return outcome, err
+		}
+		return outcome, nil
+	}
+
+	// Both members succeeded: compare and decide on the arbiter.
+	outcome.Similarity = SimilarityRatio(first.Content, second.Content)
+	if outcome.Similarity >= agreementThreshold {
+		outcome.ArbiterSkipped = true
+		slog.Info("fusion agreement, arbiter skipped",
+			slog.String("source", outcome.Source),
+			slog.Float64("similarity", outcome.Similarity),
+			slog.Float64("threshold", agreementThreshold),
+		)
+		if err := writeSSEDone(w); err != nil {
+			return outcome, err
+		}
+		return outcome, nil
+	}
+
+	// Disagreement — run the arbiter and stream its synthesis as
+	// additional SSE chunks after the speculative one. This is the
+	// "append" mode documented in the issue; OpenAI-compatible
+	// clients concatenate delta.content across chunks, so the
+	// harness sees `speculative_text + arbiter_text`. The arbiter
+	// text is the authoritative final answer in the operator's
+	// mental model.
+	slog.Info("fusion disagreement, invoking arbiter",
+		slog.String("first_source", outcome.Source),
+		slog.Float64("similarity", outcome.Similarity),
+		slog.Float64("threshold", agreementThreshold),
+	)
+	synth := SynthesisPrompt(latestPrompt, first, second)
+	synthBody := map[string]interface{}{
+		"model": arbiterModel,
+		"messages": []map[string]string{
+			{"role": "system", "content": "You are a master synthesis AI. Deliver only the final synthesized response. Do not mention that you are an arbiter."},
+			{"role": "user", "content": synth},
+		},
+		"stream": true,
+	}
+	arbiterCtx, cancelArbiter := context.WithTimeout(context.Background(), withDefaultArbiterTimeout(arbiterTimeout))
+	defer cancelArbiter()
+	if err := StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody); err != nil {
+		return outcome, fmt.Errorf("fusion: arbiter stream: %w", err)
+	}
+	if err := writeSSEDone(w); err != nil {
+		return outcome, err
+	}
+	return outcome, nil
+}
+
+// streamPanelResultAsSSE writes a single OpenAI-compatible SSE chunk
+// that carries the panel member's content as a delta. The chunk
+// embeds the source ("local" / "frontier") in a "nexus" metadata
+// field so the harness / log scraper can identify which model was
+// streamed speculatively. Err-flagged results are silently skipped —
+// the caller is responsible for picking a winner before invoking.
+//
+// Headers must already be committed (WriteHeader called) when this
+// runs, so the chunk lands with the response Content-Type the caller
+// set.
+func streamPanelResultAsSSE(w http.ResponseWriter, r PanelResult) error {
+	if r.Err != nil {
+		return nil
+	}
+	chunk := map[string]interface{}{
+		"object": "chat.completion.chunk",
+		"nexus":  map[string]string{"source": r.Source},
+		"choices": []map[string]interface{}{
+			{"index": 0, "delta": map[string]interface{}{"content": r.Content}},
+		},
+	}
+	b, err := json.Marshal(chunk)
+	if err != nil {
+		return fmt.Errorf("fusion: marshal speculative chunk: %w", err)
+	}
+	if _, err := w.Write([]byte("data: ")); err != nil {
+		return err
+	}
+	if _, err := w.Write(b); err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte("\n\n")); err != nil {
+		return err
+	}
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return nil
+}
+
+// writeSSEDone emits the OpenAI streaming terminator and flushes. SSE
+// clients (and the harness's chat-completion consumers) treat
+// `data: [DONE]\n\n` as "no more chunks"; the proxy must write it
+// after every successful progressive-fusion response — agreement
+// (no arbiter), one-member (no arbiter), or disagreement (arbiter
+// stream completed).
+func writeSSEDone(w http.ResponseWriter) error {
+	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return nil
 }

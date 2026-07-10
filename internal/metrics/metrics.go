@@ -67,6 +67,12 @@ const recordRequestErrorTimeout = 5 * time.Second
 // Telemetry-mirrored fields (OutputTokens, TTFTMs, TotalLatencyMs, TPS,
 // Streaming, Error) carry the same shape as telemetry.Record so the
 // SQLiteStore can satisfy both interfaces.
+//
+// FusionArbiterSkipped (issue #48) mirrors telemetry.Record: true only
+// for route=fusion requests that streamed the speculative panel-member
+// answer and terminated without invoking the arbiter. False in every
+// other case (legacy Panel path always invokes the arbiter; non-fusion
+// routes are always false).
 type Request struct {
 	Timestamp         time.Time
 	RequestID         string
@@ -78,12 +84,13 @@ type Request struct {
 	RAGFilename       string
 	EstimatedCostUSD  float64
 
-	OutputTokens   int
-	TTFTMs         int64
-	TotalLatencyMs int64
-	TPS            float64
-	Streaming      bool
-	Error          string
+	OutputTokens         int
+	TTFTMs               int64
+	TotalLatencyMs       int64
+	TPS                  float64
+	Streaming            bool
+	FusionArbiterSkipped bool
+	Error                string
 }
 
 // Summary is the per-day roll-up returned by Store.DailySummary.

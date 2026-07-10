@@ -421,31 +421,33 @@ func TestRequestFieldsRoundtrip(t *testing.T) {
 	defer s2.Close()
 	ss2 := s2.(*SQLiteStore)
 	// Read back via a fresh SQL query rather than DailySummary so
-	// all 15 columns can be verified.
+	// all 16 columns can be verified (issue #48 added
+	// fusion_arbiter_skipped).
 	row := ss2.db.QueryRow(`
 SELECT timestamp, request_id, route, model,
        input_tokens, output_tokens, toon_savings_tokens,
        rag_injected, rag_filename, estimated_cost_usd,
-       ttft_ms, total_latency_ms, tps, streaming, error
+       ttft_ms, total_latency_ms, tps, streaming, fusion_arbiter_skipped, error
 FROM requests WHERE request_id = ?`, in.RequestID)
 	var (
-		gotTS        time.Time
-		gotReqID     string
-		gotRoute     string
-		gotModel     string
-		gotInput     int
-		gotOutput    int
-		gotSavings   int
-		gotRAGInj    int
-		gotRAGFile   string
-		gotCost      float64
-		gotTTFT      int64
-		gotLatency   int64
-		gotTPS       float64
-		gotStreaming int
-		gotErr       string
+		gotTS                   time.Time
+		gotReqID                string
+		gotRoute                string
+		gotModel                string
+		gotInput                int
+		gotOutput               int
+		gotSavings              int
+		gotRAGInj               int
+		gotRAGFile              string
+		gotCost                 float64
+		gotTTFT                 int64
+		gotLatency              int64
+		gotTPS                  float64
+		gotStreaming            int
+		gotFusionArbiterSkipped int
+		gotErr                  string
 	)
-	if err := row.Scan(&gotTS, &gotReqID, &gotRoute, &gotModel, &gotInput, &gotOutput, &gotSavings, &gotRAGInj, &gotRAGFile, &gotCost, &gotTTFT, &gotLatency, &gotTPS, &gotStreaming, &gotErr); err != nil {
+	if err := row.Scan(&gotTS, &gotReqID, &gotRoute, &gotModel, &gotInput, &gotOutput, &gotSavings, &gotRAGInj, &gotRAGFile, &gotCost, &gotTTFT, &gotLatency, &gotTPS, &gotStreaming, &gotFusionArbiterSkipped, &gotErr); err != nil {
 		t.Fatalf("scan: %v", err)
 	}
 	if gotReqID != in.RequestID {
