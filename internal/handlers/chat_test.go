@@ -720,3 +720,133 @@ func TestChatTelemetryJSONLRecorderEndToEnd(t *testing.T) {
 
 // Suppress unused import in case of partial test runs.
 var _ = log.Println
+
+// qualityRecordingObserver is a QualityObserver test double that
+// appends each QualityEvent it sees. Safe for concurrent use.
+type qualityRecordingObserver struct {
+	mu   sync.Mutex
+	seen []QualityEvent
+}
+
+func (r *qualityRecordingObserver) Submit(e QualityEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen = append(r.seen, e)
+}
+
+func (r *qualityRecordingObserver) Snapshot() []QualityEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]QualityEvent, len(r.seen))
+	copy(out, r.seen)
+	return out
+}
+
+// TestChatLocalRouteInvokesQualityObserverForToolCall exercises the
+// issue #13 wiring: a tool-call envelope in the captured local
+// response body produces a QualityEvent with the request id and the
+// path from inside arguments.
+//
+// The tool-call JSON is embedded inside the content field because
+// the cascade (issue #14) currently emits only `content` to the
+// client; tool_calls are validated upstream but stripped from the
+// streamed response. OpenCode and similar agents surface tool-call
+// instructions back through the chat thread in the same text
+// stream — the detector handles both because it is liberal on the
+// JSON shape.
+func TestChatLocalRouteInvokesQualityObserverForToolCall(t *testing.T) {
+	deps, rt := baseDeps(t)
+	obs := &qualityRecordingObserver{}
+	deps.QualityObserver = obs
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		// Single JSON-escape layer — matches what writeSSEResponse
+		// emits after re-marshaling the cascade's decoded
+		// `content` field.
+		body := `{"choices":[{"message":{"content":"applied edit ` +
+			`{\"name\":\"edit_file\",\"arguments\":\"{\"path\":\"/tmp/foo.rs\",\"diff\":\"+x\"}\"}"}}]}`
+		_, _ = w.Write([]byte(body))
+	})
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	got := obs.Snapshot()
+	if len(got) != 1 {
+		t.Fatalf("got %d quality events, want 1 (body=%q)", len(got), rw.Body.String())
+	}
+	if got[0].Path != "/tmp/foo.rs" {
+		t.Errorf("Path = %q, want /tmp/foo.rs", got[0].Path)
+	}
+	if got[0].RequestID == "" {
+		t.Error("RequestID should be populated")
+	}
+	if got[0].ToolName == "" {
+		t.Error("ToolName should be populated")
+	}
+}
+
+// TestChatLocalRouteQualityObserverNilIsSafe confirms the handler
+// runs unchanged when QualityObserver is not configured (the file-
+// edit scan should be a no-op in that case).
+func TestChatLocalRouteQualityObserverNilIsSafe(t *testing.T) {
+	deps, rt := baseDeps(t)
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"hi"}}]}`))
+	})
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if !strings.Contains(rw.Body.String(), "hi") {
+		t.Errorf("body = %q", rw.Body.String())
+	}
+}
+
+// TestChatNonLocalRouteDoesNotInvokeQualityObserver confirms the
+// scan lives behind the same RouteLocal gate as the judge observer:
+// fusion and frontier routes never dispatch quality events.
+func TestChatNonLocalRouteDoesNotInvokeQualityObserver(t *testing.T) {
+	cases := []struct {
+		name   string
+		body   string
+		expect string
+	}{
+		{"fusion", `{"messages":[{"role":"user","content":"design the system architecture"}]}`, "fusion"},
+		{"frontier", `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 30000) + `"}]}`, "frontier"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			deps, rt := baseDeps(t)
+			obs := &qualityRecordingObserver{}
+			deps.QualityObserver = obs
+			rt.OnAny(func(w http.ResponseWriter, _ *http.Request) {
+				// Even if the response mentions an edit tool, the
+				// scan should not fire because no captureBuffer
+				// exists on this route.
+				_, _ = w.Write([]byte(`{"name":"edit_file","arguments":"{\"path\":\"/tmp/x\"}"}`))
+			})
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.body))
+			rw := httptest.NewRecorder()
+			Chat(deps).ServeHTTP(rw, req)
+			if got := obs.Snapshot(); len(got) != 0 {
+				t.Errorf("%s: observer saw %d events; want 0", tc.expect, len(got))
+			}
+		})
+	}
+}
+
+// TestEmitDetectedEditsSkipsEmptyBody confirms the cheap no-op branch.
+func TestEmitDetectedEditsSkipsEmptyBody(t *testing.T) {
+	obs := &qualityRecordingObserver{}
+	emitDetectedEdits("", "req-1", obs)
+	if got := obs.Snapshot(); len(got) != 0 {
+		t.Errorf("got %d events on empty body, want 0", len(got))
+	}
+}
+
+// TestEmitDetectedEditsNilObserverIsSafe confirms the helper does
+// not panic when no observer is wired.
+func TestEmitDetectedEditsNilObserverIsSafe(t *testing.T) {
+	// Should not panic.
+	emitDetectedEdits(`{"name":"write_file","arguments":"{\"path\":\"/tmp/x\"}"}`, "req-1", nil)
+}

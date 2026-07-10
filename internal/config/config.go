@@ -59,6 +59,19 @@ type Config struct {
 	JudgeTimeout      time.Duration // per-call judge timeout (default 30s)
 	JudgeCostPer1KUSD float64       // rough USD/1k-token rate for cost estimates
 
+	// Quality (async AST/compiler verifier, issue #13). Detected
+	// edits enqueue a background `cargo check` / `npx tsc` and the
+	// verdict (1 = clean, 0 = fail/timeout) is reported via a
+	// callback to cmd/nexus/main.go. QualityEnabled is true iff
+	// QualityConcurrency is positive; the chat handler treats a
+	// nil observer as "skip me" so the hot path is unaffected when
+	// the verifier is dormant.
+	QualityEnabled     bool          // true iff QualityConcurrency > 0
+	QualityConcurrency int           // max parallel verifier workers (default 2)
+	QualityQueueDepth  int           // buffered channel size (default 64)
+	QualityTimeout     time.Duration // per-check timeout (default 60s)
+	QualityStderrCap   int           // stderr bytes retained per verdict (default 2 KiB)
+
 	// Middleware prompts
 	MetaPrompt string // appended to system prompt by prompt_engine
 	TOONNotice string // appended when TOON compression is applied
@@ -179,6 +192,36 @@ func Load() (Config, error) {
 	// dormant even if the env vars are partially populated (a common
 	// condition during local development).
 	cfg.JudgeEnabled = cfg.JudgeSampleRate > 0 && cfg.JudgeURL != "" && cfg.JudgeModel != ""
+
+	// Quality verifier (issue #13). The verifier is dormant when
+	// QualityConcurrency is non-positive; the chat handler treats a
+	// nil observer as "no-op", so the hot path is unaffected by an
+	// unconfigured quality pipeline (same pattern as the judge).
+	qualityConcurrency, err := getEnvInt("NEXUS_QUALITY_CONCURRENCY", 2)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.QualityConcurrency = qualityConcurrency
+
+	qualityQueueDepth, err := getEnvInt("NEXUS_QUALITY_QUEUE", 64)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.QualityQueueDepth = qualityQueueDepth
+
+	qualityTimeout, err := getEnvDuration("NEXUS_QUALITY_TIMEOUT", 60*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.QualityTimeout = qualityTimeout
+
+	stderrCap, err := getEnvInt("NEXUS_QUALITY_STDERR_CAP", 2*1024)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.QualityStderrCap = stderrCap
+
+	cfg.QualityEnabled = cfg.QualityConcurrency > 0
 
 	return cfg, nil
 }
