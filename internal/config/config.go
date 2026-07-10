@@ -8,6 +8,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -82,7 +83,29 @@ type Config struct {
 	// background telemetry goroutine. An empty value disables recording
 	// (the handler installs a Noop recorder). Parent directories are
 	// created on demand.
+	//
+	// MetricsDBPath is the on-disk SQLite database written by
+	// internal/metrics (issue #4). An empty value disables the
+	// metrics store (the handler treats a nil store as "skip me").
+	// Parent directories are created on demand. The default lives
+	// under the user's XDG-style cache directory so multiple checkouts
+	// don't trample each other.
 	TelemetryPath string
+	MetricsDBPath string
+}
+
+// DefaultMetricsDBPath returns the canonical metrics DB location:
+// $XDG_CACHE_HOME/nexus-proxy/metrics.db (or the OS default for
+// os.UserCacheDir when XDG_CACHE_HOME is unset). Tests and operators
+// can override with NEXUS_METRICS_DB.
+func DefaultMetricsDBPath() string {
+	base, err := os.UserCacheDir()
+	if err != nil || base == "" {
+		// Fall back to a dot-directory in $CWD so dev / CI runs
+		// still get a writable location.
+		base = "./.cache"
+	}
+	return filepath.Join(base, "nexus-proxy", "metrics.db")
 }
 
 // Load reads configuration from environment variables, applying defaults
@@ -105,6 +128,7 @@ func Load() (Config, error) {
 		MetaPrompt:     defaultMetaPrompt,
 		TOONNotice:     defaultTOONNotice,
 		TelemetryPath:  getEnvAllowEmpty("NEXUS_TELEMETRY_PATH", "./nexus-telemetry.jsonl"),
+		MetricsDBPath:  getEnvAllowEmpty("NEXUS_METRICS_DB", DefaultMetricsDBPath()),
 	}
 
 	threshold, err := getEnvFloat("NEXUS_RAG_THRESHOLD", 0.55)
@@ -234,6 +258,10 @@ func (c Config) FrontierEnabled() bool { return c.FrontierKey != "" }
 // TelemetryEnabled reports whether the on-disk recorder should be started.
 // Disabled when TelemetryPath is empty.
 func (c Config) TelemetryEnabled() bool { return c.TelemetryPath != "" }
+
+// MetricsEnabled reports whether the SQLite metrics store should be
+// opened. Disabled when MetricsDBPath is empty.
+func (c Config) MetricsEnabled() bool { return c.MetricsDBPath != "" }
 
 func getEnv(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {

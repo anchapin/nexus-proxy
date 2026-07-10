@@ -80,6 +80,52 @@ type QualityObserverFunc func(QualityEvent)
 // Submit implements QualityObserver.
 func (f QualityObserverFunc) Submit(e QualityEvent) { f(e) }
 
+// MetricsEvent carries the per-request data needed by the savings
+// dashboard (issue #4). Fields track the full Round-trip metrics:
+// route/model/input-tokens are routing dimensions; TOON/RAG/cost are
+// the savings dimensions the dashboard renders. The handler builds
+// one of these after every proxied request (success, failure, or
+// short-circuit) and dispatches it to the configured MetricsObserver.
+//
+// Mirrors internal/metrics.Request so a tiny adapter in main.go can
+// forward directly without translation — kept here as a separate
+// type so the handlers package stays free of the metrics import.
+type MetricsEvent struct {
+	Timestamp         time.Time
+	RequestID         string
+	Route             string
+	Model             string
+	InputTokens       int
+	TOONSavingsTokens int
+	RAGInjected       bool
+	RAGFilename       string
+	EstimatedCostUSD  float64
+
+	OutputTokens   int
+	TTFTMs         int64
+	TotalLatencyMs int64
+	TPS            float64
+	Streaming      bool
+	Error          string
+}
+
+// MetricsObserver is the hook the chat handler invokes once per
+// proxied request with a MetricsEvent payload. Same invariants as
+// JudgeObserver / QualityObserver:
+//   - safe to call from many goroutines;
+//   - must not block (the SQLite backend uses a buffered channel);
+//   - may be nil (treated as "no observer"; hot path is unaffected).
+type MetricsObserver interface {
+	Submit(MetricsEvent)
+}
+
+// MetricsObserverFunc adapts a plain function to the MetricsObserver
+// interface so wiring from main.go stays a one-liner.
+type MetricsObserverFunc func(MetricsEvent)
+
+// Submit implements MetricsObserver.
+func (f MetricsObserverFunc) Submit(e MetricsEvent) { f(e) }
+
 // Deps bundles the collaborators the chat handler needs. Wiring them
 // explicitly makes the handler trivial to unit-test with stubs.
 type Deps struct {
@@ -108,6 +154,18 @@ type Deps struct {
 	// the quality package; main.go wires a closure that forwards
 	// to the verifier's Submit.
 	QualityObserver QualityObserver
+
+	// MetricsObserver is optional. When non-nil, the handler
+	// dispatches one MetricsEvent per proxied request after the
+	// upstream response flushes, with the route, model, input
+	// tokens, TOON savings, RAG injection, and rough frontier
+	// cost. The observer is invoked synchronously from the request
+	// goroutine but does not block the response path because the
+	// SQLite-backed implementation (internal/metrics) enqueues
+	// onto a buffered channel and writes asynchronously. The
+	// handler does not import the metrics package; main.go wires
+	// a closure that forwards to metricsStore.Submit.
+	MetricsObserver MetricsObserver
 
 	// Recorder receives one record per proxied request. Never nil at
 	// runtime: Chat() installs telemetry.Noop{} when the caller
@@ -185,10 +243,21 @@ func Chat(d Deps) http.Handler {
 
 		messages := middleware.ApplyPromptEngineering(rawMessages, d.Config.MetaPrompt)
 		latestPrompt := middleware.ExtractLatestUserPrompt(messages)
+		var ragInjected bool
+		var ragFilename string
 		if ex, score, err := d.RAG.Retrieve(r.Context(), latestPrompt); err == nil && ex != nil {
 			messages = middleware.InjectRAG(messages, rag.FormatInjection(ex))
 			log.Printf("[RAG HIT]: Injected %s (Score: %.2f)", ex.Filename, score)
+			ragInjected = true
+			ragFilename = ex.Filename
+			_ = score
 		}
+		// Snapshot the JSON size BEFORE TOON compression so the
+		// metrics observer can attribute tokens saved by the
+		// round-trip pass. Uses the cheap "4 chars per token"
+		// heuristic the rest of the project uses for telemetry
+		// (see internal/telemetry.EstimateTokens).
+		preCompressionChars := totalMessageChars(messages)
 		if middleware.CompressJSONBlocks(messages) {
 			messages = middleware.AppendSystemNote(messages, d.Config.TOONNotice)
 			log.Println("[TOON COMPRESSOR]: Successfully compressed JSON data arrays.")
@@ -316,7 +385,48 @@ func Chat(d Deps) http.Handler {
 			}
 		}
 
-		d.Recorder.Record(buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr))
+		// Per-request recording. The metrics observer (issue #4)
+		// is preferred when configured: it carries the savings
+		// dimensions (TOON delta, RAG injection, cost) that
+		// telemetry.Record cannot express. The legacy Recorder
+		// remains for callers that only want the TTFT / latency
+		// fields, or when no metrics store is wired (operator
+		// opted out by leaving NEXUS_METRICS_DB empty).
+		totalMs := time.Since(started).Milliseconds()
+		var ttftMs int64
+		if streaming && firstWriteAt.Load() > 0 {
+			ttftMs = time.Unix(0, firstWriteAt.Load()).Sub(started).Milliseconds()
+			if ttftMs < 0 {
+				ttftMs = 0
+			}
+		}
+		outputTokens := int(obs.BytesOut() / 4)
+		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr)
+		if d.MetricsObserver != nil {
+			postCompressionChars := totalMessageChars(messages)
+			savings := totalTokenSavings(preCompressionChars, postCompressionChars)
+			cost := frontierCostEstimate(string(route), model, telemetry.EstimateTokens(latestPrompt), d.Config.JudgeCostPer1KUSD)
+			tps := telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
+			d.MetricsObserver.Submit(MetricsEvent{
+				Timestamp:         rec.Timestamp,
+				RequestID:         reqID,
+				Route:             string(route),
+				Model:             model,
+				InputTokens:       rec.InputTokens,
+				TOONSavingsTokens: savings,
+				RAGInjected:       ragInjected,
+				RAGFilename:       ragFilename,
+				EstimatedCostUSD:  cost,
+				OutputTokens:      outputTokens,
+				TTFTMs:            ttftMs,
+				TotalLatencyMs:    totalMs,
+				TPS:               tps,
+				Streaming:         streaming,
+				Error:             rec.Error,
+			})
+		} else {
+			d.Recorder.Record(rec)
+		}
 	})
 }
 
@@ -567,4 +677,47 @@ func buildRecord(
 		rec.Error = upErr.Error()
 	}
 	return rec
+}
+
+// --- metrics (issue #4) helpers ----------------------------------------
+
+// totalMessageChars marshals messages and returns the JSON byte
+// length. Used to compute the TOON savings token estimate. Mirrors
+// json.Marshal's own overflow behaviour (returns roughly the same
+// bytes the proxy would emit across the wire).
+func totalMessageChars(messages []interface{}) int {
+	b, err := json.Marshal(messages)
+	if err != nil {
+		return 0
+	}
+	return len(b)
+}
+
+// totalTokenSavings returns the tokens saved by the TOON
+// compression pass (pre - post character count, /4), clamped to
+// zero in case the rewrite expanded the message (which can happen
+// when the schema header outweighs the value rows for tiny inputs).
+func totalTokenSavings(preChars, postChars int) int {
+	if preChars <= postChars {
+		return 0
+	}
+	return (preChars - postChars) / 4
+}
+
+// frontierCostEstimate multiplies input tokens by the configured
+// cost-per-1k. Returns zero for non-frontier routes so local +
+// fusion-trail rows count as zero cost in the dashboard. The
+// JudgeCostPer1KUSD knob is reused here for lack of a separate
+// frontier-rate env; the PRD says one is enough at this stage.
+func frontierCostEstimate(route, model string, inputTokens int, costPer1KUSD float64) float64 {
+	// model is reserved for future per-model pricing tables —
+	// the bundle stays cheap by sharing JudgeCostPer1KUSD for now.
+	_ = model
+	if route != string(router.RouteFrontier) {
+		return 0
+	}
+	if costPer1KUSD <= 0 || inputTokens <= 0 {
+		return 0
+	}
+	return float64(inputTokens) * costPer1KUSD / 1000.0
 }
