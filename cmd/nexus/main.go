@@ -18,6 +18,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/handlers"
 	"github.com/anchapin/nexus-proxy/internal/judge"
+	"github.com/anchapin/nexus-proxy/internal/metrics"
 	"github.com/anchapin/nexus-proxy/internal/quality"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
@@ -96,6 +97,21 @@ func main() {
 		}
 	}()
 
+	// SQLite-backed metrics store (issue #4). When configured the
+	// per-request savings events go here; the JSONL recorder above
+	// is left in place so operators can still get a tail-friendly
+	// log. Hand-off via MetricsObserver keeps the handlers package
+	// free of the metrics import (same dependency rule as judge
+	// and quality).
+	metricsStore, metricsObs := buildMetrics(cfg)
+	defer func() {
+		if metricsStore != nil {
+			if err := metricsStore.Close(); err != nil {
+				log.Printf("[METRICS ERROR]: close: %v", err)
+			}
+		}
+	}()
+
 	// Async AST/compiler verifier (issue #13). The handler never
 	// imports internal/quality; we plug a closure in that maps the
 	// handler's QualityEvent shape to the verifier's Event shape
@@ -159,6 +175,7 @@ func main() {
 		FormattingRegex: re,
 		JudgeObserver:   judgeObs,
 		QualityObserver: qualityO,
+		MetricsObserver: metricsObs,
 		Recorder:        recorder,
 	}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -213,4 +230,49 @@ func buildRecorder(cfg config.Config) telemetry.Recorder {
 	}
 	log.Printf("[TELEMETRY]: recording to %s", r.Path())
 	return r
+}
+
+// buildMetrics opens the SQLite metrics store when NEXUS_METRICS_DB is
+// set. Returns a nil store (and a nil observer) when the operator
+// opted out, which lets the handler take the no-metrics fast path.
+//
+// The observer is a tiny adapter from handlers.MetricsEvent to
+// metrics.Request — same pattern as the judge/quality observers.
+func buildMetrics(cfg config.Config) (metrics.Store, handlers.MetricsObserver) {
+	if !cfg.MetricsEnabled() {
+		log.Println("[METRICS]: disabled (NEXUS_METRICS_DB is empty)")
+		return nil, nil
+	}
+	store, err := metrics.Open(cfg.MetricsDBPath)
+	if err != nil {
+		log.Printf("[METRICS ERROR]: open failed (%v); metrics disabled", err)
+		return nil, nil
+	}
+	if ss, ok := store.(*metrics.SQLiteStore); ok {
+		log.Printf("[METRICS]: recording to %s", ss.Path())
+	}
+	obs := handlers.MetricsObserverFunc(func(e handlers.MetricsEvent) {
+		// The adapter does its own error handling — RecordRequest
+		// never blocks the caller, but we still swallow the
+		// (currently always-nil) error so the handler stays
+		// caller-agnostic.
+		_ = store.RecordRequest(metrics.Request{
+			Timestamp:         e.Timestamp,
+			RequestID:         e.RequestID,
+			Route:             e.Route,
+			Model:             e.Model,
+			InputTokens:       e.InputTokens,
+			TOONSavingsTokens: e.TOONSavingsTokens,
+			RAGInjected:       e.RAGInjected,
+			RAGFilename:       e.RAGFilename,
+			EstimatedCostUSD:  e.EstimatedCostUSD,
+			OutputTokens:      e.OutputTokens,
+			TTFTMs:            e.TTFTMs,
+			TotalLatencyMs:    e.TotalLatencyMs,
+			TPS:               e.TPS,
+			Streaming:         e.Streaming,
+			Error:             e.Error,
+		})
+	})
+	return store, obs
 }

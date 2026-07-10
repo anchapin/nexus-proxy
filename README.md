@@ -38,6 +38,16 @@ complexity.
   `NEXUS_JUDGE_SAMPLE_RATE > 0`. The judge output is a structured
   `JudgeScore` record ready to be persisted by a future telemetry
   layer.
+- **SQLite metrics store (issue #4).** Per-request routing and
+  savings events land in a local SQLite database
+  (`$XDG_CACHE_HOME/nexus-proxy/metrics.db` by default, override via
+  `NEXUS_METRICS_DB`). One row per proxied request with route,
+  model, input/output tokens, TOON savings, RAG injection, and
+  rough frontier-cost estimate. Writes are pushed onto a buffered
+  channel consumed by a background goroutine so the request path
+  never blocks on disk I/O. The store also satisfies
+  `telemetry.Recorder` for backwards compatibility with the v0
+  JSONL pipeline.
 
 ## Quickstart
 
@@ -178,7 +188,10 @@ internal/
   router/                  # dsl.go, slm.go, guardrails
   upstream/                # stream.go, fusion.go (panel + arbiter)
   rag/                     # in-memory vector store + Ollama embedder
-  judge/                   # async LLM-as-a-judge evaluator
+  judge/                   # async LLM-as-a-judge evaluator (issue #15)
+  quality/                 # async AST/compiler verifier (issue #13)
+  metrics/                 # SQLite-backed metrics store (issue #4)
+  telemetry/               # JSONL recorder (issue #16)
 few_shot_examples/         # (gitignored) user-curated snippets
 .env.example               # all env vars with safe defaults
 Makefile                   # build / test / lint / ci
@@ -225,12 +238,17 @@ defaults. The most useful ones:
 | `NEXUS_JUDGE_CONCURRENCY` | `2`                           | Max simultaneous judge calls            |
 | `NEXUS_JUDGE_URL`         | z.ai (fallback frontier)      | Judge endpoint                          |
 | `NEXUS_JUDGE_API_KEY`     | `NEXUS_FRONTIER_API_KEY`      | Judge bearer token                      |
+| `NEXUS_METRICS_DB`        | `~/.cache/nexus-proxy/metrics.db` | SQLite metrics store (issue #4)      |
 
 ## Status
 
 This is the Phase 1 refactor (see `Nexus Proxy PRD and Architecture.md`).
-Phase 2 (structured logging, SQLite metrics, savings dashboard) is the
-next planned body of work.
+Phase 2 is landing incrementally: structured logging (#9, MIT-licensed),
+the SQLite metrics store (#4), and the savings dashboard are still in
+progress. The metrics DB lives in the user's cache directory by default
+(~/.cache/nexus-proxy/metrics.db on Linux, %LocalAppData%\nexus-proxy
+\metrics.db on Windows); set `NEXUS_METRICS_DB` to relocate it or
+empty the variable to disable.
 
 ## License
 
