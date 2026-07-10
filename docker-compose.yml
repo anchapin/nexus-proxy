@@ -1,0 +1,72 @@
+# docker-compose.yml — run Nexus Proxy with a local Ollama backend.
+#
+# Usage:
+#   NEXUS_FRONTIER_API_KEY=sk-... docker compose up -d
+#   # or put it in a host-side .env (Compose reads it automatically)
+#   curl http://localhost:8000/healthz   # → "ok"
+#
+# The first `up` will pull the Ollama models in a second pass. Run
+# `docker compose exec ollama ollama pull qwen3-coder:4b qwen3-coder:8b
+# nomic-embed-text` from the host once the Ollama container is healthy.
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: nexus-ollama
+    # GPU passthrough for hosts with NVIDIA drivers. Comment out on
+    # CPU-only / macOS / WSL2 setups; Ollama falls back to CPU.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      # Exposed on the host so the operator can `curl http://localhost:11434`
+      # for debugging. The proxy talks to ollama over the compose network
+      # using the service name "ollama", not localhost.
+      - "11434:11434"
+    volumes:
+      # Persist downloaded models across container restarts. Without
+      # this every `up` would re-download the multi-GB qwen3-coder weights.
+      - ollama-data:/root/.ollama
+    healthcheck:
+      # The official ollama image ships with curl.
+      test: ["CMD", "curl", "-fsS", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      # Models can take a while to be ready after a cold start.
+      start_period: 30s
+    restart: unless-stopped
+
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nexus-proxy
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      # Listen address inside the container network. Override on the
+      # host with `ports:` below to change the external mapping.
+      NEXUS_ADDR: ":8000"
+      # Talk to the ollama service over the compose network — never
+      # localhost here, that would resolve to the proxy's own loopback.
+      NEXUS_OLLAMA_URL: "http://ollama:11434"
+      # Frontier key is supplied by the host environment. Leaving it
+      # empty is fine for fully-local routing; frontier-bound requests
+      # will 401 until the operator sets it.
+      NEXUS_FRONTIER_API_KEY: "${NEXUS_FRONTIER_API_KEY:-}"
+      # The default path (./nexus-telemetry.jsonl) resolves to the
+      # container's WORKDIR (/tmp), which is fine — pinning it here
+      # makes the contract explicit and survives a future WORKDIR move.
+      NEXUS_TELEMETRY_PATH: "/tmp/nexus-telemetry.jsonl"
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+volumes:
+  ollama-data:
