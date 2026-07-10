@@ -194,7 +194,10 @@ const DefaultObservedCap = 256 * 1024 // 256 KiB
 //  2. applyRetrievalAugmentation — embed latest prompt, inject best match
 //  3. optimizePromptContext     — TOON-compress JSON arrays in user msgs
 //  4. evaluateDSL -> getSLMRoutingDecision
-//  5. Stream (local/frontier) or Panel (fusion)
+//  5. dispatch:
+//     local    -> Cascade (streaming) or BufferedFetch (non-streaming)
+//     frontier -> Stream (streaming) or BufferedFetch (non-streaming)
+//     fusion   -> Panel (honors stream flag for arbiter branch)
 //
 // After a successful RouteLocal stream the handler invokes
 // JudgeObserver (when configured) with a LocalCompletion event. The
@@ -321,10 +324,13 @@ func Chat(d Deps) http.Handler {
 			route = dec
 		}
 
-		// Decide streaming up-front so the telemetry row reflects what the
-		// client actually asked for. The current Stream implementation
-		// streams either way; honoring the flag here keeps TTFT semantics
-		// honest and prepares us for issue #10 (which will switch on this).
+		// Honor the harness's stream flag (issue #10). OpenAI treats
+		// stream as advisory; a stream=false request must receive a
+		// single chatCompletionResponse JSON object, not chunked SSE.
+		// The local and frontier branches dispatch on this flag below
+		// (Cascade/Stream for stream=true, BufferedFetch for
+		// stream=false). The fusion arbiter reads body["stream"]
+		// directly inside upstream.Panel.
 		streaming := true
 		if s, ok := body["stream"].(bool); ok && !s {
 			streaming = false
@@ -362,29 +368,12 @@ func Chat(d Deps) http.Handler {
 		case router.RouteLocal:
 			body["model"] = d.Config.LocalModel
 
-			// Cascade (issue #14): try local Ollama first, fall back to
-			// configured frontier endpoints (frontier, then z.ai) on
-			// retryable failures. Cascade is rebuilt per request so
-			// config changes take effect without restarting the
-			// process.
-			cas := upstream.BuildLocalCascade(upstream.CascadeConfig{
-				LocalURL:      d.Config.OllamaURL,
-				LocalModel:    d.Config.LocalModel,
-				FrontierURL:   d.Config.FrontierURL,
-				FrontierModel: d.Config.FrontierModel,
-				FrontierKey:   d.Config.FrontierKey,
-				ZAIURL:        d.Config.ZAIURL,
-				ZAIModel:      d.Config.ZAIModel,
-				ZAIKey:        d.Config.ZAIKey,
-				Timeout:       d.Config.CascadeTimeout,
-			})
-
 			// Writer chain (outermost first):
-			//   cascade.Run -> captureWriter (judge + quality tee) ->
+			//   upstream.Write -> captureWriter (judge + quality tee) ->
 			//   ObservingWriter (telemetry byte count + TTFT) ->
 			//   underlying ResponseWriter.
 			// captureWriter is only installed when at least one
-			// observer is set; otherwise the cascade writes
+			// observer is set; otherwise the dispatch writes
 			// directly through obs with zero overhead.
 			rw := http.ResponseWriter(obs)
 			var cap *captureWriter
@@ -392,38 +381,98 @@ func Chat(d Deps) http.Handler {
 				cap = newCaptureWriter(obs, d.maxObservedBytes)
 				rw = cap
 			}
-			res, err := cas.Run(rw, d.Client, body)
-			logCascadeTelemetry(res, err, reqID)
-			if err != nil {
-				slog.Error("upstream error",
-					slog.Any("err", err),
-					slog.String("request_id", reqID),
-				)
-				upErr = err
-				http.Error(w, "Upstream error", http.StatusBadGateway)
-				// fall through: telemetry Record still fires below so
-				// the failed request shows up in the dashboard.
-			} else {
-				model = d.Config.LocalModel
-				if res.Succeeded && cap != nil {
-					if d.JudgeObserver != nil {
-						d.JudgeObserver.Submit(LocalCompletion{
-							RequestID:   reqID,
-							Instruction: latestPrompt,
-							Output:      cap.Buffer(),
-							LocalModel:  d.Config.LocalModel,
-						})
+			if streaming {
+				// Cascade (issue #14): try local Ollama first, fall
+				// back to configured frontier endpoints (frontier,
+				// then z.ai) on retryable failures. Cascade is rebuilt
+				// per request so config changes take effect without
+				// restarting the process.
+				cas := upstream.BuildLocalCascade(upstream.CascadeConfig{
+					LocalURL:      d.Config.OllamaURL,
+					LocalModel:    d.Config.LocalModel,
+					FrontierURL:   d.Config.FrontierURL,
+					FrontierModel: d.Config.FrontierModel,
+					FrontierKey:   d.Config.FrontierKey,
+					ZAIURL:        d.Config.ZAIURL,
+					ZAIModel:      d.Config.ZAIModel,
+					ZAIKey:        d.Config.ZAIKey,
+					Timeout:       d.Config.CascadeTimeout,
+				})
+				res, err := cas.Run(rw, d.Client, body)
+				logCascadeTelemetry(res, err, reqID)
+				if err != nil {
+					slog.Error("upstream error",
+						slog.Any("err", err),
+						slog.String("request_id", reqID),
+					)
+					upErr = err
+					http.Error(w, "Upstream error", http.StatusBadGateway)
+					// fall through: telemetry Record still fires
+					// below so the failed request shows up in the
+					// dashboard.
+				} else {
+					model = d.Config.LocalModel
+					if res.Succeeded && cap != nil {
+						if d.JudgeObserver != nil {
+							d.JudgeObserver.Submit(LocalCompletion{
+								RequestID:   reqID,
+								Instruction: latestPrompt,
+								Output:      cap.Buffer(),
+								LocalModel:  d.Config.LocalModel,
+							})
+						}
+						if d.QualityObserver != nil {
+							emitDetectedEdits(cap.Buffer(), reqID, d.QualityObserver)
+						}
 					}
-					if d.QualityObserver != nil {
-						emitDetectedEdits(cap.Buffer(), reqID, d.QualityObserver)
+				}
+			} else {
+				// Non-streaming (issue #10): BufferedFetch collects
+				// the full upstream body and writes it as a single
+				// chatCompletionResponse JSON object. Local model
+				// only; the cascade's validation / fallback is
+				// bypassed in this branch because the harness
+				// expects a verbatim response.
+				localURL := strings.TrimRight(d.Config.OllamaURL, "/") + "/v1/chat/completions"
+				if err := upstream.BufferedFetch(rw, d.Client, localURL, "", body); err != nil {
+					slog.Error("upstream error",
+						slog.Any("err", err),
+						slog.String("request_id", reqID),
+					)
+					upErr = err
+					http.Error(w, "Upstream error", http.StatusBadGateway)
+				} else {
+					model = d.Config.LocalModel
+					if cap != nil {
+						if d.JudgeObserver != nil {
+							d.JudgeObserver.Submit(LocalCompletion{
+								RequestID:   reqID,
+								Instruction: latestPrompt,
+								Output:      cap.Buffer(),
+								LocalModel:  d.Config.LocalModel,
+							})
+						}
+						if d.QualityObserver != nil {
+							emitDetectedEdits(cap.Buffer(), reqID, d.QualityObserver)
+						}
 					}
 				}
 			}
 
 		default:
 			model = d.Config.FrontierModel
-			if upErr = upstream.Stream(obs, d.Client,
-				d.Config.FrontierURL, d.Config.FrontierKey, body); upErr != nil {
+			// Honor the harness's stream flag (issue #10). Stream
+			// preserves SSE framing for chunked deliveries;
+			// BufferedFetch collects the full body and returns a
+			// single chatCompletionResponse JSON object.
+			if streaming {
+				upErr = upstream.Stream(obs, d.Client,
+					d.Config.FrontierURL, d.Config.FrontierKey, body)
+			} else {
+				upErr = upstream.BufferedFetch(obs, d.Client,
+					d.Config.FrontierURL, d.Config.FrontierKey, body)
+			}
+			if upErr != nil {
 				slog.Error("upstream error",
 					slog.Any("err", upErr),
 					slog.String("request_id", reqID),

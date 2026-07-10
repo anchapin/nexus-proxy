@@ -90,6 +90,80 @@ func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client
 	}
 }
 
+// BufferedFetch POSTs payload to targetURL, buffers the entire upstream
+// response, validates it as a single JSON object, and writes it back to
+// w as one chatCompletionResponse. The body is forced to stream=false
+// on the wire so the upstream returns JSON (not SSE). This is the
+// harness's expected shape when body["stream"]=false — OpenAI treats
+// the flag as advisory; non-stream responses come back as JSON. Issue
+// #10.
+//
+// apiKey may be empty (local Ollama has no auth).
+//
+// BufferedFetch is a thin wrapper around BufferedFetchWithContext that
+// uses a fresh context.Background(). Callers that need a timeout
+// should use BufferedFetchWithContext directly — same contract as
+// StreamWithContext.
+func BufferedFetch(w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}) error {
+	return BufferedFetchWithContext(context.Background(), w, client, targetURL, apiKey, payload)
+}
+
+// BufferedFetchWithContext is BufferedFetch plus an explicit request
+// context. Cancellation via context.WithTimeout propagates both
+// client-side (cancels the in-flight request) and server-side (cancels
+// the handler's r.Context()).
+func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}) error {
+	body := make(map[string]interface{}, len(payload)+1)
+	for k, v := range payload {
+		body[k] = v
+	}
+	body["stream"] = false
+
+	jsonPayload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("upstream: marshal: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(jsonPayload))
+	if err != nil {
+		return fmt.Errorf("upstream: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("upstream: do: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+
+	// Validate the upstream body is a single JSON object. A misbehaving
+	// upstream returning HTML or plain text would otherwise propagate
+	// through to the harness and confuse its JSON parser.
+	var probe map[string]interface{}
+	if err := json.Unmarshal(respBody, &probe); err != nil {
+		return fmt.Errorf("upstream: invalid JSON in response (status %d): %w", resp.StatusCode, err)
+	}
+
+	// Forward upstream headers except Content-Type, which we always set
+	// to application/json so the harness sees a plain JSON envelope
+	// regardless of what the upstream declared.
+	for k, vs := range resp.Header {
+		if k == "Content-Type" {
+			continue
+		}
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	_, werr := w.Write(respBody)
+	return werr
+}
+
 // FetchPanel fetches a single non-streaming completion from targetURL and
 // returns the assistant message text. Designed for the fusion panel where
 // we need the full response before asking the arbiter to synthesize.
@@ -203,7 +277,20 @@ func Panel(
 	// new arbiterTimeout knob.
 	arbiterCtx, cancelArbiter := context.WithTimeout(context.Background(), withDefaultArbiterTimeout(arbiterTimeout))
 	defer cancelArbiter()
-	return StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody)
+	// Honor the harness's stream flag (issue #10). Panel members
+	// already force stream=false on the wire (FetchPanel needs the
+	// full body to feed the arbiter), so only the arbiter dispatch
+	// itself needs to branch. BufferedFetchWithContext re-asserts
+	// stream=false on the arbiter wire so the synthesis endpoint
+	// returns a single chatCompletionResponse JSON object.
+	stream := true
+	if s, ok := body["stream"].(bool); ok && !s {
+		stream = false
+	}
+	if stream {
+		return StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody)
+	}
+	return BufferedFetchWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody)
 }
 
 // arbiterDefaultTimeout is the per-call arbiter timeout used when

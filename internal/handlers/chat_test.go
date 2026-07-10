@@ -260,6 +260,160 @@ func TestChatDSLArchitectureFusion(t *testing.T) {
 	}
 }
 
+// TestChatNonStreamingLocalReturnsJSONObject is the issue #10 acceptance
+// test for the local route: when the harness sends stream=false, the
+// handler must take the BufferedFetch path and return a single
+// chatCompletionResponse JSON object — not synthesized SSE chunks.
+func TestChatNonStreamingLocalReturnsJSONObject(t *testing.T) {
+	deps, rt := baseDeps(t)
+	var seenBody string
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		seenBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"non-streamed answer"},"finish_reason":"stop"}]}`))
+	})
+	body := `{"stream":false,"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rw.Code)
+	}
+	if got := rw.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	if !strings.Contains(rw.Body.String(), `"object":"chat.completion"`) {
+		t.Errorf("body missing chatCompletionResponse shape: %q", rw.Body.String())
+	}
+	if strings.HasPrefix(strings.TrimSpace(rw.Body.String()), "data:") {
+		t.Errorf("body looks like SSE, want plain JSON: %q", rw.Body.String())
+	}
+	if !strings.Contains(rw.Body.String(), `"content":"non-streamed answer"`) {
+		t.Errorf("upstream content not forwarded: %q", rw.Body.String())
+	}
+	// BufferedFetch must force stream=false on the wire even if the
+	// harness accidentally sent stream=true (or the handler didn't
+	// strip it). Belt and braces.
+	if !strings.Contains(seenBody, `"stream":false`) {
+		t.Errorf("upstream body missing stream=false override: %s", seenBody)
+	}
+}
+
+// TestChatStreamingLocalStillSynthesizesSSE is the regression
+// companion to the buffered test above: default (no stream field)
+// must keep the existing cascade + SSE synthesis path.
+func TestChatStreamingLocalStillSynthesizesSSE(t *testing.T) {
+	deps, rt := baseDeps(t)
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"model":"qwen3-coder:8b","choices":[{"message":{"content":"streamed answer"}}]}`))
+	})
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rw.Code)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(rw.Body.String()), "data:") {
+		t.Errorf("body should be SSE: %q", rw.Body.String())
+	}
+	if !strings.Contains(rw.Body.String(), "streamed answer") {
+		t.Errorf("content not forwarded: %q", rw.Body.String())
+	}
+}
+
+// TestChatNonStreamingFrontierReturnsJSONObject exercises the frontier
+// default branch when the harness asks for stream=false: the handler
+// must call BufferedFetch and return a single JSON object.
+func TestChatNonStreamingFrontierReturnsJSONObject(t *testing.T) {
+	deps, rt := baseDeps(t)
+	// 30000 chars / 4 = 7500 > 6000 guardrail, so this routes to
+	// frontier via the default branch (not the local cascade).
+	largeUser := strings.Repeat("a", 30000)
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, r *http.Request) {
+		// BufferedFetch forces stream=false on the wire; assert it.
+		b, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(b), `"stream":false`) {
+			t.Errorf("upstream body missing stream=false override: %s", string(b))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-2","object":"chat.completion","choices":[{"message":{"content":"frontier non-stream"}}]}`))
+	})
+	body := `{"stream":false,"messages":[{"role":"user","content":"` + largeUser + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rw.Code)
+	}
+	if got := rw.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	if !strings.Contains(rw.Body.String(), `"object":"chat.completion"`) {
+		t.Errorf("body missing chatCompletionResponse shape: %q", rw.Body.String())
+	}
+	if strings.HasPrefix(strings.TrimSpace(rw.Body.String()), "data:") {
+		t.Errorf("body looks like SSE, want plain JSON: %q", rw.Body.String())
+	}
+}
+
+// TestChatFusionArbiterHonorsStreamFalse is the issue #10 acceptance
+// test for the fusion path: when the harness sends stream=false, the
+// arbiter call must return a JSON object (not SSE) while the panel
+// member calls stay stream=false as before.
+//
+// baseDeps configures the arbiter URL to coincide with the frontier
+// panel member's URL (both resolve to d.Config.FrontierURL =
+// "http://frontier.local"), so the recording transport cannot route
+// them by URL alone. We use OnAny and identify the arbiter call by
+// its synthetic system prompt, which always carries the
+// "Master Synthesis Arbiter" instruction the Panel constructs.
+func TestChatFusionArbiterHonorsStreamFalse(t *testing.T) {
+	deps, rt := baseDeps(t)
+	var arbiterBody string
+	rt.OnAny(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		body := string(b)
+		switch {
+		case strings.Contains(body, "Master Synthesis Arbiter"):
+			// Arbiter call. Capture the body to assert stream=false.
+			arbiterBody = body
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"synthesized"}}]}`))
+		case strings.Contains(r.URL.String(), "ollama"):
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"local reply"}}]}`))
+		default:
+			// Frontier panel member.
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"frontier reply"}}]}`))
+		}
+	})
+	body := `{"stream":false,"messages":[{"role":"user","content":"design the system architecture"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rw.Code)
+	}
+	if got := rw.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	if !strings.Contains(rw.Body.String(), `"content":"synthesized"`) {
+		t.Errorf("arbiter JSON not forwarded: %q", rw.Body.String())
+	}
+	if strings.HasPrefix(strings.TrimSpace(rw.Body.String()), "data:") {
+		t.Errorf("arbiter body looks like SSE, want plain JSON: %q", rw.Body.String())
+	}
+	if !strings.Contains(arbiterBody, `"stream":false`) {
+		t.Errorf("arbiter request missing stream=false override: %s", arbiterBody)
+	}
+}
+
 func TestChatSLMFallbackToFrontierOnError(t *testing.T) {
 	deps, rt := baseDeps(t)
 	// SLM call to ollama will fail; frontier should be called instead
