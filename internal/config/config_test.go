@@ -42,6 +42,18 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ZAIKey != "" {
 		t.Errorf("ZAIKey = %q, want empty", cfg.ZAIKey)
 	}
+	// Telemetry defaults to a local JSON-lines file unless NEXUS_TELEMETRY_PATH
+	// is explicitly unset or set to ""; assert the default value when neither
+	// is true (typical fresh dev environment).
+	if cfg.TelemetryPath == "" {
+		t.Skip("NEXUS_TELEMETRY_PATH set in environment; default test skipped")
+	}
+	if cfg.TelemetryPath != "./nexus-telemetry.jsonl" {
+		t.Errorf("TelemetryPath = %q, want ./nexus-telemetry.jsonl", cfg.TelemetryPath)
+	}
+	if !cfg.TelemetryEnabled() {
+		t.Error("TelemetryEnabled = false, want true with default path")
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -53,6 +65,7 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("NEXUS_CASCADE_TIMEOUT", "15s")
 	t.Setenv("NEXUS_ZAI_API_KEY", "zai-test")
 	t.Setenv("NEXUS_ZAI_MODEL", "glm-4.5")
+	t.Setenv("NEXUS_TELEMETRY_PATH", "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -81,6 +94,34 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if cfg.ZAIModel != "glm-4.5" {
 		t.Errorf("ZAIModel = %q", cfg.ZAIModel)
+	}
+	if cfg.TelemetryEnabled() {
+		t.Error("TelemetryEnabled = true with empty path, want false")
+	}
+}
+
+func TestLoadTelemetryDisabledByEmptyPath(t *testing.T) {
+	t.Setenv("NEXUS_TELEMETRY_PATH", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TelemetryEnabled() {
+		t.Error("TelemetryEnabled = true, want false when path empty")
+	}
+}
+
+func TestLoadTelemetryPathHonoursOverride(t *testing.T) {
+	t.Setenv("NEXUS_TELEMETRY_PATH", "/tmp/custom-tel.jsonl")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TelemetryPath != "/tmp/custom-tel.jsonl" {
+		t.Errorf("TelemetryPath = %q, want /tmp/custom-tel.jsonl", cfg.TelemetryPath)
+	}
+	if !cfg.TelemetryEnabled() {
+		t.Error("TelemetryEnabled = false, want true with explicit path")
 	}
 }
 

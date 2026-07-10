@@ -3,6 +3,7 @@
 /harness_agnostic_go_router_proxy.exe
 /nexus
 /nexus.exe
+/bin/
 *.exe
 *.test
 *.out

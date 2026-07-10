@@ -11,7 +11,7 @@ and `README.md` for the user-facing quickstart.
 ## Repo state
 
 Phase 1 refactor is complete. The single-file prototype is gone; the
-codebase now follows standard Go layout.
+codebase now follows standard Go layout. Telemetry was added in #16.
 
 ```
 cmd/nexus/                 # main: wires config + handlers + starts HTTP
@@ -22,7 +22,8 @@ internal/
   router/                  # dsl.go, slm.go, guardrails
   upstream/                # stream.go, fusion.go (panel + arbiter)
   rag/                     # in-memory vector store + Ollama embedder
-  judge/                   # async LLM-as-a-judge evaluator (issue #15)
+judge/                   # async LLM-as-a-judge evaluator (issue #15)
+  telemetry/               # Recorder interface + JSONLRecorder + ObservingWriter
 few_shot_examples/         # (gitignored) user-curated snippets
 .env.example               # all env vars with safe defaults
 Makefile                   # build / test / lint / ci
@@ -44,6 +45,12 @@ runtime dependency.
 The binary listens on `:8000` (env: `NEXUS_ADDR`) and exposes:
 - `POST /v1/chat/completions` — the proxy
 - `GET  /healthz` — liveness probe
+
+Telemetry is opt-out: by default the proxy appends one JSON object per
+proxied request to `./nexus-telemetry.jsonl` (env: `NEXUS_TELEMETRY_PATH`,
+empty disables). Records are pushed onto a buffered channel consumed by a
+background goroutine — the request path never blocks on persistence. Set
+`NEXUS_TELEMETRY_PATH=/tmp/nexus.db` or similar to relocate the log.
 
 ## Prerequisites
 
@@ -169,7 +176,10 @@ For new behaviour, add tests first and follow the existing layout:
 | New HTTP endpoint                    | `internal/handlers`              |
 | Judge scoring / sampling logic       | `internal/judge`                 |
 | Judge persistence (SQLite, etc.)     | `internal/judge` (Storage impl)  |
+| New metric field or storage backend  | `internal/telemetry`             |
 
 Existing functions map 1:1 to those packages. The handler is the only
 public entry point — keep middleware and router free of `net/http`
-concerns so they stay unit-testable.
+concerns so they stay unit-testable. Telemetry's `Recorder` interface is
+the only seam: swap the JSONL implementation for SQLite by satisfying
+`Record(Record)` + `Close()` without touching the handler.
