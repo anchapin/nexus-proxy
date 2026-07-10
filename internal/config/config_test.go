@@ -30,6 +30,18 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.RAGThreshold != 0.55 {
 		t.Errorf("RAGThreshold = %v, want 0.55", cfg.RAGThreshold)
 	}
+	if cfg.CascadeTimeout != 30*time.Second {
+		t.Errorf("CascadeTimeout = %v, want 30s", cfg.CascadeTimeout)
+	}
+	if cfg.ZAIURL != "https://api.z.ai/v1/chat/completions" {
+		t.Errorf("ZAIURL = %q", cfg.ZAIURL)
+	}
+	if cfg.ZAIModel != "glm-4.6" {
+		t.Errorf("ZAIModel = %q", cfg.ZAIModel)
+	}
+	if cfg.ZAIKey != "" {
+		t.Errorf("ZAIKey = %q, want empty", cfg.ZAIKey)
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -38,6 +50,9 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("NEXUS_FRONTIER_API_KEY", "sk-test")
 	t.Setenv("NEXUS_RAG_THRESHOLD", "0.7")
 	t.Setenv("NEXUS_SLM_TIMEOUT", "3s")
+	t.Setenv("NEXUS_CASCADE_TIMEOUT", "15s")
+	t.Setenv("NEXUS_ZAI_API_KEY", "zai-test")
+	t.Setenv("NEXUS_ZAI_MODEL", "glm-4.5")
 
 	cfg, err := Load()
 	if err != nil {
@@ -58,6 +73,15 @@ func TestLoadOverrides(t *testing.T) {
 	if cfg.SLMTimeout != 3*time.Second {
 		t.Errorf("SLMTimeout = %v", cfg.SLMTimeout)
 	}
+	if cfg.CascadeTimeout != 15*time.Second {
+		t.Errorf("CascadeTimeout = %v, want 15s", cfg.CascadeTimeout)
+	}
+	if cfg.ZAIKey != "zai-test" {
+		t.Errorf("ZAIKey = %q", cfg.ZAIKey)
+	}
+	if cfg.ZAIModel != "glm-4.5" {
+		t.Errorf("ZAIModel = %q", cfg.ZAIModel)
+	}
 }
 
 func TestLoadInvalidValues(t *testing.T) {
@@ -69,6 +93,7 @@ func TestLoadInvalidValues(t *testing.T) {
 		{"bad int", "NEXUS_TOKEN_GUARDRAIL", "not-a-number"},
 		{"bad float", "NEXUS_RAG_THRESHOLD", "0.5x"},
 		{"bad duration", "NEXUS_SLM_TIMEOUT", "eight seconds"},
+		{"bad cascade duration", "NEXUS_CASCADE_TIMEOUT", "ten seconds"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

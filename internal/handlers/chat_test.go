@@ -121,12 +121,20 @@ func TestChatDSLLargePromptForcesFrontier(t *testing.T) {
 func TestChatDSLLowComplexityRoutesLocal(t *testing.T) {
 	deps, rt := baseDeps(t)
 	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("local stream"))
+		// Return a valid OpenAI-compatible completion so the cascade's
+		// validation accepts it and stops (no fallback to frontier).
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
 	})
 	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw := httptest.NewRecorder()
 	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rw.Code)
+	}
+	// Cascade should stop at local on first valid response.
 	if len(rt.Calls()) != 1 || rt.Calls()[0].URL != "http://ollama.local/v1/chat/completions" {
 		t.Fatalf("calls = %+v", rt.Calls())
 	}
@@ -138,6 +146,82 @@ func TestChatDSLLowComplexityRoutesLocal(t *testing.T) {
 	sys := msgs[0].(map[string]interface{})
 	if !strings.Contains(sys["content"].(string), "BOOST") {
 		t.Errorf("meta-prompt not applied: %q", sys["content"])
+	}
+	// The cascaded response should reach the harness.
+	if !strings.Contains(rw.Body.String(), "local stream") {
+		t.Errorf("body = %q", rw.Body.String())
+	}
+	if !strings.Contains(rw.Header().Get("X-Nexus-Cascade-Served-By"), "local") {
+		t.Errorf("served-by header missing: %q", rw.Header().Get("X-Nexus-Cascade-Served-By"))
+	}
+}
+
+// TestChatRouteLocalCascadeFallsBackToFrontier exercises the cascade from
+// the handler: local Ollama returns garbage, frontier (configured in
+// baseDeps) returns a valid OpenAI completion, and the harness receives
+// the frontier response with served_by=frontier.
+func TestChatRouteLocalCascadeFallsBackToFrontier(t *testing.T) {
+	deps, rt := baseDeps(t)
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		// Return something the cascade cannot validate: not a chat
+		// completion JSON shape. Triggers fallback.
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "not openai json")
+	})
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"frontier fallback"},"finish_reason":"stop"}]}`)
+	})
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rw.Code, rw.Body.String())
+	}
+	// Both local and frontier should have been called.
+	urls := make([]string, len(rt.Calls()))
+	for i, c := range rt.Calls() {
+		urls[i] = c.URL
+	}
+	if len(urls) != 2 {
+		t.Fatalf("expected 2 calls (local + fallback), got %d: %v", len(urls), urls)
+	}
+	if urls[0] != "http://ollama.local/v1/chat/completions" {
+		t.Errorf("first call = %q, want local", urls[0])
+	}
+	if urls[1] != "http://frontier.local" {
+		t.Errorf("second call = %q, want frontier", urls[1])
+	}
+	if !strings.Contains(rw.Body.String(), "frontier fallback") {
+		t.Errorf("body missing fallback content: %q", rw.Body.String())
+	}
+	if !strings.Contains(rw.Header().Get("X-Nexus-Cascade-Served-By"), "frontier") {
+		t.Errorf("served-by = %q, want frontier", rw.Header().Get("X-Nexus-Cascade-Served-By"))
+	}
+}
+
+// TestChatRouteLocalCascadeAllFail verifies the handler surfaces a 502
+// when every step in the cascade fails — the contract from issue #14:
+// "if all fail, return the last upstream's error to the client."
+func TestChatRouteLocalCascadeAllFail(t *testing.T) {
+	deps, rt := baseDeps(t)
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	})
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", rw.Code)
+	}
+	if len(rt.Calls()) != 2 {
+		t.Errorf("expected 2 calls (all steps), got %d", len(rt.Calls()))
 	}
 }
 
