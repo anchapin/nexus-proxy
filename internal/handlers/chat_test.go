@@ -10,13 +10,13 @@ import (
 	"strings"
 	"testing"
 
+	"context"
+
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
-
-import "context"
 
 type stubEmbedder struct{ vec []float64 }
 
