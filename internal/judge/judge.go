@@ -30,7 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"strconv"
@@ -202,7 +202,7 @@ func (e *Evaluator) Enqueue(s Sample) bool {
 	case e.queue <- s:
 		return true
 	default:
-		log.Printf("[JUDGE DROP]: queue full, dropping request %q", s.RequestID)
+		slog.Warn("judge queue full, dropped request", slog.String("request_id", s.RequestID))
 		return false
 	}
 }
@@ -231,7 +231,10 @@ func (e *Evaluator) worker() {
 	for s := range e.queue {
 		score := e.evaluate(s)
 		if err := e.storage.Record(score); err != nil {
-			log.Printf("[JUDGE ERROR]: storage.Record: %v", err)
+			slog.Error("judge storage record",
+				slog.String("request_id", s.RequestID),
+				slog.Any("err", err),
+			)
 		}
 	}
 }

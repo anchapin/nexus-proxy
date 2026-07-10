@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -112,7 +112,11 @@ func (c *Cascade) Run(w http.ResponseWriter, client Client, payload map[string]i
 		content, servedModel, err := fetchCascadeStep(ctx, client, step, payload)
 		cancel()
 		if err == nil {
-			log.Printf("[CASCADE]: served by %s (attempt %d/%d)", step.Name, i+1, len(c.Steps))
+			slog.Info("cascade served",
+				slog.String("step", step.Name),
+				slog.Int("attempt", i+1),
+				slog.Int("total", len(c.Steps)),
+			)
 			res.Succeeded = true
 			res.ServedBy = step.Name
 			if werr := writeSSEResponse(w, step.Name, servedModel, content); werr != nil {
@@ -122,7 +126,13 @@ func (c *Cascade) Run(w http.ResponseWriter, client Client, payload map[string]i
 		}
 		lastErr = err
 		retry := classifyFailure(err)
-		log.Printf("[CASCADE]: %s failed (attempt %d/%d, retry=%v): %v", step.Name, i+1, len(c.Steps), retry, err)
+		slog.Warn("cascade step failed",
+			slog.String("step", step.Name),
+			slog.Int("attempt", i+1),
+			slog.Int("total", len(c.Steps)),
+			slog.Bool("retry", retry),
+			slog.Any("err", err),
+		)
 		if !retry {
 			// Non-retryable (e.g. upstream returned 401/403): stop and surface.
 			return res, err

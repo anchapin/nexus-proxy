@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -34,15 +35,21 @@ const (
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
+		// The structured logger is not yet wired, so use the std
+		// log.Fatalf path. This is one of two unrecoverable boot
+		// errors (issue #3) — every other log call below flows
+		// through slog.
 		log.Fatalf("config: %v", err)
 	}
+	logger := cfg.NewLogger()
+	slog.SetDefault(logger)
 
 	emb := rag.NewOllamaEmbedder(cfg.OllamaURL, cfg.EmbeddingModel, nil)
 	store := rag.NewStore(emb, cfg.RAGThreshold)
 	bootCtx, cancel := context.WithTimeout(context.Background(), bootRAGTimeout)
 	defer cancel()
 	if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
-		log.Printf("[BOOT WARN]: RAG index failed: %v", err)
+		slog.Warn("rag index failed", slog.Any("err", err))
 	}
 
 	slm := router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, cfg.SLMTimeout, nil)
@@ -81,19 +88,23 @@ func main() {
 				Output:      c.Output,
 				LocalModel:  c.LocalModel,
 			}) {
-				log.Printf("[JUDGE DROP]: queue full, dropped %s", c.RequestID)
+				slog.Warn("judge queue full, dropped request", slog.String("request_id", c.RequestID))
 			}
 		})
-		log.Printf("[BOOT]: judge enabled (url=%s model=%s rate=%.2f concurrency=%d)",
-			cfg.JudgeURL, cfg.JudgeModel, cfg.JudgeSampleRate, cfg.JudgeConcurrency)
+		slog.Info("judge enabled",
+			slog.String("url", cfg.JudgeURL),
+			slog.String("model", cfg.JudgeModel),
+			slog.Float64("sample_rate", cfg.JudgeSampleRate),
+			slog.Int("concurrency", cfg.JudgeConcurrency),
+		)
 	} else {
-		log.Println("[BOOT]: judge disabled (sample rate <= 0 or no API key)")
+		slog.Info("judge disabled (sample rate <= 0 or no api key)")
 	}
 
 	recorder := buildRecorder(cfg)
 	defer func() {
 		if err := recorder.Close(); err != nil {
-			log.Printf("[TELEMETRY ERROR]: close: %v", err)
+			slog.Error("telemetry close", slog.Any("err", err))
 		}
 	}()
 
@@ -107,7 +118,7 @@ func main() {
 	defer func() {
 		if metricsStore != nil {
 			if err := metricsStore.Close(); err != nil {
-				log.Printf("[METRICS ERROR]: close: %v", err)
+				slog.Error("metrics close", slog.Any("err", err))
 			}
 		}
 	}()
@@ -136,12 +147,25 @@ func main() {
 				// verdict so operators can confirm the worker
 				// is doing real work.
 				if v.Err != nil {
-					log.Printf("[QUALITY]: request=%s path=%q root=%q pass=%v exit=%d err=%v",
-						v.Event.RequestID, v.Event.Path, v.RepoRoot, v.Pass, v.ExitCode, v.Err)
+					slog.Warn("quality verdict error",
+						slog.String("request_id", v.Event.RequestID),
+						slog.String("path", v.Event.Path),
+						slog.String("repo_root", v.RepoRoot),
+						slog.Bool("pass", v.Pass),
+						slog.Int("exit_code", v.ExitCode),
+						slog.Any("err", v.Err),
+					)
 					return
 				}
-				log.Printf("[QUALITY]: request=%s path=%q root=%q kind=%s pass=%v exit=%d duration=%dms",
-					v.Event.RequestID, v.Event.Path, v.RepoRoot, v.Kind, v.Pass, v.ExitCode, v.DurationMs)
+				slog.Info("quality verdict",
+					slog.String("request_id", v.Event.RequestID),
+					slog.String("path", v.Event.Path),
+					slog.String("repo_root", v.RepoRoot),
+					slog.String("kind", string(v.Kind)),
+					slog.Bool("pass", v.Pass),
+					slog.Int("exit_code", v.ExitCode),
+					slog.Int64("duration_ms", v.DurationMs),
+				)
 			}),
 		})
 		qualityO = handlers.QualityObserverFunc(func(e handlers.QualityEvent) {
@@ -150,18 +174,24 @@ func main() {
 				Path:      e.Path,
 				ToolName:  e.ToolName,
 			}) {
-				log.Printf("[QUALITY DROP]: queue full, dropped %s path=%q", e.RequestID, e.Path)
+				slog.Warn("quality queue full, dropped request",
+					slog.String("request_id", e.RequestID),
+					slog.String("path", e.Path),
+				)
 			}
 		})
-		log.Printf("[BOOT]: quality verifier enabled (concurrency=%d queue=%d timeout=%s)",
-			cfg.QualityConcurrency, cfg.QualityQueueDepth, cfg.QualityTimeout)
+		slog.Info("quality verifier enabled",
+			slog.Int("concurrency", cfg.QualityConcurrency),
+			slog.Int("queue", cfg.QualityQueueDepth),
+			slog.Duration("timeout", cfg.QualityTimeout),
+		)
 	} else {
-		log.Println("[BOOT]: quality verifier disabled (concurrency <= 0)")
+		slog.Info("quality verifier disabled (concurrency <= 0)")
 	}
 	defer func() {
 		if verifier != nil {
 			if err := verifier.Close(); err != nil {
-				log.Printf("[SHUTDOWN WARN]: quality verifier: %v", err)
+				slog.Warn("quality verifier close", slog.Any("err", err))
 			}
 		}
 	}()
@@ -182,7 +212,11 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	log.Printf("Starting Nexus Proxy on %s (local=%s frontier=%s)", cfg.Addr, cfg.LocalModel, cfg.FrontierModel)
+	slog.Info("starting nexus proxy",
+		slog.String("addr", cfg.Addr),
+		slog.String("local_model", cfg.LocalModel),
+		slog.String("frontier_model", cfg.FrontierModel),
+	)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           mux,
@@ -198,20 +232,22 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		log.Println("[SHUTDOWN]: draining judge queue and closing server...")
+		slog.Info("shutting down, draining judge queue and closing server")
 		if judgeEval != nil {
 			if err := judgeEval.Close(); err != nil {
-				log.Printf("[SHUTDOWN WARN]: judge close: %v", err)
+				slog.Warn("judge close", slog.Any("err", err))
 			}
 		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("[SHUTDOWN WARN]: server: %v", err)
+			slog.Warn("server shutdown", slog.Any("err", err))
 		}
 	}()
 
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		// Unrecoverable boot/server error — log.Fatalf is kept
+		// here per the issue #3 acceptance criteria.
 		log.Fatalf("server: %v", err)
 	}
 }
@@ -220,15 +256,15 @@ func main() {
 // TelemetryPath returns a Noop so the handler can stay recorder-agnostic.
 func buildRecorder(cfg config.Config) telemetry.Recorder {
 	if !cfg.TelemetryEnabled() {
-		log.Println("[TELEMETRY]: disabled (NEXUS_TELEMETRY_PATH is empty)")
+		slog.Info("telemetry disabled (NEXUS_TELEMETRY_PATH is empty)")
 		return telemetry.Noop{}
 	}
 	r, err := telemetry.NewJSONLRecorder(cfg.TelemetryPath)
 	if err != nil {
-		log.Printf("[TELEMETRY ERROR]: recorder init failed (%v); falling back to Noop", err)
+		slog.Error("telemetry recorder init failed, falling back to Noop", slog.Any("err", err))
 		return telemetry.Noop{}
 	}
-	log.Printf("[TELEMETRY]: recording to %s", r.Path())
+	slog.Info("telemetry recording", slog.String("path", r.Path()))
 	return r
 }
 
@@ -240,16 +276,16 @@ func buildRecorder(cfg config.Config) telemetry.Recorder {
 // metrics.Request — same pattern as the judge/quality observers.
 func buildMetrics(cfg config.Config) (metrics.Store, handlers.MetricsObserver) {
 	if !cfg.MetricsEnabled() {
-		log.Println("[METRICS]: disabled (NEXUS_METRICS_DB is empty)")
+		slog.Info("metrics disabled (NEXUS_METRICS_DB is empty)")
 		return nil, nil
 	}
 	store, err := metrics.Open(cfg.MetricsDBPath)
 	if err != nil {
-		log.Printf("[METRICS ERROR]: open failed (%v); metrics disabled", err)
+		slog.Error("metrics open failed, metrics disabled", slog.Any("err", err))
 		return nil, nil
 	}
 	if ss, ok := store.(*metrics.SQLiteStore); ok {
-		log.Printf("[METRICS]: recording to %s", ss.Path())
+		slog.Info("metrics recording", slog.String("path", ss.Path()))
 	}
 	obs := handlers.MetricsObserverFunc(func(e handlers.MetricsEvent) {
 		// The adapter does its own error handling — RecordRequest

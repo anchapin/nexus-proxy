@@ -10,7 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
@@ -241,8 +241,11 @@ func Chat(d Deps) http.Handler {
 			if errors.As(err, &maxErr) {
 				writeJSONError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
 					"Request body exceeds NEXUS_MAX_BODY_BYTES (%d bytes)", maxBytes))
-				log.Printf("[HARDENING]: rejected oversized request from %s (limit=%d)",
-					r.RemoteAddr, maxBytes)
+				slog.Warn("rejected oversized request",
+					slog.String("remote", r.RemoteAddr),
+					slog.Int("limit_bytes", maxBytes),
+					slog.String("request_id", reqID),
+				)
 				return
 			}
 			http.Error(w, "Failed to read request", http.StatusBadRequest)
@@ -265,7 +268,11 @@ func Chat(d Deps) http.Handler {
 		var ragFilename string
 		if ex, score, err := d.RAG.Retrieve(r.Context(), latestPrompt); err == nil && ex != nil {
 			messages = middleware.InjectRAG(messages, rag.FormatInjection(ex))
-			log.Printf("[RAG HIT]: Injected %s (Score: %.2f)", ex.Filename, score)
+			slog.Info("rag hit",
+				slog.String("filename", ex.Filename),
+				slog.Float64("score", score),
+				slog.String("request_id", reqID),
+			)
 			ragInjected = true
 			ragFilename = ex.Filename
 			_ = score
@@ -278,26 +285,39 @@ func Chat(d Deps) http.Handler {
 		preCompressionChars := totalMessageChars(messages)
 		if middleware.CompressJSONBlocks(messages) {
 			messages = middleware.AppendSystemNote(messages, d.Config.TOONNotice)
-			log.Println("[TOON COMPRESSOR]: Successfully compressed JSON data arrays.")
+			slog.Info("toon compressed messages", slog.String("request_id", reqID))
 		}
 		body["messages"] = messages
 		latestPrompt = middleware.ExtractLatestUserPrompt(messages)
 
 		var route router.Route
 		if g, hit := router.Guardrail(latestPrompt, d.Config.TokenGuardrail); hit {
-			log.Printf("[ROUTER]: DSL Match (Context too large: ~%d tokens) -> Force routing to FRONTIER", len(latestPrompt)/4)
+			slog.Info("guardrail forced frontier",
+				slog.String("reason", "vram"),
+				slog.Int("estimated_tokens", len(latestPrompt)/4),
+				slog.String("request_id", reqID),
+			)
 			route = g
 		} else if r2, hit := router.DSL(latestPrompt, d.FormattingRegex); hit {
-			log.Printf("[ROUTER]: DSL Match -> %s", r2)
+			slog.Info("dsl match",
+				slog.String("route", string(r2)),
+				slog.String("request_id", reqID),
+			)
 			route = r2
 		} else {
-			log.Println("[ROUTER]: DSL bypassed, asking SLM for analysis...")
+			slog.Debug("dsl bypassed, asking slm", slog.String("request_id", reqID))
 			dec, err := d.SLM.Decide(r.Context(), latestPrompt)
 			if err != nil {
-				log.Printf("[SLM ERROR]: %v. Defaulting to Frontier.", err)
+				slog.Error("slm error, defaulting to frontier",
+					slog.Any("err", err),
+					slog.String("request_id", reqID),
+				)
 				dec = router.RouteFrontier
 			}
-			log.Printf("[ROUTER]: SLM Decision -> %s", dec)
+			slog.Info("slm decision",
+				slog.String("route", string(dec)),
+				slog.String("request_id", reqID),
+			)
 			route = dec
 		}
 
@@ -321,7 +341,7 @@ func Chat(d Deps) http.Handler {
 		var upErr error
 		switch route {
 		case router.RouteFusion:
-			log.Println("[FUSION]: Spinning up model panel...")
+			slog.Info("starting fusion panel", slog.String("request_id", reqID))
 			upErr = upstream.Panel(
 				obs, d.Client,
 				d.Config.OllamaURL, d.Config.LocalModel,
@@ -331,7 +351,10 @@ func Chat(d Deps) http.Handler {
 				d.Config.ArbiterTimeout,
 			)
 			if upErr != nil {
-				log.Printf("[FUSION ERROR]: %v", upErr)
+				slog.Error("fusion error",
+					slog.Any("err", upErr),
+					slog.String("request_id", reqID),
+				)
 				http.Error(w, "Upstream error", http.StatusBadGateway)
 			}
 			model = d.Config.FrontierModel
@@ -370,9 +393,12 @@ func Chat(d Deps) http.Handler {
 				rw = cap
 			}
 			res, err := cas.Run(rw, d.Client, body)
-			logCascadeTelemetry(res, err)
+			logCascadeTelemetry(res, err, reqID)
 			if err != nil {
-				log.Printf("[UPSTREAM ERROR]: %v", err)
+				slog.Error("upstream error",
+					slog.Any("err", err),
+					slog.String("request_id", reqID),
+				)
 				upErr = err
 				http.Error(w, "Upstream error", http.StatusBadGateway)
 				// fall through: telemetry Record still fires below so
@@ -398,7 +424,10 @@ func Chat(d Deps) http.Handler {
 			model = d.Config.FrontierModel
 			if upErr = upstream.Stream(obs, d.Client,
 				d.Config.FrontierURL, d.Config.FrontierKey, body); upErr != nil {
-				log.Printf("[UPSTREAM ERROR]: %v", upErr)
+				slog.Error("upstream error",
+					slog.Any("err", upErr),
+					slog.String("request_id", reqID),
+				)
 				http.Error(w, "Upstream error", http.StatusBadGateway)
 			}
 		}
@@ -450,10 +479,17 @@ func Chat(d Deps) http.Handler {
 
 // logCascadeTelemetry emits the route_attempted / attempts line for the
 // cascade. Once issue #16 wires a real metrics store this becomes the
-// place to publish a structured event; for now it's plain log.Println.
-func logCascadeTelemetry(res upstream.CascadeResult, err error) {
-	log.Printf("[CASCADE TELEMETRY]: route_attempted=%s attempts=%d served_by=%s success=%v err=%v",
-		res.RouteAttempted, res.Attempts, res.ServedBy, res.Succeeded, err)
+// place to publish a structured event; for now it is a structured slog
+// event (issue #3).
+func logCascadeTelemetry(res upstream.CascadeResult, err error, requestID string) {
+	slog.Info("cascade result",
+		slog.String("route_attempted", res.RouteAttempted),
+		slog.Int("attempts", res.Attempts),
+		slog.String("served_by", res.ServedBy),
+		slog.Bool("success", res.Succeeded),
+		slog.Any("err", err),
+		slog.String("request_id", requestID),
+	)
 }
 
 // writeJSONError writes a structured JSON error response. Used for the
