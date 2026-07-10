@@ -46,6 +46,12 @@ type Config struct {
 	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
 	ArbiterTimeout time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
+	// HTTP request body cap (issue #11). The chat handler applies this
+	// with http.MaxBytesReader before reading the request body, so an
+	// oversized POST cannot exhaust proxy memory before the guardrail
+	// runs. Zero or negative falls back to DefaultMaxBodyBytes.
+	MaxBodyBytes int
+
 	// Judge (async LLM-as-a-judge evaluator). All zero/empty values
 	// disable the judge; the chat handler is unaffected when the
 	// evaluator is wired to a no-op observer (see cmd/nexus/main.go).
@@ -146,6 +152,16 @@ func Load() (Config, error) {
 	}
 	cfg.ArbiterTimeout = arbiterTimeout
 
+	// Hard request-body cap (issue #11). Default 1 MiB matches typical
+	// OpenAI-compatible request sizes; the chat handler wraps r.Body
+	// with http.MaxBytesReader so an oversized POST is rejected with
+	// 413 before any allocation happens.
+	maxBodyBytes, err := getEnvInt("NEXUS_MAX_BODY_BYTES", DefaultMaxBodyBytes)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.MaxBodyBytes = maxBodyBytes
+
 	// Judge (issue #15). Defaults: z.ai-style endpoint, sample 10% of
 	// local-route successes, 2 concurrent workers, 30s per call. When
 	// JudgeURL is unset we fall back to NEXUS_FRONTIER_URL so a stock
@@ -230,6 +246,21 @@ func Load() (Config, error) {
 // still runs without one (fusion will degrade to local-only), but frontier
 // routing will return 401s if attempted.
 func (c Config) FrontierEnabled() bool { return c.FrontierKey != "" }
+
+// DefaultMaxBodyBytes is the fallback request-body cap (issue #11). 1 MiB
+// matches the typical OpenAI chat-completions request envelope; agents that
+// need more room can raise it via NEXUS_MAX_BODY_BYTES.
+const DefaultMaxBodyBytes = 1 << 20 // 1 MiB
+
+// EffectiveMaxBodyBytes returns the request-body cap the chat handler should
+// enforce. Zero or negative values fall back to DefaultMaxBodyBytes so a
+// zero-value Config (e.g. inside unit tests) still gets a sane cap.
+func (c Config) EffectiveMaxBodyBytes() int {
+	if c.MaxBodyBytes > 0 {
+		return c.MaxBodyBytes
+	}
+	return DefaultMaxBodyBytes
+}
 
 // TelemetryEnabled reports whether the on-disk recorder should be started.
 // Disabled when TelemetryPath is empty.

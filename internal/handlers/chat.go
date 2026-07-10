@@ -7,6 +7,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -167,8 +169,24 @@ func Chat(d Deps) http.Handler {
 			return
 		}
 
+		// Hard cap on request body (issue #11). Wrap with
+		// http.MaxBytesReader BEFORE any allocation so an oversized
+		// POST cannot exhaust proxy memory; MaxBytesReader caps
+		// reads at the limit and surfaces *http.MaxBytesError on
+		// overflow, which we translate to 413 below.
+		maxBytes := d.Config.EffectiveMaxBodyBytes()
+		r.Body = http.MaxBytesReader(w, r.Body, int64(maxBytes))
+
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writeJSONError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
+					"Request body exceeds NEXUS_MAX_BODY_BYTES (%d bytes)", maxBytes))
+				log.Printf("[HARDENING]: rejected oversized request from %s (limit=%d)",
+					r.RemoteAddr, maxBytes)
+				return
+			}
 			http.Error(w, "Failed to read request", http.StatusBadRequest)
 			return
 		}
@@ -326,6 +344,22 @@ func Chat(d Deps) http.Handler {
 func logCascadeTelemetry(res upstream.CascadeResult, err error) {
 	log.Printf("[CASCADE TELEMETRY]: route_attempted=%s attempts=%d served_by=%s success=%v err=%v",
 		res.RouteAttempted, res.Attempts, res.ServedBy, res.Succeeded, err)
+}
+
+// writeJSONError writes a structured JSON error response. Used for the
+// 413 body-cap overflow (issue #11) so clients get a parseable error
+// rather than a plain-text body. The shape matches the OpenAI error
+// envelope (`{"error":{"message":...,"type":...}}`) so existing
+// OpenAI-compatible clients surface the message without changes.
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error": map[string]string{
+			"message": message,
+			"type":    http.StatusText(status),
+		},
+	})
 }
 
 // requestID extracts (or generates) a correlation id for the judge
