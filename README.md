@@ -160,4 +160,4 @@ next planned body of work.
 
 ## License
 
-TBD — pick one before the public release.
+MIT — see [LICENSE](LICENSE).
