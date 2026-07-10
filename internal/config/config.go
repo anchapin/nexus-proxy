@@ -44,6 +44,7 @@ type Config struct {
 	SLMTimeout     time.Duration // Qwen3-Coder routing timeout (8s)
 	FusionTimeout  time.Duration // per-panel-member fetch timeout (120s)
 	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
+	ArbiterTimeout time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
 	// Judge (async LLM-as-a-judge evaluator). All zero/empty values
 	// disable the judge; the chat handler is unaffected when the
@@ -122,6 +123,15 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.CascadeTimeout = cascadeTimeout
+
+	// Fusion arbiter synthesis (issue #12). Shorter than FusionTimeout
+	// because the arbiter is doing synthesis, not generation — a slow
+	// arbiter should not pin the whole request indefinitely.
+	arbiterTimeout, err := getEnvDuration("NEXUS_ARBITER_TIMEOUT", 60*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ArbiterTimeout = arbiterTimeout
 
 	// Judge (issue #15). Defaults: z.ai-style endpoint, sample 10% of
 	// local-route successes, 2 concurrent workers, 30s per call. When

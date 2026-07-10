@@ -26,12 +26,27 @@ type Client interface {
 // harness's expected SSE framing — each `data: {…}\n\n` arrives intact.
 //
 // apiKey may be empty (local Ollama has no auth).
+//
+// Stream is a thin wrapper around StreamWithContext that uses a fresh
+// context.Background(). Callers that need a timeout (issue #12: the
+// fusion arbiter) should use StreamWithContext directly.
 func Stream(w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}) error {
+	return StreamWithContext(context.Background(), w, client, targetURL, apiKey, payload)
+}
+
+// StreamWithContext is Stream plus an explicit request context. The
+// context is bound to the upstream POST via http.NewRequestWithContext,
+// so cancellation (e.g. via context.WithTimeout) propagates both
+// client-side (cancels the in-flight request) and server-side
+// (cancels the handler's r.Context()). Use this from callers that
+// need to bound an upstream call — issue #12 added NEXUS_ARBITER_TIMEOUT
+// for exactly this purpose on the fusion arbiter path.
+func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}) error {
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("upstream: marshal: %w", err)
 	}
-	req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(jsonPayload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(jsonPayload))
 	if err != nil {
 		return fmt.Errorf("upstream: build request: %w", err)
 	}
@@ -140,7 +155,11 @@ type PanelResult struct {
 //
 // arbiterURL/arbiterKey/arbiterModel identify the synthesis model. The
 // arbiter receives a single user message containing both candidates and
-// streams the synthesized reply via Stream.
+// streams the synthesized reply via Stream. The arbiter call is bounded
+// by arbiterTimeout (issue #12, NEXUS_ARBITER_TIMEOUT, default 60s) via
+// StreamWithContext so a slow synthesis endpoint cannot block the
+// handler indefinitely — without this the arbiter inherits the shared
+// http.DefaultClient which has no timeout.
 func Panel(
 	w http.ResponseWriter,
 	client Client,
@@ -149,6 +168,7 @@ func Panel(
 	body map[string]interface{},
 	latestPrompt string,
 	perFetchTimeout time.Duration,
+	arbiterTimeout time.Duration,
 ) error {
 	results := make(chan PanelResult, 2)
 	go func() {
@@ -177,7 +197,25 @@ func Panel(
 		},
 		"stream": true,
 	}
-	return Stream(w, client, arbiterURL, arbiterKey, synthBody)
+	// Bound the arbiter call (issue #12). The two panel-member fetches
+	// above already enforce perFetchTimeout via FetchPanel's context,
+	// so we leave them alone and only the arbiter stream picks up the
+	// new arbiterTimeout knob.
+	arbiterCtx, cancelArbiter := context.WithTimeout(context.Background(), withDefaultArbiterTimeout(arbiterTimeout))
+	defer cancelArbiter()
+	return StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody)
+}
+
+// arbiterDefaultTimeout is the per-call arbiter timeout used when
+// Panel's arbiterTimeout argument is <= 0. Mirrors the issue default
+// ("configurable, default 60s").
+const arbiterDefaultTimeout = 60 * time.Second
+
+func withDefaultArbiterTimeout(d time.Duration) time.Duration {
+	if d <= 0 {
+		return arbiterDefaultTimeout
+	}
+	return d
 }
 
 // SynthesisPrompt formats the arbiter prompt. Exported so the handler and
