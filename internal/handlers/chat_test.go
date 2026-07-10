@@ -340,7 +340,9 @@ func TestChatLocalRouteInvokesObserverWithInstructionAndOutput(t *testing.T) {
 	obs := &recordingObserver{}
 	deps.JudgeObserver = obs
 	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\n"))
+		// Cascade (issue #14) consumes a non-streaming JSON body and
+		// re-emits it as a single SSE chunk via writeSSEResponse.
+		_, _ = w.Write([]byte(`{"model":"qwen3-coder:8b","choices":[{"message":{"content":"hello world"}}]}`))
 	})
 	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -377,7 +379,9 @@ func TestChatLocalRouteObserverNilSkipsCapture(t *testing.T) {
 	// and the test should not observe any side effects beyond that.
 	deps, rt := baseDeps(t)
 	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("plain streamed body"))
+		// Cascade consumer: non-streaming JSON; the cascade's
+		// writeSSEResponse re-emits the content as a single SSE chunk.
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"plain streamed body"}}]}`))
 	})
 	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -421,7 +425,8 @@ func TestChatObserverHonoursRequestIDHeader(t *testing.T) {
 	obs := &recordingObserver{}
 	deps.JudgeObserver = obs
 	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("ok"))
+		// Cascade consumer: non-streaming JSON.
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
 	})
 	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))

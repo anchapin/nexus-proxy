@@ -161,7 +161,6 @@ func Load() (Config, error) {
 	// condition during local development).
 	cfg.JudgeEnabled = cfg.JudgeSampleRate > 0 && cfg.JudgeURL != "" && cfg.JudgeModel != ""
 
-
 	return cfg, nil
 }
 
