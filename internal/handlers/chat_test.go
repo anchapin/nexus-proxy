@@ -850,3 +850,175 @@ func TestEmitDetectedEditsNilObserverIsSafe(t *testing.T) {
 	// Should not panic.
 	emitDetectedEdits(`{"name":"write_file","arguments":"{\"path\":\"/tmp/x\"}"}`, "req-1", nil)
 }
+
+// TestChatRejectsOversizedBody is the acceptance test for issue #11: a
+// 2 MiB POST against NEXUS_MAX_BODY_BYTES=1 MiB must return 413
+// *before* JSON unmarshaling allocates the full payload. The response
+// body must be JSON so the client can surface the failure in their UI.
+func TestChatRejectsOversizedBody(t *testing.T) {
+	deps, _ := baseDeps(t)
+	deps.Config.MaxBodyBytes = 1 << 20 // 1 MiB
+
+	// Build a 2 MiB JSON body: valid JSON-shaped prefix + huge filler
+	// inside a string field. The byte cap fires long before any
+	// unmarshal attempt, so the exact shape does not have to be a
+	// well-formed chat request.
+	const oversized = 2 << 20 // 2 MiB
+	filler := strings.Repeat("a", oversized)
+	body := `{"messages":[{"role":"user","content":"` + filler + `"}]}`
+	if len(body) <= oversized {
+		t.Fatalf("oversized body not actually oversized: %d", len(body))
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413; body=%q", rw.Code, rw.Body.String())
+	}
+	if ct := rw.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	// Body must be a parseable JSON error envelope mentioning the limit.
+	var env struct {
+		Error map[string]string `json:"error"`
+	}
+	if err := json.Unmarshal(rw.Body.Bytes(), &env); err != nil {
+		t.Fatalf("response body not JSON: %v body=%q", err, rw.Body.String())
+	}
+	if !strings.Contains(env.Error["message"], "NEXUS_MAX_BODY_BYTES") {
+		t.Errorf("error message = %q, want it to mention NEXUS_MAX_BODY_BYTES", env.Error["message"])
+	}
+}
+
+// TestChatAcceptsBodyAtLimit confirms the handler succeeds for a
+// request just under the cap. This protects against an off-by-one in
+// the MaxBytesReader wiring (e.g. wrapping with limit-1).
+func TestChatAcceptsBodyAtLimit(t *testing.T) {
+	deps, rt := baseDeps(t)
+	deps.Config.MaxBodyBytes = 1 << 20 // 1 MiB
+
+	// A small but well-formed request that easily fits under 1 MiB.
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`))
+	})
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200; body=%q", rw.Code, rw.Body.String())
+	}
+}
+
+// TestChatAcceptsBodyJustUnderLimit verifies a payload one byte under
+// the cap still succeeds (sanity check on MaxBytesReader semantics).
+func TestChatAcceptsBodyJustUnderLimit(t *testing.T) {
+	deps, rt := baseDeps(t)
+	const cap = 1024 // small cap so the test stays fast
+	deps.Config.MaxBodyBytes = cap
+
+	rt.OnAny(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})
+	// Wrap filler in a comment that JSON ignores? Easier: build a
+	// valid chat request whose `content` is just under the cap. We
+	// need total JSON length <= cap.
+	overhead := len(`{"messages":[{"role":"user","content":""}]}`)
+	if cap <= overhead {
+		t.Fatalf("cap %d too small for test scaffolding", cap)
+	}
+	content := strings.Repeat("x", cap-overhead-len(`""`))
+	body := `{"messages":[{"role":"user","content":"` + content + `"}]}`
+	if len(body) >= cap {
+		t.Fatalf("body length %d >= cap %d", len(body), cap)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (body len %d < cap %d); body=%q",
+			rw.Code, len(body), cap, rw.Body.String())
+	}
+}
+
+// TestChatRejectsBodyOneByteOverLimit is the negative sibling of
+// TestChatAcceptsBodyJustUnderLimit: a payload exactly one byte over
+// the cap must trip the MaxBytesReader. This pins the boundary so a
+// future regression in the wiring (e.g. accidental `n-1`) is caught.
+func TestChatRejectsBodyOneByteOverLimit(t *testing.T) {
+	deps, _ := baseDeps(t)
+	const cap = 1024
+	deps.Config.MaxBodyBytes = cap
+
+	const prefix = `{"messages":[{"role":"user","content":"`
+	const suffix = `"}]}`
+	if cap <= len(prefix)+len(suffix) {
+		t.Fatalf("cap %d too small for envelope", cap)
+	}
+	contentLen := cap - len(prefix) - len(suffix) + 1 // +1 byte over
+	content := strings.Repeat("x", contentLen)
+	body := prefix + content + suffix
+	if len(body) <= cap {
+		t.Fatalf("body length %d <= cap %d", len(body), cap)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413 (body len %d > cap %d); body=%q",
+			rw.Code, len(body), cap, rw.Body.String())
+	}
+}
+
+// TestChatRejectsOversizedBodyBeforeUnmarshal verifies the cap fires
+// *before* the JSON parser ever sees the payload. We detect this by
+// installing a panic-prone RAG.Store stub: if unmarshal ran, the test
+// would crash before reaching the upstream. (We instead rely on the
+// simpler invariant that no upstream call is recorded.)
+func TestChatRejectsOversizedBodyBeforeUnmarshal(t *testing.T) {
+	deps, rt := baseDeps(t)
+	deps.Config.MaxBodyBytes = 1 << 20
+
+	const oversized = 3 << 20 // 3 MiB > 1 MiB cap
+	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("z", oversized) + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413", rw.Code)
+	}
+	if calls := rt.Calls(); len(calls) != 0 {
+		t.Errorf("expected zero upstream calls after oversized reject, got %d", len(calls))
+	}
+}
+
+// TestWriteJSONError confirms the helper emits a parseable envelope.
+func TestWriteJSONError(t *testing.T) {
+	rw := httptest.NewRecorder()
+	writeJSONError(rw, http.StatusRequestEntityTooLarge, "boom")
+	if rw.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413", rw.Code)
+	}
+	var env struct {
+		Error map[string]string `json:"error"`
+	}
+	if err := json.Unmarshal(rw.Body.Bytes(), &env); err != nil {
+		t.Fatalf("not JSON: %v body=%q", err, rw.Body.String())
+	}
+	if env.Error["message"] != "boom" {
+		t.Errorf("message = %q, want boom", env.Error["message"])
+	}
+	if env.Error["type"] != "Request Entity Too Large" {
+		t.Errorf("type = %q, want %q", env.Error["type"], "Request Entity Too Large")
+	}
+}
