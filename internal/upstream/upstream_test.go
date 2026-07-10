@@ -269,6 +269,7 @@ func TestPanelArbiterTimeoutBoundsHangingCall(t *testing.T) {
 		"test prompt",
 		5*time.Second, // perFetchTimeout (panel members)
 		arbiterTO,     // arbiterTimeout
+		false,         // skipLocal
 	)
 	elapsed := time.Since(start)
 
@@ -322,6 +323,7 @@ func TestPanelArbiterHappyPathNoRegression(t *testing.T) {
 		"test prompt",
 		5*time.Second, // perFetchTimeout
 		5*time.Second, // arbiterTimeout
+		false,         // skipLocal
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -330,6 +332,113 @@ func TestPanelArbiterHappyPathNoRegression(t *testing.T) {
 	}
 	if !rw.flushed {
 		t.Error("expected Flush() to be called on arbiter stream")
+	}
+}
+
+// TestPanelSkipLocalOmitsLocalFetch is the acceptance test for
+// issue #8's graceful-degradation path: when skipLocal is true the
+// local Ollama fetch must not happen (the count of local URL
+// requests is zero), the arbiter must still see a synthesizable
+// candidate set (frontier content), and the arbiter stream must
+// reach the client.
+func TestPanelSkipLocalOmitsLocalFetch(t *testing.T) {
+	// Panel calls FetchPanel with these URLs verbatim, so the
+	// fake transport handlers must register the exact same
+	// strings (no implicit "/v1/chat/completions" suffixing — see
+	// FetchPanel and Panel signatures in upstream.go).
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("local URL was hit even though skipLocal=true")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"should not appear"}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier only"}}]}`)
+	})
+	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"arb\":\"ok\"}\n\n")
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	if err := Panel(
+		rw, client,
+		"http://local.local", "local-m",
+		frontierURL, "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		5*time.Second, // perFetchTimeout
+		5*time.Second, // arbiterTimeout
+		true,          // skipLocal
+	); err != nil {
+		t.Fatalf("Panel: %v", err)
+	}
+	if got := *ft.counter(localURL); got != 0 {
+		t.Errorf("local fetch count = %d, want 0", got)
+	}
+	if got := *ft.counter(frontierURL); got != 1 {
+		t.Errorf("frontier fetch count = %d, want 1", got)
+	}
+	if !strings.Contains(rw.body.String(), `"arb":"ok"`) {
+		t.Errorf("arbiter stream not forwarded: %q", rw.body.String())
+	}
+}
+
+// TestPanelSkipLocalArbiterPromptHasDegradedMarker confirms the
+// arbiter prompt still carries an explicit "[local failed: ...]"
+// marker when the local fetch is skipped, so the arbiter is not
+// confused into thinking the local slot is empty rather than
+// deliberately omitted.
+func TestPanelSkipLocalArbiterPromptHasDegradedMarker(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier"}}]}`)
+	})
+	var seenArbiterBody string
+	ft.on(arbiterURL, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		seenArbiterBody = string(b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "data: {\"a\":1}\n\n")
+	})
+	client := &http.Client{Transport: ft}
+
+	if err := Panel(
+		newSSERW(), client,
+		localURL, "local-m",
+		frontierURL, "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"the user prompt",
+		5*time.Second, 5*time.Second,
+		true, // skipLocal
+	); err != nil {
+		t.Fatalf("Panel: %v", err)
+	}
+	if !strings.Contains(seenArbiterBody, "[local failed") {
+		t.Errorf("arbiter prompt missing [local failed marker: %s", seenArbiterBody)
+	}
+	if !strings.Contains(seenArbiterBody, "ollama unavailable (degraded)") {
+		t.Errorf("arbiter prompt missing degraded sentinel: %s", seenArbiterBody)
+	}
+	if !strings.Contains(seenArbiterBody, "frontier") {
+		t.Errorf("arbiter prompt missing frontier candidate: %s", seenArbiterBody)
 	}
 }
 
@@ -508,6 +617,7 @@ func TestPanelArbiterHonorsStreamFlagFalse(t *testing.T) {
 		"test prompt",
 		5*time.Second,
 		5*time.Second,
+		false, // skipLocal (issue #8)
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -568,6 +678,7 @@ func TestPanelArbiterHonorsStreamFlagTrueRegression(t *testing.T) {
 		"test prompt",
 		5*time.Second,
 		5*time.Second,
+		false, // skipLocal (issue #8)
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}

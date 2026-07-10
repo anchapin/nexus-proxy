@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/config"
+	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
@@ -161,6 +162,163 @@ func TestChatDSLLowComplexityRoutesLocal(t *testing.T) {
 	if !strings.Contains(rw.Header().Get("X-Nexus-Cascade-Served-By"), "local") {
 		t.Errorf("served-by header missing: %q", rw.Header().Get("X-Nexus-Cascade-Served-By"))
 	}
+	// Issue #8: every response carries X-Nexus-Degraded. Healthy
+	// local Ollama -> "false".
+	if got := rw.Header().Get("X-Nexus-Degraded"); got != "false" {
+		t.Errorf("X-Nexus-Degraded = %q, want \"false\"", got)
+	}
+}
+
+// TestChatRouteLocalHealthyDegradesToFrontier verifies the
+// graceful-degradation path (issue #8): when the health poller
+// reports Ollama unreachable, a route=local request must be served
+// by the frontier endpoint and the response must carry
+// X-Nexus-Degraded: true. The local Ollama URL must NOT be hit at
+// all (issue requirement: avoid paying the timeout cost).
+func TestChatRouteLocalHealthyDegradesToFrontier(t *testing.T) {
+	deps, rt := baseDeps(t)
+	// Trip the breaker directly via Probe — no background goroutine
+	// needed, so the test stays race-free.
+	deps.Health = tripBreaker(t)
+
+	// Frontier is configured to return a valid OpenAI completion.
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"frontier fallback content"},"finish_reason":"stop"}]}`)
+	})
+	// Local MUST NOT be hit; if it is, the test fails.
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("local Ollama URL was hit even though health.IsLocalHealthy=false")
+	})
+
+	// DSL "css" keyword forces route=local (no token-guardrail trip).
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rw.Code, rw.Body.String())
+	}
+	// Verify only frontier was called.
+	var sawLocal, sawFrontier bool
+	for _, c := range rt.Calls() {
+		switch c.URL {
+		case "http://ollama.local/v1/chat/completions":
+			sawLocal = true
+		case "http://frontier.local":
+			sawFrontier = true
+		}
+	}
+	if sawLocal {
+		t.Error("local Ollama was called despite IsLocalHealthy=false")
+	}
+	if !sawFrontier {
+		t.Error("frontier was not called on degraded route=local")
+	}
+	if got := rw.Header().Get("X-Nexus-Degraded"); got != "true" {
+		t.Errorf("X-Nexus-Degraded = %q, want \"true\"", got)
+	}
+	if got := rw.Header().Get("X-Nexus-Cascade-Served-By"); !strings.Contains(got, "frontier") {
+		t.Errorf("X-Nexus-Cascade-Served-By = %q, want frontier", got)
+	}
+	if !strings.Contains(rw.Body.String(), "frontier fallback content") {
+		t.Errorf("body missing frontier content: %q", rw.Body.String())
+	}
+}
+
+// TestChatRouteFusionHealthySkipsLocalPanel verifies the fusion
+// graceful-degradation path (issue #8): when the health poller
+// reports Ollama unreachable, a route=fusion request must skip
+// the local panel member and serve the arbiter's synthesis of the
+// frontier candidate alone. The local Ollama URL must NOT be hit.
+func TestChatRouteFusionHealthySkipsLocalPanel(t *testing.T) {
+	deps, rt := baseDeps(t)
+	deps.Health = tripBreaker(t)
+
+	// Local Ollama MUST NOT be hit.
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("local Ollama URL was hit on degraded route=fusion")
+	})
+	// Frontier + arbiter respond normally.
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"frontier candidate"},"finish_reason":"stop"}]}`)
+	})
+	rt.OnAny(func(w http.ResponseWriter, r *http.Request) {
+		// Anything else (e.g. the arbiter request) gets a
+		// minimal SSE stream.
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"synth\":\"ok\"}\n\n")
+	})
+
+	// DSL "system architecture" forces route=fusion.
+	body := `{"messages":[{"role":"user","content":"design the system architecture"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rw.Code, rw.Body.String())
+	}
+	var sawLocal bool
+	for _, c := range rt.Calls() {
+		if c.URL == "http://ollama.local/v1/chat/completions" {
+			sawLocal = true
+		}
+	}
+	if sawLocal {
+		t.Errorf("local Ollama was called on degraded fusion; calls=%+v", rt.Calls())
+	}
+	if got := rw.Header().Get("X-Nexus-Degraded"); got != "true" {
+		t.Errorf("X-Nexus-Degraded = %q, want \"true\"", got)
+	}
+}
+
+// TestChatRouteFrontierStampsDegradedFalse confirms that a
+// route=frontier request still receives the X-Nexus-Degraded
+// response header (set to "false"), so callers can rely on the
+// header being present on every proxied response.
+func TestChatRouteFrontierStampsDegradedFalse(t *testing.T) {
+	deps, rt := baseDeps(t)
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("frontier stream"))
+	})
+	// Large prompt -> guardrail forces FRONTIER route.
+	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 30000) + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rw.Code, rw.Body.String())
+	}
+	if got := rw.Header().Get("X-Nexus-Degraded"); got != "false" {
+		t.Errorf("X-Nexus-Degraded = %q, want \"false\"", got)
+	}
+}
+
+// tripBreaker returns a Health whose IsLocalHealthy returns false.
+// We avoid spinning up the poller goroutine (and the Close/cancel
+// dance that goes with it) by issuing a single failed Probe against
+// a stub server that returns 503. Threshold is 1 so one failure is
+// enough to flip the breaker.
+func tripBreaker(t *testing.T) *health.Health {
+	t.Helper()
+	deadSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "down", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(deadSrv.Close)
+	h := health.New(deadSrv.URL, time.Hour, 1, 2*time.Second, &http.Client{Timeout: 2 * time.Second})
+	if err := h.Probe(context.Background()); err == nil {
+		t.Fatal("expected Probe to fail against a 503 server")
+	}
+	if h.IsLocalHealthy() {
+		t.Fatalf("breaker did not trip; failureCount=%d", h.FailureCount())
+	}
+	return h
 }
 
 // TestChatRouteLocalCascadeFallsBackToFrontier exercises the cascade from

@@ -63,6 +63,26 @@ complexity.
   ```
 - A frontier API key (OpenAI or any OpenAI-compatible endpoint)
 
+> **Graceful degradation (issue #8).** If Ollama becomes unreachable
+> after the proxy has booted, a background health poller pings
+> `GET /api/tags` every `NEXUS_HEALTH_POLL_INTERVAL` (default 30s).
+> After `NEXUS_HEALTH_BREAKER_THRESHOLD` (default 3) consecutive
+> failed probes the breaker trips and:
+>
+> - `route=local` requests are rerouted to the configured frontier
+>   endpoint (the local step is omitted from the cascade).
+> - `route=fusion` requests still run the arbiter synthesis, but
+>   the local panel member is skipped — the arbiter sees a synthetic
+>   "[local failed: ollama unavailable (degraded)]" marker and
+>   synthesises from the frontier candidate alone.
+> - Every proxied response carries `X-Nexus-Degraded: true` while
+>   the breaker is open (and `X-Nexus-Degraded: false` once Ollama
+>   recovers — the breaker reopens on the first successful probe).
+>
+> Set `NEXUS_HEALTH_POLL_INTERVAL=0` to disable the poller entirely
+> (the proxy then assumes local Ollama is always healthy and will
+> pay the per-request upstream timeout when it isn't).
+
 ### Configure
 
 ```bash
