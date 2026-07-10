@@ -23,11 +23,11 @@ linters:
     - misspell       # typos in comments/strings
     - revive         # golint replacement
 
-  settings:
-    revive:
-      rules:
-        - name: package-comments
-          disabled: true # cmd/ packages don't need doc comments
+linters-settings:
+  revive:
+    rules:
+      - name: package-comments
+        disabled: true # cmd/ packages don't need doc comments
 
 issues:
   exclude-rules:
