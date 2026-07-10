@@ -227,6 +227,15 @@ type PanelResult struct {
 // Each member gets its own timeout (perFetchTimeout) so a slow frontier
 // can't pin the local one.
 //
+// When skipLocal is true the local Ollama fetch is omitted (issue #8
+// graceful-degradation path). The local slot in the arbiter prompt is
+// populated with a synthetic PanelResult whose Err is set to a sentinel
+// error, which formatCandidate renders as
+// "[local failed: ollama unavailable (degraded)]". The arbiter's
+// "synthesize the strongest answer" instruction already copes with one
+// candidate being unavailable, so the synthesis stream still produces a
+// useful reply using only the frontier member.
+//
 // arbiterURL/arbiterKey/arbiterModel identify the synthesis model. The
 // arbiter receives a single user message containing both candidates and
 // streams the synthesized reply via Stream. The arbiter call is bounded
@@ -243,15 +252,25 @@ func Panel(
 	latestPrompt string,
 	perFetchTimeout time.Duration,
 	arbiterTimeout time.Duration,
+	skipLocal bool,
 ) error {
 	results := make(chan PanelResult, 2)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
-		defer cancel()
-		c, err := FetchPanel(ctx, client,
-			localBaseURL+"/v1/chat/completions", "", localModel, body)
-		results <- PanelResult{Source: "local", Content: c, Err: err}
-	}()
+	if skipLocal {
+		// Synthetic local failure so the arbiter prompt shape stays
+		// stable. formatCandidate will emit "[local failed: ...]".
+		results <- PanelResult{
+			Source: "local",
+			Err:    errors.New("ollama unavailable (degraded)"),
+		}
+	} else {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
+			defer cancel()
+			c, err := FetchPanel(ctx, client,
+				localBaseURL+"/v1/chat/completions", "", localModel, body)
+			results <- PanelResult{Source: "local", Content: c, Err: err}
+		}()
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
 		defer cancel()

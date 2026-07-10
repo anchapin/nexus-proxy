@@ -314,20 +314,34 @@ type CascadeConfig struct {
 	ZAIModel      string
 	ZAIKey        string
 	Timeout       time.Duration
+
+	// SkipLocal removes the local Ollama step from the cascade.
+	// The chat handler sets this when internal/health reports
+	// Ollama is unreachable (issue #8): callers still get the
+	// frontier (and z.ai) answer, just without paying the local
+	// timeout. When true, the cascade starts at frontier; when no
+	// frontier key is configured the cascade is empty and Run
+	// returns an error.
+	SkipLocal bool
 }
 
 // BuildLocalCascade returns a cascade whose primary is local Ollama and
 // whose fallbacks are frontier and/or Z.ai endpoints that are configured
 // (their key is non-empty). Order is the issue's required declaration
-// order: [local, frontier, zai]. When no fallback key is set the cascade
-// has a single step — Run still validates the response before streaming.
+// order: [local, frontier, zai]. When CascadeConfig.SkipLocal is true
+// the local step is omitted (issue #8 graceful-degradation path).
+// When no fallback key is set the cascade has a single step — Run
+// still validates the response before streaming.
 func BuildLocalCascade(cfg CascadeConfig) *Cascade {
-	steps := []CascadeStep{{
-		Name:   "local",
-		URL:    strings.TrimRight(cfg.LocalURL, "/") + "/v1/chat/completions",
-		Model:  cfg.LocalModel,
-		APIKey: "",
-	}}
+	steps := []CascadeStep{}
+	if !cfg.SkipLocal {
+		steps = append(steps, CascadeStep{
+			Name:   "local",
+			URL:    strings.TrimRight(cfg.LocalURL, "/") + "/v1/chat/completions",
+			Model:  cfg.LocalModel,
+			APIKey: "",
+		})
+	}
 	if cfg.FrontierKey != "" {
 		steps = append(steps, CascadeStep{
 			Name:   "frontier",

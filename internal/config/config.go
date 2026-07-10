@@ -48,6 +48,17 @@ type Config struct {
 	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
 	ArbiterTimeout time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
+	// Health (issue #8). The chat handler consults
+	// internal/health.Health before issuing local-bound requests;
+	// when Ollama is unreachable it short-circuits to frontier
+	// (route=local) or skips the local panel member (route=fusion)
+	// and stamps X-Nexus-Degraded: true on the response. The
+	// breaker trips after HealthBreakerThreshold consecutive
+	// failed probes and reopens on the first success.
+	HealthPollInterval     time.Duration // background poll cadence (30s)
+	HealthBreakerThreshold int           // consecutive failures before trip (3)
+	HealthProbeTimeout     time.Duration // per-probe HTTP timeout (5s)
+
 	// HTTP request body cap (issue #11). The chat handler applies this
 	// with http.MaxBytesReader before reading the request body, so an
 	// oversized POST cannot exhaust proxy memory before the guardrail
@@ -183,6 +194,30 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.ArbiterTimeout = arbiterTimeout
+
+	// Ollama health poller (issue #8). Defaults: 30s poll cadence,
+	// 3-failure breaker, 5s per-probe HTTP timeout. Set
+	// NEXUS_HEALTH_POLL_INTERVAL to "0" to disable polling entirely;
+	// the chat handler then behaves as if Ollama is always healthy
+	// (i.e. it will still try the local route on every request and
+	// pay the upstream timeout if Ollama is down).
+	healthPoll, err := getEnvDuration("NEXUS_HEALTH_POLL_INTERVAL", 30*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.HealthPollInterval = healthPoll
+
+	healthBreaker, err := getEnvInt("NEXUS_HEALTH_BREAKER_THRESHOLD", 3)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.HealthBreakerThreshold = healthBreaker
+
+	healthProbe, err := getEnvDuration("NEXUS_HEALTH_PROBE_TIMEOUT", 5*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.HealthProbeTimeout = healthProbe
 
 	// Hard request-body cap (issue #11). Default 1 MiB matches typical
 	// OpenAI-compatible request sizes; the chat handler wraps r.Body

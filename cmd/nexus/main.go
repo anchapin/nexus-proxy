@@ -18,6 +18,7 @@ import (
 
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/handlers"
+	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/judge"
 	"github.com/anchapin/nexus-proxy/internal/metrics"
 	"github.com/anchapin/nexus-proxy/internal/quality"
@@ -54,6 +55,33 @@ func main() {
 
 	slm := router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, cfg.SLMTimeout, nil)
 	re := regexp.MustCompile(formattingRegexPattern)
+
+	// Ollama health poller (issue #8). When NEXUS_HEALTH_POLL_INTERVAL
+	// is zero the handler treats Ollama as always healthy (useful for
+	// containers that know Ollama is co-located and unreachable
+	// states are impossible). Otherwise a background goroutine
+	// pings /api/tags on the cadence and the chat handler reroutes
+	// route=local/route=fusion to frontier when Ollama trips the
+	// breaker. The poller's context is the boot context so a
+	// fatal-level config error cancels it cleanly.
+	var hpoller *health.Health
+	if cfg.HealthPollInterval > 0 {
+		hpoller = health.New(
+			cfg.OllamaURL,
+			cfg.HealthPollInterval,
+			cfg.HealthBreakerThreshold,
+			cfg.HealthProbeTimeout,
+			http.DefaultClient,
+		)
+		go hpoller.Run(context.Background())
+		defer func() {
+			if err := hpoller.Close(); err != nil {
+				slog.Warn("health poller close", slog.Any("err", err))
+			}
+		}()
+	} else {
+		slog.Info("ollama health poller disabled (NEXUS_HEALTH_POLL_INTERVAL=0)")
+	}
 
 	// Async LLM-as-a-judge evaluator (issue #15). The handler never
 	// imports internal/judge; we plug the observer in here via a
@@ -207,6 +235,7 @@ func main() {
 		QualityObserver: qualityO,
 		MetricsObserver: metricsObs,
 		Recorder:        recorder,
+		Health:          hpoller,
 	}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))

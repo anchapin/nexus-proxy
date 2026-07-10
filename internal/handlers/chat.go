@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/config"
+	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/middleware"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
@@ -174,6 +175,15 @@ type Deps struct {
 	// passes a zero value, so downstream code can invoke Record
 	// unconditionally without a nil-check.
 	Recorder telemetry.Recorder
+
+	// Health tracks the live reachability of the local Ollama
+	// endpoint (issue #8). When IsLocalHealthy returns false the
+	// handler short-circuits route=local to frontier and skips the
+	// local panel member of route=fusion, stamping
+	// X-Nexus-Degraded: true on the response. Optional: nil is
+	// treated as "always healthy" so unit tests and tools that do
+	// not wire the poller still work unchanged.
+	Health *health.Health
 
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
@@ -343,6 +353,33 @@ func Chat(d Deps) http.Handler {
 			firstWriteAt.CompareAndSwap(0, t.UnixNano())
 		})
 
+		// Graceful degradation (issue #8). When the local Ollama health
+		// poller reports unhealthy we:
+		//   - skip the local fetch on route=local (the cascade starts
+		//     at frontier, the harness sees frontier content with
+		//     X-Nexus-Degraded: true);
+		//   - skip the local panel member on route=fusion (Panel is
+		//     told to skipLocal, the arbiter sees a synthetic
+		//     "[local failed: ...]" candidate and synthesises from
+		//     frontier alone);
+		//   - leave route=frontier untouched (no local involved).
+		// We stamp the response header before the upstream call so it
+		// lands in the SSE frame regardless of which route served
+		// the request. The token guardrail (#6) is consulted first;
+		// when it fires we always go to frontier, so this check
+		// never overrides a guardrail-forced reroute.
+		localHealthy := d.Health.IsLocalHealthy()
+		skipLocal := !localHealthy && (route == router.RouteLocal || route == router.RouteFusion)
+		if skipLocal {
+			w.Header().Set("X-Nexus-Degraded", "true")
+			slog.Warn("ollama unhealthy; skipping local arm",
+				slog.String("route", string(route)),
+				slog.String("request_id", reqID),
+			)
+		} else {
+			w.Header().Set("X-Nexus-Degraded", "false")
+		}
+
 		var model string
 		var upErr error
 		switch route {
@@ -355,6 +392,7 @@ func Chat(d Deps) http.Handler {
 				d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
 				body, latestPrompt, d.Config.FusionTimeout,
 				d.Config.ArbiterTimeout,
+				skipLocal,
 			)
 			if upErr != nil {
 				slog.Error("fusion error",
@@ -367,6 +405,30 @@ func Chat(d Deps) http.Handler {
 
 		case router.RouteLocal:
 			body["model"] = d.Config.LocalModel
+
+			// Cascade (issue #14): try local Ollama first, fall back to
+			// configured frontier endpoints (frontier, then z.ai) on
+			// retryable failures. Cascade is rebuilt per request so
+			// config changes take effect without restarting the
+			// process. CascadeConfig.SkipLocal (issue #8) omits the
+			// local step entirely when the health poller reports
+			// Ollama unreachable, so the cascade starts at frontier
+			// without paying the local timeout. Hoisted above the
+			// stream flag (issue #10) so both branches share a single
+			// configured cascade; see below for the non-streaming
+			// degraded override.
+			cas := upstream.BuildLocalCascade(upstream.CascadeConfig{
+				LocalURL:      d.Config.OllamaURL,
+				LocalModel:    d.Config.LocalModel,
+				FrontierURL:   d.Config.FrontierURL,
+				FrontierModel: d.Config.FrontierModel,
+				FrontierKey:   d.Config.FrontierKey,
+				ZAIURL:        d.Config.ZAIURL,
+				ZAIModel:      d.Config.ZAIModel,
+				ZAIKey:        d.Config.ZAIKey,
+				Timeout:       d.Config.CascadeTimeout,
+				SkipLocal:     skipLocal,
+			})
 
 			// Writer chain (outermost first):
 			//   upstream.Write -> captureWriter (judge + quality tee) ->
@@ -384,20 +446,10 @@ func Chat(d Deps) http.Handler {
 			if streaming {
 				// Cascade (issue #14): try local Ollama first, fall
 				// back to configured frontier endpoints (frontier,
-				// then z.ai) on retryable failures. Cascade is rebuilt
-				// per request so config changes take effect without
-				// restarting the process.
-				cas := upstream.BuildLocalCascade(upstream.CascadeConfig{
-					LocalURL:      d.Config.OllamaURL,
-					LocalModel:    d.Config.LocalModel,
-					FrontierURL:   d.Config.FrontierURL,
-					FrontierModel: d.Config.FrontierModel,
-					FrontierKey:   d.Config.FrontierKey,
-					ZAIURL:        d.Config.ZAIURL,
-					ZAIModel:      d.Config.ZAIModel,
-					ZAIKey:        d.Config.ZAIKey,
-					Timeout:       d.Config.CascadeTimeout,
-				})
+				// then z.ai) on retryable failures. SkipLocal (issue
+				// #8) is honoured — when the health poller reports
+				// Ollama unreachable the cascade skips the local step
+				// entirely and starts at frontier.
 				res, err := cas.Run(rw, d.Client, body)
 				logCascadeTelemetry(res, err, reqID)
 				if err != nil {
@@ -433,8 +485,21 @@ func Chat(d Deps) http.Handler {
 				// only; the cascade's validation / fallback is
 				// bypassed in this branch because the harness
 				// expects a verbatim response.
-				localURL := strings.TrimRight(d.Config.OllamaURL, "/") + "/v1/chat/completions"
-				if err := upstream.BufferedFetch(rw, d.Client, localURL, "", body); err != nil {
+				//
+				// Issue #8 (graceful degradation): when skipLocal is
+				// true the local URL would hang / timeout because
+				// Ollama is unreachable. Route the buffered fetch to
+				// the configured frontier endpoint instead so the
+				// harness still gets a JSON reply promptly. The
+				// response is tagged via X-Nexus-Degraded=true
+				// (stamped above).
+				targetURL := strings.TrimRight(d.Config.OllamaURL, "/") + "/v1/chat/completions"
+				apiKey := ""
+				if skipLocal {
+					targetURL = d.Config.FrontierURL
+					apiKey = d.Config.FrontierKey
+				}
+				if err := upstream.BufferedFetch(rw, d.Client, targetURL, apiKey, body); err != nil {
 					slog.Error("upstream error",
 						slog.Any("err", err),
 						slog.String("request_id", reqID),
@@ -443,6 +508,9 @@ func Chat(d Deps) http.Handler {
 					http.Error(w, "Upstream error", http.StatusBadGateway)
 				} else {
 					model = d.Config.LocalModel
+					if skipLocal {
+						model = d.Config.FrontierModel
+					}
 					if cap != nil {
 						if d.JudgeObserver != nil {
 							d.JudgeObserver.Submit(LocalCompletion{
