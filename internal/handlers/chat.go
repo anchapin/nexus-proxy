@@ -195,6 +195,7 @@ func Chat(d Deps) http.Handler {
 				d.Config.FrontierURL, d.Config.FrontierModel,
 				d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
 				body, latestPrompt, d.Config.FusionTimeout,
+				d.Config.ArbiterTimeout,
 			)
 			if upErr != nil {
 				log.Printf("[FUSION ERROR]: %v", upErr)
