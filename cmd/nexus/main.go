@@ -8,11 +8,15 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"regexp"
+	"syscall"
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/handlers"
+	"github.com/anchapin/nexus-proxy/internal/judge"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 )
@@ -39,6 +43,48 @@ func main() {
 	slm := router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, cfg.SLMTimeout, nil)
 	re := regexp.MustCompile(formattingRegexPattern)
 
+	// Async LLM-as-a-judge evaluator (issue #15). The handler never
+	// imports internal/judge; we plug the observer in here via a
+	// closure that adapts LocalCompletion to the evaluator's
+	// Sample + Enqueue entry points.
+	var (
+		judgeEval *judge.Evaluator
+		judgeObs  handlers.JudgeObserver
+	)
+	if cfg.JudgeEnabled && cfg.JudgeAPIKey != "" {
+		evalCfg := judge.Config{
+			URL:         cfg.JudgeURL,
+			Model:       cfg.JudgeModel,
+			APIKey:      cfg.JudgeAPIKey,
+			SampleRate:  cfg.JudgeSampleRate,
+			Concurrency: cfg.JudgeConcurrency,
+			QueueDepth:  cfg.JudgeQueueDepth,
+			Timeout:     cfg.JudgeTimeout,
+			CostPer1K:   cfg.JudgeCostPer1KUSD,
+		}
+		// Issue #16 will swap this for a SQLite-backed Storage. The
+		// interface is identical so the swap is a one-line change.
+		store := judge.NewMemoryStorage()
+		judgeEval = judge.NewEvaluator(evalCfg, http.DefaultClient, store)
+		judgeObs = handlers.JudgeObserverFunc(func(c handlers.LocalCompletion) {
+			if !judgeEval.Sample() {
+				return
+			}
+			if !judgeEval.Enqueue(judge.Sample{
+				RequestID:   c.RequestID,
+				Instruction: c.Instruction,
+				Output:      c.Output,
+				LocalModel:  c.LocalModel,
+			}) {
+				log.Printf("[JUDGE DROP]: queue full, dropped %s", c.RequestID)
+			}
+		})
+		log.Printf("[BOOT]: judge enabled (url=%s model=%s rate=%.2f concurrency=%d)",
+			cfg.JudgeURL, cfg.JudgeModel, cfg.JudgeSampleRate, cfg.JudgeConcurrency)
+	} else {
+		log.Println("[BOOT]: judge disabled (sample rate <= 0 or no API key)")
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/v1/chat/completions", handlers.Chat(handlers.Deps{
 		Config:          cfg,
@@ -46,6 +92,7 @@ func main() {
 		RAG:             store,
 		SLM:             slm,
 		FormattingRegex: re,
+		JudgeObserver:   judgeObs,
 	}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))
@@ -57,7 +104,28 @@ func main() {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	if err := srv.ListenAndServe(); err != nil {
+
+	// Graceful shutdown: stop accepting new connections, drain
+	// in-flight requests, then drain the judge queue so we don't
+	// lose pending JudgeScore records.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		log.Println("[SHUTDOWN]: draining judge queue and closing server...")
+		if judgeEval != nil {
+			if err := judgeEval.Close(); err != nil {
+				log.Printf("[SHUTDOWN WARN]: judge close: %v", err)
+			}
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[SHUTDOWN WARN]: server: %v", err)
+		}
+	}()
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server: %v", err)
 	}
 }

@@ -45,6 +45,19 @@ type Config struct {
 	FusionTimeout  time.Duration // per-panel-member fetch timeout (120s)
 	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
 
+	// Judge (async LLM-as-a-judge evaluator). All zero/empty values
+	// disable the judge; the chat handler is unaffected when the
+	// evaluator is wired to a no-op observer (see cmd/nexus/main.go).
+	JudgeEnabled      bool          // true iff at least one judge parameter is non-zero
+	JudgeURL          string        // frontier endpoint for judge calls
+	JudgeModel        string        // judge model name (e.g. "gpt-4o")
+	JudgeAPIKey       string        // bearer token; may equal FrontierKey
+	JudgeSampleRate   float64       // 0..1; <=0 disables sampling
+	JudgeConcurrency  int           // max parallel judge calls (default 2)
+	JudgeQueueDepth   int           // buffered channel size (default 64)
+	JudgeTimeout      time.Duration // per-call judge timeout (default 30s)
+	JudgeCostPer1KUSD float64       // rough USD/1k-token rate for cost estimates
+
 	// Middleware prompts
 	MetaPrompt string // appended to system prompt by prompt_engine
 	TOONNotice string // appended when TOON compression is applied
@@ -100,6 +113,54 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.CascadeTimeout = cascadeTimeout
+
+	// Judge (issue #15). Defaults: z.ai-style endpoint, sample 10% of
+	// local-route successes, 2 concurrent workers, 30s per call. When
+	// JudgeURL is unset we fall back to NEXUS_FRONTIER_URL so a stock
+	// config still works.
+	cfg.JudgeURL = getEnv("NEXUS_JUDGE_URL", "https://api.z.ai/v1/chat/completions")
+	if v := os.Getenv("NEXUS_JUDGE_URL"); v == "" {
+		cfg.JudgeURL = cfg.FrontierURL
+	}
+	cfg.JudgeModel = getEnv("NEXUS_JUDGE_MODEL", cfg.FrontierModel)
+	cfg.JudgeAPIKey = getEnv("NEXUS_JUDGE_API_KEY", cfg.FrontierKey)
+
+	sampleRate, err := getEnvFloat("NEXUS_JUDGE_SAMPLE_RATE", 0.1)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.JudgeSampleRate = sampleRate
+
+	concurrency, err := getEnvInt("NEXUS_JUDGE_CONCURRENCY", 2)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.JudgeConcurrency = concurrency
+
+	queueDepth, err := getEnvInt("NEXUS_JUDGE_QUEUE", 64)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.JudgeQueueDepth = queueDepth
+
+	judgeTimeout, err := getEnvDuration("NEXUS_JUDGE_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.JudgeTimeout = judgeTimeout
+
+	costRate, err := getEnvFloat("NEXUS_JUDGE_COST_PER_1K", 0.002)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.JudgeCostPer1KUSD = costRate
+
+	// The judge is "enabled" iff the operator actually configured
+	// sampling above zero. Zero/negative rate keeps the worker pool
+	// dormant even if the env vars are partially populated (a common
+	// condition during local development).
+	cfg.JudgeEnabled = cfg.JudgeSampleRate > 0 && cfg.JudgeURL != "" && cfg.JudgeModel != ""
+
 
 	return cfg, nil
 }
