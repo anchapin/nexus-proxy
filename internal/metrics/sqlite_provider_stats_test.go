@@ -34,7 +34,7 @@ func seedProviderStats(t *testing.T, s *SQLiteStore, base time.Time, rows map[st
 }
 
 type seedRow struct {
-	latency   int64
+	latency   float64
 	cost      float64
 	err       string
 	offsetSec int // extra time offset (used for "old" rows in the window test)
@@ -260,7 +260,7 @@ func TestProviderStats_AfterReopenUsesPersistedRows(t *testing.T) {
 			RequestID:        "persist-" + intToStr(i),
 			Route:            "frontier",
 			Model:            "gpt-4o",
-			TotalLatencyMs:   int64(100 * (i + 1)),
+			TotalLatencyMs:   float64(100 * (i + 1)),
 			EstimatedCostUSD: 0.005,
 		}); err != nil {
 			t.Fatalf("RecordRequest: %v", err)

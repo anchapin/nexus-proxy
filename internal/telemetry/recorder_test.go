@@ -37,10 +37,11 @@ func TestEstimateTokens(t *testing.T) {
 
 func TestComputeTPS(t *testing.T) {
 	cases := []struct {
-		name            string
-		outputTokens    int
-		ttftMs, totalMs int64
-		want            float64
+		name         string
+		outputTokens int
+		ttftMs       int64
+		totalMs      float64
+		want         float64
 	}{
 		{"no tokens", 0, 100, 200, 0},
 		{"total zero", 50, 0, 0, 0},
@@ -48,12 +49,13 @@ func TestComputeTPS(t *testing.T) {
 		{"ttft > total (rounding)", 50, 300, 200, 0},
 		{"happy 100 tok in 1s", 100, 200, 1200, 100.0},
 		{"happy 250 tok in 0.5s gen", 250, 500, 1000, 500.0},
+		{"sub-ms total (issue #68)", 100, 0, 0.5, 200000.0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := ComputeTPS(tc.outputTokens, tc.ttftMs, tc.totalMs)
 			if !approxEqual(got, tc.want, 0.001) {
-				t.Errorf("ComputeTPS(%d,%d,%d) = %f, want %f",
+				t.Errorf("ComputeTPS(%d,%d,%f) = %f, want %f",
 					tc.outputTokens, tc.ttftMs, tc.totalMs, got, tc.want)
 			}
 		})

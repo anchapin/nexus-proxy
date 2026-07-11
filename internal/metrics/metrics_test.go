@@ -76,7 +76,7 @@ func TestRecordRequestWritesRow(t *testing.T) {
 		RAGFilename:       "examples/refactor.go",
 		EstimatedCostUSD:  0.001,
 		TTFTMs:            180,
-		TotalLatencyMs:    4200,
+		TotalLatencyMs:    4200.0,
 		TPS:               95.0,
 		Streaming:         true,
 	}
@@ -359,7 +359,7 @@ func TestTelemetryRecorderBackwardsCompat(t *testing.T) {
 		InputTokens:    50,
 		OutputTokens:   100,
 		TTFTMs:         100,
-		TotalLatencyMs: 1500,
+		TotalLatencyMs: 1500.0,
 		TPS:            71.4,
 		Streaming:      true,
 	})
@@ -407,7 +407,7 @@ func TestRequestFieldsRoundtrip(t *testing.T) {
 		BaselineCostUSD:   0.0345,
 		SavingsUSD:        0.0222,
 		TTFTMs:            250,
-		TotalLatencyMs:    5000,
+		TotalLatencyMs:    5000.0,
 		TPS:               1234.5,
 		Streaming:         true,
 		Error:             "",
@@ -449,7 +449,7 @@ FROM requests WHERE request_id = ?`, in.RequestID)
 		gotBaseline             float64
 		gotSavingsUSD           float64
 		gotTTFT                 int64
-		gotLatency              int64
+		gotLatency              float64
 		gotTPS                  float64
 		gotStreaming            int
 		gotFusionArbiterSkipped int
@@ -495,7 +495,7 @@ FROM requests WHERE request_id = ?`, in.RequestID)
 		t.Errorf("ttft_ms = %d, want %d", gotTTFT, in.TTFTMs)
 	}
 	if gotLatency != in.TotalLatencyMs {
-		t.Errorf("total_latency_ms = %d, want %d", gotLatency, in.TotalLatencyMs)
+		t.Errorf("total_latency_ms = %f, want %f", gotLatency, in.TotalLatencyMs)
 	}
 	if gotTPS != in.TPS {
 		t.Errorf("tps = %f, want %f", gotTPS, in.TPS)
@@ -744,14 +744,14 @@ CREATE INDEX IF NOT EXISTS idx_requests_request_id ON requests(request_id);`
 
 	// Insert a new row WITH the new fields to prove the columns exist.
 	if err := s.RecordRequest(Request{
-		Timestamp:       time.Now().UTC(),
-		RequestID:       "new-1",
-		Route:           "frontier",
-		Model:           "m",
-		InputTokens:     200,
+		Timestamp:        time.Now().UTC(),
+		RequestID:        "new-1",
+		Route:            "frontier",
+		Model:            "m",
+		InputTokens:      200,
 		EstimatedCostUSD: 0.001,
-		BaselineCostUSD: 0.002,
-		SavingsUSD:      0.001,
+		BaselineCostUSD:  0.002,
+		SavingsUSD:       0.001,
 	}); err != nil {
 		t.Fatalf("RecordRequest after migration: %v", err)
 	}

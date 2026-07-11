@@ -165,7 +165,7 @@ type MetricsEvent struct {
 
 	OutputTokens         int
 	TTFTMs               int64
-	TotalLatencyMs       int64
+	TotalLatencyMs       float64
 	TPS                  float64
 	Streaming            bool
 	FusionArbiterSkipped bool
@@ -1079,7 +1079,12 @@ func Chat(d Deps) http.Handler {
 		// remains for callers that only want the TTFT / latency
 		// fields, or when no metrics store is wired (operator
 		// opted out by leaving NEXUS_METRICS_DB empty).
-		totalMs := time.Since(started).Milliseconds()
+		//
+		// totalMs is float64 ms (issue #68) so a sub-millisecond
+		// handler run still records a non-zero latency; the int64
+		// truncation used to flip to 0 on fast hardware and
+		// exposed a write race against the recorder's reader.
+		totalMs := float64(time.Since(started).Microseconds()) / 1000.0
 		var ttftMs int64
 		if streaming && firstWriteAt.Load() > 0 {
 			ttftMs = time.Unix(0, firstWriteAt.Load()).Sub(started).Milliseconds()
@@ -1449,7 +1454,7 @@ func buildRecord(
 	toolCallCount int,
 	decision router.Decision,
 ) telemetry.Record {
-	totalMs := time.Since(started).Milliseconds()
+	totalMs := float64(time.Since(started).Microseconds()) / 1000.0
 	var ttftMs int64
 	if streaming && firstWriteNano > 0 {
 		ttftMs = time.Unix(0, firstWriteNano).Sub(started).Milliseconds()

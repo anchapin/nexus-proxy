@@ -939,7 +939,7 @@ func TestChatEmitsTelemetryRowWithCorrectRoute(t *testing.T) {
 		t.Error("RequestID empty")
 	}
 	if got.TotalLatencyMs <= 0 {
-		t.Errorf("TotalLatencyMs = %d, want > 0", got.TotalLatencyMs)
+		t.Errorf("TotalLatencyMs = %f, want > 0", got.TotalLatencyMs)
 	}
 	if got.OutputTokens <= 0 {
 		t.Errorf("OutputTokens = %d, want > 0", got.OutputTokens)
@@ -985,7 +985,7 @@ func TestChatTelemetryTTFTZeroForNonStreaming(t *testing.T) {
 		t.Errorf("TTFTMs = %d, want 0 for non-streaming", records[0].TTFTMs)
 	}
 	if records[0].TotalLatencyMs <= 0 {
-		t.Errorf("TotalLatencyMs = %d, want > 0", records[0].TotalLatencyMs)
+		t.Errorf("TotalLatencyMs = %f, want > 0", records[0].TotalLatencyMs)
 	}
 }
 
@@ -1068,8 +1068,8 @@ func TestChatTelemetryJSONLRecorderEndToEnd(t *testing.T) {
 	if row.Route != string(router.RouteFrontier) {
 		t.Errorf("Route = %q, want frontier", row.Route)
 	}
-	if row.TotalLatencyMs < 0 {
-		t.Errorf("TotalLatencyMs = %d, want >= 0", row.TotalLatencyMs)
+	if row.TotalLatencyMs <= 0 {
+		t.Errorf("TotalLatencyMs = %f, want > 0", row.TotalLatencyMs)
 	}
 	if row.RequestID == "" {
 		t.Error("RequestID empty")
