@@ -474,18 +474,18 @@ func TestManagerRepollsOnTicker(t *testing.T) {
 	m.Run(context.Background())
 	defer m.Close()
 
-	// Wait for the loop to drain the queue. Each call consumes one
-	// queued value; bound the wait generously so the test is not
-	// timing-sensitive on shared CI runners.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if stub.callCount() >= 3 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if n := stub.callCount(); n < 3 {
-		t.Fatalf("probe called only %d times, want >=3 (initial + 2 ticks)", n)
+	// Wait deterministically for the third successful probe
+	// publication (initial probe + 2 ticker repolls). WaitForProbes
+	// fires *after* the Manager has stored the budget in
+	// latest, so the subsequent Get() is race-free against the
+	// Manager's goroutine — unlike a wait on the stub's call
+	// count, which would race Store vs Get(). A watchdog timeout
+	// keeps the test from hanging forever if the Manager is
+	// genuinely broken; it is a safety net, not the wait.
+	select {
+	case <-m.WaitForProbes(3):
+	case <-time.After(5 * time.Second):
+		t.Fatalf("probe only stored %d times within deadline, want >=3 (initial + 2 ticks)", stub.callCount())
 	}
 	if got := m.Get(); got.Tokens != 300 {
 		t.Errorf("final Get.Tokens = %d, want 300 (last queued value)", got.Tokens)
