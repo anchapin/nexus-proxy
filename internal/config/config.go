@@ -12,6 +12,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,6 +31,18 @@ type Config struct {
 
 	// HTTP server
 	Addr string // ":8000"
+
+	// Inbound proxy authentication (issue #37). When at least one key
+	// is configured, inbound requests must present a valid
+	// `Authorization: Bearer <key>` or `X-API-Key` header or the
+	// proxy returns 401 with an OpenAI-compatible error envelope.
+	// /healthz stays exempt so orchestrator liveness probes keep
+	// working. When neither variable is set, ProxyAuthEnabled is
+	// false and the proxy behaves identically to today (zero
+	// breaking change for localhost dev).
+	ProxyAPIKey      string   // single key from NEXUS_PROXY_API_KEY
+	ProxyAPIKeys     []string // comma-separated list from NEXUS_PROXY_API_KEYS (rotation)
+	ProxyAuthEnabled bool     // true when at least one key is non-empty
 
 	// Local Ollama
 	OllamaURL      string // "http://localhost:11434"
@@ -325,6 +338,18 @@ func Load() (Config, error) {
 		MetricsDBPath:  resolveAllowEmpty("NEXUS_METRICS_DB", fileMap, DefaultMetricsDBPath()),
 	}
 
+	// Inbound proxy authentication (issue #37). NEXUS_PROXY_API_KEY is
+	// the single-key surface; NEXUS_PROXY_API_KEYS is a comma-separated
+	// list for zero-downtime key rotation. Both contribute to the
+	// accepted set. Secrets are read from env only (not the YAML file
+	// map) so a key never lands on disk — this matches the existing
+	// NEXUS_FRONTIER_API_KEY stance and the security intent of the
+	// issue. resolveString still consults fileMap but these keys are
+	// absent from configKeys, so fileMap never carries them.
+	cfg.ProxyAPIKey = resolveString("NEXUS_PROXY_API_KEY", nil, "")
+	cfg.ProxyAPIKeys = splitCSV(resolveString("NEXUS_PROXY_API_KEYS", nil, ""))
+	cfg.ProxyAuthEnabled = len(cfg.ProxyAuthKeys()) > 0
+
 	threshold, err := resolveFloat("NEXUS_RAG_THRESHOLD", fileMap, 0.55)
 	if err != nil {
 		return cfg, err
@@ -602,6 +627,88 @@ func Load() (Config, error) {
 // still runs without one (fusion will degrade to local-only), but frontier
 // routing will return 401s if attempted.
 func (c Config) FrontierEnabled() bool { return c.FrontierKey != "" }
+
+// ProxyAuthKeys returns the combined, de-duplicated, non-empty set of
+// accepted inbound API keys (NEXUS_PROXY_API_KEY plus the entries of
+// NEXUS_PROXY_API_KEYS). Returns nil when authentication is disabled,
+// so cmd/nexus can pass the slice straight to auth.Middleware (which
+// is a no-op for an empty slice). De-duplication is order-preserving
+// so the single-key stays first, matching operator intuition.
+func (c Config) ProxyAuthKeys() []string {
+	seen := make(map[string]struct{})
+	var out []string
+	for _, k := range append([]string{c.ProxyAPIKey}, c.ProxyAPIKeys...) {
+		if k = strings.TrimSpace(k); k == "" {
+			continue
+		}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, k)
+	}
+	return out
+}
+
+// splitCSV splits a comma-separated string into trimmed, non-empty
+// fields. Used for NEXUS_PROXY_API_KEYS so operators can configure key
+// rotation without a YAML array. Returns nil for an empty/blank input
+// (which leaves ProxyAPIKeys nil and thus disables auth).
+func splitCSV(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// IsLoopbackAddr reports whether addr binds only to the loopback
+// interface. Used by the boot warning (issue #37) to detect when the
+// proxy is exposed to the network without authentication.
+//
+// Addresses that bind all interfaces are NOT loopback:
+//
+//	":8000"        -> all interfaces (0.0.0.0)
+//	"0.0.0.0:8000" -> all IPv4 interfaces
+//	"[::]:8000"    -> all IPv6 interfaces
+//
+// Loopback examples:
+//
+//	"127.0.0.1:8000" -> IPv4 loopback
+//	"[::1]:8000"     -> IPv6 loopback
+//	"localhost:8000" -> loopback hostname
+//
+// An unresolvable hostname (other than "localhost") is treated as
+// non-loopback so the boot warning errs on the side of firing.
+func IsLoopbackAddr(addr string) bool {
+	host := addr
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		host = h
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		// ":8000" binds every interface.
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	// Unknown hostname form (e.g. "nexus.local"); without a DNS
+	// resolution we cannot prove loopback, so treat as exposed.
+	return false
+}
 
 // DefaultMaxBodyBytes is the fallback request-body cap (issue #11). 1 MiB
 // matches the typical OpenAI chat-completions request envelope; agents that

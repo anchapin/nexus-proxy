@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/anchapin/nexus-proxy/internal/auth"
 	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/handlers"
@@ -331,6 +332,34 @@ func main() {
 		slog.String("ollama_url", cfg.OllamaURL),
 	)
 
+	// Inbound authentication middleware (issue #37). When at least one
+	// proxy API key is configured, requests must present a valid
+	// `Authorization: Bearer <key>` or `X-API-Key` header. /healthz
+	// stays exempt so orchestrator liveness probes (K8s, Docker,
+	// Compose healthchecks) work without a key. When no key is
+	// configured the middleware is a no-op pass-through, preserving
+	// the pre-issue-#37 localhost-dev behaviour exactly.
+	var handler http.Handler = mux
+	if cfg.ProxyAuthEnabled {
+		keys := cfg.ProxyAuthKeys()
+		handler = auth.Middleware(keys, healthzExempt)(mux)
+		slog.Info("proxy auth enabled",
+			slog.Int("keys", len(keys)),
+		)
+	} else if !config.IsLoopbackAddr(cfg.Addr) {
+		// Auth is disabled AND the bind address is reachable from
+		// the network — anyone who can hit the port can burn the
+		// operator's frontier credits and reach local Ollama. Warn
+		// loudly so this is never an accident (issue #37).
+		slog.Warn("proxy auth disabled and bind address is not loopback; "+
+			"any client that can reach the port can use the proxy "+
+			"(set NEXUS_PROXY_API_KEY to enable authentication)",
+			slog.String("addr", cfg.Addr),
+		)
+	} else {
+		slog.Info("proxy auth disabled (localhost dev)")
+	}
+
 	slog.Info("starting nexus proxy",
 		slog.String("addr", cfg.Addr),
 		slog.String("local_model", cfg.LocalModel),
@@ -338,7 +367,7 @@ func main() {
 	)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -542,4 +571,13 @@ func buildLocalLimiter(cfg config.Config) *concurrencylimit.Limiter {
 		slog.Duration("queue_timeout", cfg.LocalQueueTimeout),
 	)
 	return l
+}
+
+// healthzExempt is the exemption predicate passed to auth.Middleware
+// (issue #37). It lets /healthz through without a key so orchestrator
+// liveness probes (K8s, Docker healthcheck, Compose) keep working when
+// inbound authentication is enabled. Every other path still requires
+// a valid `Authorization: Bearer <key>` or `X-API-Key` header.
+func healthzExempt(r *http.Request) bool {
+	return r.URL.Path == "/healthz"
 }

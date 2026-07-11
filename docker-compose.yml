@@ -60,6 +60,11 @@ services:
       # empty is fine for fully-local routing; frontier-bound requests
       # will 401 until the operator sets it.
       NEXUS_FRONTIER_API_KEY: "${NEXUS_FRONTIER_API_KEY:-}"
+      # Inbound auth gate (issue #37). When set on the host, the proxy
+      # requires `Authorization: Bearer <key>` or `X-API-Key` on
+      # /v1/chat/completions. Leave unset for an unauthenticated local
+      # dev compose stack. /healthz stays exempt for healthchecks.
+      NEXUS_PROXY_API_KEY: "${NEXUS_PROXY_API_KEY:-}"
       # The default path (./nexus-telemetry.jsonl) resolves to the
       # container's WORKDIR (/tmp), which is fine — pinning it here
       # makes the contract explicit and survives a future WORKDIR move.
