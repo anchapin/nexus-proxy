@@ -37,3 +37,6 @@ config.local.yaml
 # OS
 .DS_Store
 Thumbs.db
+
+# Agent orchestration artifacts (local-only, never source-controlled)
+.agents/

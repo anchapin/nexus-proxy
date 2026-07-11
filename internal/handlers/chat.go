@@ -174,6 +174,23 @@ func (b BudgetObserverFunc) BudgetSource() string {
 	return b.Source()
 }
 
+// SpendGuard is the rolling daily-budget hook the chat handler
+// consults before dispatching a RouteFrontier request (issue #38).
+// When WouldExceed returns true the handler returns HTTP 429
+// "Daily frontier budget exceeded" instead of dispatching — local
+// routing is never gated. After a frontier request completes
+// (success or upstream error) the handler calls Record so the
+// rolling 24-hour window stays accurate.
+//
+// Implementations must be safe to call concurrently from many
+// request goroutines. A nil SpendGuard disables the gate entirely
+// (the pre-issue-#38 behaviour), so callers can leave Deps.SpendGuard
+// unset without any per-request nil-check overhead.
+type SpendGuard interface {
+	WouldExceed(amount float64) bool
+	Record(amount float64)
+}
+
 // Deps bundles the collaborators the chat handler needs. Wiring them
 // explicitly makes the handler trivial to unit-test with stubs.
 type Deps struct {
@@ -254,6 +271,16 @@ type Deps struct {
 	// alongside the receiver so a misconfigured (max<=0) Limiter
 	// is also treated as disabled.
 	Limiter *concurrencylimit.Limiter
+
+	// SpendGuard is the rolling daily-budget gate for RouteFrontier
+	// (issue #38). When non-nil the handler checks WouldExceed before
+	// dispatching to the frontier; if the check returns true the
+	// handler returns 429 "Daily frontier budget exceeded" instead.
+	// Local and fusion routing are never gated. After a frontier
+	// request completes the handler calls Record so the 24h window
+	// stays accurate. A nil SpendGuard disables the gate entirely
+	// (backward compatible).
+	SpendGuard SpendGuard
 
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
@@ -676,6 +703,32 @@ func Chat(d Deps) http.Handler {
 
 		default:
 			model = d.Config.FrontierModel
+
+			// Daily frontier budget gate (issue #38). Before
+			// dispatching to the frontier, check whether the
+			// estimated cost would push the rolling 24-hour spend
+			// past the configured cap. Local and fusion routing
+			// are never gated — only pure RouteFrontier is. When
+			// SpendGuard is nil (budget disabled) this is a
+			// complete no-op, preserving the pre-issue-#38
+			// behaviour.
+			if d.SpendGuard != nil {
+				estCost := frontierCostEstimate(
+					string(router.RouteFrontier), model,
+					telemetry.EstimateTokens(latestPrompt),
+					d.Config.JudgeCostPer1KUSD,
+				)
+				if d.SpendGuard.WouldExceed(estCost) {
+					slog.Warn("daily frontier budget exceeded",
+						slog.String("request_id", reqID),
+						slog.Float64("estimated_cost", estCost),
+					)
+					writeJSONError(w, http.StatusTooManyRequests,
+						"Daily frontier budget exceeded")
+					return
+				}
+			}
+
 			// Honor the harness's stream flag (issue #10). Stream
 			// preserves SSE framing for chunked deliveries;
 			// BufferedFetch collects the full body and returns a
@@ -694,6 +747,20 @@ func Chat(d Deps) http.Handler {
 				)
 				http.Error(w, "Upstream error", http.StatusBadGateway)
 			}
+		}
+
+		// Record frontier spend for the rolling 24h budget (issue
+		// #38). Recorded after the request completes (success or
+		// upstream error) because the frontier API consumed tokens
+		// either way. The budget-exceeded early return above skips
+		// this recording, which is correct — the request was never
+		// dispatched.
+		if route == router.RouteFrontier && d.SpendGuard != nil {
+			d.SpendGuard.Record(frontierCostEstimate(
+				string(router.RouteFrontier), model,
+				telemetry.EstimateTokens(latestPrompt),
+				d.Config.JudgeCostPer1KUSD,
+			))
 		}
 
 		// Per-request recording. The metrics observer (issue #4)
