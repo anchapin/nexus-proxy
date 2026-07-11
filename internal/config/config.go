@@ -169,6 +169,20 @@ type Config struct {
 	// is the production default, text is friendlier for local dev.
 	LogLevel  slog.Level
 	LogFormat LogFormat
+
+	// Debug request/response tracing (issue #33). Debug is the master
+	// switch: when false (the default) the chat handler takes the
+	// production fast path with zero extra allocations. When true the
+	// handler emits a structured trace per request — inbound summary,
+	// middleware transforms, routing decision, upstream call, and a
+	// truncated response preview. DebugBodyBytes caps the response
+	// body preview so a runaway upstream cannot flood the log; zero or
+	// negative falls back to DefaultDebugBodyBytes. Distinct from
+	// LogLevel=debug: Debug adds payload-level visibility gated
+	// independently so operators can turn it on without enabling
+	// debug-level chatter from every other package.
+	Debug          bool
+	DebugBodyBytes int
 }
 
 // DefaultMetricsDBPath returns the canonical metrics DB location:
@@ -476,6 +490,17 @@ func Load() (Config, error) {
 	cfg.LogLevel = parseLogLevel(os.Getenv("NEXUS_LOG_LEVEL"))
 	cfg.LogFormat = parseLogFormat(os.Getenv("NEXUS_LOG_FORMAT"))
 
+	// Debug tracing (issue #33). Off by default so production has
+	// zero overhead. Body preview is bounded by NEXUS_DEBUG_BODY_BYTES
+	// (default DefaultDebugBodyBytes = 512); zero or negative falls
+	// back to the default.
+	cfg.Debug = parseBoolEnv("NEXUS_DEBUG", false)
+	debugBodyBytes, err := getEnvInt("NEXUS_DEBUG_BODY_BYTES", DefaultDebugBodyBytes)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.DebugBodyBytes = debugBodyBytes
+
 	return cfg, nil
 }
 
@@ -497,6 +522,23 @@ func (c Config) EffectiveMaxBodyBytes() int {
 		return c.MaxBodyBytes
 	}
 	return DefaultMaxBodyBytes
+}
+
+// DefaultDebugBodyBytes is the upper bound on the response-body preview
+// the debug trace logs (issue #33). 512 bytes is enough to identify the
+// upstream model, see the first few tokens, and recognise a malformed
+// reply, while keeping the log line a reasonable size.
+const DefaultDebugBodyBytes = 512
+
+// EffectiveDebugBodyBytes returns the response-body preview cap the
+// debug trace should honour. Zero or negative falls back to
+// DefaultDebugBodyBytes so a zero-value Config (typical in tests) still
+// gets a sane cap.
+func (c Config) EffectiveDebugBodyBytes() int {
+	if c.DebugBodyBytes > 0 {
+		return c.DebugBodyBytes
+	}
+	return DefaultDebugBodyBytes
 }
 
 // TelemetryEnabled reports whether the on-disk recorder should be started.

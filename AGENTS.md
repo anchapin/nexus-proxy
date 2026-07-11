@@ -190,6 +190,36 @@ dependency). The store is concurrency-safe via an internal
 chat handlers read through `Retrieve` without coordination beyond
 the lock.
 
+## Debug request/response tracing (issue #33)
+
+`NEXUS_DEBUG=true` switches the chat handler into a structured
+tracing mode that emits five `[DEBUG] <section>` slog lines per
+proxied request: `request`, `transforms`, `routing`, `upstream`,
+`response`. Each line carries a structured sub-group so operators
+can grep a single request id and see the full lifecycle:
+
+| Section       | Fields                                                                  |
+| ------------- | ----------------------------------------------------------------------- |
+| `request`     | message count, estimated tokens, model, stream flag, body bytes        |
+| `transforms`  | prompt engineering applied, RAG injection (filename/score), TOON delta  |
+| `routing`     | route, reason (guardrail / dsl / slm), budget source, estimated tokens |
+| `upstream`    | target host, model, streaming, cascade steps + served-by (when applicable) |
+| `response`    | status code, TTFT ms, total bytes, output tokens, truncated body preview |
+
+Production has zero overhead when the flag is off: the handler
+skips trace construction entirely and the existing fast path is
+byte-for-byte identical. When on, the handler installs a
+`captureWriter` even without judge/quality observers so the
+response trace can include a body preview.
+
+API keys are always redacted (`sk-...XYZ1` for a real
+`sk-proj-...XYZ1`); `Authorization` headers are stripped from any
+structured payload. The body preview is capped at
+`NEXUS_DEBUG_BODY_BYTES` (default 512) so a runaway upstream cannot
+flood the log. Traces are emitted **after** the response completes
+so they never interleave with the SSE stream the harness is
+consuming.
+
 ## Async LLM-as-a-Judge (issue #15)
 
 `internal/judge` is the async quality evaluator. It samples ~10% of

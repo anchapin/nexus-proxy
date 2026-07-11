@@ -247,17 +247,23 @@ type WriteHook func(time.Time)
 // through; Flush() forwards to the inner writer when it implements
 // http.Flusher (so Stream's flusher assertion still succeeds on real
 // writers but degrades to a no-op on non-flushers like httptest.Recorder).
+//
+// The wrapper also captures the response status code (issue #33) so the
+// debug trace can report it without an extra wrapper. WriteHeader is
+// idempotent: Go's net/http panics on a second WriteHeader, so we just
+// record the first one we see and ignore the rest.
 type ObservingWriter struct {
 	http.ResponseWriter
 	hook     WriteHook
 	wrote    atomic.Bool
 	bytesOut atomic.Uint64
+	status   atomic.Int64 // -1 until WriteHeader fires; 0 = 200 (Go default)
 }
 
 // NewObservingWriter wraps inner. hook may be nil; if so, only byte counts
 // are tracked.
 func NewObservingWriter(inner http.ResponseWriter, hook WriteHook) *ObservingWriter {
-	return &ObservingWriter{ResponseWriter: inner, hook: hook}
+	return &ObservingWriter{ResponseWriter: inner, hook: hook, status: atomic.Int64{}}
 }
 
 // Write fires the first-write hook (if not yet fired) and updates the
@@ -270,9 +276,29 @@ func (o *ObservingWriter) Write(b []byte) (int, error) {
 	return o.ResponseWriter.Write(b)
 }
 
+// WriteHeader records the status code and forwards to the inner writer.
+// Idempotent against multiple calls: Go's net/http panics on the second
+// WriteHeader, but recording is still racy-free thanks to atomic.Int64.
+func (o *ObservingWriter) WriteHeader(s int) {
+	o.status.CompareAndSwap(-1, int64(s))
+	o.ResponseWriter.WriteHeader(s)
+}
+
 // BytesOut returns the cumulative number of bytes written to the underlying
 // ResponseWriter.
 func (o *ObservingWriter) BytesOut() uint64 { return o.bytesOut.Load() }
+
+// StatusCode returns the status code the wrapped writer committed, or
+// 200 when WriteHeader was never called (the Go default). Issue #33:
+// the debug trace uses this to surface the upstream HTTP status without
+// a second wrapper layer.
+func (o *ObservingWriter) StatusCode() int {
+	s := o.status.Load()
+	if s < 0 {
+		return http.StatusOK
+	}
+	return int(s)
+}
 
 // Flush forwards to the inner writer when it implements http.Flusher.
 // Defining Flush here (rather than relying on embedding) lets Stream's
