@@ -1,8 +1,12 @@
-// Package config loads runtime configuration from environment variables.
+// Package config loads runtime configuration from environment variables
+// with optional layered overrides from a YAML config file (issue #31).
+//
+// Resolution order: env var > config file > built-in default.
 //
 // All values have safe defaults so the binary boots in development with a
 // local Ollama instance. Secrets (FRONTIER_API_KEY) must be supplied via env
-// in any non-development deployment.
+// in any non-development deployment — the YAML file can reference them
+// via ${VAR} expansion so they never appear on disk.
 package config
 
 import (
@@ -18,6 +22,12 @@ import (
 // Config holds all runtime knobs for the proxy. A zero value is invalid;
 // always go through Load.
 type Config struct {
+	// ConfigFile is the path to the YAML config file that was loaded
+	// (after --config / NEXUS_CONFIG / CWD discovery), or "" when no
+	// file was found. Reported in the boot log so operators can see
+	// which source the binary is reading (issue #31).
+	ConfigFile string
+
 	// HTTP server
 	Addr string // ":8000"
 
@@ -144,54 +154,163 @@ func DefaultMetricsDBPath() string {
 	return filepath.Join(base, "nexus-proxy", "metrics.db")
 }
 
-// Load reads configuration from environment variables, applying defaults
-// suitable for local development. It returns an error only when a required
-// value is malformed; missing optional values fall back to defaults.
+// configKeys maps the YAML "section.key" paths to env var names. This
+// is the one source of truth that bridges the structured YAML view
+// and the existing NEXUS_* env-var surface; if you add a new config
+// field, add it here AND to nexus.yaml.example.
+//
+// The parser emits lowercased "section.key" paths. Keys not present in
+// this map are silently dropped from the file's contribution so a stray
+// YAML entry (typo, leftover from an older schema) cannot break boot.
+var configKeys = map[string]string{
+	"server.addr":              "NEXUS_ADDR",
+	"server.max_body_bytes":    "NEXUS_MAX_BODY_BYTES",
+	"log.level":                "NEXUS_LOG_LEVEL",
+	"log.format":               "NEXUS_LOG_FORMAT",
+	"ollama.url":               "NEXUS_OLLAMA_URL",
+	"ollama.router_model":      "NEXUS_ROUTER_MODEL",
+	"ollama.local_model":       "NEXUS_LOCAL_MODEL",
+	"ollama.embedding_model":   "NEXUS_EMBEDDING_MODEL",
+	"frontier.url":             "NEXUS_FRONTIER_URL",
+	"frontier.model":           "NEXUS_FRONTIER_MODEL",
+	"frontier.api_key":         "NEXUS_FRONTIER_API_KEY",
+	"zai.url":                  "NEXUS_ZAI_URL",
+	"zai.model":                "NEXUS_ZAI_MODEL",
+	"zai.api_key":              "NEXUS_ZAI_API_KEY",
+	"rag.examples_dir":         "NEXUS_EXAMPLES_DIR",
+	"rag.threshold":            "NEXUS_RAG_THRESHOLD",
+	"routing.token_guardrail":  "NEXUS_TOKEN_GUARDRAIL",
+	"routing.slm_timeout":      "NEXUS_SLM_TIMEOUT",
+	"routing.fusion_timeout":   "NEXUS_FUSION_TIMEOUT",
+	"routing.cascade_timeout":  "NEXUS_CASCADE_TIMEOUT",
+	"routing.arbiter_timeout":  "NEXUS_ARBITER_TIMEOUT",
+	"health.poll_interval":     "NEXUS_HEALTH_POLL_INTERVAL",
+	"health.breaker_threshold": "NEXUS_HEALTH_BREAKER_THRESHOLD",
+	"health.probe_timeout":     "NEXUS_HEALTH_PROBE_TIMEOUT",
+	"judge.url":                "NEXUS_JUDGE_URL",
+	"judge.model":              "NEXUS_JUDGE_MODEL",
+	"judge.api_key":            "NEXUS_JUDGE_API_KEY",
+	"judge.sample_rate":        "NEXUS_JUDGE_SAMPLE_RATE",
+	"judge.concurrency":        "NEXUS_JUDGE_CONCURRENCY",
+	"judge.queue":              "NEXUS_JUDGE_QUEUE",
+	"judge.timeout":            "NEXUS_JUDGE_TIMEOUT",
+	"judge.cost_per_1k":        "NEXUS_JUDGE_COST_PER_1K",
+	"telemetry.path":           "NEXUS_TELEMETRY_PATH",
+	"metrics.db_path":          "NEXUS_METRICS_DB",
+	"quality.concurrency":      "NEXUS_QUALITY_CONCURRENCY",
+	"quality.queue":            "NEXUS_QUALITY_QUEUE",
+	"quality.timeout":          "NEXUS_QUALITY_TIMEOUT",
+	"quality.stderr_cap":       "NEXUS_QUALITY_STDERR_CAP",
+	"probe.interval":           "NEXUS_PROBE_INTERVAL",
+	"probe.timeout":            "NEXUS_PROBE_TIMEOUT",
+	"probe.bytes_per_token":    "NEXUS_PROBE_BYTES_PER_TOKEN",
+}
+
+// fileMapFromKeys translates the parsed section.key map into an
+// env-keyed map (only known keys are forwarded).
+func fileMapFromKeys(parsed map[string]string) map[string]string {
+	if parsed == nil {
+		return nil
+	}
+	out := make(map[string]string, len(parsed))
+	for k, v := range parsed {
+		if envKey, ok := configKeys[k]; ok {
+			out[envKey] = v
+		}
+	}
+	return out
+}
+
+// resolveConfigPath walks the precedence chain (flag > env > CWD) and
+// returns the path to load, or "" when no file is configured. It is
+// split out from Load so tests can assert the chain without spinning
+// up the full config struct.
+func resolveConfigPath() string {
+	if p := ConfigPathOverride(); p != "" {
+		return p
+	}
+	if p := os.Getenv("NEXUS_CONFIG"); p != "" {
+		return p
+	}
+	return DiscoverConfigFile()
+}
+
+// Load reads configuration from environment variables with layered
+// overrides from a YAML config file (issue #31). Resolution order:
+// env var > config file > built-in default. The config file is
+// resolved via the precedence chain:
+//
+//  1. SetConfigPathOverride (from main.go's --config flag)
+//  2. NEXUS_CONFIG env var
+//  3. nexus.yaml / nexus.yml / nexus.json in CWD
+//
+// A missing file is non-fatal — the boot falls back to env-only, which
+// matches the pre-issue-#31 behaviour exactly. A malformed file is
+// fatal so operators notice the typo during boot instead of silently
+// getting partial config.
 func Load() (Config, error) {
-	cfg := Config{
-		Addr:           getEnv("NEXUS_ADDR", ":8000"),
-		OllamaURL:      strings.TrimRight(getEnv("NEXUS_OLLAMA_URL", "http://localhost:11434"), "/"),
-		RouterModel:    getEnv("NEXUS_ROUTER_MODEL", "qwen3-coder:4b"),
-		LocalModel:     getEnv("NEXUS_LOCAL_MODEL", "qwen3-coder:8b"),
-		EmbeddingModel: getEnv("NEXUS_EMBEDDING_MODEL", "nomic-embed-text"),
-		FrontierURL:    getEnv("NEXUS_FRONTIER_URL", "https://api.openai.com/v1/chat/completions"),
-		FrontierModel:  getEnv("NEXUS_FRONTIER_MODEL", "gpt-4o"),
-		FrontierKey:    getEnv("NEXUS_FRONTIER_API_KEY", ""),
-		ZAIURL:         getEnv("NEXUS_ZAI_URL", "https://api.z.ai/v1/chat/completions"),
-		ZAIModel:       getEnv("NEXUS_ZAI_MODEL", "glm-4.6"),
-		ZAIKey:         getEnv("NEXUS_ZAI_API_KEY", ""),
-		ExamplesDir:    getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
-		MetaPrompt:     defaultMetaPrompt,
-		TOONNotice:     defaultTOONNotice,
-		TelemetryPath:  getEnvAllowEmpty("NEXUS_TELEMETRY_PATH", "./nexus-telemetry.jsonl"),
-		MetricsDBPath:  getEnvAllowEmpty("NEXUS_METRICS_DB", DefaultMetricsDBPath()),
+	// 1. Resolve and load the config file (if any).
+	path := resolveConfigPath()
+	var fileMap map[string]string
+	if path != "" {
+		parsed, err := LoadFile(path)
+		if err != nil {
+			return Config{}, err
+		}
+		// LoadFile returns (nil, nil) for a missing file — graceful
+		// degradation per issue #31 AC. Only known keys are forwarded
+		// so unknown YAML entries never break boot.
+		fileMap = fileMapFromKeys(parsed)
+		if fileMap == nil {
+			path = ""
+		}
 	}
 
-	threshold, err := getEnvFloat("NEXUS_RAG_THRESHOLD", 0.55)
+	cfg := Config{
+		ConfigFile:     path,
+		Addr:           resolveString("NEXUS_ADDR", fileMap, ":8000"),
+		OllamaURL:      strings.TrimRight(resolveString("NEXUS_OLLAMA_URL", fileMap, "http://localhost:11434"), "/"),
+		RouterModel:    resolveString("NEXUS_ROUTER_MODEL", fileMap, "qwen3-coder:4b"),
+		LocalModel:     resolveString("NEXUS_LOCAL_MODEL", fileMap, "qwen3-coder:8b"),
+		EmbeddingModel: resolveString("NEXUS_EMBEDDING_MODEL", fileMap, "nomic-embed-text"),
+		FrontierURL:    resolveString("NEXUS_FRONTIER_URL", fileMap, "https://api.openai.com/v1/chat/completions"),
+		FrontierModel:  resolveString("NEXUS_FRONTIER_MODEL", fileMap, "gpt-4o"),
+		FrontierKey:    resolveString("NEXUS_FRONTIER_API_KEY", fileMap, ""),
+		ZAIURL:         resolveString("NEXUS_ZAI_URL", fileMap, "https://api.z.ai/v1/chat/completions"),
+		ZAIModel:       resolveString("NEXUS_ZAI_MODEL", fileMap, "glm-4.6"),
+		ZAIKey:         resolveString("NEXUS_ZAI_API_KEY", fileMap, ""),
+		ExamplesDir:    resolveString("NEXUS_EXAMPLES_DIR", fileMap, "./few_shot_examples"),
+		MetaPrompt:     defaultMetaPrompt,
+		TOONNotice:     defaultTOONNotice,
+		TelemetryPath:  resolveAllowEmpty("NEXUS_TELEMETRY_PATH", fileMap, "./nexus-telemetry.jsonl"),
+		MetricsDBPath:  resolveAllowEmpty("NEXUS_METRICS_DB", fileMap, DefaultMetricsDBPath()),
+	}
+
+	threshold, err := resolveFloat("NEXUS_RAG_THRESHOLD", fileMap, 0.55)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.RAGThreshold = threshold
 
-	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
+	guardrail, err := resolveInt("NEXUS_TOKEN_GUARDRAIL", fileMap, 6000)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.TokenGuardrail = guardrail
 
-	slmTimeout, err := getEnvDuration("NEXUS_SLM_TIMEOUT", 8*time.Second)
+	slmTimeout, err := resolveDuration("NEXUS_SLM_TIMEOUT", fileMap, 8*time.Second)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.SLMTimeout = slmTimeout
 
-	fusionTimeout, err := getEnvDuration("NEXUS_FUSION_TIMEOUT", 120*time.Second)
+	fusionTimeout, err := resolveDuration("NEXUS_FUSION_TIMEOUT", fileMap, 120*time.Second)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.FusionTimeout = fusionTimeout
 
-	cascadeTimeout, err := getEnvDuration("NEXUS_CASCADE_TIMEOUT", 30*time.Second)
+	cascadeTimeout, err := resolveDuration("NEXUS_CASCADE_TIMEOUT", fileMap, 30*time.Second)
 	if err != nil {
 		return cfg, err
 	}
@@ -200,7 +319,7 @@ func Load() (Config, error) {
 	// Fusion arbiter synthesis (issue #12). Shorter than FusionTimeout
 	// because the arbiter is doing synthesis, not generation — a slow
 	// arbiter should not pin the whole request indefinitely.
-	arbiterTimeout, err := getEnvDuration("NEXUS_ARBITER_TIMEOUT", 60*time.Second)
+	arbiterTimeout, err := resolveDuration("NEXUS_ARBITER_TIMEOUT", fileMap, 60*time.Second)
 	if err != nil {
 		return cfg, err
 	}
@@ -212,19 +331,19 @@ func Load() (Config, error) {
 	// the chat handler then behaves as if Ollama is always healthy
 	// (i.e. it will still try the local route on every request and
 	// pay the upstream timeout if Ollama is down).
-	healthPoll, err := getEnvDuration("NEXUS_HEALTH_POLL_INTERVAL", 30*time.Second)
+	healthPoll, err := resolveDuration("NEXUS_HEALTH_POLL_INTERVAL", fileMap, 30*time.Second)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.HealthPollInterval = healthPoll
 
-	healthBreaker, err := getEnvInt("NEXUS_HEALTH_BREAKER_THRESHOLD", 3)
+	healthBreaker, err := resolveInt("NEXUS_HEALTH_BREAKER_THRESHOLD", fileMap, 3)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.HealthBreakerThreshold = healthBreaker
 
-	healthProbe, err := getEnvDuration("NEXUS_HEALTH_PROBE_TIMEOUT", 5*time.Second)
+	healthProbe, err := resolveDuration("NEXUS_HEALTH_PROBE_TIMEOUT", fileMap, 5*time.Second)
 	if err != nil {
 		return cfg, err
 	}
@@ -237,19 +356,19 @@ func Load() (Config, error) {
 	// entirely; the boot probe still runs synchronously once. When
 	// the probe is disabled or returns zero (Ollama down + no AMD
 	// sysfs), the chat handler falls back to TokenGuardrail.
-	probeInterval, err := getEnvDuration("NEXUS_PROBE_INTERVAL", 60*time.Second)
+	probeInterval, err := resolveDuration("NEXUS_PROBE_INTERVAL", fileMap, 60*time.Second)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.ProbePollInterval = probeInterval
 
-	probeTimeout, err := getEnvDuration("NEXUS_PROBE_TIMEOUT", 5*time.Second)
+	probeTimeout, err := resolveDuration("NEXUS_PROBE_TIMEOUT", fileMap, 5*time.Second)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.ProbeTimeout = probeTimeout
 
-	probeBytes, err := getEnvInt("NEXUS_PROBE_BYTES_PER_TOKEN", 256*1024)
+	probeBytes, err := resolveInt("NEXUS_PROBE_BYTES_PER_TOKEN", fileMap, 256*1024)
 	if err != nil {
 		return cfg, err
 	}
@@ -263,7 +382,7 @@ func Load() (Config, error) {
 	// OpenAI-compatible request sizes; the chat handler wraps r.Body
 	// with http.MaxBytesReader so an oversized POST is rejected with
 	// 413 before any allocation happens.
-	maxBodyBytes, err := getEnvInt("NEXUS_MAX_BODY_BYTES", DefaultMaxBodyBytes)
+	maxBodyBytes, err := resolveInt("NEXUS_MAX_BODY_BYTES", fileMap, DefaultMaxBodyBytes)
 	if err != nil {
 		return cfg, err
 	}
@@ -273,38 +392,38 @@ func Load() (Config, error) {
 	// local-route successes, 2 concurrent workers, 30s per call. When
 	// JudgeURL is unset we fall back to NEXUS_FRONTIER_URL so a stock
 	// config still works.
-	cfg.JudgeURL = getEnv("NEXUS_JUDGE_URL", "https://api.z.ai/v1/chat/completions")
-	if v := os.Getenv("NEXUS_JUDGE_URL"); v == "" {
+	cfg.JudgeURL = resolveString("NEXUS_JUDGE_URL", fileMap, "https://api.z.ai/v1/chat/completions")
+	if !isConfigSourceSet("NEXUS_JUDGE_URL", fileMap) {
 		cfg.JudgeURL = cfg.FrontierURL
 	}
-	cfg.JudgeModel = getEnv("NEXUS_JUDGE_MODEL", cfg.FrontierModel)
-	cfg.JudgeAPIKey = getEnv("NEXUS_JUDGE_API_KEY", cfg.FrontierKey)
+	cfg.JudgeModel = resolveString("NEXUS_JUDGE_MODEL", fileMap, cfg.FrontierModel)
+	cfg.JudgeAPIKey = resolveString("NEXUS_JUDGE_API_KEY", fileMap, cfg.FrontierKey)
 
-	sampleRate, err := getEnvFloat("NEXUS_JUDGE_SAMPLE_RATE", 0.1)
+	sampleRate, err := resolveFloat("NEXUS_JUDGE_SAMPLE_RATE", fileMap, 0.1)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.JudgeSampleRate = sampleRate
 
-	concurrency, err := getEnvInt("NEXUS_JUDGE_CONCURRENCY", 2)
+	concurrency, err := resolveInt("NEXUS_JUDGE_CONCURRENCY", fileMap, 2)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.JudgeConcurrency = concurrency
 
-	queueDepth, err := getEnvInt("NEXUS_JUDGE_QUEUE", 64)
+	queueDepth, err := resolveInt("NEXUS_JUDGE_QUEUE", fileMap, 64)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.JudgeQueueDepth = queueDepth
 
-	judgeTimeout, err := getEnvDuration("NEXUS_JUDGE_TIMEOUT", 30*time.Second)
+	judgeTimeout, err := resolveDuration("NEXUS_JUDGE_TIMEOUT", fileMap, 30*time.Second)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.JudgeTimeout = judgeTimeout
 
-	costRate, err := getEnvFloat("NEXUS_JUDGE_COST_PER_1K", 0.002)
+	costRate, err := resolveFloat("NEXUS_JUDGE_COST_PER_1K", fileMap, 0.002)
 	if err != nil {
 		return cfg, err
 	}
@@ -320,25 +439,25 @@ func Load() (Config, error) {
 	// QualityConcurrency is non-positive; the chat handler treats a
 	// nil observer as "no-op", so the hot path is unaffected by an
 	// unconfigured quality pipeline (same pattern as the judge).
-	qualityConcurrency, err := getEnvInt("NEXUS_QUALITY_CONCURRENCY", 2)
+	qualityConcurrency, err := resolveInt("NEXUS_QUALITY_CONCURRENCY", fileMap, 2)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.QualityConcurrency = qualityConcurrency
 
-	qualityQueueDepth, err := getEnvInt("NEXUS_QUALITY_QUEUE", 64)
+	qualityQueueDepth, err := resolveInt("NEXUS_QUALITY_QUEUE", fileMap, 64)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.QualityQueueDepth = qualityQueueDepth
 
-	qualityTimeout, err := getEnvDuration("NEXUS_QUALITY_TIMEOUT", 60*time.Second)
+	qualityTimeout, err := resolveDuration("NEXUS_QUALITY_TIMEOUT", fileMap, 60*time.Second)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.QualityTimeout = qualityTimeout
 
-	stderrCap, err := getEnvInt("NEXUS_QUALITY_STDERR_CAP", 2*1024)
+	stderrCap, err := resolveInt("NEXUS_QUALITY_STDERR_CAP", fileMap, 2*1024)
 	if err != nil {
 		return cfg, err
 	}
@@ -350,8 +469,8 @@ func Load() (Config, error) {
 	// expectation: JSON to stderr at info level. Operators flip on
 	// debug by setting NEXUS_LOG_LEVEL=debug, and switch to a
 	// human-friendly text handler with NEXUS_LOG_FORMAT=text.
-	cfg.LogLevel = parseLogLevel(os.Getenv("NEXUS_LOG_LEVEL"))
-	cfg.LogFormat = parseLogFormat(os.Getenv("NEXUS_LOG_FORMAT"))
+	cfg.LogLevel = parseLogLevel(resolveString("NEXUS_LOG_LEVEL", fileMap, ""))
+	cfg.LogFormat = parseLogFormat(resolveString("NEXUS_LOG_FORMAT", fileMap, ""))
 
 	return cfg, nil
 }
@@ -400,57 +519,102 @@ func (c Config) NewLogger() *slog.Logger {
 	return slog.New(h)
 }
 
-func getEnv(key, def string) string {
+// resolveString returns env value when the env var is set and non-empty,
+// then the YAML file value when present (even if empty — operators can
+// explicitly clear a value with `key: ""`), then the built-in default.
+func resolveString(key string, fileMap map[string]string, def string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		return v
 	}
-	return def
-}
-
-// getEnvAllowEmpty is like getEnv but returns the empty string when the
-// caller has explicitly set the variable to "". Used for the telemetry path
-// so operators can disable recording with NEXUS_TELEMETRY_PATH="".
-func getEnvAllowEmpty(key, def string) string {
-	if v, ok := os.LookupEnv(key); ok {
+	if v, ok := fileMap[key]; ok {
 		return v
 	}
 	return def
 }
 
-func getEnvInt(key string, def int) (int, error) {
-	v, ok := os.LookupEnv(key)
-	if !ok || v == "" {
-		return def, nil
+// resolveAllowEmpty is like resolveString but treats env="" as set. Used
+// for the telemetry path / metrics DB so operators can disable them by
+// setting NEXUS_TELEMETRY_PATH="" or NEXUS_METRICS_DB="".
+func resolveAllowEmpty(key string, fileMap map[string]string, def string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
 	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return 0, fmt.Errorf("config: %s must be an integer: %w", key, err)
+	if v, ok := fileMap[key]; ok {
+		return v
 	}
-	return n, nil
+	return def
 }
 
-func getEnvFloat(key string, def float64) (float64, error) {
-	v, ok := os.LookupEnv(key)
-	if !ok || v == "" {
-		return def, nil
+// resolveInt reads an int from env (non-empty), file, or default. A
+// malformed value in either source produces an error so the boot fails
+// loud instead of silently using a zero.
+func resolveInt(key string, fileMap map[string]string, def int) (int, error) {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return 0, fmt.Errorf("config: %s must be an integer: %w", key, err)
+		}
+		return n, nil
 	}
-	f, err := strconv.ParseFloat(v, 64)
-	if err != nil {
-		return 0, fmt.Errorf("config: %s must be a number: %w", key, err)
+	if v, ok := fileMap[key]; ok && v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return 0, fmt.Errorf("config: %s in file must be an integer: %w", key, err)
+		}
+		return n, nil
 	}
-	return f, nil
+	return def, nil
 }
 
-func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
-	v, ok := os.LookupEnv(key)
-	if !ok || v == "" {
-		return def, nil
+// resolveFloat reads a float from env (non-empty), file, or default.
+func resolveFloat(key string, fileMap map[string]string, def float64) (float64, error) {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return 0, fmt.Errorf("config: %s must be a number: %w", key, err)
+		}
+		return f, nil
 	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		return 0, fmt.Errorf("config: %s must be a duration (e.g. 8s, 2m): %w", key, err)
+	if v, ok := fileMap[key]; ok && v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return 0, fmt.Errorf("config: %s in file must be a number: %w", key, err)
+		}
+		return f, nil
 	}
-	return d, nil
+	return def, nil
+}
+
+// resolveDuration reads a time.Duration from env (non-empty), file, or default.
+func resolveDuration(key string, fileMap map[string]string, def time.Duration) (time.Duration, error) {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return 0, fmt.Errorf("config: %s must be a duration (e.g. 8s, 2m): %w", key, err)
+		}
+		return d, nil
+	}
+	if v, ok := fileMap[key]; ok && v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return 0, fmt.Errorf("config: %s in file must be a duration: %w", key, err)
+		}
+		return d, nil
+	}
+	return def, nil
+}
+
+// isConfigSourceSet reports whether key was set via env (non-empty) OR
+// present in fileMap. Used for "fall back if not set" logic that
+// previously relied solely on os.Getenv.
+func isConfigSourceSet(key string, fileMap map[string]string) bool {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		return true
+	}
+	if _, ok := fileMap[key]; ok {
+		return true
+	}
+	return false
 }
 
 // LogFormat is the wire format for the structured logger. JSON is the

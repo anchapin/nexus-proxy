@@ -36,6 +36,15 @@ const (
 )
 
 func main() {
+	// --config <path> is parsed here so config.Load() can honour it
+	// without forcing every embedder to plumb the path through a
+	// parameter. The flag's value is stashed in a package variable
+	// that Load() consults before NEXUS_CONFIG / CWD discovery
+	// (issue #31).
+	if path := parseConfigFlag(os.Args[1:]); path != "" {
+		config.SetConfigPathOverride(path)
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		// The structured logger is not yet wired, so use the std
@@ -46,6 +55,15 @@ func main() {
 	}
 	logger := cfg.NewLogger()
 	slog.SetDefault(logger)
+
+	// Surface which config source the binary actually read. Operators
+	// debugging "why isn't my YAML being picked up" check this line
+	// first (issue #31).
+	if cfg.ConfigFile != "" {
+		slog.Info("config file loaded", slog.String("path", cfg.ConfigFile))
+	} else {
+		slog.Info("no config file loaded; using env vars only")
+	}
 
 	emb := rag.NewOllamaEmbedder(cfg.OllamaURL, cfg.EmbeddingModel, nil)
 	store := rag.NewStore(emb, cfg.RAGThreshold)
@@ -454,4 +472,21 @@ func healthzHandler(hpoller *health.Health, mgr *probe.Manager, cfg config.Confi
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}
+}
+
+// parseConfigFlag scans args for "--config <path>" and returns the
+// path, or "" if the flag is absent. Only the "--config PATH" form is
+// recognised (no "--config=PATH" and no short alias) to keep the
+// surface minimal — operators with stricter requirements can pass
+// NEXUS_CONFIG instead.
+//
+// The function deliberately ignores unknown flags so future flags can
+// be added without coordination between main() and this scanner.
+func parseConfigFlag(args []string) string {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--config" && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
 }
