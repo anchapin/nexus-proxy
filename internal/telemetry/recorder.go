@@ -46,6 +46,16 @@ const writeBufferSize = 16 << 10
 // case — including the legacy (non-progressive) Panel path, where
 // the arbiter is always invoked. The dashboard joins on this flag
 // to report "fraction of fusion traffic that achieved agreement".
+//
+// Route-source fields (issue #74) carry the planner's Decision
+// metadata so downstream consumers (JSONL log, SQLite metrics,
+// dashboard) can attribute each request to the stage that produced
+// the route. RouteSource is one of guardrail / dsl / slm / slm-error
+// / escalation; RouteReason is a short machine-readable detail
+// (e.g. "vram" for the guardrail path, the error string for the
+// SLM-error path); SLMConfidence is the [0,1] confidence value (0.5
+// neutral, 0 for non-SLM sources); SLMTaskType is the Categorize()
+// bucket (empty for non-SLM sources).
 type Record struct {
 	Timestamp            time.Time `json:"timestamp"`
 	RequestID            string    `json:"request_id"`
@@ -59,6 +69,14 @@ type Record struct {
 	Streaming            bool      `json:"streaming"`
 	FusionArbiterSkipped bool      `json:"fusion_arbiter_skipped,omitempty"`
 	Error                string    `json:"error,omitempty"`
+
+	// Route-source metadata (issue #74). Omitempty keeps legacy
+	// JSONL rows byte-for-byte compatible when these fields are
+	// zero-valued.
+	RouteSource   string  `json:"route_source,omitempty"`
+	RouteReason   string  `json:"route_reason,omitempty"`
+	SLMConfidence float64 `json:"slm_confidence,omitempty"`
+	SLMTaskType   string  `json:"slm_task_type,omitempty"`
 }
 
 // EstimateTokens returns the cheap "4 chars per token" heuristic used

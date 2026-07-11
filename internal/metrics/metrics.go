@@ -73,6 +73,10 @@ const recordRequestErrorTimeout = 5 * time.Second
 // answer and terminated without invoking the arbiter. False in every
 // other case (legacy Panel path always invokes the arbiter; non-fusion
 // routes are always false).
+//
+// Route-source metadata (issue #74) mirrors telemetry.Record so the
+// SQLite store and the JSONL recorder carry identical routing metadata
+// for every request.
 type Request struct {
 	Timestamp         time.Time
 	RequestID         string
@@ -91,6 +95,12 @@ type Request struct {
 	Streaming            bool
 	FusionArbiterSkipped bool
 	Error                string
+
+	// Route-source metadata (issue #74).
+	RouteSource   string
+	RouteReason   string
+	SLMConfidence float64
+	SLMTaskType   string
 }
 
 // Summary is the per-day roll-up returned by Store.DailySummary.

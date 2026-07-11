@@ -27,6 +27,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/judge"
 	"github.com/anchapin/nexus-proxy/internal/metrics"
+	"github.com/anchapin/nexus-proxy/internal/observability"
 	"github.com/anchapin/nexus-proxy/internal/probe"
 	"github.com/anchapin/nexus-proxy/internal/quality"
 	"github.com/anchapin/nexus-proxy/internal/rag"
@@ -458,21 +459,41 @@ func main() {
 	}()
 
 	mux := http.NewServeMux()
+
+	// Route-decision counters (issue #74). The in-process counter set
+	// records every planner Decision that crosses the chat handler so
+	// operators get a Prometheus-text view of routing attribution
+	// without depending on the JSONL file or the SQLite store. The
+	// handler never imports observability — this closure adapts the
+	// neutral RouteDecisionEvent shape to the RouteCounters.Observe
+	// signature. /metrics is served by the handler returned by
+	// RouteCounters.Handler() so a scrape is always an atomic
+	// snapshot.
+	routeCounters := observability.NewRouteCounters()
+	routeDecisionObs := handlers.RouteDecisionObserverFunc(func(e handlers.RouteDecisionEvent) {
+		routeCounters.Observe(e.Route, e.Source, e.Confidence, e.TaskType, "")
+	})
+	mux.Handle("/metrics", routeCounters.Handler())
+	slog.Info("metrics endpoint serves prometheus text format",
+		slog.String("path", "/metrics"),
+	)
+
 	chatHandler := handlers.Chat(handlers.Deps{
-		Config:          cfg,
-		Client:          http.DefaultClient,
-		RAG:             store,
-		SLM:             slm,
-		FormattingRegex: re,
-		Confidence:      confidenceObs,
-		JudgeObserver:   judgeObs,
-		QualityObserver: qualityO,
-		MetricsObserver: metricsObs,
-		Recorder:        recorder,
-		Health:          hpoller,
-		BudgetObserver:  budgetObserver(probeMgr),
-		LocalLimiter:    localLimiter,
-		LocalCooldown:   localCooldown,
+		Config:                cfg,
+		Client:                http.DefaultClient,
+		RAG:                   store,
+		SLM:                   slm,
+		FormattingRegex:       re,
+		Confidence:            confidenceObs,
+		JudgeObserver:         judgeObs,
+		QualityObserver:       qualityO,
+		MetricsObserver:       metricsObs,
+		Recorder:              recorder,
+		Health:                hpoller,
+		BudgetObserver:        budgetObserver(probeMgr),
+		LocalLimiter:          localLimiter,
+		LocalCooldown:         localCooldown,
+		RouteDecisionObserver: routeDecisionObs,
 	})
 	// Apply the per-client rate limiter (issue #75) as the outermost
 	// wrapper so a flood of requests is rejected before any middleware
@@ -763,6 +784,10 @@ func buildMetrics(cfg config.Config) (metrics.Store, handlers.MetricsObserver) {
 			TPS:               e.TPS,
 			Streaming:         e.Streaming,
 			Error:             e.Error,
+			RouteSource:       e.RouteSource,
+			RouteReason:       e.RouteReason,
+			SLMConfidence:     e.SLMConfidence,
+			SLMTaskType:       e.SLMTaskType,
 		})
 	})
 	return store, obs

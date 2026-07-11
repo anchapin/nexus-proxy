@@ -71,10 +71,10 @@ func mockOllama(t *testing.T, status int, body string) *httptest.Server {
 
 func TestModelsList_ReturnsConfiguredModels(t *testing.T) {
 	cfg := config.Config{
-		LocalModel:           "qwen3-coder:8b",
-		RouterModel:          "qwen3-coder:4b",
-		FrontierModel:        "gpt-4o",
-		ZAIModel:             "glm-4.6",
+		LocalModel:            "qwen3-coder:8b",
+		RouterModel:           "qwen3-coder:4b",
+		FrontierModel:         "gpt-4o",
+		ZAIModel:              "glm-4.6",
 		ModelsEndpointEnabled: true,
 		// ModelsCacheTTL = 0 → Ollama poll disabled, list is purely configured.
 	}

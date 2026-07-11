@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -85,6 +86,41 @@ type QualityObserverFunc func(QualityEvent)
 // Submit implements QualityObserver.
 func (f QualityObserverFunc) Submit(e QualityEvent) { f(e) }
 
+// RouteDecisionEvent is emitted to the RouteDecisionObserver hook
+// once per proxied request, immediately after the planner returns
+// its Decision (issue #74). It mirrors the same fields the handler
+// stamps on the X-Nexus-Route-* response headers so the observer and
+// the response surface always agree. Observers use this for
+// Prometheus counters, dashboards, and any other out-of-band metric
+// that needs to attribute a route to its planning stage without
+// re-running the planner.
+type RouteDecisionEvent struct {
+	RequestID  string
+	Route      string
+	Source     string
+	Reason     string
+	Confidence float64
+	TaskType   string
+}
+
+// RouteDecisionObserver is the hook invoked once per proxied request
+// after the planner returns. Implementations must be safe for
+// concurrent use from many goroutines; the handler invokes Observe
+// on the same request goroutine so observers should not block for
+// long (a few atomic increments is fine; a network call is not).
+// Nil is treated as "no observer"; the hot path is unaffected.
+type RouteDecisionObserver interface {
+	Observe(RouteDecisionEvent)
+}
+
+// RouteDecisionObserverFunc adapts a plain function to the
+// RouteDecisionObserver interface so wiring from main.go stays a
+// one-liner.
+type RouteDecisionObserverFunc func(RouteDecisionEvent)
+
+// Observe implements RouteDecisionObserver.
+func (f RouteDecisionObserverFunc) Observe(e RouteDecisionEvent) { f(e) }
+
 // MetricsEvent carries the per-request data needed by the savings
 // dashboard (issue #4). Fields track the full Round-trip metrics:
 // route/model/input-tokens are routing dimensions; TOON/RAG/cost are
@@ -101,6 +137,15 @@ func (f QualityObserverFunc) Submit(e QualityEvent) { f(e) }
 // terminated without invoking the arbiter (panel agreement, or one
 // member failed). False in every other case so the dashboard can
 // report the "fusion agreement rate" as a single ratio.
+//
+// RouteSource / RouteReason / SLMConfidence / SLMTaskType (issue #74)
+// carry the planner's Decision metadata. RouteSource is one of
+// guardrail / dsl / slm / slm-error / escalation; RouteReason is the
+// short machine-readable detail; SLMConfidence is the [0,1]
+// confidence value the SLM was called with (0.5 neutral, 0 for
+// non-SLM stages); SLMTaskType is the Categorize() bucket. The
+// dashboard joins these to answer "what fraction of frontier traffic
+// came from a low-confidence SLM escalation?".
 type MetricsEvent struct {
 	Timestamp         time.Time
 	RequestID         string
@@ -119,6 +164,11 @@ type MetricsEvent struct {
 	Streaming            bool
 	FusionArbiterSkipped bool
 	Error                string
+
+	RouteSource   string
+	RouteReason   string
+	SLMConfidence float64
+	SLMTaskType   string
 }
 
 // MetricsObserver is the hook the chat handler invokes once per
@@ -300,6 +350,17 @@ type Deps struct {
 	// (NEXUS_LOCAL_COOLDOWN=0); the hot path is byte-for-byte
 	// identical to the pre-#80 behaviour.
 	LocalCooldown *circuit.Cooldown
+
+	// RouteDecisionObserver is invoked once per proxied request
+	// with the planner's Decision metadata (issue #74). Implementations
+	// must be safe for concurrent use; the handler invokes the
+	// observer on the request goroutine right after planner.Plan
+	// returns, so the observer should not block for long. Nil is
+	// treated as "no observer"; the hot path is unaffected. The
+	// handler does not import the observability package — main.go
+	// wires a closure that adapts the event to the in-process
+	// route counter.
+	RouteDecisionObserver RouteDecisionObserver
 
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
@@ -543,6 +604,33 @@ func Chat(d Deps) http.Handler {
 			Context:         r.Context(),
 		})
 		route := decision.Route
+
+		// Surface route-decision metadata on the response and via the
+		// observer hook (issue #74). The four X-Nexus-Route-* headers
+		// let clients and intermediate proxies reason about routing
+		// without scraping logs. Each value is sanitized against
+		// header-injection and bounded by MaxHeaderValue so the SLM
+		// error string (which can echo attacker-influenced text) is
+		// safe to include. The RouteDecisionObserver hook keeps the
+		// in-process counters (Prometheus text exposition in
+		// internal/observability) in sync with the response surface
+		// — the source/escalation story the issue calls out is only
+		// complete when both ship together.
+		routeEvent := RouteDecisionEvent{
+			RequestID:  reqID,
+			Route:      string(decision.Route),
+			Source:     string(decision.Source),
+			Reason:     decision.Reason,
+			Confidence: decision.Confidence,
+			TaskType:   decision.TaskType,
+		}
+		w.Header().Set("X-Nexus-Route", SanitizeHeaderValue(routeEvent.Route))
+		w.Header().Set("X-Nexus-Route-Source", SanitizeHeaderValue(routeEvent.Source))
+		w.Header().Set("X-Nexus-Route-Reason", SanitizeHeaderValue(routeEvent.Reason))
+		w.Header().Set("X-Nexus-Route-Confidence", SanitizeHeaderValue(formatConfidence(routeEvent.Confidence)))
+		if d.RouteDecisionObserver != nil {
+			d.RouteDecisionObserver.Observe(routeEvent)
+		}
 
 		// Emit the slog lines the pre-extraction handler produced, so
 		// existing log-scraping tests and operator dashboards keep
@@ -816,22 +904,22 @@ func Chat(d Deps) http.Handler {
 				// #8) is honoured — when the health poller reports
 				// Ollama unreachable the cascade skips the local step
 				// entirely and starts at frontier.
-			res, err := cas.Run(rw, d.Client, body)
-			logCascadeTelemetry(res, err, reqID)
-			// Issue #80: arm the local-route cooldown when the
-			// cascade reports the local step failed before a
-			// fallback served the request. Subsequent requests
-			// within the cooldown window skip local and go
-			// directly to the fallback, avoiding repeated slow
-			// local timeouts until the health poller catches up.
-			if res.LocalStepFailed && d.LocalCooldown != nil {
-				d.LocalCooldown.RecordFailure()
-				slog.Warn("local-route cooldown armed after cascade local failure",
-					slog.String("route_attempted", res.RouteAttempted),
-					slog.String("served_by", res.ServedBy),
-					slog.String("request_id", reqID),
-				)
-			}
+				res, err := cas.Run(rw, d.Client, body)
+				logCascadeTelemetry(res, err, reqID)
+				// Issue #80: arm the local-route cooldown when the
+				// cascade reports the local step failed before a
+				// fallback served the request. Subsequent requests
+				// within the cooldown window skip local and go
+				// directly to the fallback, avoiding repeated slow
+				// local timeouts until the health poller catches up.
+				if res.LocalStepFailed && d.LocalCooldown != nil {
+					d.LocalCooldown.RecordFailure()
+					slog.Warn("local-route cooldown armed after cascade local failure",
+						slog.String("route_attempted", res.RouteAttempted),
+						slog.String("served_by", res.ServedBy),
+						slog.String("request_id", reqID),
+					)
+				}
 				if err != nil {
 					slog.Error("upstream error",
 						slog.Any("err", err),
@@ -897,19 +985,19 @@ func Chat(d Deps) http.Handler {
 					targetURL = d.Config.FrontierURL
 					apiKey = d.Config.FrontierKey
 				}
-			if err := upstream.BufferedFetch(rw, d.Client, targetURL, apiKey, body); err != nil {
-				slog.Error("upstream error",
-					slog.Any("err", err),
-					slog.String("request_id", reqID),
-				)
-				upErr = err
-				http.Error(w, "Upstream error", http.StatusBadGateway)
-				// Issue #80: a non-streaming local fetch failure is
-				// also a local failure — arm the cooldown so the next
-				// request skips local and goes to the fallback.
-				if !skipLocal && d.LocalCooldown != nil {
-					d.LocalCooldown.RecordFailure()
-				}
+				if err := upstream.BufferedFetch(rw, d.Client, targetURL, apiKey, body); err != nil {
+					slog.Error("upstream error",
+						slog.Any("err", err),
+						slog.String("request_id", reqID),
+					)
+					upErr = err
+					http.Error(w, "Upstream error", http.StatusBadGateway)
+					// Issue #80: a non-streaming local fetch failure is
+					// also a local failure — arm the cooldown so the next
+					// request skips local and goes to the fallback.
+					if !skipLocal && d.LocalCooldown != nil {
+						d.LocalCooldown.RecordFailure()
+					}
 				} else {
 					model = d.Config.LocalModel
 					if skipLocal {
@@ -987,7 +1075,7 @@ func Chat(d Deps) http.Handler {
 			}
 		}
 		outputTokens := int(obs.BytesOut() / 4)
-		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr, fusionArbiterSkipped)
+		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr, fusionArbiterSkipped, decision)
 		if d.MetricsObserver != nil {
 			postCompressionChars := totalMessageChars(messages)
 			savings := totalTokenSavings(preCompressionChars, postCompressionChars)
@@ -1010,6 +1098,10 @@ func Chat(d Deps) http.Handler {
 				Streaming:            streaming,
 				FusionArbiterSkipped: fusionArbiterSkipped,
 				Error:                rec.Error,
+				RouteSource:          string(decision.Source),
+				RouteReason:          decision.Reason,
+				SLMConfidence:        decision.Confidence,
+				SLMTaskType:          decision.TaskType,
 			})
 		} else {
 			d.Recorder.Record(rec)
@@ -1332,6 +1424,7 @@ func buildRecord(
 	model, latestPrompt string,
 	upErr error,
 	fusionArbiterSkipped bool,
+	decision router.Decision,
 ) telemetry.Record {
 	totalMs := time.Since(started).Milliseconds()
 	var ttftMs int64
@@ -1353,6 +1446,10 @@ func buildRecord(
 		TotalLatencyMs:       totalMs,
 		Streaming:            streaming,
 		FusionArbiterSkipped: fusionArbiterSkipped,
+		RouteSource:          string(decision.Source),
+		RouteReason:          decision.Reason,
+		SLMConfidence:        decision.Confidence,
+		SLMTaskType:          decision.TaskType,
 	}
 	rec.TPS = telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 	if upErr != nil {
@@ -1402,4 +1499,25 @@ func frontierCostEstimate(route, model string, inputTokens int, costPer1KUSD flo
 		return 0
 	}
 	return float64(inputTokens) * costPer1KUSD / 1000.0
+}
+
+// formatConfidence renders a [0,1] confidence as the X-Nexus-Route-
+// Confidence response header value (issue #74). Two-decimal fixed
+// precision keeps the value directly comparable to the
+// telemetry.Record.SLMConfidence field without ambiguity; values
+// outside the [0,1] range are clamped to the nearest bound so a
+// runaway SLM cannot produce an unwieldy header. Non-SLM stages
+// (guardrail, DSL) emit 0.50 — the router's NeutralConfidence floor —
+// so log scrapers can distinguish "no confidence" from "really zero".
+func formatConfidence(c float64) string {
+	if c < 0 {
+		c = 0
+	}
+	if c > 1 {
+		c = 1
+	}
+	if c == 0 {
+		return "0.00"
+	}
+	return strconv.FormatFloat(c, 'f', 2, 64)
 }
