@@ -68,6 +68,7 @@ type Record struct {
 	TPS                  float64   `json:"tps"`
 	Streaming            bool      `json:"streaming"`
 	FusionArbiterSkipped bool      `json:"fusion_arbiter_skipped,omitempty"`
+	ToolCallCount        int       `json:"tool_call_count,omitempty"`
 	Error                string    `json:"error,omitempty"`
 
 	// Route-source metadata (issue #74). Omitempty keeps legacy

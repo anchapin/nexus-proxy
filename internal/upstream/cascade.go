@@ -55,6 +55,11 @@ type CascadeResult struct {
 	// fallback, avoiding repeated slow local timeouts until the health
 	// poller catches up.
 	LocalStepFailed bool
+	// ToolCalls carries the OpenAI-compatible tool_calls from the step
+	// that served the request (issue #72). Empty for content-only
+	// responses. The chat handler reads this to populate telemetry
+	// (tool_call_count) and to feed the quality observer.
+	ToolCalls []ToolCall
 }
 
 // cascadeDefaultTimeout is the per-attempt timeout used when Cascade.Timeout
@@ -117,7 +122,7 @@ func (c *Cascade) Run(w http.ResponseWriter, client Client, payload map[string]i
 		res.RouteAttempted = joinStepNames(c.Steps[:i+1])
 
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		content, servedModel, err := fetchCascadeStep(ctx, client, step, payload)
+		msg, servedModel, err := fetchCascadeStep(ctx, client, step, payload)
 		cancel()
 		if err == nil {
 			slog.Info("cascade served",
@@ -127,7 +132,8 @@ func (c *Cascade) Run(w http.ResponseWriter, client Client, payload map[string]i
 			)
 			res.Succeeded = true
 			res.ServedBy = step.Name
-			if werr := writeSSEResponse(w, step.Name, servedModel, content); werr != nil {
+			res.ToolCalls = msg.ToolCalls
+			if werr := writeSSEResponse(w, step.Name, servedModel, msg); werr != nil {
 				return res, werr
 			}
 			return res, nil
@@ -180,10 +186,10 @@ func joinStepNames(steps []CascadeStep) string {
 }
 
 // fetchCascadeStep does a single non-streaming POST to step.URL, validates
-// the response, and returns the assistant content + the model name echoed
+// the response, and returns the assistant message + the model name echoed
 // back by the upstream (used in the SSE response). All returned errors are
 // tagged via newCascadeErr so the runner knows whether to fall back.
-func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payload map[string]interface{}) (content, servedModel string, err error) {
+func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payload map[string]interface{}) (AssistantMessage, string, error) {
 	body := make(map[string]interface{}, len(payload)+2)
 	for k, v := range payload {
 		body[k] = v
@@ -193,11 +199,11 @@ func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payl
 
 	jsonPayload, mErr := json.Marshal(body)
 	if mErr != nil {
-		return "", "", newCascadeErr(false, "marshal: %v", mErr)
+		return AssistantMessage{}, "", newCascadeErr(false, "marshal: %v", mErr)
 	}
 	req, rErr := http.NewRequestWithContext(ctx, http.MethodPost, step.URL, bytes.NewReader(jsonPayload))
 	if rErr != nil {
-		return "", "", newCascadeErr(false, "build request: %v", rErr)
+		return AssistantMessage{}, "", newCascadeErr(false, "build request: %v", rErr)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if step.APIKey != "" {
@@ -207,24 +213,24 @@ func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payl
 	resp, dErr := client.Do(req)
 	if dErr != nil {
 		// Transport error / ctx timeout — always retry.
-		return "", "", newCascadeErr(true, "transport: %v", dErr)
+		return AssistantMessage{}, "", newCascadeErr(true, "transport: %v", dErr)
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 
 	if ShouldRetry(resp.StatusCode, nil) {
-		return "", "", newCascadeErr(true, "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
+		return AssistantMessage{}, "", newCascadeErr(true, "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
 	}
 	if resp.StatusCode != http.StatusOK {
 		// Non-retryable 4xx (auth, bad request, etc.). Surface to caller.
-		return "", "", newCascadeErr(false, "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
+		return AssistantMessage{}, "", newCascadeErr(false, "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
 	}
 
-	content, model, vErr := extractAssistantContent(respBody)
+	msg, model, vErr := extractAssistantMessage(respBody)
 	if vErr != nil {
-		return "", "", vErr
+		return AssistantMessage{}, "", vErr
 	}
-	return content, model, nil
+	return msg, model, nil
 }
 
 // assistantResponse is the slice of the OpenAI-compatible chat-completion
@@ -234,12 +240,15 @@ type assistantResponse struct {
 	Choices []struct {
 		Message struct {
 			Content   string     `json:"content"`
-			ToolCalls []toolCall `json:"tool_calls,omitempty"`
+			ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 		} `json:"message"`
 	} `json:"choices"`
 }
 
-type toolCall struct {
+// ToolCall is the OpenAI-compatible tool call structure. It is exported
+// so CascadeResult and PanelResult can carry structured tool calls to
+// the chat handler (issue #72) without the handler re-parsing JSON.
+type ToolCall struct {
 	ID       string `json:"id"`
 	Type     string `json:"type"`
 	Function struct {
@@ -248,40 +257,63 @@ type toolCall struct {
 	} `json:"function"`
 }
 
-// extractAssistantContent parses the upstream body and returns the assistant
-// text + model name. It triggers fallback (retry=true) on:
+// AssistantMessage bundles the assistant content and any tool calls
+// extracted from an upstream response. Used by the cascade runner and
+// the fusion panel so both code paths carry the same structured shape
+// (issue #72).
+type AssistantMessage struct {
+	Content   string
+	ToolCalls []ToolCall
+}
+
+// HasToolCalls reports whether the message carries at least one valid
+// tool call. Convenience helper for branching at call sites that only
+// care about the "should we emit tool-call SSE chunks?" decision.
+func (m AssistantMessage) HasToolCalls() bool { return len(m.ToolCalls) > 0 }
+
+// extractAssistantMessage parses the upstream body and returns the
+// assistant message (content + tool_calls) and the model name. It
+// triggers fallback (retry=true) on:
 //   - JSON decode failure
 //   - empty choices
 //   - tool_calls with missing required fields
 //   - tool_calls whose function.arguments isn't valid JSON (small models
 //     hallucinate these — that's the whole point of the cascade).
-func extractAssistantContent(body []byte) (content, model string, err error) {
+//
+// Empty content alongside valid tool_calls is accepted (issue #72): a
+// coding agent's tool-call turn often has no textual content.
+func extractAssistantMessage(body []byte) (AssistantMessage, string, error) {
 	var raw assistantResponse
 	if uErr := json.Unmarshal(body, &raw); uErr != nil {
-		return "", "", newCascadeErr(true, "decode: %v", uErr)
+		return AssistantMessage{}, "", newCascadeErr(true, "decode: %v", uErr)
 	}
 	if len(raw.Choices) == 0 {
-		return "", "", newCascadeErr(true, "empty choices")
+		return AssistantMessage{}, "", newCascadeErr(true, "empty choices")
 	}
 	msg := raw.Choices[0].Message
 	for i, tc := range msg.ToolCalls {
 		if tc.ID == "" || tc.Type == "" || tc.Function.Name == "" {
-			return "", "", newCascadeErr(true, "tool_call[%d] missing required fields", i)
+			return AssistantMessage{}, "", newCascadeErr(true, "tool_call[%d] missing required fields", i)
 		}
 		if tc.Function.Arguments != "" {
 			var probe json.RawMessage
 			if pErr := json.Unmarshal([]byte(tc.Function.Arguments), &probe); pErr != nil {
-				return "", "", newCascadeErr(true, "tool_call[%d].arguments not valid JSON: %v", i, pErr)
+				return AssistantMessage{}, "", newCascadeErr(true, "tool_call[%d].arguments not valid JSON: %v", i, pErr)
 			}
 		}
 	}
-	return msg.Content, raw.Model, nil
+	return AssistantMessage{Content: msg.Content, ToolCalls: msg.ToolCalls}, raw.Model, nil
 }
 
 // writeSSEResponse emits a single OpenAI-compatible chat-completion chunk
-// containing the buffered content, followed by the [DONE] sentinel. Headers
-// are flushed if the writer supports it.
-func writeSSEResponse(w http.ResponseWriter, stepName, servedModel, content string) error {
+// containing the buffered assistant message, followed by the [DONE]
+// sentinel. When the message carries tool calls (issue #72) the chunk's
+// delta carries delta.tool_calls (with the per-call "index" field OpenAI
+// streaming requires) and finish_reason is "tool_calls". Content-only
+// responses use the legacy delta.content + finish_reason "stop" shape —
+// byte-for-byte backward compatible. Headers are flushed if the writer
+// supports it.
+func writeSSEResponse(w http.ResponseWriter, stepName, servedModel string, msg AssistantMessage) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("X-Nexus-Cascade-Served-By", stepName)
@@ -290,6 +322,40 @@ func writeSSEResponse(w http.ResponseWriter, stepName, servedModel, content stri
 	if servedModel == "" {
 		servedModel = stepName
 	}
+
+	var delta map[string]interface{}
+	var finishReason string
+	if msg.HasToolCalls() {
+		// OpenAI streaming tool-call deltas carry an "index" so the
+		// client can assemble fragments across chunks. We emit the full
+		// set in one chunk (the upstream was non-streaming), so each
+		// entry is complete with id/type/function.
+		tc := make([]map[string]interface{}, len(msg.ToolCalls))
+		for i, call := range msg.ToolCalls {
+			tc[i] = map[string]interface{}{
+				"index": i,
+				"id":    call.ID,
+				"type":  call.Type,
+				"function": map[string]string{
+					"name":      call.Function.Name,
+					"arguments": call.Function.Arguments,
+				},
+			}
+		}
+		delta = map[string]interface{}{"tool_calls": tc}
+		// When the response is purely tool calls with no text content,
+		// OpenAI clients expect content to be absent (not an empty
+		// string). We only include content when non-empty so the delta
+		// stays minimal and matches what real OpenAI streams emit.
+		if msg.Content != "" {
+			delta["content"] = msg.Content
+		}
+		finishReason = "tool_calls"
+	} else {
+		delta = map[string]interface{}{"content": msg.Content}
+		finishReason = "stop"
+	}
+
 	chunk := map[string]interface{}{
 		"id":      "chatcmpl-cascade-" + stepName,
 		"object":  "chat.completion.chunk",
@@ -298,8 +364,8 @@ func writeSSEResponse(w http.ResponseWriter, stepName, servedModel, content stri
 		"choices": []map[string]interface{}{
 			{
 				"index":         0,
-				"delta":         map[string]string{"content": content},
-				"finish_reason": "stop",
+				"delta":         delta,
+				"finish_reason": finishReason,
 			},
 		},
 	}
