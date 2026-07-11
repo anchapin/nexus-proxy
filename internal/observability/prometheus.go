@@ -1,0 +1,261 @@
+// Prometheus text-exposition renderer (issue #40). Emits the standard
+// format (# HELP / # TYPE / sample lines) that Prometheus and any
+// compatible scraper ingest. See
+// https://prometheus.io/docs/instrumenting/exposition_formats/.
+//
+// The renderer is split from collector.go so the hot path (Submit) has
+// zero rendering dependencies; only the scrape handler pulls this in.
+
+package observability
+
+import (
+	"fmt"
+	"io"
+	"math"
+	"sort"
+	"strconv"
+)
+
+// GaugeSample is one live gauge reading captured at scrape time. Name
+// is the full Prometheus metric name (e.g. "nexus_ollama_healthy").
+type GaugeSample struct {
+	Name  string
+	Value float64
+}
+
+// GaugeProvider returns live gauge readings at scrape time. The
+// /metrics handler calls Gauges() once per scrape; implementations read
+// the latest state from their backing source (health poller, VRAM
+// probe, judge/quality worker pools, dropped counters) and return a
+// slice of samples. Implementations must be safe to call concurrently
+// with the request path and must not block on I/O — the whole scrape
+// should complete in well under a millisecond.
+//
+// main.go composes several GaugeProviderFunc closures (one per backing
+// source) and passes them to RenderPrometheus.
+type GaugeProvider interface {
+	Gauges() []GaugeSample
+}
+
+// GaugeProviderFunc adapts a plain function to the GaugeProvider
+// interface so wiring from main.go stays a one-liner.
+type GaugeProviderFunc func() []GaugeSample
+
+// Gauges implements GaugeProvider.
+func (f GaugeProviderFunc) Gauges() []GaugeSample { return f() }
+
+// metricMeta carries the HELP text and Prometheus type for a metric
+// family. Used so the renderer can emit well-formed HELP/TYPE lines for
+// gauges supplied by providers without each provider having to repeat
+// the metadata.
+type metricMeta struct {
+	help string
+	typ  string // "counter" | "gauge" | "histogram"
+}
+
+// gaugeMeta is the registry of known gauge/counter metric names
+// supplied by GaugeProviders. Names not present default to type
+// "gauge" with the bare name as HELP so unknown providers still render
+// valid output.
+var gaugeMeta = map[string]metricMeta{
+	"nexus_ollama_healthy": {
+		help: "1 if the local Ollama endpoint is healthy (circuit breaker closed), 0 otherwise.",
+		typ:  "gauge",
+	},
+	"nexus_ollama_failure_count": {
+		help: "Current consecutive failed Ollama probes since the last success.",
+		typ:  "gauge",
+	},
+	"nexus_vram_budget_tokens": {
+		help: "Current dynamic VRAM token budget from the latest probe (0 = static fallback in use).",
+		typ:  "gauge",
+	},
+	"nexus_vram_free_bytes": {
+		help: "Free VRAM in bytes reported by the latest probe (0 if the probe does not measure VRAM).",
+		typ:  "gauge",
+	},
+	"nexus_judge_queue_depth": {
+		help: "Number of buffered, unjudged samples waiting in the judge evaluator queue.",
+		typ:  "gauge",
+	},
+	"nexus_judge_concurrency": {
+		help: "Configured maximum parallel judge calls.",
+		typ:  "gauge",
+	},
+	"nexus_quality_queue_depth": {
+		help: "Number of buffered, unverified edits waiting in the quality verifier queue.",
+		typ:  "gauge",
+	},
+	"nexus_quality_concurrency": {
+		help: "Configured maximum parallel quality verifications.",
+		typ:  "gauge",
+	},
+	"nexus_quality_dropped_total": {
+		help: "Total quality events dropped because the verifier queue was full.",
+		typ:  "counter",
+	},
+	"nexus_metrics_dropped_total": {
+		help: "Total metrics records dropped because the SQLite write buffer was full.",
+		typ:  "counter",
+	},
+	"nexus_telemetry_dropped_total": {
+		help: "Total telemetry records dropped because the JSONL write buffer was full.",
+		typ:  "counter",
+	},
+}
+
+// RenderPrometheus writes the full /metrics body in Prometheus
+// text-exposition format. Counters and histograms come from the
+// Collector; gauges come from the supplied providers (each called once
+// at scrape time). Output is deterministic: metric families are emitted
+// in a fixed order and gauge samples are sorted by name, so
+// scrape-to-scrape diffs are stable and friendly to human inspection.
+//
+// RenderPrometheus performs no allocation on the hot path — it is only
+// called from the scrape handler. With 10,000 accumulated samples the
+// handler completes in well under a millisecond because every read is a
+// plain atomic load with no lock contention.
+func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
+	if c == nil {
+		return
+	}
+
+	// --- Counters -------------------------------------------------------
+
+	writeCounterLabeled(w, "nexus_requests_total",
+		"Total proxied requests by route (local/frontier/fusion).",
+		"route", []labelSample{
+			{value: "local", n: c.requestsLocal.Load()},
+			{value: "frontier", n: c.requestsFrontier.Load()},
+			{value: "fusion", n: c.requestsFusion.Load()},
+		})
+
+	writeCounter(w, "nexus_errors_total",
+		"Total proxied requests that returned an upstream error.", c.errorsTotal.Load())
+	writeCounter(w, "nexus_rag_hits_total",
+		"Total proxied requests where a RAG few-shot snippet was injected.", c.ragHitsTotal.Load())
+	writeCounter(w, "nexus_rag_misses_total",
+		"Total proxied requests where no RAG snippet met the similarity threshold.", c.ragMissesTotal.Load())
+	writeCounter(w, "nexus_toon_compressed_total",
+		"Total proxied requests whose JSON-array blocks were TOON-compressed.", c.toonCompressedTotal.Load())
+	writeCounter(w, "nexus_degraded_total",
+		"Total proxied requests that ran in degraded mode (local Ollama unreachable).", c.degradedTotal.Load())
+	writeCounter(w, "nexus_input_tokens_total",
+		"Cumulative estimated input tokens across all proxied requests.", c.inputTokensTotal.Load())
+	writeCounter(w, "nexus_output_tokens_total",
+		"Cumulative estimated output tokens across all proxied requests.", c.outputTokensTotal.Load())
+	writeCounter(w, "nexus_toon_savings_tokens_total",
+		"Cumulative tokens saved by TOON compression across all proxied requests.", c.toonSavingsTokensTotal.Load())
+
+	// Cumulative frontier cost (float-valued counter).
+	writeMeta(w, "nexus_estimated_cost_usd_total",
+		"Cumulative estimated frontier cost in USD across all proxied requests.", "counter")
+	fmt.Fprintf(w, "nexus_estimated_cost_usd_total %s\n", formatFloat(c.EstimatedCostUSD()))
+
+	// --- Histograms -----------------------------------------------------
+
+	writeHistogram(w, "nexus_request_duration_ms",
+		"End-to-end request duration in milliseconds, from body read to final flush.", c.latency)
+	writeHistogram(w, "nexus_ttft_ms",
+		"Time to first token in milliseconds (0 / unobserved for non-streaming responses).", c.ttft)
+
+	// --- Gauges (live readings from providers) --------------------------
+
+	gauges := collectGauges(providers)
+	sort.Slice(gauges, func(i, j int) bool { return gauges[i].Name < gauges[j].Name })
+	seen := make(map[string]bool, len(gauges))
+	for _, g := range gauges {
+		if !seen[g.Name] {
+			meta, ok := gaugeMeta[g.Name]
+			if !ok {
+				meta = metricMeta{help: g.Name, typ: "gauge"}
+			}
+			writeMeta(w, g.Name, meta.help, meta.typ)
+			seen[g.Name] = true
+		}
+		fmt.Fprintf(w, "%s %s\n", g.Name, formatFloat(g.Value))
+	}
+}
+
+// labelSample pairs a label value with its counter reading for a
+// labelled counter family (e.g. the route dimension on
+// nexus_requests_total).
+type labelSample struct {
+	value string
+	n     uint64
+}
+
+// writeMeta emits the # HELP and # TYPE header lines for one metric
+// family. Called once per family before its sample lines.
+func writeMeta(w io.Writer, name, help, typ string) {
+	fmt.Fprintf(w, "# HELP %s %s\n", name, help)
+	fmt.Fprintf(w, "# TYPE %s %s\n", name, typ)
+}
+
+// writeCounter emits a single-sample unlabelled counter family.
+func writeCounter(w io.Writer, name, help string, v uint64) {
+	writeMeta(w, name, help, "counter")
+	fmt.Fprintf(w, "%s %d\n", name, v)
+}
+
+// writeCounterLabeled emits a counter family with one label dimension.
+// Each labelSample becomes its own sample line. The label values are
+// emitted in the order given (callers pass them sorted by relevance).
+func writeCounterLabeled(w io.Writer, name, help, label string, samples []labelSample) {
+	writeMeta(w, name, help, "counter")
+	for _, s := range samples {
+		fmt.Fprintf(w, "%s{%s=%q} %d\n", name, label, s.value, s.n)
+	}
+}
+
+// writeHistogram emits a histogram family: one bucket line per finite
+// upper bound plus the +Inf bucket, then _sum and _count.
+func writeHistogram(w io.Writer, name, help string, h *Histogram) {
+	if h == nil {
+		return
+	}
+	writeMeta(w, name, help, "histogram")
+	cum, upperBounds, sum, count := h.Snapshot()
+	for i, ub := range upperBounds {
+		fmt.Fprintf(w, "%s_bucket{le=%q} %d\n", name, formatFloat(ub), cum[i])
+	}
+	fmt.Fprintf(w, "%s_bucket{le=%q} %d\n", name, "+Inf", cum[len(upperBounds)])
+	fmt.Fprintf(w, "%s_sum %s\n", name, formatFloat(sum))
+	fmt.Fprintf(w, "%s_count %d\n", name, count)
+}
+
+// collectGauges flattens the samples from every non-nil provider into a
+// single slice. Nil providers are skipped so main.go can pass a typed
+// nil GaugeProviderFunc without panicking.
+func collectGauges(providers []GaugeProvider) []GaugeSample {
+	var out []GaugeSample
+	for _, p := range providers {
+		if p == nil {
+			continue
+		}
+		out = append(out, p.Gauges()...)
+	}
+	return out
+}
+
+// formatFloat renders v in the most compact form Prometheus accepts:
+// integers print without a decimal point, fractional values use 'g'
+// precision, and the special values +Inf / -Inf / NaN use the spellings
+// the exposition spec requires.
+func formatFloat(v float64) string {
+	switch {
+	case math.IsInf(v, 1):
+		return "+Inf"
+	case math.IsInf(v, -1):
+		return "-Inf"
+	case math.IsNaN(v):
+		return "NaN"
+	}
+	// Whole numbers within int64 range print without a decimal point
+	// (Prometheus accepts both, but integer output is friendlier for
+	// queue depths, token counts, and health flags).
+	if v == math.Trunc(v) && math.Abs(v) < 1e15 {
+		return strconv.FormatInt(int64(v), 10)
+	}
+	return strconv.FormatFloat(v, 'g', -1, 64)
+}

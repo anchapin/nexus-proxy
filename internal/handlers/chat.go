@@ -21,6 +21,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/middleware"
+	"github.com/anchapin/nexus-proxy/internal/observability"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
@@ -130,6 +131,20 @@ type MetricsObserverFunc func(MetricsEvent)
 // Submit implements MetricsObserver.
 func (f MetricsObserverFunc) Submit(e MetricsEvent) { f(e) }
 
+// ObservabilityObserver is the hook the chat handler invokes once per
+// proxied request with an observability.ObservabilityEvent payload
+// (issue #40). The in-process Prometheus collector
+// (internal/observability.Collector) implements this interface
+// directly — handlers imports that leaf package (no cycle), so main.go
+// wires the collector in without a field-copy adapter. Same invariants
+// as MetricsObserver:
+//   - safe to call from many goroutines;
+//   - must not block (the collector does only atomic increments);
+//   - may be nil (treated as "no collector"; hot path is unaffected).
+type ObservabilityObserver interface {
+	Submit(observability.ObservabilityEvent)
+}
+
 // BudgetObserver is the dynamic VRAM-budget hook the chat handler
 // consults before falling back to the static `NEXUS_TOKEN_GUARDRAIL`
 // (issue #6).
@@ -231,6 +246,16 @@ type Deps struct {
 	// handler does not import the metrics package; main.go wires
 	// a closure that forwards to metricsStore.Submit.
 	MetricsObserver MetricsObserver
+
+	// ObservabilityObserver is optional. When non-nil, the handler
+	// dispatches one observability.ObservabilityEvent per proxied
+	// request after the upstream response flushes, carrying the
+	// routing/error/RAG/TOON/degraded flags, token sums, cost, and
+	// latency dimensions the Prometheus collector (issue #40) needs.
+	// The collector increments only sync/atomic primitives, so Submit
+	// is non-blocking and safe to call from the request goroutine.
+	// When nil the handler skips the dispatch entirely (zero overhead).
+	ObservabilityObserver ObservabilityObserver
 
 	// Recorder receives one record per proxied request. Never nil at
 	// runtime: Chat() installs telemetry.Noop{} when the caller
@@ -393,7 +418,8 @@ func Chat(d Deps) http.Handler {
 		// heuristic the rest of the project uses for telemetry
 		// (see internal/telemetry.EstimateTokens).
 		preCompressionChars := totalMessageChars(messages)
-		if middleware.CompressJSONBlocks(messages) {
+		toonCompressed := middleware.CompressJSONBlocks(messages)
+		if toonCompressed {
 			messages = middleware.AppendSystemNote(messages, d.Config.TOONNotice)
 			slog.Info("toon compressed messages", slog.String("request_id", reqID))
 		}
@@ -483,6 +509,12 @@ func Chat(d Deps) http.Handler {
 		// never overrides a guardrail-forced reroute.
 		localHealthy := d.Health.IsLocalHealthy()
 		skipLocal := !localHealthy && (route == router.RouteLocal || route == router.RouteFusion)
+		// degraded captures the health-based skip state for the
+		// observability collector (issue #40). It is snapshotted here,
+		// before the concurrency-overflow path below may reassign
+		// skipLocal — overflow is a distinct signal (X-Nexus-Overflow)
+		// and must not inflate the degraded counter.
+		degraded := skipLocal
 		if skipLocal {
 			w.Header().Set("X-Nexus-Degraded", "true")
 			slog.Warn("ollama unhealthy; skipping local arm",
@@ -780,10 +812,15 @@ func Chat(d Deps) http.Handler {
 		}
 		outputTokens := int(obs.BytesOut() / 4)
 		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr)
+		// Hoist savings/cost so both the MetricsObserver dispatch and
+		// the ObservabilityObserver dispatch (issue #40) see the same
+		// values without recomputing. frontierCostEstimate is a cheap
+		// multiply and totalTokenSavings is a subtract, so computing
+		// them unconditionally costs negligible cycles.
+		postCompressionChars := totalMessageChars(messages)
+		savings := totalTokenSavings(preCompressionChars, postCompressionChars)
+		cost := frontierCostEstimate(string(route), model, telemetry.EstimateTokens(latestPrompt), d.Config.JudgeCostPer1KUSD)
 		if d.MetricsObserver != nil {
-			postCompressionChars := totalMessageChars(messages)
-			savings := totalTokenSavings(preCompressionChars, postCompressionChars)
-			cost := frontierCostEstimate(string(route), model, telemetry.EstimateTokens(latestPrompt), d.Config.JudgeCostPer1KUSD)
 			tps := telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 			d.MetricsObserver.Submit(MetricsEvent{
 				Timestamp:         rec.Timestamp,
@@ -804,6 +841,26 @@ func Chat(d Deps) http.Handler {
 			})
 		} else {
 			d.Recorder.Record(rec)
+		}
+
+		// In-process Prometheus collector (issue #40). Dispatched once
+		// per proxied request with the routing/error/RAG/TOON/degraded
+		// flags, token sums, cost, and latency. The collector does only
+		// atomic increments, so this is non-blocking and race-free.
+		if d.ObservabilityObserver != nil {
+			d.ObservabilityObserver.Submit(observability.ObservabilityEvent{
+				Route:             string(route),
+				Error:             rec.Error,
+				RAGInjected:       ragInjected,
+				TOONCompressed:    toonCompressed,
+				Degraded:          degraded,
+				InputTokens:       rec.InputTokens,
+				OutputTokens:      outputTokens,
+				TOONSavingsTokens: savings,
+				EstimatedCostUSD:  cost,
+				TotalLatencyMs:    totalMs,
+				TTFTMs:            ttftMs,
+			})
 		}
 	})
 }

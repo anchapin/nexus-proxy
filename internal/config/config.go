@@ -171,6 +171,15 @@ type Config struct {
 	TelemetryPath string
 	MetricsDBPath string
 
+	// MetricsEndpoint is the path the Prometheus /metrics handler is
+	// mounted on (issue #40). Default "/metrics"; an empty value
+	// disables the endpoint entirely (no handler is registered, the
+	// route returns 404) so operators who do not want a scrape surface
+	// get zero regression. The in-process collector still accumulates
+	// regardless, so a future programmatic reader can observe counters
+	// even when the HTTP endpoint is off.
+	MetricsEndpoint string
+
 	// HTTP connection pool (issue #34). Every outbound call —
 	// chat upstream, SLM routing, RAG embedding, health polling,
 	// VRAM probing, and the judge evaluator — shares a single
@@ -268,6 +277,7 @@ var configKeys = map[string]string{
 	"judge.cost_per_1k":                   "NEXUS_JUDGE_COST_PER_1K",
 	"telemetry.path":                      "NEXUS_TELEMETRY_PATH",
 	"metrics.db_path":                     "NEXUS_METRICS_DB",
+	"metrics.endpoint":                    "NEXUS_METRICS_ENDPOINT",
 	"quality.concurrency":                 "NEXUS_QUALITY_CONCURRENCY",
 	"quality.queue":                       "NEXUS_QUALITY_QUEUE",
 	"quality.timeout":                     "NEXUS_QUALITY_TIMEOUT",
@@ -347,23 +357,24 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		ConfigFile:     path,
-		Addr:           resolveString("NEXUS_ADDR", fileMap, ":8000"),
-		OllamaURL:      strings.TrimRight(resolveString("NEXUS_OLLAMA_URL", fileMap, "http://localhost:11434"), "/"),
-		RouterModel:    resolveString("NEXUS_ROUTER_MODEL", fileMap, "qwen3-coder:4b"),
-		LocalModel:     resolveString("NEXUS_LOCAL_MODEL", fileMap, "qwen3-coder:8b"),
-		EmbeddingModel: resolveString("NEXUS_EMBEDDING_MODEL", fileMap, "nomic-embed-text"),
-		FrontierURL:    resolveString("NEXUS_FRONTIER_URL", fileMap, "https://api.openai.com/v1/chat/completions"),
-		FrontierModel:  resolveString("NEXUS_FRONTIER_MODEL", fileMap, "gpt-4o"),
-		FrontierKey:    resolveString("NEXUS_FRONTIER_API_KEY", fileMap, ""),
-		ZAIURL:         resolveString("NEXUS_ZAI_URL", fileMap, "https://api.z.ai/v1/chat/completions"),
-		ZAIModel:       resolveString("NEXUS_ZAI_MODEL", fileMap, "glm-4.6"),
-		ZAIKey:         resolveString("NEXUS_ZAI_API_KEY", fileMap, ""),
-		ExamplesDir:    resolveString("NEXUS_EXAMPLES_DIR", fileMap, "./few_shot_examples"),
-		MetaPrompt:     defaultMetaPrompt,
-		TOONNotice:     defaultTOONNotice,
-		TelemetryPath:  resolveAllowEmpty("NEXUS_TELEMETRY_PATH", fileMap, "./nexus-telemetry.jsonl"),
-		MetricsDBPath:  resolveAllowEmpty("NEXUS_METRICS_DB", fileMap, DefaultMetricsDBPath()),
+		ConfigFile:      path,
+		Addr:            resolveString("NEXUS_ADDR", fileMap, ":8000"),
+		OllamaURL:       strings.TrimRight(resolveString("NEXUS_OLLAMA_URL", fileMap, "http://localhost:11434"), "/"),
+		RouterModel:     resolveString("NEXUS_ROUTER_MODEL", fileMap, "qwen3-coder:4b"),
+		LocalModel:      resolveString("NEXUS_LOCAL_MODEL", fileMap, "qwen3-coder:8b"),
+		EmbeddingModel:  resolveString("NEXUS_EMBEDDING_MODEL", fileMap, "nomic-embed-text"),
+		FrontierURL:     resolveString("NEXUS_FRONTIER_URL", fileMap, "https://api.openai.com/v1/chat/completions"),
+		FrontierModel:   resolveString("NEXUS_FRONTIER_MODEL", fileMap, "gpt-4o"),
+		FrontierKey:     resolveString("NEXUS_FRONTIER_API_KEY", fileMap, ""),
+		ZAIURL:          resolveString("NEXUS_ZAI_URL", fileMap, "https://api.z.ai/v1/chat/completions"),
+		ZAIModel:        resolveString("NEXUS_ZAI_MODEL", fileMap, "glm-4.6"),
+		ZAIKey:          resolveString("NEXUS_ZAI_API_KEY", fileMap, ""),
+		ExamplesDir:     resolveString("NEXUS_EXAMPLES_DIR", fileMap, "./few_shot_examples"),
+		MetaPrompt:      defaultMetaPrompt,
+		TOONNotice:      defaultTOONNotice,
+		TelemetryPath:   resolveAllowEmpty("NEXUS_TELEMETRY_PATH", fileMap, "./nexus-telemetry.jsonl"),
+		MetricsDBPath:   resolveAllowEmpty("NEXUS_METRICS_DB", fileMap, DefaultMetricsDBPath()),
+		MetricsEndpoint: resolveAllowEmpty("NEXUS_METRICS_ENDPOINT", fileMap, "/metrics"),
 	}
 
 	// Inbound proxy authentication (issue #37). NEXUS_PROXY_API_KEY is
@@ -810,6 +821,14 @@ func (c Config) TelemetryEnabled() bool { return c.TelemetryPath != "" }
 // MetricsEnabled reports whether the SQLite metrics store should be
 // opened. Disabled when MetricsDBPath is empty.
 func (c Config) MetricsEnabled() bool { return c.MetricsDBPath != "" }
+
+// MetricsEndpointEnabled reports whether the Prometheus /metrics HTTP
+// endpoint should be registered (issue #40). Disabled when
+// MetricsEndpoint is empty (the operator set
+// NEXUS_METRICS_ENDPOINT="" explicitly). When disabled, main.go does
+// not mount the handler and /metrics returns 404 — zero regression for
+// operators who do not want a scrape surface.
+func (c Config) MetricsEndpointEnabled() bool { return c.MetricsEndpoint != "" }
 
 // NewLogger returns a *slog.Logger configured per LogLevel / LogFormat,
 // always writing to stderr. Centralising the construction in config

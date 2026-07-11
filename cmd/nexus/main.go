@@ -26,6 +26,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/judge"
 	"github.com/anchapin/nexus-proxy/internal/metrics"
+	"github.com/anchapin/nexus-proxy/internal/observability"
 	"github.com/anchapin/nexus-proxy/internal/probe"
 	"github.com/anchapin/nexus-proxy/internal/quality"
 	"github.com/anchapin/nexus-proxy/internal/rag"
@@ -307,21 +308,30 @@ func main() {
 		}
 	}()
 
+	// In-process Prometheus collector (issue #40). The collector is
+	// always instantiated — it holds only sync/atomic primitives, so
+	// the per-request Submit overhead is negligible even when the
+	// /metrics HTTP endpoint is disabled. The HTTP handler is
+	// registered below only when NEXUS_METRICS_ENDPOINT is non-empty.
+	collector := observability.NewCollector()
+	gaugeProviders := buildGaugeProviders(hpoller, probeMgr, judgeEval, verifier, metricsStore, recorder)
+
 	mux := http.NewServeMux()
 	mux.Handle("/v1/chat/completions", handlers.Chat(handlers.Deps{
-		Config:          cfg,
-		Client:          client,
-		RAG:             store,
-		SLM:             slm,
-		FormattingRegex: re,
-		JudgeObserver:   judgeObs,
-		QualityObserver: qualityO,
-		MetricsObserver: metricsObs,
-		Recorder:        recorder,
-		Health:          hpoller,
-		BudgetObserver:  budgetObserver(probeMgr),
-		Limiter:         buildLocalLimiter(cfg),
-		SpendGuard:      buildSpendGuard(cfg),
+		Config:                cfg,
+		Client:                client,
+		RAG:                   store,
+		SLM:                   slm,
+		FormattingRegex:       re,
+		JudgeObserver:         judgeObs,
+		QualityObserver:       qualityO,
+		MetricsObserver:       metricsObs,
+		ObservabilityObserver: collector,
+		Recorder:              recorder,
+		Health:                hpoller,
+		BudgetObserver:        budgetObserver(probeMgr),
+		Limiter:               buildLocalLimiter(cfg),
+		SpendGuard:            buildSpendGuard(cfg),
 	}))
 
 	// /healthz returns a small JSON document so operators can see
@@ -336,26 +346,45 @@ func main() {
 		slog.String("ollama_url", cfg.OllamaURL),
 	)
 
+	// Prometheus /metrics endpoint (issue #40). Mounted only when
+	// NEXUS_METRICS_ENDPOINT is non-empty (default "/metrics"); an
+	// empty value disables the route entirely so /metrics returns 404
+	// and operators who do not want a scrape surface get zero
+	// regression. The handler renders standard text-exposition format
+	// via the in-process collector (no prometheus/client_golang
+	// dependency). Exempt from inbound auth + rate limiting (below)
+	// so a Prometheus scraper does not need a bearer key.
+	if cfg.MetricsEndpointEnabled() {
+		mux.HandleFunc(cfg.MetricsEndpoint, metricsHandler(collector, gaugeProviders...))
+		slog.Info("prometheus metrics endpoint enabled",
+			slog.String("path", cfg.MetricsEndpoint),
+		)
+	} else {
+		slog.Info("prometheus metrics endpoint disabled (NEXUS_METRICS_ENDPOINT is empty)")
+	}
+
 	// Inbound authentication middleware (issue #37). When at least one
 	// proxy API key is configured, requests must present a valid
 	// `Authorization: Bearer <key>` or `X-API-Key` header. /healthz
-	// stays exempt so orchestrator liveness probes (K8s, Docker,
-	// Compose healthchecks) work without a key. When no key is
+	// and /metrics stay exempt so orchestrator liveness probes and
+	// Prometheus scrapers work without a key. When no key is
 	// configured the middleware is a no-op pass-through, preserving
 	// the pre-issue-#37 localhost-dev behaviour exactly.
 	// Rate limiting middleware (issue #38). Wraps the handler
 	// outermost so a rate-limited request never reaches auth or the
-	// chat handler. /healthz is exempt so liveness probes survive a
-	// rate-limit storm. When all rate vars are zero, buildRateLimiter
-	// returns nil and Middleware is a pure pass-through.
+	// chat handler. /healthz and /metrics are exempt so liveness
+	// probes and scrapes survive a rate-limit storm. When all rate
+	// vars are zero, buildRateLimiter returns nil and Middleware is a
+	// pure pass-through.
 	rateLimiter := buildRateLimiter(cfg)
 	defer rateLimiter.Close()
 	var handler http.Handler = mux
-	handler = rateLimiter.Middleware(healthzExempt)(handler)
+	exempt := publicPathExempt(cfg)
+	handler = rateLimiter.Middleware(exempt)(handler)
 
 	if cfg.ProxyAuthEnabled {
 		keys := cfg.ProxyAuthKeys()
-		handler = auth.Middleware(keys, healthzExempt)(handler)
+		handler = auth.Middleware(keys, exempt)(handler)
 		slog.Info("proxy auth enabled",
 			slog.Int("keys", len(keys)),
 		)
@@ -727,11 +756,135 @@ func buildSpendGuard(cfg config.Config) handlers.SpendGuard {
 	return st
 }
 
-// healthzExempt is the exemption predicate passed to auth.Middleware
-// (issue #37). It lets /healthz through without a key so orchestrator
-// liveness probes (K8s, Docker healthcheck, Compose) keep working when
-// inbound authentication is enabled. Every other path still requires
-// a valid `Authorization: Bearer <key>` or `X-API-Key` header.
-func healthzExempt(r *http.Request) bool {
-	return r.URL.Path == "/healthz"
+// publicPathExempt is the exemption predicate passed to auth.Middleware
+// and the rate limiter (issues #37 / #38). It lets /healthz and the
+// configured /metrics endpoint through without a key / without
+// consuming rate-limit tokens so orchestrator liveness probes (K8s,
+// Docker healthcheck, Compose) and Prometheus scrapers keep working
+// when inbound authentication or rate limiting is enabled. Every other
+// path still requires a valid `Authorization: Bearer <key>` or
+// `X-API-Key` header.
+//
+// The metrics path is taken from cfg so an operator who changes
+// NEXUS_METRICS_ENDPOINT does not have to reconfigure auth. When the
+// endpoint is disabled (empty) only /healthz is exempt.
+func publicPathExempt(cfg config.Config) func(*http.Request) bool {
+	metricsPath := cfg.MetricsEndpoint
+	return func(r *http.Request) bool {
+		if r.URL.Path == "/healthz" {
+			return true
+		}
+		if metricsPath != "" && r.URL.Path == metricsPath {
+			return true
+		}
+		return false
+	}
+}
+
+// metricsHandler returns the /metrics HTTP handler (issue #40). It
+// renders Prometheus text-exposition format from the in-process
+// collector + the live gauge providers. The handler completes in well
+// under a millisecond regardless of sample count because every read is
+// a plain atomic load — no locks are held on the scrape path.
+func metricsHandler(c *observability.Collector, providers ...observability.GaugeProvider) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Prometheus scrapers accept version 0.0.4 of the text format
+		// by default; the charset is the standard Prometheus
+		// exposition hint.
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		observability.RenderPrometheus(w, c, providers...)
+	}
+}
+
+// buildGaugeProviders composes the live gauge readings the /metrics
+// handler collects at scrape time. Each provider is a closure over one
+// backing source (health poller, VRAM probe, judge evaluator, quality
+// verifier, dropped counters). A nil backing source yields a provider
+// that returns an empty slice, so main.go never constructs a typed-nil
+// GaugeProviderFunc.
+//
+// Keeping the adapters here — rather than importing each backing
+// package from internal/observability — preserves the dependency
+// direction: observability stays a pure leaf (imports nothing
+// internal), and only main.go knows both sides.
+func buildGaugeProviders(
+	hpoller *health.Health,
+	probeMgr *probe.Manager,
+	judgeEval *judge.Evaluator,
+	verifier *quality.ShellVerifier,
+	metricsStore metrics.Store,
+	recorder telemetry.Recorder,
+) []observability.GaugeProvider {
+	return []observability.GaugeProvider{
+		// Ollama health + circuit-breaker failure count.
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var out []observability.GaugeSample
+			healthy := 0.0
+			if hpoller.IsLocalHealthy() {
+				healthy = 1
+			}
+			out = append(out,
+				observability.GaugeSample{Name: "nexus_ollama_healthy", Value: healthy},
+				observability.GaugeSample{Name: "nexus_ollama_failure_count", Value: float64(hpoller.FailureCount())},
+			)
+			return out
+		}),
+
+		// Dynamic VRAM budget from the latest probe.
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			b := probeMgr.Get()
+			return []observability.GaugeSample{
+				{Name: "nexus_vram_budget_tokens", Value: float64(b.Tokens)},
+				{Name: "nexus_vram_free_bytes", Value: float64(b.FreeVRAMBytes)},
+			}
+		}),
+
+		// Judge evaluator queue depth + configured concurrency. The
+		// evaluator is nil when the judge is disabled (sample rate <= 0
+		// or no API key); a nil evaluator reports 0 for both gauges.
+		// Evaluator.QueueDepth / Concurrency are not themselves
+		// nil-safe, so the guard lives here.
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			qd, conc := 0, 0
+			if judgeEval != nil {
+				qd = judgeEval.QueueDepth()
+				conc = judgeEval.Concurrency()
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_judge_queue_depth", Value: float64(qd)},
+				{Name: "nexus_judge_concurrency", Value: float64(conc)},
+			}
+		}),
+
+		// Quality verifier queue depth + configured concurrency +
+		// dropped counter. nil-safe: a disabled verifier reports 0.
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			return []observability.GaugeSample{
+				{Name: "nexus_quality_queue_depth", Value: float64(verifier.QueueDepth())},
+				{Name: "nexus_quality_concurrency", Value: float64(verifier.Concurrency())},
+				{Name: "nexus_quality_dropped_total", Value: float64(verifier.Dropped())},
+			}
+		}),
+
+		// Dropped counters from the metrics store and telemetry
+		// recorder. Both are backed by a buffered channel; a full
+		// buffer increments the dropped counter so the operator can
+		// see back-pressure in /metrics. Type-asserted via the
+		// optional Dropped interfaces (nil store / nil recorder
+		// contribute 0).
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var out []observability.GaugeSample
+			if dc, ok := metricsStore.(interface{ Dropped() uint64 }); ok {
+				out = append(out, observability.GaugeSample{
+					Name: "nexus_metrics_dropped_total", Value: float64(dc.Dropped()),
+				})
+			}
+			if dc, ok := recorder.(interface{ Dropped() uint64 }); ok {
+				out = append(out, observability.GaugeSample{
+					Name: "nexus_telemetry_dropped_total", Value: float64(dc.Dropped()),
+				})
+			}
+			return out
+		}),
+	}
 }
