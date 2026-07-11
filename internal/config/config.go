@@ -107,6 +107,12 @@ type Config struct {
 	HealthPollInterval     time.Duration // background poll cadence (30s)
 	HealthBreakerThreshold int           // consecutive failures before trip (3)
 	HealthProbeTimeout     time.Duration // per-probe HTTP timeout (5s)
+	// ReadinessMode selects the /readyz behaviour (issue #42).
+	// "degraded" (default) returns 200 whenever the process is
+	// alive; "strict" returns 503 when Ollama is unreachable AND
+	// no frontier key is configured. Unknown values fall back to
+	// degraded (see handlers.NormalizeReadinessMode).
+	ReadinessMode string // env NEXUS_READINESS_MODE; "strict" | "degraded"
 
 	// Hardware-aware VRAM probe (issue #6). The probe replaces the
 	// static NEXUS_TOKEN_GUARDRAIL with a live measurement of the
@@ -246,6 +252,27 @@ func DefaultMetricsDBPath() string {
 	return filepath.Join(base, "nexus-proxy", "metrics.db")
 }
 
+// Readiness mode values for NEXUS_READINESS_MODE (issue #42).
+// Kept as package-level constants so config and handlers agree on
+// the spelling without one side importing the other. The handlers
+// package exposes matching constants for callers that want to
+// branch on the mode; see internal/handlers.NormalizeReadinessMode.
+const (
+	// ReadinessModeStrict makes /readyz return 503 when neither
+	// Ollama nor a frontier API key can serve traffic. Use this
+	// in clusters where pod eviction is preferable to degraded
+	// routing (e.g. billing-sensitive deployments).
+	ReadinessModeStrict = "strict"
+
+	// ReadinessModeDegraded (default) makes /readyz always
+	// return 200 when the process is alive; the body's
+	// "degraded" field surfaces the actual subsystem state for
+	// observability without triggering an eviction. Use this
+	// when a temporary dependency outage should not churn the
+	// proxy out of the service mesh.
+	ReadinessModeDegraded = "degraded"
+)
+
 // configKeys maps the YAML "section.key" paths to env var names. This
 // is the one source of truth that bridges the structured YAML view
 // and the existing NEXUS_* env-var surface; if you add a new config
@@ -281,6 +308,7 @@ var configKeys = map[string]string{
 	"health.poll_interval":                "NEXUS_HEALTH_POLL_INTERVAL",
 	"health.breaker_threshold":            "NEXUS_HEALTH_BREAKER_THRESHOLD",
 	"health.probe_timeout":                "NEXUS_HEALTH_PROBE_TIMEOUT",
+	"health.readiness_mode":               "NEXUS_READINESS_MODE",
 	"judge.url":                           "NEXUS_JUDGE_URL",
 	"judge.model":                         "NEXUS_JUDGE_MODEL",
 	"judge.api_key":                       "NEXUS_JUDGE_API_KEY",
@@ -512,6 +540,12 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.HealthProbeTimeout = healthProbe
+
+	// Readiness mode for /readyz (issue #42). Canonicalised on
+	// read by handlers.NormalizeReadinessMode — unknown values fall
+	// back to "degraded" so a typo never flips the pod into a more
+	// aggressive eviction policy.
+	cfg.ReadinessMode = resolveString("NEXUS_READINESS_MODE", fileMap, ReadinessModeDegraded)
 
 	// Hardware-aware VRAM probe (issue #6). Defaults: 60s poll,
 	// 5s per-probe timeout, 256 KiB per token heuristic (which

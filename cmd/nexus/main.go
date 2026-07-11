@@ -6,7 +6,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log"
 	"log/slog"
@@ -52,6 +51,14 @@ func main() {
 	if path := parseConfigFlag(os.Args[1:]); path != "" {
 		config.SetConfigPathOverride(path)
 	}
+
+	// Process start time is captured before any long-running
+	// goroutine so /status can report uptime with second-level
+	// accuracy (issue #42). Anchoring before config.Load() also
+	// avoids a brief window where the /status endpoint would
+	// answer 0s for any operator who managed to hit it during
+	// boot.
+	startTime := time.Now()
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -373,9 +380,33 @@ func main() {
 	// carries the bootstrap state (`ollama_healthy`,
 	// `budget_tokens`, `budget_source`). Compose/K8s liveness probes
 	// that pipe `curl /healthz` into grep will still match the
-	// `"status":"ok"` field.
-	mux.HandleFunc("/healthz", healthzHandler(hpoller, probeMgr, cfg))
-	slog.Info("healthz endpoint serves dynamic budget JSON",
+	// `"status":"ok"` field. /healthz is preserved verbatim as a
+	// backwards-compatibility alias — the canonical Kubernetes
+	// probes target /livez and /readyz (issue #42).
+	//
+	// The probe dependency is shared across /healthz and /status via
+	// the ProbeStats adapter below; constructing it once keeps the
+	// wiring identical (and avoids two closures that both call
+	// probeMgr.Get()).
+	probeStats := buildProbeStats(probeMgr)
+	mux.HandleFunc("/healthz", handlers.HealthzHandler(hpoller, probeStats, cfg))
+	mux.HandleFunc("/livez", handlers.LivezHandler())
+	mux.HandleFunc("/readyz", handlers.ReadyzHandler(handlers.ReadyzDeps{
+		Health:             hpoller,
+		FrontierConfigured: cfg.FrontierKey != "",
+		Mode:               cfg.ReadinessMode,
+	}))
+	mux.HandleFunc("/status", handlers.StatusHandler(handlers.StatusDeps{
+		Health:        hpoller,
+		Probe:         probeStats,
+		Judge:         buildJudgeStats(judgeEval),
+		Quality:       buildQualityStats(verifier),
+		Config:        cfg,
+		ReadinessMode: cfg.ReadinessMode,
+		StartTime:     startTime,
+	}))
+	slog.Info("health endpoints registered",
+		slog.String("readiness_mode", cfg.ReadinessMode),
 		slog.String("ollama_url", cfg.OllamaURL),
 	)
 
@@ -672,49 +703,63 @@ func budgetObserver(mgr *probe.Manager) handlers.BudgetObserver {
 	}
 }
 
-// healthzHandler returns the /healthz handler. Status code is
-// always 200 when the binary is alive; the JSON body carries the
-// per-request VRAM budget, the source label, the fallback value
-// the operator configured, and whether the local Ollama poller
-// considers Ollama healthy (nil hpoller -> true, matches the
-// health.Health nil-safe contract).
-func healthzHandler(hpoller *health.Health, mgr *probe.Manager, cfg config.Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
+// buildProbeStats adapts probe.Manager.Get() into the read-only
+// ProbeStats interface consumed by handlers.HealthzHandler and
+// handlers.StatusHandler (issue #42). Same dependency-direction
+// rationale as budgetObserver above: the handlers package stays free
+// of internal/probe; only main.go knows both sides.
+//
+// A nil manager yields the zero ProbeStatsFunc{} so the adapter
+// always satisfies the interface — useful for unit tests and
+// minimal wirings that disable the probe entirely.
+func buildProbeStats(mgr *probe.Manager) handlers.ProbeStats {
+	if mgr == nil {
+		return handlers.ProbeStatsFunc{}
+	}
+	return handlers.ProbeStatsFunc{
+		TokensFn:   func() int { return mgr.Get().Tokens },
+		SourceFn:   func() string { return string(mgr.Get().Source) },
+		FreeVRAMFn: func() int64 { return mgr.Get().FreeVRAMBytes },
+		ContextFn:  func() int { return mgr.Get().ModelContext },
+	}
+}
 
-		budget := probe.Budget{Source: probe.SourceStatic}
-		if mgr != nil {
-			budget = mgr.Get()
-		}
-		// When the probe has no budget to offer (still booting,
-		// disabled, or every signal unavailable) we echo the
-		// operator-configured TokenGuardrail so /healthz always
-		// reports a concrete number operators can grep against.
-		displayTokens := budget.Tokens
-		source := string(budget.Source)
-		if displayTokens <= 0 {
-			displayTokens = cfg.TokenGuardrail
-			source = string(probe.SourceStatic)
-		}
-		resp := struct {
-			Status         string `json:"status"`
-			OllamaHealthy  bool   `json:"ollama_healthy"`
-			BudgetTokens   int    `json:"budget_tokens"`
-			BudgetSource   string `json:"budget_source"`
-			FreeVRAMBytes  int64  `json:"free_vram_bytes,omitempty"`
-			ModelContext   int    `json:"model_context,omitempty"`
-			StaticFallback int    `json:"static_fallback_tokens"`
-		}{
-			Status:         "ok",
-			OllamaHealthy:  hpoller == nil || hpoller.IsLocalHealthy(),
-			BudgetTokens:   displayTokens,
-			BudgetSource:   source,
-			FreeVRAMBytes:  budget.FreeVRAMBytes,
-			ModelContext:   budget.ModelContext,
-			StaticFallback: cfg.TokenGuardrail,
-		}
-		_ = json.NewEncoder(w).Encode(resp)
+// buildJudgeStats adapts judge.Evaluator into the read-only
+// JudgeStats interface consumed by handlers.StatusHandler (issue
+// #42). Same dependency-direction rationale as buildProbeStats:
+// handlers does not import internal/judge.
+//
+// A nil evaluator (judge disabled — sample rate <= 0 or no API
+// key) yields the zero JudgeStatsFunc{} so /status reports the
+// disabled shape without a nil-deref. The method values are bound
+// to the non-nil receiver at construction time, so future calls
+// dispatch on the original evaluator pointer.
+func buildJudgeStats(eval *judge.Evaluator) handlers.JudgeStats {
+	if eval == nil {
+		return handlers.JudgeStatsFunc{}
+	}
+	return handlers.JudgeStatsFunc{
+		EnabledFn:     eval.Enabled,
+		QueueDepthFn:  eval.QueueDepth,
+		ConcurrencyFn: eval.Concurrency,
+	}
+}
+
+// buildQualityStats adapts quality.ShellVerifier into the read-only
+// QualityStats interface consumed by handlers.StatusHandler (issue
+// #42). Same dependency-direction rationale as the other
+// adapters — handlers does not import internal/quality. A nil
+// verifier (QualityConcurrency <= 0) yields the zero adapter so
+// /status reports the disabled shape without a nil-deref.
+func buildQualityStats(verifier *quality.ShellVerifier) handlers.QualityStats {
+	if verifier == nil {
+		return handlers.QualityStatsFunc{}
+	}
+	return handlers.QualityStatsFunc{
+		EnabledFn:     verifier.Enabled,
+		QueueDepthFn:  verifier.QueueDepth,
+		ConcurrencyFn: verifier.Concurrency,
+		DroppedFn:     verifier.Dropped,
 	}
 }
 
@@ -795,21 +840,22 @@ func buildSpendGuard(cfg config.Config) handlers.SpendGuard {
 }
 
 // publicPathExempt is the exemption predicate passed to auth.Middleware
-// and the rate limiter (issues #37 / #38). It lets /healthz and the
-// configured /metrics endpoint through without a key / without
-// consuming rate-limit tokens so orchestrator liveness probes (K8s,
-// Docker healthcheck, Compose) and Prometheus scrapers keep working
-// when inbound authentication or rate limiting is enabled. Every other
-// path still requires a valid `Authorization: Bearer <key>` or
-// `X-API-Key` header.
+// and the rate limiter (issues #37 / #38). It lets /healthz, the
+// Kubernetes-style health endpoints, and the configured /metrics
+// endpoint through without a key / without consuming rate-limit tokens
+// so orchestrator liveness probes (K8s, Docker healthcheck, Compose)
+// and Prometheus scrapers keep working when inbound authentication or
+// rate limiting is enabled. Every other path still requires a valid
+// `Authorization: Bearer <key>` or `X-API-Key` header.
 //
 // The metrics path is taken from cfg so an operator who changes
 // NEXUS_METRICS_ENDPOINT does not have to reconfigure auth. When the
-// endpoint is disabled (empty) only /healthz is exempt.
+// endpoint is disabled (empty) only the health endpoints are exempt.
 func publicPathExempt(cfg config.Config) func(*http.Request) bool {
 	metricsPath := cfg.MetricsEndpoint
 	return func(r *http.Request) bool {
-		if r.URL.Path == "/healthz" {
+		switch r.URL.Path {
+		case "/healthz", "/livez", "/readyz", "/status":
 			return true
 		}
 		if metricsPath != "" && r.URL.Path == metricsPath {
