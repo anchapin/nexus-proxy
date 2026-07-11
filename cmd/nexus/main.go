@@ -27,6 +27,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/transport"
 )
 
 const (
@@ -65,7 +66,37 @@ func main() {
 		slog.Info("no config file loaded; using env vars only")
 	}
 
-	emb := rag.NewOllamaEmbedder(cfg.OllamaURL, cfg.EmbeddingModel, nil)
+	// Connection-pooled HTTP clients (issue #34). Two clients are
+	// built here so chat-class traffic and background pollers cannot
+	// starve each other for idle conns:
+	//
+	//   - client:   primary pool sized by NEXUS_HTTP_* env vars.
+	//               Wired to chat handler, SLM, embedder, judge.
+	//   - probeCli: lighter pool with MaxIdleConnsPerHost=1, used by
+	//               the health poller and the VRAM probe.
+	//
+	// Both clients keep no per-call timeout — call sites that need
+	// one (SLM router, fusion arbiter) bind http.NewRequestWithContext
+	// with their own timeout. See internal/transport for the full
+	// rationale and the env-var surface.
+	httpCfg := transport.Config{
+		MaxIdleConns:        cfg.HTTPMaxIdleConns,
+		MaxIdleConnsPerHost: cfg.HTTPMaxIdleConnsPerHost,
+		MaxConnsPerHost:     cfg.HTTPMaxConnsPerHost,
+		IdleConnTimeout:     cfg.HTTPIdleConnTimeout,
+		DisableKeepAlives:   cfg.HTTPDisableKeepAlives,
+	}
+	client := transport.New(httpCfg)
+	probeCli := transport.NewProbe(httpCfg)
+	slog.Info("http clients configured",
+		slog.Int("max_idle_conns", cfg.HTTPMaxIdleConns),
+		slog.Int("max_idle_conns_per_host", cfg.HTTPMaxIdleConnsPerHost),
+		slog.Int("max_conns_per_host", cfg.HTTPMaxConnsPerHost),
+		slog.Duration("idle_conn_timeout", cfg.HTTPIdleConnTimeout),
+		slog.Bool("disable_keepalives", cfg.HTTPDisableKeepAlives),
+	)
+
+	emb := rag.NewOllamaEmbedder(cfg.OllamaURL, cfg.EmbeddingModel, client)
 	store := rag.NewStore(emb, cfg.RAGThreshold)
 	bootCtx, cancel := context.WithTimeout(context.Background(), bootRAGTimeout)
 	defer cancel()
@@ -73,7 +104,7 @@ func main() {
 		slog.Warn("rag index failed", slog.Any("err", err))
 	}
 
-	slm := router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, cfg.SLMTimeout, nil)
+	slm := router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, cfg.SLMTimeout, client)
 	re := regexp.MustCompile(formattingRegexPattern)
 
 	// Ollama health poller (issue #8). When NEXUS_HEALTH_POLL_INTERVAL
@@ -82,8 +113,8 @@ func main() {
 	// states are impossible). Otherwise a background goroutine
 	// pings /api/tags on the cadence and the chat handler reroutes
 	// route=local/route=fusion to frontier when Ollama trips the
-	// breaker. The poller's context is the boot context so a
-	// fatal-level config error cancels it cleanly.
+	// breaker. The poller uses probeCli so its idle conns do not
+	// reserve slots on the primary pool.
 	var hpoller *health.Health
 	if cfg.HealthPollInterval > 0 {
 		hpoller = health.New(
@@ -91,7 +122,7 @@ func main() {
 			cfg.HealthPollInterval,
 			cfg.HealthBreakerThreshold,
 			cfg.HealthProbeTimeout,
-			http.DefaultClient,
+			probeCli,
 		)
 		go hpoller.Run(context.Background())
 		defer func() {
@@ -112,7 +143,7 @@ func main() {
 	// the probe is disabled (NEXUS_PROBE_INTERVAL=0) the manager
 	// still runs the boot probe once and the chat handler falls
 	// back to the static value when it produces no budget.
-	probeImpl := probe.NewOllamaProbe(cfg.OllamaURL, http.DefaultClient)
+	probeImpl := probe.NewOllamaProbe(cfg.OllamaURL, probeCli)
 	probeImpl.BytesPerToken = cfg.ProbeBytesPerToken
 	probeMgr := probe.NewManager(probeImpl, cfg.ProbePollInterval, cfg.ProbeTimeout)
 	go probeMgr.Run(context.Background())
@@ -152,7 +183,7 @@ func main() {
 		// Issue #16 will swap this for a SQLite-backed Storage. The
 		// interface is identical so the swap is a one-line change.
 		store := judge.NewMemoryStorage()
-		judgeEval = judge.NewEvaluator(evalCfg, http.DefaultClient, store)
+		judgeEval = judge.NewEvaluator(evalCfg, client, store)
 		judgeObs = handlers.JudgeObserverFunc(func(c handlers.LocalCompletion) {
 			if !judgeEval.Sample() {
 				return
@@ -274,7 +305,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/v1/chat/completions", handlers.Chat(handlers.Deps{
 		Config:          cfg,
-		Client:          http.DefaultClient,
+		Client:          client,
 		RAG:             store,
 		SLM:             slm,
 		FormattingRegex: re,
