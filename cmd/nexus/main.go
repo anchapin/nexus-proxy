@@ -8,15 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
-	"log/slog"
-	"net/http"
-	"os"
-	"os/signal"
-	"regexp"
-	"syscall"
-	"time"
-
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/handlers"
 	"github.com/anchapin/nexus-proxy/internal/health"
@@ -27,6 +18,15 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"log"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"regexp"
+	"sync"
+	"syscall"
+	"time"
 )
 
 const (
@@ -56,6 +56,12 @@ func main() {
 	}
 
 	slm := router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, cfg.SLMTimeout, nil)
+	// Judge-guided adaptive routing (issue #47): the confidence
+	// floor/ceiling bound the neutral band the SLM uses when a
+	// confidence signal is supplied. Zero values fall back to the
+	// router defaults, so this is safe even when the feature is off.
+	slm.ConfidenceFloor = cfg.RoutingConfidenceFloor
+	slm.ConfidenceCeiling = cfg.RoutingConfidenceCeiling
 	re := regexp.MustCompile(formattingRegexPattern)
 
 	// Ollama health poller (issue #8). When NEXUS_HEALTH_POLL_INTERVAL
@@ -117,8 +123,10 @@ func main() {
 	// closure that adapts LocalCompletion to the evaluator's
 	// Sample + Enqueue entry points.
 	var (
-		judgeEval *judge.Evaluator
-		judgeObs  handlers.JudgeObserver
+		judgeEval       *judge.Evaluator
+		judgeObs        handlers.JudgeObserver
+		confidenceStore *router.SQLiteConfidenceStore
+		confidenceObs   router.ConfidenceStore
 	)
 	if cfg.JudgeEnabled && cfg.JudgeAPIKey != "" {
 		evalCfg := judge.Config{
@@ -133,11 +141,46 @@ func main() {
 		}
 		// Issue #16 will swap this for a SQLite-backed Storage. The
 		// interface is identical so the swap is a one-line change.
-		store := judge.NewMemoryStorage()
-		judgeEval = judge.NewEvaluator(evalCfg, http.DefaultClient, store)
+		var storage judge.Storage = judge.NewMemoryStorage()
+
+		// Judge-guided adaptive routing (issue #47). When enabled we
+		// open the confidence store and wrap the judge storage in a
+		// bridge that feeds each landed JudgeScore back into the store
+		// as a per-category local outcome. The observer stashes the
+		// prompt category at enqueue time so the bridge can resolve it
+		// when the async score arrives.
+		var bridge *confidenceBridge
+		if cfg.RoutingConfidenceEnabled() {
+			cs, cerr := router.OpenConfidenceStore(router.ConfidenceConfig{
+				Path:       cfg.RoutingConfidenceDB,
+				MinSamples: cfg.RoutingConfidenceMinSamples,
+				Window:     cfg.RoutingConfidenceWindow,
+			})
+			if cerr != nil {
+				slog.Error("routing confidence store open failed, adaptive routing disabled",
+					slog.Any("err", cerr))
+			} else {
+				confidenceStore = cs
+				confidenceObs = cs
+				bridge = newConfidenceBridge(storage, cs)
+				storage = bridge
+				slog.Info("adaptive routing enabled",
+					slog.String("db", cs.Path()),
+					slog.Float64("floor", cfg.RoutingConfidenceFloor),
+					slog.Float64("ceiling", cfg.RoutingConfidenceCeiling),
+					slog.Int("min_samples", cfg.RoutingConfidenceMinSamples),
+					slog.Duration("window", cfg.RoutingConfidenceWindow),
+				)
+			}
+		}
+
+		judgeEval = judge.NewEvaluator(evalCfg, http.DefaultClient, storage)
 		judgeObs = handlers.JudgeObserverFunc(func(c handlers.LocalCompletion) {
 			if !judgeEval.Sample() {
 				return
+			}
+			if bridge != nil {
+				bridge.note(c.RequestID, router.Categorize(c.Instruction))
 			}
 			if !judgeEval.Enqueue(judge.Sample{
 				RequestID:   c.RequestID,
@@ -145,6 +188,9 @@ func main() {
 				Output:      c.Output,
 				LocalModel:  c.LocalModel,
 			}) {
+				if bridge != nil {
+					bridge.forget(c.RequestID)
+				}
 				slog.Warn("judge queue full, dropped request", slog.String("request_id", c.RequestID))
 			}
 		})
@@ -157,6 +203,18 @@ func main() {
 	} else {
 		slog.Info("judge disabled (sample rate <= 0 or no api key)")
 	}
+	// The confidence store's lifetime is tied to the judge storage
+	// (the bridge delegates Close to the inner judge storage), but the
+	// underlying *sql.DB is owned here. Closing it on shutdown flushes
+	// WAL frames. judgeEval.Close (below, on signal) drains the queue
+	// first, so any in-flight outcome is recorded before this runs.
+	defer func() {
+		if confidenceStore != nil {
+			if err := confidenceStore.Close(); err != nil {
+				slog.Warn("routing confidence store close", slog.Any("err", err))
+			}
+		}
+	}()
 
 	recorder := buildRecorder(cfg)
 	defer func() {
@@ -260,6 +318,7 @@ func main() {
 		RAG:             store,
 		SLM:             slm,
 		FormattingRegex: re,
+		Confidence:      confidenceObs,
 		JudgeObserver:   judgeObs,
 		QualityObserver: qualityO,
 		MetricsObserver: metricsObs,
@@ -319,6 +378,62 @@ func main() {
 		log.Fatalf("server: %v", err)
 	}
 }
+
+// confidenceBridge adapts the judge's Storage seam to the router's
+// ConfidenceStore (issue #47). The judge worker pool calls Record with a
+// JudgeScore that carries no task category, so the bridge remembers the
+// category per request id (stashed by the observer at enqueue time) and
+// resolves it when the score lands. It delegates to an inner Storage (the
+// in-memory judge log) so existing judge behaviour is preserved.
+//
+// This adapter lives in main.go — not internal/judge or internal/router —
+// so neither package imports the other (the AGENTS.md dependency rule).
+type confidenceBridge struct {
+	inner judge.Storage
+	conf  router.ConfidenceStore
+	mu    sync.Mutex
+	cats  map[string]string // request id -> category
+}
+
+func newConfidenceBridge(inner judge.Storage, conf router.ConfidenceStore) *confidenceBridge {
+	return &confidenceBridge{inner: inner, conf: conf, cats: make(map[string]string)}
+}
+
+// note stashes the category for a request id before it is enqueued so the
+// async Record can resolve it once the judge score lands.
+func (b *confidenceBridge) note(requestID, category string) {
+	b.mu.Lock()
+	b.cats[requestID] = category
+	b.mu.Unlock()
+}
+
+// forget drops a stashed category so the map does not leak when an enqueue
+// is rejected (queue full) and no score will ever arrive.
+func (b *confidenceBridge) forget(requestID string) {
+	b.mu.Lock()
+	delete(b.cats, requestID)
+	b.mu.Unlock()
+}
+
+// Record resolves the category for the scored request and feeds a local
+// outcome into the confidence store, then delegates to the inner storage.
+// Parse-failure scores (Err set, or Score outside 1..5) are persisted by
+// the inner storage but excluded from the confidence aggregate.
+func (b *confidenceBridge) Record(s judge.JudgeScore) error {
+	b.mu.Lock()
+	cat, ok := b.cats[s.RequestID]
+	delete(b.cats, s.RequestID)
+	b.mu.Unlock()
+	if ok && s.Err == nil && s.Score >= 1 {
+		b.conf.RecordOutcome(cat, router.RouteLocal, s.Score)
+	}
+	return b.inner.Record(s)
+}
+
+// Close delegates to the inner judge storage. The confidence store's own
+// *sql.DB is closed separately in main (it is owned there, not by the
+// bridge).
+func (b *confidenceBridge) Close() error { return b.inner.Close() }
 
 // buildRecorder constructs the telemetry recorder from config. A disabled
 // TelemetryPath returns a Noop so the handler can stay recorder-agnostic.

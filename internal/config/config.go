@@ -63,6 +63,23 @@ type Config struct {
 	FusionProgressiveDelivery bool    // true iff NEXUS_FUSION_PROGRESSIVE is unset or "true" (default true)
 	FusionAgreementThreshold  float64 // Jaccard ratio [0,1] above which arbiter is skipped (default 0.85)
 
+	// Judge-guided adaptive routing (issue #47). Historical judge
+	// scores are aggregated by task category in a SQLite table and fed
+	// back to the SLM router as a confidence signal. All of this is
+	// dormant unless the judge is enabled — when JudgeEnabled is false
+	// the chat handler never wires a ConfidenceStore, so routing is
+	// byte-for-byte identical to the pre-issue-47 behaviour.
+	//
+	// RoutingConfidenceDB   — on-disk SQLite path; empty disables the store.
+	// Floor / Ceiling       — bounds of the neutral band (0.4 / 0.85).
+	// MinSamples            — outcomes needed before a category is trusted (5).
+	// Window                — sliding window for the aggregate (168h / 7d).
+	RoutingConfidenceDB         string
+	RoutingConfidenceFloor      float64
+	RoutingConfidenceCeiling    float64
+	RoutingConfidenceMinSamples int
+	RoutingConfidenceWindow     time.Duration
+
 	// Health (issue #8). The chat handler consults
 	// internal/health.Health before issuing local-bound requests;
 	// when Ollama is unreachable it short-circuits to frontier
@@ -159,6 +176,18 @@ func DefaultMetricsDBPath() string {
 	return filepath.Join(base, "nexus-proxy", "metrics.db")
 }
 
+// DefaultRoutingConfidenceDBPath returns the canonical location for the
+// judge-guided adaptive routing store (issue #47):
+// $XDG_CACHE_HOME/nexus-proxy/routing_confidence.db. Operators override
+// with NEXUS_ROUTING_CONFIDENCE_DB (empty disables the store).
+func DefaultRoutingConfidenceDBPath() string {
+	base, err := os.UserCacheDir()
+	if err != nil || base == "" {
+		base = "./.cache"
+	}
+	return filepath.Join(base, "nexus-proxy", "routing_confidence.db")
+}
+
 // Load reads configuration from environment variables, applying defaults
 // suitable for local development. It returns an error only when a required
 // value is malformed; missing optional values fall back to defaults.
@@ -233,6 +262,36 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.FusionAgreementThreshold = agreementThreshold
+
+	// Judge-guided adaptive routing (issue #47). Defaults keep the
+	// feature dormant unless the judge is enabled and a DB path is
+	// configured. The DB defaults to a sibling of the metrics DB so a
+	// stock deployment gets both without extra config.
+	cfg.RoutingConfidenceDB = getEnvAllowEmpty("NEXUS_ROUTING_CONFIDENCE_DB", DefaultRoutingConfidenceDBPath())
+
+	confFloor, err := getEnvFloat("NEXUS_ROUTING_CONFIDENCE_FLOOR", 0.4)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RoutingConfidenceFloor = confFloor
+
+	confCeiling, err := getEnvFloat("NEXUS_ROUTING_CONFIDENCE_CEILING", 0.85)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RoutingConfidenceCeiling = confCeiling
+
+	confMinSamples, err := getEnvInt("NEXUS_ROUTING_CONFIDENCE_MIN_SAMPLES", 5)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RoutingConfidenceMinSamples = confMinSamples
+
+	confWindow, err := getEnvDuration("NEXUS_ROUTING_CONFIDENCE_WINDOW", 168*time.Hour)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RoutingConfidenceWindow = confWindow
 
 	// Ollama health poller (issue #8). Defaults: 30s poll cadence,
 	// 3-failure breaker, 5s per-probe HTTP timeout. Set
@@ -411,6 +470,15 @@ func (c Config) TelemetryEnabled() bool { return c.TelemetryPath != "" }
 // MetricsEnabled reports whether the SQLite metrics store should be
 // opened. Disabled when MetricsDBPath is empty.
 func (c Config) MetricsEnabled() bool { return c.MetricsDBPath != "" }
+
+// RoutingConfidenceEnabled reports whether the judge-guided adaptive
+// routing store (issue #47) should be opened. It requires BOTH a configured
+// DB path AND the judge to be enabled: without judge scores there is no
+// data to aggregate, and the acceptance criteria mandate that a disabled
+// judge produces byte-for-byte identical routing (no DB queries).
+func (c Config) RoutingConfidenceEnabled() bool {
+	return c.RoutingConfidenceDB != "" && c.JudgeEnabled
+}
 
 // NewLogger returns a *slog.Logger configured per LogLevel / LogFormat,
 // always writing to stderr. Centralising the construction in config
