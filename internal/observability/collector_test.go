@@ -1,0 +1,264 @@
+package observability
+
+import (
+	"math"
+	"strings"
+	"testing"
+)
+
+// TestSubmitIncrementsRouteCounters verifies the acceptance criterion
+// "5 test requests → nexus_requests_total incremented by 5 with correct
+// route labels". Each route lands in its own labelled bucket.
+func TestSubmitIncrementsRouteCounters(t *testing.T) {
+	c := NewCollector()
+	for i := 0; i < 5; i++ {
+		c.Submit(ObservabilityEvent{Route: "local"})
+	}
+	c.Submit(ObservabilityEvent{Route: "frontier"})
+	c.Submit(ObservabilityEvent{Route: "frontier"})
+	c.Submit(ObservabilityEvent{Route: "fusion"})
+
+	if got := c.RequestsLocal(); got != 5 {
+		t.Errorf("RequestsLocal = %d, want 5", got)
+	}
+	if got := c.RequestsFrontier(); got != 2 {
+		t.Errorf("RequestsFrontier = %d, want 2", got)
+	}
+	if got := c.RequestsFusion(); got != 1 {
+		t.Errorf("RequestsFusion = %d, want 1", got)
+	}
+}
+
+// TestSubmitUnknownRouteCountsAsFrontier guards the safe-default
+// behaviour: an unrecognised route string must not be silently
+// dropped, it accumulates into the frontier bucket (the proxy's
+// universal safe default).
+func TestSubmitUnknownRouteCountsAsFrontier(t *testing.T) {
+	c := NewCollector()
+	c.Submit(ObservabilityEvent{Route: "supervisor"})
+	if got := c.RequestsFrontier(); got != 1 {
+		t.Errorf("unknown route counted as frontier = %d, want 1", got)
+	}
+}
+
+// TestSubmitCountsErrorsRagToonDegraded checks the boolean-flag
+// counters increment exactly when their flag is set.
+func TestSubmitCountsErrorsRagToonDegraded(t *testing.T) {
+	c := NewCollector()
+	c.Submit(ObservabilityEvent{Route: "local", Error: "boom"})
+	c.Submit(ObservabilityEvent{Route: "local", RAGInjected: true})
+	c.Submit(ObservabilityEvent{Route: "local"}) // RAG miss, no flags
+	c.Submit(ObservabilityEvent{Route: "local", TOONCompressed: true})
+	c.Submit(ObservabilityEvent{Route: "local", Degraded: true})
+
+	if got := c.errorsTotal.Load(); got != 1 {
+		t.Errorf("errorsTotal = %d, want 1", got)
+	}
+	if got := c.ragHitsTotal.Load(); got != 1 {
+		t.Errorf("ragHitsTotal = %d, want 1", got)
+	}
+	if got := c.ragMissesTotal.Load(); got != 4 {
+		t.Errorf("ragMissesTotal = %d, want 4 (one hit + four unflagged)", got)
+	}
+	if got := c.toonCompressedTotal.Load(); got != 1 {
+		t.Errorf("toonCompressedTotal = %d, want 1", got)
+	}
+	if got := c.degradedTotal.Load(); got != 1 {
+		t.Errorf("degradedTotal = %d, want 1", got)
+	}
+}
+
+// TestSubmitAccumulatesTokensAndCost verifies the cumulative-sum
+// counters (tokens + cost) add across multiple submissions rather than
+// being overwritten.
+func TestSubmitAccumulatesTokensAndCost(t *testing.T) {
+	c := NewCollector()
+	c.Submit(ObservabilityEvent{
+		Route:             "frontier",
+		InputTokens:       1000,
+		OutputTokens:      500,
+		TOONSavingsTokens: 200,
+		EstimatedCostUSD:  0.01,
+	})
+	c.Submit(ObservabilityEvent{
+		Route:             "frontier",
+		InputTokens:       250,
+		OutputTokens:      50,
+		TOONSavingsTokens: 30,
+		EstimatedCostUSD:  0.005,
+	})
+
+	if got := c.inputTokensTotal.Load(); got != 1250 {
+		t.Errorf("inputTokensTotal = %d, want 1250", got)
+	}
+	if got := c.outputTokensTotal.Load(); got != 550 {
+		t.Errorf("outputTokensTotal = %d, want 550", got)
+	}
+	if got := c.toonSavingsTokensTotal.Load(); got != 230 {
+		t.Errorf("toonSavingsTokensTotal = %d, want 230", got)
+	}
+	if got, want := c.EstimatedCostUSD(), 0.015; math.Abs(got-want) > 1e-9 {
+		t.Errorf("EstimatedCostUSD = %v, want %v", got, want)
+	}
+}
+
+// TestSubmitNegativeTokensIgnored guards against a negative estimate
+// (which the savings heuristic clamps elsewhere) silently underflowing
+// the uint64 counter.
+func TestSubmitNegativeTokensIgnored(t *testing.T) {
+	c := NewCollector()
+	c.Submit(ObservabilityEvent{Route: "local", InputTokens: -5, OutputTokens: -1, TOONSavingsTokens: -10})
+	if got := c.inputTokensTotal.Load(); got != 0 {
+		t.Errorf("inputTokensTotal = %d, want 0 (negative ignored)", got)
+	}
+	if c.EstimatedCostUSD() != 0 {
+		t.Errorf("EstimatedCostUSD = %v, want 0", c.EstimatedCostUSD())
+	}
+}
+
+// TestHistogramBucketPlacement is the core histogram correctness test:
+// each observation lands in the smallest bucket whose upper bound it
+// fits under, the cumulative counts are monotonic, and the +Inf bucket
+// equals the total count.
+func TestHistogramBucketPlacement(t *testing.T) {
+	h := NewHistogram([]float64{10, 50, 100})
+	// Observations: 5 and 10 -> bucket[0] (<=10); 75 -> bucket[2] (<=100);
+	// 999 -> +Inf bucket.
+	h.Observe(5)
+	h.Observe(10)
+	h.Observe(75)
+	h.Observe(999)
+
+	cum, upperBounds, sum, count := h.Snapshot()
+	if count != 4 {
+		t.Errorf("count = %d, want 4", count)
+	}
+	// cum = [2 (<=10), 2 (<=50), 3 (<=100), 4 (+Inf)]
+	wantCum := []uint64{2, 2, 3, 4}
+	if len(cum) != len(wantCum) {
+		t.Fatalf("cumulative len = %d, want %d", len(cum), len(wantCum))
+	}
+	for i, want := range wantCum {
+		if cum[i] != want {
+			t.Errorf("cumulative[%d] (le=%v) = %d, want %d", i, upperBounds[i], cum[i], want)
+		}
+	}
+	if sum != 5+10+75+999 {
+		t.Errorf("sum = %v, want %v", sum, 1089)
+	}
+}
+
+// TestHistogramZeroValue renders an empty histogram without panicking
+// and produces a valid +Inf bucket of 0.
+func TestHistogramZeroValue(t *testing.T) {
+	h := NewHistogram(DefaultBuckets)
+	cum, _, _, count := h.Snapshot()
+	if count != 0 {
+		t.Errorf("count = %d, want 0", count)
+	}
+	// Last cumulative entry is the +Inf bucket; must be 0.
+	if cum[len(cum)-1] != 0 {
+		t.Errorf("+Inf bucket = %d, want 0", cum[len(cum)-1])
+	}
+}
+
+// TestSubmitRecordsLatencyAndTTFT confirms Submit feeds both
+// histograms when the latency fields are positive.
+func TestSubmitRecordsLatencyAndTTFT(t *testing.T) {
+	c := NewCollector()
+	c.Submit(ObservabilityEvent{Route: "local", TotalLatencyMs: 42, TTFTMs: 12})
+	c.Submit(ObservabilityEvent{Route: "local", TotalLatencyMs: 600, TTFTMs: 80})
+
+	_, _, latSum, latCount := c.Latency().Snapshot()
+	if latCount != 2 {
+		t.Errorf("latency count = %d, want 2", latCount)
+	}
+	if latSum != 642 {
+		t.Errorf("latency sum = %v, want 642", latSum)
+	}
+
+	_, _, ttftSum, ttftCount := c.TTFT().Snapshot()
+	if ttftCount != 2 {
+		t.Errorf("ttft count = %d, want 2", ttftCount)
+	}
+	if ttftSum != 92 {
+		t.Errorf("ttft sum = %v, want 92", ttftSum)
+	}
+}
+
+// TestSubmitZeroLatencyNotObserved guards the contract that a
+// non-streaming response (TTFTMs == 0) must not pollute the TTFT
+// histogram with a spurious 0-ms observation.
+func TestSubmitZeroLatencyNotObserved(t *testing.T) {
+	c := NewCollector()
+	c.Submit(ObservabilityEvent{Route: "local", TotalLatencyMs: 0, TTFTMs: 0})
+	_, _, _, count := c.Latency().Snapshot()
+	if count != 0 {
+		t.Errorf("latency count after 0-ms submit = %d, want 0", count)
+	}
+}
+
+// TestConcurrentSubmit exercises the lock-free collector under
+// concurrent writers to flush out any data race (-race catches the
+// rest). 100 goroutines × 100 submissions = 10,000 events.
+func TestConcurrentSubmit(t *testing.T) {
+	c := NewCollector()
+	const goroutines, perG = 100, 100
+	done := make(chan struct{}, goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			for i := 0; i < perG; i++ {
+				c.Submit(ObservabilityEvent{
+					Route:            "local",
+					InputTokens:      1,
+					EstimatedCostUSD: 0.001,
+					TotalLatencyMs:   5,
+					TTFTMs:           2,
+				})
+			}
+		}()
+	}
+	for g := 0; g < goroutines; g++ {
+		<-done
+	}
+	want := uint64(goroutines * perG)
+	if got := c.RequestsLocal(); got != want {
+		t.Errorf("RequestsLocal = %d, want %d", got, want)
+	}
+	if got := c.inputTokensTotal.Load(); got != want {
+		t.Errorf("inputTokensTotal = %d, want %d", got, want)
+	}
+	_, _, _, count := c.Latency().Snapshot()
+	if count != want {
+		t.Errorf("latency count = %d, want %d", count, want)
+	}
+}
+
+// TestNilHistogramRenderSafe ensures writeHistogram on a nil histogram
+// does not panic (defensive: a misconfigured collector must never crash
+// the scrape handler).
+func TestNilHistogramRenderSafe(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("writeHistogram panicked on nil histogram: %v", r)
+		}
+	}()
+	var buf strings.Builder
+	writeHistogram(&buf, "x", "help", nil)
+}
+
+// TestNilCollectorRenderSafe ensures RenderPrometheus on a nil
+// collector writes nothing and does not panic.
+func TestNilCollectorRenderSafe(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("RenderPrometheus panicked on nil collector: %v", r)
+		}
+	}()
+	var buf strings.Builder
+	RenderPrometheus(&buf, nil)
+	if buf.Len() != 0 {
+		t.Errorf("nil collector wrote %d bytes, want 0", buf.Len())
+	}
+}
