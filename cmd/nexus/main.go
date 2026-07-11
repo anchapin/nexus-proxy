@@ -448,6 +448,27 @@ func main() {
 		slog.String("ollama_url", cfg.OllamaURL),
 	)
 
+	// OpenAI-compatible model discovery (issue #78). GET /v1/models
+	// returns the configured local/router/frontier models (and any
+	// Ollama /api/tags entries when NEXUS_MODELS_CACHE_TTL > 0);
+	// GET /v1/models/{id} returns a single model or 404. Disabled
+	// wholesale when NEXUS_MODELS_ENDPOINT=false. No provider secrets
+	// (API keys) are ever exposed — the handler emits only id/object/
+	// created/owned_by per the OpenAI Models schema.
+	if cfg.ModelsEndpointEnabled {
+		mh := handlers.Models(handlers.ModelsDeps{
+			Config: cfg,
+			Client: http.DefaultClient,
+		})
+		mux.Handle("/v1/models", mh)
+		mux.Handle("/v1/models/", mh)
+		slog.Info("models endpoint enabled",
+			slog.Duration("cache_ttl", cfg.ModelsCacheTTL),
+		)
+	} else {
+		slog.Info("models endpoint disabled (NEXUS_MODELS_ENDPOINT=false)")
+	}
+
 	slog.Info("starting nexus proxy",
 		slog.String("addr", cfg.Addr),
 		slog.String("local_model", cfg.LocalModel),

@@ -224,6 +224,15 @@ type Config struct {
 	// debug-level chatter from every other package.
 	Debug          bool
 	DebugBodyBytes int
+
+	// OpenAI-compatible model discovery (issue #78). When enabled the
+	// proxy serves GET /v1/models and GET /v1/models/{id} listing the
+	// configured local, router, and frontier models, plus any models
+	// Ollama reports via /api/tags. The Ollama poll is cached for
+	// ModelsCacheTTL; set to zero or negative to serve only the
+	// configured models (no HTTP round-trip to Ollama per request).
+	ModelsEndpointEnabled bool
+	ModelsCacheTTL        time.Duration
 }
 
 // DefaultMetricsDBPath returns the canonical metrics DB location:
@@ -634,6 +643,18 @@ func Load() (Config, error) {
 	}
 	cfg.DebugBodyBytes = debugBodyBytes
 
+	// OpenAI-compatible model discovery (issue #78). Enabled by
+	// default so a stock deployment is discoverable by OpenAI-
+	// compatible clients; operators who do not want the proxy to
+	// advertise its model list set NEXUS_MODELS_ENDPOINT=false.
+	cfg.ModelsEndpointEnabled = parseBoolEnv("NEXUS_MODELS_ENDPOINT", true)
+
+	modelsCacheTTL, err := getEnvDuration("NEXUS_MODELS_CACHE_TTL", 5*time.Minute)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ModelsCacheTTL = modelsCacheTTL
+
 	return cfg, nil
 }
 
@@ -729,6 +750,13 @@ func (c Config) EffectiveDebugBodyBytes() int {
 // TelemetryEnabled reports whether the on-disk recorder should be started.
 // Disabled when TelemetryPath is empty.
 func (c Config) TelemetryEnabled() bool { return c.TelemetryPath != "" }
+
+// ModelsCacheEnabled reports whether the Ollama /api/tags poll should
+// supplement the configured models list (issue #78). Disabled when
+// ModelsCacheTTL is zero or negative — the handler then serves only
+// the configured local/router/frontier models with no HTTP round-trip
+// to Ollama per request.
+func (c Config) ModelsCacheEnabled() bool { return c.ModelsCacheTTL > 0 }
 
 // MetricsEnabled reports whether the SQLite metrics store should be
 // opened. Disabled when MetricsDBPath is empty.
