@@ -39,12 +39,12 @@ func TestHeaderAllowed(t *testing.T) {
 // allowlisted headers and leaves the rest behind (issue #39).
 func TestCopyAllowedHeadersDropsLeaks(t *testing.T) {
 	src := http.Header{
-		"Content-Type":     []string{"text/event-stream"},
-		"Cache-Control":    []string{"no-cache"},
-		"X-Nexus-Degraded": []string{"true"},
-		"Server":           []string{"cloudfront"},
-		"Set-Cookie":       []string{"session=abc; HttpOnly"},
-		"Via":              []string{"1.1 proxy"},
+		"Content-Type":          []string{"text/event-stream"},
+		"Cache-Control":         []string{"no-cache"},
+		"X-Nexus-Degraded":      []string{"true"},
+		"Server":                []string{"cloudfront"},
+		"Set-Cookie":            []string{"session=abc; HttpOnly"},
+		"Via":                   []string{"1.1 proxy"},
 		"X-Ratelimit-Remaining": []string{"0"},
 	}
 	dst := http.Header{}
@@ -73,12 +73,12 @@ func TestStreamDropsNonAllowlistedHeaders(t *testing.T) {
 		return &http.Response{
 			StatusCode: 200,
 			Header: http.Header{
-				"Content-Type":     []string{"text/event-stream"},
-				"Server":           []string{"cloudfront"},
-				"Set-Cookie":       []string{"s=1"},
-				"Via":              []string{"1.1 gw"},
+				"Content-Type":          []string{"text/event-stream"},
+				"Server":                []string{"cloudfront"},
+				"Set-Cookie":            []string{"s=1"},
+				"Via":                   []string{"1.1 gw"},
 				"X-Ratelimit-Remaining": []string{"0"},
-				"X-Nexus-Custom":   []string{"ok"},
+				"X-Nexus-Custom":        []string{"ok"},
 			},
 			Body: io.NopCloser(strings.NewReader("data: {\"a\":1}\n\n")),
 		}, nil
@@ -109,11 +109,11 @@ func TestBufferedFetchDropsNonAllowlistedHeaders(t *testing.T) {
 		return &http.Response{
 			StatusCode: 200,
 			Header: http.Header{
-				"Content-Type":     []string{"application/xml"},
-				"Server":           []string{"nginx"},
-				"Set-Cookie":       []string{"s=2"},
-				"X-Powered-By":     []string{"Express"},
-				"Cache-Control":    []string{"no-store"},
+				"Content-Type":  []string{"application/xml"},
+				"Server":        []string{"nginx"},
+				"Set-Cookie":    []string{"s=2"},
+				"X-Powered-By":  []string{"Express"},
+				"Cache-Control": []string{"no-store"},
 			},
 			Body: io.NopCloser(strings.NewReader(`{"id":"x","object":"chat.completion","choices":[{"message":{"content":"hi"}}]}`)),
 		}, nil
