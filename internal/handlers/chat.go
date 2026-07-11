@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/middleware"
@@ -238,6 +239,22 @@ type Deps struct {
 	// probe is wired.
 	BudgetObserver BudgetObserver
 
+	// Limiter is the VRAM-aware concurrency gate (issue #35). When
+	// non-nil the handler acquires a slot before dispatching any
+	// RouteLocal request (and before the local panel member of
+	// RouteFusion); waiters queue-and-wait up to
+	// Config.LocalQueueTimeout, after which the request is
+	// fast-promoted to frontier via SkipLocal and the response
+	// carries X-Nexus-Overflow: true. RouteFrontier is never
+	// gated.
+	//
+	// Optional: a nil Limiter preserves the pre-issue-#35
+	// unbounded behaviour exactly, which is what every existing
+	// unit test relies on. The chat hot path consults Config
+	// alongside the receiver so a misconfigured (max<=0) Limiter
+	// is also treated as disabled.
+	Limiter *concurrencylimit.Limiter
+
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
 	// copy used for sampling is bounded. Zero uses DefaultObservedCap.
@@ -454,6 +471,30 @@ func Chat(d Deps) http.Handler {
 		switch route {
 		case router.RouteFusion:
 			slog.Info("starting fusion panel", slog.String("request_id", reqID))
+
+			// VRAM-aware concurrency gate for the local panel
+			// member (issue #35). Same acquire-or-skip semantics
+			// as RouteLocal above, but we cannot mutate the
+			// outer skipLocal here because the subsequent
+			// Switch-case uses the same variable name to drive
+			// both the cascade SkipLocal and the non-streaming
+			// target. A scoped variable keeps the intent
+			// explicit without changing any other branch.
+			fusionSkipLocal := skipLocal
+			if d.Limiter != nil && d.Config.LocalMaxConcurrent > 0 {
+				if !d.Limiter.Acquire(r.Context(), d.Config.LocalQueueTimeout) {
+					w.Header().Set("X-Nexus-Overflow", "true")
+					slog.Warn("local concurrency limit reached; skipping local panel member",
+						slog.Int("max_concurrent", d.Config.LocalMaxConcurrent),
+						slog.Duration("queue_timeout", d.Config.LocalQueueTimeout),
+						slog.String("request_id", reqID),
+					)
+					fusionSkipLocal = true
+				} else {
+					defer d.Limiter.Release()
+				}
+			}
+
 			upErr = upstream.Panel(
 				obs, d.Client,
 				d.Config.OllamaURL, d.Config.LocalModel,
@@ -461,7 +502,7 @@ func Chat(d Deps) http.Handler {
 				d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
 				body, latestPrompt, d.Config.FusionTimeout,
 				d.Config.ArbiterTimeout,
-				skipLocal,
+				fusionSkipLocal,
 			)
 			if upErr != nil {
 				slog.Error("fusion error",
@@ -475,6 +516,40 @@ func Chat(d Deps) http.Handler {
 		case router.RouteLocal:
 			body["model"] = d.Config.LocalModel
 
+			// VRAM-aware concurrency gate (issue #35). At most
+			// Config.LocalMaxConcurrent RouteLocal requests may
+			// dispatch local Ollama simultaneously; waiters queue
+			// for up to Config.LocalQueueTimeout, after which the
+			// request is fast-promoted to frontier via SkipLocal
+			// and X-Nexus-Overflow: true is stamped on the
+			// response. RouteFrontier is never gated.
+			//
+			// Two conditions must be true for the gate to fire:
+			// both the Limiter receiver is non-nil and the operator
+			// actually configured a positive ceiling. A limiter
+			// built with New(<=0) returns nil and the config check
+			// below also disables — so this entire block is a
+			// no-op under NEXUS_LOCAL_MAX_CONCURRENT=0.
+			if d.Limiter != nil && d.Config.LocalMaxConcurrent > 0 {
+				if !d.Limiter.Acquire(r.Context(), d.Config.LocalQueueTimeout) {
+					w.Header().Set("X-Nexus-Overflow", "true")
+					slog.Warn("local concurrency limit reached; promoting to frontier cascade",
+						slog.Int("max_concurrent", d.Config.LocalMaxConcurrent),
+						slog.Duration("queue_timeout", d.Config.LocalQueueTimeout),
+						slog.String("request_id", reqID),
+					)
+					skipLocal = true
+				} else {
+					// Defer is safe even for the streaming
+					// branch because cas.Run is synchronous
+					// and returns when the response flushes
+					// (or the client disconnects, which still
+					// terminates Run). A panic in Run would
+					// also fire the deferred Release.
+					defer d.Limiter.Release()
+				}
+			}
+
 			// Cascade (issue #14): try local Ollama first, fall back to
 			// configured frontier endpoints (frontier, then z.ai) on
 			// retryable failures. Cascade is rebuilt per request so
@@ -482,10 +557,13 @@ func Chat(d Deps) http.Handler {
 			// process. CascadeConfig.SkipLocal (issue #8) omits the
 			// local step entirely when the health poller reports
 			// Ollama unreachable, so the cascade starts at frontier
-			// without paying the local timeout. Hoisted above the
-			// stream flag (issue #10) so both branches share a single
-			// configured cascade; see below for the non-streaming
-			// degraded override.
+			// without paying the local timeout. The concurrency
+			// overflow path above re-uses the same SkipLocal knob so
+			// we don't have to thread a parallel flag through the
+			// cascade (issue #35). Hoisted above the stream flag
+			// (issue #10) so both branches share a single configured
+			// cascade; see below for the non-streaming degraded
+			// override.
 			cas := upstream.BuildLocalCascade(upstream.CascadeConfig{
 				LocalURL:      d.Config.OllamaURL,
 				LocalModel:    d.Config.LocalModel,
