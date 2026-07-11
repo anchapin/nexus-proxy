@@ -95,6 +95,13 @@ health:
   breaker_threshold: 3
   # Per-probe HTTP timeout. Probes that exceed this count as failures.
   probe_timeout: 5s
+  # Controls /readyz behaviour (issue #42). "degraded" (default)
+  # always returns 200 when the process is alive and surfaces the
+  # real subsystem state via the body's "degraded" field. "strict"
+  # returns 503 when neither Ollama nor a frontier API key can serve
+  # traffic, so the orchestrator stops sending the pod new requests.
+  # Unknown values fall back to "degraded".
+  readiness_mode: degraded
 
 # --- Async LLM-as-a-Judge evaluator (issue #15) -------------------------
 # Disabled when sample_rate is <= 0. Falls back to the frontier URL
