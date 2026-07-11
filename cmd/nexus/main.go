@@ -669,6 +669,7 @@ func buildMetrics(cfg config.Config) (metrics.Store, handlers.MetricsObserver) {
 			TPS:               e.TPS,
 			Streaming:         e.Streaming,
 			Error:             e.Error,
+			TaskType:          e.TaskType,
 		})
 	})
 	return store, obs

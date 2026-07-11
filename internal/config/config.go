@@ -111,6 +111,17 @@ type Config struct {
 	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
 	ArbiterTimeout time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
+	// SLMConfidenceThreshold (issue #44) escalates low-confidence
+	// SLM decisions. When the SLM returns Decision.Confidence below
+	// this value AND the chosen route is local or fusion, the chat
+	// handler promotes the request to frontier so the user gets a
+	// confident answer. Defaults to 0.0 — the "disabled" sentinel —
+	// which short-circuits the comparison and preserves the
+	// pre-issue-#44 behaviour exactly. The threshold only takes
+	// effect on the SLM fall-through branch; guardrail / DSL hits
+	// are deterministic and never trigger escalation.
+	SLMConfidenceThreshold float64 // env NEXUS_SLM_CONFIDENCE_THRESHOLD (0.0 = disabled)
+
 	// VRAM-aware concurrency gate (issue #35). Caps the number of
 	// RouteLocal requests (and the local panel member of
 	// RouteFusion) that may dispatch local Ollama concurrently;
@@ -328,6 +339,7 @@ var configKeys = map[string]string{
 	"routing.fusion_timeout":              "NEXUS_FUSION_TIMEOUT",
 	"routing.cascade_timeout":             "NEXUS_CASCADE_TIMEOUT",
 	"routing.arbiter_timeout":             "NEXUS_ARBITER_TIMEOUT",
+	"routing.slm_confidence_threshold":    "NEXUS_SLM_CONFIDENCE_THRESHOLD",
 	"routing.local_max_concurrent":        "NEXUS_LOCAL_MAX_CONCURRENT",
 	"routing.local_queue_timeout":         "NEXUS_LOCAL_QUEUE_TIMEOUT",
 	"health.poll_interval":                "NEXUS_HEALTH_POLL_INTERVAL",
@@ -507,6 +519,24 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.ArbiterTimeout = arbiterTimeout
+
+	// SLM confidence threshold (issue #44). Clamp into [0, 1]
+	// before storing so a typo (negative / overshoot) cannot
+	// produce a nonsense escalation rule. Zero is the documented
+	// "disabled" sentinel — the handler treats threshold<=0 as a
+	// complete no-op so the pre-issue-#44 behaviour survives
+	// untouched for operators who never set the env var.
+	slmThreshold, err := resolveFloat("NEXUS_SLM_CONFIDENCE_THRESHOLD", fileMap, 0)
+	if err != nil {
+		return cfg, err
+	}
+	if slmThreshold < 0 {
+		slmThreshold = 0
+	}
+	if slmThreshold > 1 {
+		slmThreshold = 1
+	}
+	cfg.SLMConfidenceThreshold = slmThreshold
 
 	// VRAM-aware concurrency gate (issue #35). The chat handler
 	// holds a slot for the lifetime of any RouteLocal request

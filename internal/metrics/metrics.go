@@ -63,6 +63,11 @@ const recordRequestErrorTimeout = 5 * time.Second
 //     was injected (filename is empty when RAG missed).
 //   - EstimatedCostUSD — frontier ($/1k token) * input tokens for
 //     rough cost accounting. Zero for local-route requests.
+//   - TaskType (issue #44) — the SLM-reported prompt category
+//     ("code_generation", "debugging", ...). Empty for
+//     guardrail / DSL hits (deterministic path, no SLM consult)
+//     so a non-SLM dispatch is indistinguishable from "unknown"
+//     without an extra migration.
 //
 // Telemetry-mirrored fields (OutputTokens, TTFTMs, TotalLatencyMs, TPS,
 // Streaming, Error) carry the same shape as telemetry.Record so the
@@ -84,6 +89,10 @@ type Request struct {
 	TPS            float64
 	Streaming      bool
 	Error          string
+
+	// TaskType (issue #44) is the SLM's self-reported category.
+	// Empty when the SLM was not consulted (guardrail / DSL hits).
+	TaskType string
 }
 
 // Summary is the per-day roll-up returned by Store.DailySummary.

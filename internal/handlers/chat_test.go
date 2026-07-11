@@ -1880,3 +1880,386 @@ func TestBudgetObserverFuncNilClosures(t *testing.T) {
 		t.Errorf("Source with nil closure must return \"static\", got %q", got)
 	}
 }
+
+// --- issue #44: confidence-aware SLM routing + task_type ----------------
+
+// recordingMetricsObserver is a MetricsObserver test double that
+// appends every event to a slice. Safe for concurrent use; the chat
+// handler invokes Submit from the request goroutine so the lock
+// mostly guards against future test races.
+type recordingMetricsObserver struct {
+	mu   sync.Mutex
+	seen []MetricsEvent
+}
+
+func (r *recordingMetricsObserver) Submit(e MetricsEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen = append(r.seen, e)
+}
+
+func (r *recordingMetricsObserver) Snapshot() []MetricsEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]MetricsEvent, len(r.seen))
+	copy(out, r.seen)
+	return out
+}
+
+// slmResponseURL is the Ollama endpoint the SLM client posts to (no
+// trailing path under test wiring). Tests replay deterministic JSON
+// there to simulate the routing SLM's reply.
+const slmResponseURL = "http://ollama.local/api/chat"
+
+// TestChatSLMConfidenceEscalatesLocalToFrontier pins down the
+// confidence-aware escalation rule (issue #44): an SLM choosing
+// route=local with confidence below the configured threshold must
+// be promoted to frontier so the harness receives a confident
+// answer. Without this gate, a low-confidence local answer would
+// be served even though the model itself signalled uncertainty.
+func TestChatSLMConfidenceEscalatesLocalToFrontier(t *testing.T) {
+	deps, rt := baseDeps(t)
+	deps.Config.SLMConfidenceThreshold = 0.6
+	// SLM returns route=local with confidence=0.4 (below threshold).
+	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"message":{"content":"{\"route\":\"local\",\"confidence\":0.4,\"task_type\":\"refactoring\"}"}}`)
+	})
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("frontier stream"))
+	})
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("local Ollama URL must not be hit when SLM escalates local -> frontier")
+	})
+
+	body := `{"messages":[{"role":"user","content":"refactor this complex module"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if len(rt.Calls()) != 2 { // SLM call + escalated frontier call
+		t.Fatalf("calls = %+v, want 2 (SLM + frontier)", rt.Calls())
+	}
+	if rt.Calls()[1].URL != "http://frontier.local" {
+		t.Errorf("routed to %s, want frontier (low-confidence local must escalate)", rt.Calls()[1].URL)
+	}
+	if !strings.Contains(rw.Body.String(), "frontier stream") {
+		t.Errorf("body = %q, want frontier stream", rw.Body.String())
+	}
+}
+
+// TestChatSLMConfidenceEscalatesFusionToFrontier mirrors the
+// route=fusion half of the gate (issue #44). Fusion is the second
+// escalation target — a low-confidence "this needs extreme
+// architectural deliberation" answer is also bounced to frontier
+// when the model itself rated it as uncertain.
+//
+// The prompt deliberately avoids both DSL triggers ("architectural
+// design" / "system architecture" sentence matches AND the
+// formatting regex keywords) so the SLM branch is the one under
+// test. Letting the SLM emit route=fusion lets us assert that the
+// gate fires on the fusion half of the decision space too.
+func TestChatSLMConfidenceEscalatesFusionToFrontier(t *testing.T) {
+	deps, rt := baseDeps(t)
+	deps.Config.SLMConfidenceThreshold = 0.7
+	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"message":{"content":"{\"route\":\"fusion\",\"confidence\":0.5,\"task_type\":\"architecture\"}"}}`)
+	})
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("frontier stream"))
+	})
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("local Ollama URL must not be hit when SLM escalates fusion -> frontier")
+	})
+
+	body := `{"messages":[{"role":"user","content":"design the new tracing subsystem"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	// Order: SLM call (api/chat) -> escalated frontier call.
+	var sawFrontier bool
+	for _, c := range rt.Calls() {
+		if c.URL == "http://frontier.local" {
+			sawFrontier = true
+		}
+	}
+	if !sawFrontier {
+		t.Fatalf("calls = %+v, want frontier URL somewhere (low-confidence fusion must escalate)", rt.Calls())
+	}
+}
+
+// TestChatSLMThresholdZeroNeverEscalates locks down the
+// backward-compat contract (issue #44 AC: "Threshold=0 default
+// behavior identical to today"). Even with a low-confidence SLM
+// answer, the request must keep its chosen route when the
+// threshold is the disabled sentinel.
+func TestChatSLMThresholdZeroNeverEscalates(t *testing.T) {
+	deps, rt := baseDeps(t)
+	deps.Config.SLMConfidenceThreshold = 0 // disabled
+	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"message":{"content":"{\"route\":\"local\",\"confidence\":0.0,\"task_type\":\"debugging\"}"}}`)
+	})
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
+	})
+	rt.On("POST", "http://frontier.local", func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("frontier must NOT be called when threshold is 0")
+	})
+
+	body := `{"messages":[{"role":"user","content":"fix the worker pool deadlock"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if len(rt.Calls()) != 2 { // SLM + local upstream
+		t.Fatalf("calls = %+v, want 2", rt.Calls())
+	}
+	if rt.Calls()[1].URL != "http://ollama.local/v1/chat/completions" {
+		t.Errorf("routed to %s, want local (threshold=0 must be a no-op)", rt.Calls()[1].URL)
+	}
+}
+
+// TestChatSLMConfidenceAtThresholdKeepsRoute verifies the
+// comparison is strictly "<" (not "<="). An SLM returning exactly
+// the threshold confidence must NOT escalate — the operator chose
+// the value as a boundary, and over-escalating wastes frontier
+// budget on borderline-confidence requests.
+func TestChatSLMConfidenceAtThresholdKeepsRoute(t *testing.T) {
+	deps, rt := baseDeps(t)
+	deps.Config.SLMConfidenceThreshold = 0.7
+	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
+		// confidence == threshold should NOT trigger.
+		_, _ = io.WriteString(w, `{"message":{"content":"{\"route\":\"local\",\"confidence\":0.7,\"task_type\":\"refactoring\"}"}}`)
+	})
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
+	})
+	rt.On("POST", "http://frontier.local", func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("frontier must NOT be called when confidence equals threshold")
+	})
+
+	body := `{"messages":[{"role":"user","content":"add retry handling to the queue worker"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if len(rt.Calls()) < 2 {
+		t.Fatalf("calls = %+v, want SLM + local upstream", rt.Calls())
+	}
+	if rt.Calls()[1].URL != "http://ollama.local/v1/chat/completions" {
+		t.Errorf("routed to %s, want local (confidence equals threshold -> no escalation)", rt.Calls()[1].URL)
+	}
+}
+
+// TestChatSLMFallbackFrontierIsNeverEscalated verifies the other
+// side of the rule: an SLM that chose frontier directly is left
+// alone even if its confidence is below threshold. Frontier IS the
+// confident answer; promoting it elsewhere would be a regression.
+func TestChatSLMFallbackFrontierIsNeverEscalated(t *testing.T) {
+	deps, rt := baseDeps(t)
+	deps.Config.SLMConfidenceThreshold = 0.8
+	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"message":{"content":"{\"route\":\"frontier\",\"confidence\":0.2,\"task_type\":\"review\"}"}}`)
+	})
+	rt.On("POST", "http://frontier.local", func(_ http.ResponseWriter, _ *http.Request) {
+		// already frontier; no further escalation target exists.
+	})
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("local must NOT be called when SLM chose frontier directly")
+	})
+
+	body := `{"messages":[{"role":"user","content":"review this pull request"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rt.Calls()[1].URL != "http://frontier.local" {
+		t.Errorf("routed to %s, want frontier (frontier is never escalated)", rt.Calls()[1].URL)
+	}
+}
+
+// TestChatSLMLogIncludesTaskType pins down the slog contract (issue
+// #44 AC): the "slm decision" line carries `task_type` so operators
+// can confirm the field round-trips end-to-end without scraping
+// metrics. Confidence is also a required attribute for parity with
+// task_type and to make future cost dashboards trivial.
+func TestChatSLMLogIncludesTaskType(t *testing.T) {
+	deps, rt := baseDeps(t)
+	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"message":{"content":"{\"route\":\"local\",\"confidence\":0.8,\"task_type\":\"debugging\"}"}}`)
+	})
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
+	})
+
+	body := `{"messages":[{"role":"user","content":"fix the worker pool deadlock"}]}`
+	output := captureSlog(t, func() {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		rw := httptest.NewRecorder()
+		Chat(deps).ServeHTTP(rw, req)
+	})
+
+	var found bool
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+		if rec["msg"] != "slm decision" {
+			continue
+		}
+		if task, _ := rec["task_type"].(string); task == "debugging" {
+			if conf, _ := rec["confidence"].(float64); conf == 0.8 {
+				if route, _ := rec["route"].(string); route == "local" {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no slm decision line with task_type=debugging confidence=0.8 route=local in:\n%s", output)
+	}
+}
+
+// TestChatSLMEscalationLogShape pins down the warning line emitted
+// when a low-confidence SLM decision is escalated (issue #44 AC).
+// Operators tailing logs need to see `from_route`, `to_route`,
+// `confidence`, `threshold`, and `task_type` to confirm the gate is
+// firing as configured.
+func TestChatSLMEscalationLogShape(t *testing.T) {
+	deps, rt := baseDeps(t)
+	deps.Config.SLMConfidenceThreshold = 0.6
+	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"message":{"content":"{\"route\":\"local\",\"confidence\":0.3,\"task_type\":\"code_generation\"}"}}`)
+	})
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("frontier stream"))
+	})
+
+	body := `{"messages":[{"role":"user","content":"refactor this complex module"}]}`
+	output := captureSlog(t, func() {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		rw := httptest.NewRecorder()
+		Chat(deps).ServeHTTP(rw, req)
+	})
+
+	var found bool
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+		if rec["msg"] != "slm low-confidence escalation" {
+			continue
+		}
+		if from, _ := rec["from_route"].(string); from != "local" {
+			continue
+		}
+		if to, _ := rec["to_route"].(string); to != "frontier" {
+			continue
+		}
+		if conf, _ := rec["confidence"].(float64); conf != 0.3 {
+			continue
+		}
+		if threshold, _ := rec["threshold"].(float64); threshold != 0.6 {
+			continue
+		}
+		if task, _ := rec["task_type"].(string); task != "code_generation" {
+			continue
+		}
+		found = true
+	}
+	if !found {
+		t.Fatalf("no slm low-confidence escalation line matching fields in:\n%s", output)
+	}
+}
+
+// TestChatSLMMetricsEventIncludesTaskType confirms the metrics
+// event the handler forwards to the dashboard carries the SLM's
+// task_type (issue #44 AC). The SQLite column defaults to "" so a
+// mismatch here would surface as a "schema accepts NULL but
+// handler doesn't send it" regression — easy to miss until a
+// dashboard query joins on task_type.
+func TestChatSLMMetricsEventIncludesTaskType(t *testing.T) {
+	deps, rt := baseDeps(t)
+	obs := &recordingMetricsObserver{}
+	deps.MetricsObserver = obs
+	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"message":{"content":"{\"route\":\"local\",\"confidence\":0.85,\"task_type\":\"refactoring\"}"}}`)
+	})
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
+	})
+
+	body := `{"messages":[{"role":"user","content":"refactor the queue worker module"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if len(obs.Snapshot()) != 1 {
+		t.Fatalf("expected 1 metrics event, got %d", len(obs.Snapshot()))
+	}
+	ev := obs.Snapshot()[0]
+	if ev.TaskType != "refactoring" {
+		t.Errorf("MetricsEvent.TaskType = %q, want \"refactoring\"", ev.TaskType)
+	}
+	if ev.Route != "local" {
+		t.Errorf("MetricsEvent.Route = %q, want \"local\"", ev.Route)
+	}
+}
+
+// TestChatDSLHitLeavesTaskTypeEmpty confirms guardrail / DSL hits
+// leave slmTaskType at its zero value. The metrics row the
+// handler emits must record task_type="" so a non-SLM dispatch is
+// distinguishable from "SLM said unknown" by inspecting the
+// upstream path (or, more cheaply, by joining on `route=local with
+// `task_type!="" as an SLM-confident row filter).
+func TestChatDSLHitLeavesTaskTypeEmpty(t *testing.T) {
+	deps, rt := baseDeps(t)
+	obs := &recordingMetricsObserver{}
+	deps.MetricsObserver = obs
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"css fix"},"finish_reason":"stop"}]}`)
+	})
+
+	// DSL "css" keyword forces route=local before the SLM is
+	// consulted, so task_type must stay "".
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if len(obs.Snapshot()) != 1 {
+		t.Fatalf("expected 1 metrics event, got %d", len(obs.Snapshot()))
+	}
+	if ev := obs.Snapshot()[0]; ev.TaskType != "" {
+		t.Errorf("MetricsEvent.TaskType = %q, want \"\" (DSL hit bypasses SLM)", ev.TaskType)
+	}
+}
+
+// TestChatSLMErrorFallbackKeepsUnknownTaskType confirms the SLM
+// error path still populates task_type with the documented
+// "unknown" sentinel so a downstream dashboard can flag these
+// rows distinctly from "DSL / guardrail hit" rows.
+func TestChatSLMErrorFallbackKeepsUnknownTaskType(t *testing.T) {
+	deps, rt := baseDeps(t)
+	obs := &recordingMetricsObserver{}
+	deps.MetricsObserver = obs
+	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("frontier fallback"))
+	})
+
+	body := `{"messages":[{"role":"user","content":"refactor this complex module"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if len(obs.Snapshot()) != 1 {
+		t.Fatalf("expected 1 metrics event, got %d", len(obs.Snapshot()))
+	}
+	if ev := obs.Snapshot()[0]; ev.TaskType != router.TaskTypeUnknown {
+		t.Errorf("MetricsEvent.TaskType = %q, want %q (SLM error fallback)", ev.TaskType, router.TaskTypeUnknown)
+	}
+}

@@ -94,6 +94,12 @@ func (f QualityObserverFunc) Submit(e QualityEvent) { f(e) }
 // one of these after every proxied request (success, failure, or
 // short-circuit) and dispatches it to the configured MetricsObserver.
 //
+// TaskType (issue #44) carries the SLM's self-reported category
+// (e.g. "debugging", "refactoring"). Empty when the SLM was not
+// consulted (guardrail / DSL hits take the deterministic path and
+// have no task-type signal); the SQLite schema defaults the column
+// to "" so this stays a no-op for non-SLM dispatches.
+//
 // Mirrors internal/metrics.Request so a tiny adapter in main.go can
 // forward directly without translation — kept here as a separate
 // type so the handlers package stays free of the metrics import.
@@ -114,6 +120,13 @@ type MetricsEvent struct {
 	TPS            float64
 	Streaming      bool
 	Error          string
+
+	// TaskType is the SLM-reported prompt category (issue #44).
+	// Empty when the SLM was not consulted or when the legacy SLM
+	// shape did not include the field. Populated verbatim from the
+	// Decision — see router.TaskTypeUnknown for the "no opinion"
+	// sentinel the parser uses when the field is absent.
+	TaskType string
 }
 
 // MetricsObserver is the hook the chat handler invokes once per
@@ -493,6 +506,14 @@ func Chat(d Deps) http.Handler {
 		}
 
 		var route router.Route
+		// slmTaskType is populated only on the SLM branch below
+		// and forwarded into the MetricsEvent the handler emits
+		// after the upstream response flushes (issue #44). It
+		// stays "" for guardrail / DSL hits — the schema defaults
+		// the SQLite column to "" so non-SLM dispatches are
+		// indistinguishable from "no opinion" without an
+		// extra migration.
+		var slmTaskType string
 		// VRAM-aware guardrail (issue #6). When the
 		// BudgetObserver is wired and reports a positive budget,
 		// the dynamic measurement wins; otherwise we fall back to
@@ -542,22 +563,60 @@ func Chat(d Deps) http.Handler {
 			}
 		} else {
 			slog.Debug("dsl bypassed, asking slm", slog.String("request_id", reqID))
-			dec, err := d.SLM.Decide(r.Context(), latestPrompt)
+			decision, err := d.SLM.DecideRich(r.Context(), latestPrompt)
 			if err != nil {
 				slog.Error("slm error, defaulting to frontier",
 					slog.Any("err", err),
 					slog.String("request_id", reqID),
 				)
-				dec = router.RouteFrontier
+				// Reset the decision to the documented safety
+				// net: frontier + "unknown" task_type. Preserve
+				// any zeroed confidence so the escalation gate
+				// below still has a value to compare against
+				// (will not fire because RouteFrontier is not
+				// local / fusion).
+				decision = router.Decision{Route: router.RouteFrontier, TaskType: router.TaskTypeUnknown}
 			}
+
+			// Confidence-aware escalation (issue #44). When the
+			// SLM's confidence is below the operator-configured
+			// threshold and the chosen route is local or fusion
+			// (cheap but riskier than frontier), promote to
+			// frontier so the user gets a confident answer.
+			// Threshold == 0 (the default) is a complete no-op
+			// — preserves the pre-issue-#44 behaviour exactly.
+			// The threshold only takes effect on the SLM
+			// fall-through branch; guardrail / DSL hits pass
+			// through untouched because those decisions are
+			// deterministic, not probabilistic.
+			selectedRoute := decision.Route
+			threshold := d.Config.SLMConfidenceThreshold
+			if threshold > 0 && decision.Confidence < threshold &&
+				(selectedRoute == router.RouteLocal || selectedRoute == router.RouteFusion) {
+				slog.Warn("slm low-confidence escalation",
+					slog.String("from_route", string(selectedRoute)),
+					slog.String("to_route", string(router.RouteFrontier)),
+					slog.Float64("confidence", decision.Confidence),
+					slog.Float64("threshold", threshold),
+					slog.String("task_type", decision.TaskType),
+					slog.String("request_id", reqID),
+				)
+				selectedRoute = router.RouteFrontier
+			}
+
 			slog.Info("slm decision",
-				slog.String("route", string(dec)),
+				slog.String("route", string(selectedRoute)),
+				slog.Float64("confidence", decision.Confidence),
+				slog.String("task_type", decision.TaskType),
 				slog.String("request_id", reqID),
 			)
-			route = dec
+			route = selectedRoute
+			slmTaskType = decision.TaskType
 			if d.Tracer != nil {
 				_, rs := d.Tracer.StartSpan(rootCtx, "route.slm")
 				rs.SetAttr("decision", string(route))
+				rs.SetAttr("confidence", decision.Confidence)
+				rs.SetAttr("task_type", decision.TaskType)
 				if err != nil {
 					rs.RecordError(err)
 				}
@@ -1017,7 +1076,7 @@ func Chat(d Deps) http.Handler {
 			tps := telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 			d.MetricsObserver.Submit(MetricsEvent{
 				Timestamp:         rec.Timestamp,
-				RequestID:         reqID,
+				RequestID:         rec.RequestID,
 				Route:             string(route),
 				Model:             model,
 				InputTokens:       rec.InputTokens,
@@ -1031,6 +1090,7 @@ func Chat(d Deps) http.Handler {
 				TPS:               tps,
 				Streaming:         streaming,
 				Error:             rec.Error,
+				TaskType:          slmTaskType,
 			})
 		} else {
 			d.Recorder.Record(rec)

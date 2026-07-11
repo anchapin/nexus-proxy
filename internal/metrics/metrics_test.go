@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"sort"
@@ -494,6 +495,92 @@ FROM requests WHERE request_id = ?`, in.RequestID)
 	// exact since we asked modernc to use its default text format.
 	if !gotTS.Equal(in.Timestamp.UTC()) {
 		t.Errorf("timestamp = %v, want %v", gotTS, in.Timestamp.UTC())
+	}
+}
+
+// TestTaskTypeColumnAddedIdempotently (issue #44) is the
+// backward-compatibility guard for the additive task_type
+// migration. The boot path probes PRAGMA table_info and runs the
+// ALTER only when the column is missing, but that probe path was
+// trivial enough that a typo in the column name would silently
+// produce a re-apply on every Open (which SQLite would still
+// tolerate because ALTER ADD COLUMN fails loudly on a duplicate,
+// but the noise in logs would mask other regressions).
+//
+// We assert three things:
+//
+//   - A row written before the migration lands with task_type=""
+//     so legacy data remains queryable.
+//   - A row written through the new path carries the explicit
+//     task_type verbatim.
+//   - Opening the same DB file again does not blow up: the
+//     idempotent migration probe sees the column and skips the
+//     ALTER.
+func TestTaskTypeColumnAddedIdempotently(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "metrics.db")
+	open := func() *SQLiteStore {
+		s, err := OpenWithLogger(path, silentLogger)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		return s.(*SQLiteStore)
+	}
+
+	// First open: adds task_type via the migration probe.
+	s := open()
+	if err := s.RecordRequest(Request{
+		Timestamp: time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC),
+		RequestID: "legacy",
+		Route:     "local",
+		Model:     "m",
+	}); err != nil {
+		t.Fatalf("RecordRequest legacy: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	// Second open: probe finds the column, ALTER is skipped.
+	s = open()
+	if err := s.RecordRequest(Request{
+		Timestamp: time.Date(2026, 7, 11, 12, 0, 1, 0, time.UTC),
+		RequestID: "enriched",
+		Route:     "frontier",
+		Model:     "m2",
+		TaskType:  "debugging",
+	}); err != nil {
+		t.Fatalf("RecordRequest enriched: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+
+	// Third open: read both rows back, verify task_type values.
+	s = open()
+	defer s.Close()
+
+	rows, err := s.db.QueryContext(context.Background(),
+		`SELECT request_id, task_type FROM requests ORDER BY timestamp ASC`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+	got := map[string]string{}
+	for rows.Next() {
+		var rid, tt string
+		if err := rows.Scan(&rid, &tt); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got[rid] = tt
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if v := got["legacy"]; v != "" {
+		t.Errorf("legacy row task_type = %q, want \"\" (migration default)", v)
+	}
+	if v := got["enriched"]; v != "debugging" {
+		t.Errorf("enriched row task_type = %q, want \"debugging\"", v)
 	}
 }
 
