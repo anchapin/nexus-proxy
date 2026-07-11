@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/handlers"
 	"github.com/anchapin/nexus-proxy/internal/health"
@@ -147,6 +148,31 @@ func main() {
 		)
 	} else {
 		slog.Info("vram probe polling disabled (NEXUS_PROBE_INTERVAL=0); boot snapshot only")
+	}
+
+	// VRAM-aware local-route concurrency ceiling (issue #81). The
+	// limiter is dormant unless the operator set
+	// NEXUS_LOCAL_MAX_CONCURRENT above zero, so a stock deployment is
+	// byte-for-byte identical to the pre-#81 unlimited path. When
+	// enabled, the effective slot count is recomputed from the latest
+	// probe snapshot on every Acquire: min(ceiling, freeVRAM/
+	// bytesPerSlot). When the probe is unavailable (still booting,
+	// disabled, or every signal missing) the full ceiling is used so a
+	// missing probe never opens the floodgates. The closure reads
+	// probeMgr directly so the limiter never imports internal/probe.
+	var localLimiter handlers.LocalLimiter
+	if cfg.LocalMaxConcurrent > 0 {
+		localLimiter = concurrencylimit.New(
+			cfg.LocalMaxConcurrent,
+			cfg.LocalVRAMBytesPerSlot,
+			func() int64 { return probeMgr.Get().FreeVRAMBytes },
+		)
+		slog.Info("local-route concurrency limiter enabled",
+			slog.Int("ceiling", cfg.LocalMaxConcurrent),
+			slog.Int64("bytes_per_slot", cfg.LocalVRAMBytesPerSlot),
+		)
+	} else {
+		slog.Info("local-route concurrency limiter disabled (NEXUS_LOCAL_MAX_CONCURRENT<=0)")
 	}
 
 	// Async LLM-as-a-judge evaluator (issue #15). The handler never
@@ -378,6 +404,7 @@ func main() {
 		Recorder:        recorder,
 		Health:          hpoller,
 		BudgetObserver:  budgetObserver(probeMgr),
+		LocalLimiter:    localLimiter,
 	}))
 
 	// /healthz returns a small JSON document so operators can see

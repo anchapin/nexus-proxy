@@ -40,6 +40,15 @@ func TestLoadDefaults(t *testing.T) {
 	if !cfg.ProbeEnabled {
 		t.Error("ProbeEnabled = false, want true with default interval")
 	}
+	// Local-route concurrency limiter defaults (issue #81): the
+	// limiter is dormant unless the operator opts in, and the per-slot
+	// VRAM reservation defaults to 2 GiB.
+	if cfg.LocalMaxConcurrent != 0 {
+		t.Errorf("LocalMaxConcurrent = %d, want 0 (disabled by default)", cfg.LocalMaxConcurrent)
+	}
+	if cfg.LocalVRAMBytesPerSlot != DefaultLocalVRAMBytesPerSlot {
+		t.Errorf("LocalVRAMBytesPerSlot = %d, want default %d", cfg.LocalVRAMBytesPerSlot, DefaultLocalVRAMBytesPerSlot)
+	}
 	if cfg.RAGThreshold != 0.55 {
 		t.Errorf("RAGThreshold = %v, want 0.55", cfg.RAGThreshold)
 	}
@@ -311,5 +320,57 @@ func TestLoadJudgeOverrides(t *testing.T) {
 	}
 	if !cfg.JudgeEnabled {
 		t.Error("JudgeEnabled = false, want true")
+	}
+}
+
+func TestLoadLocalConcurrencyOverrides(t *testing.T) {
+	t.Setenv("NEXUS_LOCAL_MAX_CONCURRENT", "6")
+	t.Setenv("NEXUS_LOCAL_VRAM_BYTES_PER_SLOT", "1073741824") // 1 GiB
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.LocalMaxConcurrent != 6 {
+		t.Errorf("LocalMaxConcurrent = %d, want 6", cfg.LocalMaxConcurrent)
+	}
+	if cfg.LocalVRAMBytesPerSlot != 1073741824 {
+		t.Errorf("LocalVRAMBytesPerSlot = %d, want 1073741824", cfg.LocalVRAMBytesPerSlot)
+	}
+}
+
+func TestLoadLocalConcurrencyNegativeClamped(t *testing.T) {
+	// Negative ceiling is clamped to 0 (disabled); negative slot bytes
+	// fall back to the default rather than producing a nonsensical
+	// shrink divisor.
+	t.Setenv("NEXUS_LOCAL_MAX_CONCURRENT", "-3")
+	t.Setenv("NEXUS_LOCAL_VRAM_BYTES_PER_SLOT", "-512")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.LocalMaxConcurrent != 0 {
+		t.Errorf("LocalMaxConcurrent = %d, want 0 (clamped)", cfg.LocalMaxConcurrent)
+	}
+	if cfg.LocalVRAMBytesPerSlot != DefaultLocalVRAMBytesPerSlot {
+		t.Errorf("LocalVRAMBytesPerSlot = %d, want default %d", cfg.LocalVRAMBytesPerSlot, DefaultLocalVRAMBytesPerSlot)
+	}
+}
+
+func TestLoadLocalConcurrencyInvalidValues(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+		val  string
+	}{
+		{"bad max concurrent", "NEXUS_LOCAL_MAX_CONCURRENT", "many"},
+		{"bad bytes per slot", "NEXUS_LOCAL_VRAM_BYTES_PER_SLOT", "lots"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.key, tc.val)
+			if _, err := Load(); err == nil {
+				t.Errorf("expected error for %s=%s", tc.key, tc.val)
+			}
+		})
 	}
 }

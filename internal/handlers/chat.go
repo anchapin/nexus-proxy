@@ -4,6 +4,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -180,6 +181,26 @@ func (b BudgetObserverFunc) BudgetSource() string {
 	return b.Source()
 }
 
+// LocalLimiter bounds the number of concurrent local-route requests
+// the proxy issues against the local Ollama instance (issue #81).
+// Acquire blocks until a slot is available or ctx is cancelled; on
+// success it returns a release function the caller MUST invoke exactly
+// once when the local upstream work is done. On cancellation it returns
+// a non-nil error and a nil release so the caller skips the dispatch.
+//
+// Implementations must be safe for concurrent use by many goroutines
+// (the chat handler is itself concurrent). The concrete implementation
+// lives in internal/concurrencylimit; main.go wires it so the handlers
+// package never imports that package (same dependency direction as the
+// judge / quality / probe observers).
+//
+// A nil LocalLimiter means "no limit" — the pre-#81 unlimited behaviour
+// — so unit tests and deployments that leave NEXUS_LOCAL_MAX_CONCURRENT
+// unset are byte-for-byte identical.
+type LocalLimiter interface {
+	Acquire(ctx context.Context) (release func(), err error)
+}
+
 // Deps bundles the collaborators the chat handler needs. Wiring them
 // explicitly makes the handler trivial to unit-test with stubs.
 type Deps struct {
@@ -255,6 +276,18 @@ type Deps struct {
 	// handler behaves identically to before issue #6 when no
 	// probe is wired.
 	BudgetObserver BudgetObserver
+
+	// LocalLimiter bounds concurrent local-route requests (issue
+	// #81). When non-nil the handler Acquires a slot before issuing
+	// the local upstream dispatch and Releases it once the dispatch
+	// returns. The effective slot count is min(ceiling, freeVRAM/
+	// bytesPerSlot) recomputed from the latest probe snapshot on
+	// every Acquire, so a thermal-throttle or model-swap event that
+	// drops free VRAM throttles the next request automatically. Nil
+	// means "no limit" (pre-#81 unlimited behaviour); the field is
+	// left nil by Chat() when the operator did not set
+	// NEXUS_LOCAL_MAX_CONCURRENT so the hot path is unchanged.
+	LocalLimiter LocalLimiter
 
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
@@ -636,6 +669,34 @@ func Chat(d Deps) http.Handler {
 			model = d.Config.FrontierModel
 
 		case router.RouteLocal:
+			// VRAM-aware concurrency ceiling (issue #81). Bound the
+			// number of in-flight local-route requests so a small GPU
+			// does not OOM under bursty load. The limiter is optional;
+			// nil means "no limit" (pre-#81 unlimited behaviour). On
+			// acquire failure (ctx cancelled while queued) we surface a
+			// 503 and skip the dispatch — the telemetry Record below
+			// still fires so the rejected request is visible. A
+			// successful acquire registers a deferred release so the
+			// slot is freed once the local dispatch (streaming or
+			// buffered) has fully drained.
+			if d.LocalLimiter != nil {
+				release, lerr := d.LocalLimiter.Acquire(r.Context())
+				if lerr != nil {
+					slog.Warn("local concurrency acquire rejected",
+						slog.Any("err", lerr),
+						slog.String("request_id", reqID),
+					)
+					model = d.Config.LocalModel
+					upErr = lerr
+					trace.Upstream.Route = string(route)
+					trace.Upstream.Streaming = streaming
+					trace.Upstream.Model = model
+					trace.Upstream.TargetHost = HostOfURL(d.Config.OllamaURL)
+					http.Error(w, "Local route busy", http.StatusServiceUnavailable)
+					break
+				}
+				defer release()
+			}
 			body["model"] = d.Config.LocalModel
 
 			// Cascade (issue #14): try local Ollama first, fall back to
