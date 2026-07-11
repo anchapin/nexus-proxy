@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS requests (
     rag_injected INTEGER NOT NULL DEFAULT 0,
     rag_filename TEXT NOT NULL DEFAULT '',
     estimated_cost_usd REAL NOT NULL DEFAULT 0,
+    baseline_cost_usd REAL NOT NULL DEFAULT 0,
+    savings_usd REAL NOT NULL DEFAULT 0,
     ttft_ms INTEGER NOT NULL DEFAULT 0,
     total_latency_ms INTEGER NOT NULL DEFAULT 0,
     tps REAL NOT NULL DEFAULT 0,
@@ -98,6 +100,19 @@ func migrateRouteSourceColumns(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// schemaMigrations holds additive ALTER TABLE statements that bring a
+// pre-existing database up to the current schema version. Each statement
+// is safe to re-run: the "duplicate column name" error is suppressed so
+// a fresh database (already created with the full schema) is unaffected.
+//
+// Schema additions must remain additive-only (new columns, never drop /
+// rename) so existing rows keep their values and the INSERT positional
+// bind list can simply append the new column at the end.
+var schemaMigrations = []string{
+	`ALTER TABLE requests ADD COLUMN baseline_cost_usd REAL NOT NULL DEFAULT 0`,
+	`ALTER TABLE requests ADD COLUMN savings_usd REAL NOT NULL DEFAULT 0`,
+}
+
 // insertSQL is the prepared statement for RecordRequest. Kept as a
 // package const so the goroutine can reuse the same SQL string after
 // statement caching.
@@ -105,9 +120,10 @@ const insertSQL = `INSERT INTO requests
     (timestamp, request_id, route, model,
      input_tokens, output_tokens, toon_savings_tokens,
      rag_injected, rag_filename, estimated_cost_usd,
+     baseline_cost_usd, savings_usd,
      ttft_ms, total_latency_ms, tps, streaming, fusion_arbiter_skipped, error,
      route_source, route_reason, slm_confidence, slm_task_type)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // SQLiteStore is the production Store implementation (issue #4).
 // Writes are funnelled through a buffered channel and a single
@@ -157,6 +173,10 @@ func newSQLiteStore(path string, lg Logger) (*SQLiteStore, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("metrics: create schema: %w", err)
 	}
+	if err := migrateSchema(ctx_bg(), db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("metrics: migrate schema: %w", err)
+	}
 
 	// Issue #74: bring existing databases up to the route-source
 	// schema. Fresh databases already have the columns (from
@@ -177,6 +197,32 @@ func newSQLiteStore(path string, lg Logger) (*SQLiteStore, error) {
 	s.wg.Add(1)
 	go s.drain()
 	return s, nil
+}
+
+// ctx_bg returns a fresh background context for one-off migration
+// calls. Kept as a tiny helper so the migration code reads cleanly
+// without inlining context.WithTimeout boilerplate.
+func ctx_bg() context.Context {
+	return context.Background()
+}
+
+// migrateSchema runs every additive ALTER TABLE in schemaMigrations.
+// Each statement is attempted unconditionally; the "duplicate column
+// name" error (SQLite returns this when the column already exists) is
+// suppressed so the migration is idempotent on both fresh databases
+// (columns already present from CREATE TABLE) and databases upgraded
+// from a prior schema version.
+func migrateSchema(ctx context.Context, db *sql.DB) error {
+	for _, ddl := range schemaMigrations {
+		_, err := db.ExecContext(ctx, ddl)
+		if err != nil {
+			if strings.Contains(err.Error(), "duplicate column name") {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 // buildDSN maps a plain path or ":memory:" into the URI form modernc
@@ -280,6 +326,7 @@ func (s *SQLiteStore) writeOne(req Request) {
 		ts.UTC(), req.RequestID, route, model,
 		req.InputTokens, req.OutputTokens, req.TOONSavingsTokens,
 		ragInjected, req.RAGFilename, req.EstimatedCostUSD,
+		req.BaselineCostUSD, req.SavingsUSD,
 		req.TTFTMs, req.TotalLatencyMs, req.TPS, streaming,
 		fusionArbiterSkipped, req.Error,
 		req.RouteSource, req.RouteReason, req.SLMConfidence, req.SLMTaskType,
@@ -308,6 +355,8 @@ SELECT
     COALESCE(SUM(toon_savings_tokens), 0),
     COALESCE(SUM(CASE WHEN rag_injected = 1 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(estimated_cost_usd), 0),
+    COALESCE(SUM(baseline_cost_usd), 0),
+    COALESCE(SUM(savings_usd), 0),
     COALESCE(SUM(total_latency_ms), 0),
     COALESCE(SUM(CASE WHEN error != '' THEN 1 ELSE 0 END), 0)
 FROM requests
@@ -328,6 +377,8 @@ WHERE timestamp >= ? AND timestamp < ?`
 		&sum.TOONSavingsTokens,
 		&sum.RAGInjectedCount,
 		&sum.EstimatedCostTotal,
+		&sum.BaselineCostTotal,
+		&sum.SavingsTotal,
 		&sum.TotalLatencyMsSum,
 		&sum.ErrorCount,
 	); err != nil {

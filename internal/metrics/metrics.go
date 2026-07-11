@@ -88,6 +88,13 @@ type Request struct {
 	RAGFilename       string
 	EstimatedCostUSD  float64
 
+	// BaselineCostUSD is what this request would have cost if sent
+	// to the configured baseline (frontier) provider at the baseline
+	// rate, regardless of the actual route taken (issue #73).
+	// SavingsUSD = max(BaselineCostUSD - EstimatedCostUSD, 0).
+	BaselineCostUSD float64
+	SavingsUSD      float64
+
 	OutputTokens         int
 	TTFTMs               int64
 	TotalLatencyMs       int64
@@ -118,8 +125,17 @@ type Summary struct {
 	TOONSavingsTokens  int
 	RAGInjectedCount   int
 	EstimatedCostTotal float64
-	TotalLatencyMsSum  int64
-	ErrorCount         int
+
+	// BaselineCostTotal and SavingsTotal roll up the per-request
+	// baseline_cost_usd and savings_usd columns (issue #73).
+	// BaselineCostTotal is the total "would-have-cost at frontier"
+	// figure; SavingsTotal is the sum of max(baseline - actual, 0)
+	// across all requests in the period.
+	BaselineCostTotal float64
+	SavingsTotal      float64
+
+	TotalLatencyMsSum int64
+	ErrorCount        int
 }
 
 // Store persists per-request metrics. Implementations MUST return

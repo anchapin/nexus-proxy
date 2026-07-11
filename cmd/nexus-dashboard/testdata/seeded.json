@@ -6,6 +6,8 @@
     "frontier": 2,
     "fusion": 1,
     "toon_saved_tokens": 400,
-    "estimated_savings_usd": 0.0008
+    "estimated_savings_usd": 0.0008,
+    "spent_usd": 0.004,
+    "saved_usd": 0.0184
   }
 ]
