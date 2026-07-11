@@ -23,6 +23,22 @@ type Config struct {
 	// HTTP server
 	Addr string // ":8000"
 
+	// HTTP listener timeouts and header cap (issue #77). These bound
+	// the inbound connection so a slowloris-style client or an
+	// oversized header cannot exhaust the server. Distinct from the
+	// outbound NEXUS_HTTP_* transport knobs — these apply to the
+	// http.Server listener, not to upstream client calls.
+	//
+	// WriteTimeout defaults to 0 (disabled) so SSE streaming
+	// responses are never killed mid-stream; set it only when the
+	// proxy is behind a buffering reverse proxy. ReadTimeout covers
+	// the full request read (headers + body) and should be generous
+	// enough for large chat-completion payloads.
+	ReadTimeout    time.Duration // full request read deadline; 0 disables
+	WriteTimeout   time.Duration // full response write deadline; 0 disables (streaming-safe)
+	IdleTimeout    time.Duration // keep-alive idle wait; 0 disables
+	MaxHeaderBytes int           // max request header bytes; 0 uses Go default (1 MiB)
+
 	// Local Ollama
 	OllamaURL      string // "http://localhost:11434"
 	RouterModel    string // "qwen3-coder:4b"
@@ -558,6 +574,48 @@ func Load() (Config, error) {
 	}
 	cfg.MaxBodyBytes = maxBodyBytes
 
+	// HTTP listener timeouts and header cap (issue #77). These bound
+	// the inbound connection independently of the outbound transport
+	// knobs (NEXUS_HTTP_*). WriteTimeout defaults to 0 (disabled) so
+	// SSE streaming responses are never killed mid-stream. Negative
+	// durations and negative header sizes are rejected so a typo in
+	// .env fails fast at boot rather than silently disabling a guard.
+	readTimeout, err := getEnvDuration("NEXUS_SERVER_READ_TIMEOUT", DefaultServerReadTimeout)
+	if err != nil {
+		return cfg, err
+	}
+	if readTimeout < 0 {
+		return cfg, fmt.Errorf("config: NEXUS_SERVER_READ_TIMEOUT must not be negative, got %s", readTimeout)
+	}
+	cfg.ReadTimeout = readTimeout
+
+	writeTimeout, err := getEnvDuration("NEXUS_SERVER_WRITE_TIMEOUT", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if writeTimeout < 0 {
+		return cfg, fmt.Errorf("config: NEXUS_SERVER_WRITE_TIMEOUT must not be negative, got %s", writeTimeout)
+	}
+	cfg.WriteTimeout = writeTimeout
+
+	idleTimeout, err := getEnvDuration("NEXUS_SERVER_IDLE_TIMEOUT", DefaultServerIdleTimeout)
+	if err != nil {
+		return cfg, err
+	}
+	if idleTimeout < 0 {
+		return cfg, fmt.Errorf("config: NEXUS_SERVER_IDLE_TIMEOUT must not be negative, got %s", idleTimeout)
+	}
+	cfg.IdleTimeout = idleTimeout
+
+	maxHeader, err := getEnvInt("NEXUS_SERVER_MAX_HEADER_BYTES", DefaultServerMaxHeaderBytes)
+	if err != nil {
+		return cfg, err
+	}
+	if maxHeader < 0 {
+		return cfg, fmt.Errorf("config: NEXUS_SERVER_MAX_HEADER_BYTES must not be negative, got %d", maxHeader)
+	}
+	cfg.MaxHeaderBytes = maxHeader
+
 	// Judge (issue #15). Defaults: z.ai-style endpoint, sample 10% of
 	// local-route successes, 2 concurrent workers, 30s per call. When
 	// JudgeURL is unset we fall back to NEXUS_FRONTIER_URL so a stock
@@ -724,6 +782,23 @@ func (c Config) FrontierProviders() []FrontierProvider {
 	}
 	return out
 }
+
+// DefaultServerReadTimeout is the default inbound request read deadline
+// (issue #77). 30s is generous for chat-completion payloads while still
+// disconnecting slow-header/slow-body abuse well before the connection
+// ties up a goroutine for minutes.
+const DefaultServerReadTimeout = 30 * time.Second
+
+// DefaultServerIdleTimeout is the default keep-alive idle wait (issue #77).
+// 120s matches Go's http.DefaultServer zero-value behaviour and keeps a
+// warm connection ready for the next request without holding it forever.
+const DefaultServerIdleTimeout = 120 * time.Second
+
+// DefaultServerMaxHeaderBytes is the default cap on the total size of
+// the HTTP request headers (issue #77). Matches Go's
+// http.DefaultMaxHeaderBytes (1 MiB) — large enough for auth cookies and
+// content-type metadata, small enough to reject header-flood abuse.
+const DefaultServerMaxHeaderBytes = 1 << 20 // 1 MiB
 
 // DefaultMaxBodyBytes is the fallback request-body cap (issue #11). 1 MiB
 // matches the typical OpenAI chat-completions request envelope; agents that
