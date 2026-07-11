@@ -69,8 +69,27 @@ services:
       # container's WORKDIR (/tmp), which is fine — pinning it here
       # makes the contract explicit and survives a future WORKDIR move.
       NEXUS_TELEMETRY_PATH: "/tmp/nexus-telemetry.jsonl"
+      # TLS termination (issue #39). When both cert and key paths are
+      # set, the proxy serves HTTPS instead of plain HTTP. Mount the
+      # cert/key into the container via the volumes below and supply
+      # the in-container paths here. Leave both unset for plaintext.
+      NEXUS_TLS_CERT: "${NEXUS_TLS_CERT:-}"
+      NEXUS_TLS_KEY: "${NEXUS_TLS_KEY:-}"
+      # When true alongside TLS active, start a :80 → HTTPS 301 redirect.
+      NEXUS_TLS_REDIRECT: "${NEXUS_TLS_REDIRECT:-false}"
     ports:
       - "8000:8000"
+      # When TLS is enabled, map 443 too (and 80 for the redirect if
+      # NEXUS_TLS_REDIRECT=true). Uncomment as needed.
+      # - "443:8443"
+      # - "80:80"
+    volumes:
+      # Read-only mount for TLS cert/key (issue #39). The host paths are
+      # supplied via NEXUS_TLS_CERT / NEXUS_TLS_KEY on the host; mount a
+      # directory so a cert rotation only needs a file swap, not a
+      # compose restart. Adjust the host side to your cert location
+      # (e.g. /etc/letsencrypt/live/<domain>).
+      - "${NEXUS_TLS_DIR:-./certs}:/etc/nexus/tls:ro"
     restart: unless-stopped
 
 volumes:

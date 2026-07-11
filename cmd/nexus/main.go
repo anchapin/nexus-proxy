@@ -10,6 +10,7 @@ import (
 	"errors"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -372,15 +373,54 @@ func main() {
 		slog.Info("proxy auth disabled (localhost dev)")
 	}
 
+	// Security headers middleware (issue #39). Wrapped outermost so
+	// every response — including auth 401s, rate-limit 429s, and the
+	// healthz JSON — carries X-Content-Type-Options, X-Frame-Options,
+	// and Referrer-Policy. Strict-Transport-Security is emitted only
+	// when TLS is active (otherwise browsers ignore it and the spec
+	// forbids it over plaintext).
+	tlsActive := cfg.TLSActive()
+	handler = handlers.SecurityHeaders(tlsActive)(handler)
+
+	// TLS boot warning (issue #39). When inbound auth is enabled but
+	// TLS is not, the bearer tokens travel over plaintext — warn so the
+	// operator notices the exposure.
+	if cfg.ProxyAuthEnabled && !tlsActive {
+		slog.Warn("proxy auth enabled but TLS is not configured; " +
+			"API keys travel over plaintext " +
+			"(set NEXUS_TLS_CERT and NEXUS_TLS_KEY to enable TLS)")
+	}
+	// Complementary warning (issue #39 AC): TLS encrypts the transport
+	// but without an inbound API key anyone who can reach the port can
+	// use the proxy. The issue-#37 warning already covers the
+	// non-loopback case; this one fires for TLS specifically so an
+	// operator who enabled TLS but forgot the key is told explicitly.
+	if tlsActive && !cfg.ProxyAuthEnabled {
+		slog.Warn("TLS enabled but NEXUS_PROXY_API_KEY is not set; " +
+			"anyone who can reach the port can use the proxy " +
+			"(set NEXUS_PROXY_API_KEY to enable authentication)")
+	}
+
 	slog.Info("starting nexus proxy",
 		slog.String("addr", cfg.Addr),
 		slog.String("local_model", cfg.LocalModel),
 		slog.String("frontier_model", cfg.FrontierModel),
+		slog.Bool("tls", tlsActive),
 	)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	// HTTP→HTTPS redirect (issue #39). When TLS is active and the
+	// operator opted into the redirect, a second listener on :80 issues
+	// a 301 Moved Permanently to the HTTPS port so clients connecting
+	// over plain HTTP get upgraded.
+	var redirectSrv *http.Server
+	if tlsActive && cfg.TLSRedirect {
+		redirectSrv = startHTTPRedirectServer(cfg.Addr)
+		slog.Info("http→https redirect enabled on :80")
 	}
 
 	// Graceful shutdown: stop accepting new connections, drain
@@ -393,6 +433,13 @@ func main() {
 	go func() {
 		<-sigCh
 		slog.Info("shutting down, draining judge queue and closing server")
+		if redirectSrv != nil {
+			// Non-fatal: a failed redirect shutdown must not block
+			// the primary server's graceful drain.
+			if err := redirectSrv.Close(); err != nil {
+				slog.Warn("redirect server close", slog.Any("err", err))
+			}
+		}
 		if judgeEval != nil {
 			if err := judgeEval.Close(); err != nil {
 				slog.Warn("judge close", slog.Any("err", err))
@@ -405,11 +452,67 @@ func main() {
 		}
 	}()
 
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		// Unrecoverable boot/server error — log.Fatalf is kept
-		// here per the issue #3 acceptance criteria.
-		log.Fatalf("server: %v", err)
+	if tlsActive {
+		if err := srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// Unrecoverable boot/server error — log.Fatalf is kept
+			// here per the issue #3 acceptance criteria.
+			log.Fatalf("server (tls): %v", err)
+		}
+	} else {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// Unrecoverable boot/server error — log.Fatalf is kept
+			// here per the issue #3 acceptance criteria.
+			log.Fatalf("server: %v", err)
+		}
 	}
+}
+
+// startHTTPRedirectServer launches a background HTTP server on :80 that
+// 301-redirects every request to the same host on the HTTPS port derived
+// from tlsAddr (issue #39). The returned *http.Server is started in its
+// own goroutine; the caller is responsible for closing it on shutdown.
+//
+// The HTTPS port is extracted from tlsAddr's port component so an
+// operator running TLS on :8443 redirects to https://host:8443/. When
+// the port cannot be parsed the redirect targets the default :443, which
+// is dropped from the URL per RFC 3986.
+func startHTTPRedirectServer(tlsAddr string) *http.Server {
+	httpsPort := httpsPortFromAddr(tlsAddr)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		target := "https://" + host
+		if httpsPort != "" && httpsPort != "443" {
+			target = "https://" + net.JoinHostPort(host, httpsPort)
+		}
+		target += r.URL.RequestURI()
+		http.Redirect(w, r, target, http.StatusMovedPermanently)
+	})
+	srv := &http.Server{
+		Addr:              ":80",
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Warn("redirect server stopped", slog.Any("err", err))
+		}
+	}()
+	return srv
+}
+
+// httpsPortFromAddr extracts the port from a "host:port" or ":port"
+// address. Returns "" when no port can be parsed (caller treats empty as
+// the default :443).
+func httpsPortFromAddr(addr string) string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	return port
 }
 
 // buildRecorder constructs the telemetry recorder from config. A disabled
