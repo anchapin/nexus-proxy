@@ -58,6 +58,17 @@ type Config struct {
 	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
 	ArbiterTimeout time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
+	// VRAM-aware concurrency gate (issue #35). Caps the number of
+	// RouteLocal requests (and the local panel member of
+	// RouteFusion) that may dispatch local Ollama concurrently;
+	// waiters queue-and-wait up to LocalQueueTimeout, after which
+	// the chat handler fast-promotes to frontier via SkipLocal and
+	// stamps X-Nexus-Overflow: true on the response. LocalMaxConcurrent
+	// <= 0 disables the gate (the chat handler treats a nil/disabled
+	// Limiter as "unlimited", preserving the pre-#35 behaviour).
+	LocalMaxConcurrent int           // max concurrent local route dispatches (2)
+	LocalQueueTimeout  time.Duration // max wait for a slot before overflow promotion (5s)
+
 	// Health (issue #8). The chat handler consults
 	// internal/health.Health before issuing local-bound requests;
 	// when Ollama is unreachable it short-circuits to frontier
@@ -205,6 +216,8 @@ var configKeys = map[string]string{
 	"routing.fusion_timeout":       "NEXUS_FUSION_TIMEOUT",
 	"routing.cascade_timeout":      "NEXUS_CASCADE_TIMEOUT",
 	"routing.arbiter_timeout":      "NEXUS_ARBITER_TIMEOUT",
+	"routing.local_max_concurrent": "NEXUS_LOCAL_MAX_CONCURRENT",
+	"routing.local_queue_timeout":  "NEXUS_LOCAL_QUEUE_TIMEOUT",
 	"health.poll_interval":         "NEXUS_HEALTH_POLL_INTERVAL",
 	"health.breaker_threshold":     "NEXUS_HEALTH_BREAKER_THRESHOLD",
 	"health.probe_timeout":         "NEXUS_HEALTH_PROBE_TIMEOUT",
@@ -350,6 +363,40 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.ArbiterTimeout = arbiterTimeout
+
+	// VRAM-aware concurrency gate (issue #35). The chat handler
+	// holds a slot for the lifetime of any RouteLocal request
+	// (and the local panel member of RouteFusion) so concurrent
+	// coding agents cannot collectively OOM Ollama. The queue
+	// timeout is how long a request is willing to wait for a
+	// slot before the handler fast-promotes to frontier and
+	// stamps X-Nexus-Overflow: true. Both values default to
+	// safe operator-friendly numbers; setting
+	// NEXUS_LOCAL_MAX_CONCURRENT=0 disables the gate entirely
+	// (the handler treats it as unlimited).
+	localMax, err := resolveInt("NEXUS_LOCAL_MAX_CONCURRENT", fileMap, 2)
+	if err != nil {
+		return cfg, err
+	}
+	if localMax < 0 {
+		// Negative is a config typo; clamp to disabled rather
+		// than panic at boot. Operators who want "unlimited"
+		// should set 0 explicitly per the issue spec.
+		localMax = 0
+	}
+	cfg.LocalMaxConcurrent = localMax
+
+	localQueue, err := resolveDuration("NEXUS_LOCAL_QUEUE_TIMEOUT", fileMap, 5*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	if localQueue < 0 {
+		// Negative queue timeout is meaningless; fold into the
+		// "try once and give up" semantics so a bad value at
+		// least still rejects on overflow.
+		localQueue = 0
+	}
+	cfg.LocalQueueTimeout = localQueue
 
 	// Ollama health poller (issue #8). Defaults: 30s poll cadence,
 	// 3-failure breaker, 5s per-probe HTTP timeout. Set

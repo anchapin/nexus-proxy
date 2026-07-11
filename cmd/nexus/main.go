@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/handlers"
 	"github.com/anchapin/nexus-proxy/internal/health"
@@ -315,6 +316,7 @@ func main() {
 		Recorder:        recorder,
 		Health:          hpoller,
 		BudgetObserver:  budgetObserver(probeMgr),
+		Limiter:         buildLocalLimiter(cfg),
 	}))
 
 	// /healthz returns a small JSON document so operators can see
@@ -520,4 +522,24 @@ func parseConfigFlag(args []string) string {
 		}
 	}
 	return ""
+}
+
+// buildLocalLimiter constructs the VRAM-aware concurrency limiter
+// (issue #35) from config. Returns nil when the operator disabled the
+// gate (LocalMaxConcurrent <= 0) so the chat handler can rely on a
+// single nil-check. The default of 2 concurrent local requests is
+// well below typical 8 GiB VRAM budgets; the queue timeout caps how
+// long a request is willing to wait for a slot before the handler
+// fast-promotes to frontier and stamps X-Nexus-Overflow: true.
+func buildLocalLimiter(cfg config.Config) *concurrencylimit.Limiter {
+	if cfg.LocalMaxConcurrent <= 0 {
+		slog.Info("local concurrency limiter disabled (NEXUS_LOCAL_MAX_CONCURRENT=0)")
+		return nil
+	}
+	l := concurrencylimit.New(cfg.LocalMaxConcurrent)
+	slog.Info("local concurrency limiter enabled",
+		slog.Int("max_concurrent", cfg.LocalMaxConcurrent),
+		slog.Duration("queue_timeout", cfg.LocalQueueTimeout),
+	)
+	return l
 }

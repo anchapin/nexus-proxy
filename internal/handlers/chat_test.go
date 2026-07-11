@@ -14,9 +14,11 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/rag"
@@ -387,6 +389,245 @@ func TestChatRouteLocalCascadeAllFail(t *testing.T) {
 	}
 	if len(rt.Calls()) != 2 {
 		t.Errorf("expected 2 calls (all steps), got %d", len(rt.Calls()))
+	}
+}
+
+// TestChatRouteLocalLimiterOverflowPromotesToFrontier pins the
+// issue-#35 acceptance criterion: with MaxConcurrent=1 and two
+// concurrent route=local requests, exactly one is served by local
+// Ollama and the other is fast-promoted to the frontier cascade
+// with X-Nexus-Overflow: true on the response. The first request
+// holds the slot by blocking inside its upstream-call recorder so
+// the second request can deterministically time out on the queue
+// and take the overflow path.
+//
+// The test uses channel-based synchronisation (not sleeps): it
+// waits for the local handler to be entered before firing the
+// second request, and waits for the frontier handler to be entered
+// (by the overflow) before releasing the first one. This avoids
+// the false-negatives a sleep-based schedule would produce under
+// -race + a busy CI box.
+func TestChatRouteLocalLimiterOverflowPromotesToFrontier(t *testing.T) {
+	deps, rt := baseDeps(t)
+
+	// Slot-1 ceiling + short queue so the overflow fires
+	// quickly. baselineDeps returns LocalMaxConcurrent=0 (no
+	// limiter), so wiring it here is the only place we exercise
+	// the gate in the test suite.
+	deps.Config.LocalMaxConcurrent = 1
+	deps.Config.LocalQueueTimeout = 200 * time.Millisecond
+	deps.Limiter = concurrencylimit.New(1)
+
+	localEntered := make(chan struct{})
+	var localEnteredOnce sync.Once
+	releaseLocal := make(chan struct{})
+	rt.On("POST", "http://ollama.local/v1/chat/completions",
+		func(w http.ResponseWriter, r *http.Request) {
+			localEnteredOnce.Do(func() { close(localEntered) })
+			// Hold the slot open until the test signals. We also
+			// honour ctx cancellation so a failing test does not
+			// leak the goroutine forever.
+			select {
+			case <-releaseLocal:
+			case <-r.Context().Done():
+				return
+			}
+			// Valid OpenAI completion shape so the cascade
+			// validation accepts the response and stops here
+			// (no fallback to frontier for this request).
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local answer"},"finish_reason":"stop"}]}`)
+		})
+
+	frontierEntered := make(chan struct{})
+	var frontierEnteredOnce sync.Once
+	rt.On("POST", "http://frontier.local",
+		func(w http.ResponseWriter, _ *http.Request) {
+			frontierEnteredOnce.Do(func() { close(frontierEntered) })
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"frontier overflow"},"finish_reason":"stop"}]}`)
+		})
+
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var rw1, rw2 *httptest.ResponseRecorder
+
+	// Request 1: acquires the slot, blocks in the local recorder.
+	go func() {
+		defer wg.Done()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		rw1 = httptest.NewRecorder()
+		Chat(deps).ServeHTTP(rw1, req)
+	}()
+
+	// Wait until the local handler is actually entered before
+	// firing the second request. Without this the test could
+	// race: request 2 might land before request 1 acquired the
+	// slot and end up taking it instead of overflowing.
+	<-localEntered
+
+	// Request 2: must queue, time out, then fast-promote to
+	// frontier (skipLocal = true) with X-Nexus-Overflow.
+	go func() {
+		defer wg.Done()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		rw2 = httptest.NewRecorder()
+		Chat(deps).ServeHTTP(rw2, req)
+	}()
+
+	// Frontier is only called by the overflow path (the first
+	// request's cascade stays at local because the local body
+	// is a valid OpenAI shape). Wait for it to enter.
+	select {
+	case <-frontierEntered:
+	case <-time.After(2 * time.Second):
+		close(releaseLocal) // unblock request 1 to avoid hangs
+		wg.Wait()
+		t.Fatal("frontier handler was never called by overflow request")
+	}
+
+	// Now we can release the local request; it completes
+	// quickly because releaseLocal is closed.
+	close(releaseLocal)
+	wg.Wait()
+
+	// Request 2 must carry X-Nexus-Overflow: true and the
+	// frontier content (the cascade skipped local entirely).
+	if got := rw2.Header().Get("X-Nexus-Overflow"); got != "true" {
+		t.Errorf("rw2 X-Nexus-Overflow = %q, want \"true\"", got)
+	}
+	if !strings.Contains(rw2.Body.String(), "frontier overflow") {
+		t.Errorf("rw2 body = %q, want frontier overflow content", rw2.Body.String())
+	}
+	if !strings.Contains(rw2.Header().Get("X-Nexus-Cascade-Served-By"), "frontier") {
+		t.Errorf("rw2 served-by = %q, want frontier", rw2.Header().Get("X-Nexus-Cascade-Served-By"))
+	}
+
+	// Request 1 was the slot-holder; it must NOT carry the
+	// overflow header and its body must come from local.
+	if got := rw1.Header().Get("X-Nexus-Overflow"); got != "" {
+		t.Errorf("rw1 X-Nexus-Overflow = %q, want unset (slot-holder takes normal path)", got)
+	}
+	if !strings.Contains(rw1.Body.String(), "local answer") {
+		t.Errorf("rw1 body = %q, want local answer", rw1.Body.String())
+	}
+
+	// Upstream call bookkeeping: local=1, frontier=1.
+	var frontierCalls, localCalls int
+	for _, c := range rt.Calls() {
+		switch c.URL {
+		case "http://frontier.local":
+			frontierCalls++
+		case "http://ollama.local/v1/chat/completions":
+			localCalls++
+		}
+	}
+	if localCalls != 1 {
+		t.Errorf("local calls = %d, want 1", localCalls)
+	}
+	if frontierCalls != 1 {
+		t.Errorf("frontier calls = %d, want 1 (only the overflow request)", frontierCalls)
+	}
+}
+
+// TestChatRouteFrontierIgnoresLimiter pins the issue-#35 contract
+// that RouteFrontier is NEVER gated by the concurrency limiter.
+// With a max=1 limiter and many concurrent requests, all of them
+// must still reach the frontier endpoint — the limiter should not
+// stamp X-Nexus-Overflow and must not fall back to local for any
+// frontier-classified request. The large-prompt forcing the
+// guardrail drives the route=frontier classification so the test
+// does not need a separate routing knob.
+func TestChatRouteFrontierIgnoresLimiter(t *testing.T) {
+	deps, rt := baseDeps(t)
+
+	// Wire the tightest possible limiter. Frontier traffic must
+	// not be gated by it.
+	deps.Config.LocalMaxConcurrent = 1
+	deps.Config.LocalQueueTimeout = 1 * time.Second
+	deps.Limiter = concurrencylimit.New(1)
+
+	// Defence in depth: if the limiter ever incorrectly steered
+	// a frontier request to local, fail the test loud.
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("local Ollama URL was hit for a frontier-classified request")
+	})
+
+	var frontierCalls atomic.Int32
+	rt.On("POST", "http://frontier.local",
+		func(w http.ResponseWriter, _ *http.Request) {
+			frontierCalls.Add(1)
+			_, _ = w.Write([]byte("frontier stream"))
+		})
+
+	// 30 000 char prompt / 4 = 7500 > 6000 guardrail -> route=frontier.
+	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 30000) + `"}]}`
+	const N = 5
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			rw := httptest.NewRecorder()
+			Chat(deps).ServeHTTP(rw, req)
+			if rw.Code != http.StatusOK {
+				t.Errorf("status = %d, want 200", rw.Code)
+			}
+			if got := rw.Header().Get("X-Nexus-Overflow"); got != "" {
+				t.Errorf("X-Nexus-Overflow = %q on a frontier request, want unset", got)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := frontierCalls.Load(); int(got) != N {
+		t.Errorf("frontier calls = %d, want %d", got, N)
+	}
+}
+
+// TestChatNilLimiterPreservesUnlimitedBehaviour is the
+// backward-compat smoke test: a Deps with Limiter == nil (the
+// pre-issue-#35 default) must behave exactly as before — no
+// overflow header, no frontier promotion, every concurrent local
+// request lands on Ollama. The test fires N concurrent
+// route=local requests with no limiter and confirms every one
+// reaches local and carries no overflow marker.
+func TestChatNilLimiterPreservesUnlimitedBehaviour(t *testing.T) {
+	deps, rt := baseDeps(t)
+
+	// Limiter deliberately left nil; the handler must NOT fall
+	// through to any X-Nexus-Overflow branch.
+	var localCalls atomic.Int32
+	rt.On("POST", "http://ollama.local/v1/chat/completions",
+		func(w http.ResponseWriter, _ *http.Request) {
+			localCalls.Add(1)
+			_, _ = w.Write([]byte(`{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+		})
+
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	const N = 5
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			rw := httptest.NewRecorder()
+			Chat(deps).ServeHTTP(rw, req)
+			if got := rw.Header().Get("X-Nexus-Overflow"); got != "" {
+				t.Errorf("X-Nexus-Overflow = %q, want unset (nil limiter should be a no-op)", got)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := localCalls.Load(); int(got) != N {
+		t.Errorf("local calls = %d, want %d", got, N)
 	}
 }
 
