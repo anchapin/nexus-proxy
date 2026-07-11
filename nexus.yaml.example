@@ -151,3 +151,22 @@ probe:
   # VRAM->token heuristic. 256 KiB per token works out to ~32k tokens
   # of safe headroom on an 8 GiB GPU.
   bytes_per_token: 262144
+
+# --- HTTP connection pool (issue #34) --------------------------------------
+# Every outbound call shares a single *http.Client wired with a custom
+# *http.Transport. The Go stdlib default (MaxIdleConnsPerHost=2) is the
+# very bottleneck this fixes; raise the per-host idle cap so the chat
+# handler + SLM + RAG goroutines can all hit the local Ollama without
+# fighting for two idle conns.
+http:
+  # Total idle conns across all hosts (default 100).
+  max_idle_conns: 100
+  # Idle conns retained per host (default 16). Raise for higher-fanout
+  # workloads; lower to keep the pool small.
+  max_idle_conns_per_host: 16
+  # Total (in-flight + idle) conns per host. 0 == unlimited.
+  max_conns_per_host: 0
+  # How long an idle connection stays in the pool.
+  idle_conn_timeout: 90s
+  # Disable HTTP keep-alive (rarely wanted; default false).
+  disable_keepalives: false

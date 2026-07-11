@@ -121,6 +121,8 @@ In `internal/handlers/chat.go`:
   timeouts are `NEXUS_SLM_TIMEOUT` (8s default) and
   `NEXUS_FUSION_TIMEOUT` (120s default). Other upstream calls use the
   shared `http.DefaultClient`.
+- HTTP client is configured via `internal/transport.New` — env vars
+  `NEXUS_HTTP_*` tunables (issue #34).
 - The `few_shot_examples/` directory is auto-created at first run if
   missing (`Store.IndexDir`). It's gitignored.
 - Tests use `httptest` + a `RecordingTransport` helper in
