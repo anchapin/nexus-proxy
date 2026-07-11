@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,6 +29,12 @@ import (
 //
 // Index on timestamp is the only one beyond the implicit PK index;
 // daily aggregations are the dominant read pattern.
+//
+// The route_source / route_reason / slm_confidence / slm_task_type
+// columns (issue #74) are added here for fresh databases. Existing
+// databases are migrated via migrateRouteSourceColumns at Open time
+// so additive ALTER TABLE statements bring them up to the same shape
+// without data loss.
 const requestsSchema = `
 CREATE TABLE IF NOT EXISTS requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,11 +53,50 @@ CREATE TABLE IF NOT EXISTS requests (
     tps REAL NOT NULL DEFAULT 0,
     streaming INTEGER NOT NULL DEFAULT 1,
     fusion_arbiter_skipped INTEGER NOT NULL DEFAULT 0,
-    error TEXT NOT NULL DEFAULT ''
+    error TEXT NOT NULL DEFAULT '',
+    route_source TEXT NOT NULL DEFAULT '',
+    route_reason TEXT NOT NULL DEFAULT '',
+    slm_confidence REAL NOT NULL DEFAULT 0,
+    slm_task_type TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
 CREATE INDEX IF NOT EXISTS idx_requests_request_id ON requests(request_id);
 `
+
+// routeSourceMigrations is the set of additive ALTER TABLE statements
+// that bring an existing requests table up to the issue #74 schema.
+// Each is idempotent: SQLite errors on duplicate-column are swallowed
+// by the caller (migrateRouteSourceColumns) so re-running against an
+// already-migrated database is a no-op.
+var routeSourceMigrations = []string{
+	`ALTER TABLE requests ADD COLUMN route_source TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE requests ADD COLUMN route_reason TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE requests ADD COLUMN slm_confidence REAL NOT NULL DEFAULT 0`,
+	`ALTER TABLE requests ADD COLUMN slm_task_type TEXT NOT NULL DEFAULT ''`,
+}
+
+// migrateRouteSourceColumns runs the additive ALTER TABLE migrations
+// for issue #74. Each statement is attempted individually; "duplicate
+// column" errors mean the column already exists (the database was
+// created or migrated by a newer build) and are silently ignored.
+// Any other error aborts Open so the operator sees the problem at
+// boot rather than on the first failed INSERT.
+func migrateRouteSourceColumns(ctx context.Context, db *sql.DB) error {
+	for _, stmt := range routeSourceMigrations {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			// modernc.org/sqlite returns the error string
+			// containing "duplicate column name" for the
+			// already-exists case. We match on that substring
+			// rather than a typed error so the check survives
+			// driver-level error wrapping.
+			if strings.Contains(err.Error(), "duplicate column name") {
+				continue
+			}
+			return fmt.Errorf("metrics: migrate: %w", err)
+		}
+	}
+	return nil
+}
 
 // insertSQL is the prepared statement for RecordRequest. Kept as a
 // package const so the goroutine can reuse the same SQL string after
@@ -59,8 +105,9 @@ const insertSQL = `INSERT INTO requests
     (timestamp, request_id, route, model,
      input_tokens, output_tokens, toon_savings_tokens,
      rag_injected, rag_filename, estimated_cost_usd,
-     ttft_ms, total_latency_ms, tps, streaming, fusion_arbiter_skipped, error)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     ttft_ms, total_latency_ms, tps, streaming, fusion_arbiter_skipped, error,
+     route_source, route_reason, slm_confidence, slm_task_type)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // SQLiteStore is the production Store implementation (issue #4).
 // Writes are funnelled through a buffered channel and a single
@@ -109,6 +156,16 @@ func newSQLiteStore(path string, lg Logger) (*SQLiteStore, error) {
 	if _, err := db.ExecContext(context.Background(), requestsSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("metrics: create schema: %w", err)
+	}
+
+	// Issue #74: bring existing databases up to the route-source
+	// schema. Fresh databases already have the columns (from
+	// requestsSchema above), so every ALTER will no-op on the
+	// "duplicate column name" error and the migration completes in
+	// microseconds.
+	if err := migrateRouteSourceColumns(context.Background(), db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("metrics: migrate route-source: %w", err)
 	}
 
 	s := &SQLiteStore{
@@ -225,6 +282,7 @@ func (s *SQLiteStore) writeOne(req Request) {
 		ragInjected, req.RAGFilename, req.EstimatedCostUSD,
 		req.TTFTMs, req.TotalLatencyMs, req.TPS, streaming,
 		fusionArbiterSkipped, req.Error,
+		req.RouteSource, req.RouteReason, req.SLMConfidence, req.SLMTaskType,
 	)
 	if err != nil {
 		s.logger("ERROR: insert request_id=%s: %v", req.RequestID, err)
@@ -489,6 +547,10 @@ func (s *SQLiteStore) Record(r telemetry.Record) {
 		Streaming:            r.Streaming,
 		FusionArbiterSkipped: r.FusionArbiterSkipped,
 		Error:                r.Error,
+		RouteSource:          r.RouteSource,
+		RouteReason:          r.RouteReason,
+		SLMConfidence:        r.SLMConfidence,
+		SLMTaskType:          r.SLMTaskType,
 		// TOONSavingsTokens / RAGInjected / RAGFilename /
 		// EstimatedCostUSD default zero — populated by callers
 		// that explicitly use RecordRequest.

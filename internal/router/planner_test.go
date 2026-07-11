@@ -25,12 +25,12 @@ import (
 // which method was called and with what confidence, and returns the
 // preconfigured route/error pair.
 type stubSLM struct {
-	route           Route
-	err             error
-	calledDecide    bool
-	calledWithConf  bool
-	lastConfidence  float64
-	lastPrompt      string
+	route          Route
+	err            error
+	calledDecide   bool
+	calledWithConf bool
+	lastConfidence float64
+	lastPrompt     string
 }
 
 func (s *stubSLM) Decide(_ context.Context, prompt string) (Route, error) {
@@ -49,8 +49,8 @@ func (s *stubSLM) DecideWithConfidence(_ context.Context, prompt string, confide
 // stubConf is a ConfidenceStore test double that returns a fixed
 // confidence value. It records the categories it was queried with.
 type stubConf struct {
-	value     float64
-	queried   []string
+	value   float64
+	queried []string
 }
 
 func (s *stubConf) RecordOutcome(_ string, _ Route, _ int) {}
@@ -65,12 +65,12 @@ var formattingRegex = regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|
 
 func TestPlanner_Plan(t *testing.T) {
 	tests := []struct {
-		name           string
-		planner        *Planner
-		req            PlanRequest
-		wantRoute      Route
-		wantSource     DecisionSource
-		wantSLMCalled  bool // whether the SLM stage was reached
+		name          string
+		planner       *Planner
+		req           PlanRequest
+		wantRoute     Route
+		wantSource    DecisionSource
+		wantSLMCalled bool // whether the SLM stage was reached
 	}{
 		{
 			name: "guardrail forces frontier on oversized prompt",
@@ -85,9 +85,9 @@ func TestPlanner_Plan(t *testing.T) {
 				GuardrailSource: "static-fallback",
 				Context:         context.Background(),
 			},
-			wantRoute:      RouteFrontier,
-			wantSource:     SourceGuardrail,
-			wantSLMCalled:  false,
+			wantRoute:     RouteFrontier,
+			wantSource:    SourceGuardrail,
+			wantSLMCalled: false,
 		},
 		{
 			name: "guardrail disabled when budget <= 0 falls through to DSL",
@@ -101,9 +101,9 @@ func TestPlanner_Plan(t *testing.T) {
 				GuardrailSource: "static-fallback",
 				Context:         context.Background(),
 			},
-			wantRoute:      RouteLocal, // DSL matches "css"
-			wantSource:     SourceDSL,
-			wantSLMCalled:  false,
+			wantRoute:     RouteLocal, // DSL matches "css"
+			wantSource:    SourceDSL,
+			wantSLMCalled: false,
 		},
 		{
 			name: "dsl local match for formatting keyword",
@@ -117,9 +117,9 @@ func TestPlanner_Plan(t *testing.T) {
 				GuardrailSource: "static-fallback",
 				Context:         context.Background(),
 			},
-			wantRoute:      RouteLocal,
-			wantSource:     SourceDSL,
-			wantSLMCalled:  false,
+			wantRoute:     RouteLocal,
+			wantSource:    SourceDSL,
+			wantSLMCalled: false,
 		},
 		{
 			name: "dsl fusion match for architecture keyword",
@@ -133,9 +133,9 @@ func TestPlanner_Plan(t *testing.T) {
 				GuardrailSource: "static-fallback",
 				Context:         context.Background(),
 			},
-			wantRoute:      RouteFusion,
-			wantSource:     SourceDSL,
-			wantSLMCalled:  false,
+			wantRoute:     RouteFusion,
+			wantSource:    SourceDSL,
+			wantSLMCalled: false,
 		},
 		{
 			name: "slm decision local",
@@ -149,9 +149,9 @@ func TestPlanner_Plan(t *testing.T) {
 				GuardrailSource: "static-fallback",
 				Context:         context.Background(),
 			},
-			wantRoute:      RouteLocal,
-			wantSource:     SourceSLM,
-			wantSLMCalled:  true,
+			wantRoute:     RouteLocal,
+			wantSource:    SourceSLM,
+			wantSLMCalled: true,
 		},
 		{
 			name: "slm decision frontier",
@@ -165,9 +165,9 @@ func TestPlanner_Plan(t *testing.T) {
 				GuardrailSource: "static-fallback",
 				Context:         context.Background(),
 			},
-			wantRoute:      RouteFrontier,
-			wantSource:     SourceSLM,
-			wantSLMCalled:  true,
+			wantRoute:     RouteFrontier,
+			wantSource:    SourceSLM,
+			wantSLMCalled: true,
 		},
 		{
 			name: "slm error falls back to frontier",
@@ -181,9 +181,9 @@ func TestPlanner_Plan(t *testing.T) {
 				GuardrailSource: "static-fallback",
 				Context:         context.Background(),
 			},
-			wantRoute:      RouteFrontier,
-			wantSource:     SourceSLMError,
-			wantSLMCalled:  true,
+			wantRoute:     RouteFrontier,
+			wantSource:    SourceSLMError,
+			wantSLMCalled: true,
 		},
 		{
 			name: "dsl bypassed when no keyword matches, slm consulted",
@@ -197,9 +197,9 @@ func TestPlanner_Plan(t *testing.T) {
 				GuardrailSource: "static-fallback",
 				Context:         context.Background(),
 			},
-			wantRoute:      RouteFusion,
-			wantSource:     SourceSLM,
-			wantSLMCalled:  true,
+			wantRoute:     RouteFusion,
+			wantSource:    SourceSLM,
+			wantSLMCalled: true,
 		},
 	}
 

@@ -28,7 +28,7 @@ import (
 // ModelsDeps carries the collaborators the /v1/models handler needs.
 type ModelsDeps struct {
 	Config config.Config
-	Client *http.Client    // shared HTTP client for Ollama /api/tags; nil → http.DefaultClient
+	Client *http.Client     // shared HTTP client for Ollama /api/tags; nil → http.DefaultClient
 	Now    func() time.Time // injectable clock for tests; nil → time.Now
 }
 
