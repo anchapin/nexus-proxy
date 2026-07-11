@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
@@ -37,6 +38,29 @@ const (
 )
 
 func main() {
+	// Subcommand dispatch (issue #32). The default invocation
+	// (no args) starts the proxy; `nexus check` (alias `nexus
+	// doctor`) runs the boot-time diagnostic suite and exits.
+	// Anything else is reserved for future subcommands; an
+	// unknown verb is rejected here so the operator gets a
+	// clear error before config.Load runs.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "check", "doctor":
+			os.Exit(runCheck(os.Args[2:], os.Stdout, os.Stderr))
+		case "-h", "--help", "help":
+			fmt.Fprintln(os.Stderr, "Usage: nexus [check|doctor]")
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "Run with no arguments to start the proxy.")
+			fmt.Fprintln(os.Stderr, "Run `nexus check` to validate boot-time configuration.")
+			os.Exit(0)
+		default:
+			fmt.Fprintf(os.Stderr, "nexus: unknown subcommand %q\n\n", os.Args[1])
+			fmt.Fprintln(os.Stderr, "Usage: nexus [check|doctor]")
+			os.Exit(2)
+		}
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		// The structured logger is not yet wired, so use the std
