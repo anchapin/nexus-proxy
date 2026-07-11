@@ -22,6 +22,45 @@ type Client interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
+// callOpts collects optional request-level knobs the chat handler
+// can pass via variadic CallOption values. Backward-compatible:
+// every existing call site compiles unchanged because the
+// variadic opts parameter has zero-value defaults.
+type callOpts struct {
+	traceparent string
+}
+
+// CallOption configures one optional behaviour on an outbound call.
+// Implemented as a functional option so callers can compose new
+// fields without touching the function signatures (issue #41 —
+// distributed tracing).
+type CallOption func(*callOpts)
+
+// WithTraceparent sets the W3C `traceparent` header on the outbound
+// POST. Empty strings are ignored so the option is safe to wire
+// unconditionally. The receiving service uses the header to attach
+// its own span to the proxy's trace, completing the distributed
+// correlation chain.
+func WithTraceparent(value string) CallOption {
+	return func(o *callOpts) {
+		if value != "" {
+			o.traceparent = value
+		}
+	}
+}
+
+// applyCallOpts resolves the variadic option chain. Nil options are
+// silently skipped so the call sites stay terse.
+func applyCallOpts(opts []CallOption) *callOpts {
+	o := &callOpts{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(o)
+		}
+	}
+	return o
+}
+
 // allowedHeaders is the allowlist of upstream response headers the proxy
 // forwards to clients (issue #39). Headers NOT in this set — Server,
 // Set-Cookie, Via, upstream X-RateLimit-*, X-Powered-By, ... — are dropped
@@ -73,8 +112,8 @@ func copyAllowedHeaders(dst, src http.Header) {
 // Stream is a thin wrapper around StreamWithContext that uses a fresh
 // context.Background(). Callers that need a timeout (issue #12: the
 // fusion arbiter) should use StreamWithContext directly.
-func Stream(w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}) error {
-	return StreamWithContext(context.Background(), w, client, targetURL, apiKey, payload)
+func Stream(w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}, opts ...CallOption) error {
+	return StreamWithContext(context.Background(), w, client, targetURL, apiKey, payload, opts...)
 }
 
 // StreamWithContext is Stream plus an explicit request context. The
@@ -84,7 +123,7 @@ func Stream(w http.ResponseWriter, client Client, targetURL, apiKey string, payl
 // (cancels the handler's r.Context()). Use this from callers that
 // need to bound an upstream call — issue #12 added NEXUS_ARBITER_TIMEOUT
 // for exactly this purpose on the fusion arbiter path.
-func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}) error {
+func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}, opts ...CallOption) error {
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("upstream: marshal: %w", err)
@@ -96,6 +135,9 @@ func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	if o := applyCallOpts(opts); o.traceparent != "" {
+		req.Header.Set("traceparent", o.traceparent)
 	}
 
 	resp, err := client.Do(req)
@@ -146,15 +188,15 @@ func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client
 // uses a fresh context.Background(). Callers that need a timeout
 // should use BufferedFetchWithContext directly — same contract as
 // StreamWithContext.
-func BufferedFetch(w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}) error {
-	return BufferedFetchWithContext(context.Background(), w, client, targetURL, apiKey, payload)
+func BufferedFetch(w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}, opts ...CallOption) error {
+	return BufferedFetchWithContext(context.Background(), w, client, targetURL, apiKey, payload, opts...)
 }
 
 // BufferedFetchWithContext is BufferedFetch plus an explicit request
 // context. Cancellation via context.WithTimeout propagates both
 // client-side (cancels the in-flight request) and server-side (cancels
 // the handler's r.Context()).
-func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}) error {
+func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}, opts ...CallOption) error {
 	body := make(map[string]interface{}, len(payload)+1)
 	for k, v := range payload {
 		body[k] = v
@@ -172,6 +214,9 @@ func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	if o := applyCallOpts(opts); o.traceparent != "" {
+		req.Header.Set("traceparent", o.traceparent)
 	}
 
 	resp, err := client.Do(req)
@@ -202,7 +247,7 @@ func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client
 // FetchPanel fetches a single non-streaming completion from targetURL and
 // returns the assistant message text. Designed for the fusion panel where
 // we need the full response before asking the arbiter to synthesize.
-func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName string, body map[string]interface{}) (string, error) {
+func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName string, body map[string]interface{}, opts ...CallOption) (string, error) {
 	payload := make(map[string]interface{}, len(body)+2)
 	for k, v := range body {
 		payload[k] = v
@@ -221,6 +266,9 @@ func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	if o := applyCallOpts(opts); o.traceparent != "" {
+		req.Header.Set("traceparent", o.traceparent)
 	}
 
 	resp, err := client.Do(req)
@@ -288,6 +336,7 @@ func Panel(
 	perFetchTimeout time.Duration,
 	arbiterTimeout time.Duration,
 	skipLocal bool,
+	opts ...CallOption,
 ) error {
 	results := make(chan PanelResult, 2)
 	if skipLocal {
@@ -302,7 +351,7 @@ func Panel(
 			ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
 			defer cancel()
 			c, err := FetchPanel(ctx, client,
-				localBaseURL+"/v1/chat/completions", "", localModel, body)
+				localBaseURL+"/v1/chat/completions", "", localModel, body, opts...)
 			results <- PanelResult{Source: "local", Content: c, Err: err}
 		}()
 	}
@@ -310,7 +359,7 @@ func Panel(
 		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
 		defer cancel()
 		c, err := FetchPanel(ctx, client,
-			frontierURL, "", frontierModel, body)
+			frontierURL, "", frontierModel, body, opts...)
 		results <- PanelResult{Source: "frontier", Content: c, Err: err}
 	}()
 	r1 := <-results
@@ -342,9 +391,9 @@ func Panel(
 		stream = false
 	}
 	if stream {
-		return StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody)
+		return StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody, opts...)
 	}
-	return BufferedFetchWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody)
+	return BufferedFetchWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody, opts...)
 }
 
 // arbiterDefaultTimeout is the per-call arbiter timeout used when

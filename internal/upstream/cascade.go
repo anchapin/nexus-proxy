@@ -93,7 +93,7 @@ func ShouldRetry(statusCode int, err error) bool {
 //
 // Validation happens before any byte is sent to the client, so the harness
 // never sees a malformed response (issue requirement).
-func (c *Cascade) Run(w http.ResponseWriter, client Client, payload map[string]interface{}) (CascadeResult, error) {
+func (c *Cascade) Run(w http.ResponseWriter, client Client, payload map[string]interface{}, opts ...CallOption) (CascadeResult, error) {
 	if len(c.Steps) == 0 {
 		return CascadeResult{}, errors.New("cascade: no steps configured")
 	}
@@ -109,7 +109,7 @@ func (c *Cascade) Run(w http.ResponseWriter, client Client, payload map[string]i
 		res.RouteAttempted = joinStepNames(c.Steps[:i+1])
 
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		content, servedModel, err := fetchCascadeStep(ctx, client, step, payload)
+		content, servedModel, err := fetchCascadeStep(ctx, client, step, payload, opts...)
 		cancel()
 		if err == nil {
 			slog.Info("cascade served",
@@ -166,7 +166,7 @@ func joinStepNames(steps []CascadeStep) string {
 // the response, and returns the assistant content + the model name echoed
 // back by the upstream (used in the SSE response). All returned errors are
 // tagged via newCascadeErr so the runner knows whether to fall back.
-func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payload map[string]interface{}) (content, servedModel string, err error) {
+func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payload map[string]interface{}, opts ...CallOption) (content, servedModel string, err error) {
 	body := make(map[string]interface{}, len(payload)+2)
 	for k, v := range payload {
 		body[k] = v
@@ -185,6 +185,9 @@ func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payl
 	req.Header.Set("Content-Type", "application/json")
 	if step.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+step.APIKey)
+	}
+	if o := applyCallOpts(opts); o.traceparent != "" {
+		req.Header.Set("traceparent", o.traceparent)
 	}
 
 	resp, dErr := client.Do(req)

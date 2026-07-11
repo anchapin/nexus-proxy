@@ -33,6 +33,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/ratelimit"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 	"github.com/anchapin/nexus-proxy/internal/transport"
 )
 
@@ -316,6 +317,37 @@ func main() {
 	collector := observability.NewCollector()
 	gaugeProviders := buildGaugeProviders(hpoller, probeMgr, judgeEval, verifier, metricsStore, recorder)
 
+	// Distributed tracing (issue #41). The exporter is nil when
+	// NEXUS_TRACING_ENDPOINT is empty — matches the "zero overhead
+	// when disabled" contract documented on handlers.Deps.Tracer.
+	// Uses the connection-pooled client so the export POSTs share
+	// idle conns with the chat handler rather than spawning a
+	// separate transport. Closed below in the shutdown path so a
+	// graceful drain flushes the in-memory span queue.
+	var tracer *tracing.Exporter
+	if cfg.TracingEnabled() {
+		tracer = tracing.NewExporter(tracing.ExporterConfig{
+			Endpoint:  cfg.TracingEndpoint,
+			Timeout:   cfg.TracingTimeout,
+			QueueSize: cfg.TracingQueueSize,
+			Client:    client,
+			Sampler:   tracing.NewProbabilitySampler(cfg.TracingSampleRate),
+		})
+		if tracer == nil {
+			slog.Warn("tracing exporter unavailable; tracing disabled",
+				slog.String("endpoint", cfg.TracingEndpoint))
+		} else {
+			slog.Info("tracing enabled",
+				slog.String("endpoint", cfg.TracingEndpoint),
+				slog.Float64("sample_rate", cfg.TracingSampleRate),
+				slog.Duration("timeout", cfg.TracingTimeout),
+				slog.Int("queue", cfg.TracingQueueSize),
+			)
+		}
+	} else {
+		slog.Info("tracing disabled (NEXUS_TRACING_ENDPOINT is empty)")
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/v1/chat/completions", handlers.Chat(handlers.Deps{
 		Config:                cfg,
@@ -332,6 +364,7 @@ func main() {
 		BudgetObserver:        budgetObserver(probeMgr),
 		Limiter:               buildLocalLimiter(cfg),
 		SpendGuard:            buildSpendGuard(cfg),
+		Tracer:                tracer,
 	}))
 
 	// /healthz returns a small JSON document so operators can see
@@ -472,6 +505,11 @@ func main() {
 		if judgeEval != nil {
 			if err := judgeEval.Close(); err != nil {
 				slog.Warn("judge close", slog.Any("err", err))
+			}
+		}
+		if tracer != nil {
+			if err := tracer.Close(); err != nil {
+				slog.Warn("tracer close", slog.Any("err", err))
 			}
 		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
