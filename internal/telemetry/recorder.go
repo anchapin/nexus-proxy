@@ -36,9 +36,17 @@ const bufferedChannelSize = 1024
 // explicit Flush call rather than the bufio auto-flush threshold.
 const writeBufferSize = 16 << 10
 
-// Record is the row written for every proxied request. Times are stored in
-// milliseconds; TTFTMs is 0 for non-streaming responses (TTFT is undefined
-// when the harness requested a single buffered reply).
+// Record is the row written for every proxied request.
+//
+// TTFTMs is integer milliseconds (0 for non-streaming responses — TTFT
+// is undefined when the harness requested a single buffered reply).
+//
+// TotalLatencyMs is FLOAT64 milliseconds (issue #68). Sub-millisecond
+// precision matters: on fast hardware the cast to int64 truncates a
+// few-microsecond handler run to 0, which trips assertions that the
+// latency was recorded and surfaces as a race-detector-dependent
+// flake. Storing the value as float64 captures the true elapsed time
+// regardless of rounding for display.
 //
 // FusionArbiterSkipped (issue #48) is true only for route=fusion
 // requests that streamed the speculative panel-member answer and
@@ -64,7 +72,7 @@ type Record struct {
 	InputTokens          int       `json:"input_tokens"`
 	OutputTokens         int       `json:"output_tokens"`
 	TTFTMs               int64     `json:"ttft_ms"`
-	TotalLatencyMs       int64     `json:"total_latency_ms"`
+	TotalLatencyMs       float64   `json:"total_latency_ms"`
 	TPS                  float64   `json:"tps"`
 	Streaming            bool      `json:"streaming"`
 	FusionArbiterSkipped bool      `json:"fusion_arbiter_skipped,omitempty"`
@@ -94,15 +102,21 @@ func EstimateTokens(s string) int {
 // phase (total latency minus time-to-first-token). Returns 0 when the
 // generation window is non-positive or no tokens were produced. Units are
 // tokens / second.
-func ComputeTPS(outputTokens int, ttftMs, totalMs int64) float64 {
+//
+// totalMs is float64 milliseconds (see Record.TotalLatencyMs); ttftMs is
+// integer milliseconds. Mixing the two is deliberate — TTFT rounds to a
+// coarse integer because the first-byte hook fires on a Write call and
+// the slack is well above 1 ms — while totalMs keeps sub-ms precision to
+// avoid the issue #68 flake.
+func ComputeTPS(outputTokens int, ttftMs int64, totalMs float64) float64 {
 	if outputTokens <= 0 || totalMs <= 0 {
 		return 0
 	}
-	genMs := totalMs - ttftMs
+	genMs := totalMs - float64(ttftMs)
 	if genMs <= 0 {
 		return 0
 	}
-	return float64(outputTokens) * 1000.0 / float64(genMs)
+	return float64(outputTokens) * 1000.0 / genMs
 }
 
 // Recorder persists records. Implementations MUST NOT block Record callers;

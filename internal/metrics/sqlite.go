@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS requests (
     baseline_cost_usd REAL NOT NULL DEFAULT 0,
     savings_usd REAL NOT NULL DEFAULT 0,
     ttft_ms INTEGER NOT NULL DEFAULT 0,
-    total_latency_ms INTEGER NOT NULL DEFAULT 0,
+    total_latency_ms REAL NOT NULL DEFAULT 0,
     tps REAL NOT NULL DEFAULT 0,
     streaming INTEGER NOT NULL DEFAULT 1,
     fusion_arbiter_skipped INTEGER NOT NULL DEFAULT 0,

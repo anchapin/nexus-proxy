@@ -68,6 +68,9 @@ const recordRequestErrorTimeout = 5 * time.Second
 // Streaming, Error) carry the same shape as telemetry.Record so the
 // SQLiteStore can satisfy both interfaces.
 //
+// TotalLatencyMs is float64 milliseconds (issue #68) — see
+// telemetry.Record.TotalLatencyMs for the rationale.
+//
 // FusionArbiterSkipped (issue #48) mirrors telemetry.Record: true only
 // for route=fusion requests that streamed the speculative panel-member
 // answer and terminated without invoking the arbiter. False in every
@@ -97,7 +100,7 @@ type Request struct {
 
 	OutputTokens         int
 	TTFTMs               int64
-	TotalLatencyMs       int64
+	TotalLatencyMs       float64
 	TPS                  float64
 	Streaming            bool
 	FusionArbiterSkipped bool
@@ -134,7 +137,7 @@ type Summary struct {
 	BaselineCostTotal float64
 	SavingsTotal      float64
 
-	TotalLatencyMsSum int64
+	TotalLatencyMsSum float64
 	ErrorCount        int
 }
 
