@@ -216,6 +216,20 @@ type Config struct {
 	// is the production default, text is friendlier for local dev.
 	LogLevel  slog.Level
 	LogFormat LogFormat
+
+	// Distributed tracing (issue #41). When TracingEndpoint is empty
+	// the proxy boots with zero tracing overhead — no background
+	// goroutine, no per-request allocation beyond a nil-check on
+	// Deps.Tracer. Setting the endpoint enables the W3C
+	// `traceparent` propagation, span tree creation, and async
+	// OTLP/JSON export. TracingSampleRate (0.0–1.0) is the
+	// probability that any given request is recorded; TracingTimeout
+	// bounds each POST; TracingQueueSize caps the in-memory backlog
+	// before the export loop starts dropping spans.
+	TracingEndpoint   string
+	TracingSampleRate float64
+	TracingTimeout    time.Duration
+	TracingQueueSize  int
 }
 
 // DefaultMetricsDBPath returns the canonical metrics DB location:
@@ -294,6 +308,10 @@ var configKeys = map[string]string{
 	"ratelimit.per_client_burst":          "NEXUS_RATE_LIMIT_BURST",
 	"ratelimit.global_rpm":                "NEXUS_GLOBAL_RATE_LIMIT_RPM",
 	"ratelimit.frontier_daily_budget_usd": "NEXUS_FRONTIER_DAILY_BUDGET_USD",
+	"tracing.endpoint":                    "NEXUS_TRACING_ENDPOINT",
+	"tracing.sample_rate":                 "NEXUS_TRACING_SAMPLE_RATE",
+	"tracing.timeout":                     "NEXUS_TRACING_TIMEOUT",
+	"tracing.queue":                       "NEXUS_TRACING_QUEUE",
 }
 
 // fileMapFromKeys translates the parsed section.key map into an
@@ -698,8 +716,50 @@ func Load() (Config, error) {
 	cfg.LogLevel = parseLogLevel(resolveString("NEXUS_LOG_LEVEL", fileMap, ""))
 	cfg.LogFormat = parseLogFormat(resolveString("NEXUS_LOG_FORMAT", fileMap, ""))
 
+	// Distributed tracing (issue #41). All four vars default to
+	// "disabled" — the exporter only starts when the operator
+	// explicitly sets NEXUS_TRACING_ENDPOINT. Sample rate defaults
+	// to 0 (off); the timeout and queue have sane operator-friendly
+	// defaults that match the spec.
+	cfg.TracingEndpoint = resolveAllowEmpty("NEXUS_TRACING_ENDPOINT", fileMap, "")
+
+	tracingRate, err := resolveFloat("NEXUS_TRACING_SAMPLE_RATE", fileMap, 0)
+	if err != nil {
+		return cfg, err
+	}
+	if tracingRate < 0 {
+		tracingRate = 0
+	}
+	if tracingRate > 1 {
+		tracingRate = 1
+	}
+	cfg.TracingSampleRate = tracingRate
+
+	tracingTimeout, err := resolveDuration("NEXUS_TRACING_TIMEOUT", fileMap, 10*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	if tracingTimeout <= 0 {
+		tracingTimeout = 10 * time.Second
+	}
+	cfg.TracingTimeout = tracingTimeout
+
+	tracingQueue, err := resolveInt("NEXUS_TRACING_QUEUE", fileMap, 256)
+	if err != nil {
+		return cfg, err
+	}
+	if tracingQueue <= 0 {
+		tracingQueue = 256
+	}
+	cfg.TracingQueueSize = tracingQueue
+
 	return cfg, nil
 }
+
+// TracingEnabled reports whether the OTLP/JSON exporter should
+// start. Returns false when TracingEndpoint is empty (the spec
+// contract: an unset endpoint keeps the binary entirely trace-free).
+func (c Config) TracingEnabled() bool { return c.TracingEndpoint != "" }
 
 // FrontierEnabled reports whether a frontier API key is configured. The proxy
 // still runs without one (fusion will degrade to local-only), but frontier

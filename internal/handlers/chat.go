@@ -25,6 +25,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
 
@@ -307,6 +308,19 @@ type Deps struct {
 	// (backward compatible).
 	SpendGuard SpendGuard
 
+	// Tracer emits spans for each request phase (issue #41). The
+	// exporter owns the W3C traceparent parsing, sampling decision,
+	// and OTLP/JSON export; the handler just wraps each phase in
+	// a child span and stamps the per-phase attributes (route,
+	// model, input_tokens, ttft_ms, total_latency_ms, ...).
+	//
+	// Optional: a nil Tracer is treated as "tracing disabled" so
+	// every method call short-circuits without producing a span or
+	// allocating beyond a nil-check. Chat() does NOT substitute a
+	// no-op exporter — the handler does the nil-check inline so the
+	// hot path avoids an unnecessary indirection when tracing is off.
+	Tracer *tracing.Exporter
+
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
 	// copy used for sampling is bounded. Zero uses DefaultObservedCap.
@@ -362,6 +376,26 @@ func Chat(d Deps) http.Handler {
 			return
 		}
 
+		// Distributed tracing (issue #41). Honour an inbound W3C
+		// `traceparent` so an upstream caller can attach the proxy
+		// to its trace; otherwise mint a fresh trace id. The
+		// exporter's sampler decides per-trace whether the spans
+		// are actually exported, so NEXUS_TRACING_SAMPLE_RATE=0
+		// transparently skips the whole subtree.
+		var traceCtx tracing.Context
+		if tp := r.Header.Get("traceparent"); tp != "" {
+			if traceID, spanID, ok := tracing.ParseTraceparent(tp); ok {
+				traceCtx = tracing.Context{TraceID: traceID, SpanID: spanID}
+			}
+		}
+		var rootCtx tracing.Context
+		var rootSpan *tracing.Span
+		if d.Tracer != nil {
+			rootCtx, rootSpan = d.Tracer.StartSpan(traceCtx, "nexus.chat_completions")
+			defer rootSpan.End()
+			rootSpan.SetAttr("request_id", reqID)
+		}
+
 		// Hard cap on request body (issue #11). Wrap with
 		// http.MaxBytesReader BEFORE any allocation so an oversized
 		// POST cannot exhaust proxy memory; MaxBytesReader caps
@@ -401,16 +435,38 @@ func Chat(d Deps) http.Handler {
 		latestPrompt := middleware.ExtractLatestUserPrompt(messages)
 		var ragInjected bool
 		var ragFilename string
-		if ex, score, err := d.RAG.Retrieve(r.Context(), latestPrompt); err == nil && ex != nil {
-			messages = middleware.InjectRAG(messages, rag.FormatInjection(ex))
-			slog.Info("rag hit",
-				slog.String("filename", ex.Filename),
-				slog.Float64("score", score),
-				slog.String("request_id", reqID),
-			)
-			ragInjected = true
-			ragFilename = ex.Filename
-			_ = score
+		if d.Tracer != nil {
+			_, ragSpan := d.Tracer.StartSpan(rootCtx, "rag.retrieve")
+			ragSpan.SetAttr("threshold", d.Config.RAGThreshold)
+			if ex, score, err := d.RAG.Retrieve(r.Context(), latestPrompt); err == nil && ex != nil {
+				messages = middleware.InjectRAG(messages, rag.FormatInjection(ex))
+				slog.Info("rag hit",
+					slog.String("filename", ex.Filename),
+					slog.Float64("score", score),
+					slog.String("request_id", reqID),
+				)
+				ragInjected = true
+				ragFilename = ex.Filename
+				ragSpan.SetAttr("filename", ex.Filename)
+				ragSpan.SetAttr("score", score)
+				ragSpan.SetAttr("injected", true)
+				_ = score
+			} else {
+				ragSpan.SetAttr("injected", false)
+			}
+			ragSpan.End()
+		} else {
+			if ex, score, err := d.RAG.Retrieve(r.Context(), latestPrompt); err == nil && ex != nil {
+				messages = middleware.InjectRAG(messages, rag.FormatInjection(ex))
+				slog.Info("rag hit",
+					slog.String("filename", ex.Filename),
+					slog.Float64("score", score),
+					slog.String("request_id", reqID),
+				)
+				ragInjected = true
+				ragFilename = ex.Filename
+				_ = score
+			}
 		}
 		// Snapshot the JSON size BEFORE TOON compression so the
 		// metrics observer can attribute tokens saved by the
@@ -418,6 +474,11 @@ func Chat(d Deps) http.Handler {
 		// heuristic the rest of the project uses for telemetry
 		// (see internal/telemetry.EstimateTokens).
 		preCompressionChars := totalMessageChars(messages)
+		var toonSpan *tracing.Span
+		if d.Tracer != nil {
+			_, toonSpan = d.Tracer.StartSpan(rootCtx, "toon.compress")
+			toonSpan.SetAttr("pre_chars", preCompressionChars)
+		}
 		toonCompressed := middleware.CompressJSONBlocks(messages)
 		if toonCompressed {
 			messages = middleware.AppendSystemNote(messages, d.Config.TOONNotice)
@@ -425,6 +486,10 @@ func Chat(d Deps) http.Handler {
 		}
 		body["messages"] = messages
 		latestPrompt = middleware.ExtractLatestUserPrompt(messages)
+		if toonSpan != nil {
+			toonSpan.SetAttr("compressed", toonCompressed)
+			toonSpan.End()
+		}
 
 		var route router.Route
 		// VRAM-aware guardrail (issue #6). When the
@@ -441,6 +506,11 @@ func Chat(d Deps) http.Handler {
 				guardrailSource = d.BudgetObserver.BudgetSource()
 			}
 		}
+		// Wrap the routing decision in a single span
+		// (route.guardrail|route.dsl|route.slm) so the trace tree
+		// shows which rule fired. The span name is chosen inside
+		// the if/else so the collector displays the actual path
+		// taken without ambiguity.
 		if g, hit := router.Guardrail(latestPrompt, guardrailBudget); hit {
 			slog.Info("guardrail forced frontier",
 				slog.String("reason", "vram"),
@@ -450,12 +520,25 @@ func Chat(d Deps) http.Handler {
 				slog.String("request_id", reqID),
 			)
 			route = g
+			if d.Tracer != nil {
+				_, rs := d.Tracer.StartSpan(rootCtx, "route.guardrail")
+				rs.SetAttr("budget_source", guardrailSource)
+				rs.SetAttr("budget_tokens", guardrailBudget)
+				rs.SetAttr("estimated_tokens", len(latestPrompt)/4)
+				rs.SetAttr("decision", string(route))
+				rs.End()
+			}
 		} else if r2, hit := router.DSL(latestPrompt, d.FormattingRegex); hit {
 			slog.Info("dsl match",
 				slog.String("route", string(r2)),
 				slog.String("request_id", reqID),
 			)
 			route = r2
+			if d.Tracer != nil {
+				_, rs := d.Tracer.StartSpan(rootCtx, "route.dsl")
+				rs.SetAttr("decision", string(route))
+				rs.End()
+			}
 		} else {
 			slog.Debug("dsl bypassed, asking slm", slog.String("request_id", reqID))
 			dec, err := d.SLM.Decide(r.Context(), latestPrompt)
@@ -471,6 +554,14 @@ func Chat(d Deps) http.Handler {
 				slog.String("request_id", reqID),
 			)
 			route = dec
+			if d.Tracer != nil {
+				_, rs := d.Tracer.StartSpan(rootCtx, "route.slm")
+				rs.SetAttr("decision", string(route))
+				if err != nil {
+					rs.RecordError(err)
+				}
+				rs.End()
+			}
 		}
 
 		// Honor the harness's stream flag (issue #10). OpenAI treats
@@ -527,6 +618,11 @@ func Chat(d Deps) http.Handler {
 
 		var model string
 		var upErr error
+		// Build the traceparent for outbound propagation once we
+		// know the upstream span. Each route branch starts its own
+		// span below, captures the resulting upCtx, and threads
+		// the corresponding traceparent header into the upstream
+		// call so the distributed trace stays correlated end-to-end.
 		switch route {
 		case router.RouteFusion:
 			slog.Info("starting fusion panel", slog.String("request_id", reqID))
@@ -554,6 +650,14 @@ func Chat(d Deps) http.Handler {
 				}
 			}
 
+			var upCtx tracing.Context
+			var upSpan *tracing.Span
+			if d.Tracer != nil {
+				upCtx, upSpan = d.Tracer.StartSpan(rootCtx, "upstream.fusion")
+				upSpan.SetAttr("local_model", d.Config.LocalModel)
+				upSpan.SetAttr("frontier_model", d.Config.FrontierModel)
+				upSpan.SetAttr("skip_local", fusionSkipLocal)
+			}
 			upErr = upstream.Panel(
 				obs, d.Client,
 				d.Config.OllamaURL, d.Config.LocalModel,
@@ -562,15 +666,22 @@ func Chat(d Deps) http.Handler {
 				body, latestPrompt, d.Config.FusionTimeout,
 				d.Config.ArbiterTimeout,
 				fusionSkipLocal,
+				upstream.WithTraceparent(tracing.InjectTraceparent(upCtx)),
 			)
 			if upErr != nil {
 				slog.Error("fusion error",
 					slog.Any("err", upErr),
 					slog.String("request_id", reqID),
 				)
+				if upSpan != nil {
+					upSpan.RecordError(upErr)
+				}
 				http.Error(w, "Upstream error", http.StatusBadGateway)
 			}
 			model = d.Config.FrontierModel
+			if upSpan != nil {
+				upSpan.End()
+			}
 
 		case router.RouteLocal:
 			body["model"] = d.Config.LocalModel
@@ -649,6 +760,14 @@ func Chat(d Deps) http.Handler {
 				cap = newCaptureWriter(obs, d.maxObservedBytes)
 				rw = cap
 			}
+			var upCtx tracing.Context
+			var upSpan *tracing.Span
+			if d.Tracer != nil {
+				upCtx, upSpan = d.Tracer.StartSpan(rootCtx, "upstream.local")
+				upSpan.SetAttr("local_model", d.Config.LocalModel)
+				upSpan.SetAttr("skip_local", skipLocal)
+				upSpan.SetAttr("streaming", streaming)
+			}
 			if streaming {
 				// Cascade (issue #14): try local Ollama first, fall
 				// back to configured frontier endpoints (frontier,
@@ -656,14 +775,23 @@ func Chat(d Deps) http.Handler {
 				// #8) is honoured — when the health poller reports
 				// Ollama unreachable the cascade skips the local step
 				// entirely and starts at frontier.
-				res, err := cas.Run(rw, d.Client, body)
+				res, err := cas.Run(rw, d.Client, body, upstream.WithTraceparent(tracing.InjectTraceparent(upCtx)))
 				logCascadeTelemetry(res, err, reqID)
+				if upSpan != nil {
+					upSpan.SetAttr("cascade_attempted", res.RouteAttempted)
+					upSpan.SetAttr("cascade_served_by", res.ServedBy)
+					upSpan.SetAttr("cascade_attempts", res.Attempts)
+					upSpan.SetAttr("cascade_succeeded", res.Succeeded)
+				}
 				if err != nil {
 					slog.Error("upstream error",
 						slog.Any("err", err),
 						slog.String("request_id", reqID),
 					)
 					upErr = err
+					if upSpan != nil {
+						upSpan.RecordError(err)
+					}
 					http.Error(w, "Upstream error", http.StatusBadGateway)
 					// fall through: telemetry Record still fires
 					// below so the failed request shows up in the
@@ -705,17 +833,23 @@ func Chat(d Deps) http.Handler {
 					targetURL = d.Config.FrontierURL
 					apiKey = d.Config.FrontierKey
 				}
-				if err := upstream.BufferedFetch(rw, d.Client, targetURL, apiKey, body); err != nil {
+				if err := upstream.BufferedFetch(rw, d.Client, targetURL, apiKey, body, upstream.WithTraceparent(tracing.InjectTraceparent(upCtx))); err != nil {
 					slog.Error("upstream error",
 						slog.Any("err", err),
 						slog.String("request_id", reqID),
 					)
 					upErr = err
+					if upSpan != nil {
+						upSpan.RecordError(err)
+					}
 					http.Error(w, "Upstream error", http.StatusBadGateway)
 				} else {
 					model = d.Config.LocalModel
 					if skipLocal {
 						model = d.Config.FrontierModel
+					}
+					if upSpan != nil {
+						upSpan.SetAttr("cascade_served_by", "local-buffer")
 					}
 					if cap != nil {
 						if d.JudgeObserver != nil {
@@ -731,6 +865,9 @@ func Chat(d Deps) http.Handler {
 						}
 					}
 				}
+			}
+			if upSpan != nil {
+				upSpan.End()
 			}
 
 		default:
@@ -761,23 +898,39 @@ func Chat(d Deps) http.Handler {
 				}
 			}
 
+			var upCtx tracing.Context
+			var upSpan *tracing.Span
+			if d.Tracer != nil {
+				upCtx, upSpan = d.Tracer.StartSpan(rootCtx, "upstream.frontier")
+				upSpan.SetAttr("frontier_model", d.Config.FrontierModel)
+				upSpan.SetAttr("streaming", streaming)
+			}
+
 			// Honor the harness's stream flag (issue #10). Stream
 			// preserves SSE framing for chunked deliveries;
 			// BufferedFetch collects the full body and returns a
 			// single chatCompletionResponse JSON object.
 			if streaming {
 				upErr = upstream.Stream(obs, d.Client,
-					d.Config.FrontierURL, d.Config.FrontierKey, body)
+					d.Config.FrontierURL, d.Config.FrontierKey, body,
+					upstream.WithTraceparent(tracing.InjectTraceparent(upCtx)))
 			} else {
 				upErr = upstream.BufferedFetch(obs, d.Client,
-					d.Config.FrontierURL, d.Config.FrontierKey, body)
+					d.Config.FrontierURL, d.Config.FrontierKey, body,
+					upstream.WithTraceparent(tracing.InjectTraceparent(upCtx)))
 			}
 			if upErr != nil {
 				slog.Error("upstream error",
 					slog.Any("err", upErr),
 					slog.String("request_id", reqID),
 				)
+				if upSpan != nil {
+					upSpan.RecordError(upErr)
+				}
 				http.Error(w, "Upstream error", http.StatusBadGateway)
+			}
+			if upSpan != nil {
+				upSpan.End()
 			}
 		}
 
@@ -861,6 +1014,30 @@ func Chat(d Deps) http.Handler {
 				TotalLatencyMs:    totalMs,
 				TTFTMs:            ttftMs,
 			})
+		}
+
+		// Stamp the request-level summary attributes on the root
+		// span (issue #41). Operators querying the collector for
+		// "show me every route=frontier request that took > 5s"
+		// can filter on these without leaving the trace UI.
+		if rootSpan != nil {
+			rootSpan.SetAttr("route", string(route))
+			rootSpan.SetAttr("model", model)
+			rootSpan.SetAttr("input_tokens", rec.InputTokens)
+			rootSpan.SetAttr("output_tokens", outputTokens)
+			rootSpan.SetAttr("ttft_ms", ttftMs)
+			rootSpan.SetAttr("total_latency_ms", totalMs)
+			rootSpan.SetAttr("degraded", degraded)
+			rootSpan.SetAttr("streaming", streaming)
+			rootSpan.SetAttr("rag_injected", ragInjected)
+			if ragInjected {
+				rootSpan.SetAttr("rag_filename", ragFilename)
+			}
+			rootSpan.SetAttr("toon_compressed", toonCompressed)
+			rootSpan.SetAttr("toon_savings_tokens", savings)
+			if upErr != nil {
+				rootSpan.RecordError(upErr)
+			}
 		}
 	})
 }
