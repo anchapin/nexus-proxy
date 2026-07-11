@@ -307,6 +307,10 @@ defaults. The most useful ones:
 | Variable                  | Default                       | Purpose                                  |
 | ------------------------- | ----------------------------- | ---------------------------------------- |
 | `NEXUS_ADDR`              | `:8000`                       | HTTP listen address                      |
+| `NEXUS_SERVER_READ_TIMEOUT` | `30s`                       | Inbound request read deadline (issue #77) |
+| `NEXUS_SERVER_WRITE_TIMEOUT` | `0` (disabled)             | Inbound response write deadline; 0 = streaming-safe (issue #77) |
+| `NEXUS_SERVER_IDLE_TIMEOUT` | `120s`                      | Keep-alive idle wait (issue #77)         |
+| `NEXUS_SERVER_MAX_HEADER_BYTES` | `1048576` (1 MiB)        | Max request header bytes (issue #77)     |
 | `NEXUS_FRONTIER_API_KEY`  | *(empty)*                     | Required for frontier routing to work    |
 | `NEXUS_TOKEN_GUARDRAIL`   | `6000`                        | Estimated tokens that force-route to frontier |
 | `NEXUS_RAG_THRESHOLD`     | `0.55`                        | Cosine similarity floor for RAG injection |

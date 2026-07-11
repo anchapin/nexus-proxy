@@ -76,6 +76,19 @@ func TestLoadDefaults(t *testing.T) {
 	if !cfg.TelemetryEnabled() {
 		t.Error("TelemetryEnabled = false, want true with default path")
 	}
+	// HTTP listener timeouts (issue #77).
+	if cfg.ReadTimeout != DefaultServerReadTimeout {
+		t.Errorf("ReadTimeout = %v, want %v", cfg.ReadTimeout, DefaultServerReadTimeout)
+	}
+	if cfg.WriteTimeout != 0 {
+		t.Errorf("WriteTimeout = %v, want 0 (disabled, streaming-safe)", cfg.WriteTimeout)
+	}
+	if cfg.IdleTimeout != DefaultServerIdleTimeout {
+		t.Errorf("IdleTimeout = %v, want %v", cfg.IdleTimeout, DefaultServerIdleTimeout)
+	}
+	if cfg.MaxHeaderBytes != DefaultServerMaxHeaderBytes {
+		t.Errorf("MaxHeaderBytes = %d, want %d", cfg.MaxHeaderBytes, DefaultServerMaxHeaderBytes)
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -364,6 +377,96 @@ func TestLoadLocalConcurrencyInvalidValues(t *testing.T) {
 	}{
 		{"bad max concurrent", "NEXUS_LOCAL_MAX_CONCURRENT", "many"},
 		{"bad bytes per slot", "NEXUS_LOCAL_VRAM_BYTES_PER_SLOT", "lots"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.key, tc.val)
+			if _, err := Load(); err == nil {
+				t.Errorf("expected error for %s=%s", tc.key, tc.val)
+			}
+		})
+	}
+}
+
+func TestLoadServerTimeoutOverrides(t *testing.T) {
+	t.Setenv("NEXUS_SERVER_READ_TIMEOUT", "45s")
+	t.Setenv("NEXUS_SERVER_WRITE_TIMEOUT", "300s")
+	t.Setenv("NEXUS_SERVER_IDLE_TIMEOUT", "60s")
+	t.Setenv("NEXUS_SERVER_MAX_HEADER_BYTES", "524288") // 512 KiB
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ReadTimeout != 45*time.Second {
+		t.Errorf("ReadTimeout = %v, want 45s", cfg.ReadTimeout)
+	}
+	if cfg.WriteTimeout != 300*time.Second {
+		t.Errorf("WriteTimeout = %v, want 300s", cfg.WriteTimeout)
+	}
+	if cfg.IdleTimeout != 60*time.Second {
+		t.Errorf("IdleTimeout = %v, want 60s", cfg.IdleTimeout)
+	}
+	if cfg.MaxHeaderBytes != 524288 {
+		t.Errorf("MaxHeaderBytes = %d, want 524288", cfg.MaxHeaderBytes)
+	}
+}
+
+func TestLoadServerTimeoutZeroAllowed(t *testing.T) {
+	// Zero is valid for all four — it disables the corresponding
+	// guard (and WriteTimeout=0 is the streaming-safe default).
+	t.Setenv("NEXUS_SERVER_READ_TIMEOUT", "0")
+	t.Setenv("NEXUS_SERVER_WRITE_TIMEOUT", "0")
+	t.Setenv("NEXUS_SERVER_IDLE_TIMEOUT", "0")
+	t.Setenv("NEXUS_SERVER_MAX_HEADER_BYTES", "0")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ReadTimeout != 0 {
+		t.Errorf("ReadTimeout = %v, want 0", cfg.ReadTimeout)
+	}
+	if cfg.WriteTimeout != 0 {
+		t.Errorf("WriteTimeout = %v, want 0", cfg.WriteTimeout)
+	}
+	if cfg.IdleTimeout != 0 {
+		t.Errorf("IdleTimeout = %v, want 0", cfg.IdleTimeout)
+	}
+	if cfg.MaxHeaderBytes != 0 {
+		t.Errorf("MaxHeaderBytes = %d, want 0", cfg.MaxHeaderBytes)
+	}
+}
+
+func TestLoadServerTimeoutNegativeRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+		val  string
+	}{
+		{"negative read timeout", "NEXUS_SERVER_READ_TIMEOUT", "-1s"},
+		{"negative write timeout", "NEXUS_SERVER_WRITE_TIMEOUT", "-5s"},
+		{"negative idle timeout", "NEXUS_SERVER_IDLE_TIMEOUT", "-10s"},
+		{"negative max header bytes", "NEXUS_SERVER_MAX_HEADER_BYTES", "-1024"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.key, tc.val)
+			if _, err := Load(); err == nil {
+				t.Errorf("expected error for %s=%s", tc.key, tc.val)
+			}
+		})
+	}
+}
+
+func TestLoadServerTimeoutInvalidValues(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+		val  string
+	}{
+		{"bad read timeout", "NEXUS_SERVER_READ_TIMEOUT", "soon"},
+		{"bad write timeout", "NEXUS_SERVER_WRITE_TIMEOUT", "forever"},
+		{"bad idle timeout", "NEXUS_SERVER_IDLE_TIMEOUT", "two minutes"},
+		{"bad max header bytes", "NEXUS_SERVER_MAX_HEADER_BYTES", "lots"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
