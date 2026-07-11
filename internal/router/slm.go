@@ -161,11 +161,9 @@ func (c *SLMClient) decide(ctx context.Context, prompt, systemPrompt string) (Ro
 	if content == "" {
 		return RouteFrontier, errors.New("slm: empty content")
 	}
-	var decision struct {
-		Route string `json:"route"`
-	}
-	if err := json.Unmarshal([]byte(content), &decision); err != nil {
-		return RouteFrontier, fmt.Errorf("slm: parse decision %q: %w", content, err)
+	decision, err := parseSLMDecision(content)
+	if err != nil {
+		return RouteFrontier, err
 	}
 
 	switch Route(strings.ToLower(decision.Route)) {
@@ -174,6 +172,133 @@ func (c *SLMClient) decide(ctx context.Context, prompt, systemPrompt string) (Ro
 	default:
 		return RouteFrontier, nil
 	}
+}
+
+// slmDecision is the parsed route-decision object returned by the routing
+// SLM. The model is instructed to emit {"route":"local|frontier|fusion"},
+// but it frequently wraps that in markdown fences or prose (issue #79).
+// parseSLMDecision below tolerates those shapes so a usable decision is
+// not discarded just because of formatting noise.
+type slmDecision struct {
+	Route string `json:"route"`
+}
+
+// parseSLMDecision extracts the route-decision JSON object from the SLM's
+// raw response content. It tolerates three common SLM output shapes:
+//  1. Bare JSON object: {"route":"local"}
+//  2. Markdown-fenced JSON: ```json\n{"route":"local"}\n```
+//  3. Prose before/after the first JSON object: Here: {"route":"local"} !
+//
+// It returns an error only when no valid JSON object can be found, so the
+// caller (decide) can fall back to RouteFrontier — the safe default. The
+// first balanced JSON object wins: if there are multiple objects only the
+// first is considered, so ambiguous/conflicting responses do not silently
+// pick a later object (issue #79).
+//
+// Defaults preserved for the caller: an unspecified or unknown route still
+// resolves to RouteFrontier unless the object explicitly names local or
+// fusion; confidence clamping and task-type defaults live in the planner
+// and are untouched here.
+func parseSLMDecision(content string) (slmDecision, error) {
+	var d slmDecision
+	content = strings.TrimSpace(content)
+
+	// 1. Fast path: the whole content is a bare JSON object.
+	if err := json.Unmarshal([]byte(content), &d); err == nil {
+		return d, nil
+	}
+
+	// 2. Markdown-fenced JSON block (```json ... ``` or ``` ... ```).
+	if fenced := extractFencedJSON(content); fenced != "" {
+		if err := json.Unmarshal([]byte(fenced), &d); err == nil {
+			return d, nil
+		}
+	}
+
+	// 3. First balanced {...} substring, tolerating prose wrappers and
+	// braces that appear inside JSON string literals.
+	if obj := extractFirstJSONObject(content); obj != "" {
+		if err := json.Unmarshal([]byte(obj), &d); err == nil {
+			return d, nil
+		}
+	}
+
+	return slmDecision{}, fmt.Errorf("slm: no parseable JSON decision in %q", content)
+}
+
+// extractFencedJSON returns the trimmed contents of the first markdown
+// fenced code block in content, preferring a ```json opener and falling
+// back to a bare ``` opener. It returns "" when no complete fenced block
+// is present. Matching on the opener is case-insensitive so ```JSON and
+// ```Json also work.
+func extractFencedJSON(content string) string {
+	lower := strings.ToLower(content)
+	for _, opener := range []string{"```json", "```"} {
+		idx := strings.Index(lower, opener)
+		if idx < 0 {
+			continue
+		}
+		start := idx + len(opener)
+		// Skip a single trailing newline immediately after the opener so
+		// it is not treated as part of the JSON payload.
+		if rest := content[start:]; strings.HasPrefix(rest, "\r\n") {
+			start += 2
+		} else if strings.HasPrefix(rest, "\n") {
+			start++
+		}
+		if start > len(content) {
+			continue
+		}
+		end := strings.Index(content[start:], "```")
+		if end < 0 {
+			continue
+		}
+		return strings.TrimSpace(content[start : start+end])
+	}
+	return ""
+}
+
+// extractFirstJSONObject returns the first brace-balanced JSON object
+// substring of content, starting at the first '{'. It is string-literal
+// aware so braces that appear inside JSON string values do not affect
+// balancing. It returns "" when content has no '{' or the braces never
+// balance to zero.
+func extractFirstJSONObject(content string) string {
+	start := strings.IndexByte(content, '{')
+	if start < 0 {
+		return ""
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(content); i++ {
+		c := content[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if inString {
+			switch c {
+			case '\\':
+				escaped = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return content[start : i+1]
+			}
+		}
+	}
+	return ""
 }
 
 // HTTPPoster is the minimal interface SLMClient needs from an http.Client.
