@@ -1083,13 +1083,9 @@ func Chat(d Deps) http.Handler {
 			))
 		}
 
-		// Per-request recording. The metrics observer (issue #4)
-		// is preferred when configured: it carries the savings
-		// dimensions (TOON delta, RAG injection, cost) that
-		// telemetry.Record cannot express. The legacy Recorder
-		// remains for callers that only want the TTFT / latency
-		// fields, or when no metrics store is wired (operator
-		// opted out by leaving NEXUS_METRICS_DB empty).
+		// Per-request recording. Recorder and MetricsObserver are
+		// independent sinks: the former preserves the tail-friendly
+		// JSONL log while the latter carries richer savings dimensions.
 		totalMs := time.Since(started).Milliseconds()
 		var ttftMs int64
 		if streaming && firstWriteAt.Load() > 0 {
@@ -1128,9 +1124,8 @@ func Chat(d Deps) http.Handler {
 				Error:             rec.Error,
 				TaskType:          slmTaskType,
 			})
-		} else {
-			d.Recorder.Record(rec)
 		}
+		d.Recorder.Record(rec)
 
 		// In-process Prometheus collector (issue #40). Dispatched once
 		// per proxied request with the routing/error/RAG/TOON/degraded
