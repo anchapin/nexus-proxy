@@ -8,6 +8,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"regexp"
+	"sync"
+	"syscall"
+	"time"
+
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/handlers"
 	"github.com/anchapin/nexus-proxy/internal/health"
@@ -18,15 +28,6 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
-	"log"
-	"log/slog"
-	"net/http"
-	"os"
-	"os/signal"
-	"regexp"
-	"sync"
-	"syscall"
-	"time"
 )
 
 const (
@@ -48,12 +49,18 @@ func main() {
 	slog.SetDefault(logger)
 
 	emb := rag.NewOllamaEmbedder(cfg.OllamaURL, cfg.EmbeddingModel, nil)
-	store := rag.NewStore(emb, cfg.RAGThreshold)
 	bootCtx, cancel := context.WithTimeout(context.Background(), bootRAGTimeout)
 	defer cancel()
-	if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
-		slog.Warn("rag index failed", slog.Any("err", err))
-	}
+
+	// RAG store (issue #46). When NEXUS_RAG_DB is set, open the
+	// SQLite-backed PersistentStore and LoadOrIndex it. The boot
+	// path is a one-shot: Load if the DB has rows, otherwise
+	// IndexDir (which embeds via Ollama AND persists each result).
+	// When NEXUS_RAG_DB is empty we fall back to the legacy
+	// in-memory-only Store with the original IndexDir semantics —
+	// the proxy is byte-for-byte identical to the pre-issue-46
+	// behaviour.
+	store, persistentStore, ragWatcher := buildRAGStore(cfg, emb, bootCtx)
 
 	slm := router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, cfg.SLMTimeout, nil)
 	// Judge-guided adaptive routing (issue #47): the confidence
@@ -222,6 +229,28 @@ func main() {
 			slog.Error("telemetry close", slog.Any("err", err))
 		}
 	}()
+
+	// File watcher (issue #46). Spawned only when persistence is
+	// enabled AND the operator set NEXUS_RAG_POLL_INTERVAL > 0.
+	// Stop blocks on shutdown so the goroutine has a chance to
+	// drain before the DB handle closes below.
+	if ragWatcher != nil {
+		defer func() {
+			ragWatcher.Stop()
+			slog.Info("rag watcher stopped")
+		}()
+	}
+
+	// Persistent store (issue #46). Close flushes WAL frames after
+	// the watcher has stopped, so any final Upsert from a pending
+	// scan lands on disk.
+	if persistentStore != nil {
+		defer func() {
+			if err := persistentStore.Close(); err != nil {
+				slog.Warn("rag persistent store close", slog.Any("err", err))
+			}
+		}()
+	}
 
 	// SQLite-backed metrics store (issue #4). When configured the
 	// per-request savings events go here; the JSONL recorder above
@@ -434,6 +463,91 @@ func (b *confidenceBridge) Record(s judge.JudgeScore) error {
 // *sql.DB is closed separately in main (it is owned there, not by the
 // bridge).
 func (b *confidenceBridge) Close() error { return b.inner.Close() }
+
+// buildRAGStore constructs the RAG store (issue #46). Returns:
+//   - store: the RAGStore the chat handler is wired to (PersistentStore
+//     or in-memory Store, both satisfy the interface);
+//   - persistentStore: non-nil only when persistence is enabled, so the
+//     caller knows whether to schedule a Close() on shutdown;
+//   - watcher: non-nil only when the background file watcher is
+//     running, so the caller can Stop() it before closing the DB.
+//
+// Boot path:
+//   - When NEXUS_RAG_DB is set: open PersistentStore, call
+//     LoadOrIndex (Load if the DB has rows, otherwise IndexDir which
+//     embeds AND persists each file). On any error during open we log
+//     and fall back to the legacy in-memory Store so the proxy still
+//     serves traffic — persistence is an optimisation, not a
+//     correctness requirement.
+//   - When NEXUS_RAG_DB is empty: construct a plain in-memory Store
+//     and run the original IndexDir path; this is byte-for-byte
+//     identical to the pre-issue-46 behaviour.
+//
+// The watcher is started only when persistence is enabled AND
+// NEXUS_RAG_POLL_INTERVAL > 0; an interval of zero leaves
+// persistence on but disables runtime updates (boot-only load).
+func buildRAGStore(cfg config.Config, emb *rag.OllamaEmbedder, bootCtx context.Context) (rag.RAGStore, *rag.PersistentStore, *rag.Watcher) {
+	if !cfg.RAGPersistentEnabled() {
+		slog.Info("rag persistent store disabled (NEXUS_RAG_DB is empty); using in-memory store")
+		store := rag.NewStore(emb, cfg.RAGThreshold)
+		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
+			slog.Warn("rag index failed", slog.Any("err", err))
+		}
+		return store, nil, nil
+	}
+
+	ps, err := rag.OpenPersistentStore(cfg.RAGDBPath, emb, cfg.RAGThreshold)
+	if err != nil {
+		// Persistence is a best-effort optimisation. Fall back to
+		// the in-memory store so the proxy still serves traffic —
+		// an operator with a broken cache should not blackhole
+		// requests.
+		slog.Error("rag persistent store open failed, falling back to in-memory store",
+			slog.String("path", cfg.RAGDBPath),
+			slog.Any("err", err),
+		)
+		store := rag.NewStore(emb, cfg.RAGThreshold)
+		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
+			slog.Warn("rag index failed", slog.Any("err", err))
+		}
+		return store, nil, nil
+	}
+
+	n, err := ps.LoadOrIndex(bootCtx, cfg.ExamplesDir)
+	if err != nil {
+		// If we can't read the DB AND can't re-index, fall back to
+		// a fresh in-memory store so the chat hot path still
+		// works. The persistent DB stays closed but unused.
+		slog.Error("rag load/index failed, falling back to in-memory store",
+			slog.String("path", cfg.RAGDBPath),
+			slog.Any("err", err),
+		)
+		_ = ps.Close()
+		store := rag.NewStore(emb, cfg.RAGThreshold)
+		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
+			slog.Warn("rag index failed", slog.Any("err", err))
+		}
+		return store, nil, nil
+	}
+	slog.Info("rag persistent store ready",
+		slog.String("path", cfg.RAGDBPath),
+		slog.Int("examples", n),
+	)
+
+	var watcher *rag.Watcher
+	if cfg.RAGWatcherEnabled() {
+		watcher = rag.NewWatcher(ps, cfg.ExamplesDir, cfg.RAGPollInterval)
+		watcher.Start(context.Background())
+		slog.Info("rag file watcher enabled",
+			slog.String("dir", cfg.ExamplesDir),
+			slog.Duration("interval", cfg.RAGPollInterval),
+		)
+	} else {
+		slog.Info("rag file watcher disabled (NEXUS_RAG_POLL_INTERVAL=0); boot-time load only")
+	}
+
+	return ps, ps, watcher
+}
 
 // buildRecorder constructs the telemetry recorder from config. A disabled
 // TelemetryPath returns a Noop so the handler can stay recorder-agnostic.

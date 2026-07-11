@@ -21,9 +21,7 @@ internal/
   middleware/              # toon.go, prompt_engine.go
   router/                  # dsl.go, slm.go, guardrails
   upstream/                # stream.go, fusion.go (panel + arbiter)
-  rag/                     # in-memory vector store + Ollama embedder
-judge/                   # async LLM-as-a-judge evaluator (issue #15)
-  telemetry/               # Recorder interface + JSONLRecorder + ObservingWriter
+  rag/                     # SQLite-backed store + Ollama embedder + file watcher (issue #46)
 few_shot_examples/         # (gitignored) user-curated snippets
 .env.example               # all env vars with safe defaults
 Makefile                   # build / test / lint / ci
@@ -153,6 +151,45 @@ In `internal/handlers/chat.go`:
   `internal/upstream/recording.go` to record and replay HTTP calls.
   All tests run in <2s with `-race`.
 
+## Persistent RAG vector store (issue #46)
+
+`internal/rag` now ships a SQLite-backed `PersistentStore` and a
+background `Watcher` so the few-shot embeddings survive restarts and
+new snippets can be indexed without restarting the proxy.
+
+```
+internal/rag/
+  rag.go          # FewShotExample, Embedder, RAGStore interface, Store (in-memory)
+  sqlite.go       # PersistentStore: SQLite-backed cache + Load/IndexDir/Upsert/Remove
+  watcher.go      # Watcher: mtime+size polling goroutine, file -> PersistentStore
+```
+
+The chat handler still calls `d.RAG.Retrieve` against a `rag.RAGStore`
+interface — both `*Store` and `*PersistentStore` satisfy it, so the
+handler is unaware of which implementation is wired.
+
+| Env var                       | Default                                  | Purpose                                  |
+| ----------------------------- | ---------------------------------------- | ---------------------------------------- |
+| `NEXUS_RAG_DB`                | `~/.cache/nexus-proxy/rag.db`            | On-disk SQLite cache; empty disables persistence |
+| `NEXUS_RAG_POLL_INTERVAL`     | `30s`                                    | Watcher cadence; `0` disables the watcher but keeps the cache |
+
+Boot path (when persistence is enabled):
+1. `OpenPersistentStore` opens (or creates) the DB and the in-memory
+   `*Store` it embeds.
+2. `LoadOrIndex` calls `Load` first (O(rows) — no Ollama) and only
+   falls back to `IndexDir` (which embeds + persists) if the DB is
+   empty.
+3. The watcher (when enabled) polls the examples dir every
+   `NEXUS_RAG_POLL_INTERVAL` and reconciles via Upsert/Remove using
+   (mtime, size) as the freshness signal — a re-write triggers
+   re-embed, a deletion drops the row.
+
+Embeddings are serialised with `encoding/gob` (stdlib, no extra
+dependency). The store is concurrency-safe via an internal
+`sync.RWMutex`; the watcher writes through `Upsert`/`Remove` and
+chat handlers read through `Retrieve` without coordination beyond
+the lock.
+
 ## Async LLM-as-a-Judge (issue #15)
 
 `internal/judge` is the async quality evaluator. It samples ~10% of
@@ -200,10 +237,10 @@ For new behaviour, add tests first and follow the existing layout:
 | New routing rule                     | `internal/router`                |
 | Different upstream protocol          | `internal/upstream`              |
 | New HTTP endpoint                    | `internal/handlers`              |
-| Fusion agreement / progressive logic | `internal/upstream` (PanelStreaming) |
 | Judge scoring / sampling logic       | `internal/judge`                 |
 | Judge persistence (SQLite, etc.)     | `internal/judge` (Storage impl)  |
 | New metric field or storage backend  | `internal/telemetry`             |
+| RAG embedding cache / indexer        | `internal/rag`                   |
 
 Existing functions map 1:1 to those packages. The handler is the only
 public entry point — keep middleware and router free of `net/http`

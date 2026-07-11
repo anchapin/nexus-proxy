@@ -110,6 +110,36 @@ func TestRetrieveEmbedderError(t *testing.T) {
 	}
 }
 
+// TestStoreConcurrentRetrieveAndAdd is a regression test for the
+// race detector: the watcher (issue #46) may Upsert while a chat
+// handler goroutine is mid-Retrieve. The store must serialise via
+// its RWMutex or `go test -race` flags the access.
+func TestStoreConcurrentRetrieveAndAdd(t *testing.T) {
+	emb := stubEmbedder{vecs: map[string][]float64{
+		"prompt": {1, 0, 0},
+		"a":      {0.9, 0.1, 0},
+		"b":      {0.1, 0.9, 0},
+		"c":      {0.5, 0.5, 0},
+	}}
+	store := NewStore(emb, 0.0)
+	store.Add("seed", "seed", []float64{1, 0})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			store.Add("seed", "seed", []float64{1, 0})
+			store.replace(store.snapshot())
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		if _, _, err := store.Retrieve(context.Background(), "prompt"); err != nil {
+			t.Fatalf("Retrieve: %v", err)
+		}
+	}
+	<-done
+}
+
 var errSentinel = errStub("embed down")
 
 type errStub string

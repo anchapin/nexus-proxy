@@ -185,7 +185,7 @@ func (b BudgetObserverFunc) BudgetSource() string {
 type Deps struct {
 	Config          config.Config
 	Client          upstream.Client // http.Client satisfies this interface
-	RAG             *rag.Store
+	RAG             rag.RAGStore
 	SLM             *router.SLMClient
 	FormattingRegex *regexp.Regexp
 
