@@ -477,3 +477,120 @@ func TestLoadServerTimeoutInvalidValues(t *testing.T) {
 		})
 	}
 }
+
+// --- Trusted proxies (issue #75) ---
+
+func TestTrustedProxies_DefaultDisabled(t *testing.T) {
+	t.Setenv("NEXUS_TRUSTED_PROXIES", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TrustedProxiesConfigured() {
+		t.Error("trusted proxies should be unconfigured by default (trust nobody)")
+	}
+	if cfg.RateLimitEnabled() {
+		t.Error("rate limit should be disabled by default")
+	}
+}
+
+func TestTrustedProxies_CIDRList(t *testing.T) {
+	t.Setenv("NEXUS_TRUSTED_PROXIES", "10.0.0.0/8, 172.16.0.0/12")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.TrustedProxies) != 2 {
+		t.Fatalf("expected 2 CIDRs, got %d", len(cfg.TrustedProxies))
+	}
+	if !cfg.TrustedProxiesConfigured() {
+		t.Error("TrustedProxiesConfigured should be true")
+	}
+}
+
+func TestTrustedProxies_BareIP(t *testing.T) {
+	t.Setenv("NEXUS_TRUSTED_PROXIES", "127.0.0.1")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.TrustedProxies) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(cfg.TrustedProxies))
+	}
+	if ones, bits := cfg.TrustedProxies[0].Mask.Size(); ones != 32 || bits != 32 {
+		t.Errorf("bare IPv4 should be /32, got /%d of %d", ones, bits)
+	}
+}
+
+func TestTrustedProxies_InvalidFailsBoot(t *testing.T) {
+	cases := []string{
+		"not-a-cidr",
+		"10.0.0.0/8, bogus",
+		"10.0.0.0/99",
+	}
+	for _, c := range cases {
+		t.Run(c, func(t *testing.T) {
+			t.Setenv("NEXUS_TRUSTED_PROXIES", c)
+			if _, err := Load(); err == nil {
+				t.Errorf("expected boot error for %q", c)
+			}
+		})
+	}
+}
+
+func TestRateLimit_Overrides(t *testing.T) {
+	t.Setenv("NEXUS_RATE_LIMIT_RPM", "120")
+	t.Setenv("NEXUS_RATE_LIMIT_BURST", "30")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimitRPM != 120 {
+		t.Errorf("RateLimitRPM = %d, want 120", cfg.RateLimitRPM)
+	}
+	if cfg.RateLimitBurst != 30 {
+		t.Errorf("RateLimitBurst = %d, want 30", cfg.RateLimitBurst)
+	}
+	if !cfg.RateLimitEnabled() {
+		t.Error("RateLimitEnabled should be true")
+	}
+}
+
+func TestRateLimit_NegativeClamped(t *testing.T) {
+	t.Setenv("NEXUS_RATE_LIMIT_RPM", "-5")
+	t.Setenv("NEXUS_RATE_LIMIT_BURST", "-1")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimitRPM != 0 {
+		t.Errorf("RateLimitRPM = %d, want 0 (clamped)", cfg.RateLimitRPM)
+	}
+	if cfg.RateLimitBurst != 0 {
+		t.Errorf("RateLimitBurst = %d, want 0 (clamped)", cfg.RateLimitBurst)
+	}
+}
+
+func TestIsLoopbackBind(t *testing.T) {
+	cases := []struct {
+		addr string
+		want bool
+	}{
+		{":8000", true}, // empty host — dev default
+		{"localhost:8000", true},
+		{"127.0.0.1:8000", true},
+		{"127.99.99.99:8000", true}, // whole /8
+		{"[::1]:8000", true},
+		{"0.0.0.0:8000", false}, // all interfaces — non-loopback
+		{"10.0.0.5:8000", false},
+		{"example.com:8000", false}, // unknown host
+	}
+	for _, tc := range cases {
+		t.Run(tc.addr, func(t *testing.T) {
+			cfg := Config{Addr: tc.addr}
+			if got := cfg.IsLoopbackBind(); got != tc.want {
+				t.Errorf("IsLoopbackBind(%q) = %v, want %v", tc.addr, got, tc.want)
+			}
+		})
+	}
+}

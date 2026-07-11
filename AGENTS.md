@@ -21,6 +21,7 @@ internal/
   middleware/              # toon.go, prompt_engine.go
   router/                  # dsl.go, slm.go, guardrails
   upstream/                # stream.go, fusion.go (panel + arbiter)
+  ratelimit/               # clientip.go, middleware.go (trusted-proxy + per-client limiter, issue #75)
   rag/                     # SQLite-backed store + Ollama embedder + file watcher (issue #46)
 few_shot_examples/         # (gitignored) user-curated snippets
 .env.example               # all env vars with safe defaults
@@ -133,6 +134,35 @@ In `internal/handlers/chat.go`:
    append TOON instructions to system
 4. Then routing: `Guardrail` → `DSL` → `SLM`
 5. Then stream (`local` / `frontier`) or `Panel` (`fusion`)
+
+The HTTP-layer rate limiter (`internal/ratelimit`, issue #75) wraps the
+chat handler **before** any of the above runs — a throttled request is
+rejected with 429 before prompt engineering / RAG / routing do any work.
+It is disabled (passthrough) when `NEXUS_RATE_LIMIT_RPM <= 0`.
+
+## Trusted-proxy client-IP resolution (issue #75)
+
+`internal/ratelimit.ClientIPResolver` is the single source of truth for
+"who is the client?". It honours `X-Forwarded-For` / `X-Real-IP` **only**
+when the direct TCP peer (`r.RemoteAddr`) is in the
+`NEXUS_TRUSTED_PROXIES` CIDR allowlist; otherwise it uses the peer IP
+and ignores the headers (spoofing defence). A multi-hop XFF chain is
+walked right-to-left, skipping trusted hops, to find the first
+untrusted client IP (same algorithm as nginx `real_ip_recursive`).
+
+Gotchas to remember when extending:
+
+- **Empty config = trust nobody** (the safe default). The zero-value /
+  nil resolver always returns the direct peer IP.
+- **Invalid CIDR fails boot** — `config.parseTrustedProxies` returns an
+  error rather than silently falling back, so a typo doesn't quietly
+  disable XFF honouiring.
+- `config.IsLoopbackBind` classifies `:8000` as loopback-safe (dev
+  default) but `0.0.0.0:8000` as non-loopback; the boot warning fires
+  only for the latter + rate-limit-on + no-trusted-proxies.
+- The `ClientIPResolver` and `Middleware` live in `internal/ratelimit`
+  (NOT `internal/middleware`, which is prompt transforms only) so they
+  can import `net/http` without polluting the prompt pipeline.
 
 ## Style / workflow notes
 
@@ -267,6 +297,7 @@ For new behaviour, add tests first and follow the existing layout:
 | New routing rule                     | `internal/router`                |
 | Different upstream protocol          | `internal/upstream`              |
 | New HTTP endpoint                    | `internal/handlers`              |
+| Trusted-proxy / client-IP / rate limit | `internal/ratelimit`           |
 | Judge scoring / sampling logic       | `internal/judge`                 |
 | Judge persistence (SQLite, etc.)     | `internal/judge` (Storage impl)  |
 | New metric field or storage backend  | `internal/telemetry`             |

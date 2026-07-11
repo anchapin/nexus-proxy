@@ -8,6 +8,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -259,6 +260,28 @@ type Config struct {
 	// configured models (no HTTP round-trip to Ollama per request).
 	ModelsEndpointEnabled bool
 	ModelsCacheTTL        time.Duration
+
+	// Trusted-proxy enforcement + rate limiting (issue #75).
+	//
+	// TrustedProxies is the parsed CIDR allowlist sourced from
+	// NEXUS_TRUSTED_PROXIES (comma-separated, e.g.
+	// "10.0.0.0/8,172.16.0.0/12"). Only when the direct TCP peer is in
+	// this list does the proxy honour X-Forwarded-For / X-Real-IP for
+	// client-identity purposes. An empty/nil list means "trust nobody":
+	// the direct peer IP is always used and forwarded headers are
+	// ignored, so attackers who can reach the proxy directly cannot
+	// spoof per-client rate-limit buckets. TrustedProxiesRaw preserves
+	// the raw env value for diagnostics (boot warning echo).
+	//
+	// RateLimitRPM is the per-client request ceiling in requests per
+	// minute; zero or negative disables rate limiting entirely so a
+	// stock deployment is byte-for-byte identical to the pre-#75 path.
+	// RateLimitBurst is the token-bucket capacity (max burst before
+	// throttling); <=0 falls back to RateLimitRPM in the limiter.
+	TrustedProxies    []*net.IPNet
+	TrustedProxiesRaw string
+	RateLimitRPM      int
+	RateLimitBurst    int
 }
 
 // DefaultMetricsDBPath returns the canonical metrics DB location:
@@ -731,6 +754,47 @@ func Load() (Config, error) {
 	cfg.PromptInjectionMode = middleware.ParseInjectionMode(
 		os.Getenv("NEXUS_PROMPT_INJECTION_MODE"),
 	)
+	// Trusted-proxy enforcement + rate limiting (issue #75).
+	//
+	// NEXUS_TRUSTED_PROXIES is a comma-separated CIDR list. Empty
+	// (the default) means "trust nobody": the direct peer IP is used
+	// and X-Forwarded-For / X-Real-IP are ignored, so an attacker who
+	// reaches the proxy directly cannot spoof per-client rate-limit
+	// buckets. Operators running Nexus behind nginx / a cloud load
+	// balancer set this to the proxy's CIDR so forwarded headers are
+	// honoured only from the real reverse proxy.
+	//
+	// Invalid CIDRs fail boot with a clear error — silently falling
+	// back to "trust nobody" would mask a misconfiguration that
+	// accidentally disables XFF honouiring for a legit deployment.
+	cfg.TrustedProxiesRaw = strings.TrimSpace(os.Getenv("NEXUS_TRUSTED_PROXIES"))
+	parsed, err := parseTrustedProxies(cfg.TrustedProxiesRaw)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.TrustedProxies = parsed
+
+	// Per-client rate ceiling (requests/minute). Zero or negative
+	// disables the limiter entirely so a stock deployment is
+	// byte-for-byte identical to the pre-#75 path. Burst is the
+	// token-bucket capacity; <=0 falls back to RPM in the limiter.
+	rateRPM, err := getEnvInt("NEXUS_RATE_LIMIT_RPM", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if rateRPM < 0 {
+		rateRPM = 0
+	}
+	cfg.RateLimitRPM = rateRPM
+
+	rateBurst, err := getEnvInt("NEXUS_RATE_LIMIT_BURST", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if rateBurst < 0 {
+		rateBurst = 0
+	}
+	cfg.RateLimitBurst = rateBurst
 
 	return cfg, nil
 }
@@ -864,6 +928,91 @@ func (c Config) PromptInjectionIsolated() bool {
 // MetricsEnabled reports whether the SQLite metrics store should be
 // opened. Disabled when MetricsDBPath is empty.
 func (c Config) MetricsEnabled() bool { return c.MetricsDBPath != "" }
+
+// RateLimitEnabled reports whether the per-client rate limiter is
+// active (issue #75). Disabled when RateLimitRPM <= 0 so a stock
+// deployment is byte-for-byte identical to the pre-#75 path.
+func (c Config) RateLimitEnabled() bool { return c.RateLimitRPM > 0 }
+
+// TrustedProxiesConfigured reports whether any trusted-proxy CIDRs are
+// set. Used by the boot-time warning to detect the "rate limit on +
+// non-loopback bind + no trusted proxies" misconfiguration that would
+// let a single NATed IP exhaust the whole per-client budget.
+func (c Config) TrustedProxiesConfigured() bool { return len(c.TrustedProxies) > 0 }
+
+// IsLoopbackBind reports whether the configured NEXUS_ADDR binds only
+// to a loopback interface. A listen address is considered loopback when
+// its host portion is empty ("", as in ":8000" — binds all interfaces
+// but is typically reached via localhost in dev), "localhost", or a
+// literal loopback IP (127.0.0.0/8, ::1). Used by the boot warning to
+// decide whether missing trusted-proxy config is dangerous.
+//
+// Note: ":8000" technically binds all interfaces, but we classify it as
+// loopback-safe because the canonical production deployment sets an
+// explicit non-loopback address (e.g. "0.0.0.0:8000") when exposing the
+// proxy beyond the host. The warning targets operators who explicitly
+// opened the proxy to the network.
+func (c Config) IsLoopbackBind() bool {
+	host := listenHost(c.Addr)
+	if host == "" || host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// Unknown host name; treat conservatively as non-loopback so
+		// the warning fires rather than suppressing it.
+		return false
+	}
+	return ip.IsLoopback()
+}
+
+// listenHost extracts the host portion of a "host:port" listen address,
+// returning the whole string when it contains no port. IPv6 bracketed
+// addresses ("[::1]:8000") are handled by net.SplitHostPort.
+func listenHost(addr string) string {
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		return h
+	}
+	return addr
+}
+
+// parseTrustedProxies parses the NEXUS_TRUSTED_PROXIES env value into a
+// slice of *net.IPNet. Empty input yields nil + no error ("trust
+// nobody"). A bare IP (no /prefix) is promoted to a host route
+// (/32 for IPv4, /128 for IPv6) for ergonomic single-host trust
+// entries. Any invalid entry returns an error naming the offender.
+//
+// Mirrors ratelimit.ParseTrustedCIDRs but is duplicated here so
+// internal/config does not import internal/ratelimit (keeping the
+// dependency direction clean: config is a leaf package).
+func parseTrustedProxies(raw string) ([]*net.IPNet, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]*net.IPNet, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, ipnet, err := net.ParseCIDR(p); err == nil {
+			out = append(out, ipnet)
+			continue
+		}
+		if ip := net.ParseIP(p); ip != nil {
+			if ip.To4() != nil {
+				out = append(out, &net.IPNet{IP: ip.To4(), Mask: net.CIDRMask(32, 32)})
+			} else {
+				out = append(out, &net.IPNet{IP: ip.To16(), Mask: net.CIDRMask(128, 128)})
+			}
+			continue
+		}
+		return nil, fmt.Errorf("config: invalid NEXUS_TRUSTED_PROXIES entry %q (expected CIDR or IP)", p)
+	}
+	return out, nil
+}
 
 // RoutingConfidenceEnabled reports whether the judge-guided adaptive
 // routing store (issue #47) should be opened. It requires BOTH a configured
