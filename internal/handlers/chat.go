@@ -157,6 +157,12 @@ type MetricsEvent struct {
 	RAGFilename       string
 	EstimatedCostUSD  float64
 
+	// BaselineCostUSD is what the request would have cost at the
+	// configured frontier baseline rate (issue #73). SavingsUSD is
+	// max(BaselineCostUSD - EstimatedCostUSD, 0).
+	BaselineCostUSD float64
+	SavingsUSD      float64
+
 	OutputTokens         int
 	TTFTMs               int64
 	TotalLatencyMs       int64
@@ -1086,7 +1092,13 @@ func Chat(d Deps) http.Handler {
 		if d.MetricsObserver != nil {
 			postCompressionChars := totalMessageChars(messages)
 			savings := totalTokenSavings(preCompressionChars, postCompressionChars)
-			cost := frontierCostEstimate(string(route), model, telemetry.EstimateTokens(latestPrompt), d.Config.JudgeCostPer1KUSD)
+			inputTokens := telemetry.EstimateTokens(latestPrompt)
+			cost := frontierCostEstimate(string(route), model, inputTokens, d.Config.JudgeCostPer1KUSD)
+			baselineCost := baselineCostEstimate(inputTokens+outputTokens, d.Config.CostBaselineRatePer1K)
+			savingsCost := baselineCost - cost
+			if savingsCost < 0 {
+				savingsCost = 0
+			}
 			tps := telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 			d.MetricsObserver.Submit(MetricsEvent{
 				Timestamp:            rec.Timestamp,
@@ -1098,6 +1110,8 @@ func Chat(d Deps) http.Handler {
 				RAGInjected:          ragInjected,
 				RAGFilename:          ragFilename,
 				EstimatedCostUSD:     cost,
+				BaselineCostUSD:      baselineCost,
+				SavingsUSD:           savingsCost,
 				OutputTokens:         outputTokens,
 				TTFTMs:               ttftMs,
 				TotalLatencyMs:       totalMs,
@@ -1530,4 +1544,18 @@ func formatConfidence(c float64) string {
 		return "0.00"
 	}
 	return strconv.FormatFloat(c, 'f', 2, 64)
+}
+
+// baselineCostEstimate computes what a request would have cost if
+// sent to the frontier baseline provider, regardless of the actual
+// route (issue #73). It uses the total token count (input + output)
+// at the baseline rate, so local/fusion requests with zero actual
+// cost show a positive baseline and savings. Returns zero when the
+// rate is unavailable (pricing data missing) so the request is
+// recorded without failing.
+func baselineCostEstimate(totalTokens int, baselineRatePer1K float64) float64 {
+	if baselineRatePer1K <= 0 || totalTokens <= 0 {
+		return 0
+	}
+	return float64(totalTokens) * baselineRatePer1K / 1000.0
 }

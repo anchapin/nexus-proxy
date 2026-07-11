@@ -96,6 +96,20 @@ type Config struct {
 	FrontierCostPer1K       float64       // USD per 1k input tokens for frontier (0.005)
 	ZAICostPer1K            float64       // USD per 1k input tokens for z.ai (0.002)
 
+	// Cost-avoidance baseline (issue #73). The baseline represents
+	// what each request WOULD have cost if sent to the frontier
+	// provider at the frontier rate, regardless of the actual route.
+	// savings_usd = max(baseline_cost - actual_cost, 0). When
+	// CostBaselineProvider / CostBaselineModel are empty the proxy
+	// defaults to the configured frontier provider / model, so a
+	// stock deployment gets cost-avoidance tracking without extra
+	// configuration. CostBaselineRatePer1K defaults to
+	// FrontierCostPer1K so the baseline and the actual frontier
+	// pricing stay consistent.
+	CostBaselineProvider string  // "frontier" (default) or a custom provider name
+	CostBaselineModel    string  // NEXUS_FRONTIER_MODEL (default) or a custom model
+	CostBaselineRatePer1K float64 // USD per 1k tokens for baseline valuation
+
 	// Fusion progressive delivery (issue #48). When enabled and the
 	// harness requests a streaming response, the chat handler
 	// dispatches route=fusion to upstream.PanelStreaming instead of
@@ -452,6 +466,22 @@ func Load() (Config, error) {
 		zaiCost = 0
 	}
 	cfg.ZAICostPer1K = zaiCost
+
+	// Cost-avoidance baseline (issue #73). Provider and model
+	// default to the configured frontier values so a stock
+	// deployment gets cost-avoidance tracking without extra config.
+	// The rate defaults to FrontierCostPer1K so the baseline stays
+	// consistent with the actual frontier pricing.
+	cfg.CostBaselineProvider = getEnv("NEXUS_COST_BASELINE_PROVIDER", "frontier")
+	cfg.CostBaselineModel = getEnv("NEXUS_COST_BASELINE_MODEL", cfg.FrontierModel)
+	baselineRate, err := getEnvFloat("NEXUS_COST_BASELINE_RATE_PER_1K", cfg.FrontierCostPer1K)
+	if err != nil {
+		return cfg, err
+	}
+	if baselineRate < 0 {
+		baselineRate = 0
+	}
+	cfg.CostBaselineRatePer1K = baselineRate
 
 	// Fusion progressive delivery (issue #48). Defaults to ON so a
 	// stock `.env.example` boots into the new behaviour; operators

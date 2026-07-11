@@ -778,6 +778,8 @@ func buildMetrics(cfg config.Config) (metrics.Store, handlers.MetricsObserver) {
 			RAGInjected:       e.RAGInjected,
 			RAGFilename:       e.RAGFilename,
 			EstimatedCostUSD:  e.EstimatedCostUSD,
+			BaselineCostUSD:   e.BaselineCostUSD,
+			SavingsUSD:        e.SavingsUSD,
 			OutputTokens:      e.OutputTokens,
 			TTFTMs:            e.TTFTMs,
 			TotalLatencyMs:    e.TotalLatencyMs,

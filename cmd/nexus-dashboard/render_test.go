@@ -40,12 +40,12 @@ func seedStore(t *testing.T) (path string) {
 		t.Fatalf("open seed store: %v", err)
 	}
 	rows := []metrics.Request{
-		{Timestamp: goldenDay, RequestID: "l1", Route: "local", Model: "qwen3-coder:8b", InputTokens: 200, TOONSavingsTokens: 50},
-		{Timestamp: goldenDay, RequestID: "l2", Route: "local", Model: "qwen3-coder:8b", InputTokens: 300, TOONSavingsTokens: 60},
-		{Timestamp: goldenDay, RequestID: "l3", Route: "local", Model: "qwen3-coder:8b", InputTokens: 150, TOONSavingsTokens: 40},
-		{Timestamp: goldenDay, RequestID: "f1", Route: "frontier", Model: "gpt-4o", InputTokens: 1200, TOONSavingsTokens: 100, EstimatedCostUSD: 0.0024},
-		{Timestamp: goldenDay, RequestID: "f2", Route: "frontier", Model: "gpt-4o", InputTokens: 800, TOONSavingsTokens: 80, EstimatedCostUSD: 0.0016},
-		{Timestamp: goldenDay, RequestID: "u1", Route: "fusion", Model: "glm-4.6", InputTokens: 500, TOONSavingsTokens: 70},
+		{Timestamp: goldenDay, RequestID: "l1", Route: "local", Model: "qwen3-coder:8b", InputTokens: 200, OutputTokens: 100, TOONSavingsTokens: 50, BaselineCostUSD: 0.0015, SavingsUSD: 0.0015},
+		{Timestamp: goldenDay, RequestID: "l2", Route: "local", Model: "qwen3-coder:8b", InputTokens: 300, OutputTokens: 150, TOONSavingsTokens: 60, BaselineCostUSD: 0.00225, SavingsUSD: 0.00225},
+		{Timestamp: goldenDay, RequestID: "l3", Route: "local", Model: "qwen3-coder:8b", InputTokens: 150, OutputTokens: 80, TOONSavingsTokens: 40, BaselineCostUSD: 0.00115, SavingsUSD: 0.00115},
+		{Timestamp: goldenDay, RequestID: "f1", Route: "frontier", Model: "gpt-4o", InputTokens: 1200, OutputTokens: 500, TOONSavingsTokens: 100, EstimatedCostUSD: 0.0024, BaselineCostUSD: 0.0085, SavingsUSD: 0.0061},
+		{Timestamp: goldenDay, RequestID: "f2", Route: "frontier", Model: "gpt-4o", InputTokens: 800, OutputTokens: 300, TOONSavingsTokens: 80, EstimatedCostUSD: 0.0016, BaselineCostUSD: 0.0055, SavingsUSD: 0.0039},
+		{Timestamp: goldenDay, RequestID: "u1", Route: "fusion", Model: "glm-4.6", InputTokens: 500, OutputTokens: 200, TOONSavingsTokens: 70, BaselineCostUSD: 0.0035, SavingsUSD: 0.0035},
 	}
 	for _, r := range rows {
 		if err := w.RecordRequest(r); err != nil {
