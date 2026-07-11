@@ -420,7 +420,39 @@ func Chat(d Deps) http.Handler {
 			trace.Request.Stream = s
 		}
 
-		messages := middleware.ApplyPromptEngineering(rawMessages, d.Config.MetaPrompt)
+		// Prompt-injection hardening (issue #76). In warn and strict
+		// modes the proxy scans the user-supplied system messages for
+		// suspicious override patterns BEFORE applying its own policy.
+		// Strict mode rejects the request with a 400 OpenAI-style
+		// error; warn mode logs and continues. Off mode (default)
+		// skips detection entirely for zero overhead.
+		if d.Config.PromptInjectionIsolated() {
+			hits := middleware.DetectSuspiciousSystem(rawMessages)
+			if len(hits) > 0 {
+				if d.Config.PromptInjectionMode == middleware.InjectionModeStrict {
+					writeJSONError(w, http.StatusBadRequest,
+						"Request rejected: suspicious prompt-injection pattern detected in system message")
+					slog.Warn("strict mode rejected suspicious system message",
+						slog.Int("patterns", len(hits)),
+						slog.String("request_id", reqID),
+					)
+					return
+				}
+				middleware.LogSuspicious(hits, reqID)
+			}
+		}
+
+		// Apply prompt engineering. In off mode (default) the legacy
+		// append path is used — byte-for-byte backward compatible.
+		// In warn/strict modes the isolated variant inserts a dedicated
+		// leading system message wrapped in proxy-policy delimiters so
+		// trusted text always precedes user-supplied system content.
+		var messages []interface{}
+		if d.Config.PromptInjectionIsolated() {
+			messages = middleware.ApplyPromptEngineeringIsolated(rawMessages, d.Config.MetaPrompt)
+		} else {
+			messages = middleware.ApplyPromptEngineering(rawMessages, d.Config.MetaPrompt)
+		}
 		latestPrompt := middleware.ExtractLatestUserPrompt(messages)
 		// Record whether the meta-prompt actually appended to a
 		// system slot — "applied" only when there is now a system
@@ -453,7 +485,11 @@ func Chat(d Deps) http.Handler {
 		preCompressionChars := totalMessageChars(messages)
 		trace.Transforms.TOONBytesBefore = preCompressionChars
 		if middleware.CompressJSONBlocks(messages) {
-			messages = middleware.AppendSystemNote(messages, d.Config.TOONNotice)
+			if d.Config.PromptInjectionIsolated() {
+				messages = middleware.AppendSystemNoteIsolated(messages, d.Config.TOONNotice)
+			} else {
+				messages = middleware.AppendSystemNote(messages, d.Config.TOONNotice)
+			}
 			slog.Info("toon compressed messages", slog.String("request_id", reqID))
 		}
 		postCompressionChars := totalMessageChars(messages)
