@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/middleware"
 )
 
 // Config holds all runtime knobs for the proxy. A zero value is invalid;
@@ -187,6 +189,14 @@ type Config struct {
 	// Middleware prompts
 	MetaPrompt string // appended to system prompt by prompt_engine
 	TOONNotice string // appended when TOON compression is applied
+
+	// Prompt-injection hardening (issue #76). Controls whether the
+	// proxy isolates its policy text from user-supplied system content
+	// and whether suspicious injection patterns are logged or rejected.
+	//   - off (default): legacy append behaviour, fully backward compatible.
+	//   - warn: proxy text delimited + suspicious patterns logged.
+	//   - strict: proxy text delimited + suspicious patterns rejected (400).
+	PromptInjectionMode middleware.InjectionMode
 
 	// Telemetry
 	//
@@ -655,6 +665,15 @@ func Load() (Config, error) {
 	}
 	cfg.ModelsCacheTTL = modelsCacheTTL
 
+	// Prompt-injection hardening (issue #76). Defaults to off so a
+	// stock deployment boots with byte-for-byte legacy behaviour.
+	// Operators opt into warn (log only) or strict (reject 400) by
+	// setting NEXUS_PROMPT_INJECTION_MODE. Unknown values fall back
+	// to off rather than failing boot.
+	cfg.PromptInjectionMode = middleware.ParseInjectionMode(
+		os.Getenv("NEXUS_PROMPT_INJECTION_MODE"),
+	)
+
 	return cfg, nil
 }
 
@@ -757,6 +776,15 @@ func (c Config) TelemetryEnabled() bool { return c.TelemetryPath != "" }
 // the configured local/router/frontier models with no HTTP round-trip
 // to Ollama per request.
 func (c Config) ModelsCacheEnabled() bool { return c.ModelsCacheTTL > 0 }
+
+// PromptInjectionIsolated reports whether the proxy should isolate
+// its policy text from user-supplied system content (issue #76).
+// True in warn and strict modes; false in the default off mode so
+// the legacy append path is preserved.
+func (c Config) PromptInjectionIsolated() bool {
+	return c.PromptInjectionMode == middleware.InjectionModeWarn ||
+		c.PromptInjectionMode == middleware.InjectionModeStrict
+}
 
 // MetricsEnabled reports whether the SQLite metrics store should be
 // opened. Disabled when MetricsDBPath is empty.
