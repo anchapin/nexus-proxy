@@ -457,13 +457,23 @@ func Chat(d Deps) http.Handler {
 		// RequestTrace because it is what every later stage sees.
 		trace.Request.EstimatedTokens = len(latestPrompt) / 4
 
-		var route router.Route
-		// VRAM-aware guardrail (issue #6). When the
-		// BudgetObserver is wired and reports a positive budget,
-		// the dynamic measurement wins; otherwise we fall back to
-		// the operator-configured NEXUS_TOKEN_GUARDRAIL. The source
-		// label travels with the log line so operators can confirm
-		// which path was taken without digging through the source.
+		// --- routing decision (issue #82) ---------------------------------
+		//
+		// The full decision ladder (Guardrail -> DSL -> SLM, with the
+		// judge-guided confidence bias) now lives in router.Planner.
+		// The handler resolves the VRAM budget from the BudgetObserver
+		// (or the static config fallback), delegates the decision to
+		// the planner, and interprets the structured Decision to emit
+		// slog lines and populate the debug trace. This keeps the
+		// planner pure (no HTTP, no logging) and gives the handler a
+		// single call site for routing changes.
+
+		// VRAM-aware guardrail budget (issue #6). When the
+		// BudgetObserver is wired and reports a positive budget, the
+		// dynamic measurement wins; otherwise we fall back to the
+		// operator-configured NEXUS_TOKEN_GUARDRAIL. The source label
+		// travels with the log line so operators can confirm which
+		// path was taken without digging through the source.
 		guardrailBudget := d.Config.TokenGuardrail
 		guardrailSource := "static-fallback"
 		if d.BudgetObserver != nil {
@@ -472,74 +482,72 @@ func Chat(d Deps) http.Handler {
 				guardrailSource = d.BudgetObserver.BudgetSource()
 			}
 		}
-		if g, hit := router.Guardrail(latestPrompt, guardrailBudget); hit {
+
+		planner := &router.Planner{
+			SLM:             d.SLM,
+			Confidence:      d.Confidence,
+			FormattingRegex: d.FormattingRegex,
+		}
+		decision := planner.Plan(router.PlanRequest{
+			Prompt:          latestPrompt,
+			GuardrailBudget: guardrailBudget,
+			GuardrailSource: guardrailSource,
+			Context:         r.Context(),
+		})
+		route := decision.Route
+
+		// Emit the slog lines the pre-extraction handler produced, so
+		// existing log-scraping tests and operator dashboards keep
+		// working unchanged. The planner is log-free; the handler owns
+		// the observability surface.
+		switch decision.Source {
+		case router.SourceGuardrail:
 			slog.Info("guardrail forced frontier",
 				slog.String("reason", "vram"),
-				slog.String("budget_source", guardrailSource),
-				slog.Int("budget_tokens", guardrailBudget),
-				slog.Int("estimated_tokens", len(latestPrompt)/4),
+				slog.String("budget_source", decision.BudgetSource),
+				slog.Int("budget_tokens", decision.BudgetTokens),
+				slog.Int("estimated_tokens", decision.EstimatedTokens),
 				slog.String("request_id", reqID),
 			)
-			route = g
-			trace.Routing.Route = string(g)
-			trace.Routing.Reason = "guardrail"
-			trace.Routing.BudgetSource = guardrailSource
-			trace.Routing.BudgetTokens = guardrailBudget
-			trace.Routing.EstimatedTokens = len(latestPrompt) / 4
-		} else if r2, hit := router.DSL(latestPrompt, d.FormattingRegex); hit {
+		case router.SourceDSL:
 			slog.Info("dsl match",
-				slog.String("route", string(r2)),
+				slog.String("route", string(decision.Route)),
 				slog.String("request_id", reqID),
 			)
-			route = r2
-			trace.Routing.Route = string(r2)
-			trace.Routing.Reason = "dsl"
-			trace.Routing.BudgetSource = guardrailSource
-			trace.Routing.BudgetTokens = guardrailBudget
-			trace.Routing.EstimatedTokens = len(latestPrompt) / 4
-		} else {
+		default:
+			// SLM path (success, error, or escalation). The pre-
+			// extraction handler emitted these debug lines before the
+			// SLM call; we emit them after the planner returns, which
+			// is temporally equivalent for log purposes.
 			slog.Debug("dsl bypassed, asking slm", slog.String("request_id", reqID))
-			// Judge-guided adaptive routing (issue #47). When a
-			// confidence store is wired we categorize the prompt and
-			// feed the local model's historical confidence for that
-			// category into the SLM, biasing toward frontier for
-			// categories the local model has handled poorly. When no
-			// store is wired (judge disabled) we take the plain
-			// neutral Decide path so routing is unchanged.
-			var (
-				dec router.Route
-				err error
-			)
 			if d.Confidence != nil {
-				category := router.Categorize(latestPrompt)
-				confidence := d.Confidence.LocalConfidence(category)
 				slog.Debug("adaptive routing confidence",
-					slog.String("category", category),
-					slog.Float64("confidence", confidence),
+					slog.String("category", decision.TaskType),
+					slog.Float64("confidence", decision.Confidence),
 					slog.String("request_id", reqID),
 				)
-				dec, err = d.SLM.DecideWithConfidence(r.Context(), latestPrompt, confidence)
-			} else {
-				dec, err = d.SLM.Decide(r.Context(), latestPrompt)
 			}
-			if err != nil {
+			if decision.Source == router.SourceSLMError {
 				slog.Error("slm error, defaulting to frontier",
-					slog.Any("err", err),
+					slog.Any("err", errors.New(decision.SLMError)),
 					slog.String("request_id", reqID),
 				)
-				dec = router.RouteFrontier
 			}
 			slog.Info("slm decision",
-				slog.String("route", string(dec)),
+				slog.String("route", string(decision.Route)),
 				slog.String("request_id", reqID),
 			)
-			route = dec
-			trace.Routing.Route = string(dec)
-			trace.Routing.Reason = "slm"
-			trace.Routing.BudgetSource = guardrailSource
-			trace.Routing.BudgetTokens = guardrailBudget
-			trace.Routing.EstimatedTokens = len(latestPrompt) / 4
 		}
+
+		// Populate the debug trace from the Decision. The trace reason
+		// uses the planner's source-to-reason mapping so the labels
+		// ("guardrail", "dsl", "slm") are backward-compatible with the
+		// pre-extraction handler.
+		trace.Routing.Route = string(decision.Route)
+		trace.Routing.Reason = decision.Source.TraceReason()
+		trace.Routing.BudgetSource = decision.BudgetSource
+		trace.Routing.BudgetTokens = decision.BudgetTokens
+		trace.Routing.EstimatedTokens = decision.EstimatedTokens
 
 		// Honor the harness's stream flag (issue #10). OpenAI treats
 		// stream as advisory; a stream=false request must receive a
