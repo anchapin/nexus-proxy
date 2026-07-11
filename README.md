@@ -105,6 +105,33 @@ go run ./cmd/nexus
 The server listens on `:8000` by default. Set `NEXUS_ADDR=:9000` (or any
 other address) to change it.
 
+### Running behind a reverse proxy (nginx / Cloudflare / cloud LB)
+
+When Nexus sits behind a reverse proxy, the proxy appends the real
+client IP to `X-Forwarded-For` on each request. By default Nexus
+**ignores** that header and uses the direct peer IP — so a direct
+attacker cannot spoof per-client rate limits by rotating the header.
+
+To honour `X-Forwarded-For` / `X-Real-IP`, whitelist the reverse
+proxy's CIDR via `NEXUS_TRUSTED_PROXIES`. Forwarded headers are then
+honoured **only** when the direct peer is in the list:
+
+```bash
+# Trust the private networks your reverse proxy uses.
+NEXUS_TRUSTED_PROXIES=10.0.0.0/8,172.16.0.0/12
+# Or a single loopback proxy:
+NEXUS_TRUSTED_PROXIES=127.0.0.1
+```
+
+A multi-hop `X-Forwarded-For` chain is walked right-to-left, skipping
+trusted hops, to find the first untrusted (real client) IP — the same
+algorithm nginx's `real_ip_recursive` uses.
+
+The boot log emits a warning when rate limiting is enabled, the bind
+address is non-loopback, and no trusted proxies are configured — that
+combination usually means a forgotten reverse-proxy whitelist (so every
+client behind the proxy shares one bucket).
+
 ### Point your agent at the proxy
 
 In OpenCode's `~/.config/opencode/config.toml`:
@@ -321,6 +348,9 @@ defaults. The most useful ones:
 | `NEXUS_JUDGE_URL`         | z.ai (fallback frontier)      | Judge endpoint                          |
 | `NEXUS_JUDGE_API_KEY`     | `NEXUS_FRONTIER_API_KEY`      | Judge bearer token                      |
 | `NEXUS_METRICS_DB`        | `~/.cache/nexus-proxy/metrics.db` | SQLite metrics store (issue #4)      |
+| `NEXUS_TRUSTED_PROXIES`   | *(empty = trust nobody)*      | CIDR allowlist for X-Forwarded-For (issue #75) |
+| `NEXUS_RATE_LIMIT_RPM`    | `0` (disabled)                | Per-client requests/min ceiling (issue #75) |
+| `NEXUS_RATE_LIMIT_BURST`  | `0` (= RPM)                  | Token-bucket burst capacity (issue #75) |
 
 ## Status
 

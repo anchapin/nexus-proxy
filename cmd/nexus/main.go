@@ -30,6 +30,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/probe"
 	"github.com/anchapin/nexus-proxy/internal/quality"
 	"github.com/anchapin/nexus-proxy/internal/rag"
+	"github.com/anchapin/nexus-proxy/internal/ratelimit"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
 )
@@ -201,6 +202,44 @@ func main() {
 		)
 	} else {
 		slog.Info("local-route cooldown disabled (NEXUS_LOCAL_COOLDOWN<=0)")
+	}
+
+	// Trusted-proxy-aware client-IP resolver + per-client rate limiter
+	// (issue #75). The resolver honours X-Forwarded-For / X-Real-IP
+	// ONLY when the direct TCP peer is in the NEXUS_TRUSTED_PROXIES
+	// CIDR allowlist; with an empty list (the default) it trusts
+	// nobody and uses the direct peer IP, so an attacker who reaches
+	// the proxy directly cannot spoof per-client rate-limit buckets.
+	ipResolver := ratelimit.NewClientIPResolver(cfg.TrustedProxies)
+
+	// Boot hardening warning (issue #75). Rate limiting behind a
+	// non-loopback bind with no trusted proxies is almost certainly a
+	// misconfiguration: either the proxy is directly exposed (so a
+	// single NATed IP can exhaust the whole per-client budget by
+	// rotating X-Forwarded-For — except the trust-nobody resolver
+	// already prevents that), OR the operator meant to put the proxy
+	// behind nginx / a cloud LB and forgot to whitelist its CIDR
+	// (so legitimate clients all share the proxy's IP bucket). Warn
+	// loudly either way; boot never fails on this.
+	if cfg.RateLimitEnabled() && !cfg.IsLoopbackBind() && !cfg.TrustedProxiesConfigured() {
+		slog.Warn("rate limit enabled on a non-loopback bind with NEXUS_TRUSTED_PROXIES unset: "+
+			"all clients behind a NAT/share-IP will share a single bucket. "+
+			"Set NEXUS_TRUSTED_PROXIES to the reverse-proxy CIDR, or bind to 127.0.0.1",
+			slog.String("addr", cfg.Addr),
+			slog.Int("rate_limit_rpm", cfg.RateLimitRPM),
+		)
+	}
+
+	var rateLimiter *ratelimit.Middleware
+	if cfg.RateLimitEnabled() {
+		rateLimiter = ratelimit.NewMiddleware(cfg.RateLimitRPM, cfg.RateLimitBurst, ipResolver)
+		slog.Info("rate limiter enabled",
+			slog.Int("rpm", cfg.RateLimitRPM),
+			slog.Int("burst", cfg.RateLimitBurst),
+			slog.Bool("trusted_proxies", cfg.TrustedProxiesConfigured()),
+		)
+	} else {
+		slog.Info("rate limiter disabled (NEXUS_RATE_LIMIT_RPM<=0)")
 	}
 
 	// Async LLM-as-a-judge evaluator (issue #15). The handler never
@@ -419,7 +458,7 @@ func main() {
 	}()
 
 	mux := http.NewServeMux()
-	mux.Handle("/v1/chat/completions", handlers.Chat(handlers.Deps{
+	chatHandler := handlers.Chat(handlers.Deps{
 		Config:          cfg,
 		Client:          http.DefaultClient,
 		RAG:             store,
@@ -434,7 +473,15 @@ func main() {
 		BudgetObserver:  budgetObserver(probeMgr),
 		LocalLimiter:    localLimiter,
 		LocalCooldown:   localCooldown,
-	}))
+	})
+	// Apply the per-client rate limiter (issue #75) as the outermost
+	// wrapper so a flood of requests is rejected before any middleware
+	// / RAG / routing work runs. A nil/disabled limiter returns the
+	// handler unchanged (zero overhead).
+	if rateLimiter != nil {
+		chatHandler = rateLimiter.Wrap(chatHandler)
+	}
+	mux.Handle("/v1/chat/completions", chatHandler)
 
 	// /healthz returns a small JSON document so operators can see
 	// the dynamic VRAM budget without scraping logs (issue #6).
