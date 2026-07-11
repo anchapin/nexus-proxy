@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/middleware"
@@ -288,6 +289,17 @@ type Deps struct {
 	// left nil by Chat() when the operator did not set
 	// NEXUS_LOCAL_MAX_CONCURRENT so the hot path is unchanged.
 	LocalLimiter LocalLimiter
+
+	// LocalCooldown arms a short cooldown after the cascade detects
+	// a local (Ollama) failure (issue #80). While active, subsequent
+	// route=local and route=fusion requests skip the local step
+	// entirely (same path as the health-unhealthy skip) and are
+	// served by the fallback route. The response is stamped with
+	// X-Nexus-Local-Cooldown: true so clients can detect the
+	// degradation. Nil means the circuit is disabled
+	// (NEXUS_LOCAL_COOLDOWN=0); the hot path is byte-for-byte
+	// identical to the pre-#80 behaviour.
+	LocalCooldown *circuit.Cooldown
 
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
@@ -572,8 +584,10 @@ func Chat(d Deps) http.Handler {
 			firstWriteAt.CompareAndSwap(0, t.UnixNano())
 		})
 
-		// Graceful degradation (issue #8). When the local Ollama health
-		// poller reports unhealthy we:
+		// Graceful degradation (issue #8) + local-route cooldown
+		// (issue #80). When the local Ollama health poller reports
+		// unhealthy OR the cooldown circuit is active (armed by a
+		// recent cascade-detected local failure) we:
 		//   - skip the local fetch on route=local (the cascade starts
 		//     at frontier, the harness sees frontier content with
 		//     X-Nexus-Degraded: true);
@@ -587,14 +601,29 @@ func Chat(d Deps) http.Handler {
 		// the request. The token guardrail (#6) is consulted first;
 		// when it fires we always go to frontier, so this check
 		// never overrides a guardrail-forced reroute.
+		//
+		// Issue #80: the cooldown closes the window between the
+		// cascade observing a local failure and the health poller
+		// tripping its breaker. Without it, every request in that
+		// window re-attempts the dead local endpoint and pays the
+		// full upstream timeout before falling back.
 		localHealthy := d.Health.IsLocalHealthy()
-		skipLocal := !localHealthy && (route == router.RouteLocal || route == router.RouteFusion)
+		cooldownActive := d.LocalCooldown != nil && d.LocalCooldown.Active()
+		skipLocal := (!localHealthy || cooldownActive) && (route == router.RouteLocal || route == router.RouteFusion)
 		if skipLocal {
 			w.Header().Set("X-Nexus-Degraded", "true")
-			slog.Warn("ollama unhealthy; skipping local arm",
-				slog.String("route", string(route)),
-				slog.String("request_id", reqID),
-			)
+			if cooldownActive {
+				w.Header().Set("X-Nexus-Local-Cooldown", "true")
+				slog.Warn("local-route cooldown active; skipping local arm",
+					slog.String("route", string(route)),
+					slog.String("request_id", reqID),
+				)
+			} else {
+				slog.Warn("ollama unhealthy; skipping local arm",
+					slog.String("route", string(route)),
+					slog.String("request_id", reqID),
+				)
+			}
 		} else {
 			w.Header().Set("X-Nexus-Degraded", "false")
 		}
@@ -751,8 +780,22 @@ func Chat(d Deps) http.Handler {
 				// #8) is honoured — when the health poller reports
 				// Ollama unreachable the cascade skips the local step
 				// entirely and starts at frontier.
-				res, err := cas.Run(rw, d.Client, body)
-				logCascadeTelemetry(res, err, reqID)
+			res, err := cas.Run(rw, d.Client, body)
+			logCascadeTelemetry(res, err, reqID)
+			// Issue #80: arm the local-route cooldown when the
+			// cascade reports the local step failed before a
+			// fallback served the request. Subsequent requests
+			// within the cooldown window skip local and go
+			// directly to the fallback, avoiding repeated slow
+			// local timeouts until the health poller catches up.
+			if res.LocalStepFailed && d.LocalCooldown != nil {
+				d.LocalCooldown.RecordFailure()
+				slog.Warn("local-route cooldown armed after cascade local failure",
+					slog.String("route_attempted", res.RouteAttempted),
+					slog.String("served_by", res.ServedBy),
+					slog.String("request_id", reqID),
+				)
+			}
 				if err != nil {
 					slog.Error("upstream error",
 						slog.Any("err", err),
@@ -818,13 +861,19 @@ func Chat(d Deps) http.Handler {
 					targetURL = d.Config.FrontierURL
 					apiKey = d.Config.FrontierKey
 				}
-				if err := upstream.BufferedFetch(rw, d.Client, targetURL, apiKey, body); err != nil {
-					slog.Error("upstream error",
-						slog.Any("err", err),
-						slog.String("request_id", reqID),
-					)
-					upErr = err
-					http.Error(w, "Upstream error", http.StatusBadGateway)
+			if err := upstream.BufferedFetch(rw, d.Client, targetURL, apiKey, body); err != nil {
+				slog.Error("upstream error",
+					slog.Any("err", err),
+					slog.String("request_id", reqID),
+				)
+				upErr = err
+				http.Error(w, "Upstream error", http.StatusBadGateway)
+				// Issue #80: a non-streaming local fetch failure is
+				// also a local failure — arm the cooldown so the next
+				// request skips local and goes to the fallback.
+				if !skipLocal && d.LocalCooldown != nil {
+					d.LocalCooldown.RecordFailure()
+				}
 				} else {
 					model = d.Config.LocalModel
 					if skipLocal {

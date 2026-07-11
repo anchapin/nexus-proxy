@@ -144,6 +144,14 @@ type Config struct {
 	LocalMaxConcurrent    int   // hard ceiling on concurrent local slots (0 disables)
 	LocalVRAMBytesPerSlot int64 // VRAM bytes reserved per concurrent local slot (2 GiB)
 
+	// Local-route cooldown (issue #80). After the cascade detects a
+	// local (Ollama) failure and falls back, the chat handler arms a
+	// short cooldown so subsequent requests within the window skip
+	// local and go directly to the fallback route — closing the gap
+	// between the cascade observing failure and the health poller
+	// catching up. Zero disables the circuit (pre-#80 behaviour).
+	LocalCooldown time.Duration // default 10s; 0 disables
+
 	// HTTP request body cap (issue #11). The chat handler applies this
 	// with http.MaxBytesReader before reading the request body, so an
 	// oversized POST cannot exhaust proxy memory before the guardrail
@@ -507,6 +515,19 @@ func Load() (Config, error) {
 		localSlotBytes = int(DefaultLocalVRAMBytesPerSlot)
 	}
 	cfg.LocalVRAMBytesPerSlot = int64(localSlotBytes)
+
+	// Local-route cooldown (issue #80). Arms a short cooldown after
+	// the cascade detects a local failure so subsequent requests skip
+	// local and go directly to the fallback route. Default 10s; zero
+	// disables the circuit (pre-#80 behaviour).
+	localCooldown, err := getEnvDuration("NEXUS_LOCAL_COOLDOWN", 10*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	if localCooldown < 0 {
+		localCooldown = 0
+	}
+	cfg.LocalCooldown = localCooldown
 
 	// Hard request-body cap (issue #11). Default 1 MiB matches typical
 	// OpenAI-compatible request sizes; the chat handler wraps r.Body
