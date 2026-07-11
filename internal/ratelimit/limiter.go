@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
 // Config carries the rate-limit parameters consumed by New. Zero
@@ -187,6 +189,10 @@ func (l *Limiter) bucketFor(key string) *bucket {
 type Decision struct {
 	Allowed    bool          // true when the request may proceed
 	RetryAfter time.Duration // valid only when Allowed is false
+	// Scope names the bucket that decided the outcome. Useful for
+	// tracing and metrics ("global" vs "per_client"); empty when
+	// the limiter itself is nil.
+	Scope string
 }
 
 // Allow reports whether key may proceed, consuming a token from both
@@ -213,10 +219,14 @@ func (l *Limiter) Check(key string) Decision {
 	}
 
 	now := time.Now()
+	// Scope names the bucket(s) that decided. When both are active
+	// and an allow lands, "both" identifies the configuration;
+	// otherwise the single active bucket is named.
+	scope := scopeFor(l)
 
 	if l.global != nil {
 		if ok, ra := l.global.allow(now); !ok {
-			return Decision{Allowed: false, RetryAfter: ra}
+			return Decision{Allowed: false, RetryAfter: ra, Scope: scope}
 		}
 	}
 
@@ -224,11 +234,33 @@ func (l *Limiter) Check(key string) Decision {
 	if l.cfg.PerClientRPM > 0 {
 		b := l.bucketFor(key)
 		if ok, ra := b.allow(now); !ok {
-			return Decision{Allowed: false, RetryAfter: ra}
+			return Decision{Allowed: false, RetryAfter: ra, Scope: scope}
 		}
 	}
 
-	return Decision{Allowed: true}
+	return Decision{Allowed: true, Scope: scope}
+}
+
+// scopeFor collapses the configured buckets into a single label so
+// the tracing / metrics surface sees one of: "global", "per_client",
+// "both". A nil or empty limiter returns "" — Check never invokes
+// this with a nil pointer.
+func scopeFor(l *Limiter) string {
+	if l == nil {
+		return ""
+	}
+	hasGlobal := l.global != nil
+	hasPerClient := l.cfg.PerClientRPM > 0
+	switch {
+	case hasGlobal && hasPerClient:
+		return "both"
+	case hasGlobal:
+		return "global"
+	case hasPerClient:
+		return "per_client"
+	default:
+		return ""
+	}
 }
 
 // Close stops the background cleanup goroutine. Safe to call on a
@@ -314,13 +346,37 @@ func (l *Limiter) Middleware(exempt func(*http.Request) bool) func(http.Handler)
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Distributed tracing (issue #71). Same zero-overhead
+			// guard as auth.Middleware: when the operator has not
+			// configured a collector this block disappears
+			// entirely.
+			//
+			// The span carries the resolved scope (global vs
+			// per-client) and the allow/deny verdict so a 429 in
+			// the trace view tells operators instantly which
+			// bucket exhausted.
+			var span *tracing.Span
+			if tracing.Enabled() {
+				r2, s := tracing.StartSpanFromContext(r.Context(), "ratelimit.check")
+				span = s
+				r = r.WithContext(r2)
+				defer span.End()
+				span.SetAttr("ratelimit.exempt", exempt != nil && exempt(r))
+			}
 			if exempt != nil && exempt(r) {
 				next.ServeHTTP(w, r)
 				return
 			}
 			ip := ClientIP(r)
 			dec := l.Check(ip)
+			if span != nil {
+				span.SetAttr("ratelimit.scope", dec.Scope)
+				span.SetAttr("ratelimit.allowed", dec.Allowed)
+			}
 			if !dec.Allowed {
+				if span != nil {
+					span.SetStatus(tracing.StatusError, "rate_limit_exceeded")
+				}
 				writeRateLimited(w, dec.RetryAfter)
 				return
 			}
