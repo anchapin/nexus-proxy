@@ -41,6 +41,15 @@ type Config struct {
 	ExamplesDir  string  // "./few_shot_examples"
 	RAGThreshold float64 // cosine similarity cutoff for retrieval (0.55)
 
+	// RAG persistence (issue #46). When RAGDBPath is set, the few-shot
+	// embeddings are cached on disk and reloaded on boot without
+	// re-hitting Ollama. RAGPollInterval > 0 enables a background
+	// goroutine that detects new / modified / deleted files in
+	// ExamplesDir and updates the store incrementally. Set
+	// NEXUS_RAG_DB="" to fall back to the legacy in-memory-only path.
+	RAGDBPath       string        // on-disk SQLite database for the RAG store
+	RAGPollInterval time.Duration // watcher cadence; 0 disables the watcher
+
 	// Routing
 	TokenGuardrail int           // estimated tokens above this force frontier (6000)
 	SLMTimeout     time.Duration // Qwen3-Coder routing timeout (8s)
@@ -188,6 +197,18 @@ func DefaultRoutingConfidenceDBPath() string {
 	return filepath.Join(base, "nexus-proxy", "routing_confidence.db")
 }
 
+// DefaultRAGDBPath returns the canonical location for the persistent
+// RAG store (issue #46): $XDG_CACHE_HOME/nexus-proxy/rag.db. Operators
+// override with NEXUS_RAG_DB (empty disables the store, falling back
+// to the legacy in-memory-only path).
+func DefaultRAGDBPath() string {
+	base, err := os.UserCacheDir()
+	if err != nil || base == "" {
+		base = "./.cache"
+	}
+	return filepath.Join(base, "nexus-proxy", "rag.db")
+}
+
 // Load reads configuration from environment variables, applying defaults
 // suitable for local development. It returns an error only when a required
 // value is malformed; missing optional values fall back to defaults.
@@ -216,6 +237,21 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.RAGThreshold = threshold
+
+	// RAG persistence (issue #46). The DB path defaults to the user
+	// cache dir so multiple checkouts don't trample each other.
+	// NEXUS_RAG_POLL_INTERVAL=0 disables the file watcher but leaves
+	// persistence on (boot still loads from disk).
+	cfg.RAGDBPath = getEnvAllowEmpty("NEXUS_RAG_DB", DefaultRAGDBPath())
+
+	pollInterval, err := getEnvDuration("NEXUS_RAG_POLL_INTERVAL", 30*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	if pollInterval < 0 {
+		pollInterval = 0
+	}
+	cfg.RAGPollInterval = pollInterval
 
 	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
 	if err != nil {
@@ -478,6 +514,19 @@ func (c Config) MetricsEnabled() bool { return c.MetricsDBPath != "" }
 // judge produces byte-for-byte identical routing (no DB queries).
 func (c Config) RoutingConfidenceEnabled() bool {
 	return c.RoutingConfidenceDB != "" && c.JudgeEnabled
+}
+
+// RAGPersistentEnabled reports whether the SQLite-backed RAG store
+// (issue #46) should be opened. Disabled when RAGDBPath is empty,
+// which preserves the legacy in-memory-only behaviour for operators
+// who want zero on-disk state.
+func (c Config) RAGPersistentEnabled() bool { return c.RAGDBPath != "" }
+
+// RAGWatcherEnabled reports whether the background file watcher
+// (issue #46) should be started. Disabled when RAGPollInterval is
+// zero OR when the persistent store itself is disabled.
+func (c Config) RAGWatcherEnabled() bool {
+	return c.RAGPersistentEnabled() && c.RAGPollInterval > 0
 }
 
 // NewLogger returns a *slog.Logger configured per LogLevel / LogFormat,
