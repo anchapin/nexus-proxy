@@ -102,6 +102,18 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total telemetry records dropped because the JSONL write buffer was full.",
 		typ:  "counter",
 	},
+	// Issue #70: live middleware gauges. These come from backing
+	// sources (rate-limit bucket count, budget running total) at
+	// scrape time rather than from per-request events, so they are
+	// supplied as gauge providers from main.go.
+	"nexus_rate_limit_buckets": {
+		help: "Current number of per-client rate-limit buckets held in memory.",
+		typ:  "gauge",
+	},
+	"nexus_budget_spend_usd": {
+		help: "Rolling 24-hour spend in USD from the daily frontier budget tracker.",
+		typ:  "gauge",
+	},
 }
 
 // RenderPrometheus writes the full /metrics body in Prometheus
@@ -151,6 +163,71 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	writeMeta(w, "nexus_estimated_cost_usd_total",
 		"Cumulative estimated frontier cost in USD across all proxied requests.", "counter")
 	fmt.Fprintf(w, "nexus_estimated_cost_usd_total %s\n", formatFloat(c.EstimatedCostUSD()))
+
+	// --- Middleware instrumentation (issue #70) --------------------------
+
+	// Auth counters are emitted with one sample line per outcome label
+	// (accepted / rejected_invalid / rejected_missing). The fourth
+	// outcome "exempt" is intentionally omitted: an exempt request is
+	// not an authentication decision and would dilute the per-decision
+	// counts. The AuthAuthenticatedClients gauge mirrors the
+	// accepted counter so operators can chart a clean "successful
+	// authentications" timeline.
+	writeCounterLabeled(w, "nexus_auth_requests_total",
+		"Authentication decisions by outcome (issue #70).",
+		"outcome", []labelSample{
+			{value: "accepted", n: c.authAccepted.Load()},
+			{value: "rejected_invalid", n: c.authRejectedInvalid.Load()},
+			{value: "rejected_missing", n: c.authRejectedMissing.Load()},
+		})
+
+	// Rate-limit counters are emitted as two labelled families so the
+	// {scope, allowed} matrix is one scrape away. scope values are
+	// "global" or "per_client"; the limiter never emits "both" — when
+	// both buckets are active the deny from either side wins and the
+	// single failing bucket is named.
+	writeCounterLabeled(w, "nexus_rate_limit_allowed_total",
+		"Requests that passed the rate limiter, by bucket scope.",
+		"scope", []labelSample{
+			{value: "global", n: c.rateLimitAllowedGlobal.Load()},
+			{value: "per_client", n: c.rateLimitAllowedPerClient.Load()},
+		})
+	writeCounterLabeled(w, "nexus_rate_limit_rejected_total",
+		"Requests rejected (429) by the rate limiter, by bucket scope.",
+		"scope", []labelSample{
+			{value: "global", n: c.rateLimitRejectedGlobal.Load()},
+			{value: "per_client", n: c.rateLimitRejectedPerClient.Load()},
+		})
+
+	// Budget counters. nexus_budget_recorded_usd_total is a cumulative
+	// float-valued counter mirroring SpendTracker.Record calls;
+	// nexus_budget_exceeded_total counts WouldExceed == true events.
+	writeMeta(w, "nexus_budget_recorded_usd_total",
+		"Cumulative USD recorded by the rolling daily frontier budget tracker.", "counter")
+	fmt.Fprintf(w, "nexus_budget_recorded_usd_total %s\n", formatFloat(c.BudgetRecordedUSD()))
+
+	writeCounter(w, "nexus_budget_exceeded_total",
+		"Number of frontier requests rejected by the daily budget gate.",
+		c.budgetExceededTotal.Load())
+
+	// TLS handshake counters. Optional: only non-zero when the operator
+	// configured TLS (NEXUS_TLS_CERT + NEXUS_TLS_KEY); otherwise both
+	// samples stay at 0.
+	writeCounterLabeled(w, "nexus_tls_connections_total",
+		"TLS handshake outcomes (issue #70; optional, only non-zero with NEXUS_TLS_CERT).",
+		"outcome", []labelSample{
+			{value: "accepted", n: c.tlsConnectionsAccepted.Load()},
+			{value: "rejected", n: c.tlsConnectionsRejected.Load()},
+		})
+
+	// Auth gauge: cumulative accepted authentications. The metric name
+	// carries "_clients" per the issue spec; semantically this is a
+	// monotonic counter that operators usually want charted as a
+	// monotonically-rising line (Prometheus treats it as gauge so a
+	// rate() function gives authentications-per-second).
+	writeMeta(w, "nexus_auth_authenticated_clients",
+		"Cumulative accepted authentications (issue #70).", "gauge")
+	fmt.Fprintf(w, "nexus_auth_authenticated_clients %d\n", c.AuthAuthenticatedClients())
 
 	// --- Histograms -----------------------------------------------------
 

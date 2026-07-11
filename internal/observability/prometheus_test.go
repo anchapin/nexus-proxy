@@ -277,3 +277,132 @@ func TestRenderPrometheusCostFloat(t *testing.T) {
 		t.Errorf("fractional cost not rendered\n%s", out)
 	}
 }
+
+// TestRenderPrometheusAuthCounters (issue #70) renders the auth
+// counters and gauge after a known sequence of Inc* calls and
+// confirms the per-outcome labels and cumulative gauge are correct.
+func TestRenderPrometheusAuthCounters(t *testing.T) {
+	c := NewCollector()
+
+	c.IncAuthAccepted()
+	c.IncAuthAccepted()
+	c.IncAuthAccepted()
+	c.IncAuthRejectedInvalid()
+	c.IncAuthRejectedMissing()
+	c.IncAuthRejectedMissing()
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c)
+	out := sb.String()
+
+	wantLines := []string{
+		"# TYPE nexus_auth_requests_total counter",
+		`nexus_auth_requests_total{outcome="accepted"} 3`,
+		`nexus_auth_requests_total{outcome="rejected_invalid"} 1`,
+		`nexus_auth_requests_total{outcome="rejected_missing"} 2`,
+		"# TYPE nexus_auth_authenticated_clients gauge",
+		"nexus_auth_authenticated_clients 3",
+	}
+	for _, want := range wantLines {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in output\n%s", want, out)
+		}
+	}
+}
+
+// TestRenderPrometheusRateLimitCounters (issue #70) renders the
+// per-bucket allow/reject counters and the live bucket-count gauge.
+func TestRenderPrometheusRateLimitCounters(t *testing.T) {
+	c := NewCollector()
+
+	c.IncRateLimit("global", true)
+	c.IncRateLimit("global", false)
+	c.IncRateLimit("global", false)
+	c.IncRateLimit("per_client", true)
+	c.IncRateLimit("per_client", true)
+
+	// Live gauge from a provider so the renderer pulls it.
+	provider := GaugeProviderFunc(func() []GaugeSample {
+		return []GaugeSample{{Name: "nexus_rate_limit_buckets", Value: 7}}
+	})
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c, provider)
+	out := sb.String()
+
+	wantLines := []string{
+		"# TYPE nexus_rate_limit_allowed_total counter",
+		`nexus_rate_limit_allowed_total{scope="global"} 1`,
+		`nexus_rate_limit_allowed_total{scope="per_client"} 2`,
+		"# TYPE nexus_rate_limit_rejected_total counter",
+		`nexus_rate_limit_rejected_total{scope="global"} 2`,
+		`nexus_rate_limit_rejected_total{scope="per_client"} 0`,
+		"# TYPE nexus_rate_limit_buckets gauge",
+		"nexus_rate_limit_buckets 7",
+	}
+	for _, want := range wantLines {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in output\n%s", want, out)
+		}
+	}
+}
+
+// TestRenderPrometheusBudgetCounters (issue #70) renders the
+// recorded counter, exceeded counter, and live rolling-total gauge.
+func TestRenderPrometheusBudgetCounters(t *testing.T) {
+	c := NewCollector()
+
+	c.AddBudgetRecorded(0.1234)
+	c.AddBudgetRecorded(0.0566)
+	c.IncBudgetExceeded()
+	c.IncBudgetExceeded()
+	c.IncBudgetExceeded()
+
+	provider := GaugeProviderFunc(func() []GaugeSample {
+		return []GaugeSample{{Name: "nexus_budget_spend_usd", Value: 0.18}}
+	})
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c, provider)
+	out := sb.String()
+
+	wantLines := []string{
+		"# TYPE nexus_budget_recorded_usd_total counter",
+		"nexus_budget_recorded_usd_total 0.18",
+		"# TYPE nexus_budget_exceeded_total counter",
+		"nexus_budget_exceeded_total 3",
+		"# TYPE nexus_budget_spend_usd gauge",
+		"nexus_budget_spend_usd 0.18",
+	}
+	for _, want := range wantLines {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in output\n%s", want, out)
+		}
+	}
+}
+
+// TestRenderPrometheusTLSCounters (issue #70) renders the
+// accepted/rejected labelled family. Both samples stay at 0 unless
+// the wiring layer (tls.Config.VerifyConnection) increments one,
+// but the renderer must always emit the HELP/TYPE pair so the
+// metric is scrapeable the moment TLS becomes active.
+func TestRenderPrometheusTLSCounters(t *testing.T) {
+	c := NewCollector()
+
+	c.IncTLSAccepted()
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c)
+	out := sb.String()
+
+	wantLines := []string{
+		"# TYPE nexus_tls_connections_total counter",
+		`nexus_tls_connections_total{outcome="accepted"} 1`,
+		`nexus_tls_connections_total{outcome="rejected"} 0`,
+	}
+	for _, want := range wantLines {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in output\n%s", want, out)
+		}
+	}
+}

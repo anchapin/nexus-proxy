@@ -86,6 +86,39 @@ type Collector struct {
 
 	latency *Histogram
 	ttft    *Histogram
+
+	// --- Middleware instrumentation (issue #70) ---------------------------
+	//
+	// Auth counters are labelled by outcome via three separate atomics
+	// rather than a label-keyed map. The label set is fixed at three
+	// values, so three atomics is the simplest lock-free layout and
+	// keeps the hot path to a single add per request.
+	authAccepted        atomic.Uint64
+	authRejectedInvalid atomic.Uint64
+	authRejectedMissing atomic.Uint64
+
+	// Rate-limit counters are emitted per bucket (global / per_client)
+	// so operators can tell at a glance whether the global bucket or a
+	// specific client is the bottleneck (issue #70 AC: "How many
+	// requests are 429'd by the rate limiter (per client IP and
+	// globally)?").
+	rateLimitAllowedGlobal     atomic.Uint64
+	rateLimitAllowedPerClient  atomic.Uint64
+	rateLimitRejectedGlobal    atomic.Uint64
+	rateLimitRejectedPerClient atomic.Uint64
+
+	// Budget counters track daily frontier spend (issue #38).
+	// Exceeded is bumped when the gate rejects; RecordedUSD is the
+	// running sum (float, lock-free via the bits trick) of amounts
+	// the tracker recorded after a frontier call completed.
+	budgetExceededTotal   atomic.Uint64
+	budgetRecordedUSDBits atomic.Uint64
+
+	// TLS counters are bumped from main.go via http.Server.ConnState.
+	// Accepted fires on http.StateTLSHandshakeComplete; Rejected
+	// fires when a connection closes before reaching that state.
+	tlsConnectionsAccepted atomic.Uint64
+	tlsConnectionsRejected atomic.Uint64
 }
 
 // NewCollector constructs a Collector with the default latency and TTFT
@@ -165,6 +198,98 @@ func (c *Collector) Latency() *Histogram { return c.latency }
 
 // TTFT returns the time-to-first-token histogram.
 func (c *Collector) TTFT() *Histogram { return c.ttft }
+
+// --- Middleware instrumentation helpers (issue #70) ----------------------
+//
+// Each helper bumps exactly one atomic counter so the middleware hot
+// path stays a single atomic add. The middleware packages own the
+// decision logic (when a request is "accepted" vs "rejected_invalid"
+// etc.); the collector only stores the resulting counts.
+
+// IncAuthAccepted records one accepted authentication request.
+func (c *Collector) IncAuthAccepted() { c.authAccepted.Add(1) }
+
+// IncAuthRejectedInvalid records a request that presented a
+// credential but it did not match any configured key.
+func (c *Collector) IncAuthRejectedInvalid() { c.authRejectedInvalid.Add(1) }
+
+// IncAuthRejectedMissing records a request that presented no
+// credential at all (no Authorization / X-API-Key header).
+func (c *Collector) IncAuthRejectedMissing() { c.authRejectedMissing.Add(1) }
+
+// AuthAuthenticatedClients returns the cumulative count of accepted
+// authentications. The /metrics renderer exposes it under the gauge
+// name nexus_auth_authenticated_clients so operators can chart a
+// running total of successful auth events without scraping logs.
+//
+// (The name carries "clients" rather than "events" because the issue
+// spec calls for a gauge by that name; semantically this is a
+// monotonic counter rendered as a gauge family so a single PromQL
+// query shows the long-running trend.)
+func (c *Collector) AuthAuthenticatedClients() uint64 { return c.authAccepted.Load() }
+
+// IncRateLimit bumps the appropriate rate-limit counter for scope
+// (one of "global", "per_client"). The middleware packages own the
+// mapping from configuration to scope label.
+//
+// A scope other than "global" or "per_client" is silently ignored
+// rather than treated as a default — the renderer only knows those
+// two label values, so a third bucket would be invisible. Invalid
+// scopes indicate a wiring bug worth surfacing in logs at the call
+// site rather than silently dropping.
+func (c *Collector) IncRateLimit(scope string, allowed bool) {
+	switch scope {
+	case "global":
+		if allowed {
+			c.rateLimitAllowedGlobal.Add(1)
+		} else {
+			c.rateLimitRejectedGlobal.Add(1)
+		}
+	case "per_client":
+		if allowed {
+			c.rateLimitAllowedPerClient.Add(1)
+		} else {
+			c.rateLimitRejectedPerClient.Add(1)
+		}
+	}
+}
+
+// IncBudgetExceeded bumps the budget-exceeded counter when the
+// SpendGate rejects a frontier request (issue #70 AC: "How often is
+// the daily frontier budget hit?").
+func (c *Collector) IncBudgetExceeded() { c.budgetExceededTotal.Add(1) }
+
+// AddBudgetRecorded adds amount to the cumulative recorded-spend
+// counter. The collector mirrors the SpendTracker.Record behaviour:
+// positive amounts only, lock-free via the bits trick.
+func (c *Collector) AddBudgetRecorded(amount float64) {
+	if amount > 0 {
+		atomicAddFloat(&c.budgetRecordedUSDBits, amount)
+	}
+}
+
+// BudgetRecordedUSD returns the cumulative USD the budget tracker
+// recorded (sum of all Record calls). The /metrics renderer exposes
+// it as the gauge nexus_budget_recorded_usd_total.
+//
+// The gauge name carries "_total" because it is monotonic; the
+// renderer types it as "counter" in the Prometheus exposition.
+func (c *Collector) BudgetRecordedUSD() float64 {
+	return math.Float64frombits(c.budgetRecordedUSDBits.Load())
+}
+
+// BudgetExceeded returns the cumulative budget-exceeded count.
+func (c *Collector) BudgetExceeded() uint64 { return c.budgetExceededTotal.Load() }
+
+// IncTLSAccepted bumps the accepted TLS-handshake counter. Wired
+// from main.go via http.Server.ConnState on
+// http.StateTLSHandshakeComplete.
+func (c *Collector) IncTLSAccepted() { c.tlsConnectionsAccepted.Add(1) }
+
+// IncTLSRejected bumps the rejected TLS-handshake counter. Wired
+// from main.go via http.Server.ConnState for connections that
+// close before reaching http.StateTLSHandshakeComplete.
+func (c *Collector) IncTLSRejected() { c.tlsConnectionsRejected.Add(1) }
 
 // Histogram is a fixed-bucket cumulative histogram. Buckets are
 // pre-allocated at construction; Observe performs a single linear scan

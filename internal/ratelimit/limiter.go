@@ -41,6 +41,14 @@ type Config struct {
 	// GlobalBurst is the token-bucket capacity for the global
 	// bucket. Zero defaults to GlobalRPM.
 	GlobalBurst int
+
+	// Observer is an optional hook invoked on every non-exempt
+	// rate-limit decision (issue #70). The scope argument is one of
+	// "global", "per_client", or "both"; allowed matches the
+	// Decision.Allowed bool. A nil observer is treated as "no
+	// observability" — Check / Allow still run their normal path,
+	// they simply skip the hook call.
+	Observer func(scope string, allowed bool)
 }
 
 // staleThreshold is how long a per-client bucket may sit idle before
@@ -145,7 +153,13 @@ func New(cfg Config) *Limiter {
 	}
 
 	l := &Limiter{
-		cfg:  Config{PerClientRPM: cfg.PerClientRPM, PerClientBurst: burst, GlobalRPM: cfg.GlobalRPM, GlobalBurst: cfg.GlobalBurst},
+		cfg: Config{
+			PerClientRPM:   cfg.PerClientRPM,
+			PerClientBurst: burst,
+			GlobalRPM:      cfg.GlobalRPM,
+			GlobalBurst:    cfg.GlobalBurst,
+			Observer:       cfg.Observer, // issue #70 — preserved through the constructor's defensive copy
+		},
 		stop: make(chan struct{}),
 		done: make(chan struct{}),
 	}
@@ -226,6 +240,7 @@ func (l *Limiter) Check(key string) Decision {
 
 	if l.global != nil {
 		if ok, ra := l.global.allow(now); !ok {
+			l.observe(scope, false)
 			return Decision{Allowed: false, RetryAfter: ra, Scope: scope}
 		}
 	}
@@ -234,11 +249,37 @@ func (l *Limiter) Check(key string) Decision {
 	if l.cfg.PerClientRPM > 0 {
 		b := l.bucketFor(key)
 		if ok, ra := b.allow(now); !ok {
+			l.observe(scope, false)
 			return Decision{Allowed: false, RetryAfter: ra, Scope: scope}
 		}
 	}
 
+	l.observe(scope, true)
 	return Decision{Allowed: true, Scope: scope}
+}
+
+// observe invokes the configured observer hook (issue #70). The
+// receiver is never nil when called from Check; the helper exists
+// so the call sites stay compact and so a future addition (e.g. a
+// per-bucket gauge) lands in one place.
+func (l *Limiter) observe(scope string, allowed bool) {
+	if l.cfg.Observer != nil {
+		l.cfg.Observer(scope, allowed)
+	}
+}
+
+// SetObserver installs (or clears, with a nil argument) the
+// per-decision observer hook (issue #70). The hook may also be
+// supplied at construction via Config.Observer; SetObserver lets
+// callers wire a hook after the Limiter has been built (e.g. when
+// the observer closes over a value constructed later). A nil
+// receiver is a no-op so callers need not nil-check the Limiter
+// from main.go.
+func (l *Limiter) SetObserver(observer func(scope string, allowed bool)) {
+	if l == nil {
+		return
+	}
+	l.cfg.Observer = observer
 }
 
 // scopeFor collapses the configured buckets into a single label so
