@@ -64,7 +64,6 @@ func newOllamaFixture(t *testing.T) *ollamaFixture {
 type frontierFixture struct {
 	*httptest.Server
 	status int
-	mu     atomic.Int32 // concurrency guard for status + bearer
 	bearer atomic.Value // string — most recent Authorization header
 	calls  atomic.Int32
 }
