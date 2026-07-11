@@ -57,6 +57,26 @@ type Config struct {
 	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
 	ArbiterTimeout time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
+	// Frontier provider selector (issue #45). When more than one
+	// frontier provider is configured (frontier + z.ai), the chat
+	// handler consults a router.ProviderSelector to pick the cheaper
+	// / faster endpoint on every route=frontier request. The selector
+	// reads per-model p50 latency and average cost from the metrics
+	// store over SelectorWindow; SelectorRefreshInterval is the
+	// background cache cadence. SelectorMinSamples is the per-provider
+	// observation floor below which the selector falls back to the
+	// first configured provider (no flapping on cold start).
+	//
+	// FrontierCostPer1K and ZAICostPer1K override the per-request USD
+	// cost the metrics store assigns to each provider (a flat rate
+	// per 1k input tokens). They mirror JudgeCostPer1KUSD but apply
+	// to the per-provider slice that BuildFrontierProviders emits.
+	SelectorWindow          time.Duration // look-back window for provider stats (1h)
+	SelectorMinSamples      int           // per-provider observation floor (5)
+	SelectorRefreshInterval time.Duration // background cache refresh cadence (60s)
+	FrontierCostPer1K       float64       // USD per 1k input tokens for frontier (0.005)
+	ZAICostPer1K            float64       // USD per 1k input tokens for z.ai (0.002)
+
 	// Fusion progressive delivery (issue #48). When enabled and the
 	// harness requests a streaming response, the chat handler
 	// dispatches route=fusion to upstream.PanelStreaming instead of
@@ -300,6 +320,60 @@ func Load() (Config, error) {
 	}
 	cfg.ArbiterTimeout = arbiterTimeout
 
+	// Frontier provider selector (issue #45). Look-back window,
+	// observation floor, and cache cadence. Defaults match the
+	// router.DefaultSelector* constants; operators can shorten
+	// SelectorWindow during development to see fresh picks.
+	selectorWindow, err := getEnvDuration("NEXUS_SELECTOR_WINDOW", time.Hour)
+	if err != nil {
+		return cfg, err
+	}
+	if selectorWindow < 0 {
+		selectorWindow = 0
+	}
+	cfg.SelectorWindow = selectorWindow
+
+	selectorMin, err := getEnvInt("NEXUS_SELECTOR_MIN_SAMPLES", 5)
+	if err != nil {
+		return cfg, err
+	}
+	if selectorMin < 0 {
+		selectorMin = 0
+	}
+	cfg.SelectorMinSamples = selectorMin
+
+	selectorRefresh, err := getEnvDuration("NEXUS_SELECTOR_REFRESH", 60*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	if selectorRefresh < 0 {
+		selectorRefresh = 0
+	}
+	cfg.SelectorRefreshInterval = selectorRefresh
+
+	// Per-provider cost rates. Defaults approximate OpenAI gpt-4o
+	// (~$5/M input tokens) and z.ai glm-4.6 (~$2/M). The chat
+	// handler passes these through to BuildFrontierProviders so the
+	// selector has a deterministic cost weight even before the
+	// metrics store has observed any traffic.
+	frontierCost, err := getEnvFloat("NEXUS_FRONTIER_COST_PER_1K", 0.005)
+	if err != nil {
+		return cfg, err
+	}
+	if frontierCost < 0 {
+		frontierCost = 0
+	}
+	cfg.FrontierCostPer1K = frontierCost
+
+	zaiCost, err := getEnvFloat("NEXUS_ZAI_COST_PER_1K", 0.002)
+	if err != nil {
+		return cfg, err
+	}
+	if zaiCost < 0 {
+		zaiCost = 0
+	}
+	cfg.ZAICostPer1K = zaiCost
+
 	// Fusion progressive delivery (issue #48). Defaults to ON so a
 	// stock `.env.example` boots into the new behaviour; operators
 	// who want to opt out (e.g. to A/B test against the old
@@ -508,6 +582,49 @@ func Load() (Config, error) {
 // still runs without one (fusion will degrade to local-only), but frontier
 // routing will return 401s if attempted.
 func (c Config) FrontierEnabled() bool { return c.FrontierKey != "" }
+
+// FrontierProvider describes one configured frontier endpoint. The
+// chat handler consults FrontierProviders when route=frontier is
+// selected; when more than one provider is configured, the handler
+// also consults a router.ProviderSelector (issue #45) to pick the
+// cheaper / faster endpoint based on observed metrics.
+type FrontierProvider struct {
+	Name         string  // "frontier" or "zai"
+	URL          string  // upstream endpoint
+	Model        string  // OpenAI-compatible model name
+	APIKey       string  // bearer token (empty for the local endpoint)
+	CostPer1KUSD float64 // USD per 1k input tokens (selector weight)
+}
+
+// FrontierProviders returns the configured frontier endpoints in
+// declaration order (frontier first, z.ai second — same order as the
+// existing cascade). Providers with an empty APIKey are omitted so a
+// half-configured deployment cannot accidentally proxy requests to an
+// unauthenticated endpoint. CostPer1KUSD is sourced from
+// FrontierCostPer1K / ZAICostPer1K so the selector has a deterministic
+// cost weight even before the metrics store has observed traffic.
+func (c Config) FrontierProviders() []FrontierProvider {
+	out := make([]FrontierProvider, 0, 2)
+	if c.FrontierKey != "" {
+		out = append(out, FrontierProvider{
+			Name:         "frontier",
+			URL:          c.FrontierURL,
+			Model:        c.FrontierModel,
+			APIKey:       c.FrontierKey,
+			CostPer1KUSD: c.FrontierCostPer1K,
+		})
+	}
+	if c.ZAIKey != "" {
+		out = append(out, FrontierProvider{
+			Name:         "zai",
+			URL:          c.ZAIURL,
+			Model:        c.ZAIModel,
+			APIKey:       c.ZAIKey,
+			CostPer1KUSD: c.ZAICostPer1K,
+		})
+	}
+	return out
+}
 
 // DefaultMaxBodyBytes is the fallback request-body cap (issue #11). 1 MiB
 // matches the typical OpenAI chat-completions request envelope; agents that

@@ -278,6 +278,169 @@ WHERE timestamp >= ? AND timestamp < ?`
 	return sum, nil
 }
 
+// providerStatsAggregateSQL computes count, average cost, and error
+// rate per model over the [since, now] window. The p50/p95 latencies
+// are computed by a separate query below — modernc.org/sqlite supports
+// window functions but keeping the percentile step in its own query
+// avoids repeating the window scan twice.
+const providerStatsAggregateSQL = `
+SELECT model,
+       COUNT(*) AS sample_count,
+       COALESCE(AVG(estimated_cost_usd), 0) AS avg_cost,
+       SUM(CASE WHEN error != '' THEN 1 ELSE 0 END) AS error_count
+FROM requests
+WHERE timestamp >= ? AND model != 'unknown'
+GROUP BY model
+ORDER BY model`
+
+// providerStatsPercentileSQL picks the row at the (rank)-th
+// percentile position for each model. The caller binds the percentile
+// rank via the LIMIT/OFFSET trick — a subquery returns COUNT(*) per
+// model, and a single SELECT with ROW_NUMBER() picks the row whose
+// rank matches. Returns a row per model with its p_NN latency.
+//
+// Two queries are required because SQLite cannot bind LIMIT/OFFSET in
+// a single windowed aggregate across multiple percentiles. Both
+// queries share the same index (idx_requests_timestamp) so the cost
+// is two cheap range scans.
+const providerStatsPercentileSQL = `
+WITH ranked AS (
+    SELECT model, total_latency_ms,
+           ROW_NUMBER() OVER (PARTITION BY model ORDER BY total_latency_ms) AS rn,
+           COUNT(*) OVER (PARTITION BY model) AS cnt
+    FROM requests
+    WHERE timestamp >= ? AND model != 'unknown'
+)
+SELECT model, total_latency_ms
+FROM ranked
+WHERE rn = MAX(1, CAST((cnt * ? + 99) / 100 AS INTEGER))
+ORDER BY model`
+
+// providerStatsQueryTimeout bounds a single ProviderStats call. The
+// aggregation runs over the requests table; even with millions of
+// rows the indexed range scan finishes in tens of milliseconds. The
+// 10s ceiling exists only so a stalled disk cannot pin the refresh
+// goroutine forever.
+const providerStatsQueryTimeout = 10 * time.Second
+
+// ProviderStats returns the per-provider latency, cost, sample-count
+// and error-rate aggregate for the sliding window ending now and
+// starting at since. It satisfies router.ProviderStatsSource so the
+// chat handler's route=frontier dispatch can score frontier and z.ai
+// against each other without hitting the DB on the hot path (the
+// router.ProviderStatsCache calls this from a background goroutine on
+// a fixed cadence).
+//
+// "Provider" is identified by the requests.model column — each
+// configured frontier endpoint uses a distinct model name (e.g.
+// "gpt-4o" for frontier, "glm-4.6" for z.ai), so the per-model
+// aggregation maps cleanly to the configured provider list. Rows
+// where model = "unknown" (the sentinel used by RecordRequest when no
+// model was supplied) are filtered out so an under-instrumented
+// provider cannot pollute the aggregate.
+//
+// p50 is the row at the 50th percentile of total_latency_ms; p95 at
+// the 95th. The selector currently consumes only p50, but p95 is
+// surfaced so future operators can reason about tail latency without
+// extending the schema.
+//
+// Safe for concurrent use; SQLiteStore owns a single connection so
+// concurrent ProviderStats calls serialise but never block on the
+// request hot path (which never calls this directly).
+func (s *SQLiteStore) ProviderStats(since time.Time) ([]router.ProviderStats, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), providerStatsQueryTimeout)
+	defer cancel()
+
+	// Step 1: per-model sample_count, avg_cost, error_count.
+	rows, err := s.db.QueryContext(ctx, providerStatsAggregateSQL, since.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("metrics: provider stats aggregate: %w", err)
+	}
+	type aggRow struct {
+		name        string
+		sampleCount int
+		avgCost     float64
+		errorCount  int
+	}
+	var aggs []aggRow
+	for rows.Next() {
+		var r aggRow
+		if err := rows.Scan(&r.name, &r.sampleCount, &r.avgCost, &r.errorCount); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("metrics: scan aggregate: %w", err)
+		}
+		aggs = append(aggs, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("metrics: aggregate rows: %w", err)
+	}
+	if len(aggs) == 0 {
+		return nil, nil
+	}
+
+	// Step 2: per-model p50 (one windowed scan).
+	p50ByName, err := s.providerStatsPercentile(ctx, since, 50)
+	if err != nil {
+		return nil, err
+	}
+	// Step 3: per-model p95 (another windowed scan). Kept
+	// separate so the percentile position is computed once per
+	// model rather than twice in the same query, and so a future
+	// operator who only needs p50 can short-circuit by skipping
+	// the second call.
+	p95ByName, err := s.providerStatsPercentile(ctx, since, 95)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]router.ProviderStats, 0, len(aggs))
+	for _, a := range aggs {
+		var errRate float64
+		if a.sampleCount > 0 {
+			errRate = float64(a.errorCount) / float64(a.sampleCount)
+		}
+		out = append(out, router.ProviderStats{
+			Name:         a.name,
+			P50LatencyMs: p50ByName[a.name],
+			P95LatencyMs: p95ByName[a.name],
+			AvgCostUSD:   a.avgCost,
+			SampleCount:  a.sampleCount,
+			ErrorRate:    errRate,
+		})
+	}
+	return out, nil
+}
+
+// providerStatsPercentile runs the windowed percentile query for a
+// single rank and returns a name -> latency map. The rank is a
+// percentile in 1..100. Empty / missing rows return a zero latency;
+// callers should treat that as "no data" (the selector already
+// filters P50 <= 0).
+func (s *SQLiteStore) providerStatsPercentile(ctx context.Context, since time.Time, percentile int) (map[string]int64, error) {
+	rows, err := s.db.QueryContext(ctx, providerStatsPercentileSQL, since.UTC(), percentile)
+	if err != nil {
+		return nil, fmt.Errorf("metrics: provider stats p%d: %w", percentile, err)
+	}
+	defer rows.Close()
+	out := make(map[string]int64)
+	for rows.Next() {
+		var name string
+		var lat int64
+		if err := rows.Scan(&name, &lat); err != nil {
+			return nil, fmt.Errorf("metrics: scan p%d: %w", percentile, err)
+		}
+		out[name] = lat
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("metrics: p%d rows: %w", percentile, err)
+	}
+	return out, nil
+}
+
 // Close drains in-flight writes and closes the database. Safe to
 // call exactly once; subsequent calls are no-ops.
 func (s *SQLiteStore) Close() error {
