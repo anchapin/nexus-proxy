@@ -313,3 +313,90 @@ func TestLoadJudgeOverrides(t *testing.T) {
 		t.Error("JudgeEnabled = false, want true")
 	}
 }
+
+// TestTLSConfigDefaults verifies TLS vars are unset by default so the
+// proxy boots in plaintext mode identical to pre-issue-#39 behaviour
+// (issue #39 backward-compat constraint).
+func TestTLSConfigDefaults(t *testing.T) {
+	t.Setenv("NEXUS_TLS_CERT", "")
+	t.Setenv("NEXUS_TLS_KEY", "")
+	t.Setenv("NEXUS_TLS_REDIRECT", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TLSCertFile != "" {
+		t.Errorf("TLSCertFile = %q, want empty", cfg.TLSCertFile)
+	}
+	if cfg.TLSKeyFile != "" {
+		t.Errorf("TLSKeyFile = %q, want empty", cfg.TLSKeyFile)
+	}
+	if cfg.TLSRedirect {
+		t.Error("TLSRedirect = true, want false")
+	}
+	if cfg.TLSActive() {
+		t.Error("TLSActive() = true, want false when no cert/key set")
+	}
+}
+
+// TestTLSConfigActive verifies both cert and key must be set for
+// TLSActive to be true, and that a half-configured deploy (cert without
+// key, or vice-versa) stays inactive (issue #39).
+func TestTLSConfigActive(t *testing.T) {
+	t.Setenv("NEXUS_TLS_CERT", "/etc/nexus/tls.crt")
+	t.Setenv("NEXUS_TLS_KEY", "/etc/nexus/tls.key")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TLSCertFile != "/etc/nexus/tls.crt" {
+		t.Errorf("TLSCertFile = %q", cfg.TLSCertFile)
+	}
+	if cfg.TLSKeyFile != "/etc/nexus/tls.key" {
+		t.Errorf("TLSKeyFile = %q", cfg.TLSKeyFile)
+	}
+	if !cfg.TLSActive() {
+		t.Error("TLSActive() = false, want true when both cert+key set")
+	}
+}
+
+// TestTLSConfigHalfConfiguredStaysInactive verifies that setting only
+// the cert or only the key leaves TLS inactive (issue #39).
+func TestTLSConfigHalfConfiguredStaysInactive(t *testing.T) {
+	t.Setenv("NEXUS_TLS_CERT", "/etc/nexus/tls.crt")
+	t.Setenv("NEXUS_TLS_KEY", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TLSActive() {
+		t.Error("TLSActive() = true with cert but no key; want false")
+	}
+
+	t.Setenv("NEXUS_TLS_CERT", "")
+	t.Setenv("NEXUS_TLS_KEY", "/etc/nexus/tls.key")
+	cfg2, err := Load()
+	if err != nil {
+		t.Fatalf("Load (2): %v", err)
+	}
+	if cfg2.TLSActive() {
+		t.Error("TLSActive() = true with key but no cert; want false")
+	}
+}
+
+// TestTLSRedirectTruthy verifies the NEXUS_TLS_REDIRECT boolean parsing
+// (issue #39).
+func TestTLSRedirectTruthy(t *testing.T) {
+	for _, val := range []string{"true", "1", "yes", "on"} {
+		t.Run(val, func(t *testing.T) {
+			t.Setenv("NEXUS_TLS_REDIRECT", val)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if !cfg.TLSRedirect {
+				t.Errorf("TLSRedirect = false for %q, want true", val)
+			}
+		})
+	}
+}

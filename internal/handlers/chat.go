@@ -842,9 +842,17 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 // requestID extracts (or generates) a correlation id for the judge
 // hook. The handler honours an inbound X-Request-Id so a caller can
 // thread its own id through; otherwise we mint a short hex token.
+//
+// The inbound value is sanitised (issue #39): characters outside
+// [a-zA-Z0-9._:-] are stripped so a crafted header cannot inject log
+// entries or break downstream JSON consumers, and the length is capped
+// at requestIDMaxLen. When the value is empty after sanitization the
+// handler falls through to a generated hex id.
 func requestID(r *http.Request) string {
 	if v := r.Header.Get("X-Request-Id"); v != "" {
-		return v
+		if clean := sanitizeRequestID(v); clean != "" {
+			return clean
+		}
 	}
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -854,6 +862,29 @@ func requestID(r *http.Request) string {
 		return "req-unknown"
 	}
 	return "req-" + hex.EncodeToString(b[:])
+}
+
+// requestIDMaxLen caps the length of an inbound X-Request-Id. Longer
+// values are truncated so a malicious client cannot bloat logs or the
+// telemetry row with an arbitrarily long correlation id (issue #39).
+const requestIDMaxLen = 128
+
+// requestIDDisallowedRe matches characters NOT permitted in a sanitized
+// request id. The allowed set is [a-zA-Z0-9._:-]; any other character
+// (newlines, control bytes, quotes, angle brackets, whitespace, ...) is
+// stripped so a crafted X-Request-Id cannot inject log entries or break
+// downstream JSON consumers (issue #39).
+var requestIDDisallowedRe = regexp.MustCompile(`[^a-zA-Z0-9._:-]`)
+
+// sanitizeRequestID strips characters outside [a-zA-Z0-9._:-] and caps
+// the length at requestIDMaxLen. Returns "" when the input is empty
+// after sanitization, so the caller falls through to a generated hex id.
+func sanitizeRequestID(s string) string {
+	s = requestIDDisallowedRe.ReplaceAllString(s, "")
+	if len(s) > requestIDMaxLen {
+		s = s[:requestIDMaxLen]
+	}
+	return s
 }
 
 // captureWriter is an http.ResponseWriter that tees every Write into

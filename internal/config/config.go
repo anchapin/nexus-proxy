@@ -32,6 +32,21 @@ type Config struct {
 	// HTTP server
 	Addr string // ":8000"
 
+	// TLS termination (issue #39). When both TLSCertFile and TLSKeyFile
+	// are non-empty, the server uses ListenAndServeTLS instead of
+	// ListenAndServe so inbound traffic is encrypted. TLSActive()
+	// reports the combined condition so main.go and the security-headers
+	// middleware can branch on a single boolean. When neither variable
+	// is set the proxy serves plain HTTP — identical to pre-issue-#39
+	// behaviour (zero breaking change for localhost dev).
+	TLSCertFile string // env NEXUS_TLS_CERT; empty == plaintext
+	TLSKeyFile  string // env NEXUS_TLS_KEY; empty == plaintext
+	// TLSRedirect, when true alongside TLS active, starts a second
+	// listener on port 80 that issues a 301 Moved Permanently to the
+	// HTTPS port so clients connecting over plain HTTP get upgraded.
+	// Ignored when TLS is not active.
+	TLSRedirect bool // env NEXUS_TLS_REDIRECT
+
 	// Inbound proxy authentication (issue #37). When at least one key
 	// is configured, inbound requests must present a valid
 	// `Authorization: Bearer <key>` or `X-API-Key` header or the
@@ -363,6 +378,15 @@ func Load() (Config, error) {
 	cfg.ProxyAPIKeys = splitCSV(resolveString("NEXUS_PROXY_API_KEYS", nil, ""))
 	cfg.ProxyAuthEnabled = len(cfg.ProxyAuthKeys()) > 0
 
+	// TLS termination (issue #39). Paths are read from env only (not the
+	// YAML file map) so a cert/key path never lands on disk in a config
+	// file — same stance as the other secrets. TLSRedirect is a strict
+	// bool (truthy spellings: true | 1 | yes | on). When both cert and
+	// key are empty the proxy serves plain HTTP exactly as before.
+	cfg.TLSCertFile = resolveString("NEXUS_TLS_CERT", nil, "")
+	cfg.TLSKeyFile = resolveString("NEXUS_TLS_KEY", nil, "")
+	cfg.TLSRedirect = resolveBool("NEXUS_TLS_REDIRECT", nil, false)
+
 	threshold, err := resolveFloat("NEXUS_RAG_THRESHOLD", fileMap, 0.55)
 	if err != nil {
 		return cfg, err
@@ -670,6 +694,17 @@ func Load() (Config, error) {
 // still runs without one (fusion will degrade to local-only), but frontier
 // routing will return 401s if attempted.
 func (c Config) FrontierEnabled() bool { return c.FrontierKey != "" }
+
+// TLSActive reports whether TLS termination is configured — i.e. both
+// TLSCertFile and TLSKeyFile are non-empty. Used by main.go to branch
+// between ListenAndServeTLS and ListenAndServe, and by the
+// security-headers middleware to decide whether to emit
+// Strict-Transport-Security. A single set value (cert without key, or
+// vice-versa) is treated as inactive so a half-configured deploy keeps
+// serving plaintext rather than failing to boot on a missing file.
+func (c Config) TLSActive() bool {
+	return c.TLSCertFile != "" && c.TLSKeyFile != ""
+}
 
 // ProxyAuthKeys returns the combined, de-duplicated, non-empty set of
 // accepted inbound API keys (NEXUS_PROXY_API_KEY plus the entries of

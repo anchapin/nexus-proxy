@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -19,6 +20,48 @@ import (
 // default http.Client satisfies it; tests can pass a stub.
 type Client interface {
 	Do(req *http.Request) (*http.Response, error)
+}
+
+// allowedHeaders is the allowlist of upstream response headers the proxy
+// forwards to clients (issue #39). Headers NOT in this set — Server,
+// Set-Cookie, Via, upstream X-RateLimit-*, X-Powered-By, ... — are dropped
+// so the proxy does not leak upstream identity or forward session state
+// into the harness's response stream.
+//
+// X-Nexus-* is matched by prefix (see headerAllowed) so the proxy's own
+// instrumentation headers (X-Nexus-Degraded, X-Nexus-Overflow,
+// X-Nexus-Cascade-Served-By, X-Nexus-RateLimit-*) pass through regardless
+// of which subsystem set them.
+var allowedHeaders = map[string]struct{}{
+	"Content-Type":  {},
+	"Cache-Control": {},
+}
+
+// headerAllowed reports whether name should be forwarded to the client.
+// Header names are canonicalised by net/http (CanonicalMIMEHeaderKey)
+// before they reach the map, so we compare against the canonical form.
+// X-Nexus-* is matched by prefix (case-insensitive, redundant given
+// canonicalisation but defensive) so future instrumentation headers pass
+// through without touching the allowlist.
+func headerAllowed(name string) bool {
+	if _, ok := allowedHeaders[name]; ok {
+		return true
+	}
+	return strings.HasPrefix(strings.ToLower(name), "x-nexus-")
+}
+
+// copyAllowedHeaders copies only allowlisted headers from src to dst.
+// Non-allowed headers (Server, Set-Cookie, Via, ...) are dropped so the
+// proxy does not leak upstream identity or session state to the client.
+func copyAllowedHeaders(dst, src http.Header) {
+	for k, vs := range src {
+		if !headerAllowed(k) {
+			continue
+		}
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
 }
 
 // Stream POSTs payload to targetURL and flushes every newline-terminated
@@ -61,11 +104,10 @@ func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client
 	}
 	defer resp.Body.Close()
 
-	for k, vs := range resp.Header {
-		for _, v := range vs {
-			w.Header().Add(k, v)
-		}
-	}
+	// Forward only allowlisted upstream headers so the proxy does not
+	// leak upstream identity (Server), session state (Set-Cookie), or
+	// routing metadata (Via) to the client (issue #39).
+	copyAllowedHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
 	flusher, ok := w.(http.Flusher)
@@ -147,17 +189,10 @@ func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client
 		return fmt.Errorf("upstream: invalid JSON in response (status %d): %w", resp.StatusCode, err)
 	}
 
-	// Forward upstream headers except Content-Type, which we always set
-	// to application/json so the harness sees a plain JSON envelope
-	// regardless of what the upstream declared.
-	for k, vs := range resp.Header {
-		if k == "Content-Type" {
-			continue
-		}
-		for _, v := range vs {
-			w.Header().Add(k, v)
-		}
-	}
+	// Forward only allowlisted upstream headers (issue #39). Content-Type
+	// is then always re-asserted to application/json so the harness sees a
+	// plain JSON envelope regardless of what the upstream declared.
+	copyAllowedHeaders(w.Header(), resp.Header)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	_, werr := w.Write(respBody)
