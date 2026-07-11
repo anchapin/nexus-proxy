@@ -306,6 +306,21 @@ func Chat(d Deps) http.Handler {
 		reqID := requestID(r)
 		started := time.Now()
 
+		// Debug trace scaffolding (issue #33). Allocated up front so
+		// each lifecycle step can populate its sub-trace; emitted as
+		// a single batch at the very end. The trace variable is a
+		// single DebugTrace value — not a pointer — so the hot path
+		// (Debug=false) never allocates at all. The conditional at
+		// emit time keeps the production cost at zero.
+		var trace DebugTrace
+		trace.Request.RequestID = reqID
+		trace.Request.Stream = true // overridden after parse if harness says stream=false
+		if d.Config.Debug {
+			slog.Debug("[DEBUG] handler entered",
+				slog.String("request_id", reqID),
+			)
+		}
+
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 			return
@@ -346,10 +361,31 @@ func Chat(d Deps) http.Handler {
 			return
 		}
 
+		// Capture the inbound shape for the debug trace BEFORE any
+		// middleware mutates messages. Populating these fields is
+		// cheap (a few assignments) so we do it unconditionally; the
+		// DebugTrace.Emit call is the only path that actually reads
+		// them, and that's gated by d.Config.Debug below.
+		trace.Request.Messages = len(rawMessages)
+		trace.Request.InboundBodyBytes = len(bodyBytes)
+		if m, ok := body["model"].(string); ok {
+			trace.Request.ModelRequested = m
+		}
+		if s, ok := body["stream"].(bool); ok {
+			trace.Request.Stream = s
+		}
+
 		messages := middleware.ApplyPromptEngineering(rawMessages, d.Config.MetaPrompt)
 		latestPrompt := middleware.ExtractLatestUserPrompt(messages)
+		// Record whether the meta-prompt actually appended to a
+		// system slot — "applied" only when there is now a system
+		// message containing the operator-configured enhancement.
+		trace.Transforms.PromptEngineeringApplied =
+			d.Config.MetaPrompt != "" && len(messages) > 0 &&
+				containsSystemWith(messages, d.Config.MetaPrompt)
 		var ragInjected bool
 		var ragFilename string
+		var ragScore float64
 		if ex, score, err := d.RAG.Retrieve(r.Context(), latestPrompt); err == nil && ex != nil {
 			messages = middleware.InjectRAG(messages, rag.FormatInjection(ex))
 			slog.Info("rag hit",
@@ -359,20 +395,34 @@ func Chat(d Deps) http.Handler {
 			)
 			ragInjected = true
 			ragFilename = ex.Filename
-			_ = score
+			ragScore = score
 		}
+		trace.Transforms.RAGInjected = ragInjected
+		trace.Transforms.RAGFilename = ragFilename
+		trace.Transforms.RAGScore = ragScore
 		// Snapshot the JSON size BEFORE TOON compression so the
 		// metrics observer can attribute tokens saved by the
 		// round-trip pass. Uses the cheap "4 chars per token"
 		// heuristic the rest of the project uses for telemetry
 		// (see internal/telemetry.EstimateTokens).
 		preCompressionChars := totalMessageChars(messages)
+		trace.Transforms.TOONBytesBefore = preCompressionChars
 		if middleware.CompressJSONBlocks(messages) {
 			messages = middleware.AppendSystemNote(messages, d.Config.TOONNotice)
 			slog.Info("toon compressed messages", slog.String("request_id", reqID))
 		}
+		postCompressionChars := totalMessageChars(messages)
+		trace.Transforms.TOONApplied = postCompressionChars != preCompressionChars
+		trace.Transforms.TOONBytesAfter = postCompressionChars
+		trace.Transforms.TOONTokensSaved = totalTokenSavings(preCompressionChars, postCompressionChars)
 		body["messages"] = messages
 		latestPrompt = middleware.ExtractLatestUserPrompt(messages)
+		// Promote the post-middleware prompt length into the
+		// request trace so operators can see what the SLM/router
+		// actually consumed. The pre-middleware count lives on the
+		// TransformTrace; the post-middleware count lives on the
+		// RequestTrace because it is what every later stage sees.
+		trace.Request.EstimatedTokens = len(latestPrompt) / 4
 
 		var route router.Route
 		// VRAM-aware guardrail (issue #6). When the
@@ -398,12 +448,22 @@ func Chat(d Deps) http.Handler {
 				slog.String("request_id", reqID),
 			)
 			route = g
+			trace.Routing.Route = string(g)
+			trace.Routing.Reason = "guardrail"
+			trace.Routing.BudgetSource = guardrailSource
+			trace.Routing.BudgetTokens = guardrailBudget
+			trace.Routing.EstimatedTokens = len(latestPrompt) / 4
 		} else if r2, hit := router.DSL(latestPrompt, d.FormattingRegex); hit {
 			slog.Info("dsl match",
 				slog.String("route", string(r2)),
 				slog.String("request_id", reqID),
 			)
 			route = r2
+			trace.Routing.Route = string(r2)
+			trace.Routing.Reason = "dsl"
+			trace.Routing.BudgetSource = guardrailSource
+			trace.Routing.BudgetTokens = guardrailBudget
+			trace.Routing.EstimatedTokens = len(latestPrompt) / 4
 		} else {
 			slog.Debug("dsl bypassed, asking slm", slog.String("request_id", reqID))
 			// Judge-guided adaptive routing (issue #47). When a
@@ -441,6 +501,11 @@ func Chat(d Deps) http.Handler {
 				slog.String("request_id", reqID),
 			)
 			route = dec
+			trace.Routing.Route = string(dec)
+			trace.Routing.Reason = "slm"
+			trace.Routing.BudgetSource = guardrailSource
+			trace.Routing.BudgetTokens = guardrailBudget
+			trace.Routing.EstimatedTokens = len(latestPrompt) / 4
 		}
 
 		// Honor the harness's stream flag (issue #10). OpenAI treats
@@ -454,6 +519,10 @@ func Chat(d Deps) http.Handler {
 		if s, ok := body["stream"].(bool); ok && !s {
 			streaming = false
 		}
+		// Refresh the request trace's stream flag with the resolved
+		// value (defaulted to true when the harness omitted it) so
+		// the debug log reflects what the handler actually used.
+		trace.Request.Stream = streaming
 
 		// Wrap the response writer so we can capture TTFT and byte counts
 		// without affecting upstream.Stream's flusher contract.
@@ -492,6 +561,17 @@ func Chat(d Deps) http.Handler {
 		var model string
 		var upErr error
 		var fusionArbiterSkipped bool
+		// capw is the response-body captureWriter installed for the
+		// local cascade branch when judge/quality observers OR
+		// debug tracing are configured (issue #33). Hoisted out of
+		// the RouteLocal case so the debug emit block at the end of
+		// the handler can read the buffered body preview regardless
+		// of which branch served the request. For route=frontier
+		// the value is nil and the debug trace records an empty
+		// body preview — the operator can still see the request id
+		// and decide whether to enable captureWriter globally in a
+		// follow-up.
+		var capw *captureWriter
 		switch route {
 		case router.RouteFusion:
 			slog.Info("starting fusion panel", slog.String("request_id", reqID))
@@ -499,11 +579,22 @@ func Chat(d Deps) http.Handler {
 			// has not opted out and the harness asked for SSE
 			// (streaming=true), dispatch to PanelStreaming instead
 			// of the legacy Panel. The streaming path races the
-			// two panel members, streams the first to complete as
-			// a speculative OpenAI-compatible SSE chunk, and only
+			// two panel members, streams the first to complete as a
+			// speculative OpenAI-compatible SSE chunk, and only
 			// invokes the arbiter when the second member
 			// disagrees. The legacy Panel path remains unchanged
 			// for stream=false / NEXUS_FUSION_PROGRESSIVE=false.
+			//
+			// Debug trace (issue #33): fusion dispatches to two
+			// distinct upstreams (local + frontier) plus a
+			// synthesis arbiter. The trace records the frontier
+			// host as the "primary" target and notes both
+			// panel members via the cascade-free routing — fusion
+			// has no cascade, both panel members run in parallel.
+			trace.Upstream.Route = string(route)
+			trace.Upstream.Streaming = streaming
+			trace.Upstream.Model = d.Config.FrontierModel
+			trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
 			if streaming && d.Config.FusionProgressiveDelivery {
 				var outcome upstream.PanelOutcome
 				outcome, upErr = upstream.PanelStreaming(
@@ -572,17 +663,17 @@ func Chat(d Deps) http.Handler {
 			})
 
 			// Writer chain (outermost first):
-			//   upstream.Write -> captureWriter (judge + quality tee) ->
-			//   ObservingWriter (telemetry byte count + TTFT) ->
+			//   upstream.Write -> captureWriter (judge + quality tee OR debug) ->
+			//   ObservingWriter (telemetry byte count + TTFT + status) ->
 			//   underlying ResponseWriter.
-			// captureWriter is only installed when at least one
-			// observer is set; otherwise the dispatch writes
-			// directly through obs with zero overhead.
+			// captureWriter is installed when at least one observer
+			// is set OR debug tracing is on (issue #33); otherwise
+			// the dispatch writes directly through obs with zero
+			// overhead.
 			rw := http.ResponseWriter(obs)
-			var cap *captureWriter
-			if d.JudgeObserver != nil || d.QualityObserver != nil {
-				cap = newCaptureWriter(obs, d.maxObservedBytes)
-				rw = cap
+			if d.JudgeObserver != nil || d.QualityObserver != nil || d.Config.Debug {
+				capw = newCaptureWriter(obs, d.maxObservedBytes)
+				rw = capw
 			}
 			if streaming {
 				// Cascade (issue #14): try local Ollama first, fall
@@ -605,20 +696,38 @@ func Chat(d Deps) http.Handler {
 					// dashboard.
 				} else {
 					model = d.Config.LocalModel
-					if res.Succeeded && cap != nil {
+					if res.Succeeded && capw != nil {
 						if d.JudgeObserver != nil {
 							d.JudgeObserver.Submit(LocalCompletion{
 								RequestID:   reqID,
 								Instruction: latestPrompt,
-								Output:      cap.Buffer(),
+								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
 							})
 						}
 						if d.QualityObserver != nil {
-							emitDetectedEdits(cap.Buffer(), reqID, d.QualityObserver)
+							emitDetectedEdits(capw.Buffer(), reqID, d.QualityObserver)
 						}
 					}
 				}
+				// Debug trace (issue #33): populate cascade details
+				// once the cascade result is known. Steps come from
+				// the joined RouteAttempted; the runner already
+				// separated them with "->". The frontier host is the
+				// canonical "target" because local has no host
+				// exposed in the URL — operators reading the trace
+				// get the most-actionable piece.
+				trace.Upstream.Route = string(route)
+				trace.Upstream.Streaming = streaming
+				trace.Upstream.Model = model
+				trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
+				if res.RouteAttempted != "" {
+					trace.Upstream.CascadeSteps = strings.Split(res.RouteAttempted, "->")
+				} else {
+					trace.Upstream.CascadeSteps = stepNames(cas.Steps)
+				}
+				trace.Upstream.CascadeServedBy = res.ServedBy
+				trace.Upstream.CascadeSuccess = res.Succeeded
 			} else {
 				// Non-streaming (issue #10): BufferedFetch collects
 				// the full upstream body and writes it as a single
@@ -652,20 +761,31 @@ func Chat(d Deps) http.Handler {
 					if skipLocal {
 						model = d.Config.FrontierModel
 					}
-					if cap != nil {
+					if capw != nil {
 						if d.JudgeObserver != nil {
 							d.JudgeObserver.Submit(LocalCompletion{
 								RequestID:   reqID,
 								Instruction: latestPrompt,
-								Output:      cap.Buffer(),
+								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
 							})
 						}
 						if d.QualityObserver != nil {
-							emitDetectedEdits(cap.Buffer(), reqID, d.QualityObserver)
+							emitDetectedEdits(capw.Buffer(), reqID, d.QualityObserver)
 						}
 					}
 				}
+				// Debug trace (issue #33): non-streaming local path
+				// bypasses the cascade so there are no per-step
+				// attempts to report; we just record the single
+				// upstream target we hit.
+				trace.Upstream.Route = string(route)
+				trace.Upstream.Streaming = false
+				trace.Upstream.Model = model
+				trace.Upstream.TargetHost = HostOfURL(targetURL)
+				trace.Upstream.CascadeSteps = nil
+				trace.Upstream.CascadeServedBy = ""
+				trace.Upstream.CascadeSuccess = upErr == nil
 			}
 
 		default:
@@ -688,6 +808,13 @@ func Chat(d Deps) http.Handler {
 				)
 				http.Error(w, "Upstream error", http.StatusBadGateway)
 			}
+			// Debug trace (issue #33): route=frontier is a single
+			// endpoint with no cascade — populate the trace with
+			// just the target host and model.
+			trace.Upstream.Route = string(route)
+			trace.Upstream.Streaming = streaming
+			trace.Upstream.Model = model
+			trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
 		}
 
 		// Per-request recording. The metrics observer (issue #4)
@@ -732,6 +859,35 @@ func Chat(d Deps) http.Handler {
 			})
 		} else {
 			d.Recorder.Record(rec)
+		}
+
+		// Debug trace emission (issue #33). When Debug is on we
+		// flush a single batch of structured slog lines that
+		// describes the full request lifecycle. Emission happens
+		// AFTER the metrics dispatch so the trace can include the
+		// final response status (which http.Error may have set
+		// before we got here). The trace is gated on the
+		// pre-existing flag, so the production path pays zero
+		// allocations when NEXUS_DEBUG is unset.
+		if d.Config.Debug {
+			trace.Response.Status = obs.StatusCode()
+			trace.Response.TTFTMs = ttftMs
+			trace.Response.TotalBytes = obs.BytesOut()
+			trace.Response.OutputTokens = outputTokens
+			if capw != nil {
+				preview, truncated := TruncateForDebug(capw.Buffer(), d.Config.EffectiveDebugBodyBytes())
+				trace.Response.BodyPreview = preview
+				trace.Response.BodyTruncated = truncated
+			} else {
+				// captureWriter was not installed (debug turned
+				// on mid-request, race-style — should not happen
+				// because the flag is checked at every code path
+				// but be defensive). Surface the situation rather
+				// than crash on a nil deref.
+				trace.Response.BodyPreview = ""
+				trace.Response.BodyTruncated = false
+			}
+			trace.Emit(slog.Default())
 		}
 	})
 }
@@ -845,6 +1001,47 @@ var (
 	_ http.ResponseWriter = (*captureWriter)(nil)
 	_ http.Flusher        = (*captureWriter)(nil)
 )
+
+// containsSystemWith reports whether messages already contained a
+// system role whose content includes needle. Used by the debug trace
+// to confirm the meta-prompt pass actually appended the operator-
+// configured enhancement rather than leaving messages untouched (e.g.
+// when MetaPrompt is empty or the harness sent zero messages).
+func containsSystemWith(messages []interface{}, needle string) bool {
+	if needle == "" {
+		return false
+	}
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if role != "system" {
+			continue
+		}
+		if content, _ := msg["content"].(string); strings.Contains(content, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// stepNames returns the human-friendly names of cascade steps in
+// declaration order. Used by the debug trace (issue #33) as a
+// fallback when the cascade runner's RouteAttempted is empty (e.g.
+// every step errored before recording). Keeps the trace complete
+// even on full failure paths.
+func stepNames(steps []upstream.CascadeStep) []string {
+	if len(steps) == 0 {
+		return nil
+	}
+	out := make([]string, len(steps))
+	for i, s := range steps {
+		out[i] = s.Name
+	}
+	return out
+}
 
 // qualityEditNames is the set of tool names the handler treats as
 // "this might have written a file". Mirrors internal/quality so the
