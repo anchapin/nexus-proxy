@@ -8,6 +8,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"regexp"
+	"sync"
+	"syscall"
+	"time"
+
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/handlers"
 	"github.com/anchapin/nexus-proxy/internal/health"
@@ -18,15 +28,6 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
-	"log"
-	"log/slog"
-	"net/http"
-	"os"
-	"os/signal"
-	"regexp"
-	"sync"
-	"syscall"
-	"time"
 )
 
 const (
