@@ -650,3 +650,222 @@ func TestCascadeLocalStepFailedNotSetOnNonRetryable(t *testing.T) {
 	// Non-retryable means the cascade stops immediately; fallback is
 	// never called and LocalStepFailed should be false.
 }
+
+// --- Issue #72: tool_calls preservation tests --------------------------------
+
+// toolCallBody is a minimal OpenAI-compatible response with one tool call.
+const toolCallBody = `{"model":"qwen","choices":[{"message":{"content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"cmd\":\"ls\"}"}}]}}]}`
+
+// TestCascadeToolCallsStreamedAsDeltaToolCalls verifies that valid
+// tool_calls from the local upstream reach the client as OpenAI-compatible
+// SSE delta.tool_calls with finish_reason "tool_calls" (issue #72).
+func TestCascadeToolCallsStreamedAsDeltaToolCalls(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, toolCallBody)
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("fallback should not fire for valid tool_calls")
+	})
+	rw := newSSERW()
+	res, err := twoStepCascade().Run(rw, &http.Client{Transport: ft}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Succeeded || res.ServedBy != "local" {
+		t.Fatalf("Succeeded=%v ServedBy=%q", res.Succeeded, res.ServedBy)
+	}
+	if len(res.ToolCalls) != 1 {
+		t.Fatalf("ToolCalls len = %d, want 1", len(res.ToolCalls))
+	}
+	// Parse the SSE chunk and verify the delta carries tool_calls.
+	body := rw.body.String()
+	lines := strings.SplitN(strings.TrimSpace(body), "\n\n", 2)
+	if len(lines) < 1 {
+		t.Fatalf("no SSE frames: %q", body)
+	}
+	raw := strings.TrimPrefix(lines[0], "data: ")
+	var chunk map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &chunk); err != nil {
+		t.Fatalf("invalid chunk JSON: %v", err)
+	}
+	choices, _ := chunk["choices"].([]interface{})
+	if len(choices) != 1 {
+		t.Fatalf("choices len = %d", len(choices))
+	}
+	choice := choices[0].(map[string]interface{})
+	if choice["finish_reason"] != "tool_calls" {
+		t.Errorf("finish_reason = %v, want tool_calls", choice["finish_reason"])
+	}
+	delta, _ := choice["delta"].(map[string]interface{})
+	tc, ok := delta["tool_calls"].([]interface{})
+	if !ok {
+		t.Fatalf("delta.tool_calls missing or wrong type: %v", delta)
+	}
+	if len(tc) != 1 {
+		t.Errorf("tool_calls len = %d, want 1", len(tc))
+	}
+	first := tc[0].(map[string]interface{})
+	if first["id"] != "call_1" {
+		t.Errorf("tool_call id = %v", first["id"])
+	}
+	if first["index"] != float64(0) {
+		t.Errorf("tool_call index = %v, want 0", first["index"])
+	}
+	fn := first["function"].(map[string]interface{})
+	if fn["name"] != "bash" {
+		t.Errorf("function name = %v", fn["name"])
+	}
+	// Empty content must NOT appear in the delta.
+	if _, hasContent := delta["content"]; hasContent {
+		t.Errorf("delta should not carry content for tool-call-only response: %v", delta)
+	}
+}
+
+// TestCascadeEmptyContentWithToolCallsAccepted verifies that an empty
+// content field alongside valid tool_calls does NOT trigger fallback
+// (issue #72 acceptance criterion).
+func TestCascadeEmptyContentWithToolCallsAccepted(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, toolCallBody) // content is ""
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("fallback should not fire")
+	})
+	res, err := twoStepCascade().Run(newSSERW(), &http.Client{Transport: ft}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Succeeded || res.ServedBy != "local" {
+		t.Errorf("Succeeded=%v ServedBy=%q", res.Succeeded, res.ServedBy)
+	}
+}
+
+// TestCascadeContentOnlyBackwardCompat verifies content-only responses
+// still produce delta.content + finish_reason "stop" — the legacy shape
+// must be byte-for-byte backward compatible (issue #72).
+func TestCascadeContentOnlyBackwardCompat(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+	rw := newSSERW()
+	res, err := twoStepCascade().Run(rw, &http.Client{Transport: ft}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(res.ToolCalls) != 0 {
+		t.Errorf("ToolCalls len = %d, want 0", len(res.ToolCalls))
+	}
+	body := rw.body.String()
+	raw := strings.TrimPrefix(strings.SplitN(strings.TrimSpace(body), "\n\n", 2)[0], "data: ")
+	var chunk map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &chunk); err != nil {
+		t.Fatalf("invalid chunk: %v", err)
+	}
+	choice := chunk["choices"].([]interface{})[0].(map[string]interface{})
+	if choice["finish_reason"] != "stop" {
+		t.Errorf("finish_reason = %v, want stop", choice["finish_reason"])
+	}
+	delta := choice["delta"].(map[string]interface{})
+	if _, hasTC := delta["tool_calls"]; hasTC {
+		t.Errorf("content-only delta should not carry tool_calls: %v", delta)
+	}
+	if delta["content"] != "hello from local" {
+		t.Errorf("content = %v", delta["content"])
+	}
+}
+
+// TestCascadeMultipleToolCallsIndexed verifies that multiple tool calls
+// in a single response each get the correct streaming "index" field.
+func TestCascadeMultipleToolCallsIndexed(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"model":"qwen","choices":[{"message":{"content":"","tool_calls":[
+			{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.go\"}"}},
+			{"id":"call_2","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"b.go\"}"}}
+		]}}]}`)
+	})
+	rw := newSSERW()
+	res, err := twoStepCascade().Run(rw, &http.Client{Transport: ft}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(res.ToolCalls) != 2 {
+		t.Fatalf("ToolCalls len = %d, want 2", len(res.ToolCalls))
+	}
+	body := rw.body.String()
+	raw := strings.TrimPrefix(strings.SplitN(strings.TrimSpace(body), "\n\n", 2)[0], "data: ")
+	var chunk map[string]interface{}
+	_ = json.Unmarshal([]byte(raw), &chunk)
+	choice := chunk["choices"].([]interface{})[0].(map[string]interface{})
+	tc := choice["delta"].(map[string]interface{})["tool_calls"].([]interface{})
+	for i, raw := range tc {
+		entry := raw.(map[string]interface{})
+		if entry["index"] != float64(i) {
+			t.Errorf("tool_call[%d] index = %v, want %d", i, entry["index"], i)
+		}
+	}
+}
+
+// TestCascadeContentAndToolCallsBothPresent verifies that when the
+// upstream returns both content and tool_calls, the delta includes
+// both (some models emit a preamble before the tool call).
+func TestCascadeContentAndToolCallsBothPresent(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"model":"qwen","choices":[{"message":{"content":"Let me check that.","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{}"}}]}}]}`)
+	})
+	rw := newSSERW()
+	_, err := twoStepCascade().Run(rw, &http.Client{Transport: ft}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	raw := strings.TrimPrefix(strings.SplitN(strings.TrimSpace(rw.body.String()), "\n\n", 2)[0], "data: ")
+	var chunk map[string]interface{}
+	_ = json.Unmarshal([]byte(raw), &chunk)
+	choice := chunk["choices"].([]interface{})[0].(map[string]interface{})
+	delta := choice["delta"].(map[string]interface{})
+	if delta["content"] != "Let me check that." {
+		t.Errorf("content = %v", delta["content"])
+	}
+	if _, ok := delta["tool_calls"]; !ok {
+		t.Errorf("tool_calls missing from delta: %v", delta)
+	}
+	if choice["finish_reason"] != "tool_calls" {
+		t.Errorf("finish_reason = %v, want tool_calls", choice["finish_reason"])
+	}
+}
+
+// TestExtractAssistantMessageToolCalls is a unit test for the extraction
+// function itself, verifying tool_calls are returned alongside content.
+func TestExtractAssistantMessageToolCalls(t *testing.T) {
+	msg, model, err := extractAssistantMessage([]byte(toolCallBody))
+	if err != nil {
+		t.Fatalf("extractAssistantMessage: %v", err)
+	}
+	if model != "qwen" {
+		t.Errorf("model = %q", model)
+	}
+	if msg.Content != "" {
+		t.Errorf("Content = %q, want empty", msg.Content)
+	}
+	if !msg.HasToolCalls() {
+		t.Error("HasToolCalls = false, want true")
+	}
+	if len(msg.ToolCalls) != 1 {
+		t.Fatalf("ToolCalls len = %d", len(msg.ToolCalls))
+	}
+	if msg.ToolCalls[0].ID != "call_1" {
+		t.Errorf("ID = %q", msg.ToolCalls[0].ID)
+	}
+	if msg.ToolCalls[0].Function.Name != "bash" {
+		t.Errorf("Name = %q", msg.ToolCalls[0].Function.Name)
+	}
+}

@@ -163,6 +163,7 @@ type MetricsEvent struct {
 	TPS                  float64
 	Streaming            bool
 	FusionArbiterSkipped bool
+	ToolCallCount        int
 	Error                string
 
 	RouteSource   string
@@ -755,6 +756,11 @@ func Chat(d Deps) http.Handler {
 		var model string
 		var upErr error
 		var fusionArbiterSkipped bool
+		// toolCallCount is populated from the cascade result on the
+		// local streaming route (issue #72) and forwarded to telemetry
+		// + metrics so the dashboard can report how many tool calls
+		// were preserved. Zero on all other paths.
+		var toolCallCount int
 		// capw is the response-body captureWriter installed for the
 		// local cascade branch when judge/quality observers OR
 		// debug tracing are configured (issue #33). Hoisted out of
@@ -932,6 +938,7 @@ func Chat(d Deps) http.Handler {
 					// dashboard.
 				} else {
 					model = d.Config.LocalModel
+					toolCallCount = len(res.ToolCalls)
 					if res.Succeeded && capw != nil {
 						if d.JudgeObserver != nil {
 							d.JudgeObserver.Submit(LocalCompletion{
@@ -1075,7 +1082,7 @@ func Chat(d Deps) http.Handler {
 			}
 		}
 		outputTokens := int(obs.BytesOut() / 4)
-		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr, fusionArbiterSkipped, decision)
+		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr, fusionArbiterSkipped, toolCallCount, decision)
 		if d.MetricsObserver != nil {
 			postCompressionChars := totalMessageChars(messages)
 			savings := totalTokenSavings(preCompressionChars, postCompressionChars)
@@ -1097,6 +1104,7 @@ func Chat(d Deps) http.Handler {
 				TPS:                  tps,
 				Streaming:            streaming,
 				FusionArbiterSkipped: fusionArbiterSkipped,
+				ToolCallCount:        toolCallCount,
 				Error:                rec.Error,
 				RouteSource:          string(decision.Source),
 				RouteReason:          decision.Reason,
@@ -1424,6 +1432,7 @@ func buildRecord(
 	model, latestPrompt string,
 	upErr error,
 	fusionArbiterSkipped bool,
+	toolCallCount int,
 	decision router.Decision,
 ) telemetry.Record {
 	totalMs := time.Since(started).Milliseconds()
@@ -1446,6 +1455,7 @@ func buildRecord(
 		TotalLatencyMs:       totalMs,
 		Streaming:            streaming,
 		FusionArbiterSkipped: fusionArbiterSkipped,
+		ToolCallCount:        toolCallCount,
 		RouteSource:          string(decision.Source),
 		RouteReason:          decision.Reason,
 		SLMConfidence:        decision.Confidence,

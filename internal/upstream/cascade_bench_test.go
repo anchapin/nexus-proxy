@@ -46,7 +46,7 @@ func BenchmarkExtractAssistantContent(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, _, err := extractAssistantContent(body); err != nil {
+				if _, _, err := extractAssistantMessage(body); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -73,7 +73,7 @@ func BenchmarkWriteSSEResponse(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				rw := httptest.NewRecorder()
-				if err := writeSSEResponse(rw, "local", "qwen3-coder:8b", content); err != nil {
+				if err := writeSSEResponse(rw, "local", "qwen3-coder:8b", AssistantMessage{Content: content}); err != nil {
 					b.Fatal(err)
 				}
 			}

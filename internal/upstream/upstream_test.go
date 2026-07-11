@@ -114,8 +114,8 @@ func TestFetchPanelHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchPanel: %v", err)
 	}
-	if got != "hello" {
-		t.Errorf("got %q", got)
+	if got.Content != "hello" {
+		t.Errorf("got %q", got.Content)
 	}
 }
 
@@ -1244,5 +1244,91 @@ func TestPanelStreamingSetsProgressiveHeader(t *testing.T) {
 	}
 	if got := rw.header.Get("Content-Type"); got != "text/event-stream" {
 		t.Errorf("Content-Type = %q, want \"text/event-stream\"", got)
+	}
+}
+
+// --- Issue #72: fusion tool_calls tests --------------------------------------
+
+// TestPanelStreamingToolCallWinnerSkipsArbiter verifies that when a
+// panel member returns tool_calls, the speculative winner streams them
+// as delta.tool_calls and the arbiter is NOT invoked (issue #72). The
+// arbiter synthesizes text only and cannot merge tool calls.
+func TestPanelStreamingToolCallWinnerSkipsArbiter(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"cmd\":\"ls\"}"}}]}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"some text answer"}}]}`)
+	})
+	var arbiterCalled int
+	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		arbiterCalled++
+		w.WriteHeader(200)
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	outcome, err := PanelStreaming(
+		rw, client,
+		"http://local.local", "local-m",
+		frontierURL, "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		5*time.Second, 5*time.Second,
+		false, 0.85,
+	)
+	if err != nil {
+		t.Fatalf("PanelStreaming: %v", err)
+	}
+	if !outcome.ArbiterSkipped {
+		t.Error("ArbiterSkipped = false, want true for tool-call winner")
+	}
+	if arbiterCalled != 0 {
+		t.Errorf("arbiter called %d times, want 0", arbiterCalled)
+	}
+	body := rw.body.String()
+	if !strings.Contains(body, `"tool_calls"`) {
+		t.Errorf("body missing tool_calls delta: %q", body)
+	}
+	if !strings.Contains(body, `"finish_reason":"tool_calls"`) {
+		t.Errorf("body missing finish_reason tool_calls: %q", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("missing [DONE]: %q", body)
+	}
+}
+
+// TestFetchPanelPreservesToolCalls verifies FetchPanel returns tool_calls
+// in the AssistantMessage alongside content (issue #72).
+func TestFetchPanelPreservesToolCalls(t *testing.T) {
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Body: io.NopCloser(strings.NewReader(
+				`{"choices":[{"message":{"content":"running it","tool_calls":[{"id":"c1","type":"function","function":{"name":"exec","arguments":"{}"}}]}}]}`,
+			)),
+		}, nil
+	})}
+	got, err := FetchPanel(context.Background(), client, "http://x", "", "m", nil)
+	if err != nil {
+		t.Fatalf("FetchPanel: %v", err)
+	}
+	if got.Content != "running it" {
+		t.Errorf("Content = %q", got.Content)
+	}
+	if len(got.ToolCalls) != 1 {
+		t.Fatalf("ToolCalls len = %d, want 1", len(got.ToolCalls))
+	}
+	if got.ToolCalls[0].Function.Name != "exec" {
+		t.Errorf("name = %q", got.ToolCalls[0].Function.Name)
 	}
 }

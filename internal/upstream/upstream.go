@@ -166,9 +166,12 @@ func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client
 }
 
 // FetchPanel fetches a single non-streaming completion from targetURL and
-// returns the assistant message text. Designed for the fusion panel where
-// we need the full response before asking the arbiter to synthesize.
-func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName string, body map[string]interface{}) (string, error) {
+// returns the assistant message (content + tool_calls). Designed for the
+// fusion panel where we need the full response before asking the arbiter
+// to synthesize. Tool calls are preserved (issue #72) so the progressive
+// streaming path can emit them as delta.tool_calls when the panel member
+// is the speculative winner.
+func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName string, body map[string]interface{}) (AssistantMessage, error) {
 	payload := make(map[string]interface{}, len(body)+2)
 	for k, v := range body {
 		payload[k] = v
@@ -178,11 +181,11 @@ func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName
 
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("fusion: marshal: %w", err)
+		return AssistantMessage{}, fmt.Errorf("fusion: marshal: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(jsonPayload))
 	if err != nil {
-		return "", fmt.Errorf("fusion: build request: %w", err)
+		return AssistantMessage{}, fmt.Errorf("fusion: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
@@ -191,37 +194,50 @@ func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("fusion: do: %w", err)
+		return AssistantMessage{}, fmt.Errorf("fusion: do: %w", err)
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("fusion: %s status %d: %s", modelName, resp.StatusCode, respBody)
+		return AssistantMessage{}, fmt.Errorf("fusion: %s status %d: %s", modelName, resp.StatusCode, respBody)
 	}
 
 	var raw struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content   string     `json:"content"`
+				ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 			} `json:"message"`
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(respBody, &raw); err != nil {
-		return "", fmt.Errorf("fusion: decode: %w", err)
+		return AssistantMessage{}, fmt.Errorf("fusion: decode: %w", err)
 	}
 	if len(raw.Choices) == 0 {
-		return "", fmt.Errorf("fusion: %s returned empty choice", modelName)
+		return AssistantMessage{}, fmt.Errorf("fusion: %s returned empty choice", modelName)
 	}
-	return raw.Choices[0].Message.Content, nil
+	return AssistantMessage{
+		Content:   raw.Choices[0].Message.Content,
+		ToolCalls: raw.Choices[0].Message.ToolCalls,
+	}, nil
 }
 
 // PanelResult is one member's contribution to a fusion response. Members
 // that errored are returned with Err set and Content empty; callers should
 // surface that to the arbiter so it can choose to ignore or down-weight.
+//
+// ToolCalls carries any OpenAI-compatible tool_calls the member returned
+// (issue #72). When the member is streamed speculatively as the winner,
+// streamPanelResultAsSSE emits these as delta.tool_calls. The arbiter
+// synthesis path is text-only — tool calls from a disagreeing member are
+// not merged into the arbiter output. This is intentional: tool-call
+// arbitration (picking the "better" set of tool calls from two members)
+// is a separate concern left for a future change.
 type PanelResult struct {
-	Source  string // "local" or "frontier"
-	Content string
-	Err     error
+	Source    string // "local" or "frontier"
+	Content   string
+	ToolCalls []ToolCall
+	Err       error
 }
 
 // Panel runs local and frontier fetches concurrently and waits for both.
@@ -264,20 +280,20 @@ func Panel(
 			Err:    errors.New("ollama unavailable (degraded)"),
 		}
 	} else {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
-			defer cancel()
-			c, err := FetchPanel(ctx, client,
-				localBaseURL+"/v1/chat/completions", "", localModel, body)
-			results <- PanelResult{Source: "local", Content: c, Err: err}
-		}()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
+		defer cancel()
+		msg, err := FetchPanel(ctx, client,
+			localBaseURL+"/v1/chat/completions", "", localModel, body)
+		results <- PanelResult{Source: "local", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
+	}()
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
 		defer cancel()
-		c, err := FetchPanel(ctx, client,
+		msg, err := FetchPanel(ctx, client,
 			frontierURL, "", frontierModel, body)
-		results <- PanelResult{Source: "frontier", Content: c, Err: err}
+		results <- PanelResult{Source: "frontier", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
 	}()
 	r1 := <-results
 	r2 := <-results
@@ -462,19 +478,19 @@ func PanelStreaming(
 		}
 	} else {
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
-			defer cancel()
-			c, err := FetchPanel(ctx, client,
-				localBaseURL+"/v1/chat/completions", "", localModel, body)
-			results <- PanelResult{Source: "local", Content: c, Err: err}
-		}()
+		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
+		defer cancel()
+		msg, err := FetchPanel(ctx, client,
+			localBaseURL+"/v1/chat/completions", "", localModel, body)
+		results <- PanelResult{Source: "local", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
+	}()
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
 		defer cancel()
-		c, err := FetchPanel(ctx, client,
+		msg, err := FetchPanel(ctx, client,
 			frontierURL, "", frontierModel, body)
-		results <- PanelResult{Source: "frontier", Content: c, Err: err}
+		results <- PanelResult{Source: "frontier", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
 	}()
 	first := <-results
 	second := <-results
@@ -490,16 +506,41 @@ func PanelStreaming(
 	}
 
 	// Pick the member that produced content. If one errored the other
-	// wins outright; if both succeeded, the "first to arrive" stays
-	// as the speculative source and we compare against the other.
+	// wins outright; if both succeeded, prefer the one carrying
+	// tool_calls (issue #72): tool calls are the primary deliverable
+	// for coding agents and the arbiter cannot synthesize them, so a
+	// member that returned structured tool calls should be the
+	// speculative winner even if it arrived second.
 	winner := first
 	if first.Err != nil {
+		winner = second
+	} else if len(second.ToolCalls) > 0 && len(first.ToolCalls) == 0 {
 		winner = second
 	}
 	outcome.Source = winner.Source
 
 	if err := streamPanelResultAsSSE(w, winner); err != nil {
 		return outcome, fmt.Errorf("fusion: stream speculative: %w", err)
+	}
+
+	// Tool-call responses bypass the arbiter (issue #72). The arbiter
+	// synthesizes text — it cannot merge or choose between two sets of
+	// structured tool calls. When the speculative winner carries tool
+	// calls we terminate the response immediately after streaming them.
+	// This is the documented "route tool-call requests away from fusion
+	// arbitration" path: the request still goes through fusion (both
+	// panel members ran), but the arbitration step is skipped. A future
+	// change may add tool-call-aware arbitration.
+	if len(winner.ToolCalls) > 0 {
+		outcome.ArbiterSkipped = true
+		slog.Info("fusion tool-call winner, arbiter skipped",
+			slog.String("source", outcome.Source),
+			slog.Int("tool_calls", len(winner.ToolCalls)),
+		)
+		if err := writeSSEDone(w); err != nil {
+			return outcome, err
+		}
+		return outcome, nil
 	}
 
 	// One-member case (the other errored, or skipLocal ran frontier
@@ -566,6 +607,13 @@ func PanelStreaming(
 // streamed speculatively. Err-flagged results are silently skipped —
 // the caller is responsible for picking a winner before invoking.
 //
+// When the winner carries tool_calls (issue #72), the delta emits
+// delta.tool_calls (with per-call index) instead of delta.content,
+// and finish_reason is "tool_calls". The arbiter synthesis path is
+// text-only; if the speculative winner had tool calls the response
+// terminates after the speculative chunk — there is no text to
+// append from an arbiter.
+//
 // Headers must already be committed (WriteHeader called) when this
 // runs, so the chunk lands with the response Content-Type the caller
 // set.
@@ -573,11 +621,35 @@ func streamPanelResultAsSSE(w http.ResponseWriter, r PanelResult) error {
 	if r.Err != nil {
 		return nil
 	}
+	var delta map[string]interface{}
+	var finishReason string
+	if len(r.ToolCalls) > 0 {
+		tc := make([]map[string]interface{}, len(r.ToolCalls))
+		for i, call := range r.ToolCalls {
+			tc[i] = map[string]interface{}{
+				"index": i,
+				"id":    call.ID,
+				"type":  call.Type,
+				"function": map[string]string{
+					"name":      call.Function.Name,
+					"arguments": call.Function.Arguments,
+				},
+			}
+		}
+		delta = map[string]interface{}{"tool_calls": tc}
+		if r.Content != "" {
+			delta["content"] = r.Content
+		}
+		finishReason = "tool_calls"
+	} else {
+		delta = map[string]interface{}{"content": r.Content}
+		finishReason = "stop"
+	}
 	chunk := map[string]interface{}{
 		"object": "chat.completion.chunk",
 		"nexus":  map[string]string{"source": r.Source},
 		"choices": []map[string]interface{}{
-			{"index": 0, "delta": map[string]interface{}{"content": r.Content}},
+			{"index": 0, "delta": delta, "finish_reason": finishReason},
 		},
 	}
 	b, err := json.Marshal(chunk)
