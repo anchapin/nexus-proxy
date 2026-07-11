@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/providers"
 )
 
 // CascadeStep is one member of a Cascade: a single model endpoint the
@@ -308,15 +310,32 @@ func writeSSEResponse(w http.ResponseWriter, stepName, servedModel, content stri
 // CascadeConfig is the input to BuildLocalCascade. Defined here (rather
 // than re-using config.Config) so upstream stays decoupled from config.
 type CascadeConfig struct {
-	LocalURL      string
-	LocalModel    string
+	LocalURL   string
+	LocalModel string
+	// Providers is the optional multi-frontier registry (issue #43).
+	// When non-empty, BuildLocalCascade iterates Providers instead
+	// of the legacy FrontierURL/Model/Key + ZAIURL/Model/Key pair,
+	// preserving the operator's declaration order. Providers with
+	// empty APIKey are skipped (unconfigured fallbacks are
+	// visible in the registry but never dispatched). The
+	// FrontierURL/Model/Key and ZAIURL/Model/Key fields below
+	// remain for callers that construct CascadeConfig without a
+	// registry (existing tests, ad-hoc tools); BuildLocalCascade
+	// falls back to them when Providers is empty.
+	Providers []providers.Provider
+	// Legacy single-frontier fields. Kept for backward
+	// compatibility with callers that still build CascadeConfig by
+	// hand; BuildLocalCascade uses them only when Providers is nil
+	// or empty.
 	FrontierURL   string
 	FrontierModel string
 	FrontierKey   string
-	ZAIURL        string
-	ZAIModel      string
-	ZAIKey        string
-	Timeout       time.Duration
+	// Legacy z.ai fallback fields. Same backward-compat semantics
+	// as FrontierURL/Model/Key.
+	ZAIURL   string
+	ZAIModel string
+	ZAIKey   string
+	Timeout  time.Duration
 
 	// SkipLocal removes the local Ollama step from the cascade.
 	// The chat handler sets this when internal/health reports
@@ -329,12 +348,22 @@ type CascadeConfig struct {
 }
 
 // BuildLocalCascade returns a cascade whose primary is local Ollama and
-// whose fallbacks are frontier and/or Z.ai endpoints that are configured
-// (their key is non-empty). Order is the issue's required declaration
-// order: [local, frontier, zai]. When CascadeConfig.SkipLocal is true
-// the local step is omitted (issue #8 graceful-degradation path).
-// When no fallback key is set the cascade has a single step — Run
-// still validates the response before streaming.
+// whose fallbacks are the frontier endpoints in CascadeConfig.Providers
+// (issue #43) — or, when Providers is empty, the legacy
+// FrontierURL/ZAIURL pair.
+//
+// Order: [local, provider1, provider2, ...]. When
+// CascadeConfig.SkipLocal is true the local step is omitted (issue #8
+// graceful-degradation path). When no fallback key is set the cascade
+// has a single step — Run still validates the response before
+// streaming.
+//
+// Operators who use the new NEXUS_PROVIDERS env surface pass the
+// registry's FrontierProviders() slice here; operators who haven't
+// migrated get the pre-#43 behaviour for free via the legacy field
+// fallback. The hardcoded "frontier"/"zai" step names are gone in the
+// Providers branch — the registry's provider.Name is used instead so
+// multi-frontier telemetry reads naturally.
 func BuildLocalCascade(cfg CascadeConfig) *Cascade {
 	steps := []CascadeStep{}
 	if !cfg.SkipLocal {
@@ -345,21 +374,43 @@ func BuildLocalCascade(cfg CascadeConfig) *Cascade {
 			APIKey: "",
 		})
 	}
-	if cfg.FrontierKey != "" {
-		steps = append(steps, CascadeStep{
-			Name:   "frontier",
-			URL:    cfg.FrontierURL,
-			APIKey: cfg.FrontierKey,
-			Model:  cfg.FrontierModel,
-		})
-	}
-	if cfg.ZAIKey != "" {
-		steps = append(steps, CascadeStep{
-			Name:   "zai",
-			URL:    cfg.ZAIURL,
-			APIKey: cfg.ZAIKey,
-			Model:  cfg.ZAIModel,
-		})
+	if len(cfg.Providers) > 0 {
+		// Multi-frontier path (issue #43). Skip providers without
+		// an APIKey so an unconfigured fallback never makes it
+		// into the cascade; the registry still surfaces them in
+		// /status and FrontierProviders() so operators can see
+		// what's available.
+		for _, p := range cfg.Providers {
+			if p.APIKey == "" {
+				continue
+			}
+			steps = append(steps, CascadeStep{
+				Name:   p.Name,
+				URL:    p.URL,
+				APIKey: p.APIKey,
+				Model:  p.Model,
+			})
+		}
+	} else {
+		// Legacy single-frontier + z.ai fallback path. Preserved
+		// so cascade_test.go (and any external caller building
+		// CascadeConfig by hand) continues to work unchanged.
+		if cfg.FrontierKey != "" {
+			steps = append(steps, CascadeStep{
+				Name:   "frontier",
+				URL:    cfg.FrontierURL,
+				APIKey: cfg.FrontierKey,
+				Model:  cfg.FrontierModel,
+			})
+		}
+		if cfg.ZAIKey != "" {
+			steps = append(steps, CascadeStep{
+				Name:   "zai",
+				URL:    cfg.ZAIURL,
+				APIKey: cfg.ZAIKey,
+				Model:  cfg.ZAIModel,
+			})
+		}
 	}
 	return &Cascade{Steps: steps, Timeout: cfg.Timeout}
 }

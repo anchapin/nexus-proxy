@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/providers"
 )
 
 // Config holds all runtime knobs for the proxy. A zero value is invalid;
@@ -65,15 +67,38 @@ type Config struct {
 	LocalModel     string // "qwen3-coder:8b"
 	EmbeddingModel string // "nomic-embed-text"
 
-	// Frontier API (OpenAI-compatible)
+	// Frontier API (OpenAI-compatible). Legacy single-provider
+	// fields retained for backward compatibility (issue #43): the
+	// chat handler still consults these when the operator does not
+	// opt into the new NEXUS_PROVIDERS surface. When NEXUS_PROVIDERS
+	// IS configured, Load() overwrites these three with the first
+	// provider from the registry so callers that read them directly
+	// (telemetry, status pages, cost dashboards) see the new values.
 	FrontierURL   string // "https://api.openai.com/v1/chat/completions"
 	FrontierModel string // "gpt-4o"
 	FrontierKey   string // required for actual frontier traffic; may be empty in dev
 
-	// Z.ai fallback (optional second frontier endpoint for the local-route cascade)
+	// Z.ai fallback (optional second frontier endpoint for the local-route cascade).
+	// Vestigial once NEXUS_PROVIDERS is configured — Load() keeps
+	// these in sync with the legacy NEXUS_ZAI_* env vars so callers
+	// outside the cascade (boot logs, status pages) still report a
+	// useful default. Issue #43 keeps these fields for one release
+	// so existing dashboards do not regress; a future release will
+	// deprecate them in favour of Providers.
 	ZAIURL   string // "https://api.z.ai/v1/chat/completions"
 	ZAIModel string // "glm-4.6"
 	ZAIKey   string // empty == skipped from cascade
+
+	// Providers is the multi-frontier registry (issue #43). When
+	// NEXUS_PROVIDERS is set, the registry carries the operator's
+	// declaration order (with per-provider priority as a
+	// tiebreaker). When NEXUS_PROVIDERS is unset, Load() builds a
+	// backward-compat registry from the legacy NEXUS_FRONTIER_*
+	// and NEXUS_ZAI_* vars so .env.example boots unchanged. The
+	// chat handler dispatches route=frontier via the registry; the
+	// cascade builder iterates registry.FrontierProviders() to
+	// assemble fallback steps.
+	Providers providers.Registry
 
 	// RAG
 	ExamplesDir  string  // "./few_shot_examples"
@@ -786,6 +811,63 @@ func Load() (Config, error) {
 		tracingQueue = 256
 	}
 	cfg.TracingQueueSize = tracingQueue
+
+	// Provider registry (issue #43). LoadFromEnv reads
+	// NEXUS_PROVIDERS + per-provider env vars; when NEXUS_PROVIDERS
+	// is unset it returns an empty registry and we fall back to a
+	// synthetic registry built from the legacy NEXUS_FRONTIER_* /
+	// NEXUS_ZAI_* vars that the rest of Load() already resolved.
+	// The synthetic fallback preserves the pre-#43 boot sequence
+	// exactly: a stock .env.example with no NEXUS_PROVIDERS still
+	// produces a working cascade with frontier as primary and z.ai
+	// as second fallback.
+	registry, err := providers.LoadFromEnv()
+	if err != nil {
+		return cfg, err
+	}
+	if registry.Len() == 0 {
+		// Backward-compat synthesis (issue #43 AC: "existing
+		// .env.example boots unchanged"). Skip providers whose
+		// API key is empty so the cascade does not include
+		// unconfigured fallbacks, but always surface a registry
+		// entry for the frontier slot so the chat handler can
+		// resolve a default model/URL when the operator supplies
+		// just a key.
+		legacy := make([]providers.Provider, 0, 2)
+		legacy = append(legacy, providers.Provider{
+			Name:     "frontier",
+			URL:      cfg.FrontierURL,
+			Model:    cfg.FrontierModel,
+			APIKey:   cfg.FrontierKey,
+			Priority: 0,
+		})
+		if cfg.ZAIURL != "" && cfg.ZAIKey != "" {
+			legacy = append(legacy, providers.Provider{
+				Name:     "zai",
+				URL:      cfg.ZAIURL,
+				Model:    cfg.ZAIModel,
+				APIKey:   cfg.ZAIKey,
+				Priority: 1,
+			})
+		}
+		registry = providers.NewRegistry(legacy)
+	} else {
+		// NEXUS_PROVIDERS is set: the registry is canonical. Sync
+		// the legacy Config.FrontierURL/Model/Key fields from the
+		// first provider so any caller still reading them (boot
+		// logs, status pages, /readyz) sees the operator's chosen
+		// endpoint instead of the openai default. NEXUS_ZAI_* is
+		// intentionally NOT synced because the registry may
+		// contain a provider called something other than "zai"
+		// (anthropic, gemini, ...).
+		if frontiers := registry.FrontierProviders(); len(frontiers) > 0 {
+			first := frontiers[0]
+			cfg.FrontierURL = first.URL
+			cfg.FrontierModel = first.Model
+			cfg.FrontierKey = first.APIKey
+		}
+	}
+	cfg.Providers = registry
 
 	return cfg, nil
 }
