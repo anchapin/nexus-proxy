@@ -22,6 +22,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/middleware"
 	"github.com/anchapin/nexus-proxy/internal/observability"
+	"github.com/anchapin/nexus-proxy/internal/providers"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
@@ -734,9 +735,18 @@ func Chat(d Deps) http.Handler {
 			// (issue #10) so both branches share a single configured
 			// cascade; see below for the non-streaming degraded
 			// override.
+			//
+			// Providers (issue #43): when the registry has entries
+			// we hand them straight to BuildLocalCascade so the
+			// fallback list reflects NEXUS_PROVIDERS rather than
+			// the legacy NEXUS_FRONTIER_* + NEXUS_ZAI_* pair. The
+			// legacy fields are passed alongside so callers that
+			// still build CascadeConfig by hand (existing tests)
+			// keep working when Providers is nil.
 			cas := upstream.BuildLocalCascade(upstream.CascadeConfig{
 				LocalURL:      d.Config.OllamaURL,
 				LocalModel:    d.Config.LocalModel,
+				Providers:     d.Config.Providers.FrontierProviders(),
 				FrontierURL:   d.Config.FrontierURL,
 				FrontierModel: d.Config.FrontierModel,
 				FrontierKey:   d.Config.FrontierKey,
@@ -827,11 +837,25 @@ func Chat(d Deps) http.Handler {
 				// harness still gets a JSON reply promptly. The
 				// response is tagged via X-Nexus-Degraded=true
 				// (stamped above).
+				//
+				// Issue #43: the fallback target is the registry's
+				// first frontier provider, matching the route=frontier
+				// branch above. The legacy Config.FrontierURL/Key
+				// remain the source when the registry is empty
+				// (e.g. callers that build Config by hand).
 				targetURL := strings.TrimRight(d.Config.OllamaURL, "/") + "/v1/chat/completions"
 				apiKey := ""
+				frontierModel := d.Config.FrontierModel
 				if skipLocal {
-					targetURL = d.Config.FrontierURL
-					apiKey = d.Config.FrontierKey
+					if frontiers := d.Config.Providers.FrontierProviders(); len(frontiers) > 0 {
+						first := frontiers[0]
+						targetURL = first.URL
+						apiKey = first.APIKey
+						frontierModel = first.Model
+					} else {
+						targetURL = d.Config.FrontierURL
+						apiKey = d.Config.FrontierKey
+					}
 				}
 				if err := upstream.BufferedFetch(rw, d.Client, targetURL, apiKey, body, upstream.WithTraceparent(tracing.InjectTraceparent(upCtx))); err != nil {
 					slog.Error("upstream error",
@@ -846,7 +870,7 @@ func Chat(d Deps) http.Handler {
 				} else {
 					model = d.Config.LocalModel
 					if skipLocal {
-						model = d.Config.FrontierModel
+						model = frontierModel
 					}
 					if upSpan != nil {
 						upSpan.SetAttr("cascade_served_by", "local-buffer")
@@ -871,7 +895,23 @@ func Chat(d Deps) http.Handler {
 			}
 
 		default:
-			model = d.Config.FrontierModel
+			// Issue #43: pick the frontier endpoint from the
+			// registry's first provider, falling back to the
+			// legacy Config.FrontierURL/Model/Key when the
+			// registry is empty (callers that build a Config
+			// struct directly without going through Load).
+			// The fallback path preserves the pre-#43 behaviour
+			// for unit tests that don't populate the registry.
+			frontierURL := d.Config.FrontierURL
+			frontierKey := d.Config.FrontierKey
+			if frontiers := d.Config.Providers.FrontierProviders(); len(frontiers) > 0 {
+				first := frontiers[0]
+				frontierURL = first.URL
+				frontierKey = first.APIKey
+				model = first.Model
+			} else {
+				model = d.Config.FrontierModel
+			}
 
 			// Daily frontier budget gate (issue #38). Before
 			// dispatching to the frontier, check whether the
@@ -885,7 +925,7 @@ func Chat(d Deps) http.Handler {
 				estCost := frontierCostEstimate(
 					string(router.RouteFrontier), model,
 					telemetry.EstimateTokens(latestPrompt),
-					d.Config.JudgeCostPer1KUSD,
+					d.Config.Providers, d.Config.JudgeCostPer1KUSD,
 				)
 				if d.SpendGuard.WouldExceed(estCost) {
 					slog.Warn("daily frontier budget exceeded",
@@ -902,7 +942,7 @@ func Chat(d Deps) http.Handler {
 			var upSpan *tracing.Span
 			if d.Tracer != nil {
 				upCtx, upSpan = d.Tracer.StartSpan(rootCtx, "upstream.frontier")
-				upSpan.SetAttr("frontier_model", d.Config.FrontierModel)
+				upSpan.SetAttr("frontier_model", model)
 				upSpan.SetAttr("streaming", streaming)
 			}
 
@@ -912,11 +952,11 @@ func Chat(d Deps) http.Handler {
 			// single chatCompletionResponse JSON object.
 			if streaming {
 				upErr = upstream.Stream(obs, d.Client,
-					d.Config.FrontierURL, d.Config.FrontierKey, body,
+					frontierURL, frontierKey, body,
 					upstream.WithTraceparent(tracing.InjectTraceparent(upCtx)))
 			} else {
 				upErr = upstream.BufferedFetch(obs, d.Client,
-					d.Config.FrontierURL, d.Config.FrontierKey, body,
+					frontierURL, frontierKey, body,
 					upstream.WithTraceparent(tracing.InjectTraceparent(upCtx)))
 			}
 			if upErr != nil {
@@ -944,7 +984,7 @@ func Chat(d Deps) http.Handler {
 			d.SpendGuard.Record(frontierCostEstimate(
 				string(router.RouteFrontier), model,
 				telemetry.EstimateTokens(latestPrompt),
-				d.Config.JudgeCostPer1KUSD,
+				d.Config.Providers, d.Config.JudgeCostPer1KUSD,
 			))
 		}
 
@@ -972,7 +1012,7 @@ func Chat(d Deps) http.Handler {
 		// them unconditionally costs negligible cycles.
 		postCompressionChars := totalMessageChars(messages)
 		savings := totalTokenSavings(preCompressionChars, postCompressionChars)
-		cost := frontierCostEstimate(string(route), model, telemetry.EstimateTokens(latestPrompt), d.Config.JudgeCostPer1KUSD)
+		cost := frontierCostEstimate(string(route), model, telemetry.EstimateTokens(latestPrompt), d.Config.Providers, d.Config.JudgeCostPer1KUSD)
 		if d.MetricsObserver != nil {
 			tps := telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 			d.MetricsObserver.Submit(MetricsEvent{
@@ -1370,20 +1410,30 @@ func totalTokenSavings(preChars, postChars int) int {
 	return (preChars - postChars) / 4
 }
 
-// frontierCostEstimate multiplies input tokens by the configured
-// cost-per-1k. Returns zero for non-frontier routes so local +
-// fusion-trail rows count as zero cost in the dashboard. The
-// JudgeCostPer1KUSD knob is reused here for lack of a separate
-// frontier-rate env; the PRD says one is enough at this stage.
-func frontierCostEstimate(route, model string, inputTokens int, costPer1KUSD float64) float64 {
-	// model is reserved for future per-model pricing tables —
-	// the bundle stays cheap by sharing JudgeCostPer1KUSD for now.
-	_ = model
+// frontierCostEstimate multiplies input tokens by the per-provider
+// cost-per-1k (issue #43) when the model matches a configured
+// provider, otherwise by the fallback cost-per-1k. Returns zero for
+// non-frontier routes so local + fusion-trail rows count as zero
+// cost in the dashboard.
+//
+// The fallback knob is Config.JudgeCostPer1KUSD — re-used for lack
+// of a separate env var until cost-aware routing (issue #44) lands.
+// When a provider has its own InputCostPer1K > 0 (set via
+// NEXUS_PROVIDER_<NAME>_INPUT_COST_PER_1K), that rate wins so each
+// frontier's contribution to the rolling 24h spend is honest.
+func frontierCostEstimate(route, model string, inputTokens int, reg providers.Registry, fallbackCostPer1KUSD float64) float64 {
 	if route != string(router.RouteFrontier) {
 		return 0
 	}
-	if costPer1KUSD <= 0 || inputTokens <= 0 {
+	if inputTokens <= 0 {
 		return 0
 	}
-	return float64(inputTokens) * costPer1KUSD / 1000.0
+	costPer1K := fallbackCostPer1KUSD
+	if p, ok := reg.ByModel(model); ok && p.InputCostPer1K > 0 {
+		costPer1K = p.InputCostPer1K
+	}
+	if costPer1K <= 0 {
+		return 0
+	}
+	return float64(inputTokens) * costPer1K / 1000.0
 }
