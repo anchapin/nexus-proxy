@@ -8,6 +8,12 @@ BINARY      ?= nexus
 PKG         := ./...
 LINT        ?= golangci-lint
 
+# Build version injected via -ldflags. Defaults to "dev" for local
+# builds; the release workflow overrides this with the git tag (e.g.
+# v1.0.0). Override locally with: make build VERSION=v1.2.3
+VERSION     ?= dev
+LDFLAGS     := -s -w -X main.version=$(VERSION)
+
 .PHONY: help build run test test-race bench bench-short vet fmt lint tidy ci clean
 
 help:
@@ -27,7 +33,7 @@ help:
 
 build:
 	@mkdir -p bin
-	$(GO) build -o bin/$(BINARY) ./cmd/nexus
+	$(GO) build -trimpath -ldflags="$(LDFLAGS)" -o bin/$(BINARY) ./cmd/nexus
 
 run:
 	$(GO) run ./cmd/nexus

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
@@ -38,6 +39,12 @@ const (
 	shutdownTimeout        = 10 * time.Second
 )
 
+// version is the build version. Overridden at compile time via
+// -ldflags "-X main.version=v1.2.3" in the Makefile and the release
+// workflow. The default "dev" lets `nexus --version` work from a
+// local `make build` without any special setup.
+var version = "dev"
+
 func main() {
 	// Subcommand dispatch (issue #32). The default invocation
 	// (no args) starts the proxy; `nexus check` (alias `nexus
@@ -54,6 +61,10 @@ func main() {
 			fmt.Fprintln(os.Stderr, "")
 			fmt.Fprintln(os.Stderr, "Run with no arguments to start the proxy.")
 			fmt.Fprintln(os.Stderr, "Run `nexus check` to validate boot-time configuration.")
+			fmt.Fprintln(os.Stderr, "Run `nexus --version` to print the build version.")
+			os.Exit(0)
+		case "-v", "--version", "version":
+			printVersion(os.Stdout)
 			os.Exit(0)
 		default:
 			fmt.Fprintf(os.Stderr, "nexus: unknown subcommand %q\n\n", os.Args[1])
@@ -457,6 +468,12 @@ func main() {
 		// here per the issue #3 acceptance criteria.
 		log.Fatalf("server: %v", err)
 	}
+}
+
+// printVersion writes the build version to w. Extracted from main()
+// so it can be unit-tested without os.Exec.
+func printVersion(w io.Writer) {
+	fmt.Fprintf(w, "nexus %s\n", version)
 }
 
 // confidenceBridge adapts the judge's Storage seam to the router's

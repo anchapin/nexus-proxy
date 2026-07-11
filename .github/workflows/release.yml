@@ -1,0 +1,262 @@
+# Release workflow (issue #83).
+#
+# Triggered by semver tags (v*). Produces:
+#   - Cross-compiled binaries (linux/amd64, linux/arm64, darwin/arm64)
+#   - SHA256 checksums file
+#   - GitHub Release with all artifacts attached
+#   - Multi-arch (amd64 + arm64) GHCR image
+#   - SBOM (SPDX JSON) attached to the release
+#   - Keyless cosign signature on the image (requires OIDC permissions)
+#
+# Kept separate from ci.yml per the issue's implementation notes.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write      # create GitHub Release + upload assets
+  packages: write      # push to GHCR
+  id-token: write      # cosign keyless signing (OIDC)
+  attestations: write  # artifact attestations
+
+env:
+  GO_VERSION: '1.21'
+
+jobs:
+  # ── Cross-compile binaries + checksums ──────────────────────────
+  build-binaries:
+    name: Build binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Determine version
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          mkdir -p dist
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+
+          # Targets: OS/ARCH -> output filename
+          build_one() {
+            local goos="$1" goarch="$2" name="$3"
+            echo "::group::Building ${goos}/${goarch}"
+            CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
+              go build -trimpath -ldflags="${LDFLAGS}" \
+              -o "dist/${name}" ./cmd/nexus
+            echo "::endgroup::"
+          }
+
+          build_one linux   amd64 "nexus-${VERSION}-linux-amd64"
+          build_one linux   arm64 "nexus-${VERSION}-linux-arm64"
+          build_one darwin  arm64 "nexus-${VERSION}-darwin-arm64"
+
+      - name: Generate SHA256 checksums
+        working-directory: dist
+        run: |
+          sha256sum nexus-* > checksums-sha256.txt
+          echo "Checksums:"
+          cat checksums-sha256.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: dist/
+          retention-days: 7
+
+  # ── Build & publish multi-arch GHCR image + cosign signature ────
+  docker:
+    name: GHCR image + signature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: ver
+        run: |
+          VERSION="${GITHUB_REF_NAME}"   # e.g. v1.0.0
+          # Strip leading 'v' for SemVer-flavoured tags if desired by
+          # consumers, but keep the raw tag too for traceability.
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version_no_v=$(echo "${VERSION}" | sed 's/^v//')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.version }}
+            type=raw,value=${{ steps.ver.outputs.version_no_v }}
+            type=raw,value=latest
+
+      - name: Build & push (multi-arch)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: VERSION=${{ steps.ver.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Ask buildx for a per-platform digest we can sign.
+          outputs: type=image,push-by-digest=true,name=ghcr.io/${{ github.repository }},push=true
+          provenance: true
+          sbom: true
+
+      # ── Keyless cosign signing (requires id-token: write) ───────
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless)
+        run: |
+          # Sign the image digest. cosign uses the OIDC token from
+          # id-token: write to create a keyless signature recorded in
+          # the Rekor transparency log.
+          IMAGE="ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}"
+          echo "Signing: ${IMAGE}"
+          cosign sign --yes "${IMAGE}"
+
+      - name: Verify signature
+        run: |
+          IMAGE="ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}"
+          # Verify against the certificate identity of the workflow.
+          cosign verify "${IMAGE}" \
+            --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.ref_name }}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+
+  # ── SBOM generation ─────────────────────────────────────────────
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Determine version
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate SBOM (SPDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          format: spdx-json
+          artifact-name: nexus-${{ steps.ver.outputs.version }}-sbom.spdx.json
+          upload-artifact: true
+          upload-release-assets: false  # attached in the release job below
+
+      - name: Download SBOM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: nexus-${{ steps.ver.outputs.version }}-sbom.spdx.json
+          path: dist/
+
+      - name: Rename SBOM for release upload
+        run: mv dist/*.spdx.json "dist/nexus-${{ steps.ver.outputs.version }}-sbom.spdx.json"
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: dist/*.spdx.json
+          retention-days: 7
+
+  # ── Create GitHub Release with all artifacts ────────────────────
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-binaries, sbom]
+    steps:
+      - name: Determine version
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: dist/
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.version }}
+          name: ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          files: |
+            dist/nexus-*
+            dist/checksums-sha256.txt
+            dist/*.spdx.json
+          body: |
+            ## Artifacts
+
+            | File | Description |
+            |------|-------------|
+            | `nexus-*-linux-amd64` | Linux x86_64 binary |
+            | `nexus-*-linux-arm64` | Linux ARM64 binary |
+            | `nexus-*-darwin-arm64` | macOS Apple Silicon binary |
+            | `checksums-sha256.txt` | SHA256 checksums for all binaries |
+            | `*-sbom.spdx.json` | SPDX SBOM |
+
+            ## Verify
+
+            ```bash
+            sha256sum -c checksums-sha256.txt
+            ```
+
+            ## Docker image
+
+            ```bash
+            docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.version }}
+            docker run --rm ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.version }} --version
+            ```
+
+            ## Verify image signature
+
+            ```bash
+            cosign verify ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.version }} \
+              --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ steps.ver.outputs.version }}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+            ```
