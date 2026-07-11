@@ -131,6 +131,19 @@ type Config struct {
 	ProbeTimeout       time.Duration // per-probe HTTP timeout (5s)
 	ProbeBytesPerToken int           // VRAM->token heuristic (256 KiB per token)
 
+	// Local-route concurrency ceiling (issue #81). The limiter bounds
+	// in-flight local-route requests so a small GPU does not OOM under
+	// bursty load. NEXUS_LOCAL_MAX_CONCURRENT is the hard ceiling; the
+	// live effective count is min(ceiling, freeVRAM/bytesPerSlot) using
+	// the latest probe snapshot from internal/probe. Zero or negative
+	// disables the limiter entirely (pre-#81 unlimited behaviour), so a
+	// stock deployment is byte-for-byte unchanged when the operator
+	// leaves the knob unset. LocalVRAMBytesPerSlot is the per-slot VRAM
+	// reservation (default 2 GiB); it only affects the dynamic shrink
+	// path — when the probe is unavailable the full Ceiling is used.
+	LocalMaxConcurrent    int   // hard ceiling on concurrent local slots (0 disables)
+	LocalVRAMBytesPerSlot int64 // VRAM bytes reserved per concurrent local slot (2 GiB)
+
 	// HTTP request body cap (issue #11). The chat handler applies this
 	// with http.MaxBytesReader before reading the request body, so an
 	// oversized POST cannot exhaust proxy memory before the guardrail
@@ -470,6 +483,31 @@ func Load() (Config, error) {
 	cfg.ProbeBytesPerToken = probeBytes
 	cfg.ProbeEnabled = cfg.ProbePollInterval > 0
 
+	// Local-route concurrency ceiling (issue #81). The limiter is
+	// dormant unless the operator sets NEXUS_LOCAL_MAX_CONCURRENT
+	// above zero, so a stock deployment is byte-for-byte identical to
+	// the pre-#81 unlimited path. When enabled, the effective slot
+	// count is min(ceiling, freeVRAM/bytesPerSlot) recomputed on every
+	// acquire from the latest probe snapshot; when the probe is
+	// unavailable the full ceiling is used.
+	localMax, err := getEnvInt("NEXUS_LOCAL_MAX_CONCURRENT", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if localMax < 0 {
+		localMax = 0
+	}
+	cfg.LocalMaxConcurrent = localMax
+
+	localSlotBytes, err := getEnvInt("NEXUS_LOCAL_VRAM_BYTES_PER_SLOT", int(DefaultLocalVRAMBytesPerSlot))
+	if err != nil {
+		return cfg, err
+	}
+	if localSlotBytes < 0 {
+		localSlotBytes = int(DefaultLocalVRAMBytesPerSlot)
+	}
+	cfg.LocalVRAMBytesPerSlot = int64(localSlotBytes)
+
 	// Hard request-body cap (issue #11). Default 1 MiB matches typical
 	// OpenAI-compatible request sizes; the chat handler wraps r.Body
 	// with http.MaxBytesReader so an oversized POST is rejected with
@@ -646,6 +684,15 @@ func (c Config) EffectiveMaxBodyBytes() int {
 // upstream model, see the first few tokens, and recognise a malformed
 // reply, while keeping the log line a reasonable size.
 const DefaultDebugBodyBytes = 512
+
+// DefaultLocalVRAMBytesPerSlot is the VRAM reservation each concurrent
+// local-route slot assumes when NEXUS_LOCAL_VRAM_BYTES_PER_SLOT is unset
+// (issue #81). 2 GiB keeps a Q4-quantised 8B model plus a modest context
+// resident; on the PRD's target 8-12 GiB GPUs this yields ~3-5 effective
+// slots once the loaded model's footprint is accounted for. The value
+// only affects the dynamic shrink path; when the probe is unavailable
+// the full NEXUS_LOCAL_MAX_CONCURRENT ceiling is used regardless.
+const DefaultLocalVRAMBytesPerSlot int64 = 2 << 30 // 2 GiB
 
 // EffectiveDebugBodyBytes returns the response-body preview cap the
 // debug trace should honour. Zero or negative falls back to
