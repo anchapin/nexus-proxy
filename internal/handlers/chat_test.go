@@ -14,9 +14,11 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/rag"
@@ -1857,5 +1859,157 @@ func TestChatFusionProgressiveTelemetryFlag(t *testing.T) {
 	}
 	if !row.FusionArbiterSkipped {
 		t.Errorf("FusionArbiterSkipped = false, want true (agreement path)")
+	}
+}
+
+// --- Local-route cooldown tests (issue #80) ---------------------------------
+
+// TestChatLocalCooldownSkipsLocalAfterCascadeFailure verifies the core
+// acceptance criterion: after the cascade detects a local failure and
+// arms the cooldown, the NEXT request must skip local entirely and go
+// directly to the frontier fallback, with the X-Nexus-Local-Cooldown
+// header stamped on the response.
+func TestChatLocalCooldownSkipsLocalAfterCascadeFailure(t *testing.T) {
+	deps, rt := baseDeps(t)
+	cd := circuit.NewWithClock(30*time.Second, time.Now)
+	deps.LocalCooldown = cd
+
+	localHits := int32(0)
+	// First call to local returns garbage -> cascade falls back.
+	// After the first request arms the cooldown, the second request
+	// must NOT reach local at all.
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&localHits, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "not openai json")
+	})
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"frontier fallback"},"finish_reason":"stop"}]}`)
+	})
+
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+
+	// Request 1: local fails, cascade falls back, cooldown armed.
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw1 := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw1, req1)
+	if rw1.Code != http.StatusOK {
+		t.Fatalf("req1 status = %d; body=%q", rw1.Code, rw1.Body.String())
+	}
+	if !cd.Active() {
+		t.Fatal("cooldown should be armed after cascade local failure")
+	}
+
+	// Request 2: cooldown active, local must be skipped.
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw2 := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw2, req2)
+	if rw2.Code != http.StatusOK {
+		t.Fatalf("req2 status = %d; body=%q", rw2.Code, rw2.Body.String())
+	}
+	if got := rw2.Header().Get("X-Nexus-Local-Cooldown"); got != "true" {
+		t.Errorf("X-Nexus-Local-Cooldown = %q, want \"true\"", got)
+	}
+	if got := rw2.Header().Get("X-Nexus-Degraded"); got != "true" {
+		t.Errorf("X-Nexus-Degraded = %q, want \"true\"", got)
+	}
+	// Local should have been hit exactly once (request 1).
+	if n := atomic.LoadInt32(&localHits); n != 1 {
+		t.Errorf("local was hit %d times, want 1 (cooldown should skip second)", n)
+	}
+}
+
+// TestChatLocalCooldownDisabledDoesNotSkip verifies that a nil
+// (disabled) cooldown circuit keeps the pre-#80 behaviour: even after
+// a cascade local failure, the next request still tries local.
+func TestChatLocalCooldownDisabledDoesNotSkip(t *testing.T) {
+	deps, rt := baseDeps(t)
+	// No LocalCooldown wired — disabled behaviour.
+
+	localHits := int32(0)
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&localHits, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "not openai json")
+	})
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	})
+
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		rw := httptest.NewRecorder()
+		Chat(deps).ServeHTTP(rw, req)
+		if rw.Code != http.StatusOK {
+			t.Fatalf("req %d status = %d", i, rw.Code)
+		}
+	}
+	if n := atomic.LoadInt32(&localHits); n != 3 {
+		t.Errorf("local was hit %d times, want 3 (cooldown disabled)", n)
+	}
+	if got := deps.Config.LocalCooldown; got != 0 {
+		t.Errorf("default LocalCooldown should be 0 in test config, got %v", got)
+	}
+}
+
+// TestChatLocalCooldownStampsNoHeaderWhenInactive verifies that
+// when the cooldown is not armed (no failure recorded), the
+// X-Nexus-Local-Cooldown header is absent and local is attempted
+// normally.
+func TestChatLocalCooldownNoHeaderWhenInactive(t *testing.T) {
+	deps, rt := baseDeps(t)
+	cd := circuit.NewWithClock(30*time.Second, time.Now)
+	deps.LocalCooldown = cd
+
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local ok"},"finish_reason":"stop"}]}`)
+	})
+
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%q", rw.Code, rw.Body.String())
+	}
+	if got := rw.Header().Get("X-Nexus-Local-Cooldown"); got != "" {
+		t.Errorf("X-Nexus-Local-Cooldown = %q, want absent when cooldown inactive", got)
+	}
+	if got := rw.Header().Get("X-Nexus-Degraded"); got != "false" {
+		t.Errorf("X-Nexus-Degraded = %q, want \"false\"", got)
+	}
+}
+
+// TestChatLocalCooldownDoesNotAffectFrontierRoute verifies that the
+// cooldown only affects route=local and route=fusion, not route=frontier.
+func TestChatLocalCooldownDoesNotAffectFrontierRoute(t *testing.T) {
+	deps, rt := baseDeps(t)
+	cd := circuit.NewWithClock(30*time.Second, time.Now)
+	deps.LocalCooldown = cd
+	cd.RecordFailure() // arm the cooldown
+
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("frontier stream"))
+	})
+
+	// Large prompt -> guardrail forces FRONTIER route.
+	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 30000) + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%q", rw.Code, rw.Body.String())
+	}
+	// Frontier route should NOT have the cooldown header — the
+	// cooldown only protects route=local / route=fusion.
+	if got := rw.Header().Get("X-Nexus-Local-Cooldown"); got != "" {
+		t.Errorf("X-Nexus-Local-Cooldown = %q, want absent on route=frontier", got)
 	}
 }

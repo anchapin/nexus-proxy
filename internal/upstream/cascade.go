@@ -47,6 +47,14 @@ type CascadeResult struct {
 	ServedBy string
 	// Succeeded is true if a step returned a usable response.
 	Succeeded bool
+	// LocalStepFailed is true when the "local" step was attempted but
+	// failed with a retryable error and a later step served the request
+	// (or the cascade exhausted every step). The chat handler uses this
+	// to arm the local-route cooldown (issue #80) so subsequent requests
+	// within the cooldown window skip local and go directly to the
+	// fallback, avoiding repeated slow local timeouts until the health
+	// poller catches up.
+	LocalStepFailed bool
 }
 
 // cascadeDefaultTimeout is the per-attempt timeout used when Cascade.Timeout
@@ -126,6 +134,15 @@ func (c *Cascade) Run(w http.ResponseWriter, client Client, payload map[string]i
 		}
 		lastErr = err
 		retry := classifyFailure(err)
+		// Issue #80: expose whether the local step was the one that
+		// failed so the chat handler can arm the local-route cooldown.
+		// Only set when the step is named "local" AND the error is
+		// retryable — a non-retryable failure (e.g. 401) surfaces to
+		// the caller immediately and does not indicate a transient
+		// local problem worth cooling down.
+		if step.Name == "local" && retry {
+			res.LocalStepFailed = true
+		}
 		slog.Warn("cascade step failed",
 			slog.String("step", step.Name),
 			slog.Int("attempt", i+1),

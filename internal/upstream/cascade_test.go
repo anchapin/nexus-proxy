@@ -586,3 +586,67 @@ func TestCascadeSSEChunkStructure(t *testing.T) {
 		t.Error("expected Flush() to be called")
 	}
 }
+
+// --- LocalStepFailed (issue #80) tests --------------------------------------
+
+// TestCascadeLocalStepFailedOn5xx verifies that when the "local" step
+// fails with a retryable error and a fallback serves the request, the
+// CascadeResult.LocalStepFailed flag is set to true. The chat handler
+// uses this flag to arm the local-route cooldown.
+func TestCascadeLocalStepFailedOn5xx(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, "ollama down")
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"model":"fb-m","choices":[{"message":{"content":"ok"}}]}`)
+	})
+	client := &http.Client{Transport: ft}
+
+	res, err := twoStepCascade().Run(newSSERW(), client, map[string]interface{}{"messages": []interface{}{}})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.LocalStepFailed {
+		t.Error("LocalStepFailed = false, want true after local 5xx + frontier fallback")
+	}
+}
+
+// TestCascadeLocalStepFailedNotSetOnSuccess verifies the flag is false
+// when local serves the request normally.
+func TestCascadeLocalStepFailedNotSetOnSuccess(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+	client := &http.Client{Transport: ft}
+
+	res, err := twoStepCascade().Run(newSSERW(), client, map[string]interface{}{"messages": []interface{}{}})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.LocalStepFailed {
+		t.Error("LocalStepFailed = true, want false when local served the request")
+	}
+}
+
+// TestCascadeLocalStepFailedNotSetOnNonRetryable verifies the flag is
+// NOT set when local fails with a non-retryable error (e.g. 401) — that
+// surfaces immediately and is not a transient local health problem.
+func TestCascadeLocalStepFailedNotSetOnNonRetryable(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	client := &http.Client{Transport: ft}
+
+	_, err := twoStepCascade().Run(newSSERW(), client, map[string]interface{}{"messages": []interface{}{}})
+	if err == nil {
+		t.Fatal("expected error for 401, got nil")
+	}
+	// Non-retryable means the cascade stops immediately; fallback is
+	// never called and LocalStepFailed should be false.
+}

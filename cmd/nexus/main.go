@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/handlers"
@@ -184,6 +185,22 @@ func main() {
 		)
 	} else {
 		slog.Info("local-route concurrency limiter disabled (NEXUS_LOCAL_MAX_CONCURRENT<=0)")
+	}
+
+	// Local-route cooldown (issue #80). Arms a short cooldown after
+	// the cascade detects a local failure so subsequent requests skip
+	// local and go directly to the fallback route — closing the gap
+	// between the cascade observing failure and the health poller
+	// tripping its breaker. Disabled (nil) when NEXUS_LOCAL_COOLDOWN
+	// is zero; the hot path is byte-for-byte identical to pre-#80.
+	var localCooldown *circuit.Cooldown
+	if cfg.LocalCooldown > 0 {
+		localCooldown = circuit.New(cfg.LocalCooldown)
+		slog.Info("local-route cooldown enabled",
+			slog.Duration("cooldown", cfg.LocalCooldown),
+		)
+	} else {
+		slog.Info("local-route cooldown disabled (NEXUS_LOCAL_COOLDOWN<=0)")
 	}
 
 	// Async LLM-as-a-judge evaluator (issue #15). The handler never
@@ -416,6 +433,7 @@ func main() {
 		Health:          hpoller,
 		BudgetObserver:  budgetObserver(probeMgr),
 		LocalLimiter:    localLimiter,
+		LocalCooldown:   localCooldown,
 	}))
 
 	// /healthz returns a small JSON document so operators can see
