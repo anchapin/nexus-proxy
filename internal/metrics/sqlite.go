@@ -58,8 +58,24 @@ const insertSQL = `INSERT INTO requests
     (timestamp, request_id, route, model,
      input_tokens, output_tokens, toon_savings_tokens,
      rag_injected, rag_filename, estimated_cost_usd,
-     ttft_ms, total_latency_ms, tps, streaming, error)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     ttft_ms, total_latency_ms, tps, streaming, error, task_type)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+// addTaskTypeColumnSQL is the additive migration for issue #44. The
+// CREATE TABLE above intentionally omits task_type (the schema is
+// kept minimal so existing on-disk DBs keep working through an
+// Open, migrate, keep-writing hot path) — this ALTER is the single
+// source of truth for the column on every database, fresh or
+// pre-existing.
+//
+// `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT ”` is the
+// idempotent shape documented at the top of this file. SQLite
+// rejects the duplicate re-run with "duplicate column name" which
+// is why the boot path probes via the helper below instead of
+// parsing that error string — PRAGMA table_info is O(table-width)
+// and runs once at boot, so it is the cheap way to stay
+// migration-free.
+const addTaskTypeColumnSQL = `ALTER TABLE requests ADD COLUMN task_type TEXT NOT NULL DEFAULT ''`
 
 // SQLiteStore is the production Store implementation (issue #4).
 // Writes are funnelled through a buffered channel and a single
@@ -109,6 +125,10 @@ func newSQLiteStore(path string, lg Logger) (*SQLiteStore, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("metrics: create schema: %w", err)
 	}
+	if err := addColumnIfMissing(context.Background(), db, "requests", "task_type", addTaskTypeColumnSQL); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("metrics: ensure task_type column: %w", err)
+	}
 
 	s := &SQLiteStore{
 		db:     db,
@@ -151,6 +171,57 @@ func buildDSN(path string) string {
 // pattern used by tests that need to verify the row landed beyond
 // the buffer.
 func (s *SQLiteStore) Path() string { return s.path }
+
+// addColumnIfMissing probes whether table already has a column
+// named columnName (issue #44). When the column is absent the
+// supplied alterSQL is executed against db. The probe is the
+// idempotent shape of choice — `ALTER TABLE ADD COLUMN` returns
+// "duplicate column name" on re-run and matching that error string
+// across modernc driver versions is fragile, so a one-time
+// PRAGMA table_info scan keeps the boot path migration-free.
+//
+// Returns nil when the column already exists, when the ALTER is
+// applied cleanly, or when the probe itself succeeds but the
+// column is missing (in which case the ALTER is run).
+func addColumnIfMissing(ctx context.Context, db *sql.DB, table, columnName, alterSQL string) error {
+	rows, err := db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return fmt.Errorf("probe columns: %w", err)
+	}
+	hasColumn := false
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			ctype   string
+			notnull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("probe columns: %w", err)
+		}
+		if name == columnName {
+			hasColumn = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("probe columns iterate: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("probe columns close: %w", err)
+	}
+	if hasColumn {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, alterSQL); err != nil {
+		return fmt.Errorf("apply migration: %w", err)
+	}
+	return nil
+}
 
 // Dropped returns the number of records dropped because the write
 // buffer was full. See DroppedCounter.
@@ -219,6 +290,7 @@ func (s *SQLiteStore) writeOne(req Request) {
 		req.InputTokens, req.OutputTokens, req.TOONSavingsTokens,
 		ragInjected, req.RAGFilename, req.EstimatedCostUSD,
 		req.TTFTMs, req.TotalLatencyMs, req.TPS, streaming, req.Error,
+		req.TaskType,
 	)
 	if err != nil {
 		s.logger("ERROR: insert request_id=%s: %v", req.RequestID, err)
