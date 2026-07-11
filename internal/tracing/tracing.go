@@ -21,10 +21,12 @@
 package tracing
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -208,12 +210,19 @@ type Span struct {
 // the zero value (no tracing in scope) the new span gets a fresh
 // trace id and an empty ParentSpanID — it becomes a root span.
 //
-// StartSpan is the standalone entry point that produces a span
-// without binding it to an exporter; the returned span's End is a
-// no-op (the caller is responsible for forwarding it elsewhere if
-// needed). For the chat-handler hot path use Exporter.StartSpan,
-// which binds the span to the exporter so End submits it
-// automatically.
+// When a process-wide exporter has been registered via
+// RegisterExporter, the returned span is bound to that exporter so
+// End submits it automatically. When no exporter is registered
+// (the default) the span is unbound — End becomes a local
+// no-op and the caller is responsible for forwarding the span
+// elsewhere if needed.
+//
+// Most call sites (the chat handler, the per-phase spans inside
+// the handler) use Exporter.StartSpan to bind the span directly
+// to a *Exporter. The standalone StartSpan is the entry point for
+// middleware (auth.Middleware, ratelimit.Middleware,
+// SecurityHeaders) which has no per-call access to the exporter
+// — the package-level registered exporter carries it.
 func StartSpan(parent Context, name string) (Context, *Span) {
 	if parent.TraceID == "" {
 		parent.TraceID = NewTraceID()
@@ -228,7 +237,93 @@ func StartSpan(parent Context, name string) (Context, *Span) {
 		Attributes:   make(map[string]any, 4),
 		Status:       StatusUnset,
 	}
+	if e := globalExporter.Load(); e != nil && e.sampler.ShouldSample(parent.TraceID) {
+		s.exporter = e
+	}
 	return parent.WithSpanID(sid), s
+}
+
+// globalExporter is the process-wide exporter registered by
+// RegisterExporter. Atomic pointer so concurrent readers (every
+// hot-path StartSpan call) pay a single atomic load. Tests that
+// want their own exporter call RegisterExporter to swap it.
+var globalExporter atomic.Pointer[Exporter]
+
+// RegisterExporter installs e as the process-wide exporter so the
+// package-level StartSpan binds new spans to it. Passing nil
+// disables the global binding (the next StartSpan returns an
+// unbound span). Idempotent — safe to call from multiple
+// boot paths; the most recent non-nil pointer wins.
+//
+// RegisterExporter is the seam the chat handler uses to expose the
+// tracing-enabled flag to middleware that has no access to the
+// handler's Deps (auth.Middleware, ratelimit.Limiter.Middleware,
+// SecurityHeaders). After this call returns Enabled reports
+// true and the next StartSpan attaches to e.
+func RegisterExporter(e *Exporter) {
+	globalExporter.Store(e)
+}
+
+// Enabled reports whether a process-wide exporter has been
+// registered. Middleware MUST guard span creation with this
+// function so the hot path incurs zero allocation when the
+// operator leaves NEXUS_TRACING_ENDPOINT empty (issue #71 AC:
+// "ZERO overhead when tracing disabled").
+//
+// The read is a single atomic load; non-tracing builds can
+// inline it as a constant. Always paired with the same call that
+// runs StartSpan so the two reads see the same value.
+func Enabled() bool {
+	return globalExporter.Load() != nil
+}
+
+// ctxKey is the unexported type used as the context.Context key
+// for storing the parent tracing Context. Unexported so external
+// packages cannot collide on the same key.
+type ctxKey struct{}
+
+// WithSpanContext returns a derived context carrying tc as the
+// active parent tracing context. Downstream handlers retrieve it
+// via SpanContextFromContext to create child spans attached to
+// the same trace id. Returns parent unmodified when tc is the
+// zero value — the caller may still stamp it harmlessly.
+func WithSpanContext(parent context.Context, tc Context) context.Context {
+	if tc.TraceID == "" {
+		return parent
+	}
+	return context.WithValue(parent, ctxKey{}, tc)
+}
+
+// SpanContextFromContext returns the tracing Context previously
+// stored via WithSpanContext, or the zero value + false when
+// none has been set. Use the ok result to decide whether a child
+// span attaches to a real parent or starts a fresh root.
+func SpanContextFromContext(ctx context.Context) (Context, bool) {
+	if ctx == nil {
+		return Context{}, false
+	}
+	v, ok := ctx.Value(ctxKey{}).(Context)
+	return v, ok
+}
+
+// StartSpanFromContext creates a child span attached to the
+// tracing Context stored in ctx by an upstream middleware
+// (RequestMiddleware or one of the per-phase middlewares). When
+// no parent has been stored, StartSpanFromContext creates a
+// fresh root span with the same semantics as StartSpan.
+//
+// Returns (ctx', span) where ctx' carries the new span id and
+// should be propagated to downstream code via r.WithContext.
+//
+// A nil span is returned when Enabled() is false so callers can
+// `defer span.End()` safely (Span methods are nil-safe).
+func StartSpanFromContext(ctx context.Context, name string) (context.Context, *Span) {
+	if !Enabled() {
+		return ctx, nil
+	}
+	parent, _ := SpanContextFromContext(ctx)
+	childCtx, span := StartSpan(parent, name)
+	return WithSpanContext(ctx, childCtx), span
 }
 
 // SetAttr stores key=val on the span. Safe from any goroutine;

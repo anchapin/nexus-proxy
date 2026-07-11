@@ -355,6 +355,13 @@ func main() {
 		slog.Info("tracing disabled (NEXUS_TRACING_ENDPOINT is empty)")
 	}
 
+	// Register the exporter process-wide so the per-phase middleware
+	// (auth / rate-limit / security headers, issue #71) can guard
+	// span creation with tracing.Enabled(). When tracing is disabled
+	// the pointer is nil and every middleware takes the
+	// pass-through branch — zero allocations per request.
+	tracing.RegisterExporter(tracer)
+
 	mux := http.NewServeMux()
 	mux.Handle("/v1/chat/completions", handlers.Chat(handlers.Deps{
 		Config:                cfg,
@@ -474,6 +481,14 @@ func main() {
 	// forbids it over plaintext).
 	tlsActive := cfg.TLSActive()
 	handler = handlers.SecurityHeaders(tlsActive)(handler)
+
+	// Distributed-tracing root middleware (issue #71). Installed
+	// outermost so every request — accepted, rate-limited, or
+	// auth-rejected — opens a span that anchors the per-phase spans
+	// emitted by the inner middleware. When tracing is disabled this
+	// is a pass-through (the package-level Enabled() check inside
+	// the middleware short-circuits before any allocation).
+	handler = tracing.RequestMiddleware(handler)
 
 	// TLS boot warning (issue #39). When inbound auth is enabled but
 	// TLS is not, the bearer tokens travel over plaintext — warn so the

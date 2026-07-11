@@ -18,6 +18,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
 // Middleware wraps next with bearer-token authentication. Requests that
@@ -60,17 +62,61 @@ func Middleware(keys []string, exempt func(*http.Request) bool) func(http.Handle
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Distributed tracing (issue #71). When the operator
+			// has not configured a collector, Enabled() returns
+			// false and this block disappears entirely — zero
+			// overhead on the hot path.
+			//
+			// The span attaches to whichever parent the tracing
+			// middleware (or the chat handler) has already
+			// installed in r.Context(). When no parent exists
+			// the span becomes its own root with a fresh trace
+			// id, so an auth-rejected request that arrives before
+			// any upstream caller still produces a visible trace.
+			var span *tracing.Span
+			if tracing.Enabled() {
+				r2, s := tracing.StartSpanFromContext(r.Context(), "auth.check")
+				span = s
+				r = r.WithContext(r2)
+				defer span.End()
+				span.SetAttr("auth.method", authMethod(r))
+				span.SetAttr("auth.exempt", exempt != nil && exempt(r))
+			}
 			if exempt != nil && exempt(r) {
+				if span != nil {
+					span.SetAttr("auth.outcome", "exempt")
+				}
 				next.ServeHTTP(w, r)
 				return
 			}
 			if !keyMatches(extractKey(r), valid) {
+				if span != nil {
+					span.SetAttr("auth.outcome", "rejected")
+					span.SetStatus(tracing.StatusError, "invalid_key")
+				}
 				writeUnauthorized(w)
 				return
+			}
+			if span != nil {
+				span.SetAttr("auth.outcome", "accepted")
 			}
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// authMethod reports whether the request presented a bearer
+// credential, an X-API-Key header, or no credential at all. The
+// span attributes mirror that distinction so a trace view can
+// distinguish "presented the wrong key" from "presented no key".
+func authMethod(r *http.Request) string {
+	if h := r.Header.Get("Authorization"); h != "" {
+		return "bearer"
+	}
+	if k := r.Header.Get("X-API-Key"); k != "" {
+		return "x-api-key"
+	}
+	return "none"
 }
 
 // extractKey pulls the presented credential from the request. It checks

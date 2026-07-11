@@ -4,6 +4,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -415,7 +416,32 @@ func Chat(d Deps) http.Handler {
 		// POST cannot exhaust proxy memory; MaxBytesReader caps
 		// reads at the limit and surfaces *http.MaxBytesError on
 		// overflow, which we translate to 413 below.
+		//
+		// Tracing (issue #71): wrap the read in a span named
+		// "request.body_size" so a 413 in the trace view is
+		// explained by the limit rather than appearing as an
+		// orphan error. When the chat handler created its own
+		// root span above, attach to it (rootCtx); otherwise the
+		// helper reads the parent from r.Context() — operators
+		// running with the tracing middleware in front get the
+		// RequestMiddleware-installed parent.
 		maxBytes := d.Config.EffectiveMaxBodyBytes()
+		var bodySpan *tracing.Span
+		if tracing.Enabled() {
+			var bodyCtx context.Context
+			var s *tracing.Span
+			if rootCtx.TraceID != "" {
+				var newCtx tracing.Context
+				newCtx, s = tracing.StartSpan(rootCtx, "request.body_size")
+				bodyCtx = tracing.WithSpanContext(r.Context(), newCtx)
+			} else {
+				bodyCtx, s = tracing.StartSpanFromContext(r.Context(), "request.body_size")
+			}
+			bodySpan = s
+			r = r.WithContext(bodyCtx)
+			defer bodySpan.End()
+			bodySpan.SetAttr("max_bytes", maxBytes)
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, int64(maxBytes))
 
 		bodyBytes, err := io.ReadAll(r.Body)
@@ -424,6 +450,10 @@ func Chat(d Deps) http.Handler {
 			if errors.As(err, &maxErr) {
 				writeJSONError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
 					"Request body exceeds NEXUS_MAX_BODY_BYTES (%d bytes)", maxBytes))
+				if bodySpan != nil {
+					bodySpan.SetAttr("outcome", "oversized")
+					bodySpan.SetStatus(tracing.StatusError, "request_body_too_large")
+				}
 				slog.Warn("rejected oversized request",
 					slog.String("remote", r.RemoteAddr),
 					slog.Int("limit_bytes", maxBytes),
@@ -431,8 +461,14 @@ func Chat(d Deps) http.Handler {
 				)
 				return
 			}
+			if bodySpan != nil {
+				bodySpan.SetStatus(tracing.StatusError, "read_failed")
+			}
 			http.Error(w, "Failed to read request", http.StatusBadRequest)
 			return
+		}
+		if bodySpan != nil {
+			bodySpan.SetAttr("bytes_read", len(bodyBytes))
 		}
 		var body map[string]interface{}
 		if err := json.Unmarshal(bodyBytes, &body); err != nil {
