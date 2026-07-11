@@ -197,6 +197,64 @@ docker run --rm -p 8000:8000 \
   nexus-proxy:dev
 ```
 
+## Releases
+
+Every semver tag (`v1.0.0`, `v1.2.3`, …) triggers the
+[release workflow](.github/workflows/release.yml), which publishes:
+
+- **Cross-compiled binaries** — `linux/amd64`, `linux/arm64`,
+  `darwin/arm64`
+- **SHA256 checksums** — `checksums-sha256.txt`
+- **GHCR multi-arch image** — `ghcr.io/anchapin/nexus-proxy:<tag>`
+  (amd64 + arm64), also tagged `latest`
+- **SBOM** — SPDX JSON attached to the release
+- **Cosign signature** — keyless (OIDC) signature on the image,
+  recorded in the Rekor transparency log
+
+### Install a prebuilt binary
+
+```bash
+# Download the binary for your platform from the GitHub Release page,
+# then verify its checksum:
+sha256sum -c checksums-sha256.txt
+
+# Make it executable and run:
+chmod +x nexus-*-linux-amd64
+./nexus-*-linux-amd64 --version
+```
+
+### Pull the container image
+
+```bash
+# Replace <tag> with a release version (e.g. v1.0.0) or "latest"
+docker pull ghcr.io/anchapin/nexus-proxy:<tag>
+
+# Check the version:
+docker run --rm ghcr.io/anchapin/nexus-proxy:<tag> --version
+```
+
+### Verify the image signature
+
+The image is signed with cosign keyless signing. Verify it against the
+GitHub Actions OIDC identity:
+
+```bash
+cosign verify ghcr.io/anchapin/nexus-proxy:<tag> \
+  --certificate-identity "https://github.com/anchapin/nexus-proxy/.github/workflows/release.yml@refs/tags/<tag>" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+```
+
+### `--version`
+
+```bash
+$ ./nexus --version
+nexus v1.0.0
+```
+
+`--version` (or `-v`) prints the build version and exits. The version is
+injected at compile time via `-ldflags`; a local `make build` reports
+`nexus dev` unless you override it with `make build VERSION=v1.2.3`.
+
 ## Architecture
 
 ```

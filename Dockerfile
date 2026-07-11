@@ -13,6 +13,11 @@
 # ---------- Stage 1: build ------------------------------------------------
 FROM golang:1.21-alpine AS build
 
+# Build version injected via -ldflags. The release workflow passes the
+# git tag here (e.g. --build-arg VERSION=v1.0.0). Defaults to "dev" for
+# local `docker build`.
+ARG VERSION=dev
+
 WORKDIR /src
 
 # Module cache layer. The repo is currently stdlib-only so go.sum may
@@ -29,8 +34,9 @@ COPY internal/ ./internal/
 # Fully static binary — CGO disabled so there is no glibc dependency.
 # -trimpath strips local filesystem paths from the binary.
 # -ldflags "-s -w" drops the symbol table and DWARF info for size.
+# -X main.version injects the build version for `nexus --version`.
 RUN CGO_ENABLED=0 GOOS=linux \
-    go build -trimpath -ldflags="-s -w" \
+    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
     -o /out/nexus ./cmd/nexus
 
 # ---------- Stage 2: runtime ---------------------------------------------
