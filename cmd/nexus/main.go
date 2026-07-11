@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"log"
 	"log/slog"
@@ -316,13 +317,39 @@ func main() {
 		}
 	}()
 
+	// Rate limiting middleware (issue #38). Wraps the handler
+	// outermost so a rate-limited request never reaches auth or the
+	// chat handler. /healthz and /metrics are exempt so liveness
+	// probes and scrapes survive a rate-limit storm. When all rate
+	// vars are zero, buildRateLimiter returns nil and Middleware is a
+	// pure pass-through.
+	//
+	// The rate limiter is constructed BEFORE the Prometheus collector
+	// so its observer hook (issue #70) can be wired below in a single
+	// installObservers step; that keeps the dependency direction
+	// one-way (the middleware packages do not import observability).
+	rateLimiter := buildRateLimiter(cfg)
+	defer rateLimiter.Close()
+
+	// Daily-spend tracker (issue #38). Same rationale as the rate
+	// limiter: built before the collector so its observer can be
+	// installed below. A nil SpendGuard (budget disabled) is the
+	// pre-issue-#38 default and installObservers skips it.
+	spendGuard := buildSpendGuard(cfg)
+
 	// In-process Prometheus collector (issue #40). The collector is
 	// always instantiated — it holds only sync/atomic primitives, so
 	// the per-request Submit overhead is negligible even when the
 	// /metrics HTTP endpoint is disabled. The HTTP handler is
 	// registered below only when NEXUS_METRICS_ENDPOINT is non-empty.
 	collector := observability.NewCollector()
-	gaugeProviders := buildGaugeProviders(hpoller, probeMgr, judgeEval, verifier, metricsStore, recorder)
+
+	// Install Prometheus observer closures on the live middleware
+	// instances (issue #70). Each closure is a single function call
+	// to the collector so it stays allocation-free on the hot path.
+	installObservabilityObservers(collector, rateLimiter, spendGuard)
+
+	gaugeProviders := buildGaugeProviders(hpoller, probeMgr, judgeEval, verifier, metricsStore, recorder, rateLimiter, spendGuard)
 
 	// Distributed tracing (issue #41). The exporter is nil when
 	// NEXUS_TRACING_ENDPOINT is empty — matches the "zero overhead
@@ -377,7 +404,7 @@ func main() {
 		Health:                hpoller,
 		BudgetObserver:        budgetObserver(probeMgr),
 		Limiter:               buildLocalLimiter(cfg),
-		SpendGuard:            buildSpendGuard(cfg),
+		SpendGuard:            spendGuard,
 		Tracer:                tracer,
 	}))
 
@@ -441,21 +468,21 @@ func main() {
 	// Prometheus scrapers work without a key. When no key is
 	// configured the middleware is a no-op pass-through, preserving
 	// the pre-issue-#37 localhost-dev behaviour exactly.
-	// Rate limiting middleware (issue #38). Wraps the handler
-	// outermost so a rate-limited request never reaches auth or the
-	// chat handler. /healthz and /metrics are exempt so liveness
-	// probes and scrapes survive a rate-limit storm. When all rate
-	// vars are zero, buildRateLimiter returns nil and Middleware is a
-	// pure pass-through.
-	rateLimiter := buildRateLimiter(cfg)
-	defer rateLimiter.Close()
+	//
+	// The rate limiter and auth observer were constructed and wired
+	// in main() above; here we only chain the middleware. The rate
+	// limiter wraps outermost so a rate-limited request never reaches
+	// auth or the chat handler; auth wraps the rate limit so an
+	// auth-rejected request never consumes a rate-limit token. A nil
+	// rateLimiter is handled by Limiter.Middleware itself (it returns
+	// an identity pass-through).
 	var handler http.Handler = mux
 	exempt := publicPathExempt(cfg)
 	handler = rateLimiter.Middleware(exempt)(handler)
 
 	if cfg.ProxyAuthEnabled {
 		keys := cfg.ProxyAuthKeys()
-		handler = auth.Middleware(keys, exempt)(handler)
+		handler = auth.MiddlewareWithObserver(keys, exempt, buildAuthObserver(collector))(handler)
 		slog.Info("proxy auth enabled",
 			slog.Int("keys", len(keys)),
 		)
@@ -566,7 +593,16 @@ func main() {
 	}()
 
 	if tlsActive {
-		if err := srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		// Build a TLS listener with VerifyConnection wired so a
+		// successful handshake bumps the Prometheus TLS counter
+		// (issue #70). The alternative srv.ListenAndServeTLS path
+		// builds its own tls.Config internally and offers no hook
+		// for VerifyConnection.
+		listener, err := buildTLSListener(collector, cfg)
+		if err != nil {
+			log.Fatalf("server (tls listener): %v", err)
+		}
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			// Unrecoverable boot/server error — log.Fatalf is kept
 			// here per the issue #3 acceptance criteria.
 			log.Fatalf("server (tls): %v", err)
@@ -899,9 +935,9 @@ func metricsHandler(c *observability.Collector, providers ...observability.Gauge
 // buildGaugeProviders composes the live gauge readings the /metrics
 // handler collects at scrape time. Each provider is a closure over one
 // backing source (health poller, VRAM probe, judge evaluator, quality
-// verifier, dropped counters). A nil backing source yields a provider
-// that returns an empty slice, so main.go never constructs a typed-nil
-// GaugeProviderFunc.
+// verifier, dropped counters, rate-limit buckets, budget running
+// total). A nil backing source yields a provider that returns an empty
+// slice, so main.go never constructs a typed-nil GaugeProviderFunc.
 //
 // Keeping the adapters here — rather than importing each backing
 // package from internal/observability — preserves the dependency
@@ -914,6 +950,8 @@ func buildGaugeProviders(
 	verifier *quality.ShellVerifier,
 	metricsStore metrics.Store,
 	recorder telemetry.Recorder,
+	rateLimiter *ratelimit.Limiter,
+	spendGuard handlers.SpendGuard,
 ) []observability.GaugeProvider {
 	return []observability.GaugeProvider{
 		// Ollama health + circuit-breaker failure count.
@@ -986,5 +1024,107 @@ func buildGaugeProviders(
 			}
 			return out
 		}),
+
+		// Live rate-limit bucket count (issue #70). nil-safe; the
+		// returned gauge is 0 when rate limiting is disabled.
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			buckets := 0
+			if rateLimiter != nil {
+				buckets = rateLimiter.ClientCount()
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_rate_limit_buckets", Value: float64(buckets)},
+			}
+		}),
+
+		// Rolling 24-hour frontier spend (issue #70). nil-safe; the
+		// returned gauge is 0 when the daily budget is disabled.
+		// SpendGuard is an opaque interface so we type-assert to the
+		// concrete *budget.SpendTracker and call RunningTotal.
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			spend := 0.0
+			if st, ok := spendGuard.(*budget.SpendTracker); ok {
+				spend = st.RunningTotal()
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_budget_spend_usd", Value: spend},
+			}
+		}),
 	}
+}
+
+// installObservabilityObservers wires the Prometheus collector's
+// per-decision counters to the live middleware instances (issue #70).
+// Each closure is a single function call into the collector so the
+// middleware hot path stays allocation-free. nil receivers are
+// skipped so callers can wire an observer on a disabled middleware
+// (rate-limit off, daily budget zero) without conditional code in
+// the call site.
+func installObservabilityObservers(c *observability.Collector, rateLimiter *ratelimit.Limiter, spendGuard handlers.SpendGuard) {
+	if rateLimiter != nil {
+		rateLimiter.SetObserver(func(scope string, allowed bool) {
+			c.IncRateLimit(scope, allowed)
+		})
+	}
+	if st, ok := spendGuard.(*budget.SpendTracker); ok {
+		st.SetObserver(func(event string, amount float64) {
+			switch event {
+			case budget.ObserverEventSpent:
+				c.AddBudgetRecorded(amount)
+			case budget.ObserverEventExceeded:
+				c.IncBudgetExceeded()
+			}
+		})
+	}
+}
+
+// buildAuthObserver adapts the Prometheus collector to the
+// function-typed AuthObserver hook used by auth.MiddlewareWithObserver
+// (issue #70). Outcome values are documented on
+// auth.AuthObserverFunc; "exempt" maps to no increment because an
+// exempt request is not an authentication decision.
+func buildAuthObserver(c *observability.Collector) auth.AuthObserverFunc {
+	return func(outcome string) {
+		switch outcome {
+		case "accepted":
+			c.IncAuthAccepted()
+		case "rejected_invalid":
+			c.IncAuthRejectedInvalid()
+		case "rejected_missing":
+			c.IncAuthRejectedMissing()
+		}
+	}
+}
+
+// buildTLSListener constructs a net.Listener that the http.Server
+// can serve over, with the Prometheus TLS-accepted counter wired
+// via tls.Config.VerifyConnection (issue #70).
+//
+// VerifyConnection runs after every successful TLS handshake (and
+// the optional client cert verification path). It is the canonical
+// "handshake completed" hook in the crypto/tls surface — there is
+// no equivalent on http.Server.ConnState, which is why we cannot
+// simply install a ConnState hook here.
+//
+// The "rejected" half of the counter (handshake started but never
+// completed) is left at zero in this implementation. Counting it
+// reliably requires wrapping the listener with an instrumented
+// net.Conn that tracks per-connection state; that adds complexity
+// the issue marks as "optional". A future PR can drop in a
+// rejection-counting listener when operator demand justifies the
+// extra bookkeeping.
+func buildTLSListener(c *observability.Collector, cfg config.Config) (net.Listener, error) {
+	cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+	if err != nil {
+		return nil, err
+	}
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+		VerifyConnection: func(state tls.ConnectionState) error {
+			c.IncTLSAccepted()
+			return nil
+		},
+	}
+	return tls.Listen("tcp", cfg.Addr, tlsCfg)
 }

@@ -22,6 +22,20 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
+// AuthObserverFunc is the function-typed hook invoked by
+// MiddlewareWithObserver on every authentication decision (issue #70).
+// Outcome is one of:
+//
+//   - "accepted"            — a valid credential matched
+//   - "rejected_invalid"    — a credential was presented but did not match
+//   - "rejected_missing"    — no credential was presented
+//   - "exempt"              — request was short-circuited by the exempt predicate
+//
+// Implementations must be safe to call concurrently from many
+// request goroutines and must be allocation-free on the hot path
+// (the production observer is a single atomic add).
+type AuthObserverFunc func(outcome string)
+
 // Middleware wraps next with bearer-token authentication. Requests that
 // do not present a valid key in `Authorization: Bearer <key>` (scheme
 // matched case-insensitively) or `X-API-Key` are rejected with HTTP 401
@@ -42,7 +56,25 @@ import (
 // compared even after a match, so the function always spends time
 // proportional to len(keys) rather than leaking the position of the
 // accepted key.
+//
+// The observer hook (when non-nil) is invoked exactly once per
+// request with one of the outcome labels documented on
+// AuthObserverFunc. The hook is never called for the no-keys-configured
+// identity pass-through because the resulting middleware is literally
+// `next` (no decision to observe).
+//
+// Use MiddlewareWithObserver when observability is required. This
+// function is the no-observer convenience wrapper used by tests that
+// only care about accept/reject behaviour.
 func Middleware(keys []string, exempt func(*http.Request) bool) func(http.Handler) http.Handler {
+	return MiddlewareWithObserver(keys, exempt, nil)
+}
+
+// MiddlewareWithObserver is Middleware plus a per-decision observer
+// hook (issue #70). A nil observer is treated as "no observability"
+// so callers can pass nil without nil-checking at the call site (the
+// inner closure skips the invocation).
+func MiddlewareWithObserver(keys []string, exempt func(*http.Request) bool, observer AuthObserverFunc) func(http.Handler) http.Handler {
 	// Defensive copy + drop blanks so callers cannot mutate the slice
 	// after wiring and so a stray empty entry cannot accept an
 	// unauthenticated request.
@@ -86,19 +118,33 @@ func Middleware(keys []string, exempt func(*http.Request) bool) func(http.Handle
 				if span != nil {
 					span.SetAttr("auth.outcome", "exempt")
 				}
+				if observer != nil {
+					observer("exempt")
+				}
 				next.ServeHTTP(w, r)
 				return
 			}
-			if !keyMatches(extractKey(r), valid) {
+			presented := extractKey(r)
+			if !keyMatches(presented, valid) {
 				if span != nil {
 					span.SetAttr("auth.outcome", "rejected")
 					span.SetStatus(tracing.StatusError, "invalid_key")
+				}
+				if observer != nil {
+					if presented == "" {
+						observer("rejected_missing")
+					} else {
+						observer("rejected_invalid")
+					}
 				}
 				writeUnauthorized(w)
 				return
 			}
 			if span != nil {
 				span.SetAttr("auth.outcome", "accepted")
+			}
+			if observer != nil {
+				observer("accepted")
 			}
 			next.ServeHTTP(w, r)
 		})

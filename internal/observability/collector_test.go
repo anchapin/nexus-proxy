@@ -3,6 +3,7 @@ package observability
 import (
 	"math"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -260,5 +261,162 @@ func TestNilCollectorRenderSafe(t *testing.T) {
 	RenderPrometheus(&buf, nil)
 	if buf.Len() != 0 {
 		t.Errorf("nil collector wrote %d bytes, want 0", buf.Len())
+	}
+}
+
+// --- Middleware instrumentation (issue #70) --------------------------------
+
+// TestIncAuthCounters verifies each of the three per-decision auth
+// counters increments independently and that AuthAuthenticatedClients
+// mirrors the accepted counter for the gauge surface.
+func TestIncAuthCounters(t *testing.T) {
+	c := NewCollector()
+
+	c.IncAuthAccepted()
+	c.IncAuthAccepted()
+	c.IncAuthRejectedInvalid()
+	c.IncAuthRejectedMissing()
+	c.IncAuthRejectedMissing()
+
+	if got := c.authAccepted.Load(); got != 2 {
+		t.Errorf("authAccepted = %d, want 2", got)
+	}
+	if got := c.authRejectedInvalid.Load(); got != 1 {
+		t.Errorf("authRejectedInvalid = %d, want 1", got)
+	}
+	if got := c.authRejectedMissing.Load(); got != 2 {
+		t.Errorf("authRejectedMissing = %d, want 2", got)
+	}
+	if got := c.AuthAuthenticatedClients(); got != 2 {
+		t.Errorf("AuthAuthenticatedClients = %d, want 2", got)
+	}
+}
+
+// TestIncRateLimitScopes verifies the IncRateLimit(scope, allowed)
+// helper routes to the correct counter for both recognised scopes
+// and silently drops unknown ones (so a wiring bug is visible in
+// logs rather than silently masked as a default bucket).
+func TestIncRateLimitScopes(t *testing.T) {
+	c := NewCollector()
+
+	c.IncRateLimit("global", true)
+	c.IncRateLimit("global", true)
+	c.IncRateLimit("global", false)
+	c.IncRateLimit("per_client", true)
+	c.IncRateLimit("per_client", false)
+	c.IncRateLimit("per_client", false)
+	c.IncRateLimit("per_client", false)
+	// Unknown scope: must not panic and must not affect known buckets.
+	c.IncRateLimit("nonexistent", true)
+
+	if got := c.rateLimitAllowedGlobal.Load(); got != 2 {
+		t.Errorf("rateLimitAllowedGlobal = %d, want 2", got)
+	}
+	if got := c.rateLimitRejectedGlobal.Load(); got != 1 {
+		t.Errorf("rateLimitRejectedGlobal = %d, want 1", got)
+	}
+	if got := c.rateLimitAllowedPerClient.Load(); got != 1 {
+		t.Errorf("rateLimitAllowedPerClient = %d, want 1", got)
+	}
+	if got := c.rateLimitRejectedPerClient.Load(); got != 3 {
+		t.Errorf("rateLimitRejectedPerClient = %d, want 3", got)
+	}
+}
+
+// TestBudgetRecorder verifies AddBudgetRecorded accumulates the float
+// total lock-free and BudgetRecordedUSD returns the same value.
+// Non-positive amounts are ignored to match SpendTracker.Record.
+func TestBudgetRecorder(t *testing.T) {
+	c := NewCollector()
+
+	c.AddBudgetRecorded(0.01)
+	c.AddBudgetRecorded(0.02)
+	c.AddBudgetRecorded(0)    // dropped
+	c.AddBudgetRecorded(-0.5) // dropped (negative)
+
+	got := c.BudgetRecordedUSD()
+	if math.Abs(got-0.03) > 1e-9 {
+		t.Errorf("BudgetRecordedUSD = %v, want 0.03", got)
+	}
+
+	// Exceeded counter increments independently.
+	c.IncBudgetExceeded()
+	c.IncBudgetExceeded()
+	if got := c.BudgetExceeded(); got != 2 {
+		t.Errorf("BudgetExceeded = %d, want 2", got)
+	}
+}
+
+// TestTLSCounters verifies IncTLSAccepted / IncTLSRejected
+// increment independently. The wiring layer in main.go drives the
+// "accepted" signal from tls.Config.VerifyConnection, so the helper
+// must be reachable from the test without going through net/http.
+func TestTLSCounters(t *testing.T) {
+	c := NewCollector()
+
+	c.IncTLSAccepted()
+	c.IncTLSAccepted()
+	c.IncTLSRejected()
+
+	if got := c.tlsConnectionsAccepted.Load(); got != 2 {
+		t.Errorf("tlsConnectionsAccepted = %d, want 2", got)
+	}
+	if got := c.tlsConnectionsRejected.Load(); got != 1 {
+		t.Errorf("tlsConnectionsRejected = %d, want 1", got)
+	}
+}
+
+// TestCollectorCountersConcurrent hammers all the new counters from
+// many goroutines under -race to confirm the lock-free guarantee.
+func TestCollectorCountersConcurrent(t *testing.T) {
+	c := NewCollector()
+	const goroutines = 16
+	const iters = 200
+
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				c.IncAuthAccepted()
+				c.IncAuthRejectedInvalid()
+				c.IncAuthRejectedMissing()
+				if id%2 == 0 {
+					c.IncRateLimit("global", true)
+				} else {
+					c.IncRateLimit("per_client", false)
+				}
+				c.AddBudgetRecorded(0.001)
+				c.IncBudgetExceeded()
+				c.IncTLSAccepted()
+				c.IncTLSRejected()
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	const wantAuth = goroutines * iters
+	if got := c.authAccepted.Load(); got != wantAuth {
+		t.Errorf("authAccepted = %d, want %d", got, wantAuth)
+	}
+	if got := c.authRejectedInvalid.Load(); got != wantAuth {
+		t.Errorf("authRejectedInvalid = %d, want %d", got, wantAuth)
+	}
+	if got := c.authRejectedMissing.Load(); got != wantAuth {
+		t.Errorf("authRejectedMissing = %d, want %d", got, wantAuth)
+	}
+	if got := c.rateLimitAllowedGlobal.Load(); got != uint64(goroutines/2*iters) {
+		t.Errorf("rateLimitAllowedGlobal = %d, want %d", got, goroutines/2*iters)
+	}
+	if got := c.rateLimitRejectedPerClient.Load(); got != uint64((goroutines-goroutines/2)*iters) {
+		t.Errorf("rateLimitRejectedPerClient = %d, want %d", got, (goroutines-goroutines/2)*iters)
+	}
+	if got := c.tlsConnectionsAccepted.Load(); got != wantAuth {
+		t.Errorf("tlsConnectionsAccepted = %d, want %d", got, wantAuth)
+	}
+	wantBudgetUSD := 0.001 * float64(wantAuth)
+	if got := c.BudgetRecordedUSD(); math.Abs(got-wantBudgetUSD) > 1e-9 {
+		t.Errorf("BudgetRecordedUSD = %v, want %v", got, wantBudgetUSD)
 	}
 }
