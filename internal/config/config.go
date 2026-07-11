@@ -177,6 +177,15 @@ type Config struct {
 	HTTPIdleConnTimeout     time.Duration // idle keep-alive window (90s)
 	HTTPDisableKeepAlives   bool          // true disables HTTP keep-alive (rarely wanted)
 
+	// Rate limiting (issue #38). A stdlib-only token-bucket limiter
+	// caps both per-client-IP and aggregate request rates. All four
+	// values default to zero (disabled), so the proxy behaves
+	// identically to before when the operator does not configure them.
+	RateLimitRPM           int     // per-client requests per minute (0 = disabled)
+	RateLimitBurst         int     // per-client burst capacity (0 = RPM)
+	GlobalRateLimitRPM     int     // aggregate RPM across all clients (0 = disabled)
+	FrontierDailyBudgetUSD float64 // rolling 24h spend cap for RouteFrontier (0 = disabled)
+
 	// Structured logging (issue #3). LogLevel maps NEXUS_LOG_LEVEL
 	// ("debug" | "info" | "warn" | "error") to a slog.Level. LogFormat
 	// maps NEXUS_LOG_FORMAT ("json" | "text") to a slog.Handler; json
@@ -208,54 +217,58 @@ func DefaultMetricsDBPath() string {
 // this map are silently dropped from the file's contribution so a stray
 // YAML entry (typo, leftover from an older schema) cannot break boot.
 var configKeys = map[string]string{
-	"server.addr":                  "NEXUS_ADDR",
-	"server.max_body_bytes":        "NEXUS_MAX_BODY_BYTES",
-	"log.level":                    "NEXUS_LOG_LEVEL",
-	"log.format":                   "NEXUS_LOG_FORMAT",
-	"ollama.url":                   "NEXUS_OLLAMA_URL",
-	"ollama.router_model":          "NEXUS_ROUTER_MODEL",
-	"ollama.local_model":           "NEXUS_LOCAL_MODEL",
-	"ollama.embedding_model":       "NEXUS_EMBEDDING_MODEL",
-	"frontier.url":                 "NEXUS_FRONTIER_URL",
-	"frontier.model":               "NEXUS_FRONTIER_MODEL",
-	"frontier.api_key":             "NEXUS_FRONTIER_API_KEY",
-	"zai.url":                      "NEXUS_ZAI_URL",
-	"zai.model":                    "NEXUS_ZAI_MODEL",
-	"zai.api_key":                  "NEXUS_ZAI_API_KEY",
-	"rag.examples_dir":             "NEXUS_EXAMPLES_DIR",
-	"rag.threshold":                "NEXUS_RAG_THRESHOLD",
-	"routing.token_guardrail":      "NEXUS_TOKEN_GUARDRAIL",
-	"routing.slm_timeout":          "NEXUS_SLM_TIMEOUT",
-	"routing.fusion_timeout":       "NEXUS_FUSION_TIMEOUT",
-	"routing.cascade_timeout":      "NEXUS_CASCADE_TIMEOUT",
-	"routing.arbiter_timeout":      "NEXUS_ARBITER_TIMEOUT",
-	"routing.local_max_concurrent": "NEXUS_LOCAL_MAX_CONCURRENT",
-	"routing.local_queue_timeout":  "NEXUS_LOCAL_QUEUE_TIMEOUT",
-	"health.poll_interval":         "NEXUS_HEALTH_POLL_INTERVAL",
-	"health.breaker_threshold":     "NEXUS_HEALTH_BREAKER_THRESHOLD",
-	"health.probe_timeout":         "NEXUS_HEALTH_PROBE_TIMEOUT",
-	"judge.url":                    "NEXUS_JUDGE_URL",
-	"judge.model":                  "NEXUS_JUDGE_MODEL",
-	"judge.api_key":                "NEXUS_JUDGE_API_KEY",
-	"judge.sample_rate":            "NEXUS_JUDGE_SAMPLE_RATE",
-	"judge.concurrency":            "NEXUS_JUDGE_CONCURRENCY",
-	"judge.queue":                  "NEXUS_JUDGE_QUEUE",
-	"judge.timeout":                "NEXUS_JUDGE_TIMEOUT",
-	"judge.cost_per_1k":            "NEXUS_JUDGE_COST_PER_1K",
-	"telemetry.path":               "NEXUS_TELEMETRY_PATH",
-	"metrics.db_path":              "NEXUS_METRICS_DB",
-	"quality.concurrency":          "NEXUS_QUALITY_CONCURRENCY",
-	"quality.queue":                "NEXUS_QUALITY_QUEUE",
-	"quality.timeout":              "NEXUS_QUALITY_TIMEOUT",
-	"quality.stderr_cap":           "NEXUS_QUALITY_STDERR_CAP",
-	"probe.interval":               "NEXUS_PROBE_INTERVAL",
-	"probe.timeout":                "NEXUS_PROBE_TIMEOUT",
-	"probe.bytes_per_token":        "NEXUS_PROBE_BYTES_PER_TOKEN",
-	"http.max_idle_conns":          "NEXUS_HTTP_MAX_IDLE_CONNS",
-	"http.max_idle_conns_per_host": "NEXUS_HTTP_MAX_IDLE_CONNS_PER_HOST",
-	"http.max_conns_per_host":      "NEXUS_HTTP_MAX_CONNS_PER_HOST",
-	"http.idle_conn_timeout":       "NEXUS_HTTP_IDLE_CONN_TIMEOUT",
-	"http.disable_keepalives":      "NEXUS_HTTP_DISABLE_KEEPALIVES",
+	"server.addr":                         "NEXUS_ADDR",
+	"server.max_body_bytes":               "NEXUS_MAX_BODY_BYTES",
+	"log.level":                           "NEXUS_LOG_LEVEL",
+	"log.format":                          "NEXUS_LOG_FORMAT",
+	"ollama.url":                          "NEXUS_OLLAMA_URL",
+	"ollama.router_model":                 "NEXUS_ROUTER_MODEL",
+	"ollama.local_model":                  "NEXUS_LOCAL_MODEL",
+	"ollama.embedding_model":              "NEXUS_EMBEDDING_MODEL",
+	"frontier.url":                        "NEXUS_FRONTIER_URL",
+	"frontier.model":                      "NEXUS_FRONTIER_MODEL",
+	"frontier.api_key":                    "NEXUS_FRONTIER_API_KEY",
+	"zai.url":                             "NEXUS_ZAI_URL",
+	"zai.model":                           "NEXUS_ZAI_MODEL",
+	"zai.api_key":                         "NEXUS_ZAI_API_KEY",
+	"rag.examples_dir":                    "NEXUS_EXAMPLES_DIR",
+	"rag.threshold":                       "NEXUS_RAG_THRESHOLD",
+	"routing.token_guardrail":             "NEXUS_TOKEN_GUARDRAIL",
+	"routing.slm_timeout":                 "NEXUS_SLM_TIMEOUT",
+	"routing.fusion_timeout":              "NEXUS_FUSION_TIMEOUT",
+	"routing.cascade_timeout":             "NEXUS_CASCADE_TIMEOUT",
+	"routing.arbiter_timeout":             "NEXUS_ARBITER_TIMEOUT",
+	"routing.local_max_concurrent":        "NEXUS_LOCAL_MAX_CONCURRENT",
+	"routing.local_queue_timeout":         "NEXUS_LOCAL_QUEUE_TIMEOUT",
+	"health.poll_interval":                "NEXUS_HEALTH_POLL_INTERVAL",
+	"health.breaker_threshold":            "NEXUS_HEALTH_BREAKER_THRESHOLD",
+	"health.probe_timeout":                "NEXUS_HEALTH_PROBE_TIMEOUT",
+	"judge.url":                           "NEXUS_JUDGE_URL",
+	"judge.model":                         "NEXUS_JUDGE_MODEL",
+	"judge.api_key":                       "NEXUS_JUDGE_API_KEY",
+	"judge.sample_rate":                   "NEXUS_JUDGE_SAMPLE_RATE",
+	"judge.concurrency":                   "NEXUS_JUDGE_CONCURRENCY",
+	"judge.queue":                         "NEXUS_JUDGE_QUEUE",
+	"judge.timeout":                       "NEXUS_JUDGE_TIMEOUT",
+	"judge.cost_per_1k":                   "NEXUS_JUDGE_COST_PER_1K",
+	"telemetry.path":                      "NEXUS_TELEMETRY_PATH",
+	"metrics.db_path":                     "NEXUS_METRICS_DB",
+	"quality.concurrency":                 "NEXUS_QUALITY_CONCURRENCY",
+	"quality.queue":                       "NEXUS_QUALITY_QUEUE",
+	"quality.timeout":                     "NEXUS_QUALITY_TIMEOUT",
+	"quality.stderr_cap":                  "NEXUS_QUALITY_STDERR_CAP",
+	"probe.interval":                      "NEXUS_PROBE_INTERVAL",
+	"probe.timeout":                       "NEXUS_PROBE_TIMEOUT",
+	"probe.bytes_per_token":               "NEXUS_PROBE_BYTES_PER_TOKEN",
+	"http.max_idle_conns":                 "NEXUS_HTTP_MAX_IDLE_CONNS",
+	"http.max_idle_conns_per_host":        "NEXUS_HTTP_MAX_IDLE_CONNS_PER_HOST",
+	"http.max_conns_per_host":             "NEXUS_HTTP_MAX_CONNS_PER_HOST",
+	"http.idle_conn_timeout":              "NEXUS_HTTP_IDLE_CONN_TIMEOUT",
+	"http.disable_keepalives":             "NEXUS_HTTP_DISABLE_KEEPALIVES",
+	"ratelimit.per_client_rpm":            "NEXUS_RATE_LIMIT_RPM",
+	"ratelimit.per_client_burst":          "NEXUS_RATE_LIMIT_BURST",
+	"ratelimit.global_rpm":                "NEXUS_GLOBAL_RATE_LIMIT_RPM",
+	"ratelimit.frontier_daily_budget_usd": "NEXUS_FRONTIER_DAILY_BUDGET_USD",
 }
 
 // fileMapFromKeys translates the parsed section.key map into an
@@ -612,6 +625,36 @@ func Load() (Config, error) {
 	cfg.QualityStderrCap = stderrCap
 
 	cfg.QualityEnabled = cfg.QualityConcurrency > 0
+
+	// Rate limiting + daily frontier budget (issue #38). All four
+	// values default to zero (disabled). When RateLimitRPM > 0 the
+	// proxy enforces a per-client-IP token bucket; when
+	// GlobalRateLimitRPM > 0 the proxy enforces an aggregate bucket
+	// checked before the per-client bucket. FrontierDailyBudgetUSD
+	// gates only RouteFrontier (local routing is never budget-blocked).
+	rateRPM, err := resolveInt("NEXUS_RATE_LIMIT_RPM", fileMap, 0)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RateLimitRPM = rateRPM
+
+	rateBurst, err := resolveInt("NEXUS_RATE_LIMIT_BURST", fileMap, 0)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RateLimitBurst = rateBurst
+
+	globalRPM, err := resolveInt("NEXUS_GLOBAL_RATE_LIMIT_RPM", fileMap, 0)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.GlobalRateLimitRPM = globalRPM
+
+	dailyBudget, err := resolveFloat("NEXUS_FRONTIER_DAILY_BUDGET_USD", fileMap, 0)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.FrontierDailyBudgetUSD = dailyBudget
 
 	// Structured logging (issue #3). Defaults match the production
 	// expectation: JSON to stderr at info level. Operators flip on

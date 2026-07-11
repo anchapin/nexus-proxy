@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/auth"
+	"github.com/anchapin/nexus-proxy/internal/budget"
 	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/handlers"
@@ -27,6 +28,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/probe"
 	"github.com/anchapin/nexus-proxy/internal/quality"
 	"github.com/anchapin/nexus-proxy/internal/rag"
+	"github.com/anchapin/nexus-proxy/internal/ratelimit"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
 	"github.com/anchapin/nexus-proxy/internal/transport"
@@ -318,6 +320,7 @@ func main() {
 		Health:          hpoller,
 		BudgetObserver:  budgetObserver(probeMgr),
 		Limiter:         buildLocalLimiter(cfg),
+		SpendGuard:      buildSpendGuard(cfg),
 	}))
 
 	// /healthz returns a small JSON document so operators can see
@@ -339,10 +342,19 @@ func main() {
 	// Compose healthchecks) work without a key. When no key is
 	// configured the middleware is a no-op pass-through, preserving
 	// the pre-issue-#37 localhost-dev behaviour exactly.
+	// Rate limiting middleware (issue #38). Wraps the handler
+	// outermost so a rate-limited request never reaches auth or the
+	// chat handler. /healthz is exempt so liveness probes survive a
+	// rate-limit storm. When all rate vars are zero, buildRateLimiter
+	// returns nil and Middleware is a pure pass-through.
+	rateLimiter := buildRateLimiter(cfg)
+	defer rateLimiter.Close()
 	var handler http.Handler = mux
+	handler = rateLimiter.Middleware(healthzExempt)(handler)
+
 	if cfg.ProxyAuthEnabled {
 		keys := cfg.ProxyAuthKeys()
-		handler = auth.Middleware(keys, healthzExempt)(mux)
+		handler = auth.Middleware(keys, healthzExempt)(handler)
 		slog.Info("proxy auth enabled",
 			slog.Int("keys", len(keys)),
 		)
@@ -571,6 +583,45 @@ func buildLocalLimiter(cfg config.Config) *concurrencylimit.Limiter {
 		slog.Duration("queue_timeout", cfg.LocalQueueTimeout),
 	)
 	return l
+}
+
+// buildRateLimiter constructs the per-client + global rate limiter
+// (issue #38) from config. Returns nil when both RPMs are zero so
+// the middleware is a no-op pass-through. A nil Limiter is safe to
+// call Close() on.
+func buildRateLimiter(cfg config.Config) *ratelimit.Limiter {
+	if cfg.RateLimitRPM <= 0 && cfg.GlobalRateLimitRPM <= 0 {
+		slog.Info("rate limiter disabled (all RPM vars are 0)")
+		return nil
+	}
+	l := ratelimit.New(ratelimit.Config{
+		PerClientRPM:   cfg.RateLimitRPM,
+		PerClientBurst: cfg.RateLimitBurst,
+		GlobalRPM:      cfg.GlobalRateLimitRPM,
+	})
+	slog.Info("rate limiter enabled",
+		slog.Int("per_client_rpm", cfg.RateLimitRPM),
+		slog.Int("per_client_burst", cfg.RateLimitBurst),
+		slog.Int("global_rpm", cfg.GlobalRateLimitRPM),
+	)
+	return l
+}
+
+// buildSpendGuard constructs the rolling daily-budget tracker (issue
+// #38) from config. Returns nil when the budget is zero or negative
+// so the handler treats SpendGuard as "disabled" (the pre-issue-#38
+// behaviour). The *budget.SpendTracker satisfies handlers.SpendGuard
+// structurally.
+func buildSpendGuard(cfg config.Config) handlers.SpendGuard {
+	if cfg.FrontierDailyBudgetUSD <= 0 {
+		slog.Info("frontier daily budget disabled (NEXUS_FRONTIER_DAILY_BUDGET_USD=0)")
+		return nil
+	}
+	st := budget.NewSpendTracker(cfg.FrontierDailyBudgetUSD)
+	slog.Info("frontier daily budget enabled",
+		slog.Float64("budget_usd", cfg.FrontierDailyBudgetUSD),
+	)
+	return st
 }
 
 // healthzExempt is the exemption predicate passed to auth.Middleware
