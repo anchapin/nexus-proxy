@@ -744,14 +744,14 @@ CREATE INDEX IF NOT EXISTS idx_requests_request_id ON requests(request_id);`
 
 	// Insert a new row WITH the new fields to prove the columns exist.
 	if err := s.RecordRequest(Request{
-		Timestamp:       time.Now().UTC(),
-		RequestID:       "new-1",
-		Route:           "frontier",
-		Model:           "m",
-		InputTokens:     200,
+		Timestamp:        time.Now().UTC(),
+		RequestID:        "new-1",
+		Route:            "frontier",
+		Model:            "m",
+		InputTokens:      200,
 		EstimatedCostUSD: 0.001,
-		BaselineCostUSD: 0.002,
-		SavingsUSD:      0.001,
+		BaselineCostUSD:  0.002,
+		SavingsUSD:       0.001,
 	}); err != nil {
 		t.Fatalf("RecordRequest after migration: %v", err)
 	}

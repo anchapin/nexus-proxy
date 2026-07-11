@@ -280,13 +280,13 @@ func Panel(
 			Err:    errors.New("ollama unavailable (degraded)"),
 		}
 	} else {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
-		defer cancel()
-		msg, err := FetchPanel(ctx, client,
-			localBaseURL+"/v1/chat/completions", "", localModel, body)
-		results <- PanelResult{Source: "local", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
-	}()
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
+			defer cancel()
+			msg, err := FetchPanel(ctx, client,
+				localBaseURL+"/v1/chat/completions", "", localModel, body)
+			results <- PanelResult{Source: "local", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
+		}()
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
@@ -478,12 +478,12 @@ func PanelStreaming(
 		}
 	} else {
 		go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
-		defer cancel()
-		msg, err := FetchPanel(ctx, client,
-			localBaseURL+"/v1/chat/completions", "", localModel, body)
-		results <- PanelResult{Source: "local", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
-	}()
+			ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
+			defer cancel()
+			msg, err := FetchPanel(ctx, client,
+				localBaseURL+"/v1/chat/completions", "", localModel, body)
+			results <- PanelResult{Source: "local", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
+		}()
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))

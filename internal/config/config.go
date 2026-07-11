@@ -106,8 +106,8 @@ type Config struct {
 	// configuration. CostBaselineRatePer1K defaults to
 	// FrontierCostPer1K so the baseline and the actual frontier
 	// pricing stay consistent.
-	CostBaselineProvider string  // "frontier" (default) or a custom provider name
-	CostBaselineModel    string  // NEXUS_FRONTIER_MODEL (default) or a custom model
+	CostBaselineProvider  string  // "frontier" (default) or a custom provider name
+	CostBaselineModel     string  // NEXUS_FRONTIER_MODEL (default) or a custom model
 	CostBaselineRatePer1K float64 // USD per 1k tokens for baseline valuation
 
 	// Fusion progressive delivery (issue #48). When enabled and the
