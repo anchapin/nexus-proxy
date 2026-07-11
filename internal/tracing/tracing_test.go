@@ -121,11 +121,11 @@ func TestNewTraceIDAndSpanID(t *testing.T) {
 	}
 	// Two consecutive calls must return distinct ids (overwhelming
 	// probability with crypto/rand).
-	if NewTraceID() == NewTraceID() {
-		t.Error("two NewTraceID calls returned equal values")
+	if a, b := NewTraceID(), NewTraceID(); a == b {
+		t.Errorf("two NewTraceID calls returned equal values %q", a)
 	}
-	if NewSpanID() == NewSpanID() {
-		t.Error("two NewSpanID calls returned equal values")
+	if a, b := NewSpanID(), NewSpanID(); a == b {
+		t.Errorf("two NewSpanID calls returned equal values %q", a)
 	}
 }
 
