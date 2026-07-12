@@ -76,6 +76,22 @@ func Stream(w http.ResponseWriter, client Client, targetURL, apiKey string, payl
 	return StreamWithContext(context.Background(), w, client, targetURL, apiKey, payload)
 }
 
+// ErrUpstreamTruncated is returned by StreamWithContext when the
+// upstream connection dropped mid-stream after at least one chunk was
+// forwarded but before the upstream emitted its own `data: [DONE]`
+// sentinel (issue #118). The caller MUST NOT treat this as a hard
+// failure requiring a 502: the HTTP response is already committed
+// (200 + flushed SSE frames) and StreamWithContext has already emitted
+// a synthetic truncation event + `data: [DONE]` so the downstream
+// client does not hang. The sentinel exists solely so the handler can
+// record the truncation via its observability hook.
+var ErrUpstreamTruncated = errors.New("upstream: stream truncated")
+
+// sseDoneMarker is the OpenAI SSE stream terminator, recognised as a
+// standalone frame so a [DONE] embedded inside a JSON content chunk
+// never falsely marks the stream complete.
+const sseDoneMarker = "data: [DONE]"
+
 // StreamWithContext is Stream plus an explicit request context. The
 // context is bound to the upstream POST via http.NewRequestWithContext,
 // so cancellation (e.g. via context.WithTimeout) propagates both
@@ -114,6 +130,8 @@ func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client
 		return fmt.Errorf("upstream: response writer does not support flushing")
 	}
 	reader := bufio.NewReader(resp.Body)
+	var wroteAny bool
+	var seenDone bool
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
@@ -121,14 +139,82 @@ func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client
 				return werr
 			}
 			flusher.Flush()
+			wroteAny = true
+			if !seenDone && isSSEDoneLine(line) {
+				seenDone = true
+			}
 		}
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			// The upstream already emitted its own [DONE] sentinel,
+			// so the SSE stream completed normally — any trailing
+			// read error is irrelevant (the harness already saw the
+			// terminator). A clean io.EOF is a graceful close: the
+			// upstream finished its body (possibly without a [DONE]
+			// sentinel, as Ollama does on local routes) and the
+			// harness sees a normal end-of-stream. Both cases return
+			// nil so the happy-path stream stays byte-for-byte
+			// identical (issue #118 acceptance: a complete,
+			// [DONE]-less upstream must NOT gain a synthetic
+			// terminator).
+			if seenDone || errors.Is(err, io.EOF) {
 				return nil
+			}
+			// Any other read error after we forwarded at least one
+			// chunk — io.ErrUnexpectedEOF from a truncated chunked
+			// body (the `kill -9 ollama` reproduction), a connection
+			// reset, a read timeout — is a mid-stream TCP drop. The
+			// downstream SSE parser would hang waiting for the
+			// [DONE] sentinel that never arrives, so emit a synthetic
+			// truncation event + [DONE] and return a sentinel the
+			// handler can record (issue #118).
+			if wroteAny {
+				return emitTruncationTerminator(w, flusher)
 			}
 			return err
 		}
 	}
+}
+
+// isSSEDoneLine reports whether line is the OpenAI SSE terminator
+// `data: [DONE]` (with any trailing newline / carriage return).
+// Matching on the trimmed token means a partial buffer without the
+// newline still classifies correctly, and an upstream that frames
+// with `\r\n` does not cause a miss. A [DONE] embedded inside a JSON
+// content chunk never matches because content frames carry the JSON
+// payload after `data: `, not the bare token.
+func isSSEDoneLine(line []byte) bool {
+	return strings.TrimSpace(string(line)) == sseDoneMarker
+}
+
+// emitTruncationTerminator writes the SSE signal the downstream
+// harness needs when the upstream dropped mid-stream (issue #118).
+// The response is already committed (200 + flushed SSE frames), so
+// the status code cannot be changed at this point; the authoritative
+// client-facing signal is the in-band error event followed by the
+// `data: [DONE]` sentinel the harness's SSE parser is waiting on.
+//
+// X-Nexus-Truncated is set best-effort on the header map: it reaches
+// the client only in the rare case where the drop is detected before
+// the first body flush; once SSE frames are on the wire the header no
+// longer travels, but the value is still observable through /status,
+// debug traces, and httptest recorders (and through the handler,
+// which also stamps it on detection). The in-band truncation event is
+// the reliable client signal regardless.
+//
+// Returns ErrUpstreamTruncated so the caller records the truncation
+// without treating it as a hard 502.
+func emitTruncationTerminator(w http.ResponseWriter, flusher http.Flusher) error {
+	w.Header().Set("X-Nexus-Truncated", "true")
+	if _, err := io.WriteString(w, "data: {\"error\":{\"message\":\"upstream stream truncated\",\"type\":\"upstream_truncated\"}}\n\n"); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	if flusher != nil {
+		flusher.Flush()
+	}
+	return ErrUpstreamTruncated
 }
 
 // BufferedFetch POSTs payload to targetURL, buffers the entire upstream

@@ -526,28 +526,39 @@ func main() {
 	rejectionObs := handlers.RejectionObserverFunc(func(e handlers.RejectionEvent) {
 		routeCounters.ObserveRejection(e.Reason)
 	})
+	// Stream-truncation observer (issue #118). When the streaming
+	// proxy detects a mid-stream upstream TCP drop it self-heals by
+	// emitting a truncation event + [DONE] and returns
+	// upstream.ErrUpstreamTruncated; the chat handler dispatches this
+	// hook so the truncation lands in /metrics as
+	// nexus_stream_truncated_total{route}. Same closure shape as the
+	// route-decision and rejection observers.
+	streamTruncationObs := handlers.StreamTruncationObserverFunc(func(e handlers.StreamTruncationEvent) {
+		routeCounters.ObserveStreamTruncation(e.Route)
+	})
 	mux.Handle("/metrics", routeCounters.Handler())
 	slog.Info("metrics endpoint serves prometheus text format",
 		slog.String("path", "/metrics"),
 	)
 
 	chatHandler := handlers.Chat(handlers.Deps{
-		Config:                cfg,
-		Client:                http.DefaultClient,
-		RAG:                   store,
-		SLM:                   slm,
-		FormattingRegex:       re,
-		Confidence:            confidenceObs,
-		JudgeObserver:         judgeObs,
-		QualityObserver:       qualityO,
-		MetricsObserver:       metricsObs,
-		Recorder:              recorder,
-		Health:                hpoller,
-		BudgetObserver:        budgetObserver(probeMgr),
-		LocalLimiter:          localLimiter,
-		LocalCooldown:         localCooldown,
-		RouteDecisionObserver: routeDecisionObs,
-		RejectionObserver:     rejectionObs,
+		Config:                   cfg,
+		Client:                   http.DefaultClient,
+		RAG:                      store,
+		SLM:                      slm,
+		FormattingRegex:          re,
+		Confidence:               confidenceObs,
+		JudgeObserver:            judgeObs,
+		QualityObserver:          qualityO,
+		MetricsObserver:          metricsObs,
+		Recorder:                 recorder,
+		Health:                   hpoller,
+		BudgetObserver:           budgetObserver(probeMgr),
+		LocalLimiter:             localLimiter,
+		LocalCooldown:            localCooldown,
+		RouteDecisionObserver:    routeDecisionObs,
+		RejectionObserver:        rejectionObs,
+		StreamTruncationObserver: streamTruncationObs,
 	})
 	// Apply the per-client rate limiter (issue #75) as the outermost
 	// wrapper so a flood of requests is rejected before any middleware

@@ -83,6 +83,10 @@ type counterKey struct {
 // before they reached an upstream:
 //   - nexus_requests_rejected_total{reason}
 //
+// A fifth family (issue #118) records upstream streams the proxy
+// terminated early because of a mid-stream TCP drop:
+//   - nexus_stream_truncated_total{route}
+//
 // The reason label values are short, bounded strings (method,
 // body_too_large, bad_request, rate_limit, ...) defined as constants
 // in internal/handlers so the chat handler and the rate-limit
@@ -94,6 +98,13 @@ type RouteCounters struct {
 	slmDecisions             map[counterKey]*uint64
 	lowConfidenceEscalations map[counterKey]*uint64
 	rejections               map[string]*uint64
+
+	// streamTruncations tracks the total number of upstream streams
+	// the proxy terminated early because of a mid-stream TCP drop
+	// (issue #118), partitioned by route so operators can see whether
+	// local or frontier upstreams are the source of drops. Same
+	// lock-then-atomic pattern as the rejections map.
+	streamTruncations map[string]*uint64
 
 	// judgeDropped tracks the total number of judge samples dropped
 	// because the evaluation queue was full (issue #111). It is a
@@ -110,6 +121,7 @@ func NewRouteCounters() *RouteCounters {
 		slmDecisions:             make(map[counterKey]*uint64),
 		lowConfidenceEscalations: make(map[counterKey]*uint64),
 		rejections:               make(map[string]*uint64),
+		streamTruncations:        make(map[string]*uint64),
 		judgeDropped:             &v,
 	}
 }
@@ -196,6 +208,37 @@ func (rc *RouteCounters) ObserveJudgeDrop(total uint64) {
 	atomic.StoreUint64(rc.judgeDropped, total)
 }
 
+// ObserveStreamTruncation records one upstream stream the proxy
+// terminated early because of a mid-stream TCP drop (issue #118),
+// partitioned by route so operators can see whether local or frontier
+// upstreams are the source of drops. Call this from the chat handler
+// via the StreamTruncationObserver hook when upstream.StreamWithContext
+// returns ErrUpstreamTruncated. Safe for concurrent use; a nil
+// receiver is a no-op. route is the short label value ("local" |
+// "frontier" | "fusion") that appears in the Prometheus exposition.
+func (rc *RouteCounters) ObserveStreamTruncation(route string) {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(rc.routeTruncationSlot(route), 1)
+}
+
+// routeTruncationSlot returns the *uint64 for route, creating it if
+// absent. Same lock-then-atomic pattern as reasonSlot: the mutex
+// guards the map mutation only, the increment happens lock-free on
+// the returned pointer.
+func (rc *RouteCounters) routeTruncationSlot(route string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.streamTruncations[route]
+	if !ok {
+		val := uint64(0)
+		p = &val
+		rc.streamTruncations[route] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
 // reasonSlot returns the *uint64 for reason, creating it if absent.
 // Same lock-then-atomic pattern as slot: the mutex guards the map
 // mutation only, the increment happens lock-free.
@@ -269,7 +312,19 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	}
 	if n, err := writeRejectionSeries(w, "nexus_requests_rejected_total",
 		"Requests the proxy rejected before they reached an upstream.",
-		rc.rejections); err != nil {
+		"reason", rc.rejections); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	// Upstream mid-stream TCP-drop counter (issue #118). Labelled by
+	// route so a single PromQL query breaks truncations out by
+	// destination (local / frontier / fusion). Only the streaming
+	// paths can truncate; the buffered / cascade paths emit their own
+	// [DONE] and never hit this counter.
+	if n, err := writeRejectionSeries(w, "nexus_stream_truncated_total",
+		"Upstream streams the proxy terminated early because of a mid-stream TCP drop (issue #118).",
+		"route", rc.streamTruncations); err != nil {
 		return total, err
 	} else {
 		total += n
@@ -320,12 +375,14 @@ func writeSeries(w io.Writer, name, help string, m map[counterKey]*uint64, label
 	return total, nil
 }
 
-// writeRejectionSeries emits the nexus_requests_rejected_total
-// family. It is a string-keyed variant of writeSeries so the
-// rejection counters (keyed only by reason) do not need to reuse the
-// multi-field counterKey struct. Output is sorted by reason for
+// writeRejectionSeries emits a string-keyed, single-label counter
+// family. It is the string-keyed variant of writeSeries so the
+// rejection counters (labelled only by reason) and the stream-
+// truncation counters (labelled only by route) do not need to reuse
+// the multi-field counterKey struct. label is the Prometheus label
+// name ("reason" or "route"); output is sorted by key for
 // deterministic scrape diffs.
-func writeRejectionSeries(w io.Writer, name, help string, m map[string]*uint64) (int64, error) {
+func writeRejectionSeries(w io.Writer, name, help, label string, m map[string]*uint64) (int64, error) {
 	var total int64
 	n, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", name, help, name)
 	if err != nil {
@@ -342,7 +399,7 @@ func writeRejectionSeries(w io.Writer, name, help string, m map[string]*uint64) 
 	sort.Strings(keys)
 	for _, k := range keys {
 		v := atomic.LoadUint64(m[k])
-		n, err := fmt.Fprintf(w, "%s{reason=\"%s\"} %d\n", name, sanitizeLabel(k), v)
+		n, err := fmt.Fprintf(w, "%s{%s=\"%s\"} %d\n", name, label, sanitizeLabel(k), v)
 		if err != nil {
 			return total + int64(n), err
 		}
