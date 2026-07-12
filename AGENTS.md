@@ -10,19 +10,37 @@ and `README.md` for the user-facing quickstart.
 
 ## Repo state
 
-Phase 1 refactor is complete. The single-file prototype is gone; the
-codebase now follows standard Go layout. Telemetry was added in #16.
+Phases 1–5 are substantially shipped. The single-file prototype is gone;
+the codebase follows standard Go layout. Structured logging (#3),
+telemetry (#16), Prometheus metrics (#40), distributed tracing (#41),
+Kubernetes health endpoints (#42), inbound auth (#37), rate limiting
+(#38), TLS termination (#39), SQLite metrics store (#4), the
+multi-frontier provider registry (#43), and VRAM-aware concurrency
+gating (#35) have all landed.
 
 ```
-cmd/nexus/                 # main: wires config + handlers + starts HTTP
+cmd/nexus/                 # main: wires config + middleware + handlers + starts HTTP
 internal/
+  auth/                    # inbound API-key gateway middleware (#37)
+  budget/                  # rolling 24h frontier spend guard (#38)
+  concurrencylimit/        # VRAM-aware local-route semaphore (#35)
   config/                  # env loading, defaults, validation
-  handlers/                # chat.go: HTTP entry point
-  middleware/              # toon.go, prompt_engine.go
+  handlers/                # chat.go + health.go (HTTP entry points)
+  health/                  # Ollama health poller + circuit breaker (#8)
+  judge/                   # async LLM-as-a-judge evaluator (#15)
+  metrics/                 # SQLite metrics store for savings dashboard (#4)
+  middleware/              # toon.go, prompt_engine.go (prompt transforms)
+  observability/           # Prometheus collector + /metrics (#40)
+  probe/                   # VRAM probe for concurrency gating
+  providers/               # multi-frontier provider registry (#43)
+  quality/                 # AST/compiler verifier (#13)
+  rag/                     # SQLite-backed store + Ollama embedder + file watcher (#46)
+  ratelimit/               # clientip.go, middleware.go (trusted-proxy + per-client limiter, #75)
   router/                  # dsl.go, slm.go, guardrails
-  upstream/                # stream.go, fusion.go (panel + arbiter)
-  ratelimit/               # clientip.go, middleware.go (trusted-proxy + per-client limiter, issue #75)
-  rag/                     # SQLite-backed store + Ollama embedder + file watcher (issue #46)
+  telemetry/               # Recorder interface + JSONLRecorder + ObservingWriter
+  tracing/                 # W3C trace context + OTLP/JSON export (#41)
+  transport/               # shared pooled HTTP client (#34)
+  upstream/                # stream.go, cascade.go, fusion.go (panel + arbiter)
 few_shot_examples/         # (gitignored) user-curated snippets
 .env.example               # all env vars with safe defaults
 Makefile                   # build / test / lint / ci
@@ -43,13 +61,34 @@ runtime dependency.
 
 The binary listens on `:8000` (env: `NEXUS_ADDR`) and exposes:
 - `POST /v1/chat/completions` — the proxy
-- `GET  /healthz` — liveness probe
+- `GET  /healthz` — liveness probe (legacy alias)
+- `GET  /livez` — liveness probe (#42)
+- `GET  /readyz` — readiness probe; honours `NEXUS_READINESS_MODE` (#42)
+- `GET  /status` — detailed subsystem state (frontier, judge, VRAM)
+- `GET  /metrics` — Prometheus-format metrics (#40; path via `NEXUS_METRICS_ENDPOINT`)
+
+`/healthz`, `/livez`, `/readyz`, `/status`, and `/metrics` are exempt
+from inbound auth and rate limiting. `/v1/chat/completions` requires
+auth when `NEXUS_PROXY_API_KEY` is set (#37).
 
 Telemetry is opt-out: by default the proxy appends one JSON object per
 proxied request to `./nexus-telemetry.jsonl` (env: `NEXUS_TELEMETRY_PATH`,
 empty disables). Records are pushed onto a buffered channel consumed by a
-background goroutine — the request path never blocks on persistence. Set
-`NEXUS_TELEMETRY_PATH=/tmp/nexus.db` or similar to relocate the log.
+background goroutine — the request path never blocks on persistence.
+
+**SQLite metrics store (#4).** When `NEXUS_METRICS_DB` is set, the proxy
+also writes a structured row per request to a SQLite database (route,
+model, tokens, TOON savings, RAG injection, estimated frontier cost).
+This powers the savings dashboard. Parent directories are created on
+demand; leave empty to disable.
+
+**Prometheus metrics (#40).** `/metrics` exposes counters, gauges, and
+histograms for auth, rate-limit, budget, TLS middleware, and per-route
+latency. See `internal/observability`.
+
+**Known gotcha (#112).** When the SQLite metrics store is enabled, the
+JSONL telemetry log is currently silenced. Tracked as bug #112 — both
+sinks should coexist.
 
 ## Prerequisites
 
@@ -83,6 +122,7 @@ Route constants are `router.RouteLocal`, `router.RouteFrontier`,
 | Prompt contains "architectural design" or "system architecture" | `fusion` |
 | Prompt matches `\b(css\|format\|docstring\|lint\|typo\|boilerplate)\b` | `local` |
 | Otherwise                                                     | SLM decides |
+| SLM confidence < `NEXUS_SLM_CONFIDENCE_THRESHOLD` AND route is local/fusion | `frontier` (escalation, #44) |
 | SLM call fails, times out, or returns invalid JSON            | `frontier` (safe default) |
 
 ## Fusion progressive delivery (issue #48)
@@ -125,20 +165,35 @@ shape. Two non-obvious behaviours to remember when re-parsing downstream:
 
 ## Middleware order (do not reorder casually)
 
-In `internal/handlers/chat.go`:
+### Inbound chain (wired in `cmd/nexus/main.go`, outermost → innermost)
+
+1. **Security headers** (#39) — sanitizes `X-Request-Id`, sets
+   `X-Content-Type-Options`, `X-Frame-Options`, etc. Outermost so
+   every response including 401/429 gets headers.
+2. **Rate limiting** (#38/#75) — per-client-IP + optional global
+   token-bucket. Exempts `/healthz`, `/livez`, `/readyz`, `/status`,
+   `/metrics`.
+3. **Inbound auth** (#37) — bearer-token gate. Exempts the same health
+   endpoints. No-op pass-through when `NEXUS_PROXY_API_KEY` is unset.
+4. **Handler** — `handlers.Chat` dispatch.
+
+The HTTP-layer rate limiter (`internal/ratelimit`) wraps the chat
+handler **before** any prompt-pipeline step runs — a throttled request
+is rejected with 429 before prompt engineering / RAG / routing do any
+work. It is disabled (passthrough) when `NEXUS_RATE_LIMIT_RPM <= 0`.
+
+### Prompt pipeline (inside `internal/handlers/chat.go`)
 
 1. `ApplyPromptEngineering` — inject role/CoT/constraints into system prompt
 2. `RAG.Retrieve` + `InjectRAG` — embed latest user prompt, inject best
    cosine match (threshold from `NEXUS_RAG_THRESHOLD`)
 3. `CompressJSONBlocks` + `AppendSystemNote` — TOON compress JSON arrays,
    append TOON instructions to system
-4. Then routing: `Guardrail` → `DSL` → `SLM`
-5. Then stream (`local` / `frontier`) or `Panel` (`fusion`)
-
-The HTTP-layer rate limiter (`internal/ratelimit`, issue #75) wraps the
-chat handler **before** any of the above runs — a throttled request is
-rejected with 429 before prompt engineering / RAG / routing do any work.
-It is disabled (passthrough) when `NEXUS_RATE_LIMIT_RPM <= 0`.
+4. Then routing: `Guardrail` → `DSL` → `SLM` (with confidence escalation, #44)
+5. Then dispatch:
+   - `local` → `Cascade` (streaming, with fallback) or `BufferedFetch` (non-streaming)
+   - `frontier` → `Stream` (streaming) or `BufferedFetch` (non-streaming)
+   - `fusion` → `Panel` (local + frontier + arbiter)
 
 ## Trusted-proxy client-IP resolution (issue #75)
 
@@ -166,15 +221,24 @@ Gotchas to remember when extending:
 
 ## Style / workflow notes
 
-- Go 1.21+. Stdlib-only by design (PRD: "zero-dependency"). The
-  dev-time toolchain (golangci-lint, Make) is documented but optional
-  for contributors who just want to run the binary.
-- Logging is plain `log.Println` with bracketed prefixes (`[ROUTER]`,
-  `[RAG INDEXER]`, etc.). PRD Phase 2 swaps this for `slog`.
-- HTTP timeouts: `http.Server.ReadHeaderTimeout` is 10s; per-call
-  timeouts are `NEXUS_SLM_TIMEOUT` (8s default) and
-  `NEXUS_FUSION_TIMEOUT` (120s default). Other upstream calls use the
-  shared `http.DefaultClient`.
+- Go 1.21+. **Near-stdlib**: the only runtime dependency is
+  `modernc.org/sqlite` (pure-Go SQLite driver for the metrics store,
+  #4). The dev-time toolchain (golangci-lint, Make) is documented but
+  optional for contributors who just want to run the binary.
+- Logging uses `log/slog` (structured logging, #3). Format and level
+  are configurable via `NEXUS_LOG_FORMAT` (json|text) and
+  `NEXUS_LOG_LEVEL` (debug|info|warn|error). The old bracketed
+  `log.Println` prefixes (`[ROUTER]`, `[RAG INDEXER]`) are gone — use
+  `slog.Info(...)` with `slog.String("component", ...)` attributes.
+- HTTP timeouts: `http.Server.ReadHeaderTimeout` is 10s.
+  `ReadTimeout`/`WriteTimeout`/`IdleTimeout` are still 0 — tracked in
+  #106. Per-call timeouts are `NEXUS_SLM_TIMEOUT` (8s default),
+  `NEXUS_FUSION_TIMEOUT` (120s default), and
+  `NEXUS_CASCADE_TIMEOUT` (per-cascade-attempt, #14).
+- HTTP client is a single shared pooled `*http.Client` configured via
+  `internal/transport.New` (#34) — env vars `NEXUS_HTTP_*` tune
+  `MaxIdleConnsPerHost`, `MaxConnsPerHost`, `IdleConnTimeout`, etc.
+  The old `http.DefaultClient` references are gone.
 - The `few_shot_examples/` directory is auto-created at first run if
   missing (`Store.IndexDir`). It's gitignored.
 - Tests use `httptest` + a `RecordingTransport` helper in
@@ -279,32 +343,45 @@ never import `internal/judge`. The handler exposes a
 unit-testable without spinning up a worker pool.
 
 **Persistence.** `internal/judge` exposes a tiny `Storage` interface;
-today it is backed by an in-memory `MemoryStorage`. Issue #16
-(SQLite-backed telemetry) will provide a SQLite implementation that
-satisfies the same interface. The judge stores a structured
-`JudgeScore` record (request id, score 1–5, raw response, prompt/
-output token estimates, USD cost) so the future PR can persist it
+today it is backed by an in-memory `MemoryStorage`. The SQLite metrics
+store (#4, `internal/metrics`) persists per-request data (route, model,
+tokens, cost) to `NEXUS_METRICS_DB`. The judge's `JudgeScore` record
+(request id, score 1–5, raw response, prompt/output token estimates,
+USD cost) is designed to persist through the same Storage interface
 without changing the wire shape.
 
 ## Where to extend
 
 For new behaviour, add tests first and follow the existing layout:
 
-| New behaviour                        | Package                          |
-| ------------------------------------ | -------------------------------- |
-| New env var                          | `internal/config`                |
-| New prompt transform                 | `internal/middleware`            |
-| New routing rule                     | `internal/router`                |
-| Different upstream protocol          | `internal/upstream`              |
-| New HTTP endpoint                    | `internal/handlers`              |
-| Trusted-proxy / client-IP / rate limit | `internal/ratelimit`           |
-| Judge scoring / sampling logic       | `internal/judge`                 |
-| Judge persistence (SQLite, etc.)     | `internal/judge` (Storage impl)  |
-| New metric field or storage backend  | `internal/telemetry`             |
-| RAG embedding cache / indexer        | `internal/rag`                   |
+| New behaviour                           | Package                          |
+| --------------------------------------- | -------------------------------- |
+| New env var                             | `internal/config`                |
+| New prompt transform                    | `internal/middleware`            |
+| New routing rule                        | `internal/router`                |
+| Different upstream protocol / cascade   | `internal/upstream`              |
+| New HTTP endpoint                       | `internal/handlers`              |
+| Trusted-proxy / client-IP / rate limit  | `internal/ratelimit`             |
+| Inbound auth / API key validation       | `internal/auth`                  |
+| Spend guard / budget enforcement        | `internal/budget`                |
+| TLS / security headers                  | `internal/handlers` (header mw)  |
+| Prometheus metric / collector           | `internal/observability`         |
+| Distributed tracing / span              | `internal/tracing`               |
+| SQLite metrics store / savings query    | `internal/metrics`               |
+| VRAM probe / concurrency gate           | `internal/probe`, `internal/concurrencylimit` |
+| Health poller / circuit breaker         | `internal/health`                |
+| Multi-frontier provider registry        | `internal/providers`             |
+| AST/compiler quality check              | `internal/quality`               |
+| Shared HTTP client tuning               | `internal/transport`             |
+| Judge scoring / sampling logic          | `internal/judge`                 |
+| Judge persistence (SQLite, etc.)        | `internal/judge` (Storage impl)  |
+| New telemetry field or storage backend  | `internal/telemetry`             |
+| RAG embedding cache / indexer           | `internal/rag`                   |
 
 Existing functions map 1:1 to those packages. The handler is the only
 public entry point — keep middleware and router free of `net/http`
-concerns so they stay unit-testable. Telemetry's `Recorder` interface is
-the only seam: swap the JSONL implementation for SQLite by satisfying
-`Record(Record)` + `Close()` without touching the handler.
+concerns so they stay unit-testable. Telemetry's `Recorder` interface
+(`internal/telemetry`) is the JSONL seam; the SQLite metrics store
+(`internal/metrics`) is a separate sink with its own schema. Both are
+wired via `handlers.Deps` so neither touches the hot-path handler
+logic directly.

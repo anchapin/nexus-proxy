@@ -3,13 +3,14 @@ package metrics
 import (
 	"database/sql"
 	"errors"
-	_ "modernc.org/sqlite"
 	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
 )
