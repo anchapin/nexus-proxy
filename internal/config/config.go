@@ -66,6 +66,16 @@ type Config struct {
 	ZAIModel string // "glm-4.6"
 	ZAIKey   string // empty == skipped from cascade
 
+	// Inbound auth (issue #109). When ProxyAPIKey is non-empty, every
+	// non-exempt endpoint requires a matching Bearer token in the
+	// Authorization header. /healthz and /metrics stay exempt for K8s
+	// probes and Prometheus scrapers. /status is exempt only when
+	// StatusPublic is true (default false) — the diagnostics surface
+	// (frontier configured, judge enabled, VRAM state) is
+	// reconnaissance-grade and should be gated by default.
+	ProxyAPIKey  string // NEXUS_PROXY_API_KEY; empty disables auth
+	StatusPublic bool   // NEXUS_STATUS_PUBLIC; exposes /status without auth
+
 	// RAG
 	ExamplesDir  string  // "./few_shot_examples"
 	RAGThreshold float64 // cosine similarity cutoff for retrieval (0.55)
@@ -369,6 +379,8 @@ func Load() (Config, error) {
 		ZAIURL:         getEnv("NEXUS_ZAI_URL", "https://api.z.ai/v1/chat/completions"),
 		ZAIModel:       getEnv("NEXUS_ZAI_MODEL", "glm-4.6"),
 		ZAIKey:         getEnv("NEXUS_ZAI_API_KEY", ""),
+		ProxyAPIKey:    getEnv("NEXUS_PROXY_API_KEY", ""),
+		StatusPublic:   getEnvBool("NEXUS_STATUS_PUBLIC", false),
 		ExamplesDir:    getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
 		MetaPrompt:     defaultMetaPrompt,
 		TOONNotice:     defaultTOONNotice,
@@ -1110,6 +1122,11 @@ func (c Config) RoutingConfidenceEnabled() bool {
 	return c.RoutingConfidenceDB != "" && c.JudgeEnabled
 }
 
+// AuthEnabled reports whether the inbound API-key gate (issue #109)
+// is active. When false, all endpoints are open — the binary behaves
+// identically to the pre-auth proxy.
+func (c Config) AuthEnabled() bool { return c.ProxyAPIKey != "" }
+
 // RAGPersistentEnabled reports whether the SQLite-backed RAG store
 // (issue #46) should be opened. Disabled when RAGDBPath is empty,
 // which preserves the legacy in-memory-only behaviour for operators
@@ -1166,6 +1183,22 @@ func getEnvInt(key string, def int) (int, error) {
 		return 0, fmt.Errorf("config: %s must be an integer: %w", key, err)
 	}
 	return n, nil
+}
+
+// getEnvBool reads a boolean environment variable. Accepts
+// "true"/"1"/"yes" (case-insensitive) as true; anything else is
+// false. Returns def when the variable is unset or empty.
+func getEnvBool(key string, def bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def
+	}
+	switch strings.ToLower(v) {
+	case "true", "1", "yes":
+		return true
+	default:
+		return false
+	}
 }
 
 func getEnvFloat(key string, def float64) (float64, error) {
