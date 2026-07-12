@@ -1,0 +1,12 @@
+blank_issues_enabled: false
+issue_template:
+- name: bug_report
+  description: Report a bug in Nexus Proxy
+  title: '[BUG] '
+  labels: ['bug']
+  url: .github/ISSUE_TEMPLATE/bug_report.md
+- name: feature_request
+  description: Propose a new feature for Nexus Proxy
+  title: '[FEATURE] '
+  labels: ['enhancement']
+  url: .github/ISSUE_TEMPLATE/feature_request.md
