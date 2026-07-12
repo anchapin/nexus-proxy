@@ -142,8 +142,13 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 			{value: "fusion", n: c.requestsFusion.Load()},
 		})
 
-	writeCounter(w, "nexus_errors_total",
-		"Total proxied requests that returned an upstream error.", c.errorsTotal.Load())
+	writeCounterLabeled(w, "nexus_errors_total",
+		"Total proxied requests that returned an upstream error, by route.",
+		"route", []labelSample{
+			{value: "local", n: c.errorsLocal.Load()},
+			{value: "frontier", n: c.errorsFrontier.Load()},
+			{value: "fusion", n: c.errorsFusion.Load()},
+		})
 	writeCounter(w, "nexus_rag_hits_total",
 		"Total proxied requests where a RAG few-shot snippet was injected.", c.ragHitsTotal.Load())
 	writeCounter(w, "nexus_rag_misses_total",
@@ -231,10 +236,20 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 
 	// --- Histograms -----------------------------------------------------
 
-	writeHistogram(w, "nexus_request_duration_ms",
-		"End-to-end request duration in milliseconds, from body read to final flush.", c.latency)
-	writeHistogram(w, "nexus_ttft_ms",
-		"Time to first token in milliseconds (0 / unobserved for non-streaming responses).", c.ttft)
+	writeHistogramLabeled(w, "nexus_request_duration_ms",
+		"End-to-end request duration in milliseconds, from body read to final flush, by route.",
+		"route", map[string]*Histogram{
+			"local":    c.latencyLocal,
+			"frontier": c.latencyFrontier,
+			"fusion":   c.latencyFusion,
+		})
+	writeHistogramLabeled(w, "nexus_ttft_ms",
+		"Time to first token in milliseconds (0 / unobserved for non-streaming responses), by route.",
+		"route", map[string]*Histogram{
+			"local":    c.ttftLocal,
+			"frontier": c.ttftFrontier,
+			"fusion":   c.ttftFusion,
+		})
 
 	// --- Gauges (live readings from providers) --------------------------
 
@@ -285,8 +300,31 @@ func writeCounterLabeled(w io.Writer, name, help, label string, samples []labelS
 	}
 }
 
+// writeHistogramLabeled emits a histogram family with one label dimension.
+// Each route gets its own bucket lines, _sum, and _count.
+// Routes are emitted in a fixed order (local, frontier, fusion) for
+// deterministic output.
+func writeHistogramLabeled(w io.Writer, name, help, label string, histograms map[string]*Histogram) {
+	writeMeta(w, name, help, "histogram")
+	// Fixed route order for deterministic output.
+	for _, route := range []string{"local", "frontier", "fusion"} {
+		h, ok := histograms[route]
+		if !ok || h == nil {
+			continue
+		}
+		cum, upperBounds, sum, count := h.Snapshot()
+		for i, ub := range upperBounds {
+			fmt.Fprintf(w, "%s_bucket{%s=%q,le=%q} %d\n", name, label, route, formatFloat(ub), cum[i])
+		}
+		fmt.Fprintf(w, "%s_bucket{%s=%q,le=%q} %d\n", name, label, route, "+Inf", cum[len(upperBounds)])
+		fmt.Fprintf(w, "%s_sum{%s=%q} %s\n", name, label, route, formatFloat(sum))
+		fmt.Fprintf(w, "%s_count{%s=%q} %d\n", name, label, route, count)
+	}
+}
+
 // writeHistogram emits a histogram family: one bucket line per finite
 // upper bound plus the +Inf bucket, then _sum and _count.
+// Kept for backward compatibility with tests and single-route use cases.
 func writeHistogram(w io.Writer, name, help string, h *Histogram) {
 	if h == nil {
 		return

@@ -52,8 +52,14 @@ func TestSubmitCountsErrorsRagToonDegraded(t *testing.T) {
 	c.Submit(ObservabilityEvent{Route: "local", TOONCompressed: true})
 	c.Submit(ObservabilityEvent{Route: "local", Degraded: true})
 
-	if got := c.errorsTotal.Load(); got != 1 {
-		t.Errorf("errorsTotal = %d, want 1", got)
+	if got := c.errorsLocal.Load(); got != 1 {
+		t.Errorf("errorsLocal = %d, want 1", got)
+	}
+	if got := c.errorsFrontier.Load(); got != 0 {
+		t.Errorf("errorsFrontier = %d, want 0", got)
+	}
+	if got := c.errorsFusion.Load(); got != 0 {
+		t.Errorf("errorsFusion = %d, want 0", got)
 	}
 	if got := c.ragHitsTotal.Load(); got != 1 {
 		t.Errorf("ragHitsTotal = %d, want 1", got)
