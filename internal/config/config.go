@@ -1,12 +1,8 @@
-// Package config loads runtime configuration from environment variables
-// with optional layered overrides from a YAML config file (issue #31).
-//
-// Resolution order: env var > config file > built-in default.
+// Package config loads runtime configuration from environment variables.
 //
 // All values have safe defaults so the binary boots in development with a
 // local Ollama instance. Secrets (FRONTIER_API_KEY) must be supplied via env
-// in any non-development deployment — the YAML file can reference them
-// via ${VAR} expansion so they never appear on disk.
+// in any non-development deployment.
 package config
 
 import (
@@ -19,47 +15,40 @@ import (
 	"strings"
 	"time"
 
-	"github.com/anchapin/nexus-proxy/internal/providers"
+	"github.com/anchapin/nexus-proxy/internal/middleware"
 )
 
 // Config holds all runtime knobs for the proxy. A zero value is invalid;
 // always go through Load.
 type Config struct {
-	// ConfigFile is the path to the YAML config file that was loaded
-	// (after --config / NEXUS_CONFIG / CWD discovery), or "" when no
-	// file was found. Reported in the boot log so operators can see
-	// which source the binary is reading (issue #31).
-	ConfigFile string
-
 	// HTTP server
 	Addr string // ":8000"
 
-	// TLS termination (issue #39). When both TLSCertFile and TLSKeyFile
-	// are non-empty, the server uses ListenAndServeTLS instead of
-	// ListenAndServe so inbound traffic is encrypted. TLSActive()
-	// reports the combined condition so main.go and the security-headers
-	// middleware can branch on a single boolean. When neither variable
-	// is set the proxy serves plain HTTP — identical to pre-issue-#39
-	// behaviour (zero breaking change for localhost dev).
-	TLSCertFile string // env NEXUS_TLS_CERT; empty == plaintext
-	TLSKeyFile  string // env NEXUS_TLS_KEY; empty == plaintext
-	// TLSRedirect, when true alongside TLS active, starts a second
-	// listener on port 80 that issues a 301 Moved Permanently to the
-	// HTTPS port so clients connecting over plain HTTP get upgraded.
-	// Ignored when TLS is not active.
-	TLSRedirect bool // env NEXUS_TLS_REDIRECT
+	// HTTP listener timeouts and header cap (issue #77). These bound
+	// the inbound connection so a slowloris-style client or an
+	// oversized header cannot exhaust the server. Distinct from the
+	// outbound NEXUS_HTTP_* transport knobs — these apply to the
+	// http.Server listener, not to upstream client calls.
+	//
+	// WriteTimeout defaults to 0 (disabled) so SSE streaming
+	// responses are never killed mid-stream; set it only when the
+	// proxy is behind a buffering reverse proxy. ReadTimeout covers
+	// the full request read (headers + body) and should be generous
+	// enough for large chat-completion payloads.
+	ReadTimeout    time.Duration // full request read deadline; 0 disables
+	WriteTimeout   time.Duration // full response write deadline; 0 disables (streaming-safe)
+	IdleTimeout    time.Duration // keep-alive idle wait; 0 disables
+	MaxHeaderBytes int           // max request header bytes; 0 uses Go default (1 MiB)
 
-	// Inbound proxy authentication (issue #37). When at least one key
-	// is configured, inbound requests must present a valid
-	// `Authorization: Bearer <key>` or `X-API-Key` header or the
-	// proxy returns 401 with an OpenAI-compatible error envelope.
-	// /healthz stays exempt so orchestrator liveness probes keep
-	// working. When neither variable is set, ProxyAuthEnabled is
-	// false and the proxy behaves identically to today (zero
-	// breaking change for localhost dev).
-	ProxyAPIKey      string   // single key from NEXUS_PROXY_API_KEY
-	ProxyAPIKeys     []string // comma-separated list from NEXUS_PROXY_API_KEYS (rotation)
-	ProxyAuthEnabled bool     // true when at least one key is non-empty
+	// Graceful shutdown timeout (issue #121). Upper bound on the drain
+	// window the HTTP server observes after SIGTERM/SIGINT — a frontier
+	// SSE stream mid-token or a fusion arbiter call that just opened its
+	// 60s WithTimeout window needs more than the prior hardcoded 10s.
+	// 0 falls back to the default (30s) so the knob can never accidentally
+	// disable the drain. Validated against ReadTimeout at boot: a drain
+	// shorter than the inbound read deadline emits a warning because
+	// in-flight requests would still be truncated mid-read.
+	ShutdownTimeout time.Duration // SIGTERM/SIGINT drain window
 
 	// Local Ollama
 	OllamaURL      string // "http://localhost:11434"
@@ -67,42 +56,45 @@ type Config struct {
 	LocalModel     string // "qwen3-coder:8b"
 	EmbeddingModel string // "nomic-embed-text"
 
-	// Frontier API (OpenAI-compatible). Legacy single-provider
-	// fields retained for backward compatibility (issue #43): the
-	// chat handler still consults these when the operator does not
-	// opt into the new NEXUS_PROVIDERS surface. When NEXUS_PROVIDERS
-	// IS configured, Load() overwrites these three with the first
-	// provider from the registry so callers that read them directly
-	// (telemetry, status pages, cost dashboards) see the new values.
+	// Frontier API (OpenAI-compatible)
 	FrontierURL   string // "https://api.openai.com/v1/chat/completions"
 	FrontierModel string // "gpt-4o"
 	FrontierKey   string // required for actual frontier traffic; may be empty in dev
 
-	// Z.ai fallback (optional second frontier endpoint for the local-route cascade).
-	// Vestigial once NEXUS_PROVIDERS is configured — Load() keeps
-	// these in sync with the legacy NEXUS_ZAI_* env vars so callers
-	// outside the cascade (boot logs, status pages) still report a
-	// useful default. Issue #43 keeps these fields for one release
-	// so existing dashboards do not regress; a future release will
-	// deprecate them in favour of Providers.
+	// Z.ai fallback (optional second frontier endpoint for the local-route cascade)
 	ZAIURL   string // "https://api.z.ai/v1/chat/completions"
 	ZAIModel string // "glm-4.6"
 	ZAIKey   string // empty == skipped from cascade
 
-	// Providers is the multi-frontier registry (issue #43). When
-	// NEXUS_PROVIDERS is set, the registry carries the operator's
-	// declaration order (with per-provider priority as a
-	// tiebreaker). When NEXUS_PROVIDERS is unset, Load() builds a
-	// backward-compat registry from the legacy NEXUS_FRONTIER_*
-	// and NEXUS_ZAI_* vars so .env.example boots unchanged. The
-	// chat handler dispatches route=frontier via the registry; the
-	// cascade builder iterates registry.FrontierProviders() to
-	// assemble fallback steps.
-	Providers providers.Registry
+	// Inbound auth (issue #109). When ProxyAPIKey is non-empty, every
+	// non-exempt endpoint requires a matching Bearer token in the
+	// Authorization header. /healthz and /metrics stay exempt for K8s
+	// probes and Prometheus scrapers. /status is exempt only when
+	// StatusPublic is true (default false) — the diagnostics surface
+	// (frontier configured, judge enabled, VRAM state) is
+	// reconnaissance-grade and should be gated by default.
+	ProxyAPIKey  string // NEXUS_PROXY_API_KEY; empty disables auth
+	StatusPublic bool   // NEXUS_STATUS_PUBLIC; exposes /status without auth
 
 	// RAG
 	ExamplesDir  string  // "./few_shot_examples"
 	RAGThreshold float64 // cosine similarity cutoff for retrieval (0.55)
+
+	// RAG persistence (issue #46). When RAGDBPath is set, the few-shot
+	// embeddings are cached on disk and reloaded on boot without
+	// re-hitting Ollama. RAGPollInterval > 0 enables a background
+	// goroutine that detects new / modified / deleted files in
+	// ExamplesDir and updates the store incrementally. Set
+	// NEXUS_RAG_DB="" to fall back to the legacy in-memory-only path.
+	RAGDBPath       string        // on-disk SQLite database for the RAG store
+	RAGPollInterval time.Duration // watcher cadence; 0 disables the watcher
+
+	// RAG embedding cache (issue #115). Prompt embeddings are
+	// deterministic for a given model+text pair, so they are memoized
+	// in a bounded LRU. A value of 0 disables the cache (every
+	// Retrieve re-embeds); the default keeps memory flat while
+	// skipping the Ollama round-trip for repeat prompts.
+	RAGEmbedCacheSize int // max LRU entries (256)
 
 	// Routing
 	TokenGuardrail int           // estimated tokens above this force frontier (6000)
@@ -111,27 +103,71 @@ type Config struct {
 	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
 	ArbiterTimeout time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
-	// SLMConfidenceThreshold (issue #44) escalates low-confidence
-	// SLM decisions. When the SLM returns Decision.Confidence below
-	// this value AND the chosen route is local or fusion, the chat
-	// handler promotes the request to frontier so the user gets a
-	// confident answer. Defaults to 0.0 — the "disabled" sentinel —
-	// which short-circuits the comparison and preserves the
-	// pre-issue-#44 behaviour exactly. The threshold only takes
-	// effect on the SLM fall-through branch; guardrail / DSL hits
-	// are deterministic and never trigger escalation.
-	SLMConfidenceThreshold float64 // env NEXUS_SLM_CONFIDENCE_THRESHOLD (0.0 = disabled)
+	// Frontier provider selector (issue #45). When more than one
+	// frontier provider is configured (frontier + z.ai), the chat
+	// handler consults a router.ProviderSelector to pick the cheaper
+	// / faster endpoint on every route=frontier request. The selector
+	// reads per-model p50 latency and average cost from the metrics
+	// store over SelectorWindow; SelectorRefreshInterval is the
+	// background cache cadence. SelectorMinSamples is the per-provider
+	// observation floor below which the selector falls back to the
+	// first configured provider (no flapping on cold start).
+	//
+	// FrontierCostPer1K and ZAICostPer1K override the per-request USD
+	// cost the metrics store assigns to each provider (a flat rate
+	// per 1k input tokens). They mirror JudgeCostPer1KUSD but apply
+	// to the per-provider slice that BuildFrontierProviders emits.
+	SelectorWindow          time.Duration // look-back window for provider stats (1h)
+	SelectorMinSamples      int           // per-provider observation floor (5)
+	SelectorRefreshInterval time.Duration // background cache refresh cadence (60s)
+	FrontierCostPer1K       float64       // USD per 1k input tokens for frontier (0.005)
+	ZAICostPer1K            float64       // USD per 1k input tokens for z.ai (0.002)
 
-	// VRAM-aware concurrency gate (issue #35). Caps the number of
-	// RouteLocal requests (and the local panel member of
-	// RouteFusion) that may dispatch local Ollama concurrently;
-	// waiters queue-and-wait up to LocalQueueTimeout, after which
-	// the chat handler fast-promotes to frontier via SkipLocal and
-	// stamps X-Nexus-Overflow: true on the response. LocalMaxConcurrent
-	// <= 0 disables the gate (the chat handler treats a nil/disabled
-	// Limiter as "unlimited", preserving the pre-#35 behaviour).
-	LocalMaxConcurrent int           // max concurrent local route dispatches (2)
-	LocalQueueTimeout  time.Duration // max wait for a slot before overflow promotion (5s)
+	// Cost-avoidance baseline (issue #73). The baseline represents
+	// what each request WOULD have cost if sent to the frontier
+	// provider at the frontier rate, regardless of the actual route.
+	// savings_usd = max(baseline_cost - actual_cost, 0). When
+	// CostBaselineProvider / CostBaselineModel are empty the proxy
+	// defaults to the configured frontier provider / model, so a
+	// stock deployment gets cost-avoidance tracking without extra
+	// configuration. CostBaselineRatePer1K defaults to
+	// FrontierCostPer1K so the baseline and the actual frontier
+	// pricing stay consistent.
+	CostBaselineProvider  string  // "frontier" (default) or a custom provider name
+	CostBaselineModel     string  // NEXUS_FRONTIER_MODEL (default) or a custom model
+	CostBaselineRatePer1K float64 // USD per 1k tokens for baseline valuation
+
+	// Fusion progressive delivery (issue #48). When enabled and the
+	// harness requests a streaming response, the chat handler
+	// dispatches route=fusion to upstream.PanelStreaming instead of
+	// the legacy Panel. PanelStreaming races both panel members,
+	// streams the first to complete as a speculative OpenAI-
+	// compatible SSE chunk, then either terminates (agreement) or
+	// streams the arbiter's synthesis as additional chunks
+	// (disagreement). FusionAgreementThreshold is the Jaccard
+	// similarity cutoff above which the arbiter is skipped; the
+	// value is clamped into [0, 1] by upstream.PanelStreaming so a
+	// misconfigured operator can't disable the agreement-skip path
+	// entirely (negative) or always skip it (>1).
+	FusionProgressiveDelivery bool    // true iff NEXUS_FUSION_PROGRESSIVE is unset or "true" (default true)
+	FusionAgreementThreshold  float64 // Jaccard ratio [0,1] above which arbiter is skipped (default 0.85)
+
+	// Judge-guided adaptive routing (issue #47). Historical judge
+	// scores are aggregated by task category in a SQLite table and fed
+	// back to the SLM router as a confidence signal. All of this is
+	// dormant unless the judge is enabled — when JudgeEnabled is false
+	// the chat handler never wires a ConfidenceStore, so routing is
+	// byte-for-byte identical to the pre-issue-47 behaviour.
+	//
+	// RoutingConfidenceDB   — on-disk SQLite path; empty disables the store.
+	// Floor / Ceiling       — bounds of the neutral band (0.4 / 0.85).
+	// MinSamples            — outcomes needed before a category is trusted (5).
+	// Window                — sliding window for the aggregate (168h / 7d).
+	RoutingConfidenceDB         string
+	RoutingConfidenceFloor      float64
+	RoutingConfidenceCeiling    float64
+	RoutingConfidenceMinSamples int
+	RoutingConfidenceWindow     time.Duration
 
 	// Health (issue #8). The chat handler consults
 	// internal/health.Health before issuing local-bound requests;
@@ -143,12 +179,6 @@ type Config struct {
 	HealthPollInterval     time.Duration // background poll cadence (30s)
 	HealthBreakerThreshold int           // consecutive failures before trip (3)
 	HealthProbeTimeout     time.Duration // per-probe HTTP timeout (5s)
-	// ReadinessMode selects the /readyz behaviour (issue #42).
-	// "degraded" (default) returns 200 whenever the process is
-	// alive; "strict" returns 503 when Ollama is unreachable AND
-	// no frontier key is configured. Unknown values fall back to
-	// degraded (see handlers.NormalizeReadinessMode).
-	ReadinessMode string // env NEXUS_READINESS_MODE; "strict" | "degraded"
 
 	// Hardware-aware VRAM probe (issue #6). The probe replaces the
 	// static NEXUS_TOKEN_GUARDRAIL with a live measurement of the
@@ -160,6 +190,27 @@ type Config struct {
 	ProbePollInterval  time.Duration // background re-probe cadence (60s); 0 disables polling
 	ProbeTimeout       time.Duration // per-probe HTTP timeout (5s)
 	ProbeBytesPerToken int           // VRAM->token heuristic (256 KiB per token)
+
+	// Local-route concurrency ceiling (issue #81). The limiter bounds
+	// in-flight local-route requests so a small GPU does not OOM under
+	// bursty load. NEXUS_LOCAL_MAX_CONCURRENT is the hard ceiling; the
+	// live effective count is min(ceiling, freeVRAM/bytesPerSlot) using
+	// the latest probe snapshot from internal/probe. Zero or negative
+	// disables the limiter entirely (pre-#81 unlimited behaviour), so a
+	// stock deployment is byte-for-byte unchanged when the operator
+	// leaves the knob unset. LocalVRAMBytesPerSlot is the per-slot VRAM
+	// reservation (default 2 GiB); it only affects the dynamic shrink
+	// path — when the probe is unavailable the full Ceiling is used.
+	LocalMaxConcurrent    int   // hard ceiling on concurrent local slots (0 disables)
+	LocalVRAMBytesPerSlot int64 // VRAM bytes reserved per concurrent local slot (2 GiB)
+
+	// Local-route cooldown (issue #80). After the cascade detects a
+	// local (Ollama) failure and falls back, the chat handler arms a
+	// short cooldown so subsequent requests within the window skip
+	// local and go directly to the fallback route — closing the gap
+	// between the cascade observing failure and the health poller
+	// catching up. Zero disables the circuit (pre-#80 behaviour).
+	LocalCooldown time.Duration // default 10s; 0 disables
 
 	// HTTP request body cap (issue #11). The chat handler applies this
 	// with http.MaxBytesReader before reading the request body, so an
@@ -197,6 +248,14 @@ type Config struct {
 	MetaPrompt string // appended to system prompt by prompt_engine
 	TOONNotice string // appended when TOON compression is applied
 
+	// Prompt-injection hardening (issue #76). Controls whether the
+	// proxy isolates its policy text from user-supplied system content
+	// and whether suspicious injection patterns are logged or rejected.
+	//   - off (default): legacy append behaviour, fully backward compatible.
+	//   - warn: proxy text delimited + suspicious patterns logged.
+	//   - strict: proxy text delimited + suspicious patterns rejected (400).
+	PromptInjectionMode middleware.InjectionMode
+
 	// Telemetry
 	//
 	// TelemetryPath is the on-disk JSON-lines log written by the
@@ -213,45 +272,6 @@ type Config struct {
 	TelemetryPath string
 	MetricsDBPath string
 
-	// MetricsEndpoint is the path the Prometheus /metrics handler is
-	// mounted on (issue #40). Default "/metrics"; an empty value
-	// disables the endpoint entirely (no handler is registered, the
-	// route returns 404) so operators who do not want a scrape surface
-	// get zero regression. The in-process collector still accumulates
-	// regardless, so a future programmatic reader can observe counters
-	// even when the HTTP endpoint is off.
-	MetricsEndpoint string
-
-	// HTTP connection pool (issue #34). Every outbound call —
-	// chat upstream, SLM routing, RAG embedding, health polling,
-	// VRAM probing, and the judge evaluator — shares a single
-	// *http.Client wired with a custom *http.Transport sized for a
-	// multi-agent local development workload. http.DefaultClient's
-	// default Transport caps MaxIdleConnsPerHost=2, which serialises
-	// the chat handler behind a tiny pool and pays handshake latency
-	// on every call. The defaults below give the chat-class pool
-	// 16 idle conns per host (typical: local Ollama) on a 90s
-	// keep-alive window.
-	//
-	// Background pollers (health, VRAM) reuse a separate, lighter
-	// client built by transport.NewProbe that caps
-	// MaxIdleConnsPerHost=1 so the pollers do not collectively
-	// reserve N idle slots on the primary pool.
-	HTTPMaxIdleConns        int           // total idle conns across all hosts (100)
-	HTTPMaxIdleConnsPerHost int           // idle conns reserved per host (16)
-	HTTPMaxConnsPerHost     int           // total (in-flight+idle) conns per host; 0 == unlimited
-	HTTPIdleConnTimeout     time.Duration // idle keep-alive window (90s)
-	HTTPDisableKeepAlives   bool          // true disables HTTP keep-alive (rarely wanted)
-
-	// Rate limiting (issue #38). A stdlib-only token-bucket limiter
-	// caps both per-client-IP and aggregate request rates. All four
-	// values default to zero (disabled), so the proxy behaves
-	// identically to before when the operator does not configure them.
-	RateLimitRPM           int     // per-client requests per minute (0 = disabled)
-	RateLimitBurst         int     // per-client burst capacity (0 = RPM)
-	GlobalRateLimitRPM     int     // aggregate RPM across all clients (0 = disabled)
-	FrontierDailyBudgetUSD float64 // rolling 24h spend cap for RouteFrontier (0 = disabled)
-
 	// Structured logging (issue #3). LogLevel maps NEXUS_LOG_LEVEL
 	// ("debug" | "info" | "warn" | "error") to a slog.Level. LogFormat
 	// maps NEXUS_LOG_FORMAT ("json" | "text") to a slog.Handler; json
@@ -259,19 +279,50 @@ type Config struct {
 	LogLevel  slog.Level
 	LogFormat LogFormat
 
-	// Distributed tracing (issue #41). When TracingEndpoint is empty
-	// the proxy boots with zero tracing overhead — no background
-	// goroutine, no per-request allocation beyond a nil-check on
-	// Deps.Tracer. Setting the endpoint enables the W3C
-	// `traceparent` propagation, span tree creation, and async
-	// OTLP/JSON export. TracingSampleRate (0.0–1.0) is the
-	// probability that any given request is recorded; TracingTimeout
-	// bounds each POST; TracingQueueSize caps the in-memory backlog
-	// before the export loop starts dropping spans.
-	TracingEndpoint   string
-	TracingSampleRate float64
-	TracingTimeout    time.Duration
-	TracingQueueSize  int
+	// Debug request/response tracing (issue #33). Debug is the master
+	// switch: when false (the default) the chat handler takes the
+	// production fast path with zero extra allocations. When true the
+	// handler emits a structured trace per request — inbound summary,
+	// middleware transforms, routing decision, upstream call, and a
+	// truncated response preview. DebugBodyBytes caps the response
+	// body preview so a runaway upstream cannot flood the log; zero or
+	// negative falls back to DefaultDebugBodyBytes. Distinct from
+	// LogLevel=debug: Debug adds payload-level visibility gated
+	// independently so operators can turn it on without enabling
+	// debug-level chatter from every other package.
+	Debug          bool
+	DebugBodyBytes int
+
+	// OpenAI-compatible model discovery (issue #78). When enabled the
+	// proxy serves GET /v1/models and GET /v1/models/{id} listing the
+	// configured local, router, and frontier models, plus any models
+	// Ollama reports via /api/tags. The Ollama poll is cached for
+	// ModelsCacheTTL; set to zero or negative to serve only the
+	// configured models (no HTTP round-trip to Ollama per request).
+	ModelsEndpointEnabled bool
+	ModelsCacheTTL        time.Duration
+
+	// Trusted-proxy enforcement + rate limiting (issue #75).
+	//
+	// TrustedProxies is the parsed CIDR allowlist sourced from
+	// NEXUS_TRUSTED_PROXIES (comma-separated, e.g.
+	// "10.0.0.0/8,172.16.0.0/12"). Only when the direct TCP peer is in
+	// this list does the proxy honour X-Forwarded-For / X-Real-IP for
+	// client-identity purposes. An empty/nil list means "trust nobody":
+	// the direct peer IP is always used and forwarded headers are
+	// ignored, so attackers who can reach the proxy directly cannot
+	// spoof per-client rate-limit buckets. TrustedProxiesRaw preserves
+	// the raw env value for diagnostics (boot warning echo).
+	//
+	// RateLimitRPM is the per-client request ceiling in requests per
+	// minute; zero or negative disables rate limiting entirely so a
+	// stock deployment is byte-for-byte identical to the pre-#75 path.
+	// RateLimitBurst is the token-bucket capacity (max burst before
+	// throttling); <=0 falls back to RateLimitRPM in the limiter.
+	TrustedProxies    []*net.IPNet
+	TrustedProxiesRaw string
+	RateLimitRPM      int
+	RateLimitBurst    int
 }
 
 // DefaultMetricsDBPath returns the canonical metrics DB location:
@@ -288,224 +339,104 @@ func DefaultMetricsDBPath() string {
 	return filepath.Join(base, "nexus-proxy", "metrics.db")
 }
 
-// Readiness mode values for NEXUS_READINESS_MODE (issue #42).
-// Kept as package-level constants so config and handlers agree on
-// the spelling without one side importing the other. The handlers
-// package exposes matching constants for callers that want to
-// branch on the mode; see internal/handlers.NormalizeReadinessMode.
-const (
-	// ReadinessModeStrict makes /readyz return 503 when neither
-	// Ollama nor a frontier API key can serve traffic. Use this
-	// in clusters where pod eviction is preferable to degraded
-	// routing (e.g. billing-sensitive deployments).
-	ReadinessModeStrict = "strict"
-
-	// ReadinessModeDegraded (default) makes /readyz always
-	// return 200 when the process is alive; the body's
-	// "degraded" field surfaces the actual subsystem state for
-	// observability without triggering an eviction. Use this
-	// when a temporary dependency outage should not churn the
-	// proxy out of the service mesh.
-	ReadinessModeDegraded = "degraded"
-)
-
-// configKeys maps the YAML "section.key" paths to env var names. This
-// is the one source of truth that bridges the structured YAML view
-// and the existing NEXUS_* env-var surface; if you add a new config
-// field, add it here AND to nexus.yaml.example.
-//
-// The parser emits lowercased "section.key" paths. Keys not present in
-// this map are silently dropped from the file's contribution so a stray
-// YAML entry (typo, leftover from an older schema) cannot break boot.
-var configKeys = map[string]string{
-	"server.addr":                         "NEXUS_ADDR",
-	"server.max_body_bytes":               "NEXUS_MAX_BODY_BYTES",
-	"log.level":                           "NEXUS_LOG_LEVEL",
-	"log.format":                          "NEXUS_LOG_FORMAT",
-	"ollama.url":                          "NEXUS_OLLAMA_URL",
-	"ollama.router_model":                 "NEXUS_ROUTER_MODEL",
-	"ollama.local_model":                  "NEXUS_LOCAL_MODEL",
-	"ollama.embedding_model":              "NEXUS_EMBEDDING_MODEL",
-	"frontier.url":                        "NEXUS_FRONTIER_URL",
-	"frontier.model":                      "NEXUS_FRONTIER_MODEL",
-	"frontier.api_key":                    "NEXUS_FRONTIER_API_KEY",
-	"zai.url":                             "NEXUS_ZAI_URL",
-	"zai.model":                           "NEXUS_ZAI_MODEL",
-	"zai.api_key":                         "NEXUS_ZAI_API_KEY",
-	"rag.examples_dir":                    "NEXUS_EXAMPLES_DIR",
-	"rag.threshold":                       "NEXUS_RAG_THRESHOLD",
-	"routing.token_guardrail":             "NEXUS_TOKEN_GUARDRAIL",
-	"routing.slm_timeout":                 "NEXUS_SLM_TIMEOUT",
-	"routing.fusion_timeout":              "NEXUS_FUSION_TIMEOUT",
-	"routing.cascade_timeout":             "NEXUS_CASCADE_TIMEOUT",
-	"routing.arbiter_timeout":             "NEXUS_ARBITER_TIMEOUT",
-	"routing.slm_confidence_threshold":    "NEXUS_SLM_CONFIDENCE_THRESHOLD",
-	"routing.local_max_concurrent":        "NEXUS_LOCAL_MAX_CONCURRENT",
-	"routing.local_queue_timeout":         "NEXUS_LOCAL_QUEUE_TIMEOUT",
-	"health.poll_interval":                "NEXUS_HEALTH_POLL_INTERVAL",
-	"health.breaker_threshold":            "NEXUS_HEALTH_BREAKER_THRESHOLD",
-	"health.probe_timeout":                "NEXUS_HEALTH_PROBE_TIMEOUT",
-	"health.readiness_mode":               "NEXUS_READINESS_MODE",
-	"judge.url":                           "NEXUS_JUDGE_URL",
-	"judge.model":                         "NEXUS_JUDGE_MODEL",
-	"judge.api_key":                       "NEXUS_JUDGE_API_KEY",
-	"judge.sample_rate":                   "NEXUS_JUDGE_SAMPLE_RATE",
-	"judge.concurrency":                   "NEXUS_JUDGE_CONCURRENCY",
-	"judge.queue":                         "NEXUS_JUDGE_QUEUE",
-	"judge.timeout":                       "NEXUS_JUDGE_TIMEOUT",
-	"judge.cost_per_1k":                   "NEXUS_JUDGE_COST_PER_1K",
-	"telemetry.path":                      "NEXUS_TELEMETRY_PATH",
-	"metrics.db_path":                     "NEXUS_METRICS_DB",
-	"metrics.endpoint":                    "NEXUS_METRICS_ENDPOINT",
-	"quality.concurrency":                 "NEXUS_QUALITY_CONCURRENCY",
-	"quality.queue":                       "NEXUS_QUALITY_QUEUE",
-	"quality.timeout":                     "NEXUS_QUALITY_TIMEOUT",
-	"quality.stderr_cap":                  "NEXUS_QUALITY_STDERR_CAP",
-	"probe.interval":                      "NEXUS_PROBE_INTERVAL",
-	"probe.timeout":                       "NEXUS_PROBE_TIMEOUT",
-	"probe.bytes_per_token":               "NEXUS_PROBE_BYTES_PER_TOKEN",
-	"http.max_idle_conns":                 "NEXUS_HTTP_MAX_IDLE_CONNS",
-	"http.max_idle_conns_per_host":        "NEXUS_HTTP_MAX_IDLE_CONNS_PER_HOST",
-	"http.max_conns_per_host":             "NEXUS_HTTP_MAX_CONNS_PER_HOST",
-	"http.idle_conn_timeout":              "NEXUS_HTTP_IDLE_CONN_TIMEOUT",
-	"http.disable_keepalives":             "NEXUS_HTTP_DISABLE_KEEPALIVES",
-	"ratelimit.per_client_rpm":            "NEXUS_RATE_LIMIT_RPM",
-	"ratelimit.per_client_burst":          "NEXUS_RATE_LIMIT_BURST",
-	"ratelimit.global_rpm":                "NEXUS_GLOBAL_RATE_LIMIT_RPM",
-	"ratelimit.frontier_daily_budget_usd": "NEXUS_FRONTIER_DAILY_BUDGET_USD",
-	"tracing.endpoint":                    "NEXUS_TRACING_ENDPOINT",
-	"tracing.sample_rate":                 "NEXUS_TRACING_SAMPLE_RATE",
-	"tracing.timeout":                     "NEXUS_TRACING_TIMEOUT",
-	"tracing.queue":                       "NEXUS_TRACING_QUEUE",
+// DefaultRoutingConfidenceDBPath returns the canonical location for the
+// judge-guided adaptive routing store (issue #47):
+// $XDG_CACHE_HOME/nexus-proxy/routing_confidence.db. Operators override
+// with NEXUS_ROUTING_CONFIDENCE_DB (empty disables the store).
+func DefaultRoutingConfidenceDBPath() string {
+	base, err := os.UserCacheDir()
+	if err != nil || base == "" {
+		base = "./.cache"
+	}
+	return filepath.Join(base, "nexus-proxy", "routing_confidence.db")
 }
 
-// fileMapFromKeys translates the parsed section.key map into an
-// env-keyed map (only known keys are forwarded).
-func fileMapFromKeys(parsed map[string]string) map[string]string {
-	if parsed == nil {
-		return nil
+// DefaultRAGDBPath returns the canonical location for the persistent
+// RAG store (issue #46): $XDG_CACHE_HOME/nexus-proxy/rag.db. Operators
+// override with NEXUS_RAG_DB (empty disables the store, falling back
+// to the legacy in-memory-only path).
+func DefaultRAGDBPath() string {
+	base, err := os.UserCacheDir()
+	if err != nil || base == "" {
+		base = "./.cache"
 	}
-	out := make(map[string]string, len(parsed))
-	for k, v := range parsed {
-		if envKey, ok := configKeys[k]; ok {
-			out[envKey] = v
-		}
-	}
-	return out
+	return filepath.Join(base, "nexus-proxy", "rag.db")
 }
 
-// resolveConfigPath walks the precedence chain (flag > env > CWD) and
-// returns the path to load, or "" when no file is configured. It is
-// split out from Load so tests can assert the chain without spinning
-// up the full config struct.
-func resolveConfigPath() string {
-	if p := ConfigPathOverride(); p != "" {
-		return p
-	}
-	if p := os.Getenv("NEXUS_CONFIG"); p != "" {
-		return p
-	}
-	return DiscoverConfigFile()
-}
-
-// Load reads configuration from environment variables with layered
-// overrides from a YAML config file (issue #31). Resolution order:
-// env var > config file > built-in default. The config file is
-// resolved via the precedence chain:
-//
-//  1. SetConfigPathOverride (from main.go's --config flag)
-//  2. NEXUS_CONFIG env var
-//  3. nexus.yaml / nexus.yml / nexus.json in CWD
-//
-// A missing file is non-fatal — the boot falls back to env-only, which
-// matches the pre-issue-#31 behaviour exactly. A malformed file is
-// fatal so operators notice the typo during boot instead of silently
-// getting partial config.
+// Load reads configuration from environment variables, applying defaults
+// suitable for local development. It returns an error only when a required
+// value is malformed; missing optional values fall back to defaults.
 func Load() (Config, error) {
-	// 1. Resolve and load the config file (if any).
-	path := resolveConfigPath()
-	var fileMap map[string]string
-	if path != "" {
-		parsed, err := LoadFile(path)
-		if err != nil {
-			return Config{}, err
-		}
-		// LoadFile returns (nil, nil) for a missing file — graceful
-		// degradation per issue #31 AC. Only known keys are forwarded
-		// so unknown YAML entries never break boot.
-		fileMap = fileMapFromKeys(parsed)
-		if fileMap == nil {
-			path = ""
-		}
-	}
-
 	cfg := Config{
-		ConfigFile:      path,
-		Addr:            resolveString("NEXUS_ADDR", fileMap, ":8000"),
-		OllamaURL:       strings.TrimRight(resolveString("NEXUS_OLLAMA_URL", fileMap, "http://localhost:11434"), "/"),
-		RouterModel:     resolveString("NEXUS_ROUTER_MODEL", fileMap, "qwen3-coder:4b"),
-		LocalModel:      resolveString("NEXUS_LOCAL_MODEL", fileMap, "qwen3-coder:8b"),
-		EmbeddingModel:  resolveString("NEXUS_EMBEDDING_MODEL", fileMap, "nomic-embed-text"),
-		FrontierURL:     resolveString("NEXUS_FRONTIER_URL", fileMap, "https://api.openai.com/v1/chat/completions"),
-		FrontierModel:   resolveString("NEXUS_FRONTIER_MODEL", fileMap, "gpt-4o"),
-		FrontierKey:     resolveString("NEXUS_FRONTIER_API_KEY", fileMap, ""),
-		ZAIURL:          resolveString("NEXUS_ZAI_URL", fileMap, "https://api.z.ai/v1/chat/completions"),
-		ZAIModel:        resolveString("NEXUS_ZAI_MODEL", fileMap, "glm-4.6"),
-		ZAIKey:          resolveString("NEXUS_ZAI_API_KEY", fileMap, ""),
-		ExamplesDir:     resolveString("NEXUS_EXAMPLES_DIR", fileMap, "./few_shot_examples"),
-		MetaPrompt:      defaultMetaPrompt,
-		TOONNotice:      defaultTOONNotice,
-		TelemetryPath:   resolveAllowEmpty("NEXUS_TELEMETRY_PATH", fileMap, "./nexus-telemetry.jsonl"),
-		MetricsDBPath:   resolveAllowEmpty("NEXUS_METRICS_DB", fileMap, DefaultMetricsDBPath()),
-		MetricsEndpoint: resolveAllowEmpty("NEXUS_METRICS_ENDPOINT", fileMap, "/metrics"),
+		Addr:           getEnv("NEXUS_ADDR", ":8000"),
+		OllamaURL:      strings.TrimRight(getEnv("NEXUS_OLLAMA_URL", "http://localhost:11434"), "/"),
+		RouterModel:    getEnv("NEXUS_ROUTER_MODEL", "qwen3-coder:4b"),
+		LocalModel:     getEnv("NEXUS_LOCAL_MODEL", "qwen3-coder:8b"),
+		EmbeddingModel: getEnv("NEXUS_EMBEDDING_MODEL", "nomic-embed-text"),
+		FrontierURL:    getEnv("NEXUS_FRONTIER_URL", "https://api.openai.com/v1/chat/completions"),
+		FrontierModel:  getEnv("NEXUS_FRONTIER_MODEL", "gpt-4o"),
+		FrontierKey:    getEnv("NEXUS_FRONTIER_API_KEY", ""),
+		ZAIURL:         getEnv("NEXUS_ZAI_URL", "https://api.z.ai/v1/chat/completions"),
+		ZAIModel:       getEnv("NEXUS_ZAI_MODEL", "glm-4.6"),
+		ZAIKey:         getEnv("NEXUS_ZAI_API_KEY", ""),
+		ProxyAPIKey:    getEnv("NEXUS_PROXY_API_KEY", ""),
+		StatusPublic:   getEnvBool("NEXUS_STATUS_PUBLIC", false),
+		ExamplesDir:    getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
+		MetaPrompt:     defaultMetaPrompt,
+		TOONNotice:     defaultTOONNotice,
+		TelemetryPath:  getEnvAllowEmpty("NEXUS_TELEMETRY_PATH", "./nexus-telemetry.jsonl"),
+		MetricsDBPath:  getEnvAllowEmpty("NEXUS_METRICS_DB", DefaultMetricsDBPath()),
 	}
 
-	// Inbound proxy authentication (issue #37). NEXUS_PROXY_API_KEY is
-	// the single-key surface; NEXUS_PROXY_API_KEYS is a comma-separated
-	// list for zero-downtime key rotation. Both contribute to the
-	// accepted set. Secrets are read from env only (not the YAML file
-	// map) so a key never lands on disk — this matches the existing
-	// NEXUS_FRONTIER_API_KEY stance and the security intent of the
-	// issue. resolveString still consults fileMap but these keys are
-	// absent from configKeys, so fileMap never carries them.
-	cfg.ProxyAPIKey = resolveString("NEXUS_PROXY_API_KEY", nil, "")
-	cfg.ProxyAPIKeys = splitCSV(resolveString("NEXUS_PROXY_API_KEYS", nil, ""))
-	cfg.ProxyAuthEnabled = len(cfg.ProxyAuthKeys()) > 0
-
-	// TLS termination (issue #39). Paths are read from env only (not the
-	// YAML file map) so a cert/key path never lands on disk in a config
-	// file — same stance as the other secrets. TLSRedirect is a strict
-	// bool (truthy spellings: true | 1 | yes | on). When both cert and
-	// key are empty the proxy serves plain HTTP exactly as before.
-	cfg.TLSCertFile = resolveString("NEXUS_TLS_CERT", nil, "")
-	cfg.TLSKeyFile = resolveString("NEXUS_TLS_KEY", nil, "")
-	cfg.TLSRedirect = resolveBool("NEXUS_TLS_REDIRECT", nil, false)
-
-	threshold, err := resolveFloat("NEXUS_RAG_THRESHOLD", fileMap, 0.55)
+	threshold, err := getEnvFloat("NEXUS_RAG_THRESHOLD", 0.55)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.RAGThreshold = threshold
 
-	guardrail, err := resolveInt("NEXUS_TOKEN_GUARDRAIL", fileMap, 6000)
+	// RAG persistence (issue #46). The DB path defaults to the user
+	// cache dir so multiple checkouts don't trample each other.
+	// NEXUS_RAG_POLL_INTERVAL=0 disables the file watcher but leaves
+	// persistence on (boot still loads from disk).
+	cfg.RAGDBPath = getEnvAllowEmpty("NEXUS_RAG_DB", DefaultRAGDBPath())
+
+	pollInterval, err := getEnvDuration("NEXUS_RAG_POLL_INTERVAL", 30*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	if pollInterval < 0 {
+		pollInterval = 0
+	}
+	cfg.RAGPollInterval = pollInterval
+
+	// RAG embedding cache size (issue #115). Default 256 keeps the
+	// cache useful for repetitive coding prompts while bounding
+	// memory. Set to 0 to disable.
+	embedCacheSize, err := getEnvInt("NEXUS_RAG_EMBED_CACHE_SIZE", 256)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RAGEmbedCacheSize = embedCacheSize
+
+	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.TokenGuardrail = guardrail
 
-	slmTimeout, err := resolveDuration("NEXUS_SLM_TIMEOUT", fileMap, 8*time.Second)
+	slmTimeout, err := getEnvDuration("NEXUS_SLM_TIMEOUT", 8*time.Second)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.SLMTimeout = slmTimeout
 
-	fusionTimeout, err := resolveDuration("NEXUS_FUSION_TIMEOUT", fileMap, 120*time.Second)
+	fusionTimeout, err := getEnvDuration("NEXUS_FUSION_TIMEOUT", 120*time.Second)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.FusionTimeout = fusionTimeout
 
-	cascadeTimeout, err := resolveDuration("NEXUS_CASCADE_TIMEOUT", fileMap, 30*time.Second)
+	cascadeTimeout, err := getEnvDuration("NEXUS_CASCADE_TIMEOUT", 30*time.Second)
 	if err != nil {
 		return cfg, err
 	}
@@ -514,63 +445,124 @@ func Load() (Config, error) {
 	// Fusion arbiter synthesis (issue #12). Shorter than FusionTimeout
 	// because the arbiter is doing synthesis, not generation — a slow
 	// arbiter should not pin the whole request indefinitely.
-	arbiterTimeout, err := resolveDuration("NEXUS_ARBITER_TIMEOUT", fileMap, 60*time.Second)
+	arbiterTimeout, err := getEnvDuration("NEXUS_ARBITER_TIMEOUT", 60*time.Second)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.ArbiterTimeout = arbiterTimeout
 
-	// SLM confidence threshold (issue #44). Clamp into [0, 1]
-	// before storing so a typo (negative / overshoot) cannot
-	// produce a nonsense escalation rule. Zero is the documented
-	// "disabled" sentinel — the handler treats threshold<=0 as a
-	// complete no-op so the pre-issue-#44 behaviour survives
-	// untouched for operators who never set the env var.
-	slmThreshold, err := resolveFloat("NEXUS_SLM_CONFIDENCE_THRESHOLD", fileMap, 0)
+	// Frontier provider selector (issue #45). Look-back window,
+	// observation floor, and cache cadence. Defaults match the
+	// router.DefaultSelector* constants; operators can shorten
+	// SelectorWindow during development to see fresh picks.
+	selectorWindow, err := getEnvDuration("NEXUS_SELECTOR_WINDOW", time.Hour)
 	if err != nil {
 		return cfg, err
 	}
-	if slmThreshold < 0 {
-		slmThreshold = 0
+	if selectorWindow < 0 {
+		selectorWindow = 0
 	}
-	if slmThreshold > 1 {
-		slmThreshold = 1
-	}
-	cfg.SLMConfidenceThreshold = slmThreshold
+	cfg.SelectorWindow = selectorWindow
 
-	// VRAM-aware concurrency gate (issue #35). The chat handler
-	// holds a slot for the lifetime of any RouteLocal request
-	// (and the local panel member of RouteFusion) so concurrent
-	// coding agents cannot collectively OOM Ollama. The queue
-	// timeout is how long a request is willing to wait for a
-	// slot before the handler fast-promotes to frontier and
-	// stamps X-Nexus-Overflow: true. Both values default to
-	// safe operator-friendly numbers; setting
-	// NEXUS_LOCAL_MAX_CONCURRENT=0 disables the gate entirely
-	// (the handler treats it as unlimited).
-	localMax, err := resolveInt("NEXUS_LOCAL_MAX_CONCURRENT", fileMap, 2)
+	selectorMin, err := getEnvInt("NEXUS_SELECTOR_MIN_SAMPLES", 5)
 	if err != nil {
 		return cfg, err
 	}
-	if localMax < 0 {
-		// Negative is a config typo; clamp to disabled rather
-		// than panic at boot. Operators who want "unlimited"
-		// should set 0 explicitly per the issue spec.
-		localMax = 0
+	if selectorMin < 0 {
+		selectorMin = 0
 	}
-	cfg.LocalMaxConcurrent = localMax
+	cfg.SelectorMinSamples = selectorMin
 
-	localQueue, err := resolveDuration("NEXUS_LOCAL_QUEUE_TIMEOUT", fileMap, 5*time.Second)
+	selectorRefresh, err := getEnvDuration("NEXUS_SELECTOR_REFRESH", 60*time.Second)
 	if err != nil {
 		return cfg, err
 	}
-	if localQueue < 0 {
-		// Negative queue timeout is meaningless; fold into the
-		// "try once and give up" semantics so a bad value at
-		// least still rejects on overflow.
-		localQueue = 0
+	if selectorRefresh < 0 {
+		selectorRefresh = 0
 	}
-	cfg.LocalQueueTimeout = localQueue
+	cfg.SelectorRefreshInterval = selectorRefresh
+
+	// Per-provider cost rates. Defaults approximate OpenAI gpt-4o
+	// (~$5/M input tokens) and z.ai glm-4.6 (~$2/M). The chat
+	// handler passes these through to BuildFrontierProviders so the
+	// selector has a deterministic cost weight even before the
+	// metrics store has observed any traffic.
+	frontierCost, err := getEnvFloat("NEXUS_FRONTIER_COST_PER_1K", 0.005)
+	if err != nil {
+		return cfg, err
+	}
+	if frontierCost < 0 {
+		frontierCost = 0
+	}
+	cfg.FrontierCostPer1K = frontierCost
+
+	zaiCost, err := getEnvFloat("NEXUS_ZAI_COST_PER_1K", 0.002)
+	if err != nil {
+		return cfg, err
+	}
+	if zaiCost < 0 {
+		zaiCost = 0
+	}
+	cfg.ZAICostPer1K = zaiCost
+
+	// Cost-avoidance baseline (issue #73). Provider and model
+	// default to the configured frontier values so a stock
+	// deployment gets cost-avoidance tracking without extra config.
+	// The rate defaults to FrontierCostPer1K so the baseline stays
+	// consistent with the actual frontier pricing.
+	cfg.CostBaselineProvider = getEnv("NEXUS_COST_BASELINE_PROVIDER", "frontier")
+	cfg.CostBaselineModel = getEnv("NEXUS_COST_BASELINE_MODEL", cfg.FrontierModel)
+	baselineRate, err := getEnvFloat("NEXUS_COST_BASELINE_RATE_PER_1K", cfg.FrontierCostPer1K)
+	if err != nil {
+		return cfg, err
+	}
+	if baselineRate < 0 {
+		baselineRate = 0
+	}
+	cfg.CostBaselineRatePer1K = baselineRate
+
+	// Fusion progressive delivery (issue #48). Defaults to ON so a
+	// stock `.env.example` boots into the new behaviour; operators
+	// who want to opt out (e.g. to A/B test against the old
+	// blocking Panel) set NEXUS_FUSION_PROGRESSIVE=false. An empty
+	// or unparseable value falls back to the default rather than
+	// failing boot, since the knob is purely an optimisation.
+	cfg.FusionProgressiveDelivery = parseBoolEnv("NEXUS_FUSION_PROGRESSIVE", true)
+	agreementThreshold, err := getEnvFloat("NEXUS_FUSION_AGREEMENT_THRESHOLD", 0.85)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.FusionAgreementThreshold = agreementThreshold
+
+	// Judge-guided adaptive routing (issue #47). Defaults keep the
+	// feature dormant unless the judge is enabled and a DB path is
+	// configured. The DB defaults to a sibling of the metrics DB so a
+	// stock deployment gets both without extra config.
+	cfg.RoutingConfidenceDB = getEnvAllowEmpty("NEXUS_ROUTING_CONFIDENCE_DB", DefaultRoutingConfidenceDBPath())
+
+	confFloor, err := getEnvFloat("NEXUS_ROUTING_CONFIDENCE_FLOOR", 0.4)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RoutingConfidenceFloor = confFloor
+
+	confCeiling, err := getEnvFloat("NEXUS_ROUTING_CONFIDENCE_CEILING", 0.85)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RoutingConfidenceCeiling = confCeiling
+
+	confMinSamples, err := getEnvInt("NEXUS_ROUTING_CONFIDENCE_MIN_SAMPLES", 5)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RoutingConfidenceMinSamples = confMinSamples
+
+	confWindow, err := getEnvDuration("NEXUS_ROUTING_CONFIDENCE_WINDOW", 168*time.Hour)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RoutingConfidenceWindow = confWindow
 
 	// Ollama health poller (issue #8). Defaults: 30s poll cadence,
 	// 3-failure breaker, 5s per-probe HTTP timeout. Set
@@ -578,29 +570,23 @@ func Load() (Config, error) {
 	// the chat handler then behaves as if Ollama is always healthy
 	// (i.e. it will still try the local route on every request and
 	// pay the upstream timeout if Ollama is down).
-	healthPoll, err := resolveDuration("NEXUS_HEALTH_POLL_INTERVAL", fileMap, 30*time.Second)
+	healthPoll, err := getEnvDuration("NEXUS_HEALTH_POLL_INTERVAL", 30*time.Second)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.HealthPollInterval = healthPoll
 
-	healthBreaker, err := resolveInt("NEXUS_HEALTH_BREAKER_THRESHOLD", fileMap, 3)
+	healthBreaker, err := getEnvInt("NEXUS_HEALTH_BREAKER_THRESHOLD", 3)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.HealthBreakerThreshold = healthBreaker
 
-	healthProbe, err := resolveDuration("NEXUS_HEALTH_PROBE_TIMEOUT", fileMap, 5*time.Second)
+	healthProbe, err := getEnvDuration("NEXUS_HEALTH_PROBE_TIMEOUT", 5*time.Second)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.HealthProbeTimeout = healthProbe
-
-	// Readiness mode for /readyz (issue #42). Canonicalised on
-	// read by handlers.NormalizeReadinessMode — unknown values fall
-	// back to "degraded" so a typo never flips the pod into a more
-	// aggressive eviction policy.
-	cfg.ReadinessMode = resolveString("NEXUS_READINESS_MODE", fileMap, ReadinessModeDegraded)
 
 	// Hardware-aware VRAM probe (issue #6). Defaults: 60s poll,
 	// 5s per-probe timeout, 256 KiB per token heuristic (which
@@ -609,19 +595,19 @@ func Load() (Config, error) {
 	// entirely; the boot probe still runs synchronously once. When
 	// the probe is disabled or returns zero (Ollama down + no AMD
 	// sysfs), the chat handler falls back to TokenGuardrail.
-	probeInterval, err := resolveDuration("NEXUS_PROBE_INTERVAL", fileMap, 60*time.Second)
+	probeInterval, err := getEnvDuration("NEXUS_PROBE_INTERVAL", 60*time.Second)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.ProbePollInterval = probeInterval
 
-	probeTimeout, err := resolveDuration("NEXUS_PROBE_TIMEOUT", fileMap, 5*time.Second)
+	probeTimeout, err := getEnvDuration("NEXUS_PROBE_TIMEOUT", 5*time.Second)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.ProbeTimeout = probeTimeout
 
-	probeBytes, err := resolveInt("NEXUS_PROBE_BYTES_PER_TOKEN", fileMap, 256*1024)
+	probeBytes, err := getEnvInt("NEXUS_PROBE_BYTES_PER_TOKEN", 256*1024)
 	if err != nil {
 		return cfg, err
 	}
@@ -631,102 +617,155 @@ func Load() (Config, error) {
 	cfg.ProbeBytesPerToken = probeBytes
 	cfg.ProbeEnabled = cfg.ProbePollInterval > 0
 
-	// HTTP connection-pool tuning (issue #34). Defaults sized for a
-	// multi-agent local-dev workload — chat handler + SLM + RAG +
-	// judge all hitting the same Ollama host. The stdlib default of
-	// MaxIdleConnsPerHost=2 is the very issue this fixes.
-	httpMaxIdle, err := resolveInt("NEXUS_HTTP_MAX_IDLE_CONNS", fileMap, 100)
+	// Local-route concurrency ceiling (issue #81). The limiter is
+	// dormant unless the operator sets NEXUS_LOCAL_MAX_CONCURRENT
+	// above zero, so a stock deployment is byte-for-byte identical to
+	// the pre-#81 unlimited path. When enabled, the effective slot
+	// count is min(ceiling, freeVRAM/bytesPerSlot) recomputed on every
+	// acquire from the latest probe snapshot; when the probe is
+	// unavailable the full ceiling is used.
+	localMax, err := getEnvInt("NEXUS_LOCAL_MAX_CONCURRENT", 0)
 	if err != nil {
 		return cfg, err
 	}
-	if httpMaxIdle < 0 {
-		httpMaxIdle = 0
+	if localMax < 0 {
+		localMax = 0
 	}
-	cfg.HTTPMaxIdleConns = httpMaxIdle
+	cfg.LocalMaxConcurrent = localMax
 
-	httpMaxIdlePerHost, err := resolveInt("NEXUS_HTTP_MAX_IDLE_CONNS_PER_HOST", fileMap, 16)
+	localSlotBytes, err := getEnvInt("NEXUS_LOCAL_VRAM_BYTES_PER_SLOT", int(DefaultLocalVRAMBytesPerSlot))
 	if err != nil {
 		return cfg, err
 	}
-	if httpMaxIdlePerHost < 0 {
-		httpMaxIdlePerHost = 0
+	if localSlotBytes < 0 {
+		localSlotBytes = int(DefaultLocalVRAMBytesPerSlot)
 	}
-	cfg.HTTPMaxIdleConnsPerHost = httpMaxIdlePerHost
+	cfg.LocalVRAMBytesPerSlot = int64(localSlotBytes)
 
-	// MaxConnsPerHost=0 is a valid value (== unlimited), so we don't
-	// clamp negatives the way we do for the idle counters above.
-	httpMaxPerHost, err := resolveInt("NEXUS_HTTP_MAX_CONNS_PER_HOST", fileMap, 0)
+	// Local-route cooldown (issue #80). Arms a short cooldown after
+	// the cascade detects a local failure so subsequent requests skip
+	// local and go directly to the fallback route. Default 10s; zero
+	// disables the circuit (pre-#80 behaviour).
+	localCooldown, err := getEnvDuration("NEXUS_LOCAL_COOLDOWN", 10*time.Second)
 	if err != nil {
 		return cfg, err
 	}
-	if httpMaxPerHost < 0 {
-		httpMaxPerHost = 0
+	if localCooldown < 0 {
+		localCooldown = 0
 	}
-	cfg.HTTPMaxConnsPerHost = httpMaxPerHost
-
-	httpIdleTimeout, err := resolveDuration("NEXUS_HTTP_IDLE_CONN_TIMEOUT", fileMap, 90*time.Second)
-	if err != nil {
-		return cfg, err
-	}
-	if httpIdleTimeout < 0 {
-		httpIdleTimeout = 0
-	}
-	cfg.HTTPIdleConnTimeout = httpIdleTimeout
-
-	// Keep-alive toggle. Treated as a strict boolean to match the
-	// rest of the config surface: "true" | "1" | "yes" | "on" => true
-	// (case-insensitive); anything else => false. Empty stays at the
-	// built-in default (false). We deliberately do not parse ints
-	// here so operators do not have to memorise a "0 == off, 1 == on"
-	// quirk that no other env var in this file uses.
-	cfg.HTTPDisableKeepAlives = resolveBool("NEXUS_HTTP_DISABLE_KEEPALIVES", fileMap, false)
+	cfg.LocalCooldown = localCooldown
 
 	// Hard request-body cap (issue #11). Default 1 MiB matches typical
 	// OpenAI-compatible request sizes; the chat handler wraps r.Body
 	// with http.MaxBytesReader so an oversized POST is rejected with
 	// 413 before any allocation happens.
-	maxBodyBytes, err := resolveInt("NEXUS_MAX_BODY_BYTES", fileMap, DefaultMaxBodyBytes)
+	maxBodyBytes, err := getEnvInt("NEXUS_MAX_BODY_BYTES", DefaultMaxBodyBytes)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.MaxBodyBytes = maxBodyBytes
 
+	// HTTP listener timeouts and header cap (issue #77). These bound
+	// the inbound connection independently of the outbound transport
+	// knobs (NEXUS_HTTP_*). WriteTimeout defaults to 0 (disabled) so
+	// SSE streaming responses are never killed mid-stream. Negative
+	// durations and negative header sizes are rejected so a typo in
+	// .env fails fast at boot rather than silently disabling a guard.
+	readTimeout, err := getEnvDuration("NEXUS_SERVER_READ_TIMEOUT", DefaultServerReadTimeout)
+	if err != nil {
+		return cfg, err
+	}
+	if readTimeout < 0 {
+		return cfg, fmt.Errorf("config: NEXUS_SERVER_READ_TIMEOUT must not be negative, got %s", readTimeout)
+	}
+	cfg.ReadTimeout = readTimeout
+
+	writeTimeout, err := getEnvDuration("NEXUS_SERVER_WRITE_TIMEOUT", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if writeTimeout < 0 {
+		return cfg, fmt.Errorf("config: NEXUS_SERVER_WRITE_TIMEOUT must not be negative, got %s", writeTimeout)
+	}
+	cfg.WriteTimeout = writeTimeout
+
+	idleTimeout, err := getEnvDuration("NEXUS_SERVER_IDLE_TIMEOUT", DefaultServerIdleTimeout)
+	if err != nil {
+		return cfg, err
+	}
+	if idleTimeout < 0 {
+		return cfg, fmt.Errorf("config: NEXUS_SERVER_IDLE_TIMEOUT must not be negative, got %s", idleTimeout)
+	}
+	cfg.IdleTimeout = idleTimeout
+
+	maxHeader, err := getEnvInt("NEXUS_SERVER_MAX_HEADER_BYTES", DefaultServerMaxHeaderBytes)
+	if err != nil {
+		return cfg, err
+	}
+	if maxHeader < 0 {
+		return cfg, fmt.Errorf("config: NEXUS_SERVER_MAX_HEADER_BYTES must not be negative, got %d", maxHeader)
+	}
+	cfg.MaxHeaderBytes = maxHeader
+
+	// Graceful shutdown drain window (issue #121). Replaces the prior
+	// hardcoded `const shutdownTimeout = 10 * time.Second` in main.go
+	// so operators can tune the SIGTERM drain to match their longest
+	// legitimate streaming response (frontier SSE can run 120s+). A
+	// stock K8s deployment should set this just below its pod's
+	// terminationGracePeriodSeconds. Zero is treated as "use the
+	// default" (not "no drain") so a misconfigured .env cannot disable
+	// the drain and leak in-flight requests. Negative is rejected so a
+	// typo fails fast at boot. The boot-time warning when the drain is
+	// shorter than ReadTimeout is emitted in main.go (the logger is
+	// not yet wired here).
+	shutdownTimeout, err := getEnvDuration("NEXUS_SHUTDOWN_TIMEOUT", DefaultShutdownTimeout)
+	if err != nil {
+		return cfg, err
+	}
+	if shutdownTimeout < 0 {
+		return cfg, fmt.Errorf("config: NEXUS_SHUTDOWN_TIMEOUT must not be negative, got %s", shutdownTimeout)
+	}
+	if shutdownTimeout == 0 {
+		shutdownTimeout = DefaultShutdownTimeout
+	}
+	cfg.ShutdownTimeout = shutdownTimeout
+
 	// Judge (issue #15). Defaults: z.ai-style endpoint, sample 10% of
 	// local-route successes, 2 concurrent workers, 30s per call. When
 	// JudgeURL is unset we fall back to NEXUS_FRONTIER_URL so a stock
 	// config still works.
-	cfg.JudgeURL = resolveString("NEXUS_JUDGE_URL", fileMap, "https://api.z.ai/v1/chat/completions")
-	if !isConfigSourceSet("NEXUS_JUDGE_URL", fileMap) {
+	cfg.JudgeURL = getEnv("NEXUS_JUDGE_URL", "https://api.z.ai/v1/chat/completions")
+	if v := os.Getenv("NEXUS_JUDGE_URL"); v == "" {
 		cfg.JudgeURL = cfg.FrontierURL
 	}
-	cfg.JudgeModel = resolveString("NEXUS_JUDGE_MODEL", fileMap, cfg.FrontierModel)
-	cfg.JudgeAPIKey = resolveString("NEXUS_JUDGE_API_KEY", fileMap, cfg.FrontierKey)
+	cfg.JudgeModel = getEnv("NEXUS_JUDGE_MODEL", cfg.FrontierModel)
+	cfg.JudgeAPIKey = getEnv("NEXUS_JUDGE_API_KEY", cfg.FrontierKey)
 
-	sampleRate, err := resolveFloat("NEXUS_JUDGE_SAMPLE_RATE", fileMap, 0.1)
+	sampleRate, err := getEnvFloat("NEXUS_JUDGE_SAMPLE_RATE", 0.1)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.JudgeSampleRate = sampleRate
 
-	concurrency, err := resolveInt("NEXUS_JUDGE_CONCURRENCY", fileMap, 2)
+	concurrency, err := getEnvInt("NEXUS_JUDGE_CONCURRENCY", 2)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.JudgeConcurrency = concurrency
 
-	queueDepth, err := resolveInt("NEXUS_JUDGE_QUEUE", fileMap, 64)
+	queueDepth, err := getEnvInt("NEXUS_JUDGE_QUEUE", 64)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.JudgeQueueDepth = queueDepth
 
-	judgeTimeout, err := resolveDuration("NEXUS_JUDGE_TIMEOUT", fileMap, 30*time.Second)
+	judgeTimeout, err := getEnvDuration("NEXUS_JUDGE_TIMEOUT", 30*time.Second)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.JudgeTimeout = judgeTimeout
 
-	costRate, err := resolveFloat("NEXUS_JUDGE_COST_PER_1K", fileMap, 0.002)
+	costRate, err := getEnvFloat("NEXUS_JUDGE_COST_PER_1K", 0.002)
 	if err != nil {
 		return cfg, err
 	}
@@ -742,25 +781,25 @@ func Load() (Config, error) {
 	// QualityConcurrency is non-positive; the chat handler treats a
 	// nil observer as "no-op", so the hot path is unaffected by an
 	// unconfigured quality pipeline (same pattern as the judge).
-	qualityConcurrency, err := resolveInt("NEXUS_QUALITY_CONCURRENCY", fileMap, 2)
+	qualityConcurrency, err := getEnvInt("NEXUS_QUALITY_CONCURRENCY", 2)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.QualityConcurrency = qualityConcurrency
 
-	qualityQueueDepth, err := resolveInt("NEXUS_QUALITY_QUEUE", fileMap, 64)
+	qualityQueueDepth, err := getEnvInt("NEXUS_QUALITY_QUEUE", 64)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.QualityQueueDepth = qualityQueueDepth
 
-	qualityTimeout, err := resolveDuration("NEXUS_QUALITY_TIMEOUT", fileMap, 60*time.Second)
+	qualityTimeout, err := getEnvDuration("NEXUS_QUALITY_TIMEOUT", 60*time.Second)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.QualityTimeout = qualityTimeout
 
-	stderrCap, err := resolveInt("NEXUS_QUALITY_STDERR_CAP", fileMap, 2*1024)
+	stderrCap, err := getEnvInt("NEXUS_QUALITY_STDERR_CAP", 2*1024)
 	if err != nil {
 		return cfg, err
 	}
@@ -768,242 +807,161 @@ func Load() (Config, error) {
 
 	cfg.QualityEnabled = cfg.QualityConcurrency > 0
 
-	// Rate limiting + daily frontier budget (issue #38). All four
-	// values default to zero (disabled). When RateLimitRPM > 0 the
-	// proxy enforces a per-client-IP token bucket; when
-	// GlobalRateLimitRPM > 0 the proxy enforces an aggregate bucket
-	// checked before the per-client bucket. FrontierDailyBudgetUSD
-	// gates only RouteFrontier (local routing is never budget-blocked).
-	rateRPM, err := resolveInt("NEXUS_RATE_LIMIT_RPM", fileMap, 0)
-	if err != nil {
-		return cfg, err
-	}
-	cfg.RateLimitRPM = rateRPM
-
-	rateBurst, err := resolveInt("NEXUS_RATE_LIMIT_BURST", fileMap, 0)
-	if err != nil {
-		return cfg, err
-	}
-	cfg.RateLimitBurst = rateBurst
-
-	globalRPM, err := resolveInt("NEXUS_GLOBAL_RATE_LIMIT_RPM", fileMap, 0)
-	if err != nil {
-		return cfg, err
-	}
-	cfg.GlobalRateLimitRPM = globalRPM
-
-	dailyBudget, err := resolveFloat("NEXUS_FRONTIER_DAILY_BUDGET_USD", fileMap, 0)
-	if err != nil {
-		return cfg, err
-	}
-	cfg.FrontierDailyBudgetUSD = dailyBudget
-
 	// Structured logging (issue #3). Defaults match the production
 	// expectation: JSON to stderr at info level. Operators flip on
 	// debug by setting NEXUS_LOG_LEVEL=debug, and switch to a
 	// human-friendly text handler with NEXUS_LOG_FORMAT=text.
-	cfg.LogLevel = parseLogLevel(resolveString("NEXUS_LOG_LEVEL", fileMap, ""))
-	cfg.LogFormat = parseLogFormat(resolveString("NEXUS_LOG_FORMAT", fileMap, ""))
+	cfg.LogLevel = parseLogLevel(os.Getenv("NEXUS_LOG_LEVEL"))
+	cfg.LogFormat = parseLogFormat(os.Getenv("NEXUS_LOG_FORMAT"))
 
-	// Distributed tracing (issue #41). All four vars default to
-	// "disabled" — the exporter only starts when the operator
-	// explicitly sets NEXUS_TRACING_ENDPOINT. Sample rate defaults
-	// to 0 (off); the timeout and queue have sane operator-friendly
-	// defaults that match the spec.
-	cfg.TracingEndpoint = resolveAllowEmpty("NEXUS_TRACING_ENDPOINT", fileMap, "")
-
-	tracingRate, err := resolveFloat("NEXUS_TRACING_SAMPLE_RATE", fileMap, 0)
+	// Debug tracing (issue #33). Off by default so production has
+	// zero overhead. Body preview is bounded by NEXUS_DEBUG_BODY_BYTES
+	// (default DefaultDebugBodyBytes = 512); zero or negative falls
+	// back to the default.
+	cfg.Debug = parseBoolEnv("NEXUS_DEBUG", false)
+	debugBodyBytes, err := getEnvInt("NEXUS_DEBUG_BODY_BYTES", DefaultDebugBodyBytes)
 	if err != nil {
 		return cfg, err
 	}
-	if tracingRate < 0 {
-		tracingRate = 0
-	}
-	if tracingRate > 1 {
-		tracingRate = 1
-	}
-	cfg.TracingSampleRate = tracingRate
+	cfg.DebugBodyBytes = debugBodyBytes
 
-	tracingTimeout, err := resolveDuration("NEXUS_TRACING_TIMEOUT", fileMap, 10*time.Second)
+	// OpenAI-compatible model discovery (issue #78). Enabled by
+	// default so a stock deployment is discoverable by OpenAI-
+	// compatible clients; operators who do not want the proxy to
+	// advertise its model list set NEXUS_MODELS_ENDPOINT=false.
+	cfg.ModelsEndpointEnabled = parseBoolEnv("NEXUS_MODELS_ENDPOINT", true)
+
+	modelsCacheTTL, err := getEnvDuration("NEXUS_MODELS_CACHE_TTL", 5*time.Minute)
 	if err != nil {
 		return cfg, err
 	}
-	if tracingTimeout <= 0 {
-		tracingTimeout = 10 * time.Second
-	}
-	cfg.TracingTimeout = tracingTimeout
+	cfg.ModelsCacheTTL = modelsCacheTTL
 
-	tracingQueue, err := resolveInt("NEXUS_TRACING_QUEUE", fileMap, 256)
+	// Prompt-injection hardening (issue #76). Defaults to off so a
+	// stock deployment boots with byte-for-byte legacy behaviour.
+	// Operators opt into warn (log only) or strict (reject 400) by
+	// setting NEXUS_PROMPT_INJECTION_MODE. Unknown values fall back
+	// to off rather than failing boot.
+	cfg.PromptInjectionMode = middleware.ParseInjectionMode(
+		os.Getenv("NEXUS_PROMPT_INJECTION_MODE"),
+	)
+	// Trusted-proxy enforcement + rate limiting (issue #75).
+	//
+	// NEXUS_TRUSTED_PROXIES is a comma-separated CIDR list. Empty
+	// (the default) means "trust nobody": the direct peer IP is used
+	// and X-Forwarded-For / X-Real-IP are ignored, so an attacker who
+	// reaches the proxy directly cannot spoof per-client rate-limit
+	// buckets. Operators running Nexus behind nginx / a cloud load
+	// balancer set this to the proxy's CIDR so forwarded headers are
+	// honoured only from the real reverse proxy.
+	//
+	// Invalid CIDRs fail boot with a clear error — silently falling
+	// back to "trust nobody" would mask a misconfiguration that
+	// accidentally disables XFF honouiring for a legit deployment.
+	cfg.TrustedProxiesRaw = strings.TrimSpace(os.Getenv("NEXUS_TRUSTED_PROXIES"))
+	parsed, err := parseTrustedProxies(cfg.TrustedProxiesRaw)
 	if err != nil {
 		return cfg, err
 	}
-	if tracingQueue <= 0 {
-		tracingQueue = 256
-	}
-	cfg.TracingQueueSize = tracingQueue
+	cfg.TrustedProxies = parsed
 
-	// Provider registry (issue #43). LoadFromEnv reads
-	// NEXUS_PROVIDERS + per-provider env vars; when NEXUS_PROVIDERS
-	// is unset it returns an empty registry and we fall back to a
-	// synthetic registry built from the legacy NEXUS_FRONTIER_* /
-	// NEXUS_ZAI_* vars that the rest of Load() already resolved.
-	// The synthetic fallback preserves the pre-#43 boot sequence
-	// exactly: a stock .env.example with no NEXUS_PROVIDERS still
-	// produces a working cascade with frontier as primary and z.ai
-	// as second fallback.
-	registry, err := providers.LoadFromEnv()
+	// Per-client rate ceiling (requests/minute). Zero or negative
+	// disables the limiter entirely so a stock deployment is
+	// byte-for-byte identical to the pre-#75 path. Burst is the
+	// token-bucket capacity; <=0 falls back to RPM in the limiter.
+	rateRPM, err := getEnvInt("NEXUS_RATE_LIMIT_RPM", 0)
 	if err != nil {
 		return cfg, err
 	}
-	if registry.Len() == 0 {
-		// Backward-compat synthesis (issue #43 AC: "existing
-		// .env.example boots unchanged"). Skip providers whose
-		// API key is empty so the cascade does not include
-		// unconfigured fallbacks, but always surface a registry
-		// entry for the frontier slot so the chat handler can
-		// resolve a default model/URL when the operator supplies
-		// just a key.
-		legacy := make([]providers.Provider, 0, 2)
-		legacy = append(legacy, providers.Provider{
-			Name:     "frontier",
-			URL:      cfg.FrontierURL,
-			Model:    cfg.FrontierModel,
-			APIKey:   cfg.FrontierKey,
-			Priority: 0,
-		})
-		if cfg.ZAIURL != "" && cfg.ZAIKey != "" {
-			legacy = append(legacy, providers.Provider{
-				Name:     "zai",
-				URL:      cfg.ZAIURL,
-				Model:    cfg.ZAIModel,
-				APIKey:   cfg.ZAIKey,
-				Priority: 1,
-			})
-		}
-		registry = providers.NewRegistry(legacy)
-	} else {
-		// NEXUS_PROVIDERS is set: the registry is canonical. Sync
-		// the legacy Config.FrontierURL/Model/Key fields from the
-		// first provider so any caller still reading them (boot
-		// logs, status pages, /readyz) sees the operator's chosen
-		// endpoint instead of the openai default. NEXUS_ZAI_* is
-		// intentionally NOT synced because the registry may
-		// contain a provider called something other than "zai"
-		// (anthropic, gemini, ...).
-		if frontiers := registry.FrontierProviders(); len(frontiers) > 0 {
-			first := frontiers[0]
-			cfg.FrontierURL = first.URL
-			cfg.FrontierModel = first.Model
-			cfg.FrontierKey = first.APIKey
-		}
+	if rateRPM < 0 {
+		rateRPM = 0
 	}
-	cfg.Providers = registry
+	cfg.RateLimitRPM = rateRPM
+
+	rateBurst, err := getEnvInt("NEXUS_RATE_LIMIT_BURST", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if rateBurst < 0 {
+		rateBurst = 0
+	}
+	cfg.RateLimitBurst = rateBurst
 
 	return cfg, nil
 }
-
-// TracingEnabled reports whether the OTLP/JSON exporter should
-// start. Returns false when TracingEndpoint is empty (the spec
-// contract: an unset endpoint keeps the binary entirely trace-free).
-func (c Config) TracingEnabled() bool { return c.TracingEndpoint != "" }
 
 // FrontierEnabled reports whether a frontier API key is configured. The proxy
 // still runs without one (fusion will degrade to local-only), but frontier
 // routing will return 401s if attempted.
 func (c Config) FrontierEnabled() bool { return c.FrontierKey != "" }
 
-// TLSActive reports whether TLS termination is configured — i.e. both
-// TLSCertFile and TLSKeyFile are non-empty. Used by main.go to branch
-// between ListenAndServeTLS and ListenAndServe, and by the
-// security-headers middleware to decide whether to emit
-// Strict-Transport-Security. A single set value (cert without key, or
-// vice-versa) is treated as inactive so a half-configured deploy keeps
-// serving plaintext rather than failing to boot on a missing file.
-func (c Config) TLSActive() bool {
-	return c.TLSCertFile != "" && c.TLSKeyFile != ""
+// FrontierProvider describes one configured frontier endpoint. The
+// chat handler consults FrontierProviders when route=frontier is
+// selected; when more than one provider is configured, the handler
+// also consults a router.ProviderSelector (issue #45) to pick the
+// cheaper / faster endpoint based on observed metrics.
+type FrontierProvider struct {
+	Name         string  // "frontier" or "zai"
+	URL          string  // upstream endpoint
+	Model        string  // OpenAI-compatible model name
+	APIKey       string  // bearer token (empty for the local endpoint)
+	CostPer1KUSD float64 // USD per 1k input tokens (selector weight)
 }
 
-// ProxyAuthKeys returns the combined, de-duplicated, non-empty set of
-// accepted inbound API keys (NEXUS_PROXY_API_KEY plus the entries of
-// NEXUS_PROXY_API_KEYS). Returns nil when authentication is disabled,
-// so cmd/nexus can pass the slice straight to auth.Middleware (which
-// is a no-op for an empty slice). De-duplication is order-preserving
-// so the single-key stays first, matching operator intuition.
-func (c Config) ProxyAuthKeys() []string {
-	seen := make(map[string]struct{})
-	var out []string
-	for _, k := range append([]string{c.ProxyAPIKey}, c.ProxyAPIKeys...) {
-		if k = strings.TrimSpace(k); k == "" {
-			continue
-		}
-		if _, dup := seen[k]; dup {
-			continue
-		}
-		seen[k] = struct{}{}
-		out = append(out, k)
+// FrontierProviders returns the configured frontier endpoints in
+// declaration order (frontier first, z.ai second — same order as the
+// existing cascade). Providers with an empty APIKey are omitted so a
+// half-configured deployment cannot accidentally proxy requests to an
+// unauthenticated endpoint. CostPer1KUSD is sourced from
+// FrontierCostPer1K / ZAICostPer1K so the selector has a deterministic
+// cost weight even before the metrics store has observed traffic.
+func (c Config) FrontierProviders() []FrontierProvider {
+	out := make([]FrontierProvider, 0, 2)
+	if c.FrontierKey != "" {
+		out = append(out, FrontierProvider{
+			Name:         "frontier",
+			URL:          c.FrontierURL,
+			Model:        c.FrontierModel,
+			APIKey:       c.FrontierKey,
+			CostPer1KUSD: c.FrontierCostPer1K,
+		})
+	}
+	if c.ZAIKey != "" {
+		out = append(out, FrontierProvider{
+			Name:         "zai",
+			URL:          c.ZAIURL,
+			Model:        c.ZAIModel,
+			APIKey:       c.ZAIKey,
+			CostPer1KUSD: c.ZAICostPer1K,
+		})
 	}
 	return out
 }
 
-// splitCSV splits a comma-separated string into trimmed, non-empty
-// fields. Used for NEXUS_PROXY_API_KEYS so operators can configure key
-// rotation without a YAML array. Returns nil for an empty/blank input
-// (which leaves ProxyAPIKeys nil and thus disables auth).
-func splitCSV(raw string) []string {
-	if strings.TrimSpace(raw) == "" {
-		return nil
-	}
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
+// DefaultServerReadTimeout is the default inbound request read deadline
+// (issue #77). 30s is generous for chat-completion payloads while still
+// disconnecting slow-header/slow-body abuse well before the connection
+// ties up a goroutine for minutes.
+const DefaultServerReadTimeout = 30 * time.Second
 
-// IsLoopbackAddr reports whether addr binds only to the loopback
-// interface. Used by the boot warning (issue #37) to detect when the
-// proxy is exposed to the network without authentication.
-//
-// Addresses that bind all interfaces are NOT loopback:
-//
-//	":8000"        -> all interfaces (0.0.0.0)
-//	"0.0.0.0:8000" -> all IPv4 interfaces
-//	"[::]:8000"    -> all IPv6 interfaces
-//
-// Loopback examples:
-//
-//	"127.0.0.1:8000" -> IPv4 loopback
-//	"[::1]:8000"     -> IPv6 loopback
-//	"localhost:8000" -> loopback hostname
-//
-// An unresolvable hostname (other than "localhost") is treated as
-// non-loopback so the boot warning errs on the side of firing.
-func IsLoopbackAddr(addr string) bool {
-	host := addr
-	if h, _, err := net.SplitHostPort(addr); err == nil {
-		host = h
-	}
-	host = strings.TrimSpace(host)
-	if host == "" {
-		// ":8000" binds every interface.
-		return false
-	}
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback()
-	}
-	// Unknown hostname form (e.g. "nexus.local"); without a DNS
-	// resolution we cannot prove loopback, so treat as exposed.
-	return false
-}
+// DefaultServerIdleTimeout is the default keep-alive idle wait (issue #77).
+// 120s matches Go's http.DefaultServer zero-value behaviour and keeps a
+// warm connection ready for the next request without holding it forever.
+const DefaultServerIdleTimeout = 120 * time.Second
+
+// DefaultServerMaxHeaderBytes is the default cap on the total size of
+// the HTTP request headers (issue #77). Matches Go's
+// http.DefaultMaxHeaderBytes (1 MiB) — large enough for auth cookies and
+// content-type metadata, small enough to reject header-flood abuse.
+const DefaultServerMaxHeaderBytes = 1 << 20 // 1 MiB
+
+// DefaultShutdownTimeout is the default graceful-shutdown drain window
+// (issue #121). 30s accommodates a frontier SSE stream mid-token and a
+// fusion arbiter call that just opened its 60s WithTimeout window while
+// staying comfortably under a typical K8s terminationGracePeriodSeconds
+// of 30s. Operators running longer upstreams (or larger
+// terminationGracePeriodSeconds) raise this via NEXUS_SHUTDOWN_TIMEOUT.
+const DefaultShutdownTimeout = 30 * time.Second
 
 // DefaultMaxBodyBytes is the fallback request-body cap (issue #11). 1 MiB
 // matches the typical OpenAI chat-completions request envelope; agents that
@@ -1020,21 +978,167 @@ func (c Config) EffectiveMaxBodyBytes() int {
 	return DefaultMaxBodyBytes
 }
 
+// DefaultDebugBodyBytes is the upper bound on the response-body preview
+// the debug trace logs (issue #33). 512 bytes is enough to identify the
+// upstream model, see the first few tokens, and recognise a malformed
+// reply, while keeping the log line a reasonable size.
+const DefaultDebugBodyBytes = 512
+
+// DefaultLocalVRAMBytesPerSlot is the VRAM reservation each concurrent
+// local-route slot assumes when NEXUS_LOCAL_VRAM_BYTES_PER_SLOT is unset
+// (issue #81). 2 GiB keeps a Q4-quantised 8B model plus a modest context
+// resident; on the PRD's target 8-12 GiB GPUs this yields ~3-5 effective
+// slots once the loaded model's footprint is accounted for. The value
+// only affects the dynamic shrink path; when the probe is unavailable
+// the full NEXUS_LOCAL_MAX_CONCURRENT ceiling is used regardless.
+const DefaultLocalVRAMBytesPerSlot int64 = 2 << 30 // 2 GiB
+
+// EffectiveDebugBodyBytes returns the response-body preview cap the
+// debug trace should honour. Zero or negative falls back to
+// DefaultDebugBodyBytes so a zero-value Config (typical in tests) still
+// gets a sane cap.
+func (c Config) EffectiveDebugBodyBytes() int {
+	if c.DebugBodyBytes > 0 {
+		return c.DebugBodyBytes
+	}
+	return DefaultDebugBodyBytes
+}
+
 // TelemetryEnabled reports whether the on-disk recorder should be started.
 // Disabled when TelemetryPath is empty.
 func (c Config) TelemetryEnabled() bool { return c.TelemetryPath != "" }
+
+// ModelsCacheEnabled reports whether the Ollama /api/tags poll should
+// supplement the configured models list (issue #78). Disabled when
+// ModelsCacheTTL is zero or negative — the handler then serves only
+// the configured local/router/frontier models with no HTTP round-trip
+// to Ollama per request.
+func (c Config) ModelsCacheEnabled() bool { return c.ModelsCacheTTL > 0 }
+
+// PromptInjectionIsolated reports whether the proxy should isolate
+// its policy text from user-supplied system content (issue #76).
+// True in warn and strict modes; false in the default off mode so
+// the legacy append path is preserved.
+func (c Config) PromptInjectionIsolated() bool {
+	return c.PromptInjectionMode == middleware.InjectionModeWarn ||
+		c.PromptInjectionMode == middleware.InjectionModeStrict
+}
 
 // MetricsEnabled reports whether the SQLite metrics store should be
 // opened. Disabled when MetricsDBPath is empty.
 func (c Config) MetricsEnabled() bool { return c.MetricsDBPath != "" }
 
-// MetricsEndpointEnabled reports whether the Prometheus /metrics HTTP
-// endpoint should be registered (issue #40). Disabled when
-// MetricsEndpoint is empty (the operator set
-// NEXUS_METRICS_ENDPOINT="" explicitly). When disabled, main.go does
-// not mount the handler and /metrics returns 404 — zero regression for
-// operators who do not want a scrape surface.
-func (c Config) MetricsEndpointEnabled() bool { return c.MetricsEndpoint != "" }
+// RateLimitEnabled reports whether the per-client rate limiter is
+// active (issue #75). Disabled when RateLimitRPM <= 0 so a stock
+// deployment is byte-for-byte identical to the pre-#75 path.
+func (c Config) RateLimitEnabled() bool { return c.RateLimitRPM > 0 }
+
+// TrustedProxiesConfigured reports whether any trusted-proxy CIDRs are
+// set. Used by the boot-time warning to detect the "rate limit on +
+// non-loopback bind + no trusted proxies" misconfiguration that would
+// let a single NATed IP exhaust the whole per-client budget.
+func (c Config) TrustedProxiesConfigured() bool { return len(c.TrustedProxies) > 0 }
+
+// IsLoopbackBind reports whether the configured NEXUS_ADDR binds only
+// to a loopback interface. A listen address is considered loopback when
+// its host portion is empty ("", as in ":8000" — binds all interfaces
+// but is typically reached via localhost in dev), "localhost", or a
+// literal loopback IP (127.0.0.0/8, ::1). Used by the boot warning to
+// decide whether missing trusted-proxy config is dangerous.
+//
+// Note: ":8000" technically binds all interfaces, but we classify it as
+// loopback-safe because the canonical production deployment sets an
+// explicit non-loopback address (e.g. "0.0.0.0:8000") when exposing the
+// proxy beyond the host. The warning targets operators who explicitly
+// opened the proxy to the network.
+func (c Config) IsLoopbackBind() bool {
+	host := listenHost(c.Addr)
+	if host == "" || host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// Unknown host name; treat conservatively as non-loopback so
+		// the warning fires rather than suppressing it.
+		return false
+	}
+	return ip.IsLoopback()
+}
+
+// listenHost extracts the host portion of a "host:port" listen address,
+// returning the whole string when it contains no port. IPv6 bracketed
+// addresses ("[::1]:8000") are handled by net.SplitHostPort.
+func listenHost(addr string) string {
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		return h
+	}
+	return addr
+}
+
+// parseTrustedProxies parses the NEXUS_TRUSTED_PROXIES env value into a
+// slice of *net.IPNet. Empty input yields nil + no error ("trust
+// nobody"). A bare IP (no /prefix) is promoted to a host route
+// (/32 for IPv4, /128 for IPv6) for ergonomic single-host trust
+// entries. Any invalid entry returns an error naming the offender.
+//
+// Mirrors ratelimit.ParseTrustedCIDRs but is duplicated here so
+// internal/config does not import internal/ratelimit (keeping the
+// dependency direction clean: config is a leaf package).
+func parseTrustedProxies(raw string) ([]*net.IPNet, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]*net.IPNet, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, ipnet, err := net.ParseCIDR(p); err == nil {
+			out = append(out, ipnet)
+			continue
+		}
+		if ip := net.ParseIP(p); ip != nil {
+			if ip.To4() != nil {
+				out = append(out, &net.IPNet{IP: ip.To4(), Mask: net.CIDRMask(32, 32)})
+			} else {
+				out = append(out, &net.IPNet{IP: ip.To16(), Mask: net.CIDRMask(128, 128)})
+			}
+			continue
+		}
+		return nil, fmt.Errorf("config: invalid NEXUS_TRUSTED_PROXIES entry %q (expected CIDR or IP)", p)
+	}
+	return out, nil
+}
+
+// RoutingConfidenceEnabled reports whether the judge-guided adaptive
+// routing store (issue #47) should be opened. It requires BOTH a configured
+// DB path AND the judge to be enabled: without judge scores there is no
+// data to aggregate, and the acceptance criteria mandate that a disabled
+// judge produces byte-for-byte identical routing (no DB queries).
+func (c Config) RoutingConfidenceEnabled() bool {
+	return c.RoutingConfidenceDB != "" && c.JudgeEnabled
+}
+
+// AuthEnabled reports whether the inbound API-key gate (issue #109)
+// is active. When false, all endpoints are open — the binary behaves
+// identically to the pre-auth proxy.
+func (c Config) AuthEnabled() bool { return c.ProxyAPIKey != "" }
+
+// RAGPersistentEnabled reports whether the SQLite-backed RAG store
+// (issue #46) should be opened. Disabled when RAGDBPath is empty,
+// which preserves the legacy in-memory-only behaviour for operators
+// who want zero on-disk state.
+func (c Config) RAGPersistentEnabled() bool { return c.RAGDBPath != "" }
+
+// RAGWatcherEnabled reports whether the background file watcher
+// (issue #46) should be started. Disabled when RAGPollInterval is
+// zero OR when the persistent store itself is disabled.
+func (c Config) RAGWatcherEnabled() bool {
+	return c.RAGPersistentEnabled() && c.RAGPollInterval > 0
+}
 
 // NewLogger returns a *slog.Logger configured per LogLevel / LogFormat,
 // always writing to stderr. Centralising the construction in config
@@ -1052,133 +1156,94 @@ func (c Config) NewLogger() *slog.Logger {
 	return slog.New(h)
 }
 
-// resolveString returns env value when the env var is set and non-empty,
-// then the YAML file value when present (even if empty — operators can
-// explicitly clear a value with `key: ""`), then the built-in default.
-func resolveString(key string, fileMap map[string]string, def string) string {
+func getEnv(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
-		return v
-	}
-	if v, ok := fileMap[key]; ok {
 		return v
 	}
 	return def
 }
 
-// resolveAllowEmpty is like resolveString but treats env="" as set. Used
-// for the telemetry path / metrics DB so operators can disable them by
-// setting NEXUS_TELEMETRY_PATH="" or NEXUS_METRICS_DB="".
-func resolveAllowEmpty(key string, fileMap map[string]string, def string) string {
+// getEnvAllowEmpty is like getEnv but returns the empty string when the
+// caller has explicitly set the variable to "". Used for the telemetry path
+// so operators can disable recording with NEXUS_TELEMETRY_PATH="".
+func getEnvAllowEmpty(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok {
 		return v
 	}
-	if v, ok := fileMap[key]; ok {
-		return v
-	}
 	return def
 }
 
-// resolveInt reads an int from env (non-empty), file, or default. A
-// malformed value in either source produces an error so the boot fails
-// loud instead of silently using a zero.
-func resolveInt(key string, fileMap map[string]string, def int) (int, error) {
-	if v, ok := os.LookupEnv(key); ok && v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return 0, fmt.Errorf("config: %s must be an integer: %w", key, err)
-		}
-		return n, nil
+func getEnvInt(key string, def int) (int, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def, nil
 	}
-	if v, ok := fileMap[key]; ok && v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return 0, fmt.Errorf("config: %s in file must be an integer: %w", key, err)
-		}
-		return n, nil
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be an integer: %w", key, err)
 	}
-	return def, nil
+	return n, nil
 }
 
-// resolveFloat reads a float from env (non-empty), file, or default.
-func resolveFloat(key string, fileMap map[string]string, def float64) (float64, error) {
-	if v, ok := os.LookupEnv(key); ok && v != "" {
-		f, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			return 0, fmt.Errorf("config: %s must be a number: %w", key, err)
-		}
-		return f, nil
+// getEnvBool reads a boolean environment variable. Accepts
+// "true"/"1"/"yes" (case-insensitive) as true; anything else is
+// false. Returns def when the variable is unset or empty.
+func getEnvBool(key string, def bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def
 	}
-	if v, ok := fileMap[key]; ok && v != "" {
-		f, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			return 0, fmt.Errorf("config: %s in file must be a number: %w", key, err)
-		}
-		return f, nil
-	}
-	return def, nil
-}
-
-// resolveDuration reads a time.Duration from env (non-empty), file, or default.
-func resolveDuration(key string, fileMap map[string]string, def time.Duration) (time.Duration, error) {
-	if v, ok := os.LookupEnv(key); ok && v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return 0, fmt.Errorf("config: %s must be a duration (e.g. 8s, 2m): %w", key, err)
-		}
-		return d, nil
-	}
-	if v, ok := fileMap[key]; ok && v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return 0, fmt.Errorf("config: %s in file must be a duration: %w", key, err)
-		}
-		return d, nil
-	}
-	return def, nil
-}
-
-// resolveBool reads a boolean from env (non-empty), file, or default.
-// Truthy spellings — case-insensitive — are: "true", "1", "yes", "on".
-// Anything else is false. Operators who set NEXUS_HTTP_DISABLE_KEEPALIVES
-// to a non-truthy value get the default (false), which is what they
-// want on every host that has a working keep-alive.
-func resolveBool(key string, fileMap map[string]string, def bool) bool {
-	parse := func(raw string) (bool, bool) {
-		switch strings.ToLower(strings.TrimSpace(raw)) {
-		case "true", "1", "yes", "on":
-			return true, true
-		case "false", "0", "no", "off":
-			return false, true
-		}
-		return false, false
-	}
-	if v, ok := os.LookupEnv(key); ok && v != "" {
-		if b, ok := parse(v); ok {
-			return b
-		}
-		// Fall through to default; this matches the "ignore
-		// typos, do not break boot" stance taken by parseLogLevel
-		// and parseLogFormat for NEXUS_LOG_*.
-	}
-	if v, ok := fileMap[key]; ok && v != "" {
-		if b, ok := parse(v); ok {
-			return b
-		}
-	}
-	return def
-}
-
-// isConfigSourceSet reports whether key was set via env (non-empty) OR
-// present in fileMap. Used for "fall back if not set" logic that
-// previously relied solely on os.Getenv.
-func isConfigSourceSet(key string, fileMap map[string]string) bool {
-	if v, ok := os.LookupEnv(key); ok && v != "" {
+	switch strings.ToLower(v) {
+	case "true", "1", "yes":
 		return true
+	default:
+		return false
 	}
-	if _, ok := fileMap[key]; ok {
+}
+
+func getEnvFloat(key string, def float64) (float64, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def, nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be a number: %w", key, err)
+	}
+	return f, nil
+}
+
+func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be a duration (e.g. 8s, 2m): %w", key, err)
+	}
+	return d, nil
+}
+
+// parseBoolEnv maps a string env value to a bool with the supplied
+// default. Accepts the canonical spellings (true/false, 1/0, yes/no,
+// on/off) case-insensitively; an empty / unparseable value falls back
+// to def rather than failing boot. Used for the opt-in feature flag
+// NEXUS_FUSION_PROGRESSIVE (issue #48) where falling back to the
+// default is the safest failure mode.
+func parseBoolEnv(key string, def bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1", "yes", "on":
 		return true
+	case "false", "0", "no", "off":
+		return false
+	default:
+		return def
 	}
-	return false
 }
 
 // LogFormat is the wire format for the structured logger. JSON is the

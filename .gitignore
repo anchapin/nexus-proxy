@@ -38,5 +38,11 @@ config.local.yaml
 .DS_Store
 Thumbs.db
 
+# SQLite / metrics artifacts (generated at runtime by tests and boot)
+*.db
+*.db-shm
+*.db-wal
+nexus-telemetry.jsonl
+
 # Agent orchestration artifacts (local-only, never source-controlled)
 .agents/

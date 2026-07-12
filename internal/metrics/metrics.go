@@ -63,15 +63,23 @@ const recordRequestErrorTimeout = 5 * time.Second
 //     was injected (filename is empty when RAG missed).
 //   - EstimatedCostUSD — frontier ($/1k token) * input tokens for
 //     rough cost accounting. Zero for local-route requests.
-//   - TaskType (issue #44) — the SLM-reported prompt category
-//     ("code_generation", "debugging", ...). Empty for
-//     guardrail / DSL hits (deterministic path, no SLM consult)
-//     so a non-SLM dispatch is indistinguishable from "unknown"
-//     without an extra migration.
 //
 // Telemetry-mirrored fields (OutputTokens, TTFTMs, TotalLatencyMs, TPS,
 // Streaming, Error) carry the same shape as telemetry.Record so the
 // SQLiteStore can satisfy both interfaces.
+//
+// TotalLatencyMs is float64 milliseconds (issue #68) — see
+// telemetry.Record.TotalLatencyMs for the rationale.
+//
+// FusionArbiterSkipped (issue #48) mirrors telemetry.Record: true only
+// for route=fusion requests that streamed the speculative panel-member
+// answer and terminated without invoking the arbiter. False in every
+// other case (legacy Panel path always invokes the arbiter; non-fusion
+// routes are always false).
+//
+// Route-source metadata (issue #74) mirrors telemetry.Record so the
+// SQLite store and the JSONL recorder carry identical routing metadata
+// for every request.
 type Request struct {
 	Timestamp         time.Time
 	RequestID         string
@@ -83,16 +91,26 @@ type Request struct {
 	RAGFilename       string
 	EstimatedCostUSD  float64
 
-	OutputTokens   int
-	TTFTMs         int64
-	TotalLatencyMs int64
-	TPS            float64
-	Streaming      bool
-	Error          string
+	// BaselineCostUSD is what this request would have cost if sent
+	// to the configured baseline (frontier) provider at the baseline
+	// rate, regardless of the actual route taken (issue #73).
+	// SavingsUSD = max(BaselineCostUSD - EstimatedCostUSD, 0).
+	BaselineCostUSD float64
+	SavingsUSD      float64
 
-	// TaskType (issue #44) is the SLM's self-reported category.
-	// Empty when the SLM was not consulted (guardrail / DSL hits).
-	TaskType string
+	OutputTokens         int
+	TTFTMs               int64
+	TotalLatencyMs       float64
+	TPS                  float64
+	Streaming            bool
+	FusionArbiterSkipped bool
+	Error                string
+
+	// Route-source metadata (issue #74).
+	RouteSource   string
+	RouteReason   string
+	SLMConfidence float64
+	SLMTaskType   string
 }
 
 // Summary is the per-day roll-up returned by Store.DailySummary.
@@ -110,8 +128,17 @@ type Summary struct {
 	TOONSavingsTokens  int
 	RAGInjectedCount   int
 	EstimatedCostTotal float64
-	TotalLatencyMsSum  int64
-	ErrorCount         int
+
+	// BaselineCostTotal and SavingsTotal roll up the per-request
+	// baseline_cost_usd and savings_usd columns (issue #73).
+	// BaselineCostTotal is the total "would-have-cost at frontier"
+	// figure; SavingsTotal is the sum of max(baseline - actual, 0)
+	// across all requests in the period.
+	BaselineCostTotal float64
+	SavingsTotal      float64
+
+	TotalLatencyMsSum float64
+	ErrorCount        int
 }
 
 // Store persists per-request metrics. Implementations MUST return
@@ -156,12 +183,22 @@ func OpenWithLogger(path string, lg Logger) (Store, error) {
 	}
 	if path != ":memory:" {
 		if dir := filepath.Dir(path); dir != "" && dir != "." {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
 				return nil, fmt.Errorf("metrics: mkdir %q: %w", dir, err)
 			}
 		}
 	}
-	return newSQLiteStore(path, lg)
+	s, err := newSQLiteStore(path, lg)
+	if err != nil {
+		return nil, err
+	}
+	// Tighten permissions on the SQLite DB file so an upgrade from a
+	// pre-fix binary locks it down (issue #108). The driver creates the
+	// file; we chmod it after the first successful open.
+	if path != ":memory:" {
+		chmodIfWider(path, 0o600)
+	}
+	return s, nil
 }
 
 // DroppedCounter is implemented by Stores that can shed load under
@@ -194,3 +231,32 @@ type atomicDropped struct{ n atomic.Uint64 }
 
 func (a *atomicDropped) add()        { a.n.Add(1) }
 func (a *atomicDropped) get() uint64 { return a.n.Load() }
+
+// chmodIfWider checks the current mode of path and, if any
+// group/other bits are set, tightens the file to the requested mode.
+// Errors are logged — chmod failures are non-fatal.
+func chmodIfWider(path string, mode os.FileMode) {
+	info, err := os.Stat(path)
+	if err != nil {
+		slog.Warn("metrics: stat for chmod",
+			slog.String("path", path),
+			slog.Any("err", err),
+		)
+		return
+	}
+	perm := info.Mode().Perm()
+	if perm&0o077 == 0 {
+		return
+	}
+	slog.Warn("metrics: tightening file permissions",
+		slog.String("path", path),
+		slog.Int("was", int(perm)),
+		slog.Int("now", int(mode)),
+	)
+	if err := os.Chmod(path, mode); err != nil {
+		slog.Warn("metrics: chmod failed",
+			slog.String("path", path),
+			slog.Any("err", err),
+		)
+	}
+}

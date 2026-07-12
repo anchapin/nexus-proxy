@@ -2,248 +2,400 @@ package concurrencylimit
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// TestNewDisabledForZeroAndNegative pins the contract that
-// New(max<=0) returns nil and a nil Limiter reports Max=0. The chat
-// handler relies on this to gate "disabled" off a single nil-check.
-func TestNewDisabledForZeroAndNegative(t *testing.T) {
-	for _, max := range []int{0, -1, -100} {
-		l := New(max)
-		if l != nil {
-			t.Errorf("New(%d) = %p, want nil", max, l)
-		}
-		if got := l.Max(); got != 0 {
-			t.Errorf("nil Max() = %d, want 0", got)
-		}
-		// Acquire / Release on a nil receiver must not panic and
-		// Acquire must return true so the hot path takes the
-		// unbounded default.
-		if !l.Acquire(context.Background(), 0) {
-			t.Errorf("nil Acquire returned false for max=%d", max)
-		}
-		l.Release()
+// vramFn returns a FreeVRAM closure backed by an atomic int64 so tests
+// can flip the probe snapshot concurrently while the limiter reads it.
+func vramFn(initial int64) (*atomic.Int64, func() int64) {
+	v := atomic.Int64{}
+	v.Store(initial)
+	return &v, func() int64 { return v.Load() }
+}
+
+// --- Disabled limiter: probe-disabled behaviour is unchanged ---------
+
+// TestLimiterDisabledIsNoOp covers acceptance criterion "With probe
+// disabled, limiter behaviour is unchanged". A disabled limiter (nil
+// receiver or Ceiling <= 0) returns a no-op release and never blocks.
+func TestLimiterDisabledIsNoOp(t *testing.T) {
+	ctx := context.Background()
+
+	// Ceiling <= 0 -> disabled.
+	l := New(0, DefaultBytesPerSlot, func() int64 { return 1 << 30 })
+	rel, err := l.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("disabled Acquire err = %v", err)
+	}
+	if rel == nil {
+		t.Fatal("disabled Acquire returned nil release")
+	}
+	rel() // must not panic
+	if got := l.Effective(); got != 0 {
+		t.Errorf("disabled Effective = %d, want 0", got)
+	}
+
+	// Nil receiver is also a no-op (defensive; main.go guards too).
+	var nilL *Limiter
+	rel2, err := nilL.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("nil Acquire err = %v", err)
+	}
+	rel2()
+}
+
+// TestEffectiveProbeUnavailableUsesCeiling covers "Probe unavailable
+// does not open floodgates": when the FreeVRAM closure returns <= 0
+// (or is nil) the limiter falls back to the full Ceiling.
+func TestEffectiveProbeUnavailableUsesCeiling(t *testing.T) {
+	cases := []struct {
+		name string
+		free func() int64
+	}{
+		{"nil closure", nil},
+		{"zero free", func() int64 { return 0 }},
+		{"negative free", func() int64 { return -1024 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			l := New(4, 1<<30, tc.free)
+			if got := l.Effective(); got != 4 {
+				t.Errorf("Effective = %d, want ceiling 4", got)
+			}
+		})
 	}
 }
 
-// TestAcquireSucceedsWhenSlotsAvailable covers the happy path: a
-// freshly-built Limiter with max=2 grants both acquires without
-// waiting, then refuses a third while two are held.
-func TestAcquireSucceedsWhenSlotsAvailable(t *testing.T) {
-	l := New(2)
-	defer l.Release()
-	if !l.Acquire(context.Background(), 0) {
-		t.Fatal("first Acquire failed with slots available")
-	}
-	if !l.Acquire(context.Background(), 0) {
-		t.Fatal("second Acquire failed with slots available")
-	}
-	if l.Acquire(context.Background(), 0) {
-		t.Fatal("third Acquire succeeded when only two slots exist")
-	}
-	l.Release()
-}
+// --- Low VRAM reduces slots, never exceeds ceiling -------------------
 
-// TestAcquireBlocksUntilRelease verifies that an Acquire call is
-// genuinely queued and that a subsequent Release unblocks it within
-// the timeout window. Without the release the goroutine would have
-// to wait the full timeout — we assert it does not.
-func TestAcquireBlocksUntilRelease(t *testing.T) {
-	l := New(1)
-	if !l.Acquire(context.Background(), 0) {
-		t.Fatal("first Acquire failed")
+// TestEffectiveLowVRAMReducesSlots covers "Lower free VRAM reduces
+// effective local concurrency". freeVRAM/bytesPerSlot is the floor.
+func TestEffectiveLowVRAMReducesSlots(t *testing.T) {
+	const slot = int64(1 << 30) // 1 GiB per slot for easy math
+	cases := []struct {
+		name string
+		free int64
+		want int
+	}{
+		{"10 GiB / 1GiB slot -> 4 (ceiling)", 10 << 30, 4},
+		{"3 GiB / 1GiB slot -> 3", 3 << 30, 3},
+		{"2 GiB / 1GiB slot -> 2", 2 << 30, 2},
+		{"half a GiB -> 1 (floor)", 512 << 20, 1},
+		{"zero free -> ceiling (probe unavailable)", 0, 4},
 	}
-	done := make(chan bool, 1)
-	go func() {
-		done <- l.Acquire(context.Background(), time.Second)
-	}()
-	// Let the goroutine enter its blocked state.
-	time.Sleep(50 * time.Millisecond)
-	select {
-	case ok := <-done:
-		t.Fatalf("Acquire returned before Release (ok=%v)", ok)
-	default:
-	}
-	l.Release()
-	select {
-	case ok := <-done:
-		if !ok {
-			t.Fatal("Acquire returned false after Release")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Acquire did not return within 1s of Release")
-	}
-	l.Release()
-}
-
-// TestAcquireTimesOutWhenSlotsExhausted asserts that with all slots
-// in use, a follow-up Acquire returns false within the configured
-// timeout window. A 50 ms timeout must not return in <40 ms (early)
-// or 200 ms (way late); the lower bound keeps the test fast, the
-// upper bound flags a timer bug.
-func TestAcquireTimesOutWhenSlotsExhausted(t *testing.T) {
-	l := New(1)
-	if !l.Acquire(context.Background(), 0) {
-		t.Fatal("first Acquire failed")
-	}
-	start := time.Now()
-	if l.Acquire(context.Background(), 50*time.Millisecond) {
-		t.Fatal("second Acquire unexpectedly succeeded")
-	}
-	elapsed := time.Since(start)
-	if elapsed < 40*time.Millisecond {
-		t.Fatalf("Acquire returned in %v, want ~50ms", elapsed)
-	}
-	if elapsed > 500*time.Millisecond {
-		t.Fatalf("Acquire took %v, want <500ms", elapsed)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			l := New(4, slot, func() int64 { return tc.free })
+			if got := l.Effective(); got != tc.want {
+				t.Errorf("Effective(free=%d) = %d, want %d", tc.free, got, tc.want)
+			}
+		})
 	}
 }
 
-// TestAcquireHonoursContextCancellation asserts that a cancelled
-// request context unblocks Acquire even though the configured timeout
-// is generous. The chat handler relies on this so a client
-// disconnect during the queue phase does not pin the slot until the
-// configured timeout elapses.
-func TestAcquireHonoursContextCancellation(t *testing.T) {
-	l := New(1)
-	if !l.Acquire(context.Background(), 0) {
-		t.Fatal("first Acquire failed")
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		cancel()
-	}()
-	start := time.Now()
-	if l.Acquire(ctx, time.Second) {
-		t.Fatal("Acquire did not honour context cancellation")
-	}
-	elapsed := time.Since(start)
-	if elapsed > 200*time.Millisecond {
-		t.Fatalf("Acquire took %v, want <200ms (ctx cancellation)", elapsed)
-	}
-}
+// TestNeverExceedsCeiling asserts the in-flight count never goes above
+// the configured ceiling even under heavy concurrent acquire/release.
+func TestNeverExceedsCeiling(t *testing.T) {
+	const ceiling = 4
+	_, free := vramFn(20 << 30) // plenty of VRAM -> effective == ceiling
+	l := New(ceiling, 1<<30, free)
 
-// TestReleaseAllowsFurtherAcquire verifies the round-trip: after
-// Release the slot re-enters the pool and the next Acquire succeeds
-// synchronously. Without this, the limiter would leak slots under
-// normal traffic.
-func TestReleaseAllowsFurtherAcquire(t *testing.T) {
-	l := New(1)
-	if !l.Acquire(context.Background(), 0) {
-		t.Fatal("first Acquire failed")
-	}
-	l.Release()
-	if !l.Acquire(context.Background(), 0) {
-		t.Fatal("Acquire after Release failed")
-	}
-	l.Release()
-}
-
-// TestReleaseIsIdempotent guards against the double-release footgun:
-// the chat handler defers Release unconditionally, so a future refactor
-// that also calls Release on the overflow path must not over-credit
-// the pool. We call Release twice with no matching Acquire and
-// confirm we can still grant exactly max acquisitions.
-func TestReleaseIsIdempotent(t *testing.T) {
-	l := New(2)
-	l.Release()
-	l.Release()
-	var got int32
-	if !l.Acquire(context.Background(), 0) {
-		t.Fatal("first Acquire after double-Release failed")
-	}
-	got++
-	if !l.Acquire(context.Background(), 0) {
-		t.Fatal("second Acquire failed (Release over-credited the pool)")
-	}
-	got++
-	if l.Acquire(context.Background(), 0) {
-		t.Fatal("third Acquire succeeded, pool was over-credited")
-	}
-	l.Release()
-	l.Release()
-	if got != 2 {
-		t.Fatalf("got %d acquisitions, want 2", got)
-	}
-}
-
-// TestAcquireTryOnceWhenTimeoutZero documents the contract that
-// timeout=0 is a single try-and-give-up: no goroutine ever blocks.
-// This is the path the chat handler takes on the very fast path when
-// it has hard-coded a zero timeout (none today, but the option is
-// there).
-func TestAcquireTryOnceWhenTimeoutZero(t *testing.T) {
-	l := New(1)
-	if !l.Acquire(context.Background(), 0) {
-		t.Fatal("first Acquire failed")
-	}
-	if l.Acquire(context.Background(), 0) {
-		t.Fatal("second Acquire succeeded with timeout=0")
-	}
-	l.Release()
-}
-
-// TestAcquireConcurrentSerializes asserts the limiter actually
-// bounds concurrency. With max=2 and 10 workers each acquiring-then-
-// holding for 5 ms, the observed in-flight peak must be <= 2 (and
-// at least 1, otherwise the limiter is fully open and the test is
-// not exercising the semaphore). The boundary check on peak >= 1 is
-// strictly defensive — a real scheduler should always see >1 when
-// 10 workers contend, but timing-only flakiness guards against
-// false negatives.
-func TestAcquireConcurrentSerializes(t *testing.T) {
-	l := New(2)
-	var inflight atomic.Int32
-	var peak atomic.Int32
-	const workers = 10
+	var inFlight, maxSeen atomic.Int64
 	var wg sync.WaitGroup
-	wg.Add(workers)
-	for i := 0; i < workers; i++ {
+	start := make(chan struct{})
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for !l.Acquire(context.Background(), 500*time.Millisecond) {
-				// If we fail to acquire, retry: this loop only
-				// terminates when the in-flight workers drain.
-				// It is bounded by the test deadline so we
-				// won't hang forever under a buggy limiter.
+			<-start
+			rel, err := l.Acquire(context.Background())
+			if err != nil {
+				return
 			}
-			cur := inflight.Add(1)
+			defer rel()
+			cur := inFlight.Add(1)
 			for {
-				p := peak.Load()
-				if cur <= p {
-					break
-				}
-				if peak.CompareAndSwap(p, cur) {
+				old := maxSeen.Load()
+				if cur <= old || maxSeen.CompareAndSwap(old, cur) {
 					break
 				}
 			}
-			time.Sleep(5 * time.Millisecond)
-			inflight.Add(-1)
-			l.Release()
+			// Hold briefly so concurrency is observable.
+			time.Sleep(time.Millisecond)
+			inFlight.Add(-1)
 		}()
 	}
+	close(start)
 	wg.Wait()
-	if p := peak.Load(); p > 2 {
-		t.Errorf("peak in-flight = %d, want <= 2", p)
+
+	if got := maxSeen.Load(); got > ceiling {
+		t.Errorf("max in-flight = %d, exceeded ceiling %d", got, ceiling)
 	}
-	if p := peak.Load(); p < 1 {
-		t.Errorf("peak in-flight = %d, want >= 1", p)
+	if got := maxSeen.Load(); got < int64(ceiling) {
+		t.Errorf("max in-flight = %d, want saturation near %d (limiter never throttled)", got, ceiling)
 	}
 }
 
-// TestMaxReflectsConfiguredLimit pins the Max accessor so chat.go
-// can log the configured ceiling on the overflow path without
-// re-reading the Config struct.
-func TestMaxReflectsConfiguredLimit(t *testing.T) {
-	for _, max := range []int{1, 2, 16, 64} {
-		l := New(max)
-		if got := l.Max(); got != max {
-			t.Errorf("Max() = %d, want %d", got, max)
+// --- Reactive shrink: VRAM drop throttles new acquires ---------------
+
+// TestVRAMDropThrottlesNewAcquires verifies that lowering the probe's
+// free-VRAM reading causes subsequent Acquires to block (effective
+// shrink below in-flight).
+func TestVRAMDropThrottlesNewAcquires(t *testing.T) {
+	v, free := vramFn(10 << 30) // effective = min(4, 10) = 4
+	l := New(4, 1<<30, free)
+
+	// Occupy all 4 slots.
+	rels := make([]func(), 0, 4)
+	for i := 0; i < 4; i++ {
+		rel, err := l.Acquire(context.Background())
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
 		}
+		rels = append(rels, rel)
+	}
+	if got := l.InFlight(); got != 4 {
+		t.Fatalf("InFlight = %d, want 4", got)
+	}
+
+	// Drop VRAM so effective shrinks to 2. A new acquire must block.
+	v.Store(2 << 30)
+	acquired := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	go func() {
+		rel, err := l.Acquire(ctx)
+		if err == nil {
+			rel()
+			close(acquired)
+		}
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("acquire proceeded while in-flight (4) >= effective (2)")
+	case <-time.After(80 * time.Millisecond):
+		// expected: blocked.
+	}
+
+	// Release two -> in-flight 2 == effective 2; the blocked acquire
+	// still cannot proceed (inFlight must be < effective). Release a
+	// third -> in-flight 1 < 2; the blocked acquire should now win.
+	rels[0]()
+	rels[1]()
+	rels[2]()
+	select {
+	case <-acquired:
+		// good
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("acquire stayed blocked after in-flight dropped below effective")
+	}
+	rels[3]()
+}
+
+// --- Context cancellation releases blocked acquirers -----------------
+
+// TestAcquireContextCancelled verifies a blocked Acquire returns its
+// ctx.Err() promptly when the context is cancelled.
+func TestAcquireContextCancelled(t *testing.T) {
+	l := New(1, 1<<30, func() int64 { return 10 << 30 })
+	rel, err := l.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	defer rel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	gotRel, gotErr := l.Acquire(ctx)
+	if gotErr == nil {
+		if gotRel != nil {
+			gotRel()
+		}
+		t.Fatal("expected ctx.Err() from blocked acquire, got nil")
+	}
+	if gotRel != nil {
+		t.Error("expected nil release on cancellation")
+	}
+	if !errors.Is(gotErr, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want DeadlineExceeded", gotErr)
+	}
+}
+
+// --- Race detector stress --------------------------------------------
+
+// TestAcquireReleaseConcurrentStress hammers the limiter from many
+// goroutines under -race. A failure here means the mutex/cond
+// bookkeeping is not race-safe. The probe snapshot is mutated
+// concurrently to exercise the reactive-read path too.
+func TestAcquireReleaseConcurrentStress(t *testing.T) {
+	v, free := vramFn(4 << 30)
+	l := New(8, 1<<30, free)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 30; i++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				rel, err := l.Acquire(context.Background())
+				if err != nil {
+					t.Errorf("unexpected acquire err: %v", err)
+					return
+				}
+				// Occasionally churn the probe snapshot so the
+				// effective count changes mid-flight.
+				if (seed+j)%7 == 0 {
+					v.Store(int64(1+((seed+j)%6)) << 30)
+				}
+				_ = l.Effective() // exercise the reader path
+				rel()
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// After churn, in-flight must be back to zero (every acquire
+	// released).
+	if got := l.InFlight(); got != 0 {
+		t.Errorf("InFlight after stress = %d, want 0", got)
+	}
+}
+
+// TestNewDefaultsBytesPerSlot confirms New fills a non-positive
+// BytesPerSlot with DefaultBytesPerSlot.
+func TestNewDefaultsBytesPerSlot(t *testing.T) {
+	l := New(4, 0, func() int64 { return DefaultBytesPerSlot * 5 })
+	if l.BytesPerSlot != DefaultBytesPerSlot {
+		t.Errorf("BytesPerSlot = %d, want default %d", l.BytesPerSlot, DefaultBytesPerSlot)
+	}
+	// 5 * default / default = 5, ceiling 4 -> 4.
+	if got := l.Effective(); got != 4 {
+		t.Errorf("Effective = %d, want 4", got)
+	}
+}
+
+// TestReleaseIsIdempotentSafe confirms double-release cannot drive the
+// in-flight counter negative (defensive against handler wiring bugs).
+func TestReleaseIsIdempotentSafe(t *testing.T) {
+	l := New(2, 1<<30, func() int64 { return 10 << 30 })
+	rel, _ := l.Acquire(context.Background())
+	rel()
+	rel() // should be a no-op, not panic, not go negative
+	if got := l.InFlight(); got != 0 {
+		t.Errorf("InFlight after double release = %d, want 0", got)
+	}
+	// A fresh acquire must still succeed.
+	rel2, err := l.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire after double release: %v", err)
+	}
+	rel2()
+}
+
+// TestEffectiveStringForLog is a sanity check that the change-detection
+// log path runs without panicking across transitions (covered by other
+// tests via Effective(), but this makes the intent explicit).
+func TestEffectiveAcrossTransitions(t *testing.T) {
+	v, free := vramFn(8 << 30)
+	l := New(4, 1<<30, free)
+	seen := map[int]bool{}
+	for _, gi := range []int64{8, 6, 3, 1, 0, 12} {
+		v.Store(gi << 30)
+		seen[l.Effective()] = true
+	}
+	if len(seen) < 3 {
+		t.Errorf("expected >=3 distinct effective values across transitions, got %v", seen)
+	}
+}
+
+// TestAcquireReleasesOnContextDoneAfterStop guards the
+// context.AfterFunc wiring: a goroutine blocked in Acquire must be
+// released when the shared parent context is cancelled, not just on a
+// per-call timeout.
+func TestAcquireReleasesOnContextDoneAfterStop(t *testing.T) {
+	l := New(1, 1<<30, func() int64 { return 8 << 30 })
+	// Occupy the single slot for the whole test.
+	holder, err := l.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("holder acquire: %v", err)
+	}
+	defer holder()
+
+	parent, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := l.Acquire(parent)
+		errCh <- err
+	}()
+	// Give the waiter a moment to park in cond.Wait.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v, want Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked acquire was not released on parent cancel")
+	}
+}
+
+// TestManyWaitersWakeOnRelease confirms Broadcast wakes all eligible
+// waiters when multiple slots free up (Signal would only wake one).
+func TestManyWaitersWakeOnRelease(t *testing.T) {
+	const ceiling = 3
+	l := New(ceiling, 1<<30, func() int64 { return 8 << 30 })
+
+	holders := make([]func(), 0, ceiling)
+	for i := 0; i < ceiling; i++ {
+		rel, err := l.Acquire(context.Background())
+		if err != nil {
+			t.Fatalf("holder %d: %v", i, err)
+		}
+		holders = append(holders, rel)
+	}
+
+	// Queue 3 waiters.
+	type res struct {
+		err error
+	}
+	done := make(chan res, 3)
+	for i := 0; i < 3; i++ {
+		go func() {
+			rel, err := l.Acquire(context.Background())
+			if err == nil {
+				rel()
+			}
+			done <- res{err}
+		}()
+	}
+	// Release all 3 holders at once.
+	for _, h := range holders {
+		h()
+	}
+	// All 3 waiters should complete promptly.
+	for i := 0; i < 3; i++ {
+		select {
+		case r := <-done:
+			if r.err != nil {
+				t.Errorf("waiter %d err = %v", i, r.err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("waiter %d did not wake after broadcast release", i)
+		}
+	}
+}
+
+// TestFmtHelper keeps gofmt-equivalent formatting assertions honest if
+// the package grows; currently a placeholder that just exercises fmt
+// import (avoids an unused-import churn if other tests drop fmt).
+func TestFmtHelper(t *testing.T) {
+	if fmt.Sprintf("%d", DefaultBytesPerSlot) == "" {
+		t.Fail()
 	}
 }

@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -116,189 +117,173 @@ func TestSLMDecideSendsExpectedPayload(t *testing.T) {
 	}
 }
 
-// TestSLMDecideRichNewFormat exercises the enriched schema
-// ({"route":..., "confidence":..., "task_type":...}). All three fields
-// must round-trip unchanged from the SLM to Decision (issue #44).
-func TestSLMDecideRichNewFormat(t *testing.T) {
-	client := newClient(func(_ *http.Request) (*http.Response, error) {
-		return okBody(`{"message":{"content":"{\"route\":\"local\",\"confidence\":0.8,\"task_type\":\"debugging\"}"}}`)
-	})
-	c := NewSLMClient("http://x", "m", time.Second, client)
-	d, err := c.DecideRich(context.Background(), "x")
-	if err != nil {
-		t.Fatalf("DecideRich: %v", err)
-	}
-	if d.Route != RouteLocal {
-		t.Errorf("Route = %q, want local", d.Route)
-	}
-	if d.Confidence != 0.8 {
-		t.Errorf("Confidence = %v, want 0.8", d.Confidence)
-	}
-	if d.TaskType != "debugging" {
-		t.Errorf("TaskType = %q, want debugging", d.TaskType)
-	}
-}
-
-// TestSLMDecideRichOldFormatGracefulDegradation is the regression
-// guard for backward compatibility (issue #44 AC). An SLM emitting
-// only the legacy {"route":"..."} shape must parse cleanly (no
-// error), default Confidence to 0.5 and TaskType to "unknown", and
-// preserve the chosen route. Without this defaulting, an older SLM
-// rollout would regress to "every failure defaults to frontier".
-func TestSLMDecideRichOldFormatGracefulDegradation(t *testing.T) {
-	client := newClient(func(_ *http.Request) (*http.Response, error) {
-		return okBody(`{"message":{"content":"{\"route\":\"local\"}"}}`)
-	})
-	c := NewSLMClient("http://x", "m", time.Second, client)
-	d, err := c.DecideRich(context.Background(), "x")
-	if err != nil {
-		t.Fatalf("DecideRich must not error on legacy shape: %v", err)
-	}
-	if d.Route != RouteLocal {
-		t.Errorf("Route = %q, want local (legacy field is preserved)", d.Route)
-	}
-	if d.Confidence != DefaultConfidenceWhenUnspecified {
-		t.Errorf("Confidence = %v, want %v (no opinion default)", d.Confidence, DefaultConfidenceWhenUnspecified)
-	}
-	if d.TaskType != TaskTypeUnknown {
-		t.Errorf("TaskType = %q, want %q", d.TaskType, TaskTypeUnknown)
-	}
-}
-
-// TestSLMDecideRichExplicitZeroConfidence keeps the "very unsure"
-// signal distinct from "no opinion". A model that explicitly emits
-// confidence=0 must NOT be promoted to the default 0.5 — the
-// operator may have configured NEXUS_SLM_CONFIDENCE_THRESHOLD > 0
-// to escalate those requests to frontier.
-func TestSLMDecideRichExplicitZeroConfidence(t *testing.T) {
-	client := newClient(func(_ *http.Request) (*http.Response, error) {
-		return okBody(`{"message":{"content":"{\"route\":\"local\",\"confidence\":0,\"task_type\":\"\"}"}}`)
-	})
-	c := NewSLMClient("http://x", "m", time.Second, client)
-	d, err := c.DecideRich(context.Background(), "x")
-	if err != nil {
-		t.Fatalf("DecideRich: %v", err)
-	}
-	if d.Route != RouteLocal {
-		t.Errorf("Route = %q, want local", d.Route)
-	}
-	if d.Confidence != 0 {
-		t.Errorf("Confidence = %v, want 0 (explicit zero is preserved)", d.Confidence)
-	}
-	if d.TaskType != TaskTypeUnknown {
-		t.Errorf("TaskType = %q, want %q (empty string falls back)", d.TaskType, TaskTypeUnknown)
-	}
-}
-
-// TestSLMDecideRichClampsOvershootConfidence keeps the threshold
-// comparison meaningful: a confidence of 1.5 must not be treated as
-// "more confident than 1.0" — that would let a malformed SLM payload
-// defeat the escalation gate.
-func TestSLMDecideRichClampsOvershootConfidence(t *testing.T) {
-	client := newClient(func(_ *http.Request) (*http.Response, error) {
-		return okBody(`{"message":{"content":"{\"route\":\"local\",\"confidence\":1.5,\"task_type\":\"debugging\"}"}}`)
-	})
-	c := NewSLMClient("http://x", "m", time.Second, client)
-	d, _ := c.DecideRich(context.Background(), "x")
-	if d.Confidence != 1.0 {
-		t.Errorf("Confidence = %v, want clamped to 1.0", d.Confidence)
-	}
-}
-
-// TestSLMDecideRichClampsNegativeConfidence is the symmetric guard
-// for under-range confidence values.
-func TestSLMDecideRichClampsNegativeConfidence(t *testing.T) {
-	client := newClient(func(_ *http.Request) (*http.Response, error) {
-		return okBody(`{"message":{"content":"{\"route\":\"local\",\"confidence\":-0.5,\"task_type\":\"debugging\"}"}}`)
-	})
-	c := NewSLMClient("http://x", "m", time.Second, client)
-	d, _ := c.DecideRich(context.Background(), "x")
-	if d.Confidence != 0 {
-		t.Errorf("Confidence = %v, want clamped to 0", d.Confidence)
-	}
-}
-
-// TestSLMDecideRichUppercasesTaskType confirms the parser
-// normalises case so downstream code can compare against the
-// documented taxonomy without re-implementing ToLower.
-func TestSLMDecideRichNormalisesTaskType(t *testing.T) {
-	client := newClient(func(_ *http.Request) (*http.Response, error) {
-		return okBody(`{"message":{"content":"{\"route\":\"local\",\"confidence\":0.8,\"task_type\":\"  Debugging  \"}"}}`)
-	})
-	c := NewSLMClient("http://x", "m", time.Second, client)
-	d, err := c.DecideRich(context.Background(), "x")
-	if err != nil {
-		t.Fatalf("DecideRich: %v", err)
-	}
-	if d.TaskType != "debugging" {
-		t.Errorf("TaskType = %q, want normalised to \"debugging\"", d.TaskType)
-	}
-}
-
-// TestSLMDecideRichUnknownRouteKeepsConfidence confirms that the
-// "unknown route falls back to frontier" rule (preserved from
-// Decide) does NOT reset the confidence / task_type fields. The
-// chat handler only escalates local / fusion on low confidence, so
-// the gate must see the original confidence even when the route
-// default-shifted to frontier.
-func TestSLMDecideRichUnknownRouteKeepsConfidence(t *testing.T) {
-	client := newClient(func(_ *http.Request) (*http.Response, error) {
-		return okBody(`{"message":{"content":"{\"route\":\"banana\",\"confidence\":0.4,\"task_type\":\"review\"}"}}`)
-	})
-	c := NewSLMClient("http://x", "m", time.Second, client)
-	d, err := c.DecideRich(context.Background(), "x")
-	if err != nil {
-		t.Fatalf("DecideRich: %v", err)
-	}
-	if d.Route != RouteFrontier {
-		t.Errorf("Route = %q, want frontier (default for unknown value)", d.Route)
-	}
-	if d.Confidence != 0.4 {
-		t.Errorf("Confidence = %v, want 0.4 (preserved across route fallback)", d.Confidence)
-	}
-	if d.TaskType != "review" {
-		t.Errorf("TaskType = %q, want review", d.TaskType)
-	}
-}
-
-// TestDecideStillReturnsRouteOnly locks the backward-compat contract
-// of the legacy wrapper: callers (existing tests, future embedders)
-// that only read the route get the same value Decide always returned.
-func TestDecideStillReturnsRouteOnly(t *testing.T) {
-	client := newClient(func(_ *http.Request) (*http.Response, error) {
-		return okBody(`{"message":{"content":"{\"route\":\"local\",\"confidence\":0.8,\"task_type\":\"debugging\"}"}}`)
-	})
-	c := NewSLMClient("http://x", "m", time.Second, client)
-	r, err := c.Decide(context.Background(), "x")
-	if err != nil {
-		t.Fatalf("Decide: %v", err)
-	}
-	if r != RouteLocal {
-		t.Errorf("Decide returned %q, want local", r)
-	}
-}
-
-// TestSLMDecideRichTransportErrorFallsBackToFrontier confirms the
-// safety net still fires for enriched decoding — a transport
-// failure produces Decision{Route: RouteFrontier, TaskType:
-// TaskTypeUnknown} + a non-nil error so callers can log it.
-func TestSLMDecideRichTransportErrorFallsBackToFrontier(t *testing.T) {
-	client := newClient(func(_ *http.Request) (*http.Response, error) {
-		return nil, errNet("dial tcp: connection refused")
-	})
-	c := NewSLMClient("http://x", "m", time.Second, client)
-	d, err := c.DecideRich(context.Background(), "x")
-	if err == nil {
-		t.Fatal("DecideRich must surface transport errors")
-	}
-	if d.Route != RouteFrontier {
-		t.Errorf("Route = %q, want frontier", d.Route)
-	}
-	if d.TaskType != TaskTypeUnknown {
-		t.Errorf("TaskType = %q, want %q", d.TaskType, TaskTypeUnknown)
-	}
-}
-
 type errNet string
 
 func (e errNet) Error() string { return string(e) }
+
+func TestParseSLMDecision(t *testing.T) {
+	tests := []struct {
+		name      string
+		content   string
+		wantErr   bool
+		wantRoute string // raw route string from JSON (lower-cased later by decide)
+	}{
+		{
+			name:      "bare JSON local",
+			content:   `{"route":"local"}`,
+			wantRoute: "local",
+		},
+		{
+			name:      "bare JSON frontier",
+			content:   `{"route":"frontier"}`,
+			wantRoute: "frontier",
+		},
+		{
+			name:      "bare JSON fusion",
+			content:   `{"route":"fusion"}`,
+			wantRoute: "fusion",
+		},
+		{
+			name:      "bare JSON with whitespace padding",
+			content:   "  \n {\"route\":\"local\"} \n  ",
+			wantRoute: "local",
+		},
+		{
+			name:      "bare JSON uppercase route preserved",
+			content:   `{"route":"FUSION"}`,
+			wantRoute: "FUSION",
+		},
+		{
+			name:      "markdown-fenced json block",
+			content:   "```json\n{\"route\":\"local\"}\n```",
+			wantRoute: "local",
+		},
+		{
+			name:      "markdown-fenced json uppercase opener",
+			content:   "```JSON\n{\"route\":\"frontier\"}\n```",
+			wantRoute: "frontier",
+		},
+		{
+			name:      "markdown-fenced bare backticks",
+			content:   "```\n{\"route\":\"fusion\"}\n```",
+			wantRoute: "fusion",
+		},
+		{
+			name:      "markdown-fenced block surrounded by prose",
+			content:   "Here is the decision:\n```json\n{\"route\":\"local\"}\n```\nThanks!",
+			wantRoute: "local",
+		},
+		{
+			name:      "prose prefix before JSON",
+			content:   `Decision: {"route":"local"}`,
+			wantRoute: "local",
+		},
+		{
+			name:      "prose suffix after JSON",
+			content:   `{"route":"frontier"} hope that helps`,
+			wantRoute: "frontier",
+		},
+		{
+			name:      "prose on both sides of JSON",
+			content:   `Sure! Here it is: {"route":"local"} — cheers`,
+			wantRoute: "local",
+		},
+		{
+			name:      "nested braces inside string value",
+			content:   `{"route":"local","note":"a {b} c"}`,
+			wantRoute: "local",
+		},
+		{
+			name:      "escaped quote inside string value",
+			content:   `{"route":"local","note":"a \"quoted\" {value}"}`,
+			wantRoute: "local",
+		},
+		{
+			name:      "multiple objects takes first",
+			content:   `{"route":"local"}{"route":"frontier"}`,
+			wantRoute: "local",
+		},
+		{
+			name:    "fenced garbage falls back to error",
+			content: "```json\nnot json inside\n```",
+			wantErr: true,
+		},
+		{
+			name:    "pure garbage",
+			content: "not json at all",
+			wantErr: true,
+		},
+		{
+			name:    "empty content",
+			content: "",
+			wantErr: true,
+		},
+		{
+			name:    "unbalanced braces",
+			content: `{"route":"local"`,
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d, err := parseSLMDecision(tt.content)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseSLMDecision() error = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if d.Route != tt.wantRoute {
+				t.Errorf("Route = %q, want %q", d.Route, tt.wantRoute)
+			}
+		})
+	}
+}
+
+// TestSLMDecideTolerantShapes exercises the full Decide path to confirm
+// that fenced/prose-wrapped SLM responses route correctly end-to-end and
+// that genuinely malformed responses still fall back to frontier.
+func TestSLMDecideTolerantShapes(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string // the SLM "message.content" field value
+		want    Route
+	}{
+		{
+			name:    "fenced json routes local",
+			content: "```json\n{\"route\":\"local\"}\n```",
+			want:    RouteLocal,
+		},
+		{
+			name:    "prose-prefixed routes local",
+			content: `Decision: {"route":"local"}`,
+			want:    RouteLocal,
+		},
+		{
+			name:    "prose-suffixed routes fusion",
+			content: `{"route":"fusion"} done`,
+			want:    RouteFusion,
+		},
+		{
+			name:    "garbage falls back to frontier",
+			content: "totally not json :::",
+			want:    RouteFrontier,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Embed the content as a JSON string so it survives the outer
+			// Ollama envelope unmarshal.
+			inner, _ := json.Marshal(tt.content)
+			body := `{"message":{"content":` + string(inner) + `}}`
+			client := newClient(func(_ *http.Request) (*http.Response, error) {
+				return okBody(body)
+			})
+			c := NewSLMClient("http://x", "m", time.Second, client)
+			got, _ := c.Decide(context.Background(), "x")
+			if got != tt.want {
+				t.Errorf("Decide = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

@@ -60,71 +60,12 @@ services:
       # empty is fine for fully-local routing; frontier-bound requests
       # will 401 until the operator sets it.
       NEXUS_FRONTIER_API_KEY: "${NEXUS_FRONTIER_API_KEY:-}"
-      # Inbound auth gate (issue #37). When set on the host, the proxy
-      # requires `Authorization: Bearer <key>` or `X-API-Key` on
-      # /v1/chat/completions. Leave unset for an unauthenticated local
-      # dev compose stack. /healthz stays exempt for healthchecks.
-      NEXUS_PROXY_API_KEY: "${NEXUS_PROXY_API_KEY:-}"
       # The default path (./nexus-telemetry.jsonl) resolves to the
       # container's WORKDIR (/tmp), which is fine — pinning it here
       # makes the contract explicit and survives a future WORKDIR move.
       NEXUS_TELEMETRY_PATH: "/tmp/nexus-telemetry.jsonl"
-      # TLS termination (issue #39). When both cert and key paths are
-      # set, the proxy serves HTTPS instead of plain HTTP. Mount the
-      # cert/key into the container via the volumes below and supply
-      # the in-container paths here. Leave both unset for plaintext.
-      NEXUS_TLS_CERT: "${NEXUS_TLS_CERT:-}"
-      NEXUS_TLS_KEY: "${NEXUS_TLS_KEY:-}"
-      # When true alongside TLS active, start a :80 → HTTPS 301 redirect.
-      NEXUS_TLS_REDIRECT: "${NEXUS_TLS_REDIRECT:-false}"
-      # Kubernetes-style readiness (issue #42). "degraded" always
-      # returns 200 so a transient Ollama outage does not trigger a
-      # compose `unhealthy` event; flip to "strict" when the operator
-      # wants the container removed from the rotation when neither
-      # Ollama nor the frontier is reachable.
-      NEXUS_READINESS_MODE: "${NEXUS_READINESS_MODE:-degraded}"
     ports:
       - "8000:8000"
-      # When TLS is enabled, map 443 too (and 80 for the redirect if
-      # NEXUS_TLS_REDIRECT=true). Uncomment as needed.
-      # - "443:8443"
-      # - "80:80"
-    healthcheck:
-      # /readyz returns 200 when the proxy can serve traffic (or
-      # always in degraded mode) and 503 only when neither Ollama nor
-      # the frontier can serve (strict mode). Mirrors the K8s
-      # readinessProbe contract so a future k8s deployment can lift
-      # this block verbatim (issue #42 AC).
-      #
-      # The current Dockerfile uses gcr.io/distroless/static-debian12,
-      # which ships neither wget nor curl. Compose v2 will mark the
-      # service `unhealthy` whenever this test exits non-zero — so
-      # this block will only produce green healthchecks after either:
-      #   (a) the runtime image is switched to one with a busybox /
-      #       wget layer, or
-      #   (b) a sidecar / external checker is used (the same role
-      #       k8s readinessProbe plays in production).
-      # The block is still documented here so the contract is
-      # machine-readable and a future image update gets the
-      # healthcheck for free without a compose rewrite. The
-      # Dockerfile's `HEALTHCHECK NONE` is the canonical in-image
-      # stance until (a) or (b) lands.
-      test: ["CMD", "wget", "-qO-", "http://localhost:8000/readyz"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      # Give the boot-time RAG index + health probe a moment to
-      # settle before the first probe; otherwise the very first poll
-      # can race the boot RAG timeout and produce a spurious
-      # "unhealthy" event.
-      start_period: 15s
-    volumes:
-      # Read-only mount for TLS cert/key (issue #39). The host paths are
-      # supplied via NEXUS_TLS_CERT / NEXUS_TLS_KEY on the host; mount a
-      # directory so a cert rotation only needs a file swap, not a
-      # compose restart. Adjust the host side to your cert location
-      # (e.g. /etc/letsencrypt/live/<domain>).
-      - "${NEXUS_TLS_DIR:-./certs}:/etc/nexus/tls:ro"
     restart: unless-stopped
 
 volumes:

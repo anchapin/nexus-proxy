@@ -14,20 +14,18 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
+	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/middleware"
-	"github.com/anchapin/nexus-proxy/internal/observability"
-	"github.com/anchapin/nexus-proxy/internal/providers"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
-	"github.com/anchapin/nexus-proxy/internal/tracing"
 	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
 
@@ -88,6 +86,90 @@ type QualityObserverFunc func(QualityEvent)
 // Submit implements QualityObserver.
 func (f QualityObserverFunc) Submit(e QualityEvent) { f(e) }
 
+// RouteDecisionEvent is emitted to the RouteDecisionObserver hook
+// once per proxied request, immediately after the planner returns
+// its Decision (issue #74). It mirrors the same fields the handler
+// stamps on the X-Nexus-Route-* response headers so the observer and
+// the response surface always agree. Observers use this for
+// Prometheus counters, dashboards, and any other out-of-band metric
+// that needs to attribute a route to its planning stage without
+// re-running the planner.
+type RouteDecisionEvent struct {
+	RequestID  string
+	Route      string
+	Source     string
+	Reason     string
+	Confidence float64
+	TaskType   string
+}
+
+// RouteDecisionObserver is the hook invoked once per proxied request
+// after the planner returns. Implementations must be safe for
+// concurrent use from many goroutines; the handler invokes Observe
+// on the same request goroutine so observers should not block for
+// long (a few atomic increments is fine; a network call is not).
+// Nil is treated as "no observer"; the hot path is unaffected.
+type RouteDecisionObserver interface {
+	Observe(RouteDecisionEvent)
+}
+
+// RouteDecisionObserverFunc adapts a plain function to the
+// RouteDecisionObserver interface so wiring from main.go stays a
+// one-liner.
+type RouteDecisionObserverFunc func(RouteDecisionEvent)
+
+// Observe implements RouteDecisionObserver.
+func (f RouteDecisionObserverFunc) Observe(e RouteDecisionEvent) { f(e) }
+
+// Rejection reason constants (issue #119). These are the label values
+// that appear in the nexus_requests_rejected_total{reason} Prometheus
+// family. They are exported so the rate-limit middleware (which lives
+// in a separate package) and main.go's wiring can reference the same
+// vocabulary without importing internal/observability — the strings
+// flow through the RejectionObserver hook.
+const (
+	// RejectionMethod marks a 405 Method Not Allowed response.
+	RejectionMethod = "method"
+	// RejectionBodyTooLarge marks a 413 Payload Too Large response
+	// (request body exceeded NEXUS_MAX_BODY_BYTES).
+	RejectionBodyTooLarge = "body_too_large"
+	// RejectionBadRequest marks a generic 400 Bad Request response
+	// (invalid JSON, missing messages array, unreadable body,
+	// strict-mode prompt-injection rejection).
+	RejectionBadRequest = "bad_request"
+	// RejectionRateLimit marks a 429 Too Many Requests response
+	// emitted by the rate-limit middleware. The reason is recorded
+	// by the middleware hook wired in main.go.
+	RejectionRateLimit = "rate_limit"
+)
+
+// RejectionEvent carries the minimal context a rejection observer
+// needs: which request was rejected and why. The handler dispatches
+// one per early-return path (issue #119) so the Prometheus counter
+// and any out-of-band sink can report rejection rate alongside
+// nexus_requests_total.
+type RejectionEvent struct {
+	RequestID string
+	Reason    string
+}
+
+// RejectionObserver is the hook invoked once per request that the
+// proxy rejects before it reaches an upstream (405 / 413 / 400 / 429).
+// Same invariants as the other observer hooks: safe for concurrent
+// use, must not block, nil means "no observer". The handler does not
+// import the observability package; main.go wires a closure that
+// forwards to RouteCounters.ObserveRejection.
+type RejectionObserver interface {
+	ObserveRejection(RejectionEvent)
+}
+
+// RejectionObserverFunc adapts a plain function to the
+// RejectionObserver interface.
+type RejectionObserverFunc func(RejectionEvent)
+
+// ObserveRejection implements RejectionObserver.
+func (f RejectionObserverFunc) ObserveRejection(e RejectionEvent) { f(e) }
+
 // MetricsEvent carries the per-request data needed by the savings
 // dashboard (issue #4). Fields track the full Round-trip metrics:
 // route/model/input-tokens are routing dimensions; TOON/RAG/cost are
@@ -95,15 +177,24 @@ func (f QualityObserverFunc) Submit(e QualityEvent) { f(e) }
 // one of these after every proxied request (success, failure, or
 // short-circuit) and dispatches it to the configured MetricsObserver.
 //
-// TaskType (issue #44) carries the SLM's self-reported category
-// (e.g. "debugging", "refactoring"). Empty when the SLM was not
-// consulted (guardrail / DSL hits take the deterministic path and
-// have no task-type signal); the SQLite schema defaults the column
-// to "" so this stays a no-op for non-SLM dispatches.
-//
 // Mirrors internal/metrics.Request so a tiny adapter in main.go can
 // forward directly without translation — kept here as a separate
 // type so the handlers package stays free of the metrics import.
+//
+// FusionArbiterSkipped (issue #48) is true only for route=fusion
+// requests that streamed the speculative panel-member answer and
+// terminated without invoking the arbiter (panel agreement, or one
+// member failed). False in every other case so the dashboard can
+// report the "fusion agreement rate" as a single ratio.
+//
+// RouteSource / RouteReason / SLMConfidence / SLMTaskType (issue #74)
+// carry the planner's Decision metadata. RouteSource is one of
+// guardrail / dsl / slm / slm-error / escalation; RouteReason is the
+// short machine-readable detail; SLMConfidence is the [0,1]
+// confidence value the SLM was called with (0.5 neutral, 0 for
+// non-SLM stages); SLMTaskType is the Categorize() bucket. The
+// dashboard joins these to answer "what fraction of frontier traffic
+// came from a low-confidence SLM escalation?".
 type MetricsEvent struct {
 	Timestamp         time.Time
 	RequestID         string
@@ -115,19 +206,25 @@ type MetricsEvent struct {
 	RAGFilename       string
 	EstimatedCostUSD  float64
 
-	OutputTokens   int
-	TTFTMs         int64
-	TotalLatencyMs int64
-	TPS            float64
-	Streaming      bool
-	Error          string
+	// BaselineCostUSD is what the request would have cost at the
+	// configured frontier baseline rate (issue #73). SavingsUSD is
+	// max(BaselineCostUSD - EstimatedCostUSD, 0).
+	BaselineCostUSD float64
+	SavingsUSD      float64
 
-	// TaskType is the SLM-reported prompt category (issue #44).
-	// Empty when the SLM was not consulted or when the legacy SLM
-	// shape did not include the field. Populated verbatim from the
-	// Decision — see router.TaskTypeUnknown for the "no opinion"
-	// sentinel the parser uses when the field is absent.
-	TaskType string
+	OutputTokens         int
+	TTFTMs               int64
+	TotalLatencyMs       float64
+	TPS                  float64
+	Streaming            bool
+	FusionArbiterSkipped bool
+	ToolCallCount        int
+	Error                string
+
+	RouteSource   string
+	RouteReason   string
+	SLMConfidence float64
+	SLMTaskType   string
 }
 
 // MetricsObserver is the hook the chat handler invokes once per
@@ -146,20 +243,6 @@ type MetricsObserverFunc func(MetricsEvent)
 
 // Submit implements MetricsObserver.
 func (f MetricsObserverFunc) Submit(e MetricsEvent) { f(e) }
-
-// ObservabilityObserver is the hook the chat handler invokes once per
-// proxied request with an observability.ObservabilityEvent payload
-// (issue #40). The in-process Prometheus collector
-// (internal/observability.Collector) implements this interface
-// directly — handlers imports that leaf package (no cycle), so main.go
-// wires the collector in without a field-copy adapter. Same invariants
-// as MetricsObserver:
-//   - safe to call from many goroutines;
-//   - must not block (the collector does only atomic increments);
-//   - may be nil (treated as "no collector"; hot path is unaffected).
-type ObservabilityObserver interface {
-	Submit(observability.ObservabilityEvent)
-}
 
 // BudgetObserver is the dynamic VRAM-budget hook the chat handler
 // consults before falling back to the static `NEXUS_TOKEN_GUARDRAIL`
@@ -205,21 +288,24 @@ func (b BudgetObserverFunc) BudgetSource() string {
 	return b.Source()
 }
 
-// SpendGuard is the rolling daily-budget hook the chat handler
-// consults before dispatching a RouteFrontier request (issue #38).
-// When WouldExceed returns true the handler returns HTTP 429
-// "Daily frontier budget exceeded" instead of dispatching — local
-// routing is never gated. After a frontier request completes
-// (success or upstream error) the handler calls Record so the
-// rolling 24-hour window stays accurate.
+// LocalLimiter bounds the number of concurrent local-route requests
+// the proxy issues against the local Ollama instance (issue #81).
+// Acquire blocks until a slot is available or ctx is cancelled; on
+// success it returns a release function the caller MUST invoke exactly
+// once when the local upstream work is done. On cancellation it returns
+// a non-nil error and a nil release so the caller skips the dispatch.
 //
-// Implementations must be safe to call concurrently from many
-// request goroutines. A nil SpendGuard disables the gate entirely
-// (the pre-issue-#38 behaviour), so callers can leave Deps.SpendGuard
-// unset without any per-request nil-check overhead.
-type SpendGuard interface {
-	WouldExceed(amount float64) bool
-	Record(amount float64)
+// Implementations must be safe for concurrent use by many goroutines
+// (the chat handler is itself concurrent). The concrete implementation
+// lives in internal/concurrencylimit; main.go wires it so the handlers
+// package never imports that package (same dependency direction as the
+// judge / quality / probe observers).
+//
+// A nil LocalLimiter means "no limit" — the pre-#81 unlimited behaviour
+// — so unit tests and deployments that leave NEXUS_LOCAL_MAX_CONCURRENT
+// unset are byte-for-byte identical.
+type LocalLimiter interface {
+	Acquire(ctx context.Context) (release func(), err error)
 }
 
 // Deps bundles the collaborators the chat handler needs. Wiring them
@@ -227,9 +313,20 @@ type SpendGuard interface {
 type Deps struct {
 	Config          config.Config
 	Client          upstream.Client // http.Client satisfies this interface
-	RAG             *rag.Store
+	RAG             rag.RAGStore
 	SLM             *router.SLMClient
 	FormattingRegex *regexp.Regexp
+
+	// Confidence is the optional judge-guided adaptive routing store
+	// (issue #47). When non-nil the handler categorizes the prompt,
+	// looks up the local model's historical confidence for that
+	// category, and passes it to the SLM via DecideWithConfidence so a
+	// low-confidence category biases toward frontier. When nil (the
+	// default, and always when the judge is disabled) the handler uses
+	// the plain neutral Decide path — routing is byte-for-byte identical
+	// to the pre-issue-47 behaviour. The handler talks to router, never
+	// judge; main.go bridges JudgeScore -> RecordOutcome.
+	Confidence router.ConfidenceStore
 
 	// JudgeObserver is optional. When nil, the handler does not
 	// buffer the streamed response for judge sampling — every
@@ -263,16 +360,6 @@ type Deps struct {
 	// a closure that forwards to metricsStore.Submit.
 	MetricsObserver MetricsObserver
 
-	// ObservabilityObserver is optional. When non-nil, the handler
-	// dispatches one observability.ObservabilityEvent per proxied
-	// request after the upstream response flushes, carrying the
-	// routing/error/RAG/TOON/degraded flags, token sums, cost, and
-	// latency dimensions the Prometheus collector (issue #40) needs.
-	// The collector increments only sync/atomic primitives, so Submit
-	// is non-blocking and safe to call from the request goroutine.
-	// When nil the handler skips the dispatch entirely (zero overhead).
-	ObservabilityObserver ObservabilityObserver
-
 	// Recorder receives one record per proxied request. Never nil at
 	// runtime: Chat() installs telemetry.Noop{} when the caller
 	// passes a zero value, so downstream code can invoke Record
@@ -297,44 +384,51 @@ type Deps struct {
 	// probe is wired.
 	BudgetObserver BudgetObserver
 
-	// Limiter is the VRAM-aware concurrency gate (issue #35). When
-	// non-nil the handler acquires a slot before dispatching any
-	// RouteLocal request (and before the local panel member of
-	// RouteFusion); waiters queue-and-wait up to
-	// Config.LocalQueueTimeout, after which the request is
-	// fast-promoted to frontier via SkipLocal and the response
-	// carries X-Nexus-Overflow: true. RouteFrontier is never
-	// gated.
-	//
-	// Optional: a nil Limiter preserves the pre-issue-#35
-	// unbounded behaviour exactly, which is what every existing
-	// unit test relies on. The chat hot path consults Config
-	// alongside the receiver so a misconfigured (max<=0) Limiter
-	// is also treated as disabled.
-	Limiter *concurrencylimit.Limiter
+	// LocalLimiter bounds concurrent local-route requests (issue
+	// #81). When non-nil the handler Acquires a slot before issuing
+	// the local upstream dispatch and Releases it once the dispatch
+	// returns. The effective slot count is min(ceiling, freeVRAM/
+	// bytesPerSlot) recomputed from the latest probe snapshot on
+	// every Acquire, so a thermal-throttle or model-swap event that
+	// drops free VRAM throttles the next request automatically. Nil
+	// means "no limit" (pre-#81 unlimited behaviour); the field is
+	// left nil by Chat() when the operator did not set
+	// NEXUS_LOCAL_MAX_CONCURRENT so the hot path is unchanged.
+	LocalLimiter LocalLimiter
 
-	// SpendGuard is the rolling daily-budget gate for RouteFrontier
-	// (issue #38). When non-nil the handler checks WouldExceed before
-	// dispatching to the frontier; if the check returns true the
-	// handler returns 429 "Daily frontier budget exceeded" instead.
-	// Local and fusion routing are never gated. After a frontier
-	// request completes the handler calls Record so the 24h window
-	// stays accurate. A nil SpendGuard disables the gate entirely
-	// (backward compatible).
-	SpendGuard SpendGuard
+	// LocalCooldown arms a short cooldown after the cascade detects
+	// a local (Ollama) failure (issue #80). While active, subsequent
+	// route=local and route=fusion requests skip the local step
+	// entirely (same path as the health-unhealthy skip) and are
+	// served by the fallback route. The response is stamped with
+	// X-Nexus-Local-Cooldown: true so clients can detect the
+	// degradation. Nil means the circuit is disabled
+	// (NEXUS_LOCAL_COOLDOWN=0); the hot path is byte-for-byte
+	// identical to the pre-#80 behaviour.
+	LocalCooldown *circuit.Cooldown
 
-	// Tracer emits spans for each request phase (issue #41). The
-	// exporter owns the W3C traceparent parsing, sampling decision,
-	// and OTLP/JSON export; the handler just wraps each phase in
-	// a child span and stamps the per-phase attributes (route,
-	// model, input_tokens, ttft_ms, total_latency_ms, ...).
-	//
-	// Optional: a nil Tracer is treated as "tracing disabled" so
-	// every method call short-circuits without producing a span or
-	// allocating beyond a nil-check. Chat() does NOT substitute a
-	// no-op exporter — the handler does the nil-check inline so the
-	// hot path avoids an unnecessary indirection when tracing is off.
-	Tracer *tracing.Exporter
+	// RouteDecisionObserver is invoked once per proxied request
+	// with the planner's Decision metadata (issue #74). Implementations
+	// must be safe for concurrent use; the handler invokes the
+	// observer on the request goroutine right after planner.Plan
+	// returns, so the observer should not block for long. Nil is
+	// treated as "no observer"; the hot path is unaffected. The
+	// handler does not import the observability package — main.go
+	// wires a closure that adapts the event to the in-process
+	// route counter.
+	RouteDecisionObserver RouteDecisionObserver
+
+	// RejectionObserver is invoked once per request that the proxy
+	// rejects before it reaches an upstream (issue #119): 405 method,
+	// 413 body-too-large, 400 bad-request, and strict-mode
+	// prompt-injection rejections. The rate-limit middleware's 429
+	// path is wired separately in main.go because it fires before
+	// the chat handler. Implementations must be safe for concurrent
+	// use and must not block. Nil is treated as "no observer"; the
+	// hot path is unaffected. The handler does not import the
+	// observability package — main.go wires a closure that adapts
+	// the event to the in-process rejection counter.
+	RejectionObserver RejectionObserver
 
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
@@ -375,6 +469,14 @@ const DefaultObservedCap = 256 * 1024 // 256 KiB
 // Every proxied request — success, failure, or short-circuit — emits
 // exactly one telemetry.Record via Recorder so the issue #16 dashboard
 // can answer "what fraction of traffic failed in the last hour?".
+//
+// Issue #119: requests the proxy REJECTS before routing (405 method,
+// 413 body-too-large, 400 bad-request, strict-mode prompt-injection)
+// also emit exactly one record (route="rejected") AND fire the
+// RejectionObserver so the nexus_requests_rejected_total{reason}
+// Prometheus counter stays in sync with the response surface. The
+// rate-limit middleware's 429 path is instrumented separately (it fires
+// before this handler) via a hook wired in main.go.
 func Chat(d Deps) http.Handler {
 	if d.maxObservedBytes <= 0 {
 		d.maxObservedBytes = DefaultObservedCap
@@ -386,29 +488,62 @@ func Chat(d Deps) http.Handler {
 		reqID := requestID(r)
 		started := time.Now()
 
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-			return
+		// Debug trace scaffolding (issue #33). Allocated up front so
+		// each lifecycle step can populate its sub-trace; emitted as
+		// a single batch at the very end. The trace variable is a
+		// single DebugTrace value — not a pointer — so the hot path
+		// (Debug=false) never allocates at all. The conditional at
+		// emit time keeps the production cost at zero.
+		var trace DebugTrace
+		trace.Request.RequestID = reqID
+		trace.Request.Stream = true // overridden after parse if harness says stream=false
+		if d.Config.Debug {
+			slog.Debug("[DEBUG] handler entered",
+				slog.String("request_id", reqID),
+			)
 		}
 
-		// Distributed tracing (issue #41). Honour an inbound W3C
-		// `traceparent` so an upstream caller can attach the proxy
-		// to its trace; otherwise mint a fresh trace id. The
-		// exporter's sampler decides per-trace whether the spans
-		// are actually exported, so NEXUS_TRACING_SAMPLE_RATE=0
-		// transparently skips the whole subtree.
-		var traceCtx tracing.Context
-		if tp := r.Header.Get("traceparent"); tp != "" {
-			if traceID, spanID, ok := tracing.ParseTraceparent(tp); ok {
-				traceCtx = tracing.Context{TraceID: traceID, SpanID: spanID}
+		// recordRejection (issue #119) emits the terminal signal for
+		// every early-return path: one telemetry Record (route=
+		// "rejected") OR one MetricsEvent when the metrics store is
+		// wired, plus one RejectionObserver dispatch so the
+		// nexus_requests_rejected_total{reason} counter increments.
+		// Centralising the recording here means every `return` below
+		// that calls this closure honours the doc-comment promise
+		// ("every request emits exactly one record"). The closure
+		// captures started/reqID so callers only pass the reason.
+		recordRejection := func(reason string) {
+			totalMs := float64(time.Since(started).Microseconds()) / 1000.0
+			ts := time.Now().UTC()
+			if d.MetricsObserver != nil {
+				d.MetricsObserver.Submit(MetricsEvent{
+					Timestamp:      ts,
+					RequestID:      reqID,
+					Route:          "rejected",
+					Error:          reason,
+					TotalLatencyMs: totalMs,
+				})
+			} else {
+				d.Recorder.Record(telemetry.Record{
+					Timestamp:      ts,
+					RequestID:      reqID,
+					Route:          "rejected",
+					TotalLatencyMs: totalMs,
+					Error:          reason,
+				})
+			}
+			if d.RejectionObserver != nil {
+				d.RejectionObserver.ObserveRejection(RejectionEvent{
+					RequestID: reqID,
+					Reason:    reason,
+				})
 			}
 		}
-		var rootCtx tracing.Context
-		var rootSpan *tracing.Span
-		if d.Tracer != nil {
-			rootCtx, rootSpan = d.Tracer.StartSpan(traceCtx, "nexus.chat_completions")
-			defer rootSpan.End()
-			rootSpan.SetAttr("request_id", reqID)
+
+		if r.Method != http.MethodPost {
+			recordRejection(RejectionMethod)
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
 		}
 
 		// Hard cap on request body (issue #11). Wrap with
@@ -416,44 +551,16 @@ func Chat(d Deps) http.Handler {
 		// POST cannot exhaust proxy memory; MaxBytesReader caps
 		// reads at the limit and surfaces *http.MaxBytesError on
 		// overflow, which we translate to 413 below.
-		//
-		// Tracing (issue #71): wrap the read in a span named
-		// "request.body_size" so a 413 in the trace view is
-		// explained by the limit rather than appearing as an
-		// orphan error. When the chat handler created its own
-		// root span above, attach to it (rootCtx); otherwise the
-		// helper reads the parent from r.Context() — operators
-		// running with the tracing middleware in front get the
-		// RequestMiddleware-installed parent.
 		maxBytes := d.Config.EffectiveMaxBodyBytes()
-		var bodySpan *tracing.Span
-		if tracing.Enabled() {
-			var bodyCtx context.Context
-			var s *tracing.Span
-			if rootCtx.TraceID != "" {
-				var newCtx tracing.Context
-				newCtx, s = tracing.StartSpan(rootCtx, "request.body_size")
-				bodyCtx = tracing.WithSpanContext(r.Context(), newCtx)
-			} else {
-				bodyCtx, s = tracing.StartSpanFromContext(r.Context(), "request.body_size")
-			}
-			bodySpan = s
-			r = r.WithContext(bodyCtx)
-			defer bodySpan.End()
-			bodySpan.SetAttr("max_bytes", maxBytes)
-		}
 		r.Body = http.MaxBytesReader(w, r.Body, int64(maxBytes))
 
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
 			var maxErr *http.MaxBytesError
 			if errors.As(err, &maxErr) {
+				recordRejection(RejectionBodyTooLarge)
 				writeJSONError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
 					"Request body exceeds NEXUS_MAX_BODY_BYTES (%d bytes)", maxBytes))
-				if bodySpan != nil {
-					bodySpan.SetAttr("outcome", "oversized")
-					bodySpan.SetStatus(tracing.StatusError, "request_body_too_large")
-				}
 				slog.Warn("rejected oversized request",
 					slog.String("remote", r.RemoteAddr),
 					slog.Int("limit_bytes", maxBytes),
@@ -461,101 +568,140 @@ func Chat(d Deps) http.Handler {
 				)
 				return
 			}
-			if bodySpan != nil {
-				bodySpan.SetStatus(tracing.StatusError, "read_failed")
-			}
+			recordRejection(RejectionBadRequest)
 			http.Error(w, "Failed to read request", http.StatusBadRequest)
 			return
 		}
-		if bodySpan != nil {
-			bodySpan.SetAttr("bytes_read", len(bodyBytes))
-		}
 		var body map[string]interface{}
 		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			recordRejection(RejectionBadRequest)
 			http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
 			return
 		}
 		rawMessages, ok := body["messages"].([]interface{})
 		if !ok {
+			recordRejection(RejectionBadRequest)
 			http.Error(w, "Invalid or missing messages array", http.StatusBadRequest)
 			return
 		}
 
-		messages := middleware.ApplyPromptEngineering(rawMessages, d.Config.MetaPrompt)
-		latestPrompt := middleware.ExtractLatestUserPrompt(messages)
-		var ragInjected bool
-		var ragFilename string
-		if d.Tracer != nil {
-			_, ragSpan := d.Tracer.StartSpan(rootCtx, "rag.retrieve")
-			ragSpan.SetAttr("threshold", d.Config.RAGThreshold)
-			if ex, score, err := d.RAG.Retrieve(r.Context(), latestPrompt); err == nil && ex != nil {
-				messages = middleware.InjectRAG(messages, rag.FormatInjection(ex))
-				slog.Info("rag hit",
-					slog.String("filename", ex.Filename),
-					slog.Float64("score", score),
-					slog.String("request_id", reqID),
-				)
-				ragInjected = true
-				ragFilename = ex.Filename
-				ragSpan.SetAttr("filename", ex.Filename)
-				ragSpan.SetAttr("score", score)
-				ragSpan.SetAttr("injected", true)
-				_ = score
-			} else {
-				ragSpan.SetAttr("injected", false)
-			}
-			ragSpan.End()
-		} else {
-			if ex, score, err := d.RAG.Retrieve(r.Context(), latestPrompt); err == nil && ex != nil {
-				messages = middleware.InjectRAG(messages, rag.FormatInjection(ex))
-				slog.Info("rag hit",
-					slog.String("filename", ex.Filename),
-					slog.Float64("score", score),
-					slog.String("request_id", reqID),
-				)
-				ragInjected = true
-				ragFilename = ex.Filename
-				_ = score
+		// Capture the inbound shape for the debug trace BEFORE any
+		// middleware mutates messages. Populating these fields is
+		// cheap (a few assignments) so we do it unconditionally; the
+		// DebugTrace.Emit call is the only path that actually reads
+		// them, and that's gated by d.Config.Debug below.
+		trace.Request.Messages = len(rawMessages)
+		trace.Request.InboundBodyBytes = len(bodyBytes)
+		if m, ok := body["model"].(string); ok {
+			trace.Request.ModelRequested = m
+		}
+		if s, ok := body["stream"].(bool); ok {
+			trace.Request.Stream = s
+		}
+
+		// Prompt-injection hardening (issue #76). In warn and strict
+		// modes the proxy scans the user-supplied system messages for
+		// suspicious override patterns BEFORE applying its own policy.
+		// Strict mode rejects the request with a 400 OpenAI-style
+		// error; warn mode logs and continues. Off mode (default)
+		// skips detection entirely for zero overhead.
+		if d.Config.PromptInjectionIsolated() {
+			hits := middleware.DetectSuspiciousSystem(rawMessages)
+			if len(hits) > 0 {
+				if d.Config.PromptInjectionMode == middleware.InjectionModeStrict {
+					recordRejection(RejectionBadRequest)
+					writeJSONError(w, http.StatusBadRequest,
+						"Request rejected: suspicious prompt-injection pattern detected in system message")
+					slog.Warn("strict mode rejected suspicious system message",
+						slog.Int("patterns", len(hits)),
+						slog.String("request_id", reqID),
+					)
+					return
+				}
+				middleware.LogSuspicious(hits, reqID)
 			}
 		}
+
+		// Apply prompt engineering. In off mode (default) the legacy
+		// append path is used — byte-for-byte backward compatible.
+		// In warn/strict modes the isolated variant inserts a dedicated
+		// leading system message wrapped in proxy-policy delimiters so
+		// trusted text always precedes user-supplied system content.
+		var messages []interface{}
+		if d.Config.PromptInjectionIsolated() {
+			messages = middleware.ApplyPromptEngineeringIsolated(rawMessages, d.Config.MetaPrompt)
+		} else {
+			messages = middleware.ApplyPromptEngineering(rawMessages, d.Config.MetaPrompt)
+		}
+		latestPrompt := middleware.ExtractLatestUserPrompt(messages)
+		// Record whether the meta-prompt actually appended to a
+		// system slot — "applied" only when there is now a system
+		// message containing the operator-configured enhancement.
+		trace.Transforms.PromptEngineeringApplied =
+			d.Config.MetaPrompt != "" && len(messages) > 0 &&
+				containsSystemWith(messages, d.Config.MetaPrompt)
+		var ragInjected bool
+		var ragFilename string
+		var ragScore float64
+		if ex, score, err := d.RAG.Retrieve(r.Context(), latestPrompt); err == nil && ex != nil {
+			messages = middleware.InjectRAG(messages, rag.FormatInjection(ex))
+			slog.Info("rag hit",
+				slog.String("filename", ex.Filename),
+				slog.Float64("score", score),
+				slog.String("request_id", reqID),
+			)
+			ragInjected = true
+			ragFilename = ex.Filename
+			ragScore = score
+		}
+		trace.Transforms.RAGInjected = ragInjected
+		trace.Transforms.RAGFilename = ragFilename
+		trace.Transforms.RAGScore = ragScore
 		// Snapshot the JSON size BEFORE TOON compression so the
 		// metrics observer can attribute tokens saved by the
 		// round-trip pass. Uses the cheap "4 chars per token"
 		// heuristic the rest of the project uses for telemetry
 		// (see internal/telemetry.EstimateTokens).
 		preCompressionChars := totalMessageChars(messages)
-		var toonSpan *tracing.Span
-		if d.Tracer != nil {
-			_, toonSpan = d.Tracer.StartSpan(rootCtx, "toon.compress")
-			toonSpan.SetAttr("pre_chars", preCompressionChars)
-		}
-		toonCompressed := middleware.CompressJSONBlocks(messages)
-		if toonCompressed {
-			messages = middleware.AppendSystemNote(messages, d.Config.TOONNotice)
+		trace.Transforms.TOONBytesBefore = preCompressionChars
+		if middleware.CompressJSONBlocks(messages) {
+			if d.Config.PromptInjectionIsolated() {
+				messages = middleware.AppendSystemNoteIsolated(messages, d.Config.TOONNotice)
+			} else {
+				messages = middleware.AppendSystemNote(messages, d.Config.TOONNotice)
+			}
 			slog.Info("toon compressed messages", slog.String("request_id", reqID))
 		}
+		postCompressionChars := totalMessageChars(messages)
+		trace.Transforms.TOONApplied = postCompressionChars != preCompressionChars
+		trace.Transforms.TOONBytesAfter = postCompressionChars
+		trace.Transforms.TOONTokensSaved = totalTokenSavings(preCompressionChars, postCompressionChars)
 		body["messages"] = messages
 		latestPrompt = middleware.ExtractLatestUserPrompt(messages)
-		if toonSpan != nil {
-			toonSpan.SetAttr("compressed", toonCompressed)
-			toonSpan.End()
-		}
+		// Promote the post-middleware prompt length into the
+		// request trace so operators can see what the SLM/router
+		// actually consumed. The pre-middleware count lives on the
+		// TransformTrace; the post-middleware count lives on the
+		// RequestTrace because it is what every later stage sees.
+		trace.Request.EstimatedTokens = len(latestPrompt) / 4
 
-		var route router.Route
-		// slmTaskType is populated only on the SLM branch below
-		// and forwarded into the MetricsEvent the handler emits
-		// after the upstream response flushes (issue #44). It
-		// stays "" for guardrail / DSL hits — the schema defaults
-		// the SQLite column to "" so non-SLM dispatches are
-		// indistinguishable from "no opinion" without an
-		// extra migration.
-		var slmTaskType string
-		// VRAM-aware guardrail (issue #6). When the
-		// BudgetObserver is wired and reports a positive budget,
-		// the dynamic measurement wins; otherwise we fall back to
-		// the operator-configured NEXUS_TOKEN_GUARDRAIL. The source
-		// label travels with the log line so operators can confirm
-		// which path was taken without digging through the source.
+		// --- routing decision (issue #82) ---------------------------------
+		//
+		// The full decision ladder (Guardrail -> DSL -> SLM, with the
+		// judge-guided confidence bias) now lives in router.Planner.
+		// The handler resolves the VRAM budget from the BudgetObserver
+		// (or the static config fallback), delegates the decision to
+		// the planner, and interprets the structured Decision to emit
+		// slog lines and populate the debug trace. This keeps the
+		// planner pure (no HTTP, no logging) and gives the handler a
+		// single call site for routing changes.
+
+		// VRAM-aware guardrail budget (issue #6). When the
+		// BudgetObserver is wired and reports a positive budget, the
+		// dynamic measurement wins; otherwise we fall back to the
+		// operator-configured NEXUS_TOKEN_GUARDRAIL. The source label
+		// travels with the log line so operators can confirm which
+		// path was taken without digging through the source.
 		guardrailBudget := d.Config.TokenGuardrail
 		guardrailSource := "static-fallback"
 		if d.BudgetObserver != nil {
@@ -564,101 +710,99 @@ func Chat(d Deps) http.Handler {
 				guardrailSource = d.BudgetObserver.BudgetSource()
 			}
 		}
-		// Wrap the routing decision in a single span
-		// (route.guardrail|route.dsl|route.slm) so the trace tree
-		// shows which rule fired. The span name is chosen inside
-		// the if/else so the collector displays the actual path
-		// taken without ambiguity.
-		if g, hit := router.Guardrail(latestPrompt, guardrailBudget); hit {
+
+		planner := &router.Planner{
+			SLM:             d.SLM,
+			Confidence:      d.Confidence,
+			FormattingRegex: d.FormattingRegex,
+		}
+		decision := planner.Plan(router.PlanRequest{
+			Prompt:          latestPrompt,
+			GuardrailBudget: guardrailBudget,
+			GuardrailSource: guardrailSource,
+			Context:         r.Context(),
+		})
+		route := decision.Route
+
+		// Surface route-decision metadata on the response and via the
+		// observer hook (issue #74). The four X-Nexus-Route-* headers
+		// let clients and intermediate proxies reason about routing
+		// without scraping logs. Each value is sanitized against
+		// header-injection and bounded by MaxHeaderValue so the SLM
+		// error string (which can echo attacker-influenced text) is
+		// safe to include. The RouteDecisionObserver hook keeps the
+		// in-process counters (Prometheus text exposition in
+		// internal/observability) in sync with the response surface
+		// — the source/escalation story the issue calls out is only
+		// complete when both ship together.
+		routeEvent := RouteDecisionEvent{
+			RequestID:  reqID,
+			Route:      string(decision.Route),
+			Source:     string(decision.Source),
+			Reason:     decision.Reason,
+			Confidence: decision.Confidence,
+			TaskType:   decision.TaskType,
+		}
+		w.Header().Set("X-Nexus-Route", SanitizeHeaderValue(routeEvent.Route))
+		w.Header().Set("X-Nexus-Route-Source", SanitizeHeaderValue(routeEvent.Source))
+		w.Header().Set("X-Nexus-Route-Reason", SanitizeHeaderValue(routeEvent.Reason))
+		w.Header().Set("X-Nexus-Route-Confidence", SanitizeHeaderValue(formatConfidence(routeEvent.Confidence)))
+		if d.RouteDecisionObserver != nil {
+			d.RouteDecisionObserver.Observe(routeEvent)
+		}
+
+		// Emit the slog lines the pre-extraction handler produced, so
+		// existing log-scraping tests and operator dashboards keep
+		// working unchanged. The planner is log-free; the handler owns
+		// the observability surface.
+		switch decision.Source {
+		case router.SourceGuardrail:
 			slog.Info("guardrail forced frontier",
 				slog.String("reason", "vram"),
-				slog.String("budget_source", guardrailSource),
-				slog.Int("budget_tokens", guardrailBudget),
-				slog.Int("estimated_tokens", len(latestPrompt)/4),
+				slog.String("budget_source", decision.BudgetSource),
+				slog.Int("budget_tokens", decision.BudgetTokens),
+				slog.Int("estimated_tokens", decision.EstimatedTokens),
 				slog.String("request_id", reqID),
 			)
-			route = g
-			if d.Tracer != nil {
-				_, rs := d.Tracer.StartSpan(rootCtx, "route.guardrail")
-				rs.SetAttr("budget_source", guardrailSource)
-				rs.SetAttr("budget_tokens", guardrailBudget)
-				rs.SetAttr("estimated_tokens", len(latestPrompt)/4)
-				rs.SetAttr("decision", string(route))
-				rs.End()
-			}
-		} else if r2, hit := router.DSL(latestPrompt, d.FormattingRegex); hit {
+		case router.SourceDSL:
 			slog.Info("dsl match",
-				slog.String("route", string(r2)),
+				slog.String("route", string(decision.Route)),
 				slog.String("request_id", reqID),
 			)
-			route = r2
-			if d.Tracer != nil {
-				_, rs := d.Tracer.StartSpan(rootCtx, "route.dsl")
-				rs.SetAttr("decision", string(route))
-				rs.End()
-			}
-		} else {
+		default:
+			// SLM path (success, error, or escalation). The pre-
+			// extraction handler emitted these debug lines before the
+			// SLM call; we emit them after the planner returns, which
+			// is temporally equivalent for log purposes.
 			slog.Debug("dsl bypassed, asking slm", slog.String("request_id", reqID))
-			decision, err := d.SLM.DecideRich(r.Context(), latestPrompt)
-			if err != nil {
-				slog.Error("slm error, defaulting to frontier",
-					slog.Any("err", err),
-					slog.String("request_id", reqID),
-				)
-				// Reset the decision to the documented safety
-				// net: frontier + "unknown" task_type. Preserve
-				// any zeroed confidence so the escalation gate
-				// below still has a value to compare against
-				// (will not fire because RouteFrontier is not
-				// local / fusion).
-				decision = router.Decision{Route: router.RouteFrontier, TaskType: router.TaskTypeUnknown}
-			}
-
-			// Confidence-aware escalation (issue #44). When the
-			// SLM's confidence is below the operator-configured
-			// threshold and the chosen route is local or fusion
-			// (cheap but riskier than frontier), promote to
-			// frontier so the user gets a confident answer.
-			// Threshold == 0 (the default) is a complete no-op
-			// — preserves the pre-issue-#44 behaviour exactly.
-			// The threshold only takes effect on the SLM
-			// fall-through branch; guardrail / DSL hits pass
-			// through untouched because those decisions are
-			// deterministic, not probabilistic.
-			selectedRoute := decision.Route
-			threshold := d.Config.SLMConfidenceThreshold
-			if threshold > 0 && decision.Confidence < threshold &&
-				(selectedRoute == router.RouteLocal || selectedRoute == router.RouteFusion) {
-				slog.Warn("slm low-confidence escalation",
-					slog.String("from_route", string(selectedRoute)),
-					slog.String("to_route", string(router.RouteFrontier)),
+			if d.Confidence != nil {
+				slog.Debug("adaptive routing confidence",
+					slog.String("category", decision.TaskType),
 					slog.Float64("confidence", decision.Confidence),
-					slog.Float64("threshold", threshold),
-					slog.String("task_type", decision.TaskType),
 					slog.String("request_id", reqID),
 				)
-				selectedRoute = router.RouteFrontier
 			}
-
+			if decision.Source == router.SourceSLMError {
+				slog.Error("slm error, defaulting to frontier",
+					slog.Any("err", errors.New(decision.SLMError)),
+					slog.String("request_id", reqID),
+				)
+			}
 			slog.Info("slm decision",
-				slog.String("route", string(selectedRoute)),
-				slog.Float64("confidence", decision.Confidence),
-				slog.String("task_type", decision.TaskType),
+				slog.String("route", string(decision.Route)),
 				slog.String("request_id", reqID),
 			)
-			route = selectedRoute
-			slmTaskType = decision.TaskType
-			if d.Tracer != nil {
-				_, rs := d.Tracer.StartSpan(rootCtx, "route.slm")
-				rs.SetAttr("decision", string(route))
-				rs.SetAttr("confidence", decision.Confidence)
-				rs.SetAttr("task_type", decision.TaskType)
-				if err != nil {
-					rs.RecordError(err)
-				}
-				rs.End()
-			}
 		}
+
+		// Populate the debug trace from the Decision. The trace reason
+		// uses the planner's source-to-reason mapping so the labels
+		// ("guardrail", "dsl", "slm") are backward-compatible with the
+		// pre-extraction handler.
+		trace.Routing.Route = string(decision.Route)
+		trace.Routing.Reason = decision.Source.TraceReason()
+		trace.Routing.BudgetSource = decision.BudgetSource
+		trace.Routing.BudgetTokens = decision.BudgetTokens
+		trace.Routing.EstimatedTokens = decision.EstimatedTokens
 
 		// Honor the harness's stream flag (issue #10). OpenAI treats
 		// stream as advisory; a stream=false request must receive a
@@ -671,6 +815,10 @@ func Chat(d Deps) http.Handler {
 		if s, ok := body["stream"].(bool); ok && !s {
 			streaming = false
 		}
+		// Refresh the request trace's stream flag with the resolved
+		// value (defaulted to true when the harness omitted it) so
+		// the debug log reflects what the handler actually used.
+		trace.Request.Stream = streaming
 
 		// Wrap the response writer so we can capture TTFT and byte counts
 		// without affecting upstream.Stream's flusher contract.
@@ -679,8 +827,10 @@ func Chat(d Deps) http.Handler {
 			firstWriteAt.CompareAndSwap(0, t.UnixNano())
 		})
 
-		// Graceful degradation (issue #8). When the local Ollama health
-		// poller reports unhealthy we:
+		// Graceful degradation (issue #8) + local-route cooldown
+		// (issue #80). When the local Ollama health poller reports
+		// unhealthy OR the cooldown circuit is active (armed by a
+		// recent cascade-detected local failure) we:
 		//   - skip the local fetch on route=local (the cascade starts
 		//     at frontier, the harness sees frontier content with
 		//     X-Nexus-Degraded: true);
@@ -694,127 +844,145 @@ func Chat(d Deps) http.Handler {
 		// the request. The token guardrail (#6) is consulted first;
 		// when it fires we always go to frontier, so this check
 		// never overrides a guardrail-forced reroute.
+		//
+		// Issue #80: the cooldown closes the window between the
+		// cascade observing a local failure and the health poller
+		// tripping its breaker. Without it, every request in that
+		// window re-attempts the dead local endpoint and pays the
+		// full upstream timeout before falling back.
 		localHealthy := d.Health.IsLocalHealthy()
-		skipLocal := !localHealthy && (route == router.RouteLocal || route == router.RouteFusion)
-		// degraded captures the health-based skip state for the
-		// observability collector (issue #40). It is snapshotted here,
-		// before the concurrency-overflow path below may reassign
-		// skipLocal — overflow is a distinct signal (X-Nexus-Overflow)
-		// and must not inflate the degraded counter.
-		degraded := skipLocal
+		cooldownActive := d.LocalCooldown != nil && d.LocalCooldown.Active()
+		skipLocal := (!localHealthy || cooldownActive) && (route == router.RouteLocal || route == router.RouteFusion)
 		if skipLocal {
 			w.Header().Set("X-Nexus-Degraded", "true")
-			slog.Warn("ollama unhealthy; skipping local arm",
-				slog.String("route", string(route)),
-				slog.String("request_id", reqID),
-			)
+			if cooldownActive {
+				w.Header().Set("X-Nexus-Local-Cooldown", "true")
+				slog.Warn("local-route cooldown active; skipping local arm",
+					slog.String("route", string(route)),
+					slog.String("request_id", reqID),
+				)
+			} else {
+				slog.Warn("ollama unhealthy; skipping local arm",
+					slog.String("route", string(route)),
+					slog.String("request_id", reqID),
+				)
+			}
 		} else {
 			w.Header().Set("X-Nexus-Degraded", "false")
 		}
 
 		var model string
 		var upErr error
-		// Build the traceparent for outbound propagation once we
-		// know the upstream span. Each route branch starts its own
-		// span below, captures the resulting upCtx, and threads
-		// the corresponding traceparent header into the upstream
-		// call so the distributed trace stays correlated end-to-end.
+		var fusionArbiterSkipped bool
+		// toolCallCount is populated from the cascade result on the
+		// local streaming route (issue #72) and forwarded to telemetry
+		// + metrics so the dashboard can report how many tool calls
+		// were preserved. Zero on all other paths.
+		var toolCallCount int
+		// capw is the response-body captureWriter installed for the
+		// local cascade branch when judge/quality observers OR
+		// debug tracing are configured (issue #33). Hoisted out of
+		// the RouteLocal case so the debug emit block at the end of
+		// the handler can read the buffered body preview regardless
+		// of which branch served the request. For route=frontier
+		// the value is nil and the debug trace records an empty
+		// body preview — the operator can still see the request id
+		// and decide whether to enable captureWriter globally in a
+		// follow-up.
+		var capw *captureWriter
 		switch route {
 		case router.RouteFusion:
 			slog.Info("starting fusion panel", slog.String("request_id", reqID))
-
-			// VRAM-aware concurrency gate for the local panel
-			// member (issue #35). Same acquire-or-skip semantics
-			// as RouteLocal above, but we cannot mutate the
-			// outer skipLocal here because the subsequent
-			// Switch-case uses the same variable name to drive
-			// both the cascade SkipLocal and the non-streaming
-			// target. A scoped variable keeps the intent
-			// explicit without changing any other branch.
-			fusionSkipLocal := skipLocal
-			if d.Limiter != nil && d.Config.LocalMaxConcurrent > 0 {
-				if !d.Limiter.Acquire(r.Context(), d.Config.LocalQueueTimeout) {
-					w.Header().Set("X-Nexus-Overflow", "true")
-					slog.Warn("local concurrency limit reached; skipping local panel member",
-						slog.Int("max_concurrent", d.Config.LocalMaxConcurrent),
-						slog.Duration("queue_timeout", d.Config.LocalQueueTimeout),
+			// Issue #48: progressive delivery. When the operator
+			// has not opted out and the harness asked for SSE
+			// (streaming=true), dispatch to PanelStreaming instead
+			// of the legacy Panel. The streaming path races the
+			// two panel members, streams the first to complete as a
+			// speculative OpenAI-compatible SSE chunk, and only
+			// invokes the arbiter when the second member
+			// disagrees. The legacy Panel path remains unchanged
+			// for stream=false / NEXUS_FUSION_PROGRESSIVE=false.
+			//
+			// Debug trace (issue #33): fusion dispatches to two
+			// distinct upstreams (local + frontier) plus a
+			// synthesis arbiter. The trace records the frontier
+			// host as the "primary" target and notes both
+			// panel members via the cascade-free routing — fusion
+			// has no cascade, both panel members run in parallel.
+			trace.Upstream.Route = string(route)
+			trace.Upstream.Streaming = streaming
+			trace.Upstream.Model = d.Config.FrontierModel
+			trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
+			if streaming && d.Config.FusionProgressiveDelivery {
+				var outcome upstream.PanelOutcome
+				outcome, upErr = upstream.PanelStreaming(
+					obs, d.Client,
+					d.Config.OllamaURL, d.Config.LocalModel,
+					d.Config.FrontierURL, d.Config.FrontierModel,
+					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
+					body, latestPrompt, d.Config.FusionTimeout,
+					d.Config.ArbiterTimeout,
+					skipLocal,
+					d.Config.FusionAgreementThreshold,
+				)
+				fusionArbiterSkipped = outcome.ArbiterSkipped
+				if outcome.ArbiterSkipped {
+					slog.Info("fusion arbiter skipped",
+						slog.String("source", outcome.Source),
+						slog.Float64("similarity", outcome.Similarity),
 						slog.String("request_id", reqID),
 					)
-					fusionSkipLocal = true
-				} else {
-					defer d.Limiter.Release()
 				}
+			} else {
+				upErr = upstream.Panel(
+					obs, d.Client,
+					d.Config.OllamaURL, d.Config.LocalModel,
+					d.Config.FrontierURL, d.Config.FrontierModel,
+					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
+					body, latestPrompt, d.Config.FusionTimeout,
+					d.Config.ArbiterTimeout,
+					skipLocal,
+				)
 			}
-
-			var upCtx tracing.Context
-			var upSpan *tracing.Span
-			if d.Tracer != nil {
-				upCtx, upSpan = d.Tracer.StartSpan(rootCtx, "upstream.fusion")
-				upSpan.SetAttr("local_model", d.Config.LocalModel)
-				upSpan.SetAttr("frontier_model", d.Config.FrontierModel)
-				upSpan.SetAttr("skip_local", fusionSkipLocal)
-			}
-			upErr = upstream.Panel(
-				obs, d.Client,
-				d.Config.OllamaURL, d.Config.LocalModel,
-				d.Config.FrontierURL, d.Config.FrontierModel,
-				d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
-				body, latestPrompt, d.Config.FusionTimeout,
-				d.Config.ArbiterTimeout,
-				fusionSkipLocal,
-				upstream.WithTraceparent(tracing.InjectTraceparent(upCtx)),
-			)
 			if upErr != nil {
 				slog.Error("fusion error",
 					slog.Any("err", upErr),
 					slog.String("request_id", reqID),
 				)
-				if upSpan != nil {
-					upSpan.RecordError(upErr)
-				}
 				http.Error(w, "Upstream error", http.StatusBadGateway)
 			}
 			model = d.Config.FrontierModel
-			if upSpan != nil {
-				upSpan.End()
-			}
 
 		case router.RouteLocal:
-			body["model"] = d.Config.LocalModel
-
-			// VRAM-aware concurrency gate (issue #35). At most
-			// Config.LocalMaxConcurrent RouteLocal requests may
-			// dispatch local Ollama simultaneously; waiters queue
-			// for up to Config.LocalQueueTimeout, after which the
-			// request is fast-promoted to frontier via SkipLocal
-			// and X-Nexus-Overflow: true is stamped on the
-			// response. RouteFrontier is never gated.
-			//
-			// Two conditions must be true for the gate to fire:
-			// both the Limiter receiver is non-nil and the operator
-			// actually configured a positive ceiling. A limiter
-			// built with New(<=0) returns nil and the config check
-			// below also disables — so this entire block is a
-			// no-op under NEXUS_LOCAL_MAX_CONCURRENT=0.
-			if d.Limiter != nil && d.Config.LocalMaxConcurrent > 0 {
-				if !d.Limiter.Acquire(r.Context(), d.Config.LocalQueueTimeout) {
-					w.Header().Set("X-Nexus-Overflow", "true")
-					slog.Warn("local concurrency limit reached; promoting to frontier cascade",
-						slog.Int("max_concurrent", d.Config.LocalMaxConcurrent),
-						slog.Duration("queue_timeout", d.Config.LocalQueueTimeout),
+			// VRAM-aware concurrency ceiling (issue #81). Bound the
+			// number of in-flight local-route requests so a small GPU
+			// does not OOM under bursty load. The limiter is optional;
+			// nil means "no limit" (pre-#81 unlimited behaviour). On
+			// acquire failure (ctx cancelled while queued) we surface a
+			// 503 and skip the dispatch — the telemetry Record below
+			// still fires so the rejected request is visible. A
+			// successful acquire registers a deferred release so the
+			// slot is freed once the local dispatch (streaming or
+			// buffered) has fully drained.
+			if d.LocalLimiter != nil {
+				release, lerr := d.LocalLimiter.Acquire(r.Context())
+				if lerr != nil {
+					slog.Warn("local concurrency acquire rejected",
+						slog.Any("err", lerr),
 						slog.String("request_id", reqID),
 					)
-					skipLocal = true
-				} else {
-					// Defer is safe even for the streaming
-					// branch because cas.Run is synchronous
-					// and returns when the response flushes
-					// (or the client disconnects, which still
-					// terminates Run). A panic in Run would
-					// also fire the deferred Release.
-					defer d.Limiter.Release()
+					model = d.Config.LocalModel
+					upErr = lerr
+					trace.Upstream.Route = string(route)
+					trace.Upstream.Streaming = streaming
+					trace.Upstream.Model = model
+					trace.Upstream.TargetHost = HostOfURL(d.Config.OllamaURL)
+					http.Error(w, "Local route busy", http.StatusServiceUnavailable)
+					break
 				}
+				defer release()
 			}
+			body["model"] = d.Config.LocalModel
 
 			// Cascade (issue #14): try local Ollama first, fall back to
 			// configured frontier endpoints (frontier, then z.ai) on
@@ -823,25 +991,13 @@ func Chat(d Deps) http.Handler {
 			// process. CascadeConfig.SkipLocal (issue #8) omits the
 			// local step entirely when the health poller reports
 			// Ollama unreachable, so the cascade starts at frontier
-			// without paying the local timeout. The concurrency
-			// overflow path above re-uses the same SkipLocal knob so
-			// we don't have to thread a parallel flag through the
-			// cascade (issue #35). Hoisted above the stream flag
-			// (issue #10) so both branches share a single configured
-			// cascade; see below for the non-streaming degraded
-			// override.
-			//
-			// Providers (issue #43): when the registry has entries
-			// we hand them straight to BuildLocalCascade so the
-			// fallback list reflects NEXUS_PROVIDERS rather than
-			// the legacy NEXUS_FRONTIER_* + NEXUS_ZAI_* pair. The
-			// legacy fields are passed alongside so callers that
-			// still build CascadeConfig by hand (existing tests)
-			// keep working when Providers is nil.
+			// without paying the local timeout. Hoisted above the
+			// stream flag (issue #10) so both branches share a single
+			// configured cascade; see below for the non-streaming
+			// degraded override.
 			cas := upstream.BuildLocalCascade(upstream.CascadeConfig{
 				LocalURL:      d.Config.OllamaURL,
 				LocalModel:    d.Config.LocalModel,
-				Providers:     d.Config.Providers.FrontierProviders(),
 				FrontierURL:   d.Config.FrontierURL,
 				FrontierModel: d.Config.FrontierModel,
 				FrontierKey:   d.Config.FrontierKey,
@@ -853,25 +1009,17 @@ func Chat(d Deps) http.Handler {
 			})
 
 			// Writer chain (outermost first):
-			//   upstream.Write -> captureWriter (judge + quality tee) ->
-			//   ObservingWriter (telemetry byte count + TTFT) ->
+			//   upstream.Write -> captureWriter (judge + quality tee OR debug) ->
+			//   ObservingWriter (telemetry byte count + TTFT + status) ->
 			//   underlying ResponseWriter.
-			// captureWriter is only installed when at least one
-			// observer is set; otherwise the dispatch writes
-			// directly through obs with zero overhead.
+			// captureWriter is installed when at least one observer
+			// is set OR debug tracing is on (issue #33); otherwise
+			// the dispatch writes directly through obs with zero
+			// overhead.
 			rw := http.ResponseWriter(obs)
-			var cap *captureWriter
-			if d.JudgeObserver != nil || d.QualityObserver != nil {
-				cap = newCaptureWriter(obs, d.maxObservedBytes)
-				rw = cap
-			}
-			var upCtx tracing.Context
-			var upSpan *tracing.Span
-			if d.Tracer != nil {
-				upCtx, upSpan = d.Tracer.StartSpan(rootCtx, "upstream.local")
-				upSpan.SetAttr("local_model", d.Config.LocalModel)
-				upSpan.SetAttr("skip_local", skipLocal)
-				upSpan.SetAttr("streaming", streaming)
+			if d.JudgeObserver != nil || d.QualityObserver != nil || d.Config.Debug {
+				capw = newCaptureWriter(obs, d.maxObservedBytes)
+				rw = capw
 			}
 			if streaming {
 				// Cascade (issue #14): try local Ollama first, fall
@@ -880,13 +1028,21 @@ func Chat(d Deps) http.Handler {
 				// #8) is honoured — when the health poller reports
 				// Ollama unreachable the cascade skips the local step
 				// entirely and starts at frontier.
-				res, err := cas.Run(rw, d.Client, body, upstream.WithTraceparent(tracing.InjectTraceparent(upCtx)))
+				res, err := cas.Run(rw, d.Client, body)
 				logCascadeTelemetry(res, err, reqID)
-				if upSpan != nil {
-					upSpan.SetAttr("cascade_attempted", res.RouteAttempted)
-					upSpan.SetAttr("cascade_served_by", res.ServedBy)
-					upSpan.SetAttr("cascade_attempts", res.Attempts)
-					upSpan.SetAttr("cascade_succeeded", res.Succeeded)
+				// Issue #80: arm the local-route cooldown when the
+				// cascade reports the local step failed before a
+				// fallback served the request. Subsequent requests
+				// within the cooldown window skip local and go
+				// directly to the fallback, avoiding repeated slow
+				// local timeouts until the health poller catches up.
+				if res.LocalStepFailed && d.LocalCooldown != nil {
+					d.LocalCooldown.RecordFailure()
+					slog.Warn("local-route cooldown armed after cascade local failure",
+						slog.String("route_attempted", res.RouteAttempted),
+						slog.String("served_by", res.ServedBy),
+						slog.String("request_id", reqID),
+					)
 				}
 				if err != nil {
 					slog.Error("upstream error",
@@ -894,29 +1050,45 @@ func Chat(d Deps) http.Handler {
 						slog.String("request_id", reqID),
 					)
 					upErr = err
-					if upSpan != nil {
-						upSpan.RecordError(err)
-					}
 					http.Error(w, "Upstream error", http.StatusBadGateway)
 					// fall through: telemetry Record still fires
 					// below so the failed request shows up in the
 					// dashboard.
 				} else {
 					model = d.Config.LocalModel
-					if res.Succeeded && cap != nil {
+					toolCallCount = len(res.ToolCalls)
+					if res.Succeeded && capw != nil {
 						if d.JudgeObserver != nil {
 							d.JudgeObserver.Submit(LocalCompletion{
 								RequestID:   reqID,
 								Instruction: latestPrompt,
-								Output:      cap.Buffer(),
+								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
 							})
 						}
 						if d.QualityObserver != nil {
-							emitDetectedEdits(cap.Buffer(), reqID, d.QualityObserver)
+							emitDetectedEdits(capw.Buffer(), reqID, d.QualityObserver)
 						}
 					}
 				}
+				// Debug trace (issue #33): populate cascade details
+				// once the cascade result is known. Steps come from
+				// the joined RouteAttempted; the runner already
+				// separated them with "->". The frontier host is the
+				// canonical "target" because local has no host
+				// exposed in the URL — operators reading the trace
+				// get the most-actionable piece.
+				trace.Upstream.Route = string(route)
+				trace.Upstream.Streaming = streaming
+				trace.Upstream.Model = model
+				trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
+				if res.RouteAttempted != "" {
+					trace.Upstream.CascadeSteps = strings.Split(res.RouteAttempted, "->")
+				} else {
+					trace.Upstream.CascadeSteps = stepNames(cas.Steps)
+				}
+				trace.Upstream.CascadeServedBy = res.ServedBy
+				trace.Upstream.CascadeSuccess = res.Succeeded
 			} else {
 				// Non-streaming (issue #10): BufferedFetch collects
 				// the full upstream body and writes it as a single
@@ -932,161 +1104,99 @@ func Chat(d Deps) http.Handler {
 				// harness still gets a JSON reply promptly. The
 				// response is tagged via X-Nexus-Degraded=true
 				// (stamped above).
-				//
-				// Issue #43: the fallback target is the registry's
-				// first frontier provider, matching the route=frontier
-				// branch above. The legacy Config.FrontierURL/Key
-				// remain the source when the registry is empty
-				// (e.g. callers that build Config by hand).
 				targetURL := strings.TrimRight(d.Config.OllamaURL, "/") + "/v1/chat/completions"
 				apiKey := ""
-				frontierModel := d.Config.FrontierModel
 				if skipLocal {
-					if frontiers := d.Config.Providers.FrontierProviders(); len(frontiers) > 0 {
-						first := frontiers[0]
-						targetURL = first.URL
-						apiKey = first.APIKey
-						frontierModel = first.Model
-					} else {
-						targetURL = d.Config.FrontierURL
-						apiKey = d.Config.FrontierKey
-					}
+					targetURL = d.Config.FrontierURL
+					apiKey = d.Config.FrontierKey
 				}
-				if err := upstream.BufferedFetch(rw, d.Client, targetURL, apiKey, body, upstream.WithTraceparent(tracing.InjectTraceparent(upCtx))); err != nil {
+				if err := upstream.BufferedFetch(rw, d.Client, targetURL, apiKey, body); err != nil {
 					slog.Error("upstream error",
 						slog.Any("err", err),
 						slog.String("request_id", reqID),
 					)
 					upErr = err
-					if upSpan != nil {
-						upSpan.RecordError(err)
-					}
 					http.Error(w, "Upstream error", http.StatusBadGateway)
+					// Issue #80: a non-streaming local fetch failure is
+					// also a local failure — arm the cooldown so the next
+					// request skips local and goes to the fallback.
+					if !skipLocal && d.LocalCooldown != nil {
+						d.LocalCooldown.RecordFailure()
+					}
 				} else {
 					model = d.Config.LocalModel
 					if skipLocal {
-						model = frontierModel
+						model = d.Config.FrontierModel
 					}
-					if upSpan != nil {
-						upSpan.SetAttr("cascade_served_by", "local-buffer")
-					}
-					if cap != nil {
+					if capw != nil {
 						if d.JudgeObserver != nil {
 							d.JudgeObserver.Submit(LocalCompletion{
 								RequestID:   reqID,
 								Instruction: latestPrompt,
-								Output:      cap.Buffer(),
+								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
 							})
 						}
 						if d.QualityObserver != nil {
-							emitDetectedEdits(cap.Buffer(), reqID, d.QualityObserver)
+							emitDetectedEdits(capw.Buffer(), reqID, d.QualityObserver)
 						}
 					}
 				}
-			}
-			if upSpan != nil {
-				upSpan.End()
+				// Debug trace (issue #33): non-streaming local path
+				// bypasses the cascade so there are no per-step
+				// attempts to report; we just record the single
+				// upstream target we hit.
+				trace.Upstream.Route = string(route)
+				trace.Upstream.Streaming = false
+				trace.Upstream.Model = model
+				trace.Upstream.TargetHost = HostOfURL(targetURL)
+				trace.Upstream.CascadeSteps = nil
+				trace.Upstream.CascadeServedBy = ""
+				trace.Upstream.CascadeSuccess = upErr == nil
 			}
 
 		default:
-			// Issue #43: pick the frontier endpoint from the
-			// registry's first provider, falling back to the
-			// legacy Config.FrontierURL/Model/Key when the
-			// registry is empty (callers that build a Config
-			// struct directly without going through Load).
-			// The fallback path preserves the pre-#43 behaviour
-			// for unit tests that don't populate the registry.
-			frontierURL := d.Config.FrontierURL
-			frontierKey := d.Config.FrontierKey
-			if frontiers := d.Config.Providers.FrontierProviders(); len(frontiers) > 0 {
-				first := frontiers[0]
-				frontierURL = first.URL
-				frontierKey = first.APIKey
-				model = first.Model
-			} else {
-				model = d.Config.FrontierModel
-			}
-
-			// Daily frontier budget gate (issue #38). Before
-			// dispatching to the frontier, check whether the
-			// estimated cost would push the rolling 24-hour spend
-			// past the configured cap. Local and fusion routing
-			// are never gated — only pure RouteFrontier is. When
-			// SpendGuard is nil (budget disabled) this is a
-			// complete no-op, preserving the pre-issue-#38
-			// behaviour.
-			if d.SpendGuard != nil {
-				estCost := frontierCostEstimate(
-					string(router.RouteFrontier), model,
-					telemetry.EstimateTokens(latestPrompt),
-					d.Config.Providers, d.Config.JudgeCostPer1KUSD,
-				)
-				if d.SpendGuard.WouldExceed(estCost) {
-					slog.Warn("daily frontier budget exceeded",
-						slog.String("request_id", reqID),
-						slog.Float64("estimated_cost", estCost),
-					)
-					writeJSONError(w, http.StatusTooManyRequests,
-						"Daily frontier budget exceeded")
-					return
-				}
-			}
-
-			var upCtx tracing.Context
-			var upSpan *tracing.Span
-			if d.Tracer != nil {
-				upCtx, upSpan = d.Tracer.StartSpan(rootCtx, "upstream.frontier")
-				upSpan.SetAttr("frontier_model", model)
-				upSpan.SetAttr("streaming", streaming)
-			}
-
+			model = d.Config.FrontierModel
 			// Honor the harness's stream flag (issue #10). Stream
 			// preserves SSE framing for chunked deliveries;
 			// BufferedFetch collects the full body and returns a
 			// single chatCompletionResponse JSON object.
 			if streaming {
 				upErr = upstream.Stream(obs, d.Client,
-					frontierURL, frontierKey, body,
-					upstream.WithTraceparent(tracing.InjectTraceparent(upCtx)))
+					d.Config.FrontierURL, d.Config.FrontierKey, body)
 			} else {
 				upErr = upstream.BufferedFetch(obs, d.Client,
-					frontierURL, frontierKey, body,
-					upstream.WithTraceparent(tracing.InjectTraceparent(upCtx)))
+					d.Config.FrontierURL, d.Config.FrontierKey, body)
 			}
 			if upErr != nil {
 				slog.Error("upstream error",
 					slog.Any("err", upErr),
 					slog.String("request_id", reqID),
 				)
-				if upSpan != nil {
-					upSpan.RecordError(upErr)
-				}
 				http.Error(w, "Upstream error", http.StatusBadGateway)
 			}
-			if upSpan != nil {
-				upSpan.End()
-			}
+			// Debug trace (issue #33): route=frontier is a single
+			// endpoint with no cascade — populate the trace with
+			// just the target host and model.
+			trace.Upstream.Route = string(route)
+			trace.Upstream.Streaming = streaming
+			trace.Upstream.Model = model
+			trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
 		}
 
-		// Record frontier spend for the rolling 24h budget (issue
-		// #38). Recorded after the request completes (success or
-		// upstream error) because the frontier API consumed tokens
-		// either way. The budget-exceeded early return above skips
-		// this recording, which is correct — the request was never
-		// dispatched.
-		if route == router.RouteFrontier && d.SpendGuard != nil {
-			d.SpendGuard.Record(frontierCostEstimate(
-				string(router.RouteFrontier), model,
-				telemetry.EstimateTokens(latestPrompt),
-				d.Config.Providers, d.Config.JudgeCostPer1KUSD,
-			))
-		}
-
-		// Per-request recording. Recorder and MetricsObserver are
-		// independent sinks: the former preserves the tail-friendly
-		// JSONL log while the latter carries richer savings dimensions.
-		totalMs := time.Since(started).Milliseconds()
+		// Per-request recording. The metrics observer (issue #4)
+		// is preferred when configured: it carries the savings
+		// dimensions (TOON delta, RAG injection, cost) that
+		// telemetry.Record cannot express. The legacy Recorder
+		// remains for callers that only want the TTFT / latency
+		// fields, or when no metrics store is wired (operator
+		// opted out by leaving NEXUS_METRICS_DB empty).
+		//
+		// totalMs is float64 ms (issue #68) so a sub-millisecond
+		// handler run still records a non-zero latency; the int64
+		// truncation used to flip to 0 on fast hardware and
+		// exposed a write race against the recorder's reader.
+		totalMs := float64(time.Since(started).Microseconds()) / 1000.0
 		var ttftMs int64
 		if streaming && firstWriteAt.Load() > 0 {
 			ttftMs = time.Unix(0, firstWriteAt.Load()).Sub(started).Milliseconds()
@@ -1095,80 +1205,74 @@ func Chat(d Deps) http.Handler {
 			}
 		}
 		outputTokens := int(obs.BytesOut() / 4)
-		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr)
-		// Hoist savings/cost so both the MetricsObserver dispatch and
-		// the ObservabilityObserver dispatch (issue #40) see the same
-		// values without recomputing. frontierCostEstimate is a cheap
-		// multiply and totalTokenSavings is a subtract, so computing
-		// them unconditionally costs negligible cycles.
-		postCompressionChars := totalMessageChars(messages)
-		savings := totalTokenSavings(preCompressionChars, postCompressionChars)
-		cost := frontierCostEstimate(string(route), model, telemetry.EstimateTokens(latestPrompt), d.Config.Providers, d.Config.JudgeCostPer1KUSD)
+		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr, fusionArbiterSkipped, toolCallCount, decision)
 		if d.MetricsObserver != nil {
+			postCompressionChars := totalMessageChars(messages)
+			savings := totalTokenSavings(preCompressionChars, postCompressionChars)
+			inputTokens := telemetry.EstimateTokens(latestPrompt)
+			cost := frontierCostEstimate(string(route), model, inputTokens, d.Config.JudgeCostPer1KUSD)
+			baselineCost := baselineCostEstimate(inputTokens+outputTokens, d.Config.CostBaselineRatePer1K)
+			savingsCost := baselineCost - cost
+			if savingsCost < 0 {
+				savingsCost = 0
+			}
 			tps := telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 			d.MetricsObserver.Submit(MetricsEvent{
-				Timestamp:         rec.Timestamp,
-				RequestID:         rec.RequestID,
-				Route:             string(route),
-				Model:             model,
-				InputTokens:       rec.InputTokens,
-				TOONSavingsTokens: savings,
-				RAGInjected:       ragInjected,
-				RAGFilename:       ragFilename,
-				EstimatedCostUSD:  cost,
-				OutputTokens:      outputTokens,
-				TTFTMs:            ttftMs,
-				TotalLatencyMs:    totalMs,
-				TPS:               tps,
-				Streaming:         streaming,
-				Error:             rec.Error,
-				TaskType:          slmTaskType,
+				Timestamp:            rec.Timestamp,
+				RequestID:            reqID,
+				Route:                string(route),
+				Model:                model,
+				InputTokens:          rec.InputTokens,
+				TOONSavingsTokens:    savings,
+				RAGInjected:          ragInjected,
+				RAGFilename:          ragFilename,
+				EstimatedCostUSD:     cost,
+				BaselineCostUSD:      baselineCost,
+				SavingsUSD:           savingsCost,
+				OutputTokens:         outputTokens,
+				TTFTMs:               ttftMs,
+				TotalLatencyMs:       totalMs,
+				TPS:                  tps,
+				Streaming:            streaming,
+				FusionArbiterSkipped: fusionArbiterSkipped,
+				ToolCallCount:        toolCallCount,
+				Error:                rec.Error,
+				RouteSource:          string(decision.Source),
+				RouteReason:          decision.Reason,
+				SLMConfidence:        decision.Confidence,
+				SLMTaskType:          decision.TaskType,
 			})
-		}
-		d.Recorder.Record(rec)
-
-		// In-process Prometheus collector (issue #40). Dispatched once
-		// per proxied request with the routing/error/RAG/TOON/degraded
-		// flags, token sums, cost, and latency. The collector does only
-		// atomic increments, so this is non-blocking and race-free.
-		if d.ObservabilityObserver != nil {
-			d.ObservabilityObserver.Submit(observability.ObservabilityEvent{
-				Route:             string(route),
-				Error:             rec.Error,
-				RAGInjected:       ragInjected,
-				TOONCompressed:    toonCompressed,
-				Degraded:          degraded,
-				InputTokens:       rec.InputTokens,
-				OutputTokens:      outputTokens,
-				TOONSavingsTokens: savings,
-				EstimatedCostUSD:  cost,
-				TotalLatencyMs:    totalMs,
-				TTFTMs:            ttftMs,
-			})
+		} else {
+			d.Recorder.Record(rec)
 		}
 
-		// Stamp the request-level summary attributes on the root
-		// span (issue #41). Operators querying the collector for
-		// "show me every route=frontier request that took > 5s"
-		// can filter on these without leaving the trace UI.
-		if rootSpan != nil {
-			rootSpan.SetAttr("route", string(route))
-			rootSpan.SetAttr("model", model)
-			rootSpan.SetAttr("input_tokens", rec.InputTokens)
-			rootSpan.SetAttr("output_tokens", outputTokens)
-			rootSpan.SetAttr("ttft_ms", ttftMs)
-			rootSpan.SetAttr("total_latency_ms", totalMs)
-			rootSpan.SetAttr("degraded", degraded)
-			rootSpan.SetAttr("streaming", streaming)
-			rootSpan.SetAttr("rag_injected", ragInjected)
-			if ragInjected {
-				rootSpan.SetAttr("rag_filename", ragFilename)
+		// Debug trace emission (issue #33). When Debug is on we
+		// flush a single batch of structured slog lines that
+		// describes the full request lifecycle. Emission happens
+		// AFTER the metrics dispatch so the trace can include the
+		// final response status (which http.Error may have set
+		// before we got here). The trace is gated on the
+		// pre-existing flag, so the production path pays zero
+		// allocations when NEXUS_DEBUG is unset.
+		if d.Config.Debug {
+			trace.Response.Status = obs.StatusCode()
+			trace.Response.TTFTMs = ttftMs
+			trace.Response.TotalBytes = obs.BytesOut()
+			trace.Response.OutputTokens = outputTokens
+			if capw != nil {
+				preview, truncated := TruncateForDebug(capw.Buffer(), d.Config.EffectiveDebugBodyBytes())
+				trace.Response.BodyPreview = preview
+				trace.Response.BodyTruncated = truncated
+			} else {
+				// captureWriter was not installed (debug turned
+				// on mid-request, race-style — should not happen
+				// because the flag is checked at every code path
+				// but be defensive). Surface the situation rather
+				// than crash on a nil deref.
+				trace.Response.BodyPreview = ""
+				trace.Response.BodyTruncated = false
 			}
-			rootSpan.SetAttr("toon_compressed", toonCompressed)
-			rootSpan.SetAttr("toon_savings_tokens", savings)
-			if upErr != nil {
-				rootSpan.RecordError(upErr)
-			}
+			trace.Emit(slog.Default())
 		}
 	})
 }
@@ -1206,13 +1310,9 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 
 // requestID extracts (or generates) a correlation id for the judge
 // hook. The handler honours an inbound X-Request-Id so a caller can
-// thread its own id through; otherwise we mint a short hex token.
-//
-// The inbound value is sanitised (issue #39): characters outside
-// [a-zA-Z0-9._:-] are stripped so a crafted header cannot inject log
-// entries or break downstream JSON consumers, and the length is capped
-// at requestIDMaxLen. When the value is empty after sanitization the
-// handler falls through to a generated hex id.
+// thread its own id through; otherwise we mint a short hex token. The
+// inbound value is sanitized (issue #39) so a crafted header cannot
+// inject log entries or break downstream JSON consumers.
 func requestID(r *http.Request) string {
 	if v := r.Header.Get("X-Request-Id"); v != "" {
 		if clean := sanitizeRequestID(v); clean != "" {
@@ -1227,29 +1327,6 @@ func requestID(r *http.Request) string {
 		return "req-unknown"
 	}
 	return "req-" + hex.EncodeToString(b[:])
-}
-
-// requestIDMaxLen caps the length of an inbound X-Request-Id. Longer
-// values are truncated so a malicious client cannot bloat logs or the
-// telemetry row with an arbitrarily long correlation id (issue #39).
-const requestIDMaxLen = 128
-
-// requestIDDisallowedRe matches characters NOT permitted in a sanitized
-// request id. The allowed set is [a-zA-Z0-9._:-]; any other character
-// (newlines, control bytes, quotes, angle brackets, whitespace, ...) is
-// stripped so a crafted X-Request-Id cannot inject log entries or break
-// downstream JSON consumers (issue #39).
-var requestIDDisallowedRe = regexp.MustCompile(`[^a-zA-Z0-9._:-]`)
-
-// sanitizeRequestID strips characters outside [a-zA-Z0-9._:-] and caps
-// the length at requestIDMaxLen. Returns "" when the input is empty
-// after sanitization, so the caller falls through to a generated hex id.
-func sanitizeRequestID(s string) string {
-	s = requestIDDisallowedRe.ReplaceAllString(s, "")
-	if len(s) > requestIDMaxLen {
-		s = s[:requestIDMaxLen]
-	}
-	return s
 }
 
 // captureWriter is an http.ResponseWriter that tees every Write into
@@ -1313,6 +1390,47 @@ var (
 	_ http.ResponseWriter = (*captureWriter)(nil)
 	_ http.Flusher        = (*captureWriter)(nil)
 )
+
+// containsSystemWith reports whether messages already contained a
+// system role whose content includes needle. Used by the debug trace
+// to confirm the meta-prompt pass actually appended the operator-
+// configured enhancement rather than leaving messages untouched (e.g.
+// when MetaPrompt is empty or the harness sent zero messages).
+func containsSystemWith(messages []interface{}, needle string) bool {
+	if needle == "" {
+		return false
+	}
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if role != "system" {
+			continue
+		}
+		if content, _ := msg["content"].(string); strings.Contains(content, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// stepNames returns the human-friendly names of cascade steps in
+// declaration order. Used by the debug trace (issue #33) as a
+// fallback when the cascade runner's RouteAttempted is empty (e.g.
+// every step errored before recording). Keeps the trace complete
+// even on full failure paths.
+func stepNames(steps []upstream.CascadeStep) []string {
+	if len(steps) == 0 {
+		return nil
+	}
+	out := make([]string, len(steps))
+	for i, s := range steps {
+		out[i] = s.Name
+	}
+	return out
+}
 
 // qualityEditNames is the set of tool names the handler treats as
 // "this might have written a file". Mirrors internal/quality so the
@@ -1448,8 +1566,11 @@ func buildRecord(
 	route router.Route,
 	model, latestPrompt string,
 	upErr error,
+	fusionArbiterSkipped bool,
+	toolCallCount int,
+	decision router.Decision,
 ) telemetry.Record {
-	totalMs := time.Since(started).Milliseconds()
+	totalMs := float64(time.Since(started).Microseconds()) / 1000.0
 	var ttftMs int64
 	if streaming && firstWriteNano > 0 {
 		ttftMs = time.Unix(0, firstWriteNano).Sub(started).Milliseconds()
@@ -1459,15 +1580,21 @@ func buildRecord(
 	}
 	outputTokens := int(bytesOut / 4)
 	rec := telemetry.Record{
-		Timestamp:      time.Now().UTC(),
-		RequestID:      requestID,
-		Model:          model,
-		Route:          string(route),
-		InputTokens:    telemetry.EstimateTokens(latestPrompt),
-		OutputTokens:   outputTokens,
-		TTFTMs:         ttftMs,
-		TotalLatencyMs: totalMs,
-		Streaming:      streaming,
+		Timestamp:            time.Now().UTC(),
+		RequestID:            requestID,
+		Model:                model,
+		Route:                string(route),
+		InputTokens:          telemetry.EstimateTokens(latestPrompt),
+		OutputTokens:         outputTokens,
+		TTFTMs:               ttftMs,
+		TotalLatencyMs:       totalMs,
+		Streaming:            streaming,
+		FusionArbiterSkipped: fusionArbiterSkipped,
+		ToolCallCount:        toolCallCount,
+		RouteSource:          string(decision.Source),
+		RouteReason:          decision.Reason,
+		SLMConfidence:        decision.Confidence,
+		SLMTaskType:          decision.TaskType,
 	}
 	rec.TPS = telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 	if upErr != nil {
@@ -1501,30 +1628,55 @@ func totalTokenSavings(preChars, postChars int) int {
 	return (preChars - postChars) / 4
 }
 
-// frontierCostEstimate multiplies input tokens by the per-provider
-// cost-per-1k (issue #43) when the model matches a configured
-// provider, otherwise by the fallback cost-per-1k. Returns zero for
-// non-frontier routes so local + fusion-trail rows count as zero
-// cost in the dashboard.
-//
-// The fallback knob is Config.JudgeCostPer1KUSD — re-used for lack
-// of a separate env var until cost-aware routing (issue #44) lands.
-// When a provider has its own InputCostPer1K > 0 (set via
-// NEXUS_PROVIDER_<NAME>_INPUT_COST_PER_1K), that rate wins so each
-// frontier's contribution to the rolling 24h spend is honest.
-func frontierCostEstimate(route, model string, inputTokens int, reg providers.Registry, fallbackCostPer1KUSD float64) float64 {
+// frontierCostEstimate multiplies input tokens by the configured
+// cost-per-1k. Returns zero for non-frontier routes so local +
+// fusion-trail rows count as zero cost in the dashboard. The
+// JudgeCostPer1KUSD knob is reused here for lack of a separate
+// frontier-rate env; the PRD says one is enough at this stage.
+func frontierCostEstimate(route, model string, inputTokens int, costPer1KUSD float64) float64 {
+	// model is reserved for future per-model pricing tables —
+	// the bundle stays cheap by sharing JudgeCostPer1KUSD for now.
+	_ = model
 	if route != string(router.RouteFrontier) {
 		return 0
 	}
-	if inputTokens <= 0 {
+	if costPer1KUSD <= 0 || inputTokens <= 0 {
 		return 0
 	}
-	costPer1K := fallbackCostPer1KUSD
-	if p, ok := reg.ByModel(model); ok && p.InputCostPer1K > 0 {
-		costPer1K = p.InputCostPer1K
+	return float64(inputTokens) * costPer1KUSD / 1000.0
+}
+
+// formatConfidence renders a [0,1] confidence as the X-Nexus-Route-
+// Confidence response header value (issue #74). Two-decimal fixed
+// precision keeps the value directly comparable to the
+// telemetry.Record.SLMConfidence field without ambiguity; values
+// outside the [0,1] range are clamped to the nearest bound so a
+// runaway SLM cannot produce an unwieldy header. Non-SLM stages
+// (guardrail, DSL) emit 0.50 — the router's NeutralConfidence floor —
+// so log scrapers can distinguish "no confidence" from "really zero".
+func formatConfidence(c float64) string {
+	if c < 0 {
+		c = 0
 	}
-	if costPer1K <= 0 {
+	if c > 1 {
+		c = 1
+	}
+	if c == 0 {
+		return "0.00"
+	}
+	return strconv.FormatFloat(c, 'f', 2, 64)
+}
+
+// baselineCostEstimate computes what a request would have cost if
+// sent to the frontier baseline provider, regardless of the actual
+// route (issue #73). It uses the total token count (input + output)
+// at the baseline rate, so local/fusion requests with zero actual
+// cost show a positive baseline and savings. Returns zero when the
+// rate is unavailable (pricing data missing) so the request is
+// recorded without failing.
+func baselineCostEstimate(totalTokens int, baselineRatePer1K float64) float64 {
+	if baselineRatePer1K <= 0 || totalTokens <= 0 {
 		return 0
 	}
-	return float64(inputTokens) * costPer1K / 1000.0
+	return float64(totalTokens) * baselineRatePer1K / 1000.0
 }

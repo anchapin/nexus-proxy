@@ -20,6 +20,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 )
 
 // FewShotExample is one indexed code snippet with its embedding.
@@ -35,8 +37,22 @@ type Embedder interface {
 	Embed(ctx context.Context, text string) ([]float64, error)
 }
 
+// RAGStore is the read+seed API the chat handler depends on. PersistentStore
+// (issue #46) embeds *Store and implements the same surface; the handler
+// is unaffected because both types satisfy this interface.
+type RAGStore interface {
+	Retrieve(ctx context.Context, prompt string) (*FewShotExample, float64, error)
+	Add(filename, content string, embedding []float64)
+	Size() int
+	Threshold() float64
+}
+
 // Store holds the indexed few-shot examples.
 type Store struct {
+	// mu guards examples for concurrent readers (Retrieve) and writers
+	// (IndexDir / Add / PersistentStore.Upsert). Operations that don't
+	// touch the slice (Size / Threshold) skip the lock.
+	mu        sync.RWMutex
 	examples  []FewShotExample
 	embedder  Embedder
 	threshold float64
@@ -48,16 +64,54 @@ func NewStore(embedder Embedder, threshold float64) *Store {
 	return &Store{embedder: embedder, threshold: threshold}
 }
 
-// Size returns the number of indexed examples.
-func (s *Store) Size() int { return len(s.examples) }
+// Size returns the number of indexed examples. Acquires the RLock
+// because the slice header can be mutated concurrently by the
+// watcher (issue #46) and by IndexDir during boot.
+func (s *Store) Size() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.examples)
+}
 
-// Threshold returns the configured similarity floor.
+// Threshold returns the configured similarity floor. Safe to
+// call concurrently because threshold is set once at
+// construction and never mutated.
 func (s *Store) Threshold() float64 { return s.threshold }
+
+// isSymlink reports whether a DirEntry represents a symbolic link.
+// os.ReadDir uses Lstat under the hood, so the ModeSymlink bit is
+// set on the entry itself — we never follow the link.
+func isSymlink(f os.DirEntry) bool {
+	return f.Type()&os.ModeSymlink != 0
+}
+
+// resolveDir resolves symlinks in dir once so that every file-path
+// check later can compare against a canonical prefix. This also
+// prevents the parent-symlink variant (e.g. "examples/sub/../../etc/passwd").
+func resolveDir(dir string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", fmt.Errorf("rag: resolve examples dir %q: %w", dir, err)
+	}
+	return resolved, nil
+}
+
+// verifyInsideDir checks that resolvedPath is rooted inside baseDir.
+// This catches path-traversal attempts where a symlinked subdirectory
+// escapes the intended examples directory.
+func verifyInsideDir(baseDir, resolvedPath string) bool {
+	return strings.HasPrefix(resolvedPath, baseDir+string(filepath.Separator)) || resolvedPath == baseDir
+}
 
 // IndexDir walks dir, embedding every regular file's contents. It is
 // permissive: a missing directory is created (and indexing returns empty),
 // per-file read or embed errors are logged and skipped. This matches the
 // prototype's behaviour but the errors are now observable instead of silent.
+//
+// Security: symlinks are skipped (issue #107) to prevent confidentiality
+// leaks via injected few-shot examples. The directory path is resolved
+// once to canonicalize it, and every file's resolved path is verified
+// to remain inside the resolved directory.
 func (s *Store) IndexDir(ctx context.Context, dir string) error {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
@@ -70,6 +124,11 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 		return nil
 	}
 
+	safeDir, err := resolveDir(dir)
+	if err != nil {
+		return err
+	}
+
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("rag: read examples dir %q: %w", dir, err)
@@ -79,7 +138,30 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 		if f.IsDir() {
 			continue
 		}
+		if isSymlink(f) {
+			slog.Warn("rag: skipping symlink in examples dir (issue #107)",
+				slog.String("filename", f.Name()),
+				slog.String("dir", dir),
+			)
+			continue
+		}
 		path := filepath.Join(dir, f.Name())
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			slog.Error("rag: cannot resolve path, skipping",
+				slog.String("filename", f.Name()),
+				slog.Any("err", err),
+			)
+			continue
+		}
+		if !verifyInsideDir(safeDir, resolved) {
+			slog.Warn("rag: skipping file that escapes examples dir (issue #107)",
+				slog.String("filename", f.Name()),
+				slog.String("resolved", resolved),
+				slog.String("base", safeDir),
+			)
+			continue
+		}
 		content, err := os.ReadFile(path)
 		if err != nil {
 			slog.Error("rag read file", slog.String("filename", f.Name()), slog.Any("err", err))
@@ -90,11 +172,13 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 			slog.Error("rag embed file", slog.String("filename", f.Name()), slog.Any("err", err))
 			continue
 		}
+		s.mu.Lock()
 		s.examples = append(s.examples, FewShotExample{
 			Filename:  f.Name(),
 			Content:   string(content),
 			Embedding: emb,
 		})
+		s.mu.Unlock()
 		slog.Info("rag indexed", slog.String("filename", f.Name()))
 	}
 	return nil
@@ -104,7 +188,10 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 // prompt embedding meets the configured threshold, or nil if nothing clears
 // the bar. An empty store or empty prompt always yields nil.
 func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, float64, error) {
-	if len(s.examples) == 0 || prompt == "" {
+	s.mu.RLock()
+	n := len(s.examples)
+	s.mu.RUnlock()
+	if n == 0 || prompt == "" {
 		return nil, 0, nil
 	}
 	promptEmb, err := s.embedder.Embed(ctx, prompt)
@@ -112,6 +199,8 @@ func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, f
 		return nil, 0, err
 	}
 
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var best *FewShotExample
 	var bestScore float64 = -1
 	for i := range s.examples {
@@ -160,11 +249,63 @@ func FormatInjection(ex *FewShotExample) string {
 // the store. Production code uses IndexDir; Add exists so callers (and
 // tests) can populate the store without going through the embedding API.
 func (s *Store) Add(filename, content string, embedding []float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.examples = append(s.examples, FewShotExample{
 		Filename:  filename,
 		Content:   content,
 		Embedding: embedding,
 	})
+}
+
+// replace swaps the entire examples slice atomically. Used by
+// PersistentStore.Load to populate from SQLite on boot and by the
+// watcher after a deletion; the caller passes the new slice, this
+// helper handles locking.
+func (s *Store) replace(examples []FewShotExample) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.examples = examples
+}
+
+// upsertExample inserts or replaces the example keyed by filename
+// in the in-memory slice. Caller is responsible for the DB write;
+// this only updates the search corpus so Retrieve sees the change.
+func (s *Store) upsertExample(ex FewShotExample) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.examples {
+		if s.examples[i].Filename == ex.Filename {
+			s.examples[i] = ex
+			return
+		}
+	}
+	s.examples = append(s.examples, ex)
+}
+
+// removeExample drops a single example from the in-memory slice.
+// Caller is responsible for the DB write.
+func (s *Store) removeExample(filename string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := s.examples[:0]
+	for _, ex := range s.examples {
+		if ex.Filename != filename {
+			out = append(out, ex)
+		}
+	}
+	s.examples = out
+}
+
+// snapshot returns a defensive copy of the examples slice. Used by
+// tests and by the file watcher to compare state without holding
+// the lock across an Embed call.
+func (s *Store) snapshot() []FewShotExample {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]FewShotExample, len(s.examples))
+	copy(out, s.examples)
+	return out
 }
 
 // OllamaEmbedder calls the Ollama /api/embeddings endpoint. It is safe for

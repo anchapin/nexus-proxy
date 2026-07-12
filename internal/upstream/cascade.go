@@ -11,8 +11,6 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
-	"github.com/anchapin/nexus-proxy/internal/providers"
 )
 
 // CascadeStep is one member of a Cascade: a single model endpoint the
@@ -49,6 +47,19 @@ type CascadeResult struct {
 	ServedBy string
 	// Succeeded is true if a step returned a usable response.
 	Succeeded bool
+	// LocalStepFailed is true when the "local" step was attempted but
+	// failed with a retryable error and a later step served the request
+	// (or the cascade exhausted every step). The chat handler uses this
+	// to arm the local-route cooldown (issue #80) so subsequent requests
+	// within the cooldown window skip local and go directly to the
+	// fallback, avoiding repeated slow local timeouts until the health
+	// poller catches up.
+	LocalStepFailed bool
+	// ToolCalls carries the OpenAI-compatible tool_calls from the step
+	// that served the request (issue #72). Empty for content-only
+	// responses. The chat handler reads this to populate telemetry
+	// (tool_call_count) and to feed the quality observer.
+	ToolCalls []ToolCall
 }
 
 // cascadeDefaultTimeout is the per-attempt timeout used when Cascade.Timeout
@@ -95,7 +106,7 @@ func ShouldRetry(statusCode int, err error) bool {
 //
 // Validation happens before any byte is sent to the client, so the harness
 // never sees a malformed response (issue requirement).
-func (c *Cascade) Run(w http.ResponseWriter, client Client, payload map[string]interface{}, opts ...CallOption) (CascadeResult, error) {
+func (c *Cascade) Run(w http.ResponseWriter, client Client, payload map[string]interface{}) (CascadeResult, error) {
 	if len(c.Steps) == 0 {
 		return CascadeResult{}, errors.New("cascade: no steps configured")
 	}
@@ -111,7 +122,7 @@ func (c *Cascade) Run(w http.ResponseWriter, client Client, payload map[string]i
 		res.RouteAttempted = joinStepNames(c.Steps[:i+1])
 
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		content, servedModel, err := fetchCascadeStep(ctx, client, step, payload, opts...)
+		msg, servedModel, err := fetchCascadeStep(ctx, client, step, payload)
 		cancel()
 		if err == nil {
 			slog.Info("cascade served",
@@ -121,13 +132,23 @@ func (c *Cascade) Run(w http.ResponseWriter, client Client, payload map[string]i
 			)
 			res.Succeeded = true
 			res.ServedBy = step.Name
-			if werr := writeSSEResponse(w, step.Name, servedModel, content); werr != nil {
+			res.ToolCalls = msg.ToolCalls
+			if werr := writeSSEResponse(w, step.Name, servedModel, msg); werr != nil {
 				return res, werr
 			}
 			return res, nil
 		}
 		lastErr = err
 		retry := classifyFailure(err)
+		// Issue #80: expose whether the local step was the one that
+		// failed so the chat handler can arm the local-route cooldown.
+		// Only set when the step is named "local" AND the error is
+		// retryable — a non-retryable failure (e.g. 401) surfaces to
+		// the caller immediately and does not indicate a transient
+		// local problem worth cooling down.
+		if step.Name == "local" && retry {
+			res.LocalStepFailed = true
+		}
 		slog.Warn("cascade step failed",
 			slog.String("step", step.Name),
 			slog.Int("attempt", i+1),
@@ -165,10 +186,10 @@ func joinStepNames(steps []CascadeStep) string {
 }
 
 // fetchCascadeStep does a single non-streaming POST to step.URL, validates
-// the response, and returns the assistant content + the model name echoed
+// the response, and returns the assistant message + the model name echoed
 // back by the upstream (used in the SSE response). All returned errors are
 // tagged via newCascadeErr so the runner knows whether to fall back.
-func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payload map[string]interface{}, opts ...CallOption) (content, servedModel string, err error) {
+func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payload map[string]interface{}) (AssistantMessage, string, error) {
 	body := make(map[string]interface{}, len(payload)+2)
 	for k, v := range payload {
 		body[k] = v
@@ -178,41 +199,38 @@ func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payl
 
 	jsonPayload, mErr := json.Marshal(body)
 	if mErr != nil {
-		return "", "", newCascadeErr(false, "marshal: %v", mErr)
+		return AssistantMessage{}, "", newCascadeErr(false, "marshal: %v", mErr)
 	}
 	req, rErr := http.NewRequestWithContext(ctx, http.MethodPost, step.URL, bytes.NewReader(jsonPayload))
 	if rErr != nil {
-		return "", "", newCascadeErr(false, "build request: %v", rErr)
+		return AssistantMessage{}, "", newCascadeErr(false, "build request: %v", rErr)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if step.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+step.APIKey)
 	}
-	if o := applyCallOpts(opts); o.traceparent != "" {
-		req.Header.Set("traceparent", o.traceparent)
-	}
 
 	resp, dErr := client.Do(req)
 	if dErr != nil {
 		// Transport error / ctx timeout — always retry.
-		return "", "", newCascadeErr(true, "transport: %v", dErr)
+		return AssistantMessage{}, "", newCascadeErr(true, "transport: %v", dErr)
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 
 	if ShouldRetry(resp.StatusCode, nil) {
-		return "", "", newCascadeErr(true, "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
+		return AssistantMessage{}, "", newCascadeErr(true, "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
 	}
 	if resp.StatusCode != http.StatusOK {
 		// Non-retryable 4xx (auth, bad request, etc.). Surface to caller.
-		return "", "", newCascadeErr(false, "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
+		return AssistantMessage{}, "", newCascadeErr(false, "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
 	}
 
-	content, model, vErr := extractAssistantContent(respBody)
+	msg, model, vErr := extractAssistantMessage(respBody)
 	if vErr != nil {
-		return "", "", vErr
+		return AssistantMessage{}, "", vErr
 	}
-	return content, model, nil
+	return msg, model, nil
 }
 
 // assistantResponse is the slice of the OpenAI-compatible chat-completion
@@ -222,12 +240,15 @@ type assistantResponse struct {
 	Choices []struct {
 		Message struct {
 			Content   string     `json:"content"`
-			ToolCalls []toolCall `json:"tool_calls,omitempty"`
+			ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 		} `json:"message"`
 	} `json:"choices"`
 }
 
-type toolCall struct {
+// ToolCall is the OpenAI-compatible tool call structure. It is exported
+// so CascadeResult and PanelResult can carry structured tool calls to
+// the chat handler (issue #72) without the handler re-parsing JSON.
+type ToolCall struct {
 	ID       string `json:"id"`
 	Type     string `json:"type"`
 	Function struct {
@@ -236,40 +257,63 @@ type toolCall struct {
 	} `json:"function"`
 }
 
-// extractAssistantContent parses the upstream body and returns the assistant
-// text + model name. It triggers fallback (retry=true) on:
+// AssistantMessage bundles the assistant content and any tool calls
+// extracted from an upstream response. Used by the cascade runner and
+// the fusion panel so both code paths carry the same structured shape
+// (issue #72).
+type AssistantMessage struct {
+	Content   string
+	ToolCalls []ToolCall
+}
+
+// HasToolCalls reports whether the message carries at least one valid
+// tool call. Convenience helper for branching at call sites that only
+// care about the "should we emit tool-call SSE chunks?" decision.
+func (m AssistantMessage) HasToolCalls() bool { return len(m.ToolCalls) > 0 }
+
+// extractAssistantMessage parses the upstream body and returns the
+// assistant message (content + tool_calls) and the model name. It
+// triggers fallback (retry=true) on:
 //   - JSON decode failure
 //   - empty choices
 //   - tool_calls with missing required fields
 //   - tool_calls whose function.arguments isn't valid JSON (small models
 //     hallucinate these — that's the whole point of the cascade).
-func extractAssistantContent(body []byte) (content, model string, err error) {
+//
+// Empty content alongside valid tool_calls is accepted (issue #72): a
+// coding agent's tool-call turn often has no textual content.
+func extractAssistantMessage(body []byte) (AssistantMessage, string, error) {
 	var raw assistantResponse
 	if uErr := json.Unmarshal(body, &raw); uErr != nil {
-		return "", "", newCascadeErr(true, "decode: %v", uErr)
+		return AssistantMessage{}, "", newCascadeErr(true, "decode: %v", uErr)
 	}
 	if len(raw.Choices) == 0 {
-		return "", "", newCascadeErr(true, "empty choices")
+		return AssistantMessage{}, "", newCascadeErr(true, "empty choices")
 	}
 	msg := raw.Choices[0].Message
 	for i, tc := range msg.ToolCalls {
 		if tc.ID == "" || tc.Type == "" || tc.Function.Name == "" {
-			return "", "", newCascadeErr(true, "tool_call[%d] missing required fields", i)
+			return AssistantMessage{}, "", newCascadeErr(true, "tool_call[%d] missing required fields", i)
 		}
 		if tc.Function.Arguments != "" {
 			var probe json.RawMessage
 			if pErr := json.Unmarshal([]byte(tc.Function.Arguments), &probe); pErr != nil {
-				return "", "", newCascadeErr(true, "tool_call[%d].arguments not valid JSON: %v", i, pErr)
+				return AssistantMessage{}, "", newCascadeErr(true, "tool_call[%d].arguments not valid JSON: %v", i, pErr)
 			}
 		}
 	}
-	return msg.Content, raw.Model, nil
+	return AssistantMessage{Content: msg.Content, ToolCalls: msg.ToolCalls}, raw.Model, nil
 }
 
 // writeSSEResponse emits a single OpenAI-compatible chat-completion chunk
-// containing the buffered content, followed by the [DONE] sentinel. Headers
-// are flushed if the writer supports it.
-func writeSSEResponse(w http.ResponseWriter, stepName, servedModel, content string) error {
+// containing the buffered assistant message, followed by the [DONE]
+// sentinel. When the message carries tool calls (issue #72) the chunk's
+// delta carries delta.tool_calls (with the per-call "index" field OpenAI
+// streaming requires) and finish_reason is "tool_calls". Content-only
+// responses use the legacy delta.content + finish_reason "stop" shape —
+// byte-for-byte backward compatible. Headers are flushed if the writer
+// supports it.
+func writeSSEResponse(w http.ResponseWriter, stepName, servedModel string, msg AssistantMessage) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("X-Nexus-Cascade-Served-By", stepName)
@@ -278,6 +322,40 @@ func writeSSEResponse(w http.ResponseWriter, stepName, servedModel, content stri
 	if servedModel == "" {
 		servedModel = stepName
 	}
+
+	var delta map[string]interface{}
+	var finishReason string
+	if msg.HasToolCalls() {
+		// OpenAI streaming tool-call deltas carry an "index" so the
+		// client can assemble fragments across chunks. We emit the full
+		// set in one chunk (the upstream was non-streaming), so each
+		// entry is complete with id/type/function.
+		tc := make([]map[string]interface{}, len(msg.ToolCalls))
+		for i, call := range msg.ToolCalls {
+			tc[i] = map[string]interface{}{
+				"index": i,
+				"id":    call.ID,
+				"type":  call.Type,
+				"function": map[string]string{
+					"name":      call.Function.Name,
+					"arguments": call.Function.Arguments,
+				},
+			}
+		}
+		delta = map[string]interface{}{"tool_calls": tc}
+		// When the response is purely tool calls with no text content,
+		// OpenAI clients expect content to be absent (not an empty
+		// string). We only include content when non-empty so the delta
+		// stays minimal and matches what real OpenAI streams emit.
+		if msg.Content != "" {
+			delta["content"] = msg.Content
+		}
+		finishReason = "tool_calls"
+	} else {
+		delta = map[string]interface{}{"content": msg.Content}
+		finishReason = "stop"
+	}
+
 	chunk := map[string]interface{}{
 		"id":      "chatcmpl-cascade-" + stepName,
 		"object":  "chat.completion.chunk",
@@ -286,8 +364,8 @@ func writeSSEResponse(w http.ResponseWriter, stepName, servedModel, content stri
 		"choices": []map[string]interface{}{
 			{
 				"index":         0,
-				"delta":         map[string]string{"content": content},
-				"finish_reason": "stop",
+				"delta":         delta,
+				"finish_reason": finishReason,
 			},
 		},
 	}
@@ -310,32 +388,15 @@ func writeSSEResponse(w http.ResponseWriter, stepName, servedModel, content stri
 // CascadeConfig is the input to BuildLocalCascade. Defined here (rather
 // than re-using config.Config) so upstream stays decoupled from config.
 type CascadeConfig struct {
-	LocalURL   string
-	LocalModel string
-	// Providers is the optional multi-frontier registry (issue #43).
-	// When non-empty, BuildLocalCascade iterates Providers instead
-	// of the legacy FrontierURL/Model/Key + ZAIURL/Model/Key pair,
-	// preserving the operator's declaration order. Providers with
-	// empty APIKey are skipped (unconfigured fallbacks are
-	// visible in the registry but never dispatched). The
-	// FrontierURL/Model/Key and ZAIURL/Model/Key fields below
-	// remain for callers that construct CascadeConfig without a
-	// registry (existing tests, ad-hoc tools); BuildLocalCascade
-	// falls back to them when Providers is empty.
-	Providers []providers.Provider
-	// Legacy single-frontier fields. Kept for backward
-	// compatibility with callers that still build CascadeConfig by
-	// hand; BuildLocalCascade uses them only when Providers is nil
-	// or empty.
+	LocalURL      string
+	LocalModel    string
 	FrontierURL   string
 	FrontierModel string
 	FrontierKey   string
-	// Legacy z.ai fallback fields. Same backward-compat semantics
-	// as FrontierURL/Model/Key.
-	ZAIURL   string
-	ZAIModel string
-	ZAIKey   string
-	Timeout  time.Duration
+	ZAIURL        string
+	ZAIModel      string
+	ZAIKey        string
+	Timeout       time.Duration
 
 	// SkipLocal removes the local Ollama step from the cascade.
 	// The chat handler sets this when internal/health reports
@@ -348,22 +409,12 @@ type CascadeConfig struct {
 }
 
 // BuildLocalCascade returns a cascade whose primary is local Ollama and
-// whose fallbacks are the frontier endpoints in CascadeConfig.Providers
-// (issue #43) — or, when Providers is empty, the legacy
-// FrontierURL/ZAIURL pair.
-//
-// Order: [local, provider1, provider2, ...]. When
-// CascadeConfig.SkipLocal is true the local step is omitted (issue #8
-// graceful-degradation path). When no fallback key is set the cascade
-// has a single step — Run still validates the response before
-// streaming.
-//
-// Operators who use the new NEXUS_PROVIDERS env surface pass the
-// registry's FrontierProviders() slice here; operators who haven't
-// migrated get the pre-#43 behaviour for free via the legacy field
-// fallback. The hardcoded "frontier"/"zai" step names are gone in the
-// Providers branch — the registry's provider.Name is used instead so
-// multi-frontier telemetry reads naturally.
+// whose fallbacks are frontier and/or Z.ai endpoints that are configured
+// (their key is non-empty). Order is the issue's required declaration
+// order: [local, frontier, zai]. When CascadeConfig.SkipLocal is true
+// the local step is omitted (issue #8 graceful-degradation path).
+// When no fallback key is set the cascade has a single step — Run
+// still validates the response before streaming.
 func BuildLocalCascade(cfg CascadeConfig) *Cascade {
 	steps := []CascadeStep{}
 	if !cfg.SkipLocal {
@@ -374,43 +425,21 @@ func BuildLocalCascade(cfg CascadeConfig) *Cascade {
 			APIKey: "",
 		})
 	}
-	if len(cfg.Providers) > 0 {
-		// Multi-frontier path (issue #43). Skip providers without
-		// an APIKey so an unconfigured fallback never makes it
-		// into the cascade; the registry still surfaces them in
-		// /status and FrontierProviders() so operators can see
-		// what's available.
-		for _, p := range cfg.Providers {
-			if p.APIKey == "" {
-				continue
-			}
-			steps = append(steps, CascadeStep{
-				Name:   p.Name,
-				URL:    p.URL,
-				APIKey: p.APIKey,
-				Model:  p.Model,
-			})
-		}
-	} else {
-		// Legacy single-frontier + z.ai fallback path. Preserved
-		// so cascade_test.go (and any external caller building
-		// CascadeConfig by hand) continues to work unchanged.
-		if cfg.FrontierKey != "" {
-			steps = append(steps, CascadeStep{
-				Name:   "frontier",
-				URL:    cfg.FrontierURL,
-				APIKey: cfg.FrontierKey,
-				Model:  cfg.FrontierModel,
-			})
-		}
-		if cfg.ZAIKey != "" {
-			steps = append(steps, CascadeStep{
-				Name:   "zai",
-				URL:    cfg.ZAIURL,
-				APIKey: cfg.ZAIKey,
-				Model:  cfg.ZAIModel,
-			})
-		}
+	if cfg.FrontierKey != "" {
+		steps = append(steps, CascadeStep{
+			Name:   "frontier",
+			URL:    cfg.FrontierURL,
+			APIKey: cfg.FrontierKey,
+			Model:  cfg.FrontierModel,
+		})
+	}
+	if cfg.ZAIKey != "" {
+		steps = append(steps, CascadeStep{
+			Name:   "zai",
+			URL:    cfg.ZAIURL,
+			APIKey: cfg.ZAIKey,
+			Model:  cfg.ZAIModel,
+		})
 	}
 	return &Cascade{Steps: steps, Timeout: cfg.Timeout}
 }

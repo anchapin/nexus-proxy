@@ -125,6 +125,16 @@ type Manager struct {
 	closed    chan struct{}
 	wg        sync.WaitGroup
 
+	// tickCh receives one signal after every successful
+	// latest.Store(&b) inside doProbe. It exists so tests can
+	// deterministically wait for the Nth repoll to land before
+	// reading Get() — waiting on the stub's call count alone is
+	// not enough because doProbe publishes the budget *after* the
+	// stub returns. Buffered with slack so the production probe
+	// hot path never blocks; production code does not read from
+	// this channel. WaitForProbes is the public accessor.
+	tickCh chan struct{}
+
 	latest atomic.Pointer[Budget]
 }
 
@@ -148,6 +158,7 @@ func NewManager(p Probe, interval, timeout time.Duration) *Manager {
 		timeout:  timeout,
 		now:      time.Now,
 		closed:   make(chan struct{}),
+		tickCh:   make(chan struct{}, 64),
 	}
 }
 
@@ -246,12 +257,45 @@ func (m *Manager) doProbe(ctx context.Context) {
 		return
 	}
 	m.latest.Store(&b)
+	m.signalTick()
 	slog.Info("probe updated",
 		slog.String("source", string(b.Source)),
 		slog.Int("budget_tokens", b.Tokens),
 		slog.Int("model_context", b.ModelContext),
 		slog.Int64("free_vram_bytes", b.FreeVRAMBytes),
 	)
+}
+
+// signalTick delivers a non-blocking signal on tickCh so test
+// observers (WaitForProbes) can confirm the latest budget is now
+// published. The buffer is sized so production code never blocks;
+// when the buffer is full the signal is dropped, which only
+// affects tests that fell behind by more than 64 ticks.
+func (m *Manager) signalTick() {
+	select {
+	case m.tickCh <- struct{}{}:
+	default:
+	}
+}
+
+// WaitForProbes returns a channel that closes once at least n
+// successful probes have been published through latest.Store. It
+// is the test-side companion to doProbe and replaces time.Sleep
+// polling in tests that need to wait for a repoll before reading
+// Get(). Returns a closed channel when n <= 0.
+func (m *Manager) WaitForProbes(n int) <-chan struct{} {
+	out := make(chan struct{})
+	if n <= 0 {
+		close(out)
+		return out
+	}
+	go func() {
+		defer close(out)
+		for i := 0; i < n; i++ {
+			<-m.tickCh
+		}
+	}()
+	return out
 }
 
 // Close stops the background ticker and waits for the loop goroutine

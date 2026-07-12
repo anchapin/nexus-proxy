@@ -40,6 +40,15 @@ func TestLoadDefaults(t *testing.T) {
 	if !cfg.ProbeEnabled {
 		t.Error("ProbeEnabled = false, want true with default interval")
 	}
+	// Local-route concurrency limiter defaults (issue #81): the
+	// limiter is dormant unless the operator opts in, and the per-slot
+	// VRAM reservation defaults to 2 GiB.
+	if cfg.LocalMaxConcurrent != 0 {
+		t.Errorf("LocalMaxConcurrent = %d, want 0 (disabled by default)", cfg.LocalMaxConcurrent)
+	}
+	if cfg.LocalVRAMBytesPerSlot != DefaultLocalVRAMBytesPerSlot {
+		t.Errorf("LocalVRAMBytesPerSlot = %d, want default %d", cfg.LocalVRAMBytesPerSlot, DefaultLocalVRAMBytesPerSlot)
+	}
 	if cfg.RAGThreshold != 0.55 {
 		t.Errorf("RAGThreshold = %v, want 0.55", cfg.RAGThreshold)
 	}
@@ -66,6 +75,23 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if !cfg.TelemetryEnabled() {
 		t.Error("TelemetryEnabled = false, want true with default path")
+	}
+	// HTTP listener timeouts (issue #77).
+	if cfg.ReadTimeout != DefaultServerReadTimeout {
+		t.Errorf("ReadTimeout = %v, want %v", cfg.ReadTimeout, DefaultServerReadTimeout)
+	}
+	if cfg.WriteTimeout != 0 {
+		t.Errorf("WriteTimeout = %v, want 0 (disabled, streaming-safe)", cfg.WriteTimeout)
+	}
+	if cfg.IdleTimeout != DefaultServerIdleTimeout {
+		t.Errorf("IdleTimeout = %v, want %v", cfg.IdleTimeout, DefaultServerIdleTimeout)
+	}
+	if cfg.MaxHeaderBytes != DefaultServerMaxHeaderBytes {
+		t.Errorf("MaxHeaderBytes = %d, want %d", cfg.MaxHeaderBytes, DefaultServerMaxHeaderBytes)
+	}
+	// Graceful shutdown drain window (issue #121).
+	if cfg.ShutdownTimeout != DefaultShutdownTimeout {
+		t.Errorf("ShutdownTimeout = %v, want %v", cfg.ShutdownTimeout, DefaultShutdownTimeout)
 	}
 }
 
@@ -314,88 +340,300 @@ func TestLoadJudgeOverrides(t *testing.T) {
 	}
 }
 
-// TestTLSConfigDefaults verifies TLS vars are unset by default so the
-// proxy boots in plaintext mode identical to pre-issue-#39 behaviour
-// (issue #39 backward-compat constraint).
-func TestTLSConfigDefaults(t *testing.T) {
-	t.Setenv("NEXUS_TLS_CERT", "")
-	t.Setenv("NEXUS_TLS_KEY", "")
-	t.Setenv("NEXUS_TLS_REDIRECT", "")
+func TestLoadLocalConcurrencyOverrides(t *testing.T) {
+	t.Setenv("NEXUS_LOCAL_MAX_CONCURRENT", "6")
+	t.Setenv("NEXUS_LOCAL_VRAM_BYTES_PER_SLOT", "1073741824") // 1 GiB
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.TLSCertFile != "" {
-		t.Errorf("TLSCertFile = %q, want empty", cfg.TLSCertFile)
+	if cfg.LocalMaxConcurrent != 6 {
+		t.Errorf("LocalMaxConcurrent = %d, want 6", cfg.LocalMaxConcurrent)
 	}
-	if cfg.TLSKeyFile != "" {
-		t.Errorf("TLSKeyFile = %q, want empty", cfg.TLSKeyFile)
-	}
-	if cfg.TLSRedirect {
-		t.Error("TLSRedirect = true, want false")
-	}
-	if cfg.TLSActive() {
-		t.Error("TLSActive() = true, want false when no cert/key set")
+	if cfg.LocalVRAMBytesPerSlot != 1073741824 {
+		t.Errorf("LocalVRAMBytesPerSlot = %d, want 1073741824", cfg.LocalVRAMBytesPerSlot)
 	}
 }
 
-// TestTLSConfigActive verifies both cert and key must be set for
-// TLSActive to be true, and that a half-configured deploy (cert without
-// key, or vice-versa) stays inactive (issue #39).
-func TestTLSConfigActive(t *testing.T) {
-	t.Setenv("NEXUS_TLS_CERT", "/etc/nexus/tls.crt")
-	t.Setenv("NEXUS_TLS_KEY", "/etc/nexus/tls.key")
+func TestLoadLocalConcurrencyNegativeClamped(t *testing.T) {
+	// Negative ceiling is clamped to 0 (disabled); negative slot bytes
+	// fall back to the default rather than producing a nonsensical
+	// shrink divisor.
+	t.Setenv("NEXUS_LOCAL_MAX_CONCURRENT", "-3")
+	t.Setenv("NEXUS_LOCAL_VRAM_BYTES_PER_SLOT", "-512")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.TLSCertFile != "/etc/nexus/tls.crt" {
-		t.Errorf("TLSCertFile = %q", cfg.TLSCertFile)
+	if cfg.LocalMaxConcurrent != 0 {
+		t.Errorf("LocalMaxConcurrent = %d, want 0 (clamped)", cfg.LocalMaxConcurrent)
 	}
-	if cfg.TLSKeyFile != "/etc/nexus/tls.key" {
-		t.Errorf("TLSKeyFile = %q", cfg.TLSKeyFile)
-	}
-	if !cfg.TLSActive() {
-		t.Error("TLSActive() = false, want true when both cert+key set")
+	if cfg.LocalVRAMBytesPerSlot != DefaultLocalVRAMBytesPerSlot {
+		t.Errorf("LocalVRAMBytesPerSlot = %d, want default %d", cfg.LocalVRAMBytesPerSlot, DefaultLocalVRAMBytesPerSlot)
 	}
 }
 
-// TestTLSConfigHalfConfiguredStaysInactive verifies that setting only
-// the cert or only the key leaves TLS inactive (issue #39).
-func TestTLSConfigHalfConfiguredStaysInactive(t *testing.T) {
-	t.Setenv("NEXUS_TLS_CERT", "/etc/nexus/tls.crt")
-	t.Setenv("NEXUS_TLS_KEY", "")
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
+func TestLoadLocalConcurrencyInvalidValues(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+		val  string
+	}{
+		{"bad max concurrent", "NEXUS_LOCAL_MAX_CONCURRENT", "many"},
+		{"bad bytes per slot", "NEXUS_LOCAL_VRAM_BYTES_PER_SLOT", "lots"},
 	}
-	if cfg.TLSActive() {
-		t.Error("TLSActive() = true with cert but no key; want false")
-	}
-
-	t.Setenv("NEXUS_TLS_CERT", "")
-	t.Setenv("NEXUS_TLS_KEY", "/etc/nexus/tls.key")
-	cfg2, err := Load()
-	if err != nil {
-		t.Fatalf("Load (2): %v", err)
-	}
-	if cfg2.TLSActive() {
-		t.Error("TLSActive() = true with key but no cert; want false")
-	}
-}
-
-// TestTLSRedirectTruthy verifies the NEXUS_TLS_REDIRECT boolean parsing
-// (issue #39).
-func TestTLSRedirectTruthy(t *testing.T) {
-	for _, val := range []string{"true", "1", "yes", "on"} {
-		t.Run(val, func(t *testing.T) {
-			t.Setenv("NEXUS_TLS_REDIRECT", val)
-			cfg, err := Load()
-			if err != nil {
-				t.Fatalf("Load: %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.key, tc.val)
+			if _, err := Load(); err == nil {
+				t.Errorf("expected error for %s=%s", tc.key, tc.val)
 			}
-			if !cfg.TLSRedirect {
-				t.Errorf("TLSRedirect = false for %q, want true", val)
+		})
+	}
+}
+
+func TestLoadServerTimeoutOverrides(t *testing.T) {
+	t.Setenv("NEXUS_SERVER_READ_TIMEOUT", "45s")
+	t.Setenv("NEXUS_SERVER_WRITE_TIMEOUT", "300s")
+	t.Setenv("NEXUS_SERVER_IDLE_TIMEOUT", "60s")
+	t.Setenv("NEXUS_SERVER_MAX_HEADER_BYTES", "524288") // 512 KiB
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ReadTimeout != 45*time.Second {
+		t.Errorf("ReadTimeout = %v, want 45s", cfg.ReadTimeout)
+	}
+	if cfg.WriteTimeout != 300*time.Second {
+		t.Errorf("WriteTimeout = %v, want 300s", cfg.WriteTimeout)
+	}
+	if cfg.IdleTimeout != 60*time.Second {
+		t.Errorf("IdleTimeout = %v, want 60s", cfg.IdleTimeout)
+	}
+	if cfg.MaxHeaderBytes != 524288 {
+		t.Errorf("MaxHeaderBytes = %d, want 524288", cfg.MaxHeaderBytes)
+	}
+}
+
+func TestLoadServerTimeoutZeroAllowed(t *testing.T) {
+	// Zero is valid for all four — it disables the corresponding
+	// guard (and WriteTimeout=0 is the streaming-safe default).
+	t.Setenv("NEXUS_SERVER_READ_TIMEOUT", "0")
+	t.Setenv("NEXUS_SERVER_WRITE_TIMEOUT", "0")
+	t.Setenv("NEXUS_SERVER_IDLE_TIMEOUT", "0")
+	t.Setenv("NEXUS_SERVER_MAX_HEADER_BYTES", "0")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ReadTimeout != 0 {
+		t.Errorf("ReadTimeout = %v, want 0", cfg.ReadTimeout)
+	}
+	if cfg.WriteTimeout != 0 {
+		t.Errorf("WriteTimeout = %v, want 0", cfg.WriteTimeout)
+	}
+	if cfg.IdleTimeout != 0 {
+		t.Errorf("IdleTimeout = %v, want 0", cfg.IdleTimeout)
+	}
+	if cfg.MaxHeaderBytes != 0 {
+		t.Errorf("MaxHeaderBytes = %d, want 0", cfg.MaxHeaderBytes)
+	}
+}
+
+func TestLoadServerTimeoutNegativeRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+		val  string
+	}{
+		{"negative read timeout", "NEXUS_SERVER_READ_TIMEOUT", "-1s"},
+		{"negative write timeout", "NEXUS_SERVER_WRITE_TIMEOUT", "-5s"},
+		{"negative idle timeout", "NEXUS_SERVER_IDLE_TIMEOUT", "-10s"},
+		{"negative max header bytes", "NEXUS_SERVER_MAX_HEADER_BYTES", "-1024"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.key, tc.val)
+			if _, err := Load(); err == nil {
+				t.Errorf("expected error for %s=%s", tc.key, tc.val)
+			}
+		})
+	}
+}
+
+func TestLoadServerTimeoutInvalidValues(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+		val  string
+	}{
+		{"bad read timeout", "NEXUS_SERVER_READ_TIMEOUT", "soon"},
+		{"bad write timeout", "NEXUS_SERVER_WRITE_TIMEOUT", "forever"},
+		{"bad idle timeout", "NEXUS_SERVER_IDLE_TIMEOUT", "two minutes"},
+		{"bad max header bytes", "NEXUS_SERVER_MAX_HEADER_BYTES", "lots"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.key, tc.val)
+			if _, err := Load(); err == nil {
+				t.Errorf("expected error for %s=%s", tc.key, tc.val)
+			}
+		})
+	}
+}
+
+// --- Graceful shutdown timeout (issue #121) ---
+
+func TestLoadShutdownTimeoutHonoursOverride(t *testing.T) {
+	t.Setenv("NEXUS_SHUTDOWN_TIMEOUT", "5s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ShutdownTimeout != 5*time.Second {
+		t.Errorf("ShutdownTimeout = %v, want 5s", cfg.ShutdownTimeout)
+	}
+}
+
+func TestLoadShutdownTimeoutZeroFallsBackToDefault(t *testing.T) {
+	// 0 is documented as "use the default" — it must NOT disable the
+	// drain (a misconfigured .env must not leak in-flight requests).
+	t.Setenv("NEXUS_SHUTDOWN_TIMEOUT", "0")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ShutdownTimeout != DefaultShutdownTimeout {
+		t.Errorf("ShutdownTimeout = %v, want default %v", cfg.ShutdownTimeout, DefaultShutdownTimeout)
+	}
+}
+
+func TestLoadShutdownTimeoutNegativeRejected(t *testing.T) {
+	t.Setenv("NEXUS_SHUTDOWN_TIMEOUT", "-1s")
+	if _, err := Load(); err == nil {
+		t.Errorf("expected error for NEXUS_SHUTDOWN_TIMEOUT=-1s")
+	}
+}
+
+func TestLoadShutdownTimeoutInvalidValue(t *testing.T) {
+	t.Setenv("NEXUS_SHUTDOWN_TIMEOUT", "soon")
+	if _, err := Load(); err == nil {
+		t.Errorf("expected error for NEXUS_SHUTDOWN_TIMEOUT=soon")
+	}
+}
+
+// --- Trusted proxies (issue #75) ---
+
+func TestTrustedProxies_DefaultDisabled(t *testing.T) {
+	t.Setenv("NEXUS_TRUSTED_PROXIES", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TrustedProxiesConfigured() {
+		t.Error("trusted proxies should be unconfigured by default (trust nobody)")
+	}
+	if cfg.RateLimitEnabled() {
+		t.Error("rate limit should be disabled by default")
+	}
+}
+
+func TestTrustedProxies_CIDRList(t *testing.T) {
+	t.Setenv("NEXUS_TRUSTED_PROXIES", "10.0.0.0/8, 172.16.0.0/12")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.TrustedProxies) != 2 {
+		t.Fatalf("expected 2 CIDRs, got %d", len(cfg.TrustedProxies))
+	}
+	if !cfg.TrustedProxiesConfigured() {
+		t.Error("TrustedProxiesConfigured should be true")
+	}
+}
+
+func TestTrustedProxies_BareIP(t *testing.T) {
+	t.Setenv("NEXUS_TRUSTED_PROXIES", "127.0.0.1")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.TrustedProxies) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(cfg.TrustedProxies))
+	}
+	if ones, bits := cfg.TrustedProxies[0].Mask.Size(); ones != 32 || bits != 32 {
+		t.Errorf("bare IPv4 should be /32, got /%d of %d", ones, bits)
+	}
+}
+
+func TestTrustedProxies_InvalidFailsBoot(t *testing.T) {
+	cases := []string{
+		"not-a-cidr",
+		"10.0.0.0/8, bogus",
+		"10.0.0.0/99",
+	}
+	for _, c := range cases {
+		t.Run(c, func(t *testing.T) {
+			t.Setenv("NEXUS_TRUSTED_PROXIES", c)
+			if _, err := Load(); err == nil {
+				t.Errorf("expected boot error for %q", c)
+			}
+		})
+	}
+}
+
+func TestRateLimit_Overrides(t *testing.T) {
+	t.Setenv("NEXUS_RATE_LIMIT_RPM", "120")
+	t.Setenv("NEXUS_RATE_LIMIT_BURST", "30")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimitRPM != 120 {
+		t.Errorf("RateLimitRPM = %d, want 120", cfg.RateLimitRPM)
+	}
+	if cfg.RateLimitBurst != 30 {
+		t.Errorf("RateLimitBurst = %d, want 30", cfg.RateLimitBurst)
+	}
+	if !cfg.RateLimitEnabled() {
+		t.Error("RateLimitEnabled should be true")
+	}
+}
+
+func TestRateLimit_NegativeClamped(t *testing.T) {
+	t.Setenv("NEXUS_RATE_LIMIT_RPM", "-5")
+	t.Setenv("NEXUS_RATE_LIMIT_BURST", "-1")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimitRPM != 0 {
+		t.Errorf("RateLimitRPM = %d, want 0 (clamped)", cfg.RateLimitRPM)
+	}
+	if cfg.RateLimitBurst != 0 {
+		t.Errorf("RateLimitBurst = %d, want 0 (clamped)", cfg.RateLimitBurst)
+	}
+}
+
+func TestIsLoopbackBind(t *testing.T) {
+	cases := []struct {
+		addr string
+		want bool
+	}{
+		{":8000", true}, // empty host — dev default
+		{"localhost:8000", true},
+		{"127.0.0.1:8000", true},
+		{"127.99.99.99:8000", true}, // whole /8
+		{"[::1]:8000", true},
+		{"0.0.0.0:8000", false}, // all interfaces — non-loopback
+		{"10.0.0.5:8000", false},
+		{"example.com:8000", false}, // unknown host
+	}
+	for _, tc := range cases {
+		t.Run(tc.addr, func(t *testing.T) {
+			cfg := Config{Addr: tc.addr}
+			if got := cfg.IsLoopbackBind(); got != tc.want {
+				t.Errorf("IsLoopbackBind(%q) = %v, want %v", tc.addr, got, tc.want)
 			}
 		})
 	}

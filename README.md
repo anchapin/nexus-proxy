@@ -105,6 +105,33 @@ go run ./cmd/nexus
 The server listens on `:8000` by default. Set `NEXUS_ADDR=:9000` (or any
 other address) to change it.
 
+### Running behind a reverse proxy (nginx / Cloudflare / cloud LB)
+
+When Nexus sits behind a reverse proxy, the proxy appends the real
+client IP to `X-Forwarded-For` on each request. By default Nexus
+**ignores** that header and uses the direct peer IP — so a direct
+attacker cannot spoof per-client rate limits by rotating the header.
+
+To honour `X-Forwarded-For` / `X-Real-IP`, whitelist the reverse
+proxy's CIDR via `NEXUS_TRUSTED_PROXIES`. Forwarded headers are then
+honoured **only** when the direct peer is in the list:
+
+```bash
+# Trust the private networks your reverse proxy uses.
+NEXUS_TRUSTED_PROXIES=10.0.0.0/8,172.16.0.0/12
+# Or a single loopback proxy:
+NEXUS_TRUSTED_PROXIES=127.0.0.1
+```
+
+A multi-hop `X-Forwarded-For` chain is walked right-to-left, skipping
+trusted hops, to find the first untrusted (real client) IP — the same
+algorithm nginx's `real_ip_recursive` uses.
+
+The boot log emits a warning when rate limiting is enabled, the bind
+address is non-loopback, and no trusted proxies are configured — that
+combination usually means a forgotten reverse-proxy whitelist (so every
+client behind the proxy shares one bucket).
+
 ### Point your agent at the proxy
 
 In OpenCode's `~/.config/opencode/config.toml`:
@@ -197,6 +224,64 @@ docker run --rm -p 8000:8000 \
   nexus-proxy:dev
 ```
 
+## Releases
+
+Every semver tag (`v1.0.0`, `v1.2.3`, …) triggers the
+[release workflow](.github/workflows/release.yml), which publishes:
+
+- **Cross-compiled binaries** — `linux/amd64`, `linux/arm64`,
+  `darwin/arm64`
+- **SHA256 checksums** — `checksums-sha256.txt`
+- **GHCR multi-arch image** — `ghcr.io/anchapin/nexus-proxy:<tag>`
+  (amd64 + arm64), also tagged `latest`
+- **SBOM** — SPDX JSON attached to the release
+- **Cosign signature** — keyless (OIDC) signature on the image,
+  recorded in the Rekor transparency log
+
+### Install a prebuilt binary
+
+```bash
+# Download the binary for your platform from the GitHub Release page,
+# then verify its checksum:
+sha256sum -c checksums-sha256.txt
+
+# Make it executable and run:
+chmod +x nexus-*-linux-amd64
+./nexus-*-linux-amd64 --version
+```
+
+### Pull the container image
+
+```bash
+# Replace <tag> with a release version (e.g. v1.0.0) or "latest"
+docker pull ghcr.io/anchapin/nexus-proxy:<tag>
+
+# Check the version:
+docker run --rm ghcr.io/anchapin/nexus-proxy:<tag> --version
+```
+
+### Verify the image signature
+
+The image is signed with cosign keyless signing. Verify it against the
+GitHub Actions OIDC identity:
+
+```bash
+cosign verify ghcr.io/anchapin/nexus-proxy:<tag> \
+  --certificate-identity "https://github.com/anchapin/nexus-proxy/.github/workflows/release.yml@refs/tags/<tag>" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+```
+
+### `--version`
+
+```bash
+$ ./nexus --version
+nexus v1.0.0
+```
+
+`--version` (or `-v`) prints the build version and exits. The version is
+injected at compile time via `-ldflags`; a local `make build` reports
+`nexus dev` unless you override it with `make build VERSION=v1.2.3`.
+
 ## Architecture
 
 ```
@@ -241,6 +326,24 @@ make ci         # vet + build + test + lint (what CI runs)
 The race detector and a healthy test suite are required to merge — see
 `.github/workflows/ci.yml`.
 
+## Security & CI
+
+The following automated checks run on every pull request and push to
+`main`:
+
+| Check | Workflow | What it catches |
+| ----- | -------- | --------------- |
+| **CI** (vet, build, test, lint, bench) | [`ci.yml`](.github/workflows/ci.yml) | Build breakage, race conditions, lint regressions |
+| **Coverage gate** | [`ci.yml`](.github/workflows/ci.yml) | Fails if total coverage drops below `70%` |
+| **CodeQL** | [`codeql.yml`](.github/workflows/codeql.yml) | SAST for Go — taint flow, hard-coded creds, SQL injection (`security-and-quality` pack) |
+| **Secret scan** | [`secret-scan.yml`](.github/workflows/secret-scan.yml) | `gitleaks` scan for accidentally committed API keys / tokens |
+| **Dependabot** | [`dependabot.yml`](.github/dependabot.yml) | Weekly update PRs for Go modules + GitHub Actions |
+
+The coverage threshold is deliberately conservative so the gate
+activates without churning existing PRs; raise `COVERAGE_THRESHOLD` in
+`ci.yml` as coverage improves. `make ci` (local) stays green — the new
+jobs are workflow-only.
+
 ## Configuration
 
 All knobs are env vars; see `.env.example` for the full list with
@@ -249,6 +352,10 @@ defaults. The most useful ones:
 | Variable                  | Default                       | Purpose                                  |
 | ------------------------- | ----------------------------- | ---------------------------------------- |
 | `NEXUS_ADDR`              | `:8000`                       | HTTP listen address                      |
+| `NEXUS_SERVER_READ_TIMEOUT` | `30s`                       | Inbound request read deadline (issue #77) |
+| `NEXUS_SERVER_WRITE_TIMEOUT` | `0` (disabled)             | Inbound response write deadline; 0 = streaming-safe (issue #77) |
+| `NEXUS_SERVER_IDLE_TIMEOUT` | `120s`                      | Keep-alive idle wait (issue #77)         |
+| `NEXUS_SERVER_MAX_HEADER_BYTES` | `1048576` (1 MiB)        | Max request header bytes (issue #77)     |
 | `NEXUS_FRONTIER_API_KEY`  | *(empty)*                     | Required for frontier routing to work    |
 | `NEXUS_TOKEN_GUARDRAIL`   | `6000`                        | Estimated tokens that force-route to frontier |
 | `NEXUS_RAG_THRESHOLD`     | `0.55`                        | Cosine similarity floor for RAG injection |
@@ -259,6 +366,9 @@ defaults. The most useful ones:
 | `NEXUS_JUDGE_URL`         | z.ai (fallback frontier)      | Judge endpoint                          |
 | `NEXUS_JUDGE_API_KEY`     | `NEXUS_FRONTIER_API_KEY`      | Judge bearer token                      |
 | `NEXUS_METRICS_DB`        | `~/.cache/nexus-proxy/metrics.db` | SQLite metrics store (issue #4)      |
+| `NEXUS_TRUSTED_PROXIES`   | *(empty = trust nobody)*      | CIDR allowlist for X-Forwarded-For (issue #75) |
+| `NEXUS_RATE_LIMIT_RPM`    | `0` (disabled)                | Per-client requests/min ceiling (issue #75) |
+| `NEXUS_RATE_LIMIT_BURST`  | `0` (= RPM)                  | Token-bucket burst capacity (issue #75) |
 
 ## Status
 
