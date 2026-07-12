@@ -10,14 +10,19 @@ linters:
   disable-all: true
   enable:
     # Bug catchers
+    - bodyclose      # missing resp.Body.Close() after http.Client.Do
     - errcheck       # unchecked errors
+    - errorlint      # %w wrapping, errors.Is/As instead of ==
     - gosimple       # simplifications
     - govet          # stdlib vet
     - ineffassign    # unused assignments
+    - noctx          # http.NewRequest w/o context propagation
+    - sqlclosecheck  # missing rows.Close()/stmt.Close()
     - staticcheck    # broad static analysis
     - unused         # unused identifiers
 
     # Style / hygiene
+    - gocritic       # opinionated style + bug patterns
     - gofmt          # canonical formatting
     - goimports      # import grouping
     - misspell       # typos in comments/strings
@@ -27,11 +32,19 @@ linters-settings:
   revive:
     rules:
       - name: package-comments
-        disabled: true # cmd/ packages don't need doc comments
+        disabled: true # only cmd/ entry points skip package doc comments
 
 issues:
   exclude-rules:
+    # cmd/ packages are tiny wiring shims; no package doc comment needed.
+    # Scoped narrowly so internal/ packages keep the lint signal.
+    - path: ^cmd/
+      linters:
+        - revive
+
     # Tests commonly use package-level helpers and short identifiers.
+    # Note: bodyclose and sqlclosecheck are intentionally NOT exempted
+    # here — they catch real leaks in test helpers too.
     - path: _test\.go
       linters:
         - errcheck

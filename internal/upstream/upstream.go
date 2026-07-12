@@ -534,7 +534,7 @@ func PanelStreaming(
 	// passing the error through to the arbiter; in progressive mode
 	// the only sensible fallback is to fail the request.
 	if first.Err != nil && second.Err != nil {
-		return outcome, fmt.Errorf("fusion: both members failed: local=%v; frontier=%v",
+		return outcome, fmt.Errorf("fusion: both members failed: local=%w; frontier=%w",
 			first.Err, second.Err)
 	}
 

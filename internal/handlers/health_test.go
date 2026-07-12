@@ -479,7 +479,7 @@ func TestNormalizeReadinessMode(t *testing.T) {
 		"Degraded":            ReadinessModeDegraded,
 		"always-200":          ReadinessModeDegraded,
 		"lol":                 ReadinessModeDegraded,
-		"strict ":             ReadinessModeDegraded, // whitespace-sensitive
+		"strict ":             ReadinessModeDegraded, //nolint:gocritic // mapKey: intentional trailing whitespace — verifies NormalizeReadinessMode does NOT trim it (degraded fallback)
 	}
 	for in, want := range cases {
 		if got := NormalizeReadinessMode(in); got != want {
