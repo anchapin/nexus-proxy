@@ -47,16 +47,18 @@ type LocalCompletion struct {
 // goroutine that serves the request so the observer should not block
 // long. The handler also enforces a body-size cap before invoking
 // the hook so a runaway model cannot blow the observer's memory.
+// Submit reports whether the sample was accepted (true) or dropped
+// (false, e.g. queue full).
 type JudgeObserver interface {
-	Submit(LocalCompletion)
+	Submit(LocalCompletion) bool
 }
 
 // JudgeObserverFunc adapts a plain function to the JudgeObserver
 // interface so wiring from main.go stays a one-liner.
-type JudgeObserverFunc func(LocalCompletion)
+type JudgeObserverFunc func(LocalCompletion) bool
 
 // Submit implements JudgeObserver.
-func (f JudgeObserverFunc) Submit(c LocalCompletion) { f(c) }
+func (f JudgeObserverFunc) Submit(c LocalCompletion) bool { return f(c) }
 
 // QualityEvent is emitted to the QualityObserver hook each time the
 // handler detects a tool call in an upstream response that looks like
@@ -1059,12 +1061,16 @@ func Chat(d Deps) http.Handler {
 					toolCallCount = len(res.ToolCalls)
 					if res.Succeeded && capw != nil {
 						if d.JudgeObserver != nil {
-							d.JudgeObserver.Submit(LocalCompletion{
+							if !d.JudgeObserver.Submit(LocalCompletion{
 								RequestID:   reqID,
 								Instruction: latestPrompt,
 								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
-							})
+							}) {
+								slog.Warn("judge sample dropped by observer",
+									slog.String("request_id", reqID),
+								)
+							}
 						}
 						if d.QualityObserver != nil {
 							emitDetectedEdits(capw.Buffer(), reqID, d.QualityObserver)
@@ -1130,12 +1136,16 @@ func Chat(d Deps) http.Handler {
 					}
 					if capw != nil {
 						if d.JudgeObserver != nil {
-							d.JudgeObserver.Submit(LocalCompletion{
+							if !d.JudgeObserver.Submit(LocalCompletion{
 								RequestID:   reqID,
 								Instruction: latestPrompt,
 								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
-							})
+							}) {
+								slog.Warn("judge sample dropped by observer",
+									slog.String("request_id", reqID),
+								)
+							}
 						}
 						if d.QualityObserver != nil {
 							emitDetectedEdits(capw.Buffer(), reqID, d.QualityObserver)

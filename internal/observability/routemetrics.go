@@ -94,15 +94,23 @@ type RouteCounters struct {
 	slmDecisions             map[counterKey]*uint64
 	lowConfidenceEscalations map[counterKey]*uint64
 	rejections               map[string]*uint64
+
+	// judgeDropped tracks the total number of judge samples dropped
+	// because the evaluation queue was full (issue #111). It is a
+	// single label-free counter — the evaluator's atomic Dropped()
+	// value is synced into this slot by the onDrop callback.
+	judgeDropped *uint64
 }
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
 func NewRouteCounters() *RouteCounters {
+	v := uint64(0)
 	return &RouteCounters{
 		routeDecisions:           make(map[counterKey]*uint64),
 		slmDecisions:             make(map[counterKey]*uint64),
 		lowConfidenceEscalations: make(map[counterKey]*uint64),
 		rejections:               make(map[string]*uint64),
+		judgeDropped:             &v,
 	}
 }
 
@@ -174,6 +182,18 @@ func (rc *RouteCounters) ObserveRejection(reason string) {
 		return
 	}
 	atomic.AddUint64(rc.reasonSlot(reason), 1)
+}
+
+// ObserveJudgeDrop synchronises the evaluator's running drop total
+// into the nexus_judge_dropped_total Prometheus counter (issue #111).
+// The evaluator's onDrop callback passes the cumulative count so we
+// use Store (not Add) to mirror the authoritative value without
+// double-counting.
+func (rc *RouteCounters) ObserveJudgeDrop(total uint64) {
+	if rc == nil {
+		return
+	}
+	atomic.StoreUint64(rc.judgeDropped, total)
 }
 
 // reasonSlot returns the *uint64 for reason, creating it if absent.
@@ -253,6 +273,14 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 		return total, err
 	} else {
 		total += n
+	}
+	// Judge queue overflow counter (issue #111). Label-free — a
+	// single monotonic counter tracks the cumulative total.
+	v := atomic.LoadUint64(rc.judgeDropped)
+	n, err := fmt.Fprintf(w, "# HELP nexus_judge_dropped_total Judge samples dropped because the evaluation queue was full.\n# TYPE nexus_judge_dropped_total counter\nnexus_judge_dropped_total %d\n", v)
+	total += int64(n)
+	if err != nil {
+		return total, err
 	}
 	return total, nil
 }
