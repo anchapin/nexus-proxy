@@ -93,6 +93,12 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ShutdownTimeout != DefaultShutdownTimeout {
 		t.Errorf("ShutdownTimeout = %v, want %v", cfg.ShutdownTimeout, DefaultShutdownTimeout)
 	}
+	// TOON unfenced-array detection (issue #123) defaults to on so a
+	// stock deployment compresses bare arrays; operators can opt out
+	// with NEXUS_TOON_UNFENCED=false.
+	if !cfg.TOONUnfenced {
+		t.Error("TOONUnfenced = false, want true (default on)")
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -149,6 +155,39 @@ func TestLoadOverrides(t *testing.T) {
 	if cfg.ProbeBytesPerToken != 131072 {
 		t.Errorf("ProbeBytesPerToken = %d, want 131072", cfg.ProbeBytesPerToken)
 	}
+}
+
+func TestLoadTOONUnfencedFlag(t *testing.T) {
+	t.Run("defaults_on", func(t *testing.T) {
+		t.Setenv("NEXUS_TOON_UNFENCED", "")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.TOONUnfenced {
+			t.Error("TOONUnfenced = false, want true when unset (default on)")
+		}
+	})
+	t.Run("explicit_false", func(t *testing.T) {
+		t.Setenv("NEXUS_TOON_UNFENCED", "false")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.TOONUnfenced {
+			t.Error("TOONUnfenced = true, want false when NEXUS_TOON_UNFENCED=false")
+		}
+	})
+	t.Run("explicit_true", func(t *testing.T) {
+		t.Setenv("NEXUS_TOON_UNFENCED", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.TOONUnfenced {
+			t.Error("TOONUnfenced = false, want true when NEXUS_TOON_UNFENCED=true")
+		}
+	})
 }
 
 func TestLoadTelemetryDisabledByEmptyPath(t *testing.T) {

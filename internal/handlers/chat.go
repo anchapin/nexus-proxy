@@ -710,7 +710,20 @@ func Chat(d Deps) http.Handler {
 		// (see internal/telemetry.EstimateTokens).
 		preCompressionChars := totalMessageChars(messages)
 		trace.Transforms.TOONBytesBefore = preCompressionChars
-		if middleware.CompressJSONBlocks(messages) {
+		// TOON compression runs in two passes: the fenced-block path
+		// (CompressJSONBlocks) always fires, then the unfenced-array
+		// path (CompressUnfencedJSONArrays, issue #123) handles bare
+		// `[ {...} ]` arrays pasted without a code fence. The unfenced
+		// pass is gated by NEXUS_TOON_UNFENCED so operators with a
+		// downstream parser that depends on raw JSON can revert. Both
+		// passes shrink the message between the pre/post snapshots
+		// below, so the existing token-savings accounting captures
+		// them without bespoke bookkeeping.
+		toonRewrote := middleware.CompressJSONBlocks(messages)
+		if d.Config.TOONUnfenced && middleware.CompressUnfencedJSONArrays(messages) {
+			toonRewrote = true
+		}
+		if toonRewrote {
 			if d.Config.PromptInjectionIsolated() {
 				messages = middleware.AppendSystemNoteIsolated(messages, d.Config.TOONNotice)
 			} else {

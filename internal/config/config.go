@@ -248,6 +248,16 @@ type Config struct {
 	MetaPrompt string // appended to system prompt by prompt_engine
 	TOONNotice string // appended when TOON compression is applied
 
+	// TOON unfenced-array detection (issue #123). When true (the
+	// default), the middleware runs a second TOON pass over
+	// user/assistant content that rewrites bare (unfenced) and
+	// prose-embedded JSON arrays-of-objects with >=2 rows. The
+	// fenced-block path always runs regardless of this flag; setting
+	// it to false restores the pre-issue-123 behaviour where only
+	// ```json fences are compressed, useful for downstream parsers
+	// that depend on raw JSON reaching the model.
+	TOONUnfenced bool
+
 	// Prompt-injection hardening (issue #76). Controls whether the
 	// proxy isolates its policy text from user-supplied system content
 	// and whether suspicious injection patterns are logged or rejected.
@@ -381,6 +391,7 @@ func Load() (Config, error) {
 		ZAIKey:         getEnv("NEXUS_ZAI_API_KEY", ""),
 		ProxyAPIKey:    getEnv("NEXUS_PROXY_API_KEY", ""),
 		StatusPublic:   getEnvBool("NEXUS_STATUS_PUBLIC", false),
+		TOONUnfenced:   getEnvBool("NEXUS_TOON_UNFENCED", true),
 		ExamplesDir:    getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
 		MetaPrompt:     defaultMetaPrompt,
 		TOONNotice:     defaultTOONNotice,
