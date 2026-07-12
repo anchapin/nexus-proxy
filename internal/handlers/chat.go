@@ -121,6 +121,55 @@ type RouteDecisionObserverFunc func(RouteDecisionEvent)
 // Observe implements RouteDecisionObserver.
 func (f RouteDecisionObserverFunc) Observe(e RouteDecisionEvent) { f(e) }
 
+// Rejection reason constants (issue #119). These are the label values
+// that appear in the nexus_requests_rejected_total{reason} Prometheus
+// family. They are exported so the rate-limit middleware (which lives
+// in a separate package) and main.go's wiring can reference the same
+// vocabulary without importing internal/observability — the strings
+// flow through the RejectionObserver hook.
+const (
+	// RejectionMethod marks a 405 Method Not Allowed response.
+	RejectionMethod = "method"
+	// RejectionBodyTooLarge marks a 413 Payload Too Large response
+	// (request body exceeded NEXUS_MAX_BODY_BYTES).
+	RejectionBodyTooLarge = "body_too_large"
+	// RejectionBadRequest marks a generic 400 Bad Request response
+	// (invalid JSON, missing messages array, unreadable body,
+	// strict-mode prompt-injection rejection).
+	RejectionBadRequest = "bad_request"
+	// RejectionRateLimit marks a 429 Too Many Requests response
+	// emitted by the rate-limit middleware. The reason is recorded
+	// by the middleware hook wired in main.go.
+	RejectionRateLimit = "rate_limit"
+)
+
+// RejectionEvent carries the minimal context a rejection observer
+// needs: which request was rejected and why. The handler dispatches
+// one per early-return path (issue #119) so the Prometheus counter
+// and any out-of-band sink can report rejection rate alongside
+// nexus_requests_total.
+type RejectionEvent struct {
+	RequestID string
+	Reason    string
+}
+
+// RejectionObserver is the hook invoked once per request that the
+// proxy rejects before it reaches an upstream (405 / 413 / 400 / 429).
+// Same invariants as the other observer hooks: safe for concurrent
+// use, must not block, nil means "no observer". The handler does not
+// import the observability package; main.go wires a closure that
+// forwards to RouteCounters.ObserveRejection.
+type RejectionObserver interface {
+	ObserveRejection(RejectionEvent)
+}
+
+// RejectionObserverFunc adapts a plain function to the
+// RejectionObserver interface.
+type RejectionObserverFunc func(RejectionEvent)
+
+// ObserveRejection implements RejectionObserver.
+func (f RejectionObserverFunc) ObserveRejection(e RejectionEvent) { f(e) }
+
 // MetricsEvent carries the per-request data needed by the savings
 // dashboard (issue #4). Fields track the full Round-trip metrics:
 // route/model/input-tokens are routing dimensions; TOON/RAG/cost are
@@ -369,6 +418,18 @@ type Deps struct {
 	// route counter.
 	RouteDecisionObserver RouteDecisionObserver
 
+	// RejectionObserver is invoked once per request that the proxy
+	// rejects before it reaches an upstream (issue #119): 405 method,
+	// 413 body-too-large, 400 bad-request, and strict-mode
+	// prompt-injection rejections. The rate-limit middleware's 429
+	// path is wired separately in main.go because it fires before
+	// the chat handler. Implementations must be safe for concurrent
+	// use and must not block. Nil is treated as "no observer"; the
+	// hot path is unaffected. The handler does not import the
+	// observability package — main.go wires a closure that adapts
+	// the event to the in-process rejection counter.
+	RejectionObserver RejectionObserver
+
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
 	// copy used for sampling is bounded. Zero uses DefaultObservedCap.
@@ -408,6 +469,14 @@ const DefaultObservedCap = 256 * 1024 // 256 KiB
 // Every proxied request — success, failure, or short-circuit — emits
 // exactly one telemetry.Record via Recorder so the issue #16 dashboard
 // can answer "what fraction of traffic failed in the last hour?".
+//
+// Issue #119: requests the proxy REJECTS before routing (405 method,
+// 413 body-too-large, 400 bad-request, strict-mode prompt-injection)
+// also emit exactly one record (route="rejected") AND fire the
+// RejectionObserver so the nexus_requests_rejected_total{reason}
+// Prometheus counter stays in sync with the response surface. The
+// rate-limit middleware's 429 path is instrumented separately (it fires
+// before this handler) via a hook wired in main.go.
 func Chat(d Deps) http.Handler {
 	if d.maxObservedBytes <= 0 {
 		d.maxObservedBytes = DefaultObservedCap
@@ -434,7 +503,45 @@ func Chat(d Deps) http.Handler {
 			)
 		}
 
+		// recordRejection (issue #119) emits the terminal signal for
+		// every early-return path: one telemetry Record (route=
+		// "rejected") OR one MetricsEvent when the metrics store is
+		// wired, plus one RejectionObserver dispatch so the
+		// nexus_requests_rejected_total{reason} counter increments.
+		// Centralising the recording here means every `return` below
+		// that calls this closure honours the doc-comment promise
+		// ("every request emits exactly one record"). The closure
+		// captures started/reqID so callers only pass the reason.
+		recordRejection := func(reason string) {
+			totalMs := float64(time.Since(started).Microseconds()) / 1000.0
+			ts := time.Now().UTC()
+			if d.MetricsObserver != nil {
+				d.MetricsObserver.Submit(MetricsEvent{
+					Timestamp:      ts,
+					RequestID:      reqID,
+					Route:          "rejected",
+					Error:          reason,
+					TotalLatencyMs: totalMs,
+				})
+			} else {
+				d.Recorder.Record(telemetry.Record{
+					Timestamp:      ts,
+					RequestID:      reqID,
+					Route:          "rejected",
+					TotalLatencyMs: totalMs,
+					Error:          reason,
+				})
+			}
+			if d.RejectionObserver != nil {
+				d.RejectionObserver.ObserveRejection(RejectionEvent{
+					RequestID: reqID,
+					Reason:    reason,
+				})
+			}
+		}
+
 		if r.Method != http.MethodPost {
+			recordRejection(RejectionMethod)
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 			return
 		}
@@ -451,6 +558,7 @@ func Chat(d Deps) http.Handler {
 		if err != nil {
 			var maxErr *http.MaxBytesError
 			if errors.As(err, &maxErr) {
+				recordRejection(RejectionBodyTooLarge)
 				writeJSONError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
 					"Request body exceeds NEXUS_MAX_BODY_BYTES (%d bytes)", maxBytes))
 				slog.Warn("rejected oversized request",
@@ -460,16 +568,19 @@ func Chat(d Deps) http.Handler {
 				)
 				return
 			}
+			recordRejection(RejectionBadRequest)
 			http.Error(w, "Failed to read request", http.StatusBadRequest)
 			return
 		}
 		var body map[string]interface{}
 		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			recordRejection(RejectionBadRequest)
 			http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
 			return
 		}
 		rawMessages, ok := body["messages"].([]interface{})
 		if !ok {
+			recordRejection(RejectionBadRequest)
 			http.Error(w, "Invalid or missing messages array", http.StatusBadRequest)
 			return
 		}
@@ -498,6 +609,7 @@ func Chat(d Deps) http.Handler {
 			hits := middleware.DetectSuspiciousSystem(rawMessages)
 			if len(hits) > 0 {
 				if d.Config.PromptInjectionMode == middleware.InjectionModeStrict {
+					recordRejection(RejectionBadRequest)
 					writeJSONError(w, http.StatusBadRequest,
 						"Request rejected: suspicious prompt-injection pattern detected in system message")
 					slog.Warn("strict mode rejected suspicious system message",

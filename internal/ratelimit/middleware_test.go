@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -207,3 +208,59 @@ func TestMiddleware_ConcurrentNoRace(t *testing.T) {
 // Ensure the _ variable is used so unused imports don't break the build
 // in toolchains that disable the test-time net import. Kept minimal.
 var _ = net.ParseIP
+
+// TestMiddleware_RejectionHookFires verifies that the SetRejectionHook
+// callback is invoked once per 429 (issue #119). Two requests exhaust
+// the burst, so the 3rd and 4th must each fire the hook.
+func TestMiddleware_RejectionHookFires(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 2, resolver) // huge rpm, burst 2
+	var rejected int64
+	m.SetRejectionHook(func() {
+		atomic.AddInt64(&rejected, 1)
+	})
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	for i := 0; i < 4; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", nil)
+		req.RemoteAddr = "10.0.0.1:1000"
+		h.ServeHTTP(rec, req)
+	}
+	if rejected != 2 {
+		t.Errorf("rejection hook fired %d times, want 2", rejected)
+	}
+}
+
+// TestMiddleware_RejectionHookNilSafe confirms a middleware with no
+// hook installed still works (no nil-panic on the 429 path).
+func TestMiddleware_RejectionHookNilSafe(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1, 1, resolver) // burst 1
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+	h.ServeHTTP(httptest.NewRecorder(), req) // consumes burst
+	h.ServeHTTP(httptest.NewRecorder(), req) // 429 — must not panic
+}
+
+// TestMiddleware_SetRejectionHookRemoves confirms passing nil clears
+// a previously installed hook.
+func TestMiddleware_SetRejectionHookRemoves(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1, 1, resolver)
+	var fired int64
+	m.SetRejectionHook(func() { atomic.AddInt64(&fired, 1) })
+	m.SetRejectionHook(nil)
+	h := m.Wrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if fired != 0 {
+		t.Errorf("hook fired %d after nil removal, want 0", fired)
+	}
+}

@@ -135,6 +135,7 @@ func TestRouteCountersNilSafe(t *testing.T) {
 	var rc *RouteCounters
 	// Must not panic.
 	rc.Observe("frontier", "guardrail", 0, "", "")
+	rc.ObserveRejection("bad_request")
 	n, err := rc.WriteTo(&strings.Builder{})
 	if err != nil || n != 0 {
 		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
@@ -157,3 +158,82 @@ func TestRouteCountersHandlerContentType(t *testing.T) {
 // Note: TestSanitizeHeaderValue moved to internal/handlers/sanitize_test.go
 // so handlers stays free of the observability import per the
 // AGENTS.md dependency rule.
+
+// TestRouteCountersRejections verifies the issue #119 rejection
+// counter family: ObserveRejection increments a per-reason counter
+// and WriteTo emits nexus_requests_rejected_total{reason} lines.
+func TestRouteCountersRejections(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveRejection("method")
+	rc.ObserveRejection("method")
+	rc.ObserveRejection("body_too_large")
+	rc.ObserveRejection("bad_request")
+	rc.ObserveRejection("bad_request")
+	rc.ObserveRejection("bad_request")
+	rc.ObserveRejection("rate_limit")
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_requests_rejected_total", "metric family header"},
+		{`# TYPE nexus_requests_rejected_total counter`, "counter type line"},
+		{`nexus_requests_rejected_total{reason="method"} 2`, "method counted twice"},
+		{`nexus_requests_rejected_total{reason="body_too_large"} 1`, "body_too_large counted once"},
+		{`nexus_requests_rejected_total{reason="bad_request"} 3`, "bad_request counted three times"},
+		{`nexus_requests_rejected_total{reason="rate_limit"} 1`, "rate_limit counted once"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+}
+
+// TestRouteCountersRejectionDeterministicOrder verifies that repeated
+// scrapes produce identical output (sorted by reason label) so
+// Prometheus diff alerts are not triggered by reordering.
+func TestRouteCountersRejectionDeterministicOrder(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveRejection("rate_limit")
+	rc.ObserveRejection("method")
+	rc.ObserveRejection("bad_request")
+
+	var first, second strings.Builder
+	_, _ = rc.WriteTo(&first)
+	_, _ = rc.WriteTo(&second)
+	if first.String() != second.String() {
+		t.Errorf("rejection output not deterministic between scrapes")
+	}
+}
+
+// TestRouteCountersRejectionConcurrentSafe exercises ObserveRejection
+// from many goroutines; the race detector is the primary assertion.
+func TestRouteCountersRejectionConcurrentSafe(t *testing.T) {
+	rc := NewRouteCounters()
+	reasons := []string{"method", "body_too_large", "bad_request", "rate_limit"}
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			rc.ObserveRejection(reasons[n%len(reasons)])
+		}(i)
+	}
+	wg.Wait()
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+	if !strings.Contains(out, "nexus_requests_rejected_total") {
+		t.Errorf("expected rejection metric in output")
+	}
+}
