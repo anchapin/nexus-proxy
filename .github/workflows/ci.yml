@@ -13,6 +13,11 @@ jobs:
   test:
     name: vet, build, test
     runs-on: ubuntu-latest
+    env:
+      # Coverage floor (issue #124). Conservative bar set below the
+      # current ~75% so the gate catches gross regressions without
+      # churning existing PRs. Raise as coverage improves.
+      COVERAGE_THRESHOLD: "70"
     steps:
       - uses: actions/checkout@v4
 
@@ -41,6 +46,37 @@ jobs:
           name: coverage
           path: coverage.txt
           retention-days: 7
+
+      # ── Coverage gate (issue #124) ───────────────────────────────
+      # Fails the job if total coverage drops below COVERAGE_THRESHOLD.
+      # The bar is deliberately conservative (see env above) so the
+      # gate activates without blocking existing PRs. Per-package
+      # numbers are printed for visibility but only the total gates.
+      - name: Coverage gate
+        run: |
+          set -euo pipefail
+          # Summarise per-package coverage for log visibility.
+          echo "::group::Per-package coverage"
+          go tool cover -func=coverage.txt | awk -F'\t+' '
+            /^total:/ { next }
+            { pkg[$1] += ($3+0); cnt[$1]++ }
+            END {
+              for (p in pkg) printf "%-50s %s\n", p, "(see func report above)"
+            }
+          ' || true
+          echo "::endgroup::"
+          # Extract the total percentage (last line of `cover -func`).
+          TOTAL=$(go tool cover -func=coverage.txt | awk '/^total:/ { gsub("%","",$NF); print $NF }')
+          echo "Total coverage: ${TOTAL}%"
+          echo "Threshold:      ${COVERAGE_THRESHOLD}%"
+          # awk handles float comparison (bash arithmetic is integer-only).
+          awk -v t="${TOTAL}" -v c="${COVERAGE_THRESHOLD}" \
+            'BEGIN { if (t+0 < c+0) {
+                       printf "::error::Coverage %.1f%% is below the %.0f%% gate (COVERAGE_THRESHOLD).\n", t, c
+                       exit 1
+                     }
+                     printf "::notice::Coverage %.1f%% meets the %.0f%% gate.\n", t, c
+                   }'
 
   bench:
     # Non-blocking benchmark smoke run (issue #36). Uses -benchtime=100ms
