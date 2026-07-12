@@ -1697,16 +1697,25 @@ func buildRecord(
 
 // --- metrics (issue #4) helpers ----------------------------------------
 
-// totalMessageChars marshals messages and returns the JSON byte
-// length. Used to compute the TOON savings token estimate. Mirrors
-// json.Marshal's own overflow behaviour (returns roughly the same
-// bytes the proxy would emit across the wire).
+// totalMessageChars walks the message structure and sums the length
+// of all string values. This approximates the JSON byte length without
+// the allocation and overhead of json.Marshal. Used to compute the
+// TOON savings token estimate. The delta (pre - post) is accurate
+// because TOON compression only mutates string content fields.
 func totalMessageChars(messages []interface{}) int {
-	b, err := json.Marshal(messages)
-	if err != nil {
-		return 0
+	var total int
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		for _, v := range msg {
+			if s, ok := v.(string); ok {
+				total += len(s)
+			}
+		}
 	}
-	return len(b)
+	return total
 }
 
 // totalTokenSavings returns the tokens saved by the TOON
