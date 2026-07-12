@@ -99,6 +99,16 @@ type Config struct {
 	// Routing
 	TokenGuardrail int           // estimated tokens above this force frontier (6000)
 	SLMTimeout     time.Duration // Qwen3-Coder routing timeout (8s)
+	// SLM routing decision cache (issue #116). The SLM decision is
+	// deterministic for a given prompt (temperature=0.1), so identical
+	// prompts pay the same 8s Ollama round-trip repeatedly. The cache
+	// is keyed on SHA256(prompt) and stores the parsed Decision
+	// (route, confidence, task_type). A size of 0 disables the cache.
+	// TTL of 0 means no expiry (entries evicted only by LRU). SLM
+	// transport errors (network, non-200, parse failure) are NOT cached
+	// so a transient Ollama failure is retried on the next request.
+	SLMCacheSize int           // max LRU entries (default 1024)
+	SLMCacheTTL  time.Duration // entry TTL (default 5m; 0 = no expiry)
 	FusionTimeout  time.Duration // per-panel-member fetch timeout (120s)
 	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
 	ArbiterTimeout time.Duration // per-call timeout for the fusion arbiter stream (60s)
@@ -440,6 +450,26 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.SLMTimeout = slmTimeout
+
+	// SLM cache (issue #116). Size 0 disables the cache; TTL 0 means
+	// no expiry (LRU-only eviction). Defaults: size=1024, TTL=5m.
+	slmCacheSize, err := getEnvInt("NEXUS_SLM_CACHE_SIZE", 1024)
+	if err != nil {
+		return cfg, err
+	}
+	if slmCacheSize < 0 {
+		slmCacheSize = 0
+	}
+	cfg.SLMCacheSize = slmCacheSize
+
+	slmCacheTTL, err := getEnvDuration("NEXUS_SLM_CACHE_TTL", 5*time.Minute)
+	if err != nil {
+		return cfg, err
+	}
+	if slmCacheTTL < 0 {
+		slmCacheTTL = 0
+	}
+	cfg.SLMCacheTTL = slmCacheTTL
 
 	fusionTimeout, err := getEnvDuration("NEXUS_FUSION_TIMEOUT", 120*time.Second)
 	if err != nil {
