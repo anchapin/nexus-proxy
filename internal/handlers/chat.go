@@ -172,6 +172,37 @@ type RejectionObserverFunc func(RejectionEvent)
 // ObserveRejection implements RejectionObserver.
 func (f RejectionObserverFunc) ObserveRejection(e RejectionEvent) { f(e) }
 
+// StreamTruncationEvent is emitted to the StreamTruncationObserver
+// hook when the streaming proxy detects a mid-stream upstream TCP
+// drop and emits a synthetic `data: [DONE]` sentinel so the
+// downstream harness does not hang (issue #118). Carries the route so
+// the Prometheus counter can partition truncations by destination
+// (local / frontier / fusion).
+type StreamTruncationEvent struct {
+	RequestID string
+	Route     string
+}
+
+// StreamTruncationObserver is the hook invoked when an upstream
+// stream is truncated mid-flight (issue #118): upstream.StreamWithContext
+// hit an io.ErrUnexpectedEOF / connection-reset after forwarding at
+// least one chunk and self-healed by emitting a truncation event +
+// [DONE]. Same invariants as the other observer hooks: safe for
+// concurrent use, must not block, nil means "no observer". The
+// handler does not import the observability package; main.go wires a
+// closure that forwards to RouteCounters.ObserveStreamTruncation.
+type StreamTruncationObserver interface {
+	ObserveStreamTruncation(StreamTruncationEvent)
+}
+
+// StreamTruncationObserverFunc adapts a plain function to the
+// StreamTruncationObserver interface so wiring from main.go stays a
+// one-liner.
+type StreamTruncationObserverFunc func(StreamTruncationEvent)
+
+// ObserveStreamTruncation implements StreamTruncationObserver.
+func (f StreamTruncationObserverFunc) ObserveStreamTruncation(e StreamTruncationEvent) { f(e) }
+
 // MetricsEvent carries the per-request data needed by the savings
 // dashboard (issue #4). Fields track the full Round-trip metrics:
 // route/model/input-tokens are routing dimensions; TOON/RAG/cost are
@@ -431,6 +462,19 @@ type Deps struct {
 	// observability package — main.go wires a closure that adapts
 	// the event to the in-process rejection counter.
 	RejectionObserver RejectionObserver
+
+	// StreamTruncationObserver is invoked when the streaming proxy
+	// detects a mid-stream upstream TCP drop (issue #118).
+	// upstream.StreamWithContext self-heals by emitting a truncation
+	// event + `data: [DONE]` so the harness does not hang, and
+	// returns upstream.ErrUpstreamTruncated; the handler dispatches
+	// this hook so /metrics records the truncation and stamps
+	// X-Nexus-Truncated on the response. Implementations must be
+	// safe for concurrent use and must not block. Nil is treated as
+	// "no observer"; the hot path is unaffected. The handler does
+	// not import the observability package — main.go wires a closure
+	// that adapts the event to the in-process truncation counter.
+	StreamTruncationObserver StreamTruncationObserver
 
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
@@ -1177,6 +1221,31 @@ func Chat(d Deps) http.Handler {
 			} else {
 				upErr = upstream.BufferedFetch(obs, d.Client,
 					d.Config.FrontierURL, d.Config.FrontierKey, body)
+			}
+			// Issue #118: a mid-stream upstream TCP drop is self-healed
+			// inside upstream.StreamWithContext (it emits a truncation
+			// event + `data: [DONE]`) and returned as
+			// upstream.ErrUpstreamTruncated. The response is already
+			// committed (200 + flushed SSE frames), so we MUST NOT call
+			// http.Error (that would write a 502 body into a stream the
+			// client already terminated). Surface the truncation on the
+			// response header and the observability hook, then clear the
+			// error so the generic upstream-error branch below is
+			// skipped. Only the streaming path can truncate; the
+			// BufferedFetch branch never returns this sentinel.
+			if upErr != nil && errors.Is(upErr, upstream.ErrUpstreamTruncated) {
+				w.Header().Set("X-Nexus-Truncated", "true")
+				if d.StreamTruncationObserver != nil {
+					d.StreamTruncationObserver.ObserveStreamTruncation(StreamTruncationEvent{
+						RequestID: reqID,
+						Route:     string(route),
+					})
+				}
+				slog.Warn("upstream stream truncated; emitted synthetic [DONE]",
+					slog.String("route", string(route)),
+					slog.String("request_id", reqID),
+				)
+				upErr = nil
 			}
 			if upErr != nil {
 				slog.Error("upstream error",

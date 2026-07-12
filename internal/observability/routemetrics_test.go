@@ -237,3 +237,68 @@ func TestRouteCountersRejectionConcurrentSafe(t *testing.T) {
 		t.Errorf("expected rejection metric in output")
 	}
 }
+
+// TestRouteCountersStreamTruncation exercises the issue #118
+// truncation counter: ObserveStreamTruncation increments per route,
+// the metric family header is always emitted, and the values surface
+// in the Prometheus exposition with a route label.
+func TestRouteCountersStreamTruncation(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveStreamTruncation("frontier")
+	rc.ObserveStreamTruncation("frontier")
+	rc.ObserveStreamTruncation("local")
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"# HELP nexus_stream_truncated_total", "metric family HELP header"},
+		{"# TYPE nexus_stream_truncated_total counter", "metric family TYPE line"},
+		{`nexus_stream_truncated_total{route="frontier"} 2`, "frontier counted twice"},
+		{`nexus_stream_truncated_total{route="local"} 1`, "local counted once"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+}
+
+// TestRouteCountersStreamTruncationNilSafe confirms the hook is a
+// no-op on a nil receiver so the chat handler can invoke it
+// unconditionally (issue #118 wiring mirrors the other observers).
+func TestRouteCountersStreamTruncationNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveStreamTruncation("frontier") // must not panic
+}
+
+// TestRouteCountersStreamTruncationConcurrentSafe exercises
+// ObserveStreamTruncation from many goroutines; the race detector is
+// the primary assertion (same guarantee as the rejection counter).
+func TestRouteCountersStreamTruncationConcurrentSafe(t *testing.T) {
+	rc := NewRouteCounters()
+	routes := []string{"local", "frontier", "fusion"}
+	var wg sync.WaitGroup
+	for i := 0; i < 300; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			rc.ObserveStreamTruncation(routes[n%len(routes)])
+		}(i)
+	}
+	wg.Wait()
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	if !strings.Contains(sb.String(), "nexus_stream_truncated_total") {
+		t.Errorf("expected truncation metric in output")
+	}
+}
