@@ -90,6 +90,18 @@ func main() {
 	bootCtx, cancel := context.WithTimeout(context.Background(), bootRAGTimeout)
 	defer cancel()
 
+	// RAG embedding cache (issue #115). Wrap the Ollama embedder with
+	// a bounded LRU so repeat prompts skip the /api/embeddings
+	// round-trip. A size of 0 disables the cache (falls back to the
+	// raw embedder).
+	var ragEmbedder rag.Embedder = emb
+	if cfg.RAGEmbedCacheSize > 0 {
+		ragEmbedder = rag.NewCachedEmbedder(emb, cfg.RAGEmbedCacheSize)
+		slog.Info("rag embedding cache enabled",
+			slog.Int("max_entries", cfg.RAGEmbedCacheSize),
+		)
+	}
+
 	// RAG store (issue #46). When NEXUS_RAG_DB is set, open the
 	// SQLite-backed PersistentStore and LoadOrIndex it. The boot
 	// path is a one-shot: Load if the DB has rows, otherwise
@@ -98,7 +110,7 @@ func main() {
 	// in-memory-only Store with the original IndexDir semantics —
 	// the proxy is byte-for-byte identical to the pre-issue-46
 	// behaviour.
-	store, persistentStore, ragWatcher := buildRAGStore(cfg, emb, bootCtx)
+	store, persistentStore, ragWatcher := buildRAGStore(cfg, ragEmbedder, bootCtx)
 
 	slm := router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, cfg.SLMTimeout, nil)
 	// Judge-guided adaptive routing (issue #47): the confidence
@@ -714,7 +726,7 @@ func (b *confidenceBridge) Close() error { return b.inner.Close() }
 // The watcher is started only when persistence is enabled AND
 // NEXUS_RAG_POLL_INTERVAL > 0; an interval of zero leaves
 // persistence on but disables runtime updates (boot-only load).
-func buildRAGStore(cfg config.Config, emb *rag.OllamaEmbedder, bootCtx context.Context) (rag.RAGStore, *rag.PersistentStore, *rag.Watcher) {
+func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context) (rag.RAGStore, *rag.PersistentStore, *rag.Watcher) {
 	if !cfg.RAGPersistentEnabled() {
 		slog.Info("rag persistent store disabled (NEXUS_RAG_DB is empty); using in-memory store")
 		store := rag.NewStore(emb, cfg.RAGThreshold)
