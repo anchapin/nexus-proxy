@@ -24,10 +24,7 @@ func TestSecurityHeadersTracingSpan(t *testing.T) {
 	srv := httptest.NewServer(SecurityHeaders(true)(inner))
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL)
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
+	resp := getContextGet(t, http.DefaultClient, srv.URL)
 	resp.Body.Close()
 
 	if err := exp.Close(); err != nil {
@@ -58,10 +55,7 @@ func TestSecurityHeadersTracingNoTLS(t *testing.T) {
 	srv := httptest.NewServer(SecurityHeaders(false)(inner))
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL)
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
+	resp := getContextGet(t, http.DefaultClient, srv.URL)
 	resp.Body.Close()
 
 	if err := exp.Close(); err != nil {

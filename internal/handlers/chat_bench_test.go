@@ -224,7 +224,7 @@ func BenchmarkChatEndToEndProxy(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		req, _ := http.NewRequest(http.MethodPost, proxySrv.URL+"/v1/chat/completions",
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, proxySrv.URL+"/v1/chat/completions",
 			strings.NewReader(body))
 		resp, err := client.Do(req)
 		if err != nil {
@@ -270,7 +270,7 @@ func BenchmarkChatEndToEndProxyConcurrent(b *testing.B) {
 				go func() {
 					defer wg.Done()
 					for r := 0; r < perWorker; r++ {
-						req, _ := http.NewRequest(http.MethodPost,
+						req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost,
 							proxySrv.URL+"/v1/chat/completions",
 							strings.NewReader(body))
 						resp, err := client.Do(req)

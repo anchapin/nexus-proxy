@@ -74,7 +74,7 @@ func (p *OllamaProbe) Budget(ctx context.Context) (Budget, error) {
 	switch {
 	case err != nil && sysfsErr != nil:
 		return Budget{Source: SourceStatic, BytesPerToken: bpt},
-			fmt.Errorf("%w: ollama=%v sysfs=%v", ErrNoSignal, err, sysfsErr)
+			fmt.Errorf("%w: ollama=%w sysfs=%w", ErrNoSignal, err, sysfsErr)
 	case err != nil:
 		// Ollama unreachable but VRAM is read; budget from VRAM only.
 		toks := vramBytesToTokens(freeVRAM, bpt)
@@ -88,7 +88,7 @@ func (p *OllamaProbe) Budget(ctx context.Context) (Budget, error) {
 		// No sysfs (e.g. macOS dev box) but Ollama answered; trust the model context.
 		if modelCtx <= 0 {
 			return Budget{Source: SourceStatic, BytesPerToken: bpt},
-				fmt.Errorf("%w: %v (model=%q)", ErrNoSignal, err, modelName)
+				fmt.Errorf("%w: no model context (model=%q)", ErrNoSignal, modelName)
 		}
 		return Budget{
 			Tokens:        modelCtx,

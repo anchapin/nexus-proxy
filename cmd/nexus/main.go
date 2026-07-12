@@ -680,7 +680,7 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		// Unrecoverable boot/server error — log.Fatalf is kept
 		// here per the issue #3 acceptance criteria.
-		log.Fatalf("server: %v", err)
+		log.Fatalf("server: %v", err) //nolint:gocritic // exitAfterDefer: intentional fatal exit when the server fails to start; deferred cleanup is moot because the process is terminating and the OS reclaims resources
 	}
 }
 

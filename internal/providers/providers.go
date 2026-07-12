@@ -314,7 +314,7 @@ func SortByPriority(providers []Provider) []Provider {
 	copy(out, providers)
 	// Insertion sort — providers lists are tiny (single-digit) so
 	// the O(n²) cost is negligible and we avoid pulling sort.Slice
-	//'s reflection overhead.
+	// 's reflection overhead.
 	for i := 1; i < len(out); i++ {
 		cur := out[i]
 		j := i - 1

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -16,6 +17,22 @@ import (
 	"time"
 )
 
+// getContextGet issues a context-aware GET via client so the tests
+// satisfy noctx (http.Get / (*http.Client).Get do not propagate a
+// context). The response body is left open for the caller to close.
+func getContextGet(t *testing.T, client *http.Client, url string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	return resp
+}
+
 // TestSecurityHeadersStampedOnResponse asserts the three always-on
 // security headers are present on a wrapped response (issue #39).
 func TestSecurityHeadersStampedOnResponse(t *testing.T) {
@@ -25,10 +42,7 @@ func TestSecurityHeadersStampedOnResponse(t *testing.T) {
 	srv := httptest.NewServer(SecurityHeaders(false)(inner))
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
+	resp := getContextGet(t, http.DefaultClient, srv.URL)
 	defer resp.Body.Close()
 
 	if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
@@ -54,10 +68,7 @@ func TestSecurityHeadersHSTSOnlyWithTLS(t *testing.T) {
 	// No TLS → no HSTS.
 	srv := httptest.NewServer(SecurityHeaders(false)(inner))
 	defer srv.Close()
-	resp, err := http.Get(srv.URL)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
+	resp := getContextGet(t, http.DefaultClient, srv.URL)
 	if got := resp.Header.Get("Strict-Transport-Security"); got != "" {
 		t.Errorf("HSTS present without TLS: %q", got)
 	}
@@ -67,10 +78,7 @@ func TestSecurityHeadersHSTSOnlyWithTLS(t *testing.T) {
 	srv2 := httptest.NewTLSServer(SecurityHeaders(true)(inner))
 	defer srv2.Close()
 	client := srv2.Client()
-	resp2, err := client.Get(srv2.URL)
-	if err != nil {
-		t.Fatalf("Get (tls): %v", err)
-	}
+	resp2 := getContextGet(t, client, srv2.URL)
 	defer resp2.Body.Close()
 	if got := resp2.Header.Get("Strict-Transport-Security"); got != "max-age=31536000" {
 		t.Errorf("HSTS = %q, want max-age=31536000", got)
@@ -89,10 +97,7 @@ func TestSecurityHeadersOnAllPaths(t *testing.T) {
 	srv := httptest.NewServer(SecurityHeaders(false)(mux))
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/healthz")
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
+	resp := getContextGet(t, http.DefaultClient, srv.URL+"/healthz")
 	defer resp.Body.Close()
 	if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
 		t.Errorf("X-Content-Type-Options on /healthz = %q, want nosniff", got)
@@ -141,10 +146,7 @@ func TestTLSServerWithValidCert(t *testing.T) {
 	client := &http.Client{Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}}
-	resp, err := client.Get("https://" + ln.Addr().String())
-	if err != nil {
-		t.Fatalf("Get over TLS: %v", err)
-	}
+	resp := getContextGet(t, client, "https://"+ln.Addr().String())
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
