@@ -96,7 +96,7 @@ jobs:
           cat checksums-sha256.txt
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binaries
           path: dist/
@@ -228,7 +228,7 @@ jobs:
           mv "${FILE}" "nexus-${{ steps.ver.outputs.version }}-sbom.spdx.json"
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: dist/*.spdx.json
