@@ -704,8 +704,8 @@ func TestEvaluatorDroppedCallback(t *testing.T) {
 	defer close(release) // LIFO: runs first (unblocks worker)
 
 	var (
-		mu       sync.Mutex
-		totals   []uint64
+		mu        sync.Mutex
+		totals    []uint64
 		callCount int
 	)
 	e.SetDropCallback(func(total uint64) {
