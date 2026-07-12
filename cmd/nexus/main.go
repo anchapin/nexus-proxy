@@ -39,7 +39,6 @@ import (
 const (
 	formattingRegexPattern = `(?i)\b(css|format|docstring|lint|typo|boilerplate)\b`
 	bootRAGTimeout         = 30 * time.Second
-	shutdownTimeout        = 10 * time.Second
 )
 
 // version is the build version. Overridden at compile time via
@@ -242,6 +241,26 @@ func main() {
 	} else {
 		slog.Info("rate limiter disabled (NEXUS_RATE_LIMIT_RPM<=0)")
 	}
+
+	// Graceful shutdown sanity check (issue #121). The drain window
+	// must be at least as long as the inbound read deadline —
+	// otherwise a SIGTERM that arrives while a client is still
+	// uploading a large request body truncates that request mid-read
+	// even though the server nominally had time to finish it. Warn
+	// (rather than fail boot) so an operator who deliberately wants a
+	// tight drain can keep it; the warning makes the truncation
+	// visible in the logs. Skipped when ReadTimeout is 0 (disabled),
+	// since there is no inbound deadline to underrun.
+	if cfg.ReadTimeout > 0 && cfg.ShutdownTimeout < cfg.ReadTimeout {
+		slog.Warn("shutdown drain shorter than read timeout: in-flight uploads may be truncated mid-read",
+			slog.Duration("shutdown_timeout", cfg.ShutdownTimeout),
+			slog.Duration("read_timeout", cfg.ReadTimeout),
+			slog.String("hint", "set NEXUS_SHUTDOWN_TIMEOUT >= NEXUS_SERVER_READ_TIMEOUT"),
+		)
+	}
+	slog.Info("graceful shutdown drain configured",
+		slog.Duration("shutdown_timeout", cfg.ShutdownTimeout),
+	)
 
 	// Async LLM-as-a-judge evaluator (issue #15). The handler never
 	// imports internal/judge; we plug the observer in here via a
@@ -563,18 +582,23 @@ func main() {
 	// in-flight requests, then drain the judge queue so we don't
 	// lose pending JudgeScore records. The telemetry recorder is
 	// closed via the deferred call above so it always flushes,
-	// even on log.Fatalf.
+	// even on log.Fatalf. The drain window is configurable via
+	// NEXUS_SHUTDOWN_TIMEOUT (issue #121) so operators running long
+	// frontier SSE streams are not truncated by the prior hardcoded
+	// 10s ceiling.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		slog.Info("shutting down, draining judge queue and closing server")
+		slog.Info("shutting down, draining judge queue and closing server",
+			slog.Duration("drain_budget", cfg.ShutdownTimeout),
+		)
 		if judgeEval != nil {
 			if err := judgeEval.Close(); err != nil {
 				slog.Warn("judge close", slog.Any("err", err))
 			}
 		}
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Warn("server shutdown", slog.Any("err", err))

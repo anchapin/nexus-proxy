@@ -40,6 +40,16 @@ type Config struct {
 	IdleTimeout    time.Duration // keep-alive idle wait; 0 disables
 	MaxHeaderBytes int           // max request header bytes; 0 uses Go default (1 MiB)
 
+	// Graceful shutdown timeout (issue #121). Upper bound on the drain
+	// window the HTTP server observes after SIGTERM/SIGINT — a frontier
+	// SSE stream mid-token or a fusion arbiter call that just opened its
+	// 60s WithTimeout window needs more than the prior hardcoded 10s.
+	// 0 falls back to the default (30s) so the knob can never accidentally
+	// disable the drain. Validated against ReadTimeout at boot: a drain
+	// shorter than the inbound read deadline emits a warning because
+	// in-flight requests would still be truncated mid-read.
+	ShutdownTimeout time.Duration // SIGTERM/SIGINT drain window
+
 	// Local Ollama
 	OllamaURL      string // "http://localhost:11434"
 	RouterModel    string // "qwen3-coder:4b"
@@ -669,6 +679,29 @@ func Load() (Config, error) {
 	}
 	cfg.MaxHeaderBytes = maxHeader
 
+	// Graceful shutdown drain window (issue #121). Replaces the prior
+	// hardcoded `const shutdownTimeout = 10 * time.Second` in main.go
+	// so operators can tune the SIGTERM drain to match their longest
+	// legitimate streaming response (frontier SSE can run 120s+). A
+	// stock K8s deployment should set this just below its pod's
+	// terminationGracePeriodSeconds. Zero is treated as "use the
+	// default" (not "no drain") so a misconfigured .env cannot disable
+	// the drain and leak in-flight requests. Negative is rejected so a
+	// typo fails fast at boot. The boot-time warning when the drain is
+	// shorter than ReadTimeout is emitted in main.go (the logger is
+	// not yet wired here).
+	shutdownTimeout, err := getEnvDuration("NEXUS_SHUTDOWN_TIMEOUT", DefaultShutdownTimeout)
+	if err != nil {
+		return cfg, err
+	}
+	if shutdownTimeout < 0 {
+		return cfg, fmt.Errorf("config: NEXUS_SHUTDOWN_TIMEOUT must not be negative, got %s", shutdownTimeout)
+	}
+	if shutdownTimeout == 0 {
+		shutdownTimeout = DefaultShutdownTimeout
+	}
+	cfg.ShutdownTimeout = shutdownTimeout
+
 	// Judge (issue #15). Defaults: z.ai-style endpoint, sample 10% of
 	// local-route successes, 2 concurrent workers, 30s per call. When
 	// JudgeURL is unset we fall back to NEXUS_FRONTIER_URL so a stock
@@ -893,6 +926,14 @@ const DefaultServerIdleTimeout = 120 * time.Second
 // http.DefaultMaxHeaderBytes (1 MiB) — large enough for auth cookies and
 // content-type metadata, small enough to reject header-flood abuse.
 const DefaultServerMaxHeaderBytes = 1 << 20 // 1 MiB
+
+// DefaultShutdownTimeout is the default graceful-shutdown drain window
+// (issue #121). 30s accommodates a frontier SSE stream mid-token and a
+// fusion arbiter call that just opened its 60s WithTimeout window while
+// staying comfortably under a typical K8s terminationGracePeriodSeconds
+// of 30s. Operators running longer upstreams (or larger
+// terminationGracePeriodSeconds) raise this via NEXUS_SHUTDOWN_TIMEOUT.
+const DefaultShutdownTimeout = 30 * time.Second
 
 // DefaultMaxBodyBytes is the fallback request-body cap (issue #11). 1 MiB
 // matches the typical OpenAI chat-completions request envelope; agents that

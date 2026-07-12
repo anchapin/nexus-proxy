@@ -89,6 +89,10 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.MaxHeaderBytes != DefaultServerMaxHeaderBytes {
 		t.Errorf("MaxHeaderBytes = %d, want %d", cfg.MaxHeaderBytes, DefaultServerMaxHeaderBytes)
 	}
+	// Graceful shutdown drain window (issue #121).
+	if cfg.ShutdownTimeout != DefaultShutdownTimeout {
+		t.Errorf("ShutdownTimeout = %v, want %v", cfg.ShutdownTimeout, DefaultShutdownTimeout)
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -475,6 +479,46 @@ func TestLoadServerTimeoutInvalidValues(t *testing.T) {
 				t.Errorf("expected error for %s=%s", tc.key, tc.val)
 			}
 		})
+	}
+}
+
+// --- Graceful shutdown timeout (issue #121) ---
+
+func TestLoadShutdownTimeoutHonoursOverride(t *testing.T) {
+	t.Setenv("NEXUS_SHUTDOWN_TIMEOUT", "5s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ShutdownTimeout != 5*time.Second {
+		t.Errorf("ShutdownTimeout = %v, want 5s", cfg.ShutdownTimeout)
+	}
+}
+
+func TestLoadShutdownTimeoutZeroFallsBackToDefault(t *testing.T) {
+	// 0 is documented as "use the default" — it must NOT disable the
+	// drain (a misconfigured .env must not leak in-flight requests).
+	t.Setenv("NEXUS_SHUTDOWN_TIMEOUT", "0")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ShutdownTimeout != DefaultShutdownTimeout {
+		t.Errorf("ShutdownTimeout = %v, want default %v", cfg.ShutdownTimeout, DefaultShutdownTimeout)
+	}
+}
+
+func TestLoadShutdownTimeoutNegativeRejected(t *testing.T) {
+	t.Setenv("NEXUS_SHUTDOWN_TIMEOUT", "-1s")
+	if _, err := Load(); err == nil {
+		t.Errorf("expected error for NEXUS_SHUTDOWN_TIMEOUT=-1s")
+	}
+}
+
+func TestLoadShutdownTimeoutInvalidValue(t *testing.T) {
+	t.Setenv("NEXUS_SHUTDOWN_TIMEOUT", "soon")
+	if _, err := Load(); err == nil {
+		t.Errorf("expected error for NEXUS_SHUTDOWN_TIMEOUT=soon")
 	}
 }
 
