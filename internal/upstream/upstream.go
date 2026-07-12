@@ -11,55 +11,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 )
-
-// Client is the minimal interface used by the stream and fusion helpers. The
-// default http.Client satisfies it; tests can pass a stub.
-type Client interface {
-	Do(req *http.Request) (*http.Response, error)
-}
-
-// callOpts collects optional request-level knobs the chat handler
-// can pass via variadic CallOption values. Backward-compatible:
-// every existing call site compiles unchanged because the
-// variadic opts parameter has zero-value defaults.
-type callOpts struct {
-	traceparent string
-}
-
-// CallOption configures one optional behaviour on an outbound call.
-// Implemented as a functional option so callers can compose new
-// fields without touching the function signatures (issue #41 —
-// distributed tracing).
-type CallOption func(*callOpts)
-
-// WithTraceparent sets the W3C `traceparent` header on the outbound
-// POST. Empty strings are ignored so the option is safe to wire
-// unconditionally. The receiving service uses the header to attach
-// its own span to the proxy's trace, completing the distributed
-// correlation chain.
-func WithTraceparent(value string) CallOption {
-	return func(o *callOpts) {
-		if value != "" {
-			o.traceparent = value
-		}
-	}
-}
-
-// applyCallOpts resolves the variadic option chain. Nil options are
-// silently skipped so the call sites stay terse.
-func applyCallOpts(opts []CallOption) *callOpts {
-	o := &callOpts{}
-	for _, opt := range opts {
-		if opt != nil {
-			opt(o)
-		}
-	}
-	return o
-}
 
 // allowedHeaders is the allowlist of upstream response headers the proxy
 // forwards to clients (issue #39). Headers NOT in this set — Server,
@@ -77,11 +33,9 @@ var allowedHeaders = map[string]struct{}{
 }
 
 // headerAllowed reports whether name should be forwarded to the client.
-// Header names are canonicalised by net/http (CanonicalMIMEHeaderKey)
-// before they reach the map, so we compare against the canonical form.
-// X-Nexus-* is matched by prefix (case-insensitive, redundant given
-// canonicalisation but defensive) so future instrumentation headers pass
-// through without touching the allowlist.
+// Header names are canonicalised by net/http before they reach the map,
+// so we compare against the canonical form. X-Nexus-* is matched by
+// prefix so future instrumentation headers pass through untouched.
 func headerAllowed(name string) bool {
 	if _, ok := allowedHeaders[name]; ok {
 		return true
@@ -103,6 +57,12 @@ func copyAllowedHeaders(dst, src http.Header) {
 	}
 }
 
+// Client is the minimal interface used by the stream and fusion helpers. The
+// default http.Client satisfies it; tests can pass a stub.
+type Client interface {
+	Do(req *http.Request) (*http.Response, error)
+}
+
 // Stream POSTs payload to targetURL and flushes every newline-terminated
 // chunk from the upstream response body straight to w. This preserves the
 // harness's expected SSE framing — each `data: {…}\n\n` arrives intact.
@@ -112,8 +72,8 @@ func copyAllowedHeaders(dst, src http.Header) {
 // Stream is a thin wrapper around StreamWithContext that uses a fresh
 // context.Background(). Callers that need a timeout (issue #12: the
 // fusion arbiter) should use StreamWithContext directly.
-func Stream(w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}, opts ...CallOption) error {
-	return StreamWithContext(context.Background(), w, client, targetURL, apiKey, payload, opts...)
+func Stream(w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}) error {
+	return StreamWithContext(context.Background(), w, client, targetURL, apiKey, payload)
 }
 
 // StreamWithContext is Stream plus an explicit request context. The
@@ -123,7 +83,7 @@ func Stream(w http.ResponseWriter, client Client, targetURL, apiKey string, payl
 // (cancels the handler's r.Context()). Use this from callers that
 // need to bound an upstream call — issue #12 added NEXUS_ARBITER_TIMEOUT
 // for exactly this purpose on the fusion arbiter path.
-func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}, opts ...CallOption) error {
+func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}) error {
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("upstream: marshal: %w", err)
@@ -135,9 +95,6 @@ func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
-	}
-	if o := applyCallOpts(opts); o.traceparent != "" {
-		req.Header.Set("traceparent", o.traceparent)
 	}
 
 	resp, err := client.Do(req)
@@ -188,15 +145,15 @@ func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client
 // uses a fresh context.Background(). Callers that need a timeout
 // should use BufferedFetchWithContext directly — same contract as
 // StreamWithContext.
-func BufferedFetch(w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}, opts ...CallOption) error {
-	return BufferedFetchWithContext(context.Background(), w, client, targetURL, apiKey, payload, opts...)
+func BufferedFetch(w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}) error {
+	return BufferedFetchWithContext(context.Background(), w, client, targetURL, apiKey, payload)
 }
 
 // BufferedFetchWithContext is BufferedFetch plus an explicit request
 // context. Cancellation via context.WithTimeout propagates both
 // client-side (cancels the in-flight request) and server-side (cancels
 // the handler's r.Context()).
-func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}, opts ...CallOption) error {
+func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client Client, targetURL, apiKey string, payload map[string]interface{}) error {
 	body := make(map[string]interface{}, len(payload)+1)
 	for k, v := range payload {
 		body[k] = v
@@ -215,9 +172,6 @@ func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	if o := applyCallOpts(opts); o.traceparent != "" {
-		req.Header.Set("traceparent", o.traceparent)
-	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -234,9 +188,9 @@ func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client
 		return fmt.Errorf("upstream: invalid JSON in response (status %d): %w", resp.StatusCode, err)
 	}
 
-	// Forward only allowlisted upstream headers (issue #39). Content-Type
-	// is then always re-asserted to application/json so the harness sees a
-	// plain JSON envelope regardless of what the upstream declared.
+	// Forward only allowlisted upstream headers (issue #39), then force
+	// Content-Type to application/json so the harness sees a plain JSON
+	// envelope regardless of what the upstream declared.
 	copyAllowedHeaders(w.Header(), resp.Header)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
@@ -245,9 +199,12 @@ func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client
 }
 
 // FetchPanel fetches a single non-streaming completion from targetURL and
-// returns the assistant message text. Designed for the fusion panel where
-// we need the full response before asking the arbiter to synthesize.
-func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName string, body map[string]interface{}, opts ...CallOption) (string, error) {
+// returns the assistant message (content + tool_calls). Designed for the
+// fusion panel where we need the full response before asking the arbiter
+// to synthesize. Tool calls are preserved (issue #72) so the progressive
+// streaming path can emit them as delta.tool_calls when the panel member
+// is the speculative winner.
+func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName string, body map[string]interface{}) (AssistantMessage, error) {
 	payload := make(map[string]interface{}, len(body)+2)
 	for k, v := range body {
 		payload[k] = v
@@ -257,53 +214,63 @@ func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName
 
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("fusion: marshal: %w", err)
+		return AssistantMessage{}, fmt.Errorf("fusion: marshal: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(jsonPayload))
 	if err != nil {
-		return "", fmt.Errorf("fusion: build request: %w", err)
+		return AssistantMessage{}, fmt.Errorf("fusion: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	if o := applyCallOpts(opts); o.traceparent != "" {
-		req.Header.Set("traceparent", o.traceparent)
-	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("fusion: do: %w", err)
+		return AssistantMessage{}, fmt.Errorf("fusion: do: %w", err)
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("fusion: %s status %d: %s", modelName, resp.StatusCode, respBody)
+		return AssistantMessage{}, fmt.Errorf("fusion: %s status %d: %s", modelName, resp.StatusCode, respBody)
 	}
 
 	var raw struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content   string     `json:"content"`
+				ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 			} `json:"message"`
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(respBody, &raw); err != nil {
-		return "", fmt.Errorf("fusion: decode: %w", err)
+		return AssistantMessage{}, fmt.Errorf("fusion: decode: %w", err)
 	}
 	if len(raw.Choices) == 0 {
-		return "", fmt.Errorf("fusion: %s returned empty choice", modelName)
+		return AssistantMessage{}, fmt.Errorf("fusion: %s returned empty choice", modelName)
 	}
-	return raw.Choices[0].Message.Content, nil
+	return AssistantMessage{
+		Content:   raw.Choices[0].Message.Content,
+		ToolCalls: raw.Choices[0].Message.ToolCalls,
+	}, nil
 }
 
 // PanelResult is one member's contribution to a fusion response. Members
 // that errored are returned with Err set and Content empty; callers should
 // surface that to the arbiter so it can choose to ignore or down-weight.
+//
+// ToolCalls carries any OpenAI-compatible tool_calls the member returned
+// (issue #72). When the member is streamed speculatively as the winner,
+// streamPanelResultAsSSE emits these as delta.tool_calls. The arbiter
+// synthesis path is text-only — tool calls from a disagreeing member are
+// not merged into the arbiter output. This is intentional: tool-call
+// arbitration (picking the "better" set of tool calls from two members)
+// is a separate concern left for a future change.
 type PanelResult struct {
-	Source  string // "local" or "frontier"
-	Content string
-	Err     error
+	Source    string // "local" or "frontier"
+	Content   string
+	ToolCalls []ToolCall
+	Err       error
 }
 
 // Panel runs local and frontier fetches concurrently and waits for both.
@@ -336,7 +303,6 @@ func Panel(
 	perFetchTimeout time.Duration,
 	arbiterTimeout time.Duration,
 	skipLocal bool,
-	opts ...CallOption,
 ) error {
 	results := make(chan PanelResult, 2)
 	if skipLocal {
@@ -350,17 +316,17 @@ func Panel(
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
 			defer cancel()
-			c, err := FetchPanel(ctx, client,
-				localBaseURL+"/v1/chat/completions", "", localModel, body, opts...)
-			results <- PanelResult{Source: "local", Content: c, Err: err}
+			msg, err := FetchPanel(ctx, client,
+				localBaseURL+"/v1/chat/completions", "", localModel, body)
+			results <- PanelResult{Source: "local", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
 		}()
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
 		defer cancel()
-		c, err := FetchPanel(ctx, client,
-			frontierURL, "", frontierModel, body, opts...)
-		results <- PanelResult{Source: "frontier", Content: c, Err: err}
+		msg, err := FetchPanel(ctx, client,
+			frontierURL, "", frontierModel, body)
+		results <- PanelResult{Source: "frontier", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
 	}()
 	r1 := <-results
 	r2 := <-results
@@ -391,9 +357,9 @@ func Panel(
 		stream = false
 	}
 	if stream {
-		return StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody, opts...)
+		return StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody)
 	}
-	return BufferedFetchWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody, opts...)
+	return BufferedFetchWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody)
 }
 
 // arbiterDefaultTimeout is the per-call arbiter timeout used when
@@ -434,4 +400,322 @@ func withDefault(d time.Duration) time.Duration {
 		return 120 * time.Second
 	}
 	return d
+}
+
+// PanelOutcome describes the runtime path PanelStreaming took. The chat
+// handler reads it to record telemetry (issue #48 acceptance: the
+// dashboard must be able to report what fraction of fusion requests
+// achieved agreement and skipped the arbiter).
+type PanelOutcome struct {
+	// ArbiterSkipped is true when the two panel members agreed
+	// (SimilarityRatio >= agreementThreshold) OR when only one
+	// member returned content (the other errored, or skipLocal
+	// ran the frontier-only path). In both cases the speculative
+	// answer was streamed to the user without invoking the arbiter.
+	ArbiterSkipped bool
+	// Source identifies the panel member that streamed first:
+	// "local", "frontier", or "" when no member returned content.
+	// "frontier" in the skipLocal degraded path (issue #8).
+	Source string
+	// Similarity is the Jaccard ratio between the two panel
+	// members' contents. 0 when fewer than two members returned
+	// content.
+	Similarity float64
+}
+
+// PanelStreaming runs the fusion panel with progressive delivery
+// (issue #48). It launches both panel members in parallel — identical
+// to Panel — but the first member to return is streamed to the user
+// immediately as a speculative OpenAI-compatible SSE chunk tagged with
+// the source name in the chunk metadata. The second member then
+// arrives:
+//
+//   - Agreement (SimilarityRatio >= agreementThreshold): the response
+//     terminates with `data: [DONE]\n\n`. The arbiter is NOT invoked.
+//     The user sees the faster member's output and the proxy pays no
+//     arbiter cost.
+//   - Disagreement: the arbiter runs as today and its synthesis is
+//     streamed as ADDITIONAL SSE chunks after the speculative one,
+//     then `data: [DONE]\n\n`. This is the "append" disagreement mode
+//     documented in the issue; "replace" / "diff" modes are out of
+//     scope for this change and would require a separate spec.
+//   - One member errored (or skipLocal is true): the successful
+//     member's content is streamed and the response terminates. No
+//     arbiter is invoked — the speculative answer IS the answer.
+//
+// For non-streaming harness requests (body["stream"] == false) the
+// call is delegated to Panel so the existing single
+// chatCompletionResponse JSON-object shape is preserved (issue #10).
+//
+// agreementThreshold is in [0,1]; values < 0 are clamped to 0 (every
+// disagreement runs the arbiter) and values > 1 are clamped to 1
+// (the arbiter is always skipped when both members succeed).
+func PanelStreaming(
+	w http.ResponseWriter,
+	client Client,
+	localBaseURL, localModel, frontierURL, frontierModel string,
+	arbiterURL, arbiterKey, arbiterModel string,
+	body map[string]interface{},
+	latestPrompt string,
+	perFetchTimeout time.Duration,
+	arbiterTimeout time.Duration,
+	skipLocal bool,
+	agreementThreshold float64,
+) (PanelOutcome, error) {
+	var outcome PanelOutcome
+
+	// Non-streaming fallback. The handler should already have routed
+	// stream=false to Panel directly, but we double-check here so the
+	// contract is enforced at the function boundary: a caller that
+	// hands PanelStreaming a stream=false body gets the existing
+	// JSON-object response shape (issue #10).
+	if s, ok := body["stream"].(bool); ok && !s {
+		if err := Panel(w, client,
+			localBaseURL, localModel, frontierURL, frontierModel,
+			arbiterURL, arbiterKey, arbiterModel,
+			body, latestPrompt, perFetchTimeout, arbiterTimeout,
+			skipLocal); err != nil {
+			return outcome, err
+		}
+		return outcome, nil
+	}
+
+	// Clamp the threshold into [0, 1] so a misconfigured operator
+	// can't accidentally disable the agreement-skip path entirely
+	// (negative) or always skip it regardless of similarity (>1).
+	if agreementThreshold < 0 {
+		agreementThreshold = 0
+	} else if agreementThreshold > 1 {
+		agreementThreshold = 1
+	}
+
+	// SSE response headers must be set before the first Write. We
+	// commit them now so the speculative chunk goes out with the
+	// correct Content-Type regardless of which member wins.
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Nexus-Fusion-Progressive", "true")
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	results := make(chan PanelResult, 2)
+	if skipLocal {
+		// Issue #8: synthetic local failure so the arbiter-style
+		// code paths below degrade cleanly. The handler sets
+		// X-Nexus-Degraded=true; we don't duplicate the header here.
+		results <- PanelResult{
+			Source: "local",
+			Err:    errors.New("ollama unavailable (degraded)"),
+		}
+	} else {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
+			defer cancel()
+			msg, err := FetchPanel(ctx, client,
+				localBaseURL+"/v1/chat/completions", "", localModel, body)
+			results <- PanelResult{Source: "local", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
+		}()
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
+		defer cancel()
+		msg, err := FetchPanel(ctx, client,
+			frontierURL, "", frontierModel, body)
+		results <- PanelResult{Source: "frontier", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
+	}()
+	first := <-results
+	second := <-results
+
+	// Both members errored — there's nothing speculative to deliver.
+	// Surface the upstream errors so the handler renders a 502 with
+	// context. The legacy Panel path tolerates one failed member by
+	// passing the error through to the arbiter; in progressive mode
+	// the only sensible fallback is to fail the request.
+	if first.Err != nil && second.Err != nil {
+		return outcome, fmt.Errorf("fusion: both members failed: local=%v; frontier=%v",
+			first.Err, second.Err)
+	}
+
+	// Pick the member that produced content. If one errored the other
+	// wins outright; if both succeeded, prefer the one carrying
+	// tool_calls (issue #72): tool calls are the primary deliverable
+	// for coding agents and the arbiter cannot synthesize them, so a
+	// member that returned structured tool calls should be the
+	// speculative winner even if it arrived second.
+	winner := first
+	if first.Err != nil {
+		winner = second
+	} else if len(second.ToolCalls) > 0 && len(first.ToolCalls) == 0 {
+		winner = second
+	}
+	outcome.Source = winner.Source
+
+	if err := streamPanelResultAsSSE(w, winner); err != nil {
+		return outcome, fmt.Errorf("fusion: stream speculative: %w", err)
+	}
+
+	// Tool-call responses bypass the arbiter (issue #72). The arbiter
+	// synthesizes text — it cannot merge or choose between two sets of
+	// structured tool calls. When the speculative winner carries tool
+	// calls we terminate the response immediately after streaming them.
+	// This is the documented "route tool-call requests away from fusion
+	// arbitration" path: the request still goes through fusion (both
+	// panel members ran), but the arbitration step is skipped. A future
+	// change may add tool-call-aware arbitration.
+	if len(winner.ToolCalls) > 0 {
+		outcome.ArbiterSkipped = true
+		slog.Info("fusion tool-call winner, arbiter skipped",
+			slog.String("source", outcome.Source),
+			slog.Int("tool_calls", len(winner.ToolCalls)),
+		)
+		if err := writeSSEDone(w); err != nil {
+			return outcome, err
+		}
+		return outcome, nil
+	}
+
+	// One-member case (the other errored, or skipLocal ran frontier
+	// alone). The speculative answer IS the answer; no arbiter.
+	if first.Err != nil || second.Err != nil {
+		outcome.ArbiterSkipped = true
+		if err := writeSSEDone(w); err != nil {
+			return outcome, err
+		}
+		return outcome, nil
+	}
+
+	// Both members succeeded: compare and decide on the arbiter.
+	outcome.Similarity = SimilarityRatio(first.Content, second.Content)
+	if outcome.Similarity >= agreementThreshold {
+		outcome.ArbiterSkipped = true
+		slog.Info("fusion agreement, arbiter skipped",
+			slog.String("source", outcome.Source),
+			slog.Float64("similarity", outcome.Similarity),
+			slog.Float64("threshold", agreementThreshold),
+		)
+		if err := writeSSEDone(w); err != nil {
+			return outcome, err
+		}
+		return outcome, nil
+	}
+
+	// Disagreement — run the arbiter and stream its synthesis as
+	// additional SSE chunks after the speculative one. This is the
+	// "append" mode documented in the issue; OpenAI-compatible
+	// clients concatenate delta.content across chunks, so the
+	// harness sees `speculative_text + arbiter_text`. The arbiter
+	// text is the authoritative final answer in the operator's
+	// mental model.
+	slog.Info("fusion disagreement, invoking arbiter",
+		slog.String("first_source", outcome.Source),
+		slog.Float64("similarity", outcome.Similarity),
+		slog.Float64("threshold", agreementThreshold),
+	)
+	synth := SynthesisPrompt(latestPrompt, first, second)
+	synthBody := map[string]interface{}{
+		"model": arbiterModel,
+		"messages": []map[string]string{
+			{"role": "system", "content": "You are a master synthesis AI. Deliver only the final synthesized response. Do not mention that you are an arbiter."},
+			{"role": "user", "content": synth},
+		},
+		"stream": true,
+	}
+	arbiterCtx, cancelArbiter := context.WithTimeout(context.Background(), withDefaultArbiterTimeout(arbiterTimeout))
+	defer cancelArbiter()
+	if err := StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody); err != nil {
+		return outcome, fmt.Errorf("fusion: arbiter stream: %w", err)
+	}
+	if err := writeSSEDone(w); err != nil {
+		return outcome, err
+	}
+	return outcome, nil
+}
+
+// streamPanelResultAsSSE writes a single OpenAI-compatible SSE chunk
+// that carries the panel member's content as a delta. The chunk
+// embeds the source ("local" / "frontier") in a "nexus" metadata
+// field so the harness / log scraper can identify which model was
+// streamed speculatively. Err-flagged results are silently skipped —
+// the caller is responsible for picking a winner before invoking.
+//
+// When the winner carries tool_calls (issue #72), the delta emits
+// delta.tool_calls (with per-call index) instead of delta.content,
+// and finish_reason is "tool_calls". The arbiter synthesis path is
+// text-only; if the speculative winner had tool calls the response
+// terminates after the speculative chunk — there is no text to
+// append from an arbiter.
+//
+// Headers must already be committed (WriteHeader called) when this
+// runs, so the chunk lands with the response Content-Type the caller
+// set.
+func streamPanelResultAsSSE(w http.ResponseWriter, r PanelResult) error {
+	if r.Err != nil {
+		return nil
+	}
+	var delta map[string]interface{}
+	var finishReason string
+	if len(r.ToolCalls) > 0 {
+		tc := make([]map[string]interface{}, len(r.ToolCalls))
+		for i, call := range r.ToolCalls {
+			tc[i] = map[string]interface{}{
+				"index": i,
+				"id":    call.ID,
+				"type":  call.Type,
+				"function": map[string]string{
+					"name":      call.Function.Name,
+					"arguments": call.Function.Arguments,
+				},
+			}
+		}
+		delta = map[string]interface{}{"tool_calls": tc}
+		if r.Content != "" {
+			delta["content"] = r.Content
+		}
+		finishReason = "tool_calls"
+	} else {
+		delta = map[string]interface{}{"content": r.Content}
+		finishReason = "stop"
+	}
+	chunk := map[string]interface{}{
+		"object": "chat.completion.chunk",
+		"nexus":  map[string]string{"source": r.Source},
+		"choices": []map[string]interface{}{
+			{"index": 0, "delta": delta, "finish_reason": finishReason},
+		},
+	}
+	b, err := json.Marshal(chunk)
+	if err != nil {
+		return fmt.Errorf("fusion: marshal speculative chunk: %w", err)
+	}
+	if _, err := w.Write([]byte("data: ")); err != nil {
+		return err
+	}
+	if _, err := w.Write(b); err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte("\n\n")); err != nil {
+		return err
+	}
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return nil
+}
+
+// writeSSEDone emits the OpenAI streaming terminator and flushes. SSE
+// clients (and the harness's chat-completion consumers) treat
+// `data: [DONE]\n\n` as "no more chunks"; the proxy must write it
+// after every successful progressive-fusion response — agreement
+// (no arbiter), one-member (no arbiter), or disagreement (arbiter
+// stream completed).
+func writeSSEDone(w http.ResponseWriter) error {
+	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return nil
 }

@@ -36,21 +36,56 @@ const bufferedChannelSize = 1024
 // explicit Flush call rather than the bufio auto-flush threshold.
 const writeBufferSize = 16 << 10
 
-// Record is the row written for every proxied request. Times are stored in
-// milliseconds; TTFTMs is 0 for non-streaming responses (TTFT is undefined
-// when the harness requested a single buffered reply).
+// Record is the row written for every proxied request.
+//
+// TTFTMs is integer milliseconds (0 for non-streaming responses — TTFT
+// is undefined when the harness requested a single buffered reply).
+//
+// TotalLatencyMs is FLOAT64 milliseconds (issue #68). Sub-millisecond
+// precision matters: on fast hardware the cast to int64 truncates a
+// few-microsecond handler run to 0, which trips assertions that the
+// latency was recorded and surfaces as a race-detector-dependent
+// flake. Storing the value as float64 captures the true elapsed time
+// regardless of rounding for display.
+//
+// FusionArbiterSkipped (issue #48) is true only for route=fusion
+// requests that streamed the speculative panel-member answer and
+// terminated without invoking the arbiter. False in every other
+// case — including the legacy (non-progressive) Panel path, where
+// the arbiter is always invoked. The dashboard joins on this flag
+// to report "fraction of fusion traffic that achieved agreement".
+//
+// Route-source fields (issue #74) carry the planner's Decision
+// metadata so downstream consumers (JSONL log, SQLite metrics,
+// dashboard) can attribute each request to the stage that produced
+// the route. RouteSource is one of guardrail / dsl / slm / slm-error
+// / escalation; RouteReason is a short machine-readable detail
+// (e.g. "vram" for the guardrail path, the error string for the
+// SLM-error path); SLMConfidence is the [0,1] confidence value (0.5
+// neutral, 0 for non-SLM sources); SLMTaskType is the Categorize()
+// bucket (empty for non-SLM sources).
 type Record struct {
-	Timestamp      time.Time `json:"timestamp"`
-	RequestID      string    `json:"request_id"`
-	Model          string    `json:"model"`
-	Route          string    `json:"route"`
-	InputTokens    int       `json:"input_tokens"`
-	OutputTokens   int       `json:"output_tokens"`
-	TTFTMs         int64     `json:"ttft_ms"`
-	TotalLatencyMs int64     `json:"total_latency_ms"`
-	TPS            float64   `json:"tps"`
-	Streaming      bool      `json:"streaming"`
-	Error          string    `json:"error,omitempty"`
+	Timestamp            time.Time `json:"timestamp"`
+	RequestID            string    `json:"request_id"`
+	Model                string    `json:"model"`
+	Route                string    `json:"route"`
+	InputTokens          int       `json:"input_tokens"`
+	OutputTokens         int       `json:"output_tokens"`
+	TTFTMs               int64     `json:"ttft_ms"`
+	TotalLatencyMs       float64   `json:"total_latency_ms"`
+	TPS                  float64   `json:"tps"`
+	Streaming            bool      `json:"streaming"`
+	FusionArbiterSkipped bool      `json:"fusion_arbiter_skipped,omitempty"`
+	ToolCallCount        int       `json:"tool_call_count,omitempty"`
+	Error                string    `json:"error,omitempty"`
+
+	// Route-source metadata (issue #74). Omitempty keeps legacy
+	// JSONL rows byte-for-byte compatible when these fields are
+	// zero-valued.
+	RouteSource   string  `json:"route_source,omitempty"`
+	RouteReason   string  `json:"route_reason,omitempty"`
+	SLMConfidence float64 `json:"slm_confidence,omitempty"`
+	SLMTaskType   string  `json:"slm_task_type,omitempty"`
 }
 
 // EstimateTokens returns the cheap "4 chars per token" heuristic used
@@ -67,15 +102,21 @@ func EstimateTokens(s string) int {
 // phase (total latency minus time-to-first-token). Returns 0 when the
 // generation window is non-positive or no tokens were produced. Units are
 // tokens / second.
-func ComputeTPS(outputTokens int, ttftMs, totalMs int64) float64 {
+//
+// totalMs is float64 milliseconds (see Record.TotalLatencyMs); ttftMs is
+// integer milliseconds. Mixing the two is deliberate — TTFT rounds to a
+// coarse integer because the first-byte hook fires on a Write call and
+// the slack is well above 1 ms — while totalMs keeps sub-ms precision to
+// avoid the issue #68 flake.
+func ComputeTPS(outputTokens int, ttftMs int64, totalMs float64) float64 {
 	if outputTokens <= 0 || totalMs <= 0 {
 		return 0
 	}
-	genMs := totalMs - ttftMs
+	genMs := totalMs - float64(ttftMs)
 	if genMs <= 0 {
 		return 0
 	}
-	return float64(outputTokens) * 1000.0 / float64(genMs)
+	return float64(outputTokens) * 1000.0 / genMs
 }
 
 // Recorder persists records. Implementations MUST NOT block Record callers;
@@ -121,14 +162,17 @@ func NewJSONLRecorder(path string) (*JSONLRecorder, error) {
 		return nil, fmt.Errorf("telemetry: empty path")
 	}
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("telemetry: mkdir %q: %w", dir, err)
 		}
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("telemetry: open %q: %w", path, err)
 	}
+	// Tighten permissions on an existing file so an upgrade from a
+	// pre-fix binary locks down the log (issue #108).
+	chmodIfWider(path, 0o600)
 	r := &JSONLRecorder{
 		ch:   make(chan Record, bufferedChannelSize),
 		path: path,
@@ -205,6 +249,36 @@ func (r *JSONLRecorder) Close() error {
 	return nil
 }
 
+// chmodIfWider checks the current mode of path and, if any
+// group/other bits are set, tightens the file to the requested mode.
+// Errors are logged — chmod failures are non-fatal (the file was
+// already created with the restrictive mode by OpenFile).
+func chmodIfWider(path string, mode os.FileMode) {
+	info, err := os.Stat(path)
+	if err != nil {
+		slog.Warn("telemetry: stat for chmod",
+			slog.String("path", path),
+			slog.Any("err", err),
+		)
+		return
+	}
+	perm := info.Mode().Perm()
+	if perm&0o077 == 0 {
+		return // already owner-only
+	}
+	slog.Warn("telemetry: tightening file permissions",
+		slog.String("path", path),
+		slog.Int("was", int(perm)),
+		slog.Int("now", int(mode)),
+	)
+	if err := os.Chmod(path, mode); err != nil {
+		slog.Warn("telemetry: chmod failed",
+			slog.String("path", path),
+			slog.Any("err", err),
+		)
+	}
+}
+
 func writeJSONLine(w *bufio.Writer, rec Record) error {
 	b, err := json.Marshal(rec)
 	if err != nil {
@@ -239,17 +313,23 @@ type WriteHook func(time.Time)
 // through; Flush() forwards to the inner writer when it implements
 // http.Flusher (so Stream's flusher assertion still succeeds on real
 // writers but degrades to a no-op on non-flushers like httptest.Recorder).
+//
+// The wrapper also captures the response status code (issue #33) so the
+// debug trace can report it without an extra wrapper. WriteHeader is
+// idempotent: Go's net/http panics on a second WriteHeader, so we just
+// record the first one we see and ignore the rest.
 type ObservingWriter struct {
 	http.ResponseWriter
 	hook     WriteHook
 	wrote    atomic.Bool
 	bytesOut atomic.Uint64
+	status   atomic.Int64 // -1 until WriteHeader fires; 0 = 200 (Go default)
 }
 
 // NewObservingWriter wraps inner. hook may be nil; if so, only byte counts
 // are tracked.
 func NewObservingWriter(inner http.ResponseWriter, hook WriteHook) *ObservingWriter {
-	return &ObservingWriter{ResponseWriter: inner, hook: hook}
+	return &ObservingWriter{ResponseWriter: inner, hook: hook, status: atomic.Int64{}}
 }
 
 // Write fires the first-write hook (if not yet fired) and updates the
@@ -262,9 +342,29 @@ func (o *ObservingWriter) Write(b []byte) (int, error) {
 	return o.ResponseWriter.Write(b)
 }
 
+// WriteHeader records the status code and forwards to the inner writer.
+// Idempotent against multiple calls: Go's net/http panics on the second
+// WriteHeader, but recording is still racy-free thanks to atomic.Int64.
+func (o *ObservingWriter) WriteHeader(s int) {
+	o.status.CompareAndSwap(-1, int64(s))
+	o.ResponseWriter.WriteHeader(s)
+}
+
 // BytesOut returns the cumulative number of bytes written to the underlying
 // ResponseWriter.
 func (o *ObservingWriter) BytesOut() uint64 { return o.bytesOut.Load() }
+
+// StatusCode returns the status code the wrapped writer committed, or
+// 200 when WriteHeader was never called (the Go default). Issue #33:
+// the debug trace uses this to surface the upstream HTTP status without
+// a second wrapper layer.
+func (o *ObservingWriter) StatusCode() int {
+	s := o.status.Load()
+	if s < 0 {
+		return http.StatusOK
+	}
+	return int(s)
+}
 
 // Flush forwards to the inner writer when it implements http.Flusher.
 // Defining Flush here (rather than relying on embedding) lets Stream's

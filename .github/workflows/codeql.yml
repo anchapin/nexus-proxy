@@ -1,0 +1,59 @@
+# CodeQL static analysis (issue #124).
+#
+# Runs GitHub's CodeQL SAST against the Go codebase using the
+# `security-and-quality` query pack, which extends the default
+# `security-extended` pack with queries for maintainability and
+# correctness. The pack catches the classes of issues relevant to the
+# proxy: taint-flow through raw http.Response.Body handling, hard-coded
+# credentials, and SQL injection into the SQLite metrics store.
+#
+# Triggers:
+#   - push / pull_request to main      (per-PR feedback)
+#   - schedule (weekly, Monday 03:45)  (catches new queries + new deps)
+#
+# Permissions: CodeQL needs `security-events: write` to upload the
+# analysis to GitHub's security dashboard. `actions: read` is required
+# for scheduled runs on the default branch per the action docs.
+
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '45 3 * * 1'
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  analyze:
+    name: Analyze (Go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [go]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:${{ matrix.language }}'

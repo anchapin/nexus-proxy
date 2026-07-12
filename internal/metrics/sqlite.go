@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,6 +29,12 @@ import (
 //
 // Index on timestamp is the only one beyond the implicit PK index;
 // daily aggregations are the dominant read pattern.
+//
+// The route_source / route_reason / slm_confidence / slm_task_type
+// columns (issue #74) are added here for fresh databases. Existing
+// databases are migrated via migrateRouteSourceColumns at Open time
+// so additive ALTER TABLE statements bring them up to the same shape
+// without data loss.
 const requestsSchema = `
 CREATE TABLE IF NOT EXISTS requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,15 +48,70 @@ CREATE TABLE IF NOT EXISTS requests (
     rag_injected INTEGER NOT NULL DEFAULT 0,
     rag_filename TEXT NOT NULL DEFAULT '',
     estimated_cost_usd REAL NOT NULL DEFAULT 0,
+    baseline_cost_usd REAL NOT NULL DEFAULT 0,
+    savings_usd REAL NOT NULL DEFAULT 0,
     ttft_ms INTEGER NOT NULL DEFAULT 0,
-    total_latency_ms INTEGER NOT NULL DEFAULT 0,
+    total_latency_ms REAL NOT NULL DEFAULT 0,
     tps REAL NOT NULL DEFAULT 0,
     streaming INTEGER NOT NULL DEFAULT 1,
-    error TEXT NOT NULL DEFAULT ''
+    fusion_arbiter_skipped INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    route_source TEXT NOT NULL DEFAULT '',
+    route_reason TEXT NOT NULL DEFAULT '',
+    slm_confidence REAL NOT NULL DEFAULT 0,
+    slm_task_type TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
 CREATE INDEX IF NOT EXISTS idx_requests_request_id ON requests(request_id);
 `
+
+// routeSourceMigrations is the set of additive ALTER TABLE statements
+// that bring an existing requests table up to the issue #74 schema.
+// Each is idempotent: SQLite errors on duplicate-column are swallowed
+// by the caller (migrateRouteSourceColumns) so re-running against an
+// already-migrated database is a no-op.
+var routeSourceMigrations = []string{
+	`ALTER TABLE requests ADD COLUMN route_source TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE requests ADD COLUMN route_reason TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE requests ADD COLUMN slm_confidence REAL NOT NULL DEFAULT 0`,
+	`ALTER TABLE requests ADD COLUMN slm_task_type TEXT NOT NULL DEFAULT ''`,
+}
+
+// migrateRouteSourceColumns runs the additive ALTER TABLE migrations
+// for issue #74. Each statement is attempted individually; "duplicate
+// column" errors mean the column already exists (the database was
+// created or migrated by a newer build) and are silently ignored.
+// Any other error aborts Open so the operator sees the problem at
+// boot rather than on the first failed INSERT.
+func migrateRouteSourceColumns(ctx context.Context, db *sql.DB) error {
+	for _, stmt := range routeSourceMigrations {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			// modernc.org/sqlite returns the error string
+			// containing "duplicate column name" for the
+			// already-exists case. We match on that substring
+			// rather than a typed error so the check survives
+			// driver-level error wrapping.
+			if strings.Contains(err.Error(), "duplicate column name") {
+				continue
+			}
+			return fmt.Errorf("metrics: migrate: %w", err)
+		}
+	}
+	return nil
+}
+
+// schemaMigrations holds additive ALTER TABLE statements that bring a
+// pre-existing database up to the current schema version. Each statement
+// is safe to re-run: the "duplicate column name" error is suppressed so
+// a fresh database (already created with the full schema) is unaffected.
+//
+// Schema additions must remain additive-only (new columns, never drop /
+// rename) so existing rows keep their values and the INSERT positional
+// bind list can simply append the new column at the end.
+var schemaMigrations = []string{
+	`ALTER TABLE requests ADD COLUMN baseline_cost_usd REAL NOT NULL DEFAULT 0`,
+	`ALTER TABLE requests ADD COLUMN savings_usd REAL NOT NULL DEFAULT 0`,
+}
 
 // insertSQL is the prepared statement for RecordRequest. Kept as a
 // package const so the goroutine can reuse the same SQL string after
@@ -58,24 +120,10 @@ const insertSQL = `INSERT INTO requests
     (timestamp, request_id, route, model,
      input_tokens, output_tokens, toon_savings_tokens,
      rag_injected, rag_filename, estimated_cost_usd,
-     ttft_ms, total_latency_ms, tps, streaming, error, task_type)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-
-// addTaskTypeColumnSQL is the additive migration for issue #44. The
-// CREATE TABLE above intentionally omits task_type (the schema is
-// kept minimal so existing on-disk DBs keep working through an
-// Open, migrate, keep-writing hot path) — this ALTER is the single
-// source of truth for the column on every database, fresh or
-// pre-existing.
-//
-// `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT ”` is the
-// idempotent shape documented at the top of this file. SQLite
-// rejects the duplicate re-run with "duplicate column name" which
-// is why the boot path probes via the helper below instead of
-// parsing that error string — PRAGMA table_info is O(table-width)
-// and runs once at boot, so it is the cheap way to stay
-// migration-free.
-const addTaskTypeColumnSQL = `ALTER TABLE requests ADD COLUMN task_type TEXT NOT NULL DEFAULT ''`
+     baseline_cost_usd, savings_usd,
+     ttft_ms, total_latency_ms, tps, streaming, fusion_arbiter_skipped, error,
+     route_source, route_reason, slm_confidence, slm_task_type)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // SQLiteStore is the production Store implementation (issue #4).
 // Writes are funnelled through a buffered channel and a single
@@ -125,9 +173,19 @@ func newSQLiteStore(path string, lg Logger) (*SQLiteStore, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("metrics: create schema: %w", err)
 	}
-	if err := addColumnIfMissing(context.Background(), db, "requests", "task_type", addTaskTypeColumnSQL); err != nil {
+	if err := migrateSchema(ctx_bg(), db); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("metrics: ensure task_type column: %w", err)
+		return nil, fmt.Errorf("metrics: migrate schema: %w", err)
+	}
+
+	// Issue #74: bring existing databases up to the route-source
+	// schema. Fresh databases already have the columns (from
+	// requestsSchema above), so every ALTER will no-op on the
+	// "duplicate column name" error and the migration completes in
+	// microseconds.
+	if err := migrateRouteSourceColumns(context.Background(), db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("metrics: migrate route-source: %w", err)
 	}
 
 	s := &SQLiteStore{
@@ -139,6 +197,32 @@ func newSQLiteStore(path string, lg Logger) (*SQLiteStore, error) {
 	s.wg.Add(1)
 	go s.drain()
 	return s, nil
+}
+
+// ctx_bg returns a fresh background context for one-off migration
+// calls. Kept as a tiny helper so the migration code reads cleanly
+// without inlining context.WithTimeout boilerplate.
+func ctx_bg() context.Context {
+	return context.Background()
+}
+
+// migrateSchema runs every additive ALTER TABLE in schemaMigrations.
+// Each statement is attempted unconditionally; the "duplicate column
+// name" error (SQLite returns this when the column already exists) is
+// suppressed so the migration is idempotent on both fresh databases
+// (columns already present from CREATE TABLE) and databases upgraded
+// from a prior schema version.
+func migrateSchema(ctx context.Context, db *sql.DB) error {
+	for _, ddl := range schemaMigrations {
+		_, err := db.ExecContext(ctx, ddl)
+		if err != nil {
+			if strings.Contains(err.Error(), "duplicate column name") {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 // buildDSN maps a plain path or ":memory:" into the URI form modernc
@@ -171,57 +255,6 @@ func buildDSN(path string) string {
 // pattern used by tests that need to verify the row landed beyond
 // the buffer.
 func (s *SQLiteStore) Path() string { return s.path }
-
-// addColumnIfMissing probes whether table already has a column
-// named columnName (issue #44). When the column is absent the
-// supplied alterSQL is executed against db. The probe is the
-// idempotent shape of choice — `ALTER TABLE ADD COLUMN` returns
-// "duplicate column name" on re-run and matching that error string
-// across modernc driver versions is fragile, so a one-time
-// PRAGMA table_info scan keeps the boot path migration-free.
-//
-// Returns nil when the column already exists, when the ALTER is
-// applied cleanly, or when the probe itself succeeds but the
-// column is missing (in which case the ALTER is run).
-func addColumnIfMissing(ctx context.Context, db *sql.DB, table, columnName, alterSQL string) error {
-	rows, err := db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
-	if err != nil {
-		return fmt.Errorf("probe columns: %w", err)
-	}
-	hasColumn := false
-	for rows.Next() {
-		var (
-			cid     int
-			name    string
-			ctype   string
-			notnull int
-			dflt    sql.NullString
-			pk      int
-		)
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("probe columns: %w", err)
-		}
-		if name == columnName {
-			hasColumn = true
-			break
-		}
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return fmt.Errorf("probe columns iterate: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("probe columns close: %w", err)
-	}
-	if hasColumn {
-		return nil
-	}
-	if _, err := db.ExecContext(ctx, alterSQL); err != nil {
-		return fmt.Errorf("apply migration: %w", err)
-	}
-	return nil
-}
 
 // Dropped returns the number of records dropped because the write
 // buffer was full. See DroppedCounter.
@@ -285,12 +318,18 @@ func (s *SQLiteStore) writeOne(req Request) {
 	if req.Streaming {
 		streaming = 1
 	}
+	fusionArbiterSkipped := 0
+	if req.FusionArbiterSkipped {
+		fusionArbiterSkipped = 1
+	}
 	_, err := s.db.ExecContext(ctx, insertSQL,
 		ts.UTC(), req.RequestID, route, model,
 		req.InputTokens, req.OutputTokens, req.TOONSavingsTokens,
 		ragInjected, req.RAGFilename, req.EstimatedCostUSD,
-		req.TTFTMs, req.TotalLatencyMs, req.TPS, streaming, req.Error,
-		req.TaskType,
+		req.BaselineCostUSD, req.SavingsUSD,
+		req.TTFTMs, req.TotalLatencyMs, req.TPS, streaming,
+		fusionArbiterSkipped, req.Error,
+		req.RouteSource, req.RouteReason, req.SLMConfidence, req.SLMTaskType,
 	)
 	if err != nil {
 		s.logger("ERROR: insert request_id=%s: %v", req.RequestID, err)
@@ -316,6 +355,8 @@ SELECT
     COALESCE(SUM(toon_savings_tokens), 0),
     COALESCE(SUM(CASE WHEN rag_injected = 1 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(estimated_cost_usd), 0),
+    COALESCE(SUM(baseline_cost_usd), 0),
+    COALESCE(SUM(savings_usd), 0),
     COALESCE(SUM(total_latency_ms), 0),
     COALESCE(SUM(CASE WHEN error != '' THEN 1 ELSE 0 END), 0)
 FROM requests
@@ -336,12 +377,177 @@ WHERE timestamp >= ? AND timestamp < ?`
 		&sum.TOONSavingsTokens,
 		&sum.RAGInjectedCount,
 		&sum.EstimatedCostTotal,
+		&sum.BaselineCostTotal,
+		&sum.SavingsTotal,
 		&sum.TotalLatencyMsSum,
 		&sum.ErrorCount,
 	); err != nil {
 		return Summary{}, fmt.Errorf("metrics: daily summary: %w", err)
 	}
 	return sum, nil
+}
+
+// providerStatsAggregateSQL computes count, average cost, and error
+// rate per model over the [since, now] window. The p50/p95 latencies
+// are computed by a separate query below — modernc.org/sqlite supports
+// window functions but keeping the percentile step in its own query
+// avoids repeating the window scan twice.
+const providerStatsAggregateSQL = `
+SELECT model,
+       COUNT(*) AS sample_count,
+       COALESCE(AVG(estimated_cost_usd), 0) AS avg_cost,
+       SUM(CASE WHEN error != '' THEN 1 ELSE 0 END) AS error_count
+FROM requests
+WHERE timestamp >= ? AND model != 'unknown'
+GROUP BY model
+ORDER BY model`
+
+// providerStatsPercentileSQL picks the row at the (rank)-th
+// percentile position for each model. The caller binds the percentile
+// rank via the LIMIT/OFFSET trick — a subquery returns COUNT(*) per
+// model, and a single SELECT with ROW_NUMBER() picks the row whose
+// rank matches. Returns a row per model with its p_NN latency.
+//
+// Two queries are required because SQLite cannot bind LIMIT/OFFSET in
+// a single windowed aggregate across multiple percentiles. Both
+// queries share the same index (idx_requests_timestamp) so the cost
+// is two cheap range scans.
+const providerStatsPercentileSQL = `
+WITH ranked AS (
+    SELECT model, total_latency_ms,
+           ROW_NUMBER() OVER (PARTITION BY model ORDER BY total_latency_ms) AS rn,
+           COUNT(*) OVER (PARTITION BY model) AS cnt
+    FROM requests
+    WHERE timestamp >= ? AND model != 'unknown'
+)
+SELECT model, total_latency_ms
+FROM ranked
+WHERE rn = MAX(1, CAST((cnt * ? + 99) / 100 AS INTEGER))
+ORDER BY model`
+
+// providerStatsQueryTimeout bounds a single ProviderStats call. The
+// aggregation runs over the requests table; even with millions of
+// rows the indexed range scan finishes in tens of milliseconds. The
+// 10s ceiling exists only so a stalled disk cannot pin the refresh
+// goroutine forever.
+const providerStatsQueryTimeout = 10 * time.Second
+
+// ProviderStats returns the per-provider latency, cost, sample-count
+// and error-rate aggregate for the sliding window ending now and
+// starting at since. It satisfies router.ProviderStatsSource so the
+// chat handler's route=frontier dispatch can score frontier and z.ai
+// against each other without hitting the DB on the hot path (the
+// router.ProviderStatsCache calls this from a background goroutine on
+// a fixed cadence).
+//
+// "Provider" is identified by the requests.model column — each
+// configured frontier endpoint uses a distinct model name (e.g.
+// "gpt-4o" for frontier, "glm-4.6" for z.ai), so the per-model
+// aggregation maps cleanly to the configured provider list. Rows
+// where model = "unknown" (the sentinel used by RecordRequest when no
+// model was supplied) are filtered out so an under-instrumented
+// provider cannot pollute the aggregate.
+//
+// p50 is the row at the 50th percentile of total_latency_ms; p95 at
+// the 95th. The selector currently consumes only p50, but p95 is
+// surfaced so future operators can reason about tail latency without
+// extending the schema.
+//
+// Safe for concurrent use; SQLiteStore owns a single connection so
+// concurrent ProviderStats calls serialise but never block on the
+// request hot path (which never calls this directly).
+func (s *SQLiteStore) ProviderStats(since time.Time) ([]router.ProviderStats, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), providerStatsQueryTimeout)
+	defer cancel()
+
+	// Step 1: per-model sample_count, avg_cost, error_count.
+	rows, err := s.db.QueryContext(ctx, providerStatsAggregateSQL, since.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("metrics: provider stats aggregate: %w", err)
+	}
+	type aggRow struct {
+		name        string
+		sampleCount int
+		avgCost     float64
+		errorCount  int
+	}
+	var aggs []aggRow
+	for rows.Next() {
+		var r aggRow
+		if err := rows.Scan(&r.name, &r.sampleCount, &r.avgCost, &r.errorCount); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("metrics: scan aggregate: %w", err)
+		}
+		aggs = append(aggs, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("metrics: aggregate rows: %w", err)
+	}
+	if len(aggs) == 0 {
+		return nil, nil
+	}
+
+	// Step 2: per-model p50 (one windowed scan).
+	p50ByName, err := s.providerStatsPercentile(ctx, since, 50)
+	if err != nil {
+		return nil, err
+	}
+	// Step 3: per-model p95 (another windowed scan). Kept
+	// separate so the percentile position is computed once per
+	// model rather than twice in the same query, and so a future
+	// operator who only needs p50 can short-circuit by skipping
+	// the second call.
+	p95ByName, err := s.providerStatsPercentile(ctx, since, 95)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]router.ProviderStats, 0, len(aggs))
+	for _, a := range aggs {
+		var errRate float64
+		if a.sampleCount > 0 {
+			errRate = float64(a.errorCount) / float64(a.sampleCount)
+		}
+		out = append(out, router.ProviderStats{
+			Name:         a.name,
+			P50LatencyMs: p50ByName[a.name],
+			P95LatencyMs: p95ByName[a.name],
+			AvgCostUSD:   a.avgCost,
+			SampleCount:  a.sampleCount,
+			ErrorRate:    errRate,
+		})
+	}
+	return out, nil
+}
+
+// providerStatsPercentile runs the windowed percentile query for a
+// single rank and returns a name -> latency map. The rank is a
+// percentile in 1..100. Empty / missing rows return a zero latency;
+// callers should treat that as "no data" (the selector already
+// filters P50 <= 0).
+func (s *SQLiteStore) providerStatsPercentile(ctx context.Context, since time.Time, percentile int) (map[string]int64, error) {
+	rows, err := s.db.QueryContext(ctx, providerStatsPercentileSQL, since.UTC(), percentile)
+	if err != nil {
+		return nil, fmt.Errorf("metrics: provider stats p%d: %w", percentile, err)
+	}
+	defer rows.Close()
+	out := make(map[string]int64)
+	for rows.Next() {
+		var name string
+		var lat int64
+		if err := rows.Scan(&name, &lat); err != nil {
+			return nil, fmt.Errorf("metrics: scan p%d: %w", percentile, err)
+		}
+		out[name] = lat
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("metrics: p%d rows: %w", percentile, err)
+	}
+	return out, nil
 }
 
 // Close drains in-flight writes and closes the database. Safe to
@@ -380,17 +586,22 @@ func (s *SQLiteStore) Close() error {
 // not returned (the handler has long since left).
 func (s *SQLiteStore) Record(r telemetry.Record) {
 	_ = s.RecordRequest(Request{
-		Timestamp:      r.Timestamp,
-		RequestID:      r.RequestID,
-		Route:          r.Route,
-		Model:          r.Model,
-		InputTokens:    r.InputTokens,
-		OutputTokens:   r.OutputTokens,
-		TTFTMs:         r.TTFTMs,
-		TotalLatencyMs: r.TotalLatencyMs,
-		TPS:            r.TPS,
-		Streaming:      r.Streaming,
-		Error:          r.Error,
+		Timestamp:            r.Timestamp,
+		RequestID:            r.RequestID,
+		Route:                r.Route,
+		Model:                r.Model,
+		InputTokens:          r.InputTokens,
+		OutputTokens:         r.OutputTokens,
+		TTFTMs:               r.TTFTMs,
+		TotalLatencyMs:       r.TotalLatencyMs,
+		TPS:                  r.TPS,
+		Streaming:            r.Streaming,
+		FusionArbiterSkipped: r.FusionArbiterSkipped,
+		Error:                r.Error,
+		RouteSource:          r.RouteSource,
+		RouteReason:          r.RouteReason,
+		SLMConfidence:        r.SLMConfidence,
+		SLMTaskType:          r.SLMTaskType,
 		// TOONSavingsTokens / RAGInjected / RAGFilename /
 		// EstimatedCostUSD default zero — populated by callers
 		// that explicitly use RecordRequest.

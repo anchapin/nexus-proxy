@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"regexp"
 
 	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
@@ -49,4 +50,27 @@ func SecurityHeaders(tlsActive bool) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// requestIDMaxLen caps the length of an inbound X-Request-Id. Longer
+// values are truncated so a malicious client cannot bloat logs or the
+// telemetry row with an arbitrarily long correlation id (issue #39).
+const requestIDMaxLen = 128
+
+// requestIDDisallowedRe matches characters NOT permitted in a sanitized
+// request id. The allowed set is [a-zA-Z0-9._:-]; any other character
+// (newlines, control bytes, quotes, angle brackets, whitespace, ...) is
+// stripped so a crafted X-Request-Id cannot inject log entries or break
+// downstream JSON consumers (issue #39).
+var requestIDDisallowedRe = regexp.MustCompile(`[^a-zA-Z0-9._:-]`)
+
+// sanitizeRequestID strips characters outside [a-zA-Z0-9._:-] and caps
+// the length at requestIDMaxLen. Returns "" when the input is empty
+// after sanitization, so the caller falls through to a generated hex id.
+func sanitizeRequestID(s string) string {
+	s = requestIDDisallowedRe.ReplaceAllString(s, "")
+	if len(s) > requestIDMaxLen {
+		s = s[:requestIDMaxLen]
+	}
+	return s
 }

@@ -114,8 +114,8 @@ func TestFetchPanelHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchPanel: %v", err)
 	}
-	if got != "hello" {
-		t.Errorf("got %q", got)
+	if got.Content != "hello" {
+		t.Errorf("got %q", got.Content)
 	}
 }
 
@@ -687,5 +687,648 @@ func TestPanelArbiterHonorsStreamFlagTrueRegression(t *testing.T) {
 	}
 	if !strings.Contains(rw.body.String(), `"a":1`) {
 		t.Errorf("arbiter SSE not forwarded: %q", rw.body.String())
+	}
+}
+
+// --- issue #48: streaming fusion with progressive delivery -------------
+
+// TestPanelStreamingAgreementSkipsArbiter is the headline acceptance
+// test for issue #48: when both panel members produce near-identical
+// output, PanelStreaming must stream the first member's content as a
+// speculative OpenAI-compatible SSE chunk, terminate with
+// `data: [DONE]\n\n`, and NOT invoke the arbiter.
+func TestPanelStreamingAgreementSkipsArbiter(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Use a buffered channel to queue requests. The dispatcher drains the queue."}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Use a buffered channel to queue requests. The dispatcher drains the queue."}}]}`)
+	})
+	var arbiterCalled int
+	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		arbiterCalled++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "data: {\"a\":1}\n\n")
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	outcome, err := PanelStreaming(
+		rw, client,
+		"http://local.local", "local-m",
+		frontierURL, "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		5*time.Second, // perFetchTimeout
+		5*time.Second, // arbiterTimeout
+		false,         // skipLocal
+		0.85,          // agreementThreshold
+	)
+	if err != nil {
+		t.Fatalf("PanelStreaming: %v", err)
+	}
+	if !outcome.ArbiterSkipped {
+		t.Errorf("outcome.ArbiterSkipped = false, want true (similarity=%v)", outcome.Similarity)
+	}
+	if outcome.Similarity < 0.85 {
+		t.Errorf("similarity = %v, want >= 0.85", outcome.Similarity)
+	}
+	if arbiterCalled != 0 {
+		t.Errorf("arbiter was called %d times, want 0", arbiterCalled)
+	}
+	body := rw.body.String()
+	if !strings.Contains(body, `"content":"Use a buffered channel`) {
+		t.Errorf("speculative chunk not in body: %q", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("missing [DONE] terminator: %q", body)
+	}
+	if !strings.Contains(body, `"object":"chat.completion.chunk"`) {
+		t.Errorf("missing OpenAI chunk envelope: %q", body)
+	}
+	// Two upstream calls — local + frontier — but no arbiter call.
+	if got := *ft.counter(localURL); got != 1 {
+		t.Errorf("local fetch = %d, want 1", got)
+	}
+	if got := *ft.counter(frontierURL); got != 1 {
+		t.Errorf("frontier fetch = %d, want 1", got)
+	}
+}
+
+// TestPanelStreamingDisagreementRunsArbiter exercises the second
+// branch of issue #48's progressive delivery: when the two panel
+// members diverge (similarity < threshold), the speculative answer is
+// streamed first and THEN the arbiter runs, with its synthesis
+// appended as additional SSE chunks. ArbiterSkipped must be false.
+func TestPanelStreamingDisagreementRunsArbiter(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"the quick brown fox"}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"switch the entire database schema migrate everything now"}}]}`)
+	})
+	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "data: {\"synth\":\"arbiter-out\"}\n\n")
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	outcome, err := PanelStreaming(
+		rw, client,
+		"http://local.local", "local-m",
+		frontierURL, "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		5*time.Second,
+		5*time.Second,
+		false,
+		0.85,
+	)
+	if err != nil {
+		t.Fatalf("PanelStreaming: %v", err)
+	}
+	if outcome.ArbiterSkipped {
+		t.Errorf("outcome.ArbiterSkipped = true, want false (similarity=%v)", outcome.Similarity)
+	}
+	if outcome.Similarity >= 0.85 {
+		t.Errorf("similarity = %v, want < 0.85", outcome.Similarity)
+	}
+	if got := *ft.counter(arbiterURL); got != 1 {
+		t.Errorf("arbiter fetch = %d, want 1", got)
+	}
+	body := rw.body.String()
+	// Speculative chunk first — either local or frontier may win the
+	// race, so accept either answer. The arbiter's synthesis must
+	// follow regardless.
+	hasLocal := strings.Contains(body, "the quick brown fox")
+	hasFrontier := strings.Contains(body, "switch the entire database schema")
+	if !hasLocal && !hasFrontier {
+		t.Errorf("speculative answer missing: %q", body)
+	}
+	// ...then arbiter output, then [DONE].
+	if !strings.Contains(body, `"synth":"arbiter-out"`) {
+		t.Errorf("arbiter output missing: %q", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("missing [DONE] terminator: %q", body)
+	}
+}
+
+// TestPanelStreamingDegradedSkipLocal mirrors the issue #8 graceful-
+// degradation contract: when skipLocal=true, only the frontier panel
+// member is fetched. Its content streams as the (only) speculative
+// answer and the arbiter is skipped — the user gets the frontier
+// reply without paying the local timeout.
+func TestPanelStreamingDegradedSkipLocal(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("local URL was hit even though skipLocal=true")
+		w.WriteHeader(200)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier-only reply"}}]}`)
+	})
+	arbiterCalled := 0
+	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		arbiterCalled++
+		w.WriteHeader(200)
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	outcome, err := PanelStreaming(
+		rw, client,
+		"http://local.local", "local-m",
+		frontierURL, "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		5*time.Second, 5*time.Second,
+		true, // skipLocal
+		0.85,
+	)
+	if err != nil {
+		t.Fatalf("PanelStreaming: %v", err)
+	}
+	if !outcome.ArbiterSkipped {
+		t.Errorf("ArbiterSkipped = false, want true (skipLocal)")
+	}
+	if outcome.Source != "frontier" {
+		t.Errorf("Source = %q, want frontier", outcome.Source)
+	}
+	if got := *ft.counter(localURL); got != 0 {
+		t.Errorf("local fetch = %d, want 0", got)
+	}
+	if arbiterCalled != 0 {
+		t.Errorf("arbiter called %d times, want 0", arbiterCalled)
+	}
+	if !strings.Contains(rw.body.String(), "frontier-only reply") {
+		t.Errorf("frontier speculative missing: %q", rw.body.String())
+	}
+	if !strings.Contains(rw.body.String(), "data: [DONE]") {
+		t.Errorf("missing [DONE]: %q", rw.body.String())
+	}
+}
+
+// TestPanelStreamingOneMemberFailedSkipsArbiter covers the partial-
+// failure branch: one panel member errors, the other succeeds. The
+// successful member's content is streamed and the arbiter is skipped
+// — the user has already received an answer, even if from only one
+// model.
+func TestPanelStreamingOneMemberFailedSkipsArbiter(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(502)
+		_, _ = io.WriteString(w, `bad gateway`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier won"}}]}`)
+	})
+	arbiterCalled := 0
+	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		arbiterCalled++
+		w.WriteHeader(200)
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	outcome, err := PanelStreaming(
+		rw, client,
+		"http://local.local", "local-m",
+		frontierURL, "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		5*time.Second, 5*time.Second,
+		false, 0.85,
+	)
+	if err != nil {
+		t.Fatalf("PanelStreaming: %v", err)
+	}
+	if !outcome.ArbiterSkipped {
+		t.Errorf("ArbiterSkipped = false, want true (one failed)")
+	}
+	if outcome.Source != "frontier" {
+		t.Errorf("Source = %q, want frontier", outcome.Source)
+	}
+	if arbiterCalled != 0 {
+		t.Errorf("arbiter called %d times, want 0", arbiterCalled)
+	}
+	if !strings.Contains(rw.body.String(), "frontier won") {
+		t.Errorf("frontier speculative missing: %q", rw.body.String())
+	}
+}
+
+// TestPanelStreamingBothMembersFailedSurfacesError confirms the
+// failure mode when no panel member returns content: the call
+// returns an error containing both upstream messages, mirroring
+// the existing Panel path's surfacing of upstream errors.
+func TestPanelStreamingBothMembersFailedSurfacesError(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(502)
+		_, _ = io.WriteString(w, "local dead")
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(502)
+		_, _ = io.WriteString(w, "frontier dead")
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	_, err := PanelStreaming(
+		rw, client,
+		"http://local.local", "local-m",
+		frontierURL, "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		5*time.Second, 5*time.Second,
+		false, 0.85,
+	)
+	if err == nil {
+		t.Fatal("expected error when both members fail")
+	}
+	if !strings.Contains(err.Error(), "both members failed") {
+		t.Errorf("err = %v, want 'both members failed'", err)
+	}
+}
+
+// TestPanelStreamingHonorsStreamFalseFallsBackToPanel covers the
+// non-streaming contract (issue #10): when body["stream"]=false,
+// PanelStreaming must NOT emit SSE chunks. It delegates to the
+// legacy Panel path, which writes a single chatCompletionResponse
+// JSON object via BufferedFetchWithContext. ArbiterSkipped stays
+// false (the legacy path always invokes the arbiter).
+func TestPanelStreamingHonorsStreamFalseFallsBackToPanel(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local"}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier"}}]}`)
+	})
+	var arbiterBody string
+	ft.on(arbiterURL, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		arbiterBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"synthesized"}}]}`)
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newJSONRW()
+	outcome, err := PanelStreaming(
+		rw, client,
+		"http://local.local", "local-m",
+		frontierURL, "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}, "stream": false},
+		"test prompt",
+		5*time.Second, 5*time.Second,
+		false, 0.85,
+	)
+	if err != nil {
+		t.Fatalf("PanelStreaming: %v", err)
+	}
+	if outcome.ArbiterSkipped {
+		t.Errorf("ArbiterSkipped = true, want false (legacy Panel path)")
+	}
+	// Arbiter MUST have been called (legacy path).
+	if !strings.Contains(arbiterBody, "Master Synthesis Arbiter") {
+		t.Errorf("arbiter body missing arbiter prompt: %s", arbiterBody)
+	}
+	if !strings.Contains(arbiterBody, `"stream":false`) {
+		t.Errorf("arbiter body missing stream=false: %s", arbiterBody)
+	}
+	// rw must have received JSON, not SSE.
+	if !strings.Contains(rw.body.String(), `"content":"synthesized"`) {
+		t.Errorf("arbiter JSON not forwarded: %q", rw.body.String())
+	}
+	if strings.HasPrefix(strings.TrimSpace(rw.body.String()), "data:") {
+		t.Errorf("body looks like SSE, want plain JSON: %q", rw.body.String())
+	}
+}
+
+// TestPanelStreamingThresholdClamping ensures a misconfigured
+// threshold is clamped into [0, 1] before being compared, so a
+// handler-side misconfiguration cannot break the agreement-skip
+// path entirely. Effective semantics:
+//
+//   - threshold < 0 → clamped to 0 → "similarity >= 0" is always
+//     true (similarity is in [0, 1]) → arbiter always skipped
+//     when both members succeed
+//   - threshold > 1 → clamped to 1 → "similarity >= 1" only holds
+//     for identical content → arbiter runs on any divergence
+func TestPanelStreamingThresholdClamping(t *testing.T) {
+	t.Run("negative threshold clamps to 0 (always skip)", func(t *testing.T) {
+		const (
+			localURL    = "http://local.local/v1/chat/completions"
+			frontierURL = "http://frontier.local"
+			arbiterURL  = "http://arbiter.local/v1/chat/completions"
+		)
+		ft := newFakeTransport()
+		ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"identical content"}}]}`)
+		})
+		ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"identical content"}}]}`)
+		})
+		arbiterCalled := 0
+		ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+			arbiterCalled++
+			w.WriteHeader(200)
+		})
+		client := &http.Client{Transport: ft}
+		rw := newSSERW()
+		outcome, err := PanelStreaming(
+			rw, client,
+			"http://local.local", "local-m",
+			frontierURL, "frontier-m",
+			arbiterURL, "", "arbiter-m",
+			map[string]interface{}{"messages": []interface{}{}},
+			"test prompt",
+			5*time.Second, 5*time.Second,
+			false,
+			-1.0, // negative: clamped to 0 → "always skip when both succeed"
+		)
+		if err != nil {
+			t.Fatalf("PanelStreaming: %v", err)
+		}
+		if !outcome.ArbiterSkipped {
+			t.Errorf("ArbiterSkipped = false with threshold=0; every non-empty similarity >= 0 must skip")
+		}
+		if arbiterCalled != 0 {
+			t.Errorf("arbiter called %d times, want 0", arbiterCalled)
+		}
+	})
+	t.Run("over-large threshold clamps to 1 (only identical skips)", func(t *testing.T) {
+		const (
+			localURL    = "http://local.local/v1/chat/completions"
+			frontierURL = "http://frontier.local"
+			arbiterURL  = "http://arbiter.local/v1/chat/completions"
+		)
+		ft := newFakeTransport()
+		ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"the quick brown fox"}}]}`)
+		})
+		ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"completely unrelated text about database migration"}}]}`)
+		})
+		arbiterCalled := 0
+		ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+			arbiterCalled++
+			w.WriteHeader(200)
+		})
+		client := &http.Client{Transport: ft}
+		rw := newSSERW()
+		outcome, err := PanelStreaming(
+			rw, client,
+			"http://local.local", "local-m",
+			frontierURL, "frontier-m",
+			arbiterURL, "", "arbiter-m",
+			map[string]interface{}{"messages": []interface{}{}},
+			"test prompt",
+			5*time.Second, 5*time.Second,
+			false,
+			2.0, // >1: clamps to 1 → only identical content skips
+		)
+		if err != nil {
+			t.Fatalf("PanelStreaming: %v", err)
+		}
+		if outcome.ArbiterSkipped {
+			t.Errorf("ArbiterSkipped = true with threshold=1 on divergent content; arbiter must run")
+		}
+		if arbiterCalled != 1 {
+			t.Errorf("arbiter called %d times, want 1", arbiterCalled)
+		}
+	})
+}
+
+// TestPanelStreamingSpeculativeSourceIdentified confirms the SSE
+// chunk embeds the source ("local" / "frontier") in the "nexus"
+// metadata field, so log scrapers and harness diagnostics can see
+// which model streamed first.
+func TestPanelStreamingSpeculativeSourceIdentified(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local answer"}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier answer"}}]}`)
+	})
+	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	outcome, err := PanelStreaming(
+		rw, client,
+		"http://local.local", "local-m",
+		frontierURL, "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		5*time.Second, 5*time.Second,
+		false, 0.85,
+	)
+	if err != nil {
+		t.Fatalf("PanelStreaming: %v", err)
+	}
+	if outcome.Source != "local" && outcome.Source != "frontier" {
+		t.Errorf("Source = %q, want local or frontier", outcome.Source)
+	}
+	body := rw.body.String()
+	wantSource := `"source":"` + outcome.Source + `"`
+	if !strings.Contains(body, wantSource) {
+		t.Errorf("body missing source tag %s in chunk: %q", wantSource, body)
+	}
+}
+
+// TestPanelStreamingSetsProgressiveHeader verifies the SSE response
+// carries X-Nexus-Fusion-Progressive: true so operators / observability
+// tooling can confirm the new code path is active.
+func TestPanelStreamingSetsProgressiveHeader(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local"}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier"}}]}`)
+	})
+	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	if _, err := PanelStreaming(
+		rw, client,
+		"http://local.local", "local-m",
+		frontierURL, "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		5*time.Second, 5*time.Second,
+		false, 0.85,
+	); err != nil {
+		t.Fatalf("PanelStreaming: %v", err)
+	}
+	if got := rw.header.Get("X-Nexus-Fusion-Progressive"); got != "true" {
+		t.Errorf("X-Nexus-Fusion-Progressive = %q, want \"true\"", got)
+	}
+	if got := rw.header.Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want \"text/event-stream\"", got)
+	}
+}
+
+// --- Issue #72: fusion tool_calls tests --------------------------------------
+
+// TestPanelStreamingToolCallWinnerSkipsArbiter verifies that when a
+// panel member returns tool_calls, the speculative winner streams them
+// as delta.tool_calls and the arbiter is NOT invoked (issue #72). The
+// arbiter synthesizes text only and cannot merge tool calls.
+func TestPanelStreamingToolCallWinnerSkipsArbiter(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"cmd\":\"ls\"}"}}]}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"some text answer"}}]}`)
+	})
+	var arbiterCalled int
+	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		arbiterCalled++
+		w.WriteHeader(200)
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	outcome, err := PanelStreaming(
+		rw, client,
+		"http://local.local", "local-m",
+		frontierURL, "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		5*time.Second, 5*time.Second,
+		false, 0.85,
+	)
+	if err != nil {
+		t.Fatalf("PanelStreaming: %v", err)
+	}
+	if !outcome.ArbiterSkipped {
+		t.Error("ArbiterSkipped = false, want true for tool-call winner")
+	}
+	if arbiterCalled != 0 {
+		t.Errorf("arbiter called %d times, want 0", arbiterCalled)
+	}
+	body := rw.body.String()
+	if !strings.Contains(body, `"tool_calls"`) {
+		t.Errorf("body missing tool_calls delta: %q", body)
+	}
+	if !strings.Contains(body, `"finish_reason":"tool_calls"`) {
+		t.Errorf("body missing finish_reason tool_calls: %q", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("missing [DONE]: %q", body)
+	}
+}
+
+// TestFetchPanelPreservesToolCalls verifies FetchPanel returns tool_calls
+// in the AssistantMessage alongside content (issue #72).
+func TestFetchPanelPreservesToolCalls(t *testing.T) {
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Body: io.NopCloser(strings.NewReader(
+				`{"choices":[{"message":{"content":"running it","tool_calls":[{"id":"c1","type":"function","function":{"name":"exec","arguments":"{}"}}]}}]}`,
+			)),
+		}, nil
+	})}
+	got, err := FetchPanel(context.Background(), client, "http://x", "", "m", nil)
+	if err != nil {
+		t.Fatalf("FetchPanel: %v", err)
+	}
+	if got.Content != "running it" {
+		t.Errorf("Content = %q", got.Content)
+	}
+	if len(got.ToolCalls) != 1 {
+		t.Fatalf("ToolCalls len = %d, want 1", len(got.ToolCalls))
+	}
+	if got.ToolCalls[0].Function.Name != "exec" {
+		t.Errorf("name = %q", got.ToolCalls[0].Function.Name)
 	}
 }

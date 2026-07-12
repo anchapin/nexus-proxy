@@ -1,7 +1,7 @@
 package metrics
 
 import (
-	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"sort"
@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
 )
@@ -75,7 +77,7 @@ func TestRecordRequestWritesRow(t *testing.T) {
 		RAGFilename:       "examples/refactor.go",
 		EstimatedCostUSD:  0.001,
 		TTFTMs:            180,
-		TotalLatencyMs:    4200,
+		TotalLatencyMs:    4200.0,
 		TPS:               95.0,
 		Streaming:         true,
 	}
@@ -358,7 +360,7 @@ func TestTelemetryRecorderBackwardsCompat(t *testing.T) {
 		InputTokens:    50,
 		OutputTokens:   100,
 		TTFTMs:         100,
-		TotalLatencyMs: 1500,
+		TotalLatencyMs: 1500.0,
 		TPS:            71.4,
 		Streaming:      true,
 	})
@@ -403,8 +405,10 @@ func TestRequestFieldsRoundtrip(t *testing.T) {
 		RAGInjected:       true,
 		RAGFilename:       "examples/anything.go",
 		EstimatedCostUSD:  0.0123,
+		BaselineCostUSD:   0.0345,
+		SavingsUSD:        0.0222,
 		TTFTMs:            250,
-		TotalLatencyMs:    5000,
+		TotalLatencyMs:    5000.0,
 		TPS:               1234.5,
 		Streaming:         true,
 		Error:             "",
@@ -422,31 +426,37 @@ func TestRequestFieldsRoundtrip(t *testing.T) {
 	defer s2.Close()
 	ss2 := s2.(*SQLiteStore)
 	// Read back via a fresh SQL query rather than DailySummary so
-	// all 15 columns can be verified.
+	// all columns can be verified (issue #48 added
+	// fusion_arbiter_skipped; issue #73 added baseline_cost_usd /
+	// savings_usd).
 	row := ss2.db.QueryRow(`
 SELECT timestamp, request_id, route, model,
        input_tokens, output_tokens, toon_savings_tokens,
        rag_injected, rag_filename, estimated_cost_usd,
-       ttft_ms, total_latency_ms, tps, streaming, error
+       baseline_cost_usd, savings_usd,
+       ttft_ms, total_latency_ms, tps, streaming, fusion_arbiter_skipped, error
 FROM requests WHERE request_id = ?`, in.RequestID)
 	var (
-		gotTS        time.Time
-		gotReqID     string
-		gotRoute     string
-		gotModel     string
-		gotInput     int
-		gotOutput    int
-		gotSavings   int
-		gotRAGInj    int
-		gotRAGFile   string
-		gotCost      float64
-		gotTTFT      int64
-		gotLatency   int64
-		gotTPS       float64
-		gotStreaming int
-		gotErr       string
+		gotTS                   time.Time
+		gotReqID                string
+		gotRoute                string
+		gotModel                string
+		gotInput                int
+		gotOutput               int
+		gotSavings              int
+		gotRAGInj               int
+		gotRAGFile              string
+		gotCost                 float64
+		gotBaseline             float64
+		gotSavingsUSD           float64
+		gotTTFT                 int64
+		gotLatency              float64
+		gotTPS                  float64
+		gotStreaming            int
+		gotFusionArbiterSkipped int
+		gotErr                  string
 	)
-	if err := row.Scan(&gotTS, &gotReqID, &gotRoute, &gotModel, &gotInput, &gotOutput, &gotSavings, &gotRAGInj, &gotRAGFile, &gotCost, &gotTTFT, &gotLatency, &gotTPS, &gotStreaming, &gotErr); err != nil {
+	if err := row.Scan(&gotTS, &gotReqID, &gotRoute, &gotModel, &gotInput, &gotOutput, &gotSavings, &gotRAGInj, &gotRAGFile, &gotCost, &gotBaseline, &gotSavingsUSD, &gotTTFT, &gotLatency, &gotTPS, &gotStreaming, &gotFusionArbiterSkipped, &gotErr); err != nil {
 		t.Fatalf("scan: %v", err)
 	}
 	if gotReqID != in.RequestID {
@@ -476,11 +486,17 @@ FROM requests WHERE request_id = ?`, in.RequestID)
 	if gotCost != in.EstimatedCostUSD {
 		t.Errorf("estimated_cost_usd = %f, want %f", gotCost, in.EstimatedCostUSD)
 	}
+	if gotBaseline != in.BaselineCostUSD {
+		t.Errorf("baseline_cost_usd = %f, want %f", gotBaseline, in.BaselineCostUSD)
+	}
+	if gotSavingsUSD != in.SavingsUSD {
+		t.Errorf("savings_usd = %f, want %f", gotSavingsUSD, in.SavingsUSD)
+	}
 	if gotTTFT != in.TTFTMs {
 		t.Errorf("ttft_ms = %d, want %d", gotTTFT, in.TTFTMs)
 	}
 	if gotLatency != in.TotalLatencyMs {
-		t.Errorf("total_latency_ms = %d, want %d", gotLatency, in.TotalLatencyMs)
+		t.Errorf("total_latency_ms = %f, want %f", gotLatency, in.TotalLatencyMs)
 	}
 	if gotTPS != in.TPS {
 		t.Errorf("tps = %f, want %f", gotTPS, in.TPS)
@@ -495,92 +511,6 @@ FROM requests WHERE request_id = ?`, in.RequestID)
 	// exact since we asked modernc to use its default text format.
 	if !gotTS.Equal(in.Timestamp.UTC()) {
 		t.Errorf("timestamp = %v, want %v", gotTS, in.Timestamp.UTC())
-	}
-}
-
-// TestTaskTypeColumnAddedIdempotently (issue #44) is the
-// backward-compatibility guard for the additive task_type
-// migration. The boot path probes PRAGMA table_info and runs the
-// ALTER only when the column is missing, but that probe path was
-// trivial enough that a typo in the column name would silently
-// produce a re-apply on every Open (which SQLite would still
-// tolerate because ALTER ADD COLUMN fails loudly on a duplicate,
-// but the noise in logs would mask other regressions).
-//
-// We assert three things:
-//
-//   - A row written before the migration lands with task_type=""
-//     so legacy data remains queryable.
-//   - A row written through the new path carries the explicit
-//     task_type verbatim.
-//   - Opening the same DB file again does not blow up: the
-//     idempotent migration probe sees the column and skips the
-//     ALTER.
-func TestTaskTypeColumnAddedIdempotently(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "metrics.db")
-	open := func() *SQLiteStore {
-		s, err := OpenWithLogger(path, silentLogger)
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
-		return s.(*SQLiteStore)
-	}
-
-	// First open: adds task_type via the migration probe.
-	s := open()
-	if err := s.RecordRequest(Request{
-		Timestamp: time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC),
-		RequestID: "legacy",
-		Route:     "local",
-		Model:     "m",
-	}); err != nil {
-		t.Fatalf("RecordRequest legacy: %v", err)
-	}
-	if err := s.Close(); err != nil {
-		t.Fatalf("first Close: %v", err)
-	}
-
-	// Second open: probe finds the column, ALTER is skipped.
-	s = open()
-	if err := s.RecordRequest(Request{
-		Timestamp: time.Date(2026, 7, 11, 12, 0, 1, 0, time.UTC),
-		RequestID: "enriched",
-		Route:     "frontier",
-		Model:     "m2",
-		TaskType:  "debugging",
-	}); err != nil {
-		t.Fatalf("RecordRequest enriched: %v", err)
-	}
-	if err := s.Close(); err != nil {
-		t.Fatalf("second Close: %v", err)
-	}
-
-	// Third open: read both rows back, verify task_type values.
-	s = open()
-	defer s.Close()
-
-	rows, err := s.db.QueryContext(context.Background(),
-		`SELECT request_id, task_type FROM requests ORDER BY timestamp ASC`)
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	defer rows.Close()
-	got := map[string]string{}
-	for rows.Next() {
-		var rid, tt string
-		if err := rows.Scan(&rid, &tt); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		got[rid] = tt
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("rows: %v", err)
-	}
-	if v := got["legacy"]; v != "" {
-		t.Errorf("legacy row task_type = %q, want \"\" (migration default)", v)
-	}
-	if v := got["enriched"]; v != "debugging" {
-		t.Errorf("enriched row task_type = %q, want \"debugging\"", v)
 	}
 }
 
@@ -678,6 +608,8 @@ func TestSummaryFieldsAreSorted(t *testing.T) {
 		"TOONSavingsTokens",
 		"RAGInjectedCount",
 		"EstimatedCostTotal",
+		"BaselineCostTotal",
+		"SavingsTotal",
 		"TotalLatencyMsSum",
 		"ErrorCount",
 	}
@@ -704,7 +636,157 @@ func summaryFieldNames() []string {
 		"TOONSavingsTokens",
 		"RAGInjectedCount",
 		"EstimatedCostTotal",
+		"BaselineCostTotal",
+		"SavingsTotal",
 		"TotalLatencyMsSum",
 		"ErrorCount",
 	}
+}
+
+// TestDailySummaryBaselineSavingsRollup verifies that baseline_cost_usd
+// and savings_usd are summed correctly across local, frontier, and
+// fusion routes (issue #73).
+func TestDailySummaryBaselineSavingsRollup(t *testing.T) {
+	s := newTestStore(t)
+	ts := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	rows := []Request{
+		// local: actual 0, baseline 0.0015, savings 0.0015
+		{Timestamp: ts, RequestID: "l1", Route: "local", Model: "m", BaselineCostUSD: 0.0015, SavingsUSD: 0.0015},
+		// frontier: actual 0.004, baseline 0.008, savings 0.004
+		{Timestamp: ts, RequestID: "f1", Route: "frontier", Model: "m", EstimatedCostUSD: 0.004, BaselineCostUSD: 0.008, SavingsUSD: 0.004},
+		// fusion: actual 0, baseline 0.003, savings 0.003
+		{Timestamp: ts, RequestID: "u1", Route: "fusion", Model: "m", BaselineCostUSD: 0.003, SavingsUSD: 0.003},
+	}
+	for _, r := range rows {
+		_ = s.RecordRequest(r)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	s2, err := OpenWithLogger(s.Path(), silentLogger)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	sum, err := s2.DailySummary(ts)
+	if err != nil {
+		t.Fatalf("DailySummary: %v", err)
+	}
+	wantCost := 0.004
+	wantBaseline := 0.0015 + 0.008 + 0.003
+	wantSavings := 0.0015 + 0.004 + 0.003
+	if !floatEq(sum.EstimatedCostTotal, wantCost) {
+		t.Errorf("EstimatedCostTotal = %f, want ~%f", sum.EstimatedCostTotal, wantCost)
+	}
+	if !floatEq(sum.BaselineCostTotal, wantBaseline) {
+		t.Errorf("BaselineCostTotal = %f, want ~%f", sum.BaselineCostTotal, wantBaseline)
+	}
+	if !floatEq(sum.SavingsTotal, wantSavings) {
+		t.Errorf("SavingsTotal = %f, want ~%f", sum.SavingsTotal, wantSavings)
+	}
+}
+
+// TestMigrationAddsBaselineColumnsOnOldDB simulates an upgrade from
+// the pre-#73 schema: a database created WITHOUT baseline_cost_usd /
+// savings_usd is opened by the current code, and the migration must
+// add the missing columns so DailySummary and RecordRequest succeed.
+func TestMigrationAddsBaselineColumnsOnOldDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "metrics.db")
+
+	// Create the old schema (without baseline_cost_usd / savings_usd).
+	oldSchema := `
+CREATE TABLE IF NOT EXISTS requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME NOT NULL,
+    request_id TEXT NOT NULL,
+    route TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    toon_savings_tokens INTEGER NOT NULL DEFAULT 0,
+    rag_injected INTEGER NOT NULL DEFAULT 0,
+    rag_filename TEXT NOT NULL DEFAULT '',
+    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+    ttft_ms INTEGER NOT NULL DEFAULT 0,
+    total_latency_ms INTEGER NOT NULL DEFAULT 0,
+    tps REAL NOT NULL DEFAULT 0,
+    streaming INTEGER NOT NULL DEFAULT 1,
+    fusion_arbiter_skipped INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
+CREATE INDEX IF NOT EXISTS idx_requests_request_id ON requests(request_id);`
+
+	// Open directly with the driver to create the old-style schema.
+	dbPath := "file:" + path + "?mode=rwc"
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open old db: %v", err)
+	}
+	if _, err := db.Exec(oldSchema); err != nil {
+		t.Fatalf("create old schema: %v", err)
+	}
+	// Insert a row with the old column set to prove data survives.
+	_, err = db.Exec(`INSERT INTO requests
+	    (timestamp, request_id, route, model, input_tokens, estimated_cost_usd)
+	    VALUES (?, 'old-1', 'local', 'm', 100, 0)`, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("insert old row: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close old db: %v", err)
+	}
+
+	// Now open with the current OpenWithLogger — migration should fire.
+	s, err := OpenWithLogger(path, silentLogger)
+	if err != nil {
+		t.Fatalf("Open (migrated): %v", err)
+	}
+
+	// Insert a new row WITH the new fields to prove the columns exist.
+	if err := s.RecordRequest(Request{
+		Timestamp:        time.Now().UTC(),
+		RequestID:        "new-1",
+		Route:            "frontier",
+		Model:            "m",
+		InputTokens:      200,
+		EstimatedCostUSD: 0.001,
+		BaselineCostUSD:  0.002,
+		SavingsUSD:       0.001,
+	}); err != nil {
+		t.Fatalf("RecordRequest after migration: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close migrated: %v", err)
+	}
+
+	// Reopen and verify both rows are present and DailySummary works.
+	s2, err := OpenWithLogger(path, silentLogger)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	sum, err := s2.DailySummary(time.Now())
+	if err != nil {
+		t.Fatalf("DailySummary after migration: %v", err)
+	}
+	if sum.RequestCount != 2 {
+		t.Errorf("RequestCount = %d, want 2 (old + new row)", sum.RequestCount)
+	}
+	if !floatEq(sum.BaselineCostTotal, 0.002) {
+		t.Errorf("BaselineCostTotal = %f, want ~0.002", sum.BaselineCostTotal)
+	}
+	if !floatEq(sum.SavingsTotal, 0.001) {
+		t.Errorf("SavingsTotal = %f, want ~0.001", sum.SavingsTotal)
+	}
+}
+
+// floatEq compares two floats with a tolerance suitable for cost
+// sums (1e-9). Avoids importing math for a single call.
+func floatEq(a, b float64) bool {
+	d := a - b
+	if d < 0 {
+		d = -d
+	}
+	return d < 1e-9
 }

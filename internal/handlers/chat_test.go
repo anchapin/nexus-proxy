@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
+	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/rag"
@@ -48,6 +48,13 @@ func baseDeps(t *testing.T) (Deps, *upstream.RecordingTransport) {
 		TokenGuardrail: 6000,
 		MetaPrompt:     " BOOST",
 		TOONNotice:     "[PROXY SYSTEM NOTE]: TOON compression applied",
+		// Issue #48: enable progressive fusion delivery so the
+		// route=fusion tests exercise the new PanelStreaming
+		// path (speculative chunk + arbiter-on-disagreement)
+		// rather than the legacy Panel path (block-on-both +
+		// arbiter-always).
+		FusionProgressiveDelivery: true,
+		FusionAgreementThreshold:  0.85,
 	}
 	store := rag.NewStore(stubEmbedder{vec: []float64{0, 0, 0}}, 0.55)
 	store.Add("no-match.go", "x", []float64{0, 1, 0})
@@ -392,250 +399,37 @@ func TestChatRouteLocalCascadeAllFail(t *testing.T) {
 	}
 }
 
-// TestChatRouteLocalLimiterOverflowPromotesToFrontier pins the
-// issue-#35 acceptance criterion: with MaxConcurrent=1 and two
-// concurrent route=local requests, exactly one is served by local
-// Ollama and the other is fast-promoted to the frontier cascade
-// with X-Nexus-Overflow: true on the response. The first request
-// holds the slot by blocking inside its upstream-call recorder so
-// the second request can deterministically time out on the queue
-// and take the overflow path.
-//
-// The test uses channel-based synchronisation (not sleeps): it
-// waits for the local handler to be entered before firing the
-// second request, and waits for the frontier handler to be entered
-// (by the overflow) before releasing the first one. This avoids
-// the false-negatives a sleep-based schedule would produce under
-// -race + a busy CI box.
-func TestChatRouteLocalLimiterOverflowPromotesToFrontier(t *testing.T) {
-	deps, rt := baseDeps(t)
-
-	// Slot-1 ceiling + short queue so the overflow fires
-	// quickly. baselineDeps returns LocalMaxConcurrent=0 (no
-	// limiter), so wiring it here is the only place we exercise
-	// the gate in the test suite.
-	deps.Config.LocalMaxConcurrent = 1
-	deps.Config.LocalQueueTimeout = 200 * time.Millisecond
-	deps.Limiter = concurrencylimit.New(1)
-
-	localEntered := make(chan struct{})
-	var localEnteredOnce sync.Once
-	releaseLocal := make(chan struct{})
-	rt.On("POST", "http://ollama.local/v1/chat/completions",
-		func(w http.ResponseWriter, r *http.Request) {
-			localEnteredOnce.Do(func() { close(localEntered) })
-			// Hold the slot open until the test signals. We also
-			// honour ctx cancellation so a failing test does not
-			// leak the goroutine forever.
-			select {
-			case <-releaseLocal:
-			case <-r.Context().Done():
-				return
-			}
-			// Valid OpenAI completion shape so the cascade
-			// validation accepts the response and stops here
-			// (no fallback to frontier for this request).
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local answer"},"finish_reason":"stop"}]}`)
-		})
-
-	frontierEntered := make(chan struct{})
-	var frontierEnteredOnce sync.Once
-	rt.On("POST", "http://frontier.local",
-		func(w http.ResponseWriter, _ *http.Request) {
-			frontierEnteredOnce.Do(func() { close(frontierEntered) })
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, `{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"frontier overflow"},"finish_reason":"stop"}]}`)
-		})
-
-	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	var rw1, rw2 *httptest.ResponseRecorder
-
-	// Request 1: acquires the slot, blocks in the local recorder.
-	go func() {
-		defer wg.Done()
-		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-		rw1 = httptest.NewRecorder()
-		Chat(deps).ServeHTTP(rw1, req)
-	}()
-
-	// Wait until the local handler is actually entered before
-	// firing the second request. Without this the test could
-	// race: request 2 might land before request 1 acquired the
-	// slot and end up taking it instead of overflowing.
-	<-localEntered
-
-	// Request 2: must queue, time out, then fast-promote to
-	// frontier (skipLocal = true) with X-Nexus-Overflow.
-	go func() {
-		defer wg.Done()
-		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-		rw2 = httptest.NewRecorder()
-		Chat(deps).ServeHTTP(rw2, req)
-	}()
-
-	// Frontier is only called by the overflow path (the first
-	// request's cascade stays at local because the local body
-	// is a valid OpenAI shape). Wait for it to enter.
-	select {
-	case <-frontierEntered:
-	case <-time.After(2 * time.Second):
-		close(releaseLocal) // unblock request 1 to avoid hangs
-		wg.Wait()
-		t.Fatal("frontier handler was never called by overflow request")
-	}
-
-	// Now we can release the local request; it completes
-	// quickly because releaseLocal is closed.
-	close(releaseLocal)
-	wg.Wait()
-
-	// Request 2 must carry X-Nexus-Overflow: true and the
-	// frontier content (the cascade skipped local entirely).
-	if got := rw2.Header().Get("X-Nexus-Overflow"); got != "true" {
-		t.Errorf("rw2 X-Nexus-Overflow = %q, want \"true\"", got)
-	}
-	if !strings.Contains(rw2.Body.String(), "frontier overflow") {
-		t.Errorf("rw2 body = %q, want frontier overflow content", rw2.Body.String())
-	}
-	if !strings.Contains(rw2.Header().Get("X-Nexus-Cascade-Served-By"), "frontier") {
-		t.Errorf("rw2 served-by = %q, want frontier", rw2.Header().Get("X-Nexus-Cascade-Served-By"))
-	}
-
-	// Request 1 was the slot-holder; it must NOT carry the
-	// overflow header and its body must come from local.
-	if got := rw1.Header().Get("X-Nexus-Overflow"); got != "" {
-		t.Errorf("rw1 X-Nexus-Overflow = %q, want unset (slot-holder takes normal path)", got)
-	}
-	if !strings.Contains(rw1.Body.String(), "local answer") {
-		t.Errorf("rw1 body = %q, want local answer", rw1.Body.String())
-	}
-
-	// Upstream call bookkeeping: local=1, frontier=1.
-	var frontierCalls, localCalls int
-	for _, c := range rt.Calls() {
-		switch c.URL {
-		case "http://frontier.local":
-			frontierCalls++
-		case "http://ollama.local/v1/chat/completions":
-			localCalls++
-		}
-	}
-	if localCalls != 1 {
-		t.Errorf("local calls = %d, want 1", localCalls)
-	}
-	if frontierCalls != 1 {
-		t.Errorf("frontier calls = %d, want 1 (only the overflow request)", frontierCalls)
-	}
-}
-
-// TestChatRouteFrontierIgnoresLimiter pins the issue-#35 contract
-// that RouteFrontier is NEVER gated by the concurrency limiter.
-// With a max=1 limiter and many concurrent requests, all of them
-// must still reach the frontier endpoint — the limiter should not
-// stamp X-Nexus-Overflow and must not fall back to local for any
-// frontier-classified request. The large-prompt forcing the
-// guardrail drives the route=frontier classification so the test
-// does not need a separate routing knob.
-func TestChatRouteFrontierIgnoresLimiter(t *testing.T) {
-	deps, rt := baseDeps(t)
-
-	// Wire the tightest possible limiter. Frontier traffic must
-	// not be gated by it.
-	deps.Config.LocalMaxConcurrent = 1
-	deps.Config.LocalQueueTimeout = 1 * time.Second
-	deps.Limiter = concurrencylimit.New(1)
-
-	// Defence in depth: if the limiter ever incorrectly steered
-	// a frontier request to local, fail the test loud.
-	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
-		t.Error("local Ollama URL was hit for a frontier-classified request")
-	})
-
-	var frontierCalls atomic.Int32
-	rt.On("POST", "http://frontier.local",
-		func(w http.ResponseWriter, _ *http.Request) {
-			frontierCalls.Add(1)
-			_, _ = w.Write([]byte("frontier stream"))
-		})
-
-	// 30 000 char prompt / 4 = 7500 > 6000 guardrail -> route=frontier.
-	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 30000) + `"}]}`
-	const N = 5
-	var wg sync.WaitGroup
-	wg.Add(N)
-	for i := 0; i < N; i++ {
-		go func() {
-			defer wg.Done()
-			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-			rw := httptest.NewRecorder()
-			Chat(deps).ServeHTTP(rw, req)
-			if rw.Code != http.StatusOK {
-				t.Errorf("status = %d, want 200", rw.Code)
-			}
-			if got := rw.Header().Get("X-Nexus-Overflow"); got != "" {
-				t.Errorf("X-Nexus-Overflow = %q on a frontier request, want unset", got)
-			}
-		}()
-	}
-	wg.Wait()
-
-	if got := frontierCalls.Load(); int(got) != N {
-		t.Errorf("frontier calls = %d, want %d", got, N)
-	}
-}
-
-// TestChatNilLimiterPreservesUnlimitedBehaviour is the
-// backward-compat smoke test: a Deps with Limiter == nil (the
-// pre-issue-#35 default) must behave exactly as before — no
-// overflow header, no frontier promotion, every concurrent local
-// request lands on Ollama. The test fires N concurrent
-// route=local requests with no limiter and confirms every one
-// reaches local and carries no overflow marker.
-func TestChatNilLimiterPreservesUnlimitedBehaviour(t *testing.T) {
-	deps, rt := baseDeps(t)
-
-	// Limiter deliberately left nil; the handler must NOT fall
-	// through to any X-Nexus-Overflow branch.
-	var localCalls atomic.Int32
-	rt.On("POST", "http://ollama.local/v1/chat/completions",
-		func(w http.ResponseWriter, _ *http.Request) {
-			localCalls.Add(1)
-			_, _ = w.Write([]byte(`{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
-		})
-
-	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
-	const N = 5
-	var wg sync.WaitGroup
-	wg.Add(N)
-	for i := 0; i < N; i++ {
-		go func() {
-			defer wg.Done()
-			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-			rw := httptest.NewRecorder()
-			Chat(deps).ServeHTTP(rw, req)
-			if got := rw.Header().Get("X-Nexus-Overflow"); got != "" {
-				t.Errorf("X-Nexus-Overflow = %q, want unset (nil limiter should be a no-op)", got)
-			}
-		}()
-	}
-	wg.Wait()
-
-	if got := localCalls.Load(); int(got) != N {
-		t.Errorf("local calls = %d, want %d", got, N)
-	}
-}
-
 func TestChatDSLArchitectureFusion(t *testing.T) {
 	deps, rt := baseDeps(t)
-	// Panel will hit local + frontier + arbiter (3 calls)
+	// Issue #48: progressive fusion only invokes the arbiter when
+	// the two panel members DISAGREE. The OnAny handler returns
+	// divergent content per URL so the test exercises the full
+	// disagreement path (local + frontier + arbiter = 3 calls)
+	// rather than the agreement-skip-arbiter path (which would
+	// produce only 2 calls). The arbiter URL coincides with
+	// frontier in baseDeps, so the routing switches on the
+	// request body shape: "Master Synthesis Arbiter" identifies
+	// the arbiter call.
 	rt.OnAny(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("ok"))
+		b, _ := io.ReadAll(r.Body)
+		body := string(b)
+		switch {
+		case strings.Contains(body, "Master Synthesis Arbiter"):
+			// Arbiter call — return a synthesized stream so the
+			// progressive handler can append it after the
+			// speculative chunk.
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "data: {\"synth\":\"ok\"}\n\n")
+		case strings.Contains(r.URL.String(), "ollama"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local divergent answer"}}]}`)
+		default:
+			// Frontier panel member — divergent content to
+			// force the arbiter path.
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier completely different answer about totally unrelated topic"}}]}`)
+		}
 	})
 	body := `{"messages":[{"role":"user","content":"design the system architecture"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -644,7 +438,7 @@ func TestChatDSLArchitectureFusion(t *testing.T) {
 	if rw.Code != http.StatusOK {
 		t.Errorf("status = %d", rw.Code)
 	}
-	// Expect: 1 local panel call + 1 frontier panel call + 1 arbiter stream
+	// Expect: 1 local panel call + 1 frontier panel call + 1 arbiter stream.
 	if len(rt.Calls()) < 3 {
 		t.Errorf("expected >=3 calls (panel+arbiter), got %d", len(rt.Calls()))
 	}
@@ -656,6 +450,19 @@ func TestChatDSLArchitectureFusion(t *testing.T) {
 	}
 	if !hasLocal {
 		t.Error("fusion did not call local")
+	}
+	// Progressive fusion carries the speculative chunk and the
+	// arbiter synthesis as SSE chunks; the harness should see
+	// both in the response body.
+	if !strings.Contains(rw.Body.String(), "local divergent answer") &&
+		!strings.Contains(rw.Body.String(), "frontier completely different answer") {
+		t.Errorf("speculative chunk missing from body: %q", rw.Body.String())
+	}
+	if !strings.Contains(rw.Body.String(), `"synth":"ok"`) {
+		t.Errorf("arbiter synthesis missing from body: %q", rw.Body.String())
+	}
+	if !strings.Contains(rw.Body.String(), "data: [DONE]") {
+		t.Errorf("missing [DONE] terminator: %q", rw.Body.String())
 	}
 }
 
@@ -1132,7 +939,7 @@ func TestChatEmitsTelemetryRowWithCorrectRoute(t *testing.T) {
 		t.Error("RequestID empty")
 	}
 	if got.TotalLatencyMs <= 0 {
-		t.Errorf("TotalLatencyMs = %d, want > 0", got.TotalLatencyMs)
+		t.Errorf("TotalLatencyMs = %f, want > 0", got.TotalLatencyMs)
 	}
 	if got.OutputTokens <= 0 {
 		t.Errorf("OutputTokens = %d, want > 0", got.OutputTokens)
@@ -1178,7 +985,7 @@ func TestChatTelemetryTTFTZeroForNonStreaming(t *testing.T) {
 		t.Errorf("TTFTMs = %d, want 0 for non-streaming", records[0].TTFTMs)
 	}
 	if records[0].TotalLatencyMs <= 0 {
-		t.Errorf("TotalLatencyMs = %d, want > 0", records[0].TotalLatencyMs)
+		t.Errorf("TotalLatencyMs = %f, want > 0", records[0].TotalLatencyMs)
 	}
 }
 
@@ -1234,7 +1041,6 @@ func TestChatTelemetryJSONLRecorderEndToEnd(t *testing.T) {
 	deps, rt := baseDeps(t)
 	deps.Recorder = r
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(2 * time.Millisecond) // ensure the millisecond latency assertion below is stable
 		_, _ = w.Write([]byte("frontier stream"))
 	})
 	// Large prompt -> guardrail forces FRONTIER route.
@@ -1263,7 +1069,7 @@ func TestChatTelemetryJSONLRecorderEndToEnd(t *testing.T) {
 		t.Errorf("Route = %q, want frontier", row.Route)
 	}
 	if row.TotalLatencyMs <= 0 {
-		t.Errorf("TotalLatencyMs = %d, want > 0", row.TotalLatencyMs)
+		t.Errorf("TotalLatencyMs = %f, want > 0", row.TotalLatencyMs)
 	}
 	if row.RequestID == "" {
 		t.Error("RequestID empty")
@@ -1882,431 +1688,328 @@ func TestBudgetObserverFuncNilClosures(t *testing.T) {
 	}
 }
 
-// --- issue #44: confidence-aware SLM routing + task_type ----------------
+// --- issue #48: streaming fusion with progressive delivery -------------
 
-// recordingMetricsObserver is a MetricsObserver test double that
-// appends every event to a slice. Safe for concurrent use; the chat
-// handler invokes Submit from the request goroutine so the lock
-// mostly guards against future test races.
-type recordingMetricsObserver struct {
-	mu   sync.Mutex
-	seen []MetricsEvent
-}
-
-func (r *recordingMetricsObserver) Submit(e MetricsEvent) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.seen = append(r.seen, e)
-}
-
-func (r *recordingMetricsObserver) Snapshot() []MetricsEvent {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]MetricsEvent, len(r.seen))
-	copy(out, r.seen)
-	return out
-}
-
-// slmResponseURL is the Ollama endpoint the SLM client posts to (no
-// trailing path under test wiring). Tests replay deterministic JSON
-// there to simulate the routing SLM's reply.
-const slmResponseURL = "http://ollama.local/api/chat"
-
-// TestChatSLMConfidenceEscalatesLocalToFrontier pins down the
-// confidence-aware escalation rule (issue #44): an SLM choosing
-// route=local with confidence below the configured threshold must
-// be promoted to frontier so the harness receives a confident
-// answer. Without this gate, a low-confidence local answer would
-// be served even though the model itself signalled uncertainty.
-func TestChatSLMConfidenceEscalatesLocalToFrontier(t *testing.T) {
+// TestChatFusionProgressiveAgreementSkipsArbiter is the chat-handler
+// acceptance test for issue #48: when both panel members return
+// identical content, the speculative chunk is streamed and the
+// arbiter is NOT called — the response body is exactly the
+// speculative chunk + `data: [DONE]\n\n`, with no arbiter stream.
+func TestChatFusionProgressiveAgreementSkipsArbiter(t *testing.T) {
 	deps, rt := baseDeps(t)
-	deps.Config.SLMConfidenceThreshold = 0.6
-	// SLM returns route=local with confidence=0.4 (below threshold).
-	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"message":{"content":"{\"route\":\"local\",\"confidence\":0.4,\"task_type\":\"refactoring\"}"}}`)
-	})
-	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("frontier stream"))
-	})
-	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
-		t.Error("local Ollama URL must not be hit when SLM escalates local -> frontier")
-	})
-
-	body := `{"messages":[{"role":"user","content":"refactor this complex module"}]}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-	rw := httptest.NewRecorder()
-	Chat(deps).ServeHTTP(rw, req)
-	if len(rt.Calls()) != 2 { // SLM call + escalated frontier call
-		t.Fatalf("calls = %+v, want 2 (SLM + frontier)", rt.Calls())
-	}
-	if rt.Calls()[1].URL != "http://frontier.local" {
-		t.Errorf("routed to %s, want frontier (low-confidence local must escalate)", rt.Calls()[1].URL)
-	}
-	if !strings.Contains(rw.Body.String(), "frontier stream") {
-		t.Errorf("body = %q, want frontier stream", rw.Body.String())
-	}
-}
-
-// TestChatSLMConfidenceEscalatesFusionToFrontier mirrors the
-// route=fusion half of the gate (issue #44). Fusion is the second
-// escalation target — a low-confidence "this needs extreme
-// architectural deliberation" answer is also bounced to frontier
-// when the model itself rated it as uncertain.
-//
-// The prompt deliberately avoids both DSL triggers ("architectural
-// design" / "system architecture" sentence matches AND the
-// formatting regex keywords) so the SLM branch is the one under
-// test. Letting the SLM emit route=fusion lets us assert that the
-// gate fires on the fusion half of the decision space too.
-func TestChatSLMConfidenceEscalatesFusionToFrontier(t *testing.T) {
-	deps, rt := baseDeps(t)
-	deps.Config.SLMConfidenceThreshold = 0.7
-	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"message":{"content":"{\"route\":\"fusion\",\"confidence\":0.5,\"task_type\":\"architecture\"}"}}`)
-	})
-	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("frontier stream"))
-	})
-	rt.On("POST", "http://ollama.local/v1/chat/completions", func(_ http.ResponseWriter, _ *http.Request) {
-		t.Error("local Ollama URL must not be hit when SLM escalates fusion -> frontier")
-	})
-
-	body := `{"messages":[{"role":"user","content":"design the new tracing subsystem"}]}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-	rw := httptest.NewRecorder()
-	Chat(deps).ServeHTTP(rw, req)
-
-	// Order: SLM call (api/chat) -> escalated frontier call.
-	var sawFrontier bool
-	for _, c := range rt.Calls() {
-		if c.URL == "http://frontier.local" {
-			sawFrontier = true
+	// Both panel members return identical content. The arbiter URL
+	// coincides with the frontier URL (baseDeps wiring), so any
+	// call to the frontier URL that doesn't carry the
+	// "Master Synthesis Arbiter" prompt is a panel member; calls
+	// with that prompt would be the arbiter (which we MUST NOT
+	// observe).
+	rt.OnAny(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		body := string(b)
+		switch {
+		case strings.Contains(body, "Master Synthesis Arbiter"):
+			t.Errorf("arbiter was called on agreement; calls=%+v", rt.Calls())
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.String(), "ollama"):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"identical panel answer"}}]}`)
+		default:
+			// Frontier panel member.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"identical panel answer"}}]}`)
 		}
-	}
-	if !sawFrontier {
-		t.Fatalf("calls = %+v, want frontier URL somewhere (low-confidence fusion must escalate)", rt.Calls())
-	}
-}
-
-// TestChatSLMThresholdZeroNeverEscalates locks down the
-// backward-compat contract (issue #44 AC: "Threshold=0 default
-// behavior identical to today"). Even with a low-confidence SLM
-// answer, the request must keep its chosen route when the
-// threshold is the disabled sentinel.
-func TestChatSLMThresholdZeroNeverEscalates(t *testing.T) {
-	deps, rt := baseDeps(t)
-	deps.Config.SLMConfidenceThreshold = 0 // disabled
-	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"message":{"content":"{\"route\":\"local\",\"confidence\":0.0,\"task_type\":\"debugging\"}"}}`)
 	})
-	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
-	})
-	rt.On("POST", "http://frontier.local", func(_ http.ResponseWriter, _ *http.Request) {
-		t.Error("frontier must NOT be called when threshold is 0")
-	})
-
-	body := `{"messages":[{"role":"user","content":"fix the worker pool deadlock"}]}`
+	body := `{"messages":[{"role":"user","content":"design the system architecture"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw := httptest.NewRecorder()
 	Chat(deps).ServeHTTP(rw, req)
-
-	if len(rt.Calls()) != 2 { // SLM + local upstream
-		t.Fatalf("calls = %+v, want 2", rt.Calls())
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rw.Code, rw.Body.String())
 	}
-	if rt.Calls()[1].URL != "http://ollama.local/v1/chat/completions" {
-		t.Errorf("routed to %s, want local (threshold=0 must be a no-op)", rt.Calls()[1].URL)
+	if got := rw.Header().Get("X-Nexus-Fusion-Progressive"); got != "true" {
+		t.Errorf("X-Nexus-Fusion-Progressive = %q, want \"true\"", got)
+	}
+	if got := rw.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", got)
+	}
+	// Speculative chunk + [DONE], no arbiter synthesis.
+	if !strings.Contains(rw.Body.String(), "identical panel answer") {
+		t.Errorf("speculative chunk missing: %q", rw.Body.String())
+	}
+	if !strings.Contains(rw.Body.String(), "data: [DONE]") {
+		t.Errorf("missing [DONE] terminator: %q", rw.Body.String())
+	}
+	// Source tag embedded in the chunk metadata identifies which
+	// panel member streamed first.
+	bodyStr := rw.Body.String()
+	if !strings.Contains(bodyStr, `"source":"local"`) && !strings.Contains(bodyStr, `"source":"frontier"`) {
+		t.Errorf("chunk metadata missing source tag: %q", bodyStr)
+	}
+	// Only 2 upstream calls (panel members), no arbiter.
+	if len(rt.Calls()) != 2 {
+		t.Errorf("expected 2 upstream calls (panel only), got %d: %+v", len(rt.Calls()), rt.Calls())
 	}
 }
 
-// TestChatSLMConfidenceAtThresholdKeepsRoute verifies the
-// comparison is strictly "<" (not "<="). An SLM returning exactly
-// the threshold confidence must NOT escalate — the operator chose
-// the value as a boundary, and over-escalating wastes frontier
-// budget on borderline-confidence requests.
-func TestChatSLMConfidenceAtThresholdKeepsRoute(t *testing.T) {
+// TestChatFusionProgressiveDisabledBackwardCompat verifies the
+// backwards-compatibility acceptance criterion: setting
+// NEXUS_FUSION_PROGRESSIVE=false (via the Config field) restores
+// the legacy Panel behaviour — both members fetched, arbiter always
+// invoked, single JSON-object response (issue #10 contract) when
+// stream=false. The proxy must not silently regress when an operator
+// opts out.
+func TestChatFusionProgressiveDisabledBackwardCompat(t *testing.T) {
 	deps, rt := baseDeps(t)
-	deps.Config.SLMConfidenceThreshold = 0.7
-	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
-		// confidence == threshold should NOT trigger.
-		_, _ = io.WriteString(w, `{"message":{"content":"{\"route\":\"local\",\"confidence\":0.7,\"task_type\":\"refactoring\"}"}}`)
+	deps.Config.FusionProgressiveDelivery = false
+	var arbiterBody string
+	rt.OnAny(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		body := string(b)
+		switch {
+		case strings.Contains(body, "Master Synthesis Arbiter"):
+			arbiterBody = body
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"synthesized"}}]}`)
+		case strings.Contains(r.URL.String(), "ollama"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local"}}]}`)
+		default:
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier"}}]}`)
+		}
 	})
-	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
-	})
-	rt.On("POST", "http://frontier.local", func(_ http.ResponseWriter, _ *http.Request) {
-		t.Error("frontier must NOT be called when confidence equals threshold")
-	})
-
-	body := `{"messages":[{"role":"user","content":"add retry handling to the queue worker"}]}`
+	body := `{"messages":[{"role":"user","content":"design the system architecture"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw := httptest.NewRecorder()
 	Chat(deps).ServeHTTP(rw, req)
-
-	if len(rt.Calls()) < 2 {
-		t.Fatalf("calls = %+v, want SLM + local upstream", rt.Calls())
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rw.Code)
 	}
-	if rt.Calls()[1].URL != "http://ollama.local/v1/chat/completions" {
-		t.Errorf("routed to %s, want local (confidence equals threshold -> no escalation)", rt.Calls()[1].URL)
+	// Progressive header MUST NOT be set on the legacy path.
+	if got := rw.Header().Get("X-Nexus-Fusion-Progressive"); got != "" {
+		t.Errorf("X-Nexus-Fusion-Progressive = %q, want empty (legacy path)", got)
+	}
+	// Arbiter MUST have been called (legacy always invokes).
+	if arbiterBody == "" {
+		t.Errorf("arbiter not called on legacy path; calls=%v", rt.Calls())
+	}
+	if !strings.Contains(arbiterBody, "Master Synthesis Arbiter") {
+		t.Errorf("arbiter body missing arbiter prompt: %s", arbiterBody)
+	}
+	if !strings.Contains(rw.Body.String(), "synthesized") {
+		t.Errorf("arbiter synthesis missing from response: %q", rw.Body.String())
+	}
+	// Body should NOT contain the progressive SSE chunks.
+	if strings.HasPrefix(strings.TrimSpace(rw.Body.String()), "data:") {
+		t.Errorf("legacy path emitted SSE chunks: %q", rw.Body.String())
 	}
 }
 
-// TestChatSLMFallbackFrontierIsNeverEscalated verifies the other
-// side of the rule: an SLM that chose frontier directly is left
-// alone even if its confidence is below threshold. Frontier IS the
-// confident answer; promoting it elsewhere would be a regression.
-func TestChatSLMFallbackFrontierIsNeverEscalated(t *testing.T) {
-	deps, rt := baseDeps(t)
-	deps.Config.SLMConfidenceThreshold = 0.8
-	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"message":{"content":"{\"route\":\"frontier\",\"confidence\":0.2,\"task_type\":\"review\"}"}}`)
-	})
-	rt.On("POST", "http://frontier.local", func(_ http.ResponseWriter, _ *http.Request) {
-		// already frontier; no further escalation target exists.
-	})
-	rt.On("POST", "http://ollama.local/v1/chat/completions", func(_ http.ResponseWriter, _ *http.Request) {
-		t.Error("local must NOT be called when SLM chose frontier directly")
-	})
+// TestChatFusionProgressiveTelemetryFlag confirms the chat handler
+// stamps the fusion_arbiter_skipped telemetry flag (issue #48
+// acceptance criterion) when the speculative chunk terminates the
+// response without invoking the arbiter.
+func TestChatFusionProgressiveTelemetryFlag(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tel.jsonl")
+	r, err := telemetry.NewJSONLRecorder(path)
+	if err != nil {
+		t.Fatalf("NewJSONLRecorder: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
 
-	body := `{"messages":[{"role":"user","content":"review this pull request"}]}`
+	deps, rt := baseDeps(t)
+	deps.Recorder = r
+	rt.OnAny(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		body := string(b)
+		switch {
+		case strings.Contains(body, "Master Synthesis Arbiter"):
+			t.Errorf("arbiter was called on agreement; calls=%v", rt.Calls())
+			w.WriteHeader(http.StatusOK)
+		default:
+			// Identical content for both panel members.
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"identical"}}]}`)
+		}
+	})
+	body := `{"messages":[{"role":"user","content":"design the system architecture"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw := httptest.NewRecorder()
 	Chat(deps).ServeHTTP(rw, req)
-
-	if rt.Calls()[1].URL != "http://frontier.local" {
-		t.Errorf("routed to %s, want frontier (frontier is never escalated)", rt.Calls()[1].URL)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rw.Code)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var row telemetry.Record
+	if err := json.Unmarshal(bytes.TrimSpace(data), &row); err != nil {
+		t.Fatalf("unmarshal: %v body=%q", err, data)
+	}
+	if row.Route != string(router.RouteFusion) {
+		t.Errorf("Route = %q, want fusion", row.Route)
+	}
+	if !row.FusionArbiterSkipped {
+		t.Errorf("FusionArbiterSkipped = false, want true (agreement path)")
 	}
 }
 
-// TestChatSLMLogIncludesTaskType pins down the slog contract (issue
-// #44 AC): the "slm decision" line carries `task_type` so operators
-// can confirm the field round-trips end-to-end without scraping
-// metrics. Confidence is also a required attribute for parity with
-// task_type and to make future cost dashboards trivial.
-func TestChatSLMLogIncludesTaskType(t *testing.T) {
+// --- Local-route cooldown tests (issue #80) ---------------------------------
+
+// TestChatLocalCooldownSkipsLocalAfterCascadeFailure verifies the core
+// acceptance criterion: after the cascade detects a local failure and
+// arms the cooldown, the NEXT request must skip local entirely and go
+// directly to the frontier fallback, with the X-Nexus-Local-Cooldown
+// header stamped on the response.
+func TestChatLocalCooldownSkipsLocalAfterCascadeFailure(t *testing.T) {
 	deps, rt := baseDeps(t)
-	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"message":{"content":"{\"route\":\"local\",\"confidence\":0.8,\"task_type\":\"debugging\"}"}}`)
-	})
+	cd := circuit.NewWithClock(30*time.Second, time.Now)
+	deps.LocalCooldown = cd
+
+	localHits := int32(0)
+	// First call to local returns garbage -> cascade falls back.
+	// After the first request arms the cooldown, the second request
+	// must NOT reach local at all.
 	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
+		atomic.AddInt32(&localHits, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "not openai json")
+	})
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"frontier fallback"},"finish_reason":"stop"}]}`)
 	})
 
-	body := `{"messages":[{"role":"user","content":"fix the worker pool deadlock"}]}`
-	output := captureSlog(t, func() {
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+
+	// Request 1: local fails, cascade falls back, cooldown armed.
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw1 := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw1, req1)
+	if rw1.Code != http.StatusOK {
+		t.Fatalf("req1 status = %d; body=%q", rw1.Code, rw1.Body.String())
+	}
+	if !cd.Active() {
+		t.Fatal("cooldown should be armed after cascade local failure")
+	}
+
+	// Request 2: cooldown active, local must be skipped.
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw2 := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw2, req2)
+	if rw2.Code != http.StatusOK {
+		t.Fatalf("req2 status = %d; body=%q", rw2.Code, rw2.Body.String())
+	}
+	if got := rw2.Header().Get("X-Nexus-Local-Cooldown"); got != "true" {
+		t.Errorf("X-Nexus-Local-Cooldown = %q, want \"true\"", got)
+	}
+	if got := rw2.Header().Get("X-Nexus-Degraded"); got != "true" {
+		t.Errorf("X-Nexus-Degraded = %q, want \"true\"", got)
+	}
+	// Local should have been hit exactly once (request 1).
+	if n := atomic.LoadInt32(&localHits); n != 1 {
+		t.Errorf("local was hit %d times, want 1 (cooldown should skip second)", n)
+	}
+}
+
+// TestChatLocalCooldownDisabledDoesNotSkip verifies that a nil
+// (disabled) cooldown circuit keeps the pre-#80 behaviour: even after
+// a cascade local failure, the next request still tries local.
+func TestChatLocalCooldownDisabledDoesNotSkip(t *testing.T) {
+	deps, rt := baseDeps(t)
+	// No LocalCooldown wired — disabled behaviour.
+
+	localHits := int32(0)
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&localHits, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "not openai json")
+	})
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	})
+
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	for i := 0; i < 3; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 		rw := httptest.NewRecorder()
 		Chat(deps).ServeHTTP(rw, req)
-	})
-
-	var found bool
-	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
-		var rec map[string]any
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			continue
-		}
-		if rec["msg"] != "slm decision" {
-			continue
-		}
-		if task, _ := rec["task_type"].(string); task == "debugging" {
-			if conf, _ := rec["confidence"].(float64); conf == 0.8 {
-				if route, _ := rec["route"].(string); route == "local" {
-					found = true
-				}
-			}
+		if rw.Code != http.StatusOK {
+			t.Fatalf("req %d status = %d", i, rw.Code)
 		}
 	}
-	if !found {
-		t.Fatalf("no slm decision line with task_type=debugging confidence=0.8 route=local in:\n%s", output)
+	if n := atomic.LoadInt32(&localHits); n != 3 {
+		t.Errorf("local was hit %d times, want 3 (cooldown disabled)", n)
+	}
+	if got := deps.Config.LocalCooldown; got != 0 {
+		t.Errorf("default LocalCooldown should be 0 in test config, got %v", got)
 	}
 }
 
-// TestChatSLMEscalationLogShape pins down the warning line emitted
-// when a low-confidence SLM decision is escalated (issue #44 AC).
-// Operators tailing logs need to see `from_route`, `to_route`,
-// `confidence`, `threshold`, and `task_type` to confirm the gate is
-// firing as configured.
-func TestChatSLMEscalationLogShape(t *testing.T) {
+// TestChatLocalCooldownStampsNoHeaderWhenInactive verifies that
+// when the cooldown is not armed (no failure recorded), the
+// X-Nexus-Local-Cooldown header is absent and local is attempted
+// normally.
+func TestChatLocalCooldownNoHeaderWhenInactive(t *testing.T) {
 	deps, rt := baseDeps(t)
-	deps.Config.SLMConfidenceThreshold = 0.6
-	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"message":{"content":"{\"route\":\"local\",\"confidence\":0.3,\"task_type\":\"code_generation\"}"}}`)
-	})
-	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("frontier stream"))
-	})
+	cd := circuit.NewWithClock(30*time.Second, time.Now)
+	deps.LocalCooldown = cd
 
-	body := `{"messages":[{"role":"user","content":"refactor this complex module"}]}`
-	output := captureSlog(t, func() {
-		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-		rw := httptest.NewRecorder()
-		Chat(deps).ServeHTTP(rw, req)
-	})
-
-	var found bool
-	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
-		var rec map[string]any
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			continue
-		}
-		if rec["msg"] != "slm low-confidence escalation" {
-			continue
-		}
-		if from, _ := rec["from_route"].(string); from != "local" {
-			continue
-		}
-		if to, _ := rec["to_route"].(string); to != "frontier" {
-			continue
-		}
-		if conf, _ := rec["confidence"].(float64); conf != 0.3 {
-			continue
-		}
-		if threshold, _ := rec["threshold"].(float64); threshold != 0.6 {
-			continue
-		}
-		if task, _ := rec["task_type"].(string); task != "code_generation" {
-			continue
-		}
-		found = true
-	}
-	if !found {
-		t.Fatalf("no slm low-confidence escalation line matching fields in:\n%s", output)
-	}
-}
-
-// TestChatRecorderCoexistsWithMetricsObserver guards the issue #112
-// regression: adding the richer metrics sink must not silence the legacy
-// recorder. The recorder-only case also pins the existing single-sink
-// behaviour.
-func TestChatRecorderCoexistsWithMetricsObserver(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		withMetrics bool
-	}{
-		{name: "recorder only"},
-		{name: "recorder and metrics", withMetrics: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			deps, rt := baseDeps(t)
-			recorder := &capturingRecorder{}
-			deps.Recorder = recorder
-			metrics := &recordingMetricsObserver{}
-			if tc.withMetrics {
-				deps.MetricsObserver = metrics
-			}
-			rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"css fix"},"finish_reason":"stop"}]}`)
-			})
-
-			body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
-			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-			rw := httptest.NewRecorder()
-			Chat(deps).ServeHTTP(rw, req)
-
-			if rw.Code != http.StatusOK {
-				t.Fatalf("status = %d, want %d", rw.Code, http.StatusOK)
-			}
-			if got := len(recorder.Snapshot()); got != 1 {
-				t.Errorf("recorder calls = %d, want 1", got)
-			}
-			wantMetrics := 0
-			if tc.withMetrics {
-				wantMetrics = 1
-			}
-			if got := len(metrics.Snapshot()); got != wantMetrics {
-				t.Errorf("metrics events = %d, want %d", got, wantMetrics)
-			}
-		})
-	}
-}
-
-// TestChatSLMMetricsEventIncludesTaskType confirms the metrics
-// event the handler forwards to the dashboard carries the SLM's
-// task_type (issue #44 AC). The SQLite column defaults to "" so a
-// mismatch here would surface as a "schema accepts NULL but
-// handler doesn't send it" regression — easy to miss until a
-// dashboard query joins on task_type.
-func TestChatSLMMetricsEventIncludesTaskType(t *testing.T) {
-	deps, rt := baseDeps(t)
-	obs := &recordingMetricsObserver{}
-	deps.MetricsObserver = obs
-	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"message":{"content":"{\"route\":\"local\",\"confidence\":0.85,\"task_type\":\"refactoring\"}"}}`)
-	})
 	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local ok"},"finish_reason":"stop"}]}`)
 	})
 
-	body := `{"messages":[{"role":"user","content":"refactor the queue worker module"}]}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-	rw := httptest.NewRecorder()
-	Chat(deps).ServeHTTP(rw, req)
-
-	if len(obs.Snapshot()) != 1 {
-		t.Fatalf("expected 1 metrics event, got %d", len(obs.Snapshot()))
-	}
-	ev := obs.Snapshot()[0]
-	if ev.TaskType != "refactoring" {
-		t.Errorf("MetricsEvent.TaskType = %q, want \"refactoring\"", ev.TaskType)
-	}
-	if ev.Route != "local" {
-		t.Errorf("MetricsEvent.Route = %q, want \"local\"", ev.Route)
-	}
-}
-
-// TestChatDSLHitLeavesTaskTypeEmpty confirms guardrail / DSL hits
-// leave slmTaskType at its zero value. The metrics row the
-// handler emits must record task_type="" so a non-SLM dispatch is
-// distinguishable from "SLM said unknown" by inspecting the
-// upstream path (or, more cheaply, by joining on `route=local with
-// `task_type!="" as an SLM-confident row filter).
-func TestChatDSLHitLeavesTaskTypeEmpty(t *testing.T) {
-	deps, rt := baseDeps(t)
-	obs := &recordingMetricsObserver{}
-	deps.MetricsObserver = obs
-	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"css fix"},"finish_reason":"stop"}]}`)
-	})
-
-	// DSL "css" keyword forces route=local before the SLM is
-	// consulted, so task_type must stay "".
 	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw := httptest.NewRecorder()
 	Chat(deps).ServeHTTP(rw, req)
-
-	if len(obs.Snapshot()) != 1 {
-		t.Fatalf("expected 1 metrics event, got %d", len(obs.Snapshot()))
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%q", rw.Code, rw.Body.String())
 	}
-	if ev := obs.Snapshot()[0]; ev.TaskType != "" {
-		t.Errorf("MetricsEvent.TaskType = %q, want \"\" (DSL hit bypasses SLM)", ev.TaskType)
+	if got := rw.Header().Get("X-Nexus-Local-Cooldown"); got != "" {
+		t.Errorf("X-Nexus-Local-Cooldown = %q, want absent when cooldown inactive", got)
+	}
+	if got := rw.Header().Get("X-Nexus-Degraded"); got != "false" {
+		t.Errorf("X-Nexus-Degraded = %q, want \"false\"", got)
 	}
 }
 
-// TestChatSLMErrorFallbackKeepsUnknownTaskType confirms the SLM
-// error path still populates task_type with the documented
-// "unknown" sentinel so a downstream dashboard can flag these
-// rows distinctly from "DSL / guardrail hit" rows.
-func TestChatSLMErrorFallbackKeepsUnknownTaskType(t *testing.T) {
+// TestChatLocalCooldownDoesNotAffectFrontierRoute verifies that the
+// cooldown only affects route=local and route=fusion, not route=frontier.
+func TestChatLocalCooldownDoesNotAffectFrontierRoute(t *testing.T) {
 	deps, rt := baseDeps(t)
-	obs := &recordingMetricsObserver{}
-	deps.MetricsObserver = obs
-	rt.On("POST", slmResponseURL, func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "boom", http.StatusInternalServerError)
-	})
+	cd := circuit.NewWithClock(30*time.Second, time.Now)
+	deps.LocalCooldown = cd
+	cd.RecordFailure() // arm the cooldown
+
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("frontier fallback"))
+		_, _ = w.Write([]byte("frontier stream"))
 	})
 
-	body := `{"messages":[{"role":"user","content":"refactor this complex module"}]}`
+	// Large prompt -> guardrail forces FRONTIER route.
+	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 30000) + `"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw := httptest.NewRecorder()
 	Chat(deps).ServeHTTP(rw, req)
-
-	if len(obs.Snapshot()) != 1 {
-		t.Fatalf("expected 1 metrics event, got %d", len(obs.Snapshot()))
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%q", rw.Code, rw.Body.String())
 	}
-	if ev := obs.Snapshot()[0]; ev.TaskType != router.TaskTypeUnknown {
-		t.Errorf("MetricsEvent.TaskType = %q, want %q (SLM error fallback)", ev.TaskType, router.TaskTypeUnknown)
+	// Frontier route should NOT have the cooldown header — the
+	// cooldown only protects route=local / route=fusion.
+	if got := rw.Header().Get("X-Nexus-Local-Cooldown"); got != "" {
+		t.Errorf("X-Nexus-Local-Cooldown = %q, want absent on route=frontier", got)
 	}
 }

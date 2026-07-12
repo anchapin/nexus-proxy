@@ -1,229 +1,77 @@
-// Package auth provides bearer-token authentication middleware that gates
-// inbound requests to the proxy when one or more API keys are configured
-// (issue #37).
+// Package auth implements the inbound API-key gateway (issue #37/#109).
 //
-// When at least one key is set (NEXUS_PROXY_API_KEY or
-// NEXUS_PROXY_API_KEYS), requests to /v1/chat/completions must present a
-// valid `Authorization: Bearer <key>` or `X-API-Key` header or the proxy
-// returns HTTP 401 with an OpenAI-compatible error envelope. /healthz is
-// exempt by default so orchestrator liveness probes keep working.
-//
-// When no key is configured the middleware is a no-op pass-through, so
-// the proxy behaves identically to today (zero breaking change for
-// localhost dev).
+// When NEXUS_PROXY_API_KEY is set, every non-exempt endpoint requires
+// a matching Bearer token in the Authorization header. Endpoints used
+// by infrastructure probes (/healthz, /metrics) are exempt so K8s
+// liveness probes and Prometheus scrapers continue to work without
+// credentials. The /status endpoint is exempt only when
+// NEXUS_STATUS_PUBLIC=true (default false).
 package auth
 
 import (
-	"crypto/subtle"
-	"encoding/json"
 	"net/http"
 	"strings"
-
-	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
-// AuthObserverFunc is the function-typed hook invoked by
-// MiddlewareWithObserver on every authentication decision (issue #70).
-// Outcome is one of:
-//
-//   - "accepted"            — a valid credential matched
-//   - "rejected_invalid"    — a credential was presented but did not match
-//   - "rejected_missing"    — no credential was presented
-//   - "exempt"              — request was short-circuited by the exempt predicate
-//
-// Implementations must be safe to call concurrently from many
-// request goroutines and must be allocation-free on the hot path
-// (the production observer is a single atomic add).
-type AuthObserverFunc func(outcome string)
-
-// Middleware wraps next with bearer-token authentication. Requests that
-// do not present a valid key in `Authorization: Bearer <key>` (scheme
-// matched case-insensitively) or `X-API-Key` are rejected with HTTP 401
-// and an OpenAI-compatible error envelope.
-//
-// When keys is empty (or contains only blank entries) the returned
-// middleware is an identity pass-through so callers can unconditionally
-// wrap the mux without paying for an "auth disabled?" branch on the hot
-// path — the proxy behaves identically to today when no key is
-// configured.
-//
-// The exempt predicate, when non-nil, short-circuits the check for
-// specific paths (e.g. /healthz for liveness probes). Exempt requests
-// are forwarded without consuming a key comparison.
-//
-// Key comparison uses crypto/subtle.ConstantTimeCompare to prevent
-// timing attacks against the configured keys. Every configured key is
-// compared even after a match, so the function always spends time
-// proportional to len(keys) rather than leaking the position of the
-// accepted key.
-//
-// The observer hook (when non-nil) is invoked exactly once per
-// request with one of the outcome labels documented on
-// AuthObserverFunc. The hook is never called for the no-keys-configured
-// identity pass-through because the resulting middleware is literally
-// `next` (no decision to observe).
-//
-// Use MiddlewareWithObserver when observability is required. This
-// function is the no-observer convenience wrapper used by tests that
-// only care about accept/reject behaviour.
-func Middleware(keys []string, exempt func(*http.Request) bool) func(http.Handler) http.Handler {
-	return MiddlewareWithObserver(keys, exempt, nil)
+// Middleware gates HTTP requests behind a bearer token. When key is
+// empty the middleware is a pass-through (auth disabled), so a
+// development proxy with no NEXUS_PROXY_API_KEY behaves identically
+// to the pre-auth binary.
+type Middleware struct {
+	key    string
+	exempt func(*http.Request) bool
 }
 
-// MiddlewareWithObserver is Middleware plus a per-decision observer
-// hook (issue #70). A nil observer is treated as "no observability"
-// so callers can pass nil without nil-checking at the call site (the
-// inner closure skips the invocation).
-func MiddlewareWithObserver(keys []string, exempt func(*http.Request) bool, observer AuthObserverFunc) func(http.Handler) http.Handler {
-	// Defensive copy + drop blanks so callers cannot mutate the slice
-	// after wiring and so a stray empty entry cannot accept an
-	// unauthenticated request.
-	valid := make([]string, 0, len(keys))
-	for _, k := range keys {
-		if k = strings.TrimSpace(k); k != "" {
-			valid = append(valid, k)
-		}
+// NewMiddleware returns a middleware that rejects requests without a
+// matching Bearer token, unless exempt(r) returns true. A empty key
+// disables auth entirely (Wrap returns the handler unchanged).
+func NewMiddleware(key string, exempt func(*http.Request) bool) *Middleware {
+	return &Middleware{key: key, exempt: exempt}
+}
+
+// Enabled reports whether the middleware actually enforces auth.
+func (m *Middleware) Enabled() bool { return m.key != "" }
+
+// Wrap returns an http.Handler that enforces the bearer-token gate.
+// When auth is disabled (empty key) the handler is returned as-is.
+func (m *Middleware) Wrap(next http.Handler) http.Handler {
+	if !m.Enabled() {
+		return next
 	}
-	if len(valid) == 0 {
-		// No key configured — authentication disabled. Return an
-		// identity middleware so the proxy behaves identically to
-		// today (zero breaking change for localhost dev).
-		return func(next http.Handler) http.Handler {
-			return next
-		}
-	}
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Distributed tracing (issue #71). When the operator
-			// has not configured a collector, Enabled() returns
-			// false and this block disappears entirely — zero
-			// overhead on the hot path.
-			//
-			// The span attaches to whichever parent the tracing
-			// middleware (or the chat handler) has already
-			// installed in r.Context(). When no parent exists
-			// the span becomes its own root with a fresh trace
-			// id, so an auth-rejected request that arrives before
-			// any upstream caller still produces a visible trace.
-			var span *tracing.Span
-			if tracing.Enabled() {
-				r2, s := tracing.StartSpanFromContext(r.Context(), "auth.check")
-				span = s
-				r = r.WithContext(r2)
-				defer span.End()
-				span.SetAttr("auth.method", authMethod(r))
-				span.SetAttr("auth.exempt", exempt != nil && exempt(r))
-			}
-			if exempt != nil && exempt(r) {
-				if span != nil {
-					span.SetAttr("auth.outcome", "exempt")
-				}
-				if observer != nil {
-					observer("exempt")
-				}
-				next.ServeHTTP(w, r)
-				return
-			}
-			presented := extractKey(r)
-			if !keyMatches(presented, valid) {
-				if span != nil {
-					span.SetAttr("auth.outcome", "rejected")
-					span.SetStatus(tracing.StatusError, "invalid_key")
-				}
-				if observer != nil {
-					if presented == "" {
-						observer("rejected_missing")
-					} else {
-						observer("rejected_invalid")
-					}
-				}
-				writeUnauthorized(w)
-				return
-			}
-			if span != nil {
-				span.SetAttr("auth.outcome", "accepted")
-			}
-			if observer != nil {
-				observer("accepted")
-			}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if m.exempt != nil && m.exempt(r) {
 			next.ServeHTTP(w, r)
-		})
-	}
-}
-
-// authMethod reports whether the request presented a bearer
-// credential, an X-API-Key header, or no credential at all. The
-// span attributes mirror that distinction so a trace view can
-// distinguish "presented the wrong key" from "presented no key".
-func authMethod(r *http.Request) string {
-	if h := r.Header.Get("Authorization"); h != "" {
-		return "bearer"
-	}
-	if k := r.Header.Get("X-API-Key"); k != "" {
-		return "x-api-key"
-	}
-	return "none"
-}
-
-// extractKey pulls the presented credential from the request. It checks
-// `Authorization: Bearer <key>` first (scheme matched
-// case-insensitively per RFC 7235) and falls back to the `X-API-Key`
-// header. Returns "" when neither header carries a usable value.
-func extractKey(r *http.Request) string {
-	if h := r.Header.Get("Authorization"); h != "" {
-		const prefix = "bearer "
-		// EqualFold handles "Bearer", "bearer", "BEARER", etc. The
-		// prefix check guards against an empty-scheme header
-		// ("Bearer") producing a negative slice below.
-		if len(h) >= len(prefix) && strings.EqualFold(h[:len(prefix)], prefix) {
-			if v := strings.TrimSpace(h[len(prefix):]); v != "" {
-				return v
-			}
+			return
 		}
-	}
-	if k := strings.TrimSpace(r.Header.Get("X-API-Key")); k != "" {
-		return k
-	}
-	return ""
-}
-
-// keyMatches reports whether presented matches any of the configured
-// keys using a constant-time comparison. A missing/empty presented value
-// never matches, even if a configured key happens to be empty (blanks
-// are already filtered by Middleware, but this guard keeps keyMatches
-// safe for direct callers).
-//
-// Every configured key is compared even after a match (the result is
-// folded via OR) so the function always runs for len(keys) iterations;
-// an early return would leak the index of the accepted key through the
-// request latency.
-func keyMatches(presented string, keys []string) bool {
-	if presented == "" {
-		return false
-	}
-	pb := []byte(presented)
-	var ok byte
-	for _, k := range keys {
-		if subtle.ConstantTimeCompare(pb, []byte(k)) == 1 {
-			ok = 1
-			// Deliberately do NOT return early; see comment above.
+		token := BearerToken(r)
+		if token == "" {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="nexus-proxy"`)
+			http.Error(w, `{"error":"missing or malformed Authorization header"}`, http.StatusUnauthorized)
+			return
 		}
-	}
-	return ok == 1
-}
-
-// writeUnauthorized emits the OpenAI-compatible error envelope for a
-// missing/invalid key. The shape mirrors handlers.writeJSONError:
-// `{"error":{"message":...,"type":...}}`. The type token is the
-// lowercase "unauthorized" value per the issue #37 spec, which matches
-// the snake_case convention OpenAI uses for its error `type` field.
-func writeUnauthorized(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusUnauthorized)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]string{
-			"message": "Missing or invalid API key",
-			"type":    "unauthorized",
-		},
+		if token != m.key {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="nexus-proxy", error="invalid_token"`)
+			http.Error(w, `{"error":"invalid API key"}`, http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
+}
+
+// BearerToken extracts the token from the Authorization header.
+// Returns "" if the header is absent, malformed, or not a Bearer
+// scheme. The comparison is case-insensitive on the scheme name.
+func BearerToken(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if h == "" {
+		return ""
+	}
+	parts := strings.SplitN(h, " ", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	if !strings.EqualFold(parts[0], "Bearer") {
+		return ""
+	}
+	return strings.TrimSpace(parts[1])
 }
