@@ -23,10 +23,10 @@ import (
 type CachedEmbedder struct {
 	inner Embedder
 
-	mu        sync.Mutex
+	mu         sync.Mutex
 	maxEntries int
-	cache     map[string]*list.Element
-	ll        *list.List
+	cache      map[string]*list.Element
+	ll         *list.List
 }
 
 type cacheEntry struct {

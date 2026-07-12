@@ -11,7 +11,7 @@ import (
 // so tests can assert that the cache skips the inner embedder on a
 // cache hit.
 type countingEmbedder struct {
-	mu   sync.Mutex
+	mu    sync.Mutex
 	calls map[string]int
 }
 
