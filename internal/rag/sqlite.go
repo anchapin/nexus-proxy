@@ -217,6 +217,9 @@ func (p *PersistentStore) LoadOrIndex(ctx context.Context, dir string) (int, err
 // file read/embed errors are logged and skipped — but every
 // successful embedding also lands in SQLite so the next boot can
 // skip Ollama entirely.
+//
+// Security: symlinks are skipped (issue #107) to prevent confidentiality
+// leaks via injected few-shot examples.
 func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
@@ -229,6 +232,11 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 		return nil
 	}
 
+	safeDir, err := resolveDir(dir)
+	if err != nil {
+		return err
+	}
+
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("rag: read examples dir %q: %w", dir, err)
@@ -238,7 +246,30 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 		if f.IsDir() {
 			continue
 		}
+		if isSymlink(f) {
+			slog.Warn("rag: skipping symlink in examples dir (issue #107)",
+				slog.String("filename", f.Name()),
+				slog.String("dir", dir),
+			)
+			continue
+		}
 		path := filepath.Join(dir, f.Name())
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			slog.Error("rag: cannot resolve path, skipping",
+				slog.String("filename", f.Name()),
+				slog.Any("err", err),
+			)
+			continue
+		}
+		if !verifyInsideDir(safeDir, resolved) {
+			slog.Warn("rag: skipping file that escapes examples dir (issue #107)",
+				slog.String("filename", f.Name()),
+				slog.String("resolved", resolved),
+				slog.String("base", safeDir),
+			)
+			continue
+		}
 		content, err := os.ReadFile(path)
 		if err != nil {
 			slog.Error("rag read file",

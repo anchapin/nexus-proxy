@@ -115,6 +115,9 @@ func (w *Watcher) run(parent context.Context) {
 
 // scanOnce reads the directory once, diffs against `known`, and
 // applies the delta. Safe to call directly from tests.
+//
+// Security: symlinks are skipped (issue #107) to prevent confidentiality
+// leaks via injected few-shot examples.
 func (w *Watcher) scanOnce(ctx context.Context) error {
 	files, err := os.ReadDir(w.dir)
 	if err != nil {
@@ -133,6 +136,13 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 	seen := make(map[string]struct{}, len(files))
 	for _, f := range files {
 		if f.IsDir() {
+			continue
+		}
+		if isSymlink(f) {
+			slog.Warn("[RAG INDEXER] skipping symlink in examples dir (issue #107)",
+				slog.String("filename", f.Name()),
+				slog.String("dir", w.dir),
+			)
 			continue
 		}
 		info, err := f.Info()
