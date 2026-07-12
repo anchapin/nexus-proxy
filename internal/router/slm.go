@@ -2,13 +2,17 @@ package router
 
 import (
 	"bytes"
+	"container/list"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -30,6 +34,25 @@ type SLMClient struct {
 	// back to DefaultConfidenceFloor / DefaultConfidenceCeiling.
 	ConfidenceFloor   float64
 	ConfidenceCeiling float64
+
+	// SLM decision cache (issue #116). Caches routing decisions keyed by
+	// SHA256(prompt) to avoid repeated Ollama round-trips for identical
+	// prompts. Size 0 disables the cache. TTL 0 means no expiry (pure
+	// LRU eviction). Transport errors (network, non-200, parse failure)
+	// are never cached so transient failures are retried.
+	cacheMu     sync.Mutex
+	cache       map[string]*list.Element
+	cacheList   *list.List
+	cacheSize   int
+	cacheTTL    time.Duration
+}
+
+type slmCacheEntry struct {
+	key        string
+	route      Route
+	confidence float64
+	taskType   string
+	timestamp  time.Time
 }
 
 // NewSLMClient constructs a client. Pass nil for Client to use
@@ -38,7 +61,117 @@ func NewSLMClient(baseURL, model string, timeout time.Duration, client *http.Cli
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &SLMClient{BaseURL: baseURL, Model: model, Timeout: timeout, Client: client}
+	return &SLMClient{
+		BaseURL: baseURL,
+		Model:   model,
+		Timeout: timeout,
+		Client:  client,
+		cache:   make(map[string]*list.Element),
+		cacheList: list.New(),
+	}
+}
+
+// NewSLMClientWithCache constructs a client with the given cache size and
+// TTL. Size 0 disables the cache. TTL 0 means no expiry (pure LRU
+// eviction). Pass nil for Client to use http.DefaultClient.
+func NewSLMClientWithCache(baseURL, model string, timeout time.Duration, client *http.Client, cacheSize int, cacheTTL time.Duration) *SLMClient {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	if cacheSize < 0 {
+		cacheSize = 0
+	}
+	if cacheTTL < 0 {
+		cacheTTL = 0
+	}
+	return &SLMClient{
+		BaseURL:    baseURL,
+		Model:      model,
+		Timeout:    timeout,
+		Client:     client,
+		cache:      make(map[string]*list.Element),
+		cacheList:  list.New(),
+		cacheSize:  cacheSize,
+		cacheTTL:   cacheTTL,
+	}
+}
+
+// WithCache configures the SLM decision cache. size <= 0 disables the
+// cache. ttl <= 0 means no expiry (pure LRU eviction). This is a
+// fluent setter so it can be chained: NewSLMClient(...).WithCache(1024, 5*time.Minute).
+func (c *SLMClient) WithCache(size int, ttl time.Duration) *SLMClient {
+	if size <= 0 {
+		c.cacheSize = 0
+		c.cache = nil
+		c.cacheList = nil
+		return c
+	}
+	c.cacheSize = size
+	c.cacheTTL = ttl
+	c.cache = make(map[string]*list.Element)
+	c.cacheList = list.New()
+	return c
+}
+
+func (c *SLMClient) cacheKey(prompt string) string {
+	h := sha256.Sum256([]byte(prompt))
+	return hex.EncodeToString(h[:])
+}
+
+// cacheGet returns (route, confidence, taskType, ok). ok=false on miss
+// or TTL expiry. On TTL expiry the stale entry is evicted.
+func (c *SLMClient) cacheGet(key string) (Route, float64, string, bool) {
+	if c.cacheSize <= 0 || c.cache == nil {
+		return "", 0, "", false
+	}
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+	el, ok := c.cache[key]
+	if !ok {
+		return "", 0, "", false
+	}
+	entry := el.Value.(*slmCacheEntry)
+	if c.cacheTTL > 0 && time.Since(entry.timestamp) > c.cacheTTL {
+		c.cacheList.Remove(el)
+		delete(c.cache, key)
+		return "", 0, "", false
+	}
+	c.cacheList.MoveToFront(el)
+	return entry.route, entry.confidence, entry.taskType, true
+}
+
+// cachePut stores a decision in the LRU cache.
+func (c *SLMClient) cachePut(key string, route Route, confidence float64, taskType string) {
+	if c.cacheSize <= 0 || c.cache == nil {
+		return
+	}
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+	// Double-check in case another goroutine already inserted
+	if el, ok := c.cache[key]; ok {
+		c.cacheList.MoveToFront(el)
+		entry := el.Value.(*slmCacheEntry)
+		entry.route = route
+		entry.confidence = confidence
+		entry.taskType = taskType
+		entry.timestamp = time.Now()
+		return
+	}
+	entry := &slmCacheEntry{
+		key:        key,
+		route:      route,
+		confidence: confidence,
+		taskType:   taskType,
+		timestamp:  time.Now(),
+	}
+	el := c.cacheList.PushFront(entry)
+	c.cache[key] = el
+	if c.cacheList.Len() > c.cacheSize {
+		if oldest := c.cacheList.Back(); oldest != nil {
+			c.cacheList.Remove(oldest)
+			delete(c.cache, oldest.Value.(*slmCacheEntry).key)
+		}
+	}
 }
 
 // slmSystemPrompt is the static instruction we send to the routing SLM.
@@ -82,8 +215,35 @@ func (c *SLMClient) Decide(ctx context.Context, prompt string) (Route, error) {
 // historical judge scores (see ConfidenceStore). Below the floor the
 // system prompt gains a frontier bias; above the ceiling a local bias;
 // inside the neutral band the request is unchanged from Decide.
+//
+// Caching (issue #116): decisions are cached keyed on SHA256(prompt|confidence)
+// so that different bias notes do not collide. Transport errors (network,
+// non-200, parse failure) are never cached so transient failures are retried.
 func (c *SLMClient) DecideWithConfidence(ctx context.Context, prompt string, confidence float64) (Route, error) {
-	return c.decide(ctx, prompt, c.systemPromptFor(confidence))
+	systemPrompt := c.systemPromptFor(confidence)
+	
+	// Check cache first (issue #116). Key includes confidence since
+	// different confidence values produce different system prompts.
+	if c.cacheSize > 0 {
+		key := c.cacheKey(prompt + "|" + fmt.Sprintf("%.6f", confidence))
+		if route, _, _, ok := c.cacheGet(key); ok {
+			return route, nil
+		}
+	}
+	
+	route, err := c.decide(ctx, prompt, systemPrompt)
+	if err != nil {
+		return RouteFrontier, err
+	}
+	
+	// Cache successful decisions only (issue #116). Errors fall through
+	// to frontier without polluting the cache.
+	if c.cacheSize > 0 {
+		key := c.cacheKey(prompt + "|" + fmt.Sprintf("%.6f", confidence))
+		c.cachePut(key, route, confidence, "")
+	}
+	
+	return route, nil
 }
 
 // systemPromptFor returns the SLM system prompt for the given confidence,
