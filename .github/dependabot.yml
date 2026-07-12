@@ -1,0 +1,47 @@
+# Dependabot configuration (issue #124).
+#
+# Keeps the two dependency surfaces current:
+#   - `gomod`         — Go modules (modernc.org/sqlite + indirects)
+#   - `github-actions`— pinned actions in .github/workflows/*.yml
+#
+# Both ecosystems check weekly (Monday). Updates are grouped so a
+# security patch lands as a single reviewable PR rather than a flood of
+# single-bump PRs. Minor/patch updates share a group; major updates are
+# left as individual PRs (the default) because they need manual review.
+
+version: 2
+
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      go-dependencies:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: deps
+      include: scope
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: ci
+      include: scope

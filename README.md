@@ -326,6 +326,24 @@ make ci         # vet + build + test + lint (what CI runs)
 The race detector and a healthy test suite are required to merge — see
 `.github/workflows/ci.yml`.
 
+## Security & CI
+
+The following automated checks run on every pull request and push to
+`main`:
+
+| Check | Workflow | What it catches |
+| ----- | -------- | --------------- |
+| **CI** (vet, build, test, lint, bench) | [`ci.yml`](.github/workflows/ci.yml) | Build breakage, race conditions, lint regressions |
+| **Coverage gate** | [`ci.yml`](.github/workflows/ci.yml) | Fails if total coverage drops below `70%` |
+| **CodeQL** | [`codeql.yml`](.github/workflows/codeql.yml) | SAST for Go — taint flow, hard-coded creds, SQL injection (`security-and-quality` pack) |
+| **Secret scan** | [`secret-scan.yml`](.github/workflows/secret-scan.yml) | `gitleaks` scan for accidentally committed API keys / tokens |
+| **Dependabot** | [`dependabot.yml`](.github/dependabot.yml) | Weekly update PRs for Go modules + GitHub Actions |
+
+The coverage threshold is deliberately conservative so the gate
+activates without churning existing PRs; raise `COVERAGE_THRESHOLD` in
+`ci.yml` as coverage improves. `make ci` (local) stays green — the new
+jobs are workflow-only.
+
 ## Configuration
 
 All knobs are env vars; see `.env.example` for the full list with

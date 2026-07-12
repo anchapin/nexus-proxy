@@ -1,0 +1,15 @@
+# Gitleaks configuration for nexus-proxy (issue #124).
+#
+# Extends the built-in default rule set, then allowlists files that
+# contain only placeholder/example values. The real `.env` is gitignored
+# (line 21 of .gitignore); `.env.example` holds empty or dummy values
+# only and is allowlisted here so it never produces a false positive.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Example env file — placeholders only, no real secrets"
+paths = [
+  '''^\.env\.example$''',
+]
