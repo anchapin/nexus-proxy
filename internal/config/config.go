@@ -79,6 +79,13 @@ type Config struct {
 	RAGDBPath       string        // on-disk SQLite database for the RAG store
 	RAGPollInterval time.Duration // watcher cadence; 0 disables the watcher
 
+	// RAG embedding cache (issue #115). Prompt embeddings are
+	// deterministic for a given model+text pair, so they are memoized
+	// in a bounded LRU. A value of 0 disables the cache (every
+	// Retrieve re-embeds); the default keeps memory flat while
+	// skipping the Ollama round-trip for repeat prompts.
+	RAGEmbedCacheSize int // max LRU entries (256)
+
 	// Routing
 	TokenGuardrail int           // estimated tokens above this force frontier (6000)
 	SLMTimeout     time.Duration // Qwen3-Coder routing timeout (8s)
@@ -389,6 +396,15 @@ func Load() (Config, error) {
 		pollInterval = 0
 	}
 	cfg.RAGPollInterval = pollInterval
+
+	// RAG embedding cache size (issue #115). Default 256 keeps the
+	// cache useful for repetitive coding prompts while bounding
+	// memory. Set to 0 to disable.
+	embedCacheSize, err := getEnvInt("NEXUS_RAG_EMBED_CACHE_SIZE", 256)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RAGEmbedCacheSize = embedCacheSize
 
 	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
 	if err != nil {
