@@ -542,9 +542,16 @@ func main() {
 		slog.String("local_model", cfg.LocalModel),
 		slog.String("frontier_model", cfg.FrontierModel),
 	)
+	// Panic recovery (issue #110) is the OUTERMOST middleware, wrapping
+	// the entire mux so a panic anywhere downstream — a nil dereference
+	// in a handler, a regex surprise in the prompt pipeline, a JSON
+	// parse after MaxBytesReader — is converted into a structured
+	// slog.Error plus a 500 JSON envelope (or a trailing SSE error
+	// frame when the response already started streaming) instead of a
+	// TCP reset with no body. Zero overhead on the happy path.
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           mux,
+		Handler:           handlers.Recover()(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
