@@ -448,3 +448,64 @@ func TestExporterPerCallTimeout(t *testing.T) {
 		t.Fatal("Close blocked longer than 2s")
 	}
 }
+
+func TestExporterQueueDepth(t *testing.T) {
+	// Build a server that hangs forever so the export loop never
+	// drains the buffer. Submit must drop, not block.
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	e := NewExporter(ExporterConfig{
+		Endpoint:  srv.URL,
+		QueueSize: 4,
+	})
+	defer e.Close()
+
+	// QueueDepth should be 0 initially.
+	if e.QueueDepth() != 0 {
+		t.Errorf("initial QueueDepth() = %d, want 0", e.QueueDepth())
+	}
+
+	// Saturate the queue: the export goroutine reads items faster
+	// than a tight submit loop can fill it, so we issue many spans
+	// in parallel to force overflow on the contended buffer slot.
+	// Use more submits than the original test to ensure contention
+	// on the larger (4) queue.
+	const total = 200
+	var wg sync.WaitGroup
+	wg.Add(total)
+	for i := 0; i < total; i++ {
+		go func() {
+			defer wg.Done()
+			_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "overflow")
+			s.End()
+		}()
+	}
+	wg.Wait()
+
+	// QueueDepth should be at most the queue size (4) since the
+	// export goroutine may have drained some.
+	if e.QueueDepth() > 4 {
+		t.Errorf("QueueDepth() = %d, want <= 4", e.QueueDepth())
+	}
+
+	// Dropped count should be > 0 under contention.
+	if e.Dropped() == 0 {
+		t.Errorf("Dropped() = 0, want > 0 under contention (queue=4, %d submits)", total)
+	}
+}
+
+func TestExporterNilQueueDepthAndDropped(t *testing.T) {
+	var e *Exporter
+	if e.QueueDepth() != 0 {
+		t.Errorf("nil exporter QueueDepth() = %d, want 0", e.QueueDepth())
+	}
+	if e.Dropped() != 0 {
+		t.Errorf("nil exporter Dropped() = %d, want 0", e.Dropped())
+	}
+}

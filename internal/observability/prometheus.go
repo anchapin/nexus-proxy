@@ -102,6 +102,10 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total telemetry records dropped because the JSONL write buffer was full.",
 		typ:  "counter",
 	},
+	"nexus_tracing_dropped_total": {
+		help: "Total trace spans dropped because the exporter buffer was full.",
+		typ:  "counter",
+	},
 	// Issue #70: live middleware gauges. These come from backing
 	// sources (rate-limit bucket count, budget running total) at
 	// scrape time rather than from per-request events, so they are

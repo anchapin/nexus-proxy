@@ -149,6 +149,15 @@ func (e *Exporter) Dropped() uint64 {
 	return e.dropped.Load()
 }
 
+// QueueDepth returns the current number of spans waiting in the export
+// queue. Useful for /metrics gauges to observe back-pressure.
+func (e *Exporter) QueueDepth() int {
+	if e == nil {
+		return 0
+	}
+	return len(e.queue)
+}
+
 // Submit enqueues s for asynchronous POST. The call never blocks:
 // when the buffer is full s is dropped, the dropped counter is
 // incremented, and a warning is logged. A nil receiver or nil span

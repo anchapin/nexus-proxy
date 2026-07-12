@@ -107,8 +107,8 @@ type Config struct {
 	// TTL of 0 means no expiry (entries evicted only by LRU). SLM
 	// transport errors (network, non-200, parse failure) are NOT cached
 	// so a transient Ollama failure is retried on the next request.
-	SLMCacheSize int           // max LRU entries (default 1024)
-	SLMCacheTTL  time.Duration // entry TTL (default 5m; 0 = no expiry)
+	SLMCacheSize   int           // max LRU entries (default 1024)
+	SLMCacheTTL    time.Duration // entry TTL (default 5m; 0 = no expiry)
 	FusionTimeout  time.Duration // per-panel-member fetch timeout (120s)
 	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
 	ArbiterTimeout time.Duration // per-call timeout for the fusion arbiter stream (60s)
@@ -312,6 +312,15 @@ type Config struct {
 	// debug-level chatter from every other package.
 	Debug          bool
 	DebugBodyBytes int
+
+	// Distributed tracing (issue #41, #122). When TracingEndpoint is
+	// non-empty, an OTLP/JSON exporter is started and registered as the
+	// process-wide tracer. The exporter buffers spans in a bounded
+	// channel and POSTs them asynchronously; dropped spans are counted
+	// and surfaced on /metrics as nexus_tracing_dropped_total.
+	TracingEndpoint  string        // OTLP/JSON endpoint including /v1/traces
+	TracingTimeout   time.Duration // per-batch POST timeout
+	TracingQueueSize int           // buffer capacity; 0 uses default (256)
 
 	// OpenAI-compatible model discovery (issue #78). When enabled the
 	// proxy serves GET /v1/models and GET /v1/models/{id} listing the
@@ -866,6 +875,26 @@ func Load() (Config, error) {
 	}
 	cfg.DebugBodyBytes = debugBodyBytes
 
+	// Distributed tracing (issue #41, #122). Empty endpoint disables
+	// tracing entirely; the exporter's zero-value methods are no-ops.
+	cfg.TracingEndpoint = getEnvAllowEmpty("NEXUS_TRACING_ENDPOINT", "")
+	if cfg.TracingEndpoint != "" {
+		tracingTimeout, err := getEnvDuration("NEXUS_TRACING_TIMEOUT", 10*time.Second)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.TracingTimeout = tracingTimeout
+
+		tracingQueueSize, err := getEnvInt("NEXUS_TRACING_QUEUE_SIZE", 256)
+		if err != nil {
+			return cfg, err
+		}
+		if tracingQueueSize < 0 {
+			tracingQueueSize = 0
+		}
+		cfg.TracingQueueSize = tracingQueueSize
+	}
+
 	// OpenAI-compatible model discovery (issue #78). Enabled by
 	// default so a stock deployment is discoverable by OpenAI-
 	// compatible clients; operators who do not want the proxy to
@@ -1048,6 +1077,10 @@ func (c Config) EffectiveDebugBodyBytes() int {
 // TelemetryEnabled reports whether the on-disk recorder should be started.
 // Disabled when TelemetryPath is empty.
 func (c Config) TelemetryEnabled() bool { return c.TelemetryPath != "" }
+
+// TracingEnabled reports whether the OTLP/JSON trace exporter should
+// be started. Disabled when TracingEndpoint is empty.
+func (c Config) TracingEnabled() bool { return c.TracingEndpoint != "" }
 
 // ModelsCacheEnabled reports whether the Ollama /api/tags poll should
 // supplement the configured models list (issue #78). Disabled when

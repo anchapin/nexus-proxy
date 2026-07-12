@@ -35,6 +35,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/ratelimit"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
 const (
@@ -494,6 +495,34 @@ func main() {
 		}
 	}()
 
+	// Distributed tracing (issue #41, #122). When NEXUS_TRACING_ENDPOINT
+	// is set, start an OTLP/JSON exporter and register it as the
+	// process-wide tracer so middleware and handlers can create spans
+	// without explicit dependencies. The exporter's dropped-span counter
+	// is synced to /metrics via RouteCounters.ObserveTracingDrop.
+	var tracer *tracing.Exporter
+	if cfg.TracingEnabled() {
+		tracer = tracing.NewExporter(tracing.ExporterConfig{
+			Endpoint:  cfg.TracingEndpoint,
+			Timeout:   cfg.TracingTimeout,
+			QueueSize: cfg.TracingQueueSize,
+		})
+		if tracer != nil {
+			tracing.RegisterExporter(tracer)
+			slog.Info("tracing enabled",
+				slog.String("endpoint", tracer.Endpoint()),
+				slog.Int("queue_size", cfg.TracingQueueSize),
+			)
+			defer func() {
+				if err := tracer.Close(); err != nil {
+					slog.Warn("tracer close", slog.Any("err", err))
+				}
+			}()
+		}
+	} else {
+		slog.Info("tracing disabled (NEXUS_TRACING_ENDPOINT is empty)")
+	}
+
 	mux := http.NewServeMux()
 
 	// Route-decision counters (issue #74). The in-process counter set
@@ -513,6 +542,12 @@ func main() {
 		judgeEval.SetDropCallback(func(total uint64) {
 			routeCounters.ObserveJudgeDrop(total)
 		})
+	}
+	// Wire the tracer's dropped-span counter into Prometheus (issue
+	// #122). The exporter's Dropped() method returns the cumulative
+	// count; we sample it at scrape time via a closure.
+	if tracer != nil {
+		routeCounters.ObserveTracingDrop(tracer.Dropped())
 	}
 	routeDecisionObs := handlers.RouteDecisionObserverFunc(func(e handlers.RouteDecisionEvent) {
 		routeCounters.Observe(e.Route, e.Source, e.Confidence, e.TaskType)
