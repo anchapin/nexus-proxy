@@ -30,12 +30,12 @@ func TestBucketConfidence(t *testing.T) {
 
 func TestRouteCountersObserveRouteDecisions(t *testing.T) {
 	rc := NewRouteCounters()
-	rc.Observe("frontier", "guardrail", 0, "", "")
-	rc.Observe("frontier", "guardrail", 0, "", "")
-	rc.Observe("local", "dsl", 0, "", "")
-	rc.Observe("frontier", "slm", 0.6, "coding", "")
-	rc.Observe("frontier", "slm", 0.2, "coding", "") // low-confidence escalation
-	rc.Observe("local", "slm", 0.9, "format", "")
+	rc.Observe("frontier", "guardrail", 0, "")
+	rc.Observe("frontier", "guardrail", 0, "")
+	rc.Observe("local", "dsl", 0, "")
+	rc.Observe("frontier", "slm", 0.6, "coding")
+	rc.Observe("frontier", "slm", 0.2, "coding") // low-confidence escalation
+	rc.Observe("local", "slm", 0.9, "format")
 
 	var sb strings.Builder
 	if _, err := rc.WriteTo(&sb); err != nil {
@@ -64,10 +64,10 @@ func TestRouteCountersObserveRouteDecisions(t *testing.T) {
 
 func TestRouteCountersSLMDecisionsByConfidence(t *testing.T) {
 	rc := NewRouteCounters()
-	rc.Observe("local", "slm", 0.9, "coding", "")    // high
-	rc.Observe("frontier", "slm", 0.5, "coding", "") // medium
-	rc.Observe("frontier", "slm", 0.1, "coding", "") // low
-	rc.Observe("frontier", "slm-error", 0, "", "")   // none bucket
+	rc.Observe("local", "slm", 0.9, "coding")    // high
+	rc.Observe("frontier", "slm", 0.5, "coding") // medium
+	rc.Observe("frontier", "slm", 0.1, "coding") // low
+	rc.Observe("frontier", "slm-error", 0, "")   // none bucket
 
 	var sb strings.Builder
 	if _, err := rc.WriteTo(&sb); err != nil {
@@ -90,10 +90,10 @@ func TestRouteCountersSLMDecisionsByConfidence(t *testing.T) {
 
 func TestRouteCountersDeterministicOutput(t *testing.T) {
 	rc := NewRouteCounters()
-	rc.Observe("frontier", "slm", 0.6, "b", "")
-	rc.Observe("local", "dsl", 0, "", "")
-	rc.Observe("frontier", "guardrail", 0, "", "")
-	rc.Observe("local", "slm", 0.9, "a", "")
+	rc.Observe("frontier", "slm", 0.6, "b")
+	rc.Observe("local", "dsl", 0, "")
+	rc.Observe("frontier", "guardrail", 0, "")
+	rc.Observe("local", "slm", 0.9, "a")
 
 	var first, second strings.Builder
 	_, _ = rc.WriteTo(&first)
@@ -114,7 +114,7 @@ func TestRouteCountersConcurrentSafe(t *testing.T) {
 			if n%2 == 0 {
 				route = "local"
 			}
-			rc.Observe(route, "slm", 0.5, "coding", "")
+			rc.Observe(route, "slm", 0.5, "coding")
 		}(i)
 	}
 	wg.Wait()
@@ -134,7 +134,7 @@ func TestRouteCountersConcurrentSafe(t *testing.T) {
 func TestRouteCountersNilSafe(t *testing.T) {
 	var rc *RouteCounters
 	// Must not panic.
-	rc.Observe("frontier", "guardrail", 0, "", "")
+	rc.Observe("frontier", "guardrail", 0, "")
 	rc.ObserveRejection("bad_request")
 	n, err := rc.WriteTo(&strings.Builder{})
 	if err != nil || n != 0 {
@@ -144,7 +144,7 @@ func TestRouteCountersNilSafe(t *testing.T) {
 
 func TestRouteCountersHandlerContentType(t *testing.T) {
 	rc := NewRouteCounters()
-	rc.Observe("frontier", "guardrail", 0, "", "")
+	rc.Observe("frontier", "guardrail", 0, "")
 	h := rc.Handler()
 	if h == nil {
 		t.Fatal("Handler() returned nil")

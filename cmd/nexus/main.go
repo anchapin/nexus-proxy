@@ -490,7 +490,7 @@ func main() {
 	// snapshot.
 	routeCounters := observability.NewRouteCounters()
 	routeDecisionObs := handlers.RouteDecisionObserverFunc(func(e handlers.RouteDecisionEvent) {
-		routeCounters.Observe(e.Route, e.Source, e.Confidence, e.TaskType, "")
+		routeCounters.Observe(e.Route, e.Source, e.Confidence, e.TaskType)
 	})
 	// Rejection observer (issue #119). The chat handler dispatches
 	// one RejectionEvent per early-return path; the closure forwards

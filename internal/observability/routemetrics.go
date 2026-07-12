@@ -61,11 +61,10 @@ func BucketConfidence(c float64) string {
 // allocation on the hot path — the caller passes already-owned
 // strings from the Decision.
 type counterKey struct {
-	route         string
-	source        string
-	confBucket    string
-	taskType      string
-	escalatedFrom string
+	route      string
+	source     string
+	confBucket string
+	taskType   string
 }
 
 // RouteCounters is a concurrency-safe collection of route-decision
@@ -116,10 +115,7 @@ func NewRouteCounters() *RouteCounters {
 //   - source: the decision source ("guardrail", "dsl", "slm", "slm-error", "escalation")
 //   - confidence: the SLM confidence in [0,1] (0.5 neutral; pass 0 for non-SLM)
 //   - taskType: the SLM category bucket (empty for non-SLM sources)
-//   - escalatedFrom: when source=="escalation", the prior route that
-//     was overridden (e.g. "local" when a low-confidence local decision
-//     was bumped to frontier); empty otherwise.
-func (rc *RouteCounters) Observe(route, source string, confidence float64, taskType, escalatedFrom string) {
+func (rc *RouteCounters) Observe(route, source string, confidence float64, taskType string) {
 	if rc == nil {
 		return
 	}
@@ -155,11 +151,13 @@ func (rc *RouteCounters) Observe(route, source string, confidence float64, taskT
 		}
 	}
 
-	// Source==escalation is the planner's defensive nil-SLM path.
-	// Record it under low-confidence escalations too so the counter
-	// captures every frontier-bound override.
-	if source == "escalation" && escalatedFrom != "" {
-		ek := counterKey{taskType: taskType, escalatedFrom: escalatedFrom}
+	// Source==escalation is the planner's defensive nil-SLM path
+	// (the SLM timed out or was nil, so the planner fell back to
+	// frontier). Record it under low-confidence escalations so the
+	// counter captures every frontier-bound override, not just the
+	// SLM-confidence ones above.
+	if source == "escalation" {
+		ek := counterKey{taskType: taskType}
 		atomic.AddUint64(rc.slot(rc.lowConfidenceEscalations, ek), 1)
 	}
 }
@@ -316,7 +314,7 @@ func writeRejectionSeries(w io.Writer, name, help string, m map[string]*uint64) 
 	sort.Strings(keys)
 	for _, k := range keys {
 		v := atomic.LoadUint64(m[k])
-		n, err := fmt.Fprintf(w, "%s{reason=%q} %d\n", name, sanitizeLabel(k), v)
+		n, err := fmt.Fprintf(w, "%s{reason=\"%s\"} %d\n", name, sanitizeLabel(k), v)
 		if err != nil {
 			return total + int64(n), err
 		}
@@ -369,8 +367,6 @@ func labelValue(k counterKey, label string) string {
 		return k.confBucket
 	case "task_type":
 		return k.taskType
-	case "escalated_from":
-		return k.escalatedFrom
 	default:
 		return ""
 	}
