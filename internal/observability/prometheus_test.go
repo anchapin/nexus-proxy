@@ -21,13 +21,14 @@ func TestRenderPrometheusHasRequiredMetrics(t *testing.T) {
 		"# TYPE nexus_requests_total counter",
 		`nexus_requests_total{route="local"}`,
 		"# TYPE nexus_errors_total counter",
+		`nexus_errors_total{route="local"}`,
 		"# TYPE nexus_rag_hits_total counter",
 		"# TYPE nexus_toon_savings_tokens_total counter",
 		"# TYPE nexus_estimated_cost_usd_total counter",
 		"# TYPE nexus_request_duration_ms histogram",
-		"nexus_request_duration_ms_bucket{le=",
+		`nexus_request_duration_ms_bucket{route="local",le=`,
 		"# TYPE nexus_ttft_ms histogram",
-		"nexus_ttft_ms_bucket{le=",
+		`nexus_ttft_ms_bucket{route="local",le=`,
 	}
 	for _, want := range required {
 		if !strings.Contains(out, want) {
@@ -73,16 +74,16 @@ func TestRenderPrometheusHistogramFormat(t *testing.T) {
 	// The family must contain at least one finite-bucket line and
 	// the +Inf tail. Exact le label values are asserted in
 	// TestRenderHistogramLeLabels below.
-	if !strings.Contains(out, "nexus_request_duration_ms_bucket{le=") {
+	if !strings.Contains(out, `nexus_request_duration_ms_bucket{route="local",le=`) {
 		t.Errorf("no finite bucket lines rendered\n%s", out)
 	}
-	if !strings.Contains(out, `nexus_request_duration_ms_bucket{le="+Inf"} 2`) {
+	if !strings.Contains(out, `nexus_request_duration_ms_bucket{route="local",le="+Inf"} 2`) {
 		t.Errorf("+Inf bucket not rendered with cumulative count 2\n%s", out)
 	}
-	if !strings.Contains(out, "nexus_request_duration_ms_sum 37") {
+	if !strings.Contains(out, `nexus_request_duration_ms_sum{route="local"} 37`) {
 		t.Errorf("histogram sum not rendered as 37\n%s", out)
 	}
-	if !strings.Contains(out, "nexus_request_duration_ms_count 2") {
+	if !strings.Contains(out, `nexus_request_duration_ms_count{route="local"} 2`) {
 		t.Errorf("histogram count not rendered as 2\n%s", out)
 	}
 }
@@ -96,15 +97,17 @@ func TestRenderHistogramLeLabels(t *testing.T) {
 	h.Observe(999)
 
 	var sb strings.Builder
-	writeHistogram(&sb, "nexus_test_ms", "test histogram", h)
+	writeHistogramLabeled(&sb, "nexus_test_ms", "test histogram", "route", map[string]*Histogram{
+		"local": h,
+	})
 	out := sb.String()
 
 	wantLines := []string{
-		`nexus_test_ms_bucket{le="10"} 1`,
-		`nexus_test_ms_bucket{le="100"} 2`,
-		`nexus_test_ms_bucket{le="+Inf"} 3`,
-		`nexus_test_ms_sum 1054`,
-		`nexus_test_ms_count 3`,
+		`nexus_test_ms_bucket{route="local",le="10"} 1`,
+		`nexus_test_ms_bucket{route="local",le="100"} 2`,
+		`nexus_test_ms_bucket{route="local",le="+Inf"} 3`,
+		`nexus_test_ms_sum{route="local"} 1054`,
+		`nexus_test_ms_count{route="local"} 3`,
 	}
 	for _, want := range wantLines {
 		if !strings.Contains(out, want) {

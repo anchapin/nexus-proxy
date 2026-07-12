@@ -69,7 +69,11 @@ type Collector struct {
 	requestsFrontier atomic.Uint64
 	requestsFusion   atomic.Uint64
 
-	errorsTotal            atomic.Uint64
+	// Per-route error counters (issue #120).
+	errorsLocal    atomic.Uint64
+	errorsFrontier atomic.Uint64
+	errorsFusion   atomic.Uint64
+
 	ragHitsTotal           atomic.Uint64
 	ragMissesTotal         atomic.Uint64
 	toonCompressedTotal    atomic.Uint64
@@ -84,8 +88,13 @@ type Collector struct {
 	// accumulate a float without a mutex.
 	estimatedCostUSDBits atomic.Uint64
 
-	latency *Histogram
-	ttft    *Histogram
+	// Per-route latency and TTFT histograms (issue #120).
+	latencyLocal    *Histogram
+	latencyFrontier *Histogram
+	latencyFusion   *Histogram
+	ttftLocal       *Histogram
+	ttftFrontier    *Histogram
+	ttftFusion      *Histogram
 
 	// --- Middleware instrumentation (issue #70) ---------------------------
 	//
@@ -122,12 +131,16 @@ type Collector struct {
 }
 
 // NewCollector constructs a Collector with the default latency and TTFT
-// histograms. The returned collector is ready to receive Submit calls
-// and RenderPrometheus scrapes from any goroutine.
+// histograms for each route. The returned collector is ready to receive
+// Submit calls and RenderPrometheus scrapes from any goroutine.
 func NewCollector() *Collector {
 	return &Collector{
-		latency: NewHistogram(DefaultBuckets),
-		ttft:    NewHistogram(DefaultBuckets),
+		latencyLocal:    NewHistogram(DefaultBuckets),
+		latencyFrontier: NewHistogram(DefaultBuckets),
+		latencyFusion:   NewHistogram(DefaultBuckets),
+		ttftLocal:       NewHistogram(DefaultBuckets),
+		ttftFrontier:    NewHistogram(DefaultBuckets),
+		ttftFusion:      NewHistogram(DefaultBuckets),
 	}
 }
 
@@ -136,16 +149,30 @@ func NewCollector() *Collector {
 // a sequence of atomic increments — it never blocks, never allocates,
 // and is safe to call from many goroutines concurrently.
 func (c *Collector) Submit(e ObservabilityEvent) {
+	var latencyHist *Histogram
+	var ttftHist *Histogram
 	switch e.Route {
 	case "local":
 		c.requestsLocal.Add(1)
+		if e.Error != "" {
+			c.errorsLocal.Add(1)
+		}
+		latencyHist = c.latencyLocal
+		ttftHist = c.ttftLocal
 	case "fusion":
 		c.requestsFusion.Add(1)
+		if e.Error != "" {
+			c.errorsFusion.Add(1)
+		}
+		latencyHist = c.latencyFusion
+		ttftHist = c.ttftFusion
 	default: // "frontier" and any unrecognised route count as frontier
 		c.requestsFrontier.Add(1)
-	}
-	if e.Error != "" {
-		c.errorsTotal.Add(1)
+		if e.Error != "" {
+			c.errorsFrontier.Add(1)
+		}
+		latencyHist = c.latencyFrontier
+		ttftHist = c.ttftFrontier
 	}
 	if e.RAGInjected {
 		c.ragHitsTotal.Add(1)
@@ -170,11 +197,11 @@ func (c *Collector) Submit(e ObservabilityEvent) {
 	if e.EstimatedCostUSD > 0 {
 		atomicAddFloat(&c.estimatedCostUSDBits, e.EstimatedCostUSD)
 	}
-	if e.TotalLatencyMs > 0 {
-		c.latency.Observe(float64(e.TotalLatencyMs))
+	if e.TotalLatencyMs > 0 && latencyHist != nil {
+		latencyHist.Observe(float64(e.TotalLatencyMs))
 	}
-	if e.TTFTMs > 0 {
-		c.ttft.Observe(float64(e.TTFTMs))
+	if e.TTFTMs > 0 && ttftHist != nil {
+		ttftHist.Observe(float64(e.TTFTMs))
 	}
 }
 
@@ -193,11 +220,31 @@ func (c *Collector) EstimatedCostUSD() float64 {
 	return math.Float64frombits(c.estimatedCostUSDBits.Load())
 }
 
-// Latency returns the request-latency histogram.
-func (c *Collector) Latency() *Histogram { return c.latency }
+// Latency returns the request-latency histogram (legacy, returns local for backward compatibility).
+// Deprecated: use LatencyLocal, LatencyFrontier, or LatencyFusion.
+func (c *Collector) Latency() *Histogram { return c.latencyLocal }
 
-// TTFT returns the time-to-first-token histogram.
-func (c *Collector) TTFT() *Histogram { return c.ttft }
+// TTFT returns the time-to-first-token histogram (legacy, returns local for backward compatibility).
+// Deprecated: use TTFTLocal, TTFTFrontier, or TTFTFusion.
+func (c *Collector) TTFT() *Histogram { return c.ttftLocal }
+
+// LatencyLocal returns the local-route request-latency histogram.
+func (c *Collector) LatencyLocal() *Histogram { return c.latencyLocal }
+
+// LatencyFrontier returns the frontier-route request-latency histogram.
+func (c *Collector) LatencyFrontier() *Histogram { return c.latencyFrontier }
+
+// LatencyFusion returns the fusion-route request-latency histogram.
+func (c *Collector) LatencyFusion() *Histogram { return c.latencyFusion }
+
+// TTFTLocal returns the local-route time-to-first-token histogram.
+func (c *Collector) TTFTLocal() *Histogram { return c.ttftLocal }
+
+// TTFTFrontier returns the frontier-route time-to-first-token histogram.
+func (c *Collector) TTFTFrontier() *Histogram { return c.ttftFrontier }
+
+// TTFTFusion returns the fusion-route time-to-first-token histogram.
+func (c *Collector) TTFTFusion() *Histogram { return c.ttftFusion }
 
 // --- Middleware instrumentation helpers (issue #70) ----------------------
 //
