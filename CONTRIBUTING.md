@@ -1,0 +1,35 @@
+# Contributing to Nexus Proxy
+
+Thank you for your interest in contributing to Nexus Proxy! We welcome contributions that improve the routing efficiency, reliability, and developer experience of the gateway.
+
+## How to Contribute
+
+### Filing Issues and Feature Requests
+We use GitHub Issues to track bugs and requested features. Please use the provided issue templates in `.github/ISSUE_TEMPLATE/` to ensure we have all the necessary information to diagnose and implement the change.
+
+- **Bug Reports**: Include a minimal reproduction, your environment details, and the expected vs. actual behavior.
+- **Feature Requests**: Describe the problem you're solving, what success looks like, and any alternatives you've considered.
+
+### Development Workflow
+1. **Branching**: Create a feature or fix branch from `main` (e.g., `fix/issue-123` or `feat/new-router-rule`).
+2. **Commits**: Use [Conventional Commits](https://www.conventionalcommits.org/) (e.g., `feat: ...`, `fix: ...`, `docs: ...`).
+3. **Testing**: Every change must be accompanied by tests. Use `make test` to run the suite.
+4. **CI**: Ensure `make ci` passes locally before submitting a Pull Request.
+
+### Project Conventions
+- **Middleware Order**: Do not reorder middleware in `cmd/nexus/main.go` casually. The order of security headers, rate limiting, and authentication is critical for security.
+- **Environment Variables**: When adding a new configuration option, update the `configKeys` map in `internal/config/config.go` and add the variable to `.env.example`.
+- **Logging**: Use `log/slog` for structured logging. Avoid `fmt.Println` in production paths.
+- **Dependency Rule**: Follow the architecture outlined in `Nexus Proxy PRD and Architecture.md`. Avoid circular dependencies between `internal/` packages.
+
+### Local Setup
+- **Prerequisites**: Install Go 1.21+ and ensure Ollama is running locally.
+- **Build**: Run `make build`.
+- **Run**: `./bin/nexus`.
+- **Test**: `make test`.
+- **Lint**: `make lint`.
+
+## Guidelines
+- Be respectful and inclusive in all communications.
+- Follow the existing Go style and project patterns.
+- Keep changes atomic and focused.
