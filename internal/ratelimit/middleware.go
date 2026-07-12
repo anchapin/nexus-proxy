@@ -34,6 +34,13 @@ type Middleware struct {
 	burst    int           // bucket capacity
 	ttl      time.Duration // idle bucket retention before reaping
 
+	// onReject, when non-nil, is invoked once for each request the
+	// middleware rejects with 429 (issue #119). It is intended for
+	// telemetry / observability hooks and must not block — the
+	// request goroutine calls it inline. Set via SetRejectionHook
+	// after construction so NewMiddleware stays a pure constructor.
+	onReject func()
+
 	mu      sync.Mutex
 	buckets map[string]*bucket
 }
@@ -72,6 +79,18 @@ func NewMiddleware(rpm, burst int, resolver *ClientIPResolver) *Middleware {
 	}
 }
 
+// SetRejectionHook installs a callback invoked once per 429 rejection
+// (issue #119). fn must be safe to call from many goroutines and must
+// not block. Pass nil to remove a previously installed hook. The
+// method is safe to call before Wrap binds the handler; main.go wires
+// it between NewMiddleware and the server start.
+func (m *Middleware) SetRejectionHook(fn func()) {
+	if m == nil {
+		return
+	}
+	m.onReject = fn
+}
+
 // Wrap returns an http.Handler that applies the rate limit before
 // delegating to next. A disabled middleware (rpm <= 0) returns next
 // unchanged so the hot path is zero-cost when rate limiting is off.
@@ -86,6 +105,9 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ip := m.resolver.Resolve(r)
 		if !m.allow(ip, time.Now()) {
+			if m.onReject != nil {
+				m.onReject()
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Retry-After", "60")
 			w.Header().Set("X-Nexus-RateLimit-Remaining", "0")

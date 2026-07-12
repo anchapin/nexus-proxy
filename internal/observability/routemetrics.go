@@ -79,12 +79,22 @@ type counterKey struct {
 //   - nexus_route_decisions_total{route,source}
 //   - nexus_slm_decisions_total{route,confidence_bucket,task_type}
 //   - nexus_slm_low_confidence_escalations_total{task_type}
+//
+// A fourth family (issue #119) records requests the proxy rejected
+// before they reached an upstream:
+//   - nexus_requests_rejected_total{reason}
+//
+// The reason label values are short, bounded strings (method,
+// body_too_large, bad_request, rate_limit, ...) defined as constants
+// in internal/handlers so the chat handler and the rate-limit
+// middleware agree on the vocabulary without importing this package.
 type RouteCounters struct {
 	mu sync.Mutex
 
 	routeDecisions           map[counterKey]*uint64
 	slmDecisions             map[counterKey]*uint64
 	lowConfidenceEscalations map[counterKey]*uint64
+	rejections               map[string]*uint64
 }
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
@@ -93,6 +103,7 @@ func NewRouteCounters() *RouteCounters {
 		routeDecisions:           make(map[counterKey]*uint64),
 		slmDecisions:             make(map[counterKey]*uint64),
 		lowConfidenceEscalations: make(map[counterKey]*uint64),
+		rejections:               make(map[string]*uint64),
 	}
 }
 
@@ -153,6 +164,35 @@ func (rc *RouteCounters) Observe(route, source string, confidence float64, taskT
 	}
 }
 
+// ObserveRejection records a single rejected request, partitioned by
+// reason (issue #119). Call this from every early-return path in the
+// chat handler (method, body_too_large, bad_request, ...) and from
+// the rate-limit middleware's 429 path. The method is safe for
+// concurrent use and never blocks; nil receivers are a no-op so
+// callers can invoke it unconditionally. reason is the short label
+// value that appears in the Prometheus exposition.
+func (rc *RouteCounters) ObserveRejection(reason string) {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(rc.reasonSlot(reason), 1)
+}
+
+// reasonSlot returns the *uint64 for reason, creating it if absent.
+// Same lock-then-atomic pattern as slot: the mutex guards the map
+// mutation only, the increment happens lock-free.
+func (rc *RouteCounters) reasonSlot(reason string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.rejections[reason]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.rejections[reason] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
 // slot returns the *uint64 for key, creating it if absent. The
 // pointer is returned so the caller can atomic.AddUint64 without
 // holding the lock during the increment.
@@ -209,6 +249,13 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += n
 	}
+	if n, err := writeRejectionSeries(w, "nexus_requests_rejected_total",
+		"Requests the proxy rejected before they reached an upstream.",
+		rc.rejections); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
 	return total, nil
 }
 
@@ -239,6 +286,37 @@ func writeSeries(w io.Writer, name, help string, m map[counterKey]*uint64, label
 	for _, k := range keys {
 		v := atomic.LoadUint64(m[k])
 		n, err := fmt.Fprintf(w, "%s%s %d\n", name, formatLabels(k, labels), v)
+		if err != nil {
+			return total + int64(n), err
+		}
+		total += int64(n)
+	}
+	return total, nil
+}
+
+// writeRejectionSeries emits the nexus_requests_rejected_total
+// family. It is a string-keyed variant of writeSeries so the
+// rejection counters (keyed only by reason) do not need to reuse the
+// multi-field counterKey struct. Output is sorted by reason for
+// deterministic scrape diffs.
+func writeRejectionSeries(w io.Writer, name, help string, m map[string]*uint64) (int64, error) {
+	var total int64
+	n, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", name, help, name)
+	if err != nil {
+		return total + int64(n), err
+	}
+	total += int64(n)
+	if len(m) == 0 {
+		return total, nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := atomic.LoadUint64(m[k])
+		n, err := fmt.Fprintf(w, "%s{reason=%q} %d\n", name, sanitizeLabel(k), v)
 		if err != nil {
 			return total + int64(n), err
 		}

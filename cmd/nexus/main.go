@@ -473,6 +473,15 @@ func main() {
 	routeDecisionObs := handlers.RouteDecisionObserverFunc(func(e handlers.RouteDecisionEvent) {
 		routeCounters.Observe(e.Route, e.Source, e.Confidence, e.TaskType, "")
 	})
+	// Rejection observer (issue #119). The chat handler dispatches
+	// one RejectionEvent per early-return path; the closure forwards
+	// the reason to the in-process counter so it surfaces in
+	// /metrics as nexus_requests_rejected_total{reason}. The
+	// rate-limit middleware's 429 path is wired separately below
+	// because it fires before the chat handler.
+	rejectionObs := handlers.RejectionObserverFunc(func(e handlers.RejectionEvent) {
+		routeCounters.ObserveRejection(e.Reason)
+	})
 	mux.Handle("/metrics", routeCounters.Handler())
 	slog.Info("metrics endpoint serves prometheus text format",
 		slog.String("path", "/metrics"),
@@ -494,12 +503,21 @@ func main() {
 		LocalLimiter:          localLimiter,
 		LocalCooldown:         localCooldown,
 		RouteDecisionObserver: routeDecisionObs,
+		RejectionObserver:     rejectionObs,
 	})
 	// Apply the per-client rate limiter (issue #75) as the outermost
 	// wrapper so a flood of requests is rejected before any middleware
 	// / RAG / routing work runs. A nil/disabled limiter returns the
 	// handler unchanged (zero overhead).
+	//
+	// Issue #119: install the rejection hook so a 429 increments the
+	// nexus_requests_rejected_total{reason="rate_limit"} counter,
+	// making rate-limit rejections visible in /metrics alongside the
+	// handler-level rejections (method, body_too_large, bad_request).
 	if rateLimiter != nil {
+		rateLimiter.SetRejectionHook(func() {
+			routeCounters.ObserveRejection(handlers.RejectionRateLimit)
+		})
 		chatHandler = rateLimiter.Wrap(chatHandler)
 	}
 	mux.Handle("/v1/chat/completions", chatHandler)
