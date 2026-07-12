@@ -1,5 +1,7 @@
 package metrics
 
+// SQLite metrics store (issue #4). Uses modernc.org/sqlite — the only
+// allowed third-party runtime dependency. See AGENTS.md and README.md.
 import (
 	"context"
 	"database/sql"
