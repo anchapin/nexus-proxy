@@ -1,12 +1,18 @@
-# Release workflow (issue #83).
+# Release workflow (issue #83, smoke-tested via #102).
 #
-# Triggered by semver tags (v*). Produces:
+# Triggered by semver tags (v*) or manually via workflow_dispatch.
+# Produces:
 #   - Cross-compiled binaries (linux/amd64, linux/arm64, darwin/arm64)
 #   - SHA256 checksums file
 #   - GitHub Release with all artifacts attached
 #   - Multi-arch (amd64 + arm64) GHCR image
 #   - SBOM (SPDX JSON) attached to the release
 #   - Keyless cosign signature on the image (requires OIDC permissions)
+#
+# workflow_dispatch lets operators smoke-test the full pipeline from the
+# Actions UI without cutting a real release tag. When dispatched manually,
+# the resulting GitHub Release is marked as a prerelease by default so it
+# doesn't appear as "latest".
 #
 # Kept separate from ci.yml per the issue's implementation notes.
 
@@ -16,6 +22,20 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version string for artifacts (e.g. v0.0.0-smoke.1)'
+        required: true
+        default: 'v0.0.0-smoke.1'
+      prerelease:
+        description: 'Mark the GitHub Release as a prerelease (recommended for smoke tests)'
+        type: boolean
+        default: true
+      draft:
+        description: 'Create the GitHub Release as a draft instead of publishing'
+        type: boolean
+        default: false
 
 permissions:
   contents: write      # create GitHub Release + upload assets
@@ -24,7 +44,7 @@ permissions:
   attestations: write  # artifact attestations
 
 env:
-  GO_VERSION: '1.21'
+  GO_VERSION: '1.26'
 
 jobs:
   # ── Cross-compile binaries + checksums ──────────────────────────
@@ -42,12 +62,15 @@ jobs:
 
       - name: Determine version
         id: ver
-        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+        # inputs.version is set on workflow_dispatch; empty (falsy) on
+        # tag push, so we fall through to GITHUB_REF_NAME (the tag).
+        run: echo "version=${{ inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
       - name: Build binaries
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ steps.ver.outputs.version }}"
           mkdir -p dist
           LDFLAGS="-s -w -X main.version=${VERSION}"
 
@@ -89,9 +112,7 @@ jobs:
       - name: Determine version
         id: ver
         run: |
-          VERSION="${GITHUB_REF_NAME}"   # e.g. v1.0.0
-          # Strip leading 'v' for SemVer-flavoured tags if desired by
-          # consumers, but keep the raw tag too for traceability.
+          VERSION="${{ inputs.version || github.ref_name }}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "version_no_v=$(echo "${VERSION}" | sed 's/^v//')" >> "$GITHUB_OUTPUT"
 
@@ -130,30 +151,40 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # Ask buildx for a per-platform digest we can sign.
-          outputs: type=image,push-by-digest=true,name=ghcr.io/${{ github.repository }},push=true
           provenance: true
           sbom: true
+        # NOTE: Do NOT set `outputs: push-by-digest` here — it silently
+        # overrides `tags`/`push`, leaving the image untagged. The
+        # `digest` output is populated regardless and used for cosign
+        # signing below.
 
       # ── Keyless cosign signing (requires id-token: write) ───────
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
       - name: Sign image (keyless)
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
         run: |
-          # Sign the image digest. cosign uses the OIDC token from
-          # id-token: write to create a keyless signature recorded in
-          # the Rekor transparency log.
-          IMAGE="ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}"
           echo "Signing: ${IMAGE}"
           cosign sign --yes "${IMAGE}"
 
       - name: Verify signature
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
         run: |
-          IMAGE="ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}"
-          # Verify against the certificate identity of the workflow.
+          # The OIDC certificate identity differs between tag-push
+          # (refs/tags/<tag>) and workflow_dispatch (refs/heads/<branch>).
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            REF="refs/heads/${GITHUB_REF_NAME}"
+          else
+            REF="refs/tags/${GITHUB_REF_NAME}"
+          fi
+          IDENTITY="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${REF}"
+          echo "Verifying: ${IMAGE}"
+          echo "Identity:  ${IDENTITY}"
           cosign verify "${IMAGE}" \
-            --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.ref_name }}" \
+            --certificate-identity "${IDENTITY}" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
 
   # ── SBOM generation ─────────────────────────────────────────────
@@ -171,24 +202,30 @@ jobs:
 
       - name: Determine version
         id: ver
-        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+        run: echo "version=${{ inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
+      # NOTE: artifact-name must NOT contain dots — actions/upload-
+      # artifact@v4 rejects them. Use a simple name and rename the
+      # file before attaching to the release.
       - name: Generate SBOM (SPDX JSON)
         uses: anchore/sbom-action@v0
         with:
           format: spdx-json
-          artifact-name: nexus-${{ steps.ver.outputs.version }}-sbom.spdx.json
+          artifact-name: nexus-sbom
           upload-artifact: true
-          upload-release-assets: false  # attached in the release job below
+          upload-release-assets: false
 
-      - name: Download SBOM artifact
+      - name: Stage SBOM with version filename
         uses: actions/download-artifact@v4
         with:
-          name: nexus-${{ steps.ver.outputs.version }}-sbom.spdx.json
+          name: nexus-sbom
           path: dist/
 
       - name: Rename SBOM for release upload
-        run: mv dist/*.spdx.json "dist/nexus-${{ steps.ver.outputs.version }}-sbom.spdx.json"
+        run: |
+          cd dist
+          FILE=$(ls -1 | head -1)
+          mv "${FILE}" "nexus-${{ steps.ver.outputs.version }}-sbom.spdx.json"
 
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v4
@@ -205,7 +242,7 @@ jobs:
     steps:
       - name: Determine version
         id: ver
-        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+        run: echo "version=${{ inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
       - name: Download binaries
         uses: actions/download-artifact@v4
@@ -225,6 +262,8 @@ jobs:
           tag_name: ${{ steps.ver.outputs.version }}
           name: ${{ steps.ver.outputs.version }}
           generate_release_notes: true
+          prerelease: ${{ inputs.prerelease == true }}
+          draft: ${{ inputs.draft == true }}
           files: |
             dist/nexus-*
             dist/checksums-sha256.txt
