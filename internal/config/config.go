@@ -73,7 +73,7 @@ type Config struct {
 	// StatusPublic is true (default false) — the diagnostics surface
 	// (frontier configured, judge enabled, VRAM state) is
 	// reconnaissance-grade and should be gated by default.
-	ProxyAPIKey string // NEXUS_PROXY_API_KEY; empty disables auth
+	ProxyAPIKey  string // NEXUS_PROXY_API_KEY; empty disables auth
 	StatusPublic bool   // NEXUS_STATUS_PUBLIC; exposes /status without auth
 
 	// RAG
