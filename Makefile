@@ -76,3 +76,12 @@ ci: vet build test lint bench-short
 
 clean:
 	rm -rf bin/ coverage.txt coverage.html
+# Override LINT to use absolute path when go/bin path doesn't work via PATH
+GOLINCI_LINT ?= /home/alex/go/bin/golangci-lint
+ifneq (0, $(shell test -f /home/alex/go/bin/golangci-lint && echo 1 || echo 0))
+  LINT = /home/alex/go/bin/golangci-lint
+endif
+
+.PHONY: lint
+lint:
+	$(LINT) run
