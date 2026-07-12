@@ -22,8 +22,8 @@ func TestRunCheckHumanReadable(t *testing.T) {
 	ollama := newCheckOllamaFixture(t)
 	fr := newCheckFrontierFixture(t, http.StatusOK)
 
-	t.Setenv("NEXUS_OLLAMA_URL", ollama.URL)
-	t.Setenv("NEXUS_FRONTIER_URL", fr.URL+"/chat/completions")
+	t.Setenv("NEXUS_OLLAMA_URL", ollama.Server.URL)
+	t.Setenv("NEXUS_FRONTIER_URL", fr.Server.URL+"/chat/completions")
 	t.Setenv("NEXUS_FRONTIER_API_KEY", "sk-test")
 	t.Setenv("NEXUS_ZAI_API_KEY", "")
 	t.Setenv("NEXUS_TELEMETRY_PATH", filepath.Join(t.TempDir(), "telem.jsonl"))
@@ -62,7 +62,7 @@ func TestRunCheckHumanReadable(t *testing.T) {
 
 func TestRunCheckJSON(t *testing.T) {
 	ollama := newCheckOllamaFixture(t)
-	t.Setenv("NEXUS_OLLAMA_URL", ollama.URL)
+	t.Setenv("NEXUS_OLLAMA_URL", ollama.Server.URL)
 	t.Setenv("NEXUS_FRONTIER_API_KEY", "")
 	t.Setenv("NEXUS_TELEMETRY_PATH", "")
 	t.Setenv("NEXUS_METRICS_DB", "")
@@ -104,8 +104,8 @@ func TestRunCheckPassesWhenAllGreen(t *testing.T) {
 	tags := `{"models":[{"name":"qwen3-coder:4b"},{"name":"qwen3-coder:8b"},{"name":"nomic-embed-text"}]}`
 	ollama.tags = &tags
 	fr := newCheckFrontierFixture(t, http.StatusOK)
-	t.Setenv("NEXUS_OLLAMA_URL", ollama.URL)
-	t.Setenv("NEXUS_FRONTIER_URL", fr.URL+"/chat/completions")
+	t.Setenv("NEXUS_OLLAMA_URL", ollama.Server.URL)
+	t.Setenv("NEXUS_FRONTIER_URL", fr.Server.URL+"/chat/completions")
 	t.Setenv("NEXUS_FRONTIER_API_KEY", "sk-test")
 	t.Setenv("NEXUS_ZAI_API_KEY", "zai-test")
 	t.Setenv("NEXUS_TELEMETRY_PATH", filepath.Join(t.TempDir(), "telem.jsonl"))

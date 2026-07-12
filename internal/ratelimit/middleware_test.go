@@ -167,7 +167,12 @@ func TestMiddleware_Reaper(t *testing.T) {
 // must never exceed the configured burst across all of them.
 func TestMiddleware_ConcurrentNoRace(t *testing.T) {
 	resolver := NewClientIPResolver(nil)
-	m := NewMiddleware(100000, 10, resolver) // burst 10
+	// 60 RPM = 1 token/sec, so refill over a sub-second test window is
+	// negligible (~0.01 tokens in 10ms). This keeps the success ceiling
+	// at the burst capacity regardless of scheduling jitter, making the
+	// assertion deterministic. A high RPM (e.g. 100k) would refill ~17
+	// tokens in 10ms and make the test flaky.
+	m := NewMiddleware(60, 10, resolver) // burst 10
 	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -191,9 +196,10 @@ func TestMiddleware_ConcurrentNoRace(t *testing.T) {
 	}
 	wg.Wait()
 	// At most burst (10) requests should have succeeded regardless of
-	// how many raced; refill could add a few fractional tokens but with
-	// 100k rpm and near-zero elapsed time, ~10 is the ceiling.
-	if ok > 15 {
+	// how many raced. With 60 RPM the refill over the test window is
+	// ~0.01 tokens, so the ceiling is the burst capacity plus a small
+	// safety margin for implementation edge cases.
+	if ok > 12 {
 		t.Errorf("too many concurrent successes: %d (burst 10)", ok)
 	}
 }
