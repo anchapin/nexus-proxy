@@ -231,9 +231,15 @@ Gotchas to remember when extending:
   `log.Println` prefixes (`[ROUTER]`, `[RAG INDEXER]`) are gone — use
   `slog.Info(...)` with `slog.String("component", ...)` attributes.
 - HTTP timeouts: `http.Server.ReadHeaderTimeout` is 10s.
-  `ReadTimeout`/`WriteTimeout`/`IdleTimeout` are still 0 — tracked in
-  #106. Per-call timeouts are `NEXUS_SLM_TIMEOUT` (8s default),
-  `NEXUS_FUSION_TIMEOUT` (120s default), and
+  `ReadTimeout` (`NEXUS_SERVER_READ_TIMEOUT`, default 30s) guards
+  against slow headers / slow body (Slowloris).
+  `WriteTimeout` (`NEXUS_SERVER_WRITE_TIMEOUT`, default 0 / disabled)
+  is intentionally off so SSE streaming responses are never killed
+  mid-stream. `IdleTimeout` (`NEXUS_SERVER_IDLE_TIMEOUT`, default 120s)
+  closes idle keep-alive connections. `MaxHeaderBytes`
+  (`NEXUS_SERVER_MAX_HEADER_BYTES`, default 1 MiB) caps request
+  headers. Per-call upstream timeouts are `NEXUS_SLM_TIMEOUT` (8s
+  default), `NEXUS_FUSION_TIMEOUT` (120s default), and
   `NEXUS_CASCADE_TIMEOUT` (per-cascade-attempt, #14).
 - HTTP client is a single shared pooled `*http.Client` configured via
   `internal/transport.New` (#34) — env vars `NEXUS_HTTP_*` tune
