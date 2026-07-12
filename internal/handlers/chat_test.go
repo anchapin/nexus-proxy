@@ -687,10 +687,11 @@ type recordingObserver struct {
 	seen []LocalCompletion
 }
 
-func (r *recordingObserver) Submit(c LocalCompletion) {
+func (r *recordingObserver) Submit(c LocalCompletion) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.seen = append(r.seen, c)
+	return true
 }
 
 func (r *recordingObserver) Snapshot() []LocalCompletion {

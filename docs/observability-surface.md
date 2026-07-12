@@ -21,8 +21,9 @@ snake_case naming.
 | `nexus_slm_decisions_total` | counter | `route`, `confidence_bucket`, `task_type` | 3 × 4 × 8 = 96 | `routemetrics.go` |
 | `nexus_slm_low_confidence_escalations_total` | counter | `task_type` | 8 | `routemetrics.go` |
 | `nexus_requests_rejected_total` | counter | `reason` | 4 | `routemetrics.go` |
+| `nexus_judge_dropped_total` | counter | *(none)* | 1 | `routemetrics.go` |
 
-**Maximum theoretical series**: 15 + 96 + 8 + 4 = 123 series.
+**Maximum theoretical series**: 15 + 96 + 8 + 4 + 1 = 124 series.
 
 ### Label value catalog
 
@@ -184,8 +185,35 @@ on `handlers.Deps` are plugged in `cmd/nexus/main.go`:
 | `RouteDecisionObserver` | `RouteDecisionObserverFunc` → `routeCounters.Observe()` | `main.go:492-494` |
 | `RejectionObserver` | `RejectionObserverFunc` → `routeCounters.ObserveRejection()` | `main.go:501-503` |
 | Rate-limit rejection | `rateLimiter.SetRejectionHook()` → `routeCounters.ObserveRejection()` | `main.go:537-539` |
+| Judge drop callback | `eval.SetDropCallback()` → `routeCounters.ObserveJudgeDrop()` | `main.go:498-500` |
 
 ## Endpoint exempt from auth
 
 `/metrics` is exempt from inbound auth and rate limiting alongside
 `/healthz`, `/livez`, `/readyz`, and `/status`.
+
+## `GET /status` — extended health with judge state
+
+Returns the same JSON shape as `/healthz` (frontier, probe, Ollama
+health) **plus** a `judge` sub-object (always present):
+
+```json
+{
+  "frontier": { ... },
+  "judge": {
+    "enabled": true,
+    "queue_depth": 64,
+    "dropped": 3,
+    "concurrency": 2
+  },
+  "probe": { ... },
+  "ollama": { ... }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `enabled` | bool | Whether the judge evaluator is active (`NEXUS_JUDGE_SAMPLE_RATE > 0`) |
+| `queue_depth` | int | Buffered channel capacity (`NEXUS_JUDGE_QUEUE`) |
+| `dropped` | uint64 | Cumulative samples rejected because the queue was full |
+| `concurrency` | int | Number of worker goroutines (`NEXUS_JUDGE_CONCURRENCY`)
