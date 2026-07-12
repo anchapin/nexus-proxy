@@ -1,0 +1,74 @@
+# Auto-close issues when their linked PR merges (issue #104).
+#
+# GitHub only auto-closes issues linked with "Fixes #N" / "Closes #N" /
+# "Resolves #N" when the PR merges into the *default* branch. When a PR
+# merges into a non-default branch (e.g. a release branch), the linked
+# issues remain open. This workflow fills that gap.
+
+name: Auto-Close Issues
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  close-linked:
+    name: Close linked issues
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.merged == true
+    steps:
+      - name: Extract and close linked issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # ── Extract issue numbers from the PR body ──────────────
+          # Match patterns like "Fixes #123", "Closes #456", "Resolves #789"
+          # Case-insensitive, allows optional whitespace around the number.
+          ISSUES=$(echo "$PR_BODY" \
+            | grep -ioE '(fix(es|ed)?|closes?|resolved?)\s*#\s*[0-9]+' \
+            | grep -oE '[0-9]+' \
+            | sort -un || true)
+
+          if [ -z "$ISSUES" ]; then
+            echo "::notice::No linked issues found in PR #$PR_NUMBER body — nothing to close."
+            exit 0
+          fi
+
+          echo "PR #$PR_NUMBER merged — linked issues: $ISSUES"
+
+          # ── Close each issue ────────────────────────────────────
+          CLOSED=0
+          SKIPPED=0
+          for ISSUE_NUM in $ISSUES; do
+            echo "::group::Issue #$ISSUE_NUM"
+
+            # Check the issue state before attempting to close.
+            STATE=$(gh issue view "$ISSUE_NUM" \
+              --repo "$REPO" \
+              --json state \
+              --jq '.state' 2>/dev/null || echo "UNKNOWN")
+
+            if [ "$STATE" = "CLOSED" ]; then
+              echo "Issue #$ISSUE_NUM is already closed — skipping."
+              SKIPPED=$((SKIPPED + 1))
+            else
+              gh issue close "$ISSUE_NUM" \
+                --repo "$REPO" \
+                --comment "Closed automatically — PR #$PR_NUMBER merged."
+              echo "Issue #$ISSUE_NUM closed."
+              CLOSED=$((CLOSED + 1))
+            fi
+
+            echo "::endgroup::"
+          done
+
+          echo "::notice::Done. Closed: $CLOSED, Already closed: $SKIPPED, Total linked: $(echo "$ISSUES" | wc -w)."
