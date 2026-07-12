@@ -123,7 +123,7 @@ func TestBuildRAGStore(t *testing.T) {
 	ctx := context.Background()
 
 	cfg := config.Config{
-		ExamplesDir: tmpDir,
+		ExamplesDir:  tmpDir,
 		RAGThreshold: 0.55,
 	}
 	// RAGDBPath is empty by default via config.Load, so RAGPersistentEnabled() is false.
