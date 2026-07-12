@@ -1234,6 +1234,7 @@ func TestChatTelemetryJSONLRecorderEndToEnd(t *testing.T) {
 	deps, rt := baseDeps(t)
 	deps.Recorder = r
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Millisecond) // ensure the millisecond latency assertion below is stable
 		_, _ = w.Write([]byte("frontier stream"))
 	})
 	// Large prompt -> guardrail forces FRONTIER route.
@@ -2170,6 +2171,52 @@ func TestChatSLMEscalationLogShape(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("no slm low-confidence escalation line matching fields in:\n%s", output)
+	}
+}
+
+// TestChatRecorderCoexistsWithMetricsObserver guards the issue #112
+// regression: adding the richer metrics sink must not silence the legacy
+// recorder. The recorder-only case also pins the existing single-sink
+// behaviour.
+func TestChatRecorderCoexistsWithMetricsObserver(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		withMetrics bool
+	}{
+		{name: "recorder only"},
+		{name: "recorder and metrics", withMetrics: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps, rt := baseDeps(t)
+			recorder := &capturingRecorder{}
+			deps.Recorder = recorder
+			metrics := &recordingMetricsObserver{}
+			if tc.withMetrics {
+				deps.MetricsObserver = metrics
+			}
+			rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"css fix"},"finish_reason":"stop"}]}`)
+			})
+
+			body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			rw := httptest.NewRecorder()
+			Chat(deps).ServeHTTP(rw, req)
+
+			if rw.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d", rw.Code, http.StatusOK)
+			}
+			if got := len(recorder.Snapshot()); got != 1 {
+				t.Errorf("recorder calls = %d, want 1", got)
+			}
+			wantMetrics := 0
+			if tc.withMetrics {
+				wantMetrics = 1
+			}
+			if got := len(metrics.Snapshot()); got != wantMetrics {
+				t.Errorf("metrics events = %d, want %d", got, wantMetrics)
+			}
+		})
 	}
 }
 
