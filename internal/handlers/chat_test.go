@@ -320,7 +320,7 @@ func tripBreaker(t *testing.T) *health.Health {
 		http.Error(w, "down", http.StatusServiceUnavailable)
 	}))
 	t.Cleanup(deadSrv.Close)
-	h := health.New(deadSrv.URL, time.Hour, 1, 2*time.Second, &http.Client{Timeout: 2 * time.Second})
+	h := health.New(deadSrv.URL, "qwen3-coder:8b", time.Hour, 1, 2*time.Second, &http.Client{Timeout: 2 * time.Second})
 	if err := h.Probe(context.Background()); err == nil {
 		t.Fatal("expected Probe to fail against a 503 server")
 	}
