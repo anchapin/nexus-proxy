@@ -326,6 +326,12 @@ make ci         # vet + build + test + lint (what CI runs)
 The race detector and a healthy test suite are required to merge — see
 `.github/workflows/ci.yml`.
 
+**Runtime dependency note.** The binary links against
+`modernc.org/sqlite` for the savings-dashboard SQLite metrics store
+(`NEXUS_METRICS_DB`). This is the single allowed third-party runtime
+module. New runtime dependencies require a tracked decision in
+`## Notes for orchestrator`.
+
 ## Security & CI
 
 The following automated checks run on every pull request and push to

@@ -162,6 +162,18 @@ shape. Two non-obvious behaviours to remember when re-parsing downstream:
   round-trip lossy.
 - The regex `JSONArrayBlock` only fires on ` ```json\n[ ... ]\n``` `
   fenced blocks inside `user`/`assistant` messages.
+- A second pass, `middleware.CompressUnfencedJSONArrays` (issue #123),
+  catches bare (unfenced) and prose-embedded arrays-of-objects in
+  `user`/`assistant` content. It is gated by `NEXUS_TOON_UNFENCED`
+  (default on). Detection is a bracket-balancing scan that emits
+  candidates, each then validated by `json.Unmarshal` into
+  `[]map[string]interface{}` — only arrays with **≥2 rows** are
+  rewritten (single-row arrays don't amortise the schema header), and
+  arrays of primitives are skipped at the candidate stage. Surrounding
+  prose is preserved: only the matched byte range is replaced, and the
+  replacement uses the same ` ```text ` fence and `SerializeToTOON`
+  rules as the fenced path so downstream sees one TOON shape. Set
+  `NEXUS_TOON_UNFENCED=false` to revert to fenced-only compression.
 
 ## Middleware order (do not reorder casually)
 
@@ -221,9 +233,9 @@ Gotchas to remember when extending:
 
 ## Style / workflow notes
 
-- Go 1.21+. **Near-stdlib**: the only runtime dependency is
-  `modernc.org/sqlite` (pure-Go SQLite driver for the metrics store,
-  #4). The dev-time toolchain (golangci-lint, Make) is documented but
+- Go 1.21+. **Runtime dependencies: `modernc.org/sqlite` only**, pulled in
+  by the metrics store (issue #4). All other functionality uses stdlib.
+  The dev-time toolchain (golangci-lint, Make) is documented but
   optional for contributors who just want to run the binary.
 - Logging uses `log/slog` (structured logging, #3). Format and level
   are configurable via `NEXUS_LOG_FORMAT` (json|text) and

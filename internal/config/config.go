@@ -97,13 +97,21 @@ type Config struct {
 	RAGEmbedCacheSize int // max LRU entries (256)
 
 	// Routing
-	TokenGuardrail     int           // estimated tokens above this force frontier (6000)
-	SLMTimeout         time.Duration // Qwen3-Coder routing timeout (8s)
-	SLMCacheTTL        time.Duration // TTL for SLM routing decision cache (5m)
-	SLMCacheMaxEntries int           // max entries in SLM routing decision cache (512)
-	FusionTimeout      time.Duration // per-panel-member fetch timeout (120s)
-	CascadeTimeout     time.Duration // per-attempt timeout for cascade fallback (30s)
-	ArbiterTimeout     time.Duration // per-call timeout for the fusion arbiter stream (60s)
+	TokenGuardrail int           // estimated tokens above this force frontier (6000)
+	SLMTimeout     time.Duration // Qwen3-Coder routing timeout (8s)
+	// SLM routing decision cache (issue #116). The SLM decision is
+	// deterministic for a given prompt (temperature=0.1), so identical
+	// prompts pay the same 8s Ollama round-trip repeatedly. The cache
+	// is keyed on SHA256(prompt) and stores the parsed Decision
+	// (route, confidence, task_type). A size of 0 disables the cache.
+	// TTL of 0 means no expiry (entries evicted only by LRU). SLM
+	// transport errors (network, non-200, parse failure) are NOT cached
+	// so a transient Ollama failure is retried on the next request.
+	SLMCacheSize   int           // max LRU entries (default 1024)
+	SLMCacheTTL    time.Duration // entry TTL (default 5m; 0 = no expiry)
+	FusionTimeout  time.Duration // per-panel-member fetch timeout (120s)
+	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
+	ArbiterTimeout time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
 	// Frontier provider selector (issue #45). When more than one
 	// frontier provider is configured (frontier + z.ai), the chat
@@ -250,6 +258,16 @@ type Config struct {
 	MetaPrompt string // appended to system prompt by prompt_engine
 	TOONNotice string // appended when TOON compression is applied
 
+	// TOON unfenced-array detection (issue #123). When true (the
+	// default), the middleware runs a second TOON pass over
+	// user/assistant content that rewrites bare (unfenced) and
+	// prose-embedded JSON arrays-of-objects with >=2 rows. The
+	// fenced-block path always runs regardless of this flag; setting
+	// it to false restores the pre-issue-123 behaviour where only
+	// ```json fences are compressed, useful for downstream parsers
+	// that depend on raw JSON reaching the model.
+	TOONUnfenced bool
+
 	// Prompt-injection hardening (issue #76). Controls whether the
 	// proxy isolates its policy text from user-supplied system content
 	// and whether suspicious injection patterns are logged or rejected.
@@ -294,6 +312,15 @@ type Config struct {
 	// debug-level chatter from every other package.
 	Debug          bool
 	DebugBodyBytes int
+
+	// Distributed tracing (issue #41, #122). When TracingEndpoint is
+	// non-empty, an OTLP/JSON exporter is started and registered as the
+	// process-wide tracer. The exporter buffers spans in a bounded
+	// channel and POSTs them asynchronously; dropped spans are counted
+	// and surfaced on /metrics as nexus_tracing_dropped_total.
+	TracingEndpoint  string        // OTLP/JSON endpoint including /v1/traces
+	TracingTimeout   time.Duration // per-batch POST timeout
+	TracingQueueSize int           // buffer capacity; 0 uses default (256)
 
 	// OpenAI-compatible model discovery (issue #78). When enabled the
 	// proxy serves GET /v1/models and GET /v1/models/{id} listing the
@@ -383,6 +410,7 @@ func Load() (Config, error) {
 		ZAIKey:         getEnv("NEXUS_ZAI_API_KEY", ""),
 		ProxyAPIKey:    getEnv("NEXUS_PROXY_API_KEY", ""),
 		StatusPublic:   getEnvBool("NEXUS_STATUS_PUBLIC", false),
+		TOONUnfenced:   getEnvBool("NEXUS_TOON_UNFENCED", true),
 		ExamplesDir:    getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
 		MetaPrompt:     defaultMetaPrompt,
 		TOONNotice:     defaultTOONNotice,
@@ -432,23 +460,25 @@ func Load() (Config, error) {
 	}
 	cfg.SLMTimeout = slmTimeout
 
-	// SLM routing decision cache (issue #162). TTL defaults to 5m so
-	// repeated prompts within a coding session hit the cache; max
-	// entries caps memory at ~512 entries with simple LRU eviction.
+	// SLM cache (issue #116). Size 0 disables the cache; TTL 0 means
+	// no expiry (LRU-only eviction). Defaults: size=1024, TTL=5m.
+	slmCacheSize, err := getEnvInt("NEXUS_SLM_CACHE_SIZE", 1024)
+	if err != nil {
+		return cfg, err
+	}
+	if slmCacheSize < 0 {
+		slmCacheSize = 0
+	}
+	cfg.SLMCacheSize = slmCacheSize
+
 	slmCacheTTL, err := getEnvDuration("NEXUS_SLM_CACHE_TTL", 5*time.Minute)
 	if err != nil {
 		return cfg, err
 	}
+	if slmCacheTTL < 0 {
+		slmCacheTTL = 0
+	}
 	cfg.SLMCacheTTL = slmCacheTTL
-
-	slmCacheMax, err := getEnvInt("NEXUS_SLM_CACHE_MAX_ENTRIES", 512)
-	if err != nil {
-		return cfg, err
-	}
-	if slmCacheMax < 0 {
-		slmCacheMax = 0
-	}
-	cfg.SLMCacheMaxEntries = slmCacheMax
 
 	fusionTimeout, err := getEnvDuration("NEXUS_FUSION_TIMEOUT", 120*time.Second)
 	if err != nil {
@@ -845,6 +875,26 @@ func Load() (Config, error) {
 	}
 	cfg.DebugBodyBytes = debugBodyBytes
 
+	// Distributed tracing (issue #41, #122). Empty endpoint disables
+	// tracing entirely; the exporter's zero-value methods are no-ops.
+	cfg.TracingEndpoint = getEnvAllowEmpty("NEXUS_TRACING_ENDPOINT", "")
+	if cfg.TracingEndpoint != "" {
+		tracingTimeout, err := getEnvDuration("NEXUS_TRACING_TIMEOUT", 10*time.Second)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.TracingTimeout = tracingTimeout
+
+		tracingQueueSize, err := getEnvInt("NEXUS_TRACING_QUEUE_SIZE", 256)
+		if err != nil {
+			return cfg, err
+		}
+		if tracingQueueSize < 0 {
+			tracingQueueSize = 0
+		}
+		cfg.TracingQueueSize = tracingQueueSize
+	}
+
 	// OpenAI-compatible model discovery (issue #78). Enabled by
 	// default so a stock deployment is discoverable by OpenAI-
 	// compatible clients; operators who do not want the proxy to
@@ -1027,6 +1077,10 @@ func (c Config) EffectiveDebugBodyBytes() int {
 // TelemetryEnabled reports whether the on-disk recorder should be started.
 // Disabled when TelemetryPath is empty.
 func (c Config) TelemetryEnabled() bool { return c.TelemetryPath != "" }
+
+// TracingEnabled reports whether the OTLP/JSON trace exporter should
+// be started. Disabled when TracingEndpoint is empty.
+func (c Config) TracingEnabled() bool { return c.TracingEndpoint != "" }
 
 // ModelsCacheEnabled reports whether the Ollama /api/tags poll should
 // supplement the configured models list (issue #78). Disabled when
