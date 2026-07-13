@@ -119,8 +119,8 @@ type Request struct {
 	// FusionArbiterCostUSD (issue #239) mirrors telemetry.Record:
 	// estimated cost of the arbiter call when it ran. 0 when the
 	// arbiter was skipped or for non-fusion routes.
-	FusionArbiterCostUSD    float64
-	Error                   string
+	FusionArbiterCostUSD float64
+	Error                string
 
 	// Route-source metadata (issue #74).
 	RouteSource   string
