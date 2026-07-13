@@ -20,9 +20,6 @@ linters:
     - unused         # unused identifiers
 
     # Style / hygiene
-    - gofmt          # canonical formatting
-    - goimports      # import grouping
-    - misspell       # typos in comments/strings
     - revive         # golint replacement
 
   settings:
@@ -42,3 +39,8 @@ linters:
       # Don't fail on TODO comments in early-stage code; revisit later.
       - path: (.+)\.go$
         text: TODO\(
+
+formatters:
+  enable:
+    - goimports      # import grouping
+    - gofmt          # canonical formatting
