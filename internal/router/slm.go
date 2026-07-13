@@ -40,11 +40,11 @@ type SLMClient struct {
 	// prompts. Size 0 disables the cache. TTL 0 means no expiry (pure
 	// LRU eviction). Transport errors (network, non-200, parse failure)
 	// are never cached so transient failures are retried.
-	cacheMu     sync.Mutex
-	cache       map[string]*list.Element
-	cacheList   *list.List
-	cacheSize   int
-	cacheTTL    time.Duration
+	cacheMu   sync.Mutex
+	cache     map[string]*list.Element
+	cacheList *list.List
+	cacheSize int
+	cacheTTL  time.Duration
 }
 
 type slmCacheEntry struct {
@@ -62,11 +62,11 @@ func NewSLMClient(baseURL, model string, timeout time.Duration, client *http.Cli
 		client = http.DefaultClient
 	}
 	return &SLMClient{
-		BaseURL: baseURL,
-		Model:   model,
-		Timeout: timeout,
-		Client:  client,
-		cache:   make(map[string]*list.Element),
+		BaseURL:   baseURL,
+		Model:     model,
+		Timeout:   timeout,
+		Client:    client,
+		cache:     make(map[string]*list.Element),
 		cacheList: list.New(),
 	}
 }
@@ -85,14 +85,14 @@ func NewSLMClientWithCache(baseURL, model string, timeout time.Duration, client 
 		cacheTTL = 0
 	}
 	return &SLMClient{
-		BaseURL:    baseURL,
-		Model:      model,
-		Timeout:    timeout,
-		Client:     client,
-		cache:      make(map[string]*list.Element),
-		cacheList:  list.New(),
-		cacheSize:  cacheSize,
-		cacheTTL:   cacheTTL,
+		BaseURL:   baseURL,
+		Model:     model,
+		Timeout:   timeout,
+		Client:    client,
+		cache:     make(map[string]*list.Element),
+		cacheList: list.New(),
+		cacheSize: cacheSize,
+		cacheTTL:  cacheTTL,
 	}
 }
 
@@ -221,7 +221,7 @@ func (c *SLMClient) Decide(ctx context.Context, prompt string) (Route, error) {
 // non-200, parse failure) are never cached so transient failures are retried.
 func (c *SLMClient) DecideWithConfidence(ctx context.Context, prompt string, confidence float64) (Route, error) {
 	systemPrompt := c.systemPromptFor(confidence)
-	
+
 	// Check cache first (issue #116). Key includes confidence since
 	// different confidence values produce different system prompts.
 	if c.cacheSize > 0 {
@@ -230,19 +230,19 @@ func (c *SLMClient) DecideWithConfidence(ctx context.Context, prompt string, con
 			return route, nil
 		}
 	}
-	
+
 	route, err := c.decide(ctx, prompt, systemPrompt)
 	if err != nil {
 		return RouteFrontier, err
 	}
-	
+
 	// Cache successful decisions only (issue #116). Errors fall through
 	// to frontier without polluting the cache.
 	if c.cacheSize > 0 {
 		key := c.cacheKey(prompt + "|" + fmt.Sprintf("%.6f", confidence))
 		c.cachePut(key, route, confidence, "")
 	}
-	
+
 	return route, nil
 }
 

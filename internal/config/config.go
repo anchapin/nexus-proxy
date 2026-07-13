@@ -107,8 +107,8 @@ type Config struct {
 	// TTL of 0 means no expiry (entries evicted only by LRU). SLM
 	// transport errors (network, non-200, parse failure) are NOT cached
 	// so a transient Ollama failure is retried on the next request.
-	SLMCacheSize int           // max LRU entries (default 1024)
-	SLMCacheTTL  time.Duration // entry TTL (default 5m; 0 = no expiry)
+	SLMCacheSize   int           // max LRU entries (default 1024)
+	SLMCacheTTL    time.Duration // entry TTL (default 5m; 0 = no expiry)
 	FusionTimeout  time.Duration // per-panel-member fetch timeout (120s)
 	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
 	ArbiterTimeout time.Duration // per-call timeout for the fusion arbiter stream (60s)

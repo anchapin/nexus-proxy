@@ -233,9 +233,9 @@ Gotchas to remember when extending:
 
 ## Style / workflow notes
 
-- Go 1.21+. **Near-stdlib**: the only runtime dependency is
-  `modernc.org/sqlite` (pure-Go SQLite driver for the metrics store,
-  #4). The dev-time toolchain (golangci-lint, Make) is documented but
+- Go 1.21+. **Runtime dependencies: `modernc.org/sqlite` only**, pulled in
+  by the metrics store (issue #4). All other functionality uses stdlib.
+  The dev-time toolchain (golangci-lint, Make) is documented but
   optional for contributors who just want to run the binary.
 - Logging uses `log/slog` (structured logging, #3). Format and level
   are configurable via `NEXUS_LOG_FORMAT` (json|text) and
