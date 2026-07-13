@@ -66,6 +66,13 @@ type CascadeResult struct {
 // is <= 0. Mirrors the issue default ("configurable, default 30s").
 const cascadeDefaultTimeout = 30 * time.Second
 
+// ErrSSEPartialWrite is returned by writeSSEResponse when an SSE body write
+// fails after HTTP headers have already been committed (WriteHeader called).
+// The caller must not call http.Error after receiving this error; the
+// connection should be closed instead to avoid corrupting the SSE stream.
+// See issue #241.
+var ErrSSEPartialWrite = errors.New("cascade: SSE partial write after headers committed")
+
 // cascadeErr tags a per-step failure so the runner knows whether to fall
 // back (retry=true) or surface the error immediately (retry=false — e.g.
 // upstream returned 401, retrying won't help).
@@ -371,13 +378,17 @@ func writeSSEResponse(w http.ResponseWriter, stepName, servedModel string, msg A
 	}
 	chunkBytes, err := json.Marshal(chunk)
 	if err != nil {
+		// Marshal failure before headers are committed — safe to return as-is.
 		return err
 	}
 	if _, err := fmt.Fprintf(w, "data: %s\n\n", chunkBytes); err != nil {
-		return err
+		// Body write after headers committed — return sentinel so the caller
+		// closes the connection instead of calling http.Error (issue #241).
+		return ErrSSEPartialWrite
 	}
 	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
-		return err
+		// Body write after headers committed — sentinel (issue #241).
+		return ErrSSEPartialWrite
 	}
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
