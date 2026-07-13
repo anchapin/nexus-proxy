@@ -3,13 +3,13 @@
 # Conservative starter set: catches bugs and obvious smells without fighting
 # formatter choices. Tighten or loosen per project taste over time.
 
-version: 2
+version: "2"
 
 run:
   timeout: 5m
 
 linters:
-  disable-all: true
+  default: none
   enable:
     # Bug catchers
     - errcheck       # unchecked errors
@@ -25,19 +25,20 @@ linters:
     - misspell       # typos in comments/strings
     - revive         # golint replacement
 
-linters-settings:
-  revive:
+  settings:
+    revive:
+      rules:
+        - name: package-comments
+          disabled: true # cmd/ packages don't need doc comments
+
+  exclusions:
     rules:
-      - name: package-comments
-        disabled: true # cmd/ packages don't need doc comments
+      # Tests commonly use package-level helpers and short identifiers.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - revive
 
-issues:
-  exclude-rules:
-    # Tests commonly use package-level helpers and short identifiers.
-    - path: _test\.go
-      linters:
-        - errcheck
-        - revive
-
-  # Don't fail on TODO comments in early-stage code; revisit later.
-  exclude: ['TODO\(']
+      # Don't fail on TODO comments in early-stage code; revisit later.
+      - path: (.+)\.go$
+        text: TODO\(
