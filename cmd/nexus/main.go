@@ -28,6 +28,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/judge"
 	"github.com/anchapin/nexus-proxy/internal/metrics"
+	"github.com/anchapin/nexus-proxy/internal/middleware"
 	"github.com/anchapin/nexus-proxy/internal/observability"
 	"github.com/anchapin/nexus-proxy/internal/probe"
 	"github.com/anchapin/nexus-proxy/internal/quality"
@@ -714,16 +715,17 @@ func main() {
 		slog.Info("inbound auth disabled (NEXUS_PROXY_API_KEY unset)")
 	}
 
-	// Panic recovery (issue #110) is the OUTERMOST middleware, wrapping
-	// the entire mux so a panic anywhere downstream — a nil dereference
-	// in a handler, a regex surprise in the prompt pipeline, a JSON
-	// parse after MaxBytesReader — is converted into a structured
-	// slog.Error plus a 500 JSON envelope (or a trailing SSE error
-	// frame when the response already started streaming) instead of a
-	// TCP reset with no body. Zero overhead on the happy path.
+	// Security headers (issue #235) are the OUTERMOST layer so every
+	// response — including 401, 429, and 500 error envelopes — carries
+	// the hardening headers. Inside that we apply panic recovery so a
+	// nil dereference or surprise regex anywhere downstream is turned
+	// into a structured slog.Error plus a 500 JSON envelope (or a
+	// trailing SSE error frame when the response already started
+	// streaming) instead of a TCP reset with no body. Zero overhead
+	// on the happy path.
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           handlers.Recover()(rootHandler),
+		Handler:           middleware.SecurityHeaders()(handlers.Recover()(rootHandler)),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
