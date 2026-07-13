@@ -92,7 +92,7 @@ type Record struct {
 // across the proxy (router VRAM guardrail, telemetry input). Centralising
 // the rule here keeps the two call sites consistent.
 func EstimateTokens(s string) int {
-	if len(s) <= 0 {
+	if len(s) == 0 {
 		return 0
 	}
 	return len(s) / 4

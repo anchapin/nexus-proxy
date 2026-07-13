@@ -43,3 +43,6 @@ Thumbs.db
 *.db-shm
 *.db-wal
 nexus-telemetry.jsonl
+
+# Agent orchestration artifacts (local-only, never source-controlled)
+.agents/

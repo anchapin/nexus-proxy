@@ -3,65 +3,63 @@
 # Conservative starter set: catches bugs and obvious smells without fighting
 # formatter choices. Tighten or loosen per project taste over time.
 
-version: "2"
-
 run:
   timeout: 5m
 
 linters:
-  default: none
+  disable-all: true
   enable:
     # Bug catchers
+    - bodyclose      # missing resp.Body.Close() after http.Client.Do
+    - depguard       # dependency allow-list enforcement
     - errcheck       # unchecked errors
+    - errorlint      # %w wrapping, errors.Is/As instead of ==
+    - gosimple       # simplifications
     - govet          # stdlib vet
     - ineffassign    # unused assignments
-    - staticcheck    # gosimple merged here in v2; broad static analysis
+    - noctx          # http.NewRequest w/o context propagation
+    - sqlclosecheck  # missing rows.Close()/stmt.Close()
+    - staticcheck    # broad static analysis
     - unused         # unused identifiers
 
     # Style / hygiene
+    - gocritic       # opinionated style + bug patterns
+    - gofmt          # canonical formatting
+    - goimports      # import grouping
+    - misspell       # typos in comments/strings
     - revive         # golint replacement
 
-  settings:
-    revive:
-      rules:
-        - name: package-comments
-          disabled: true # cmd/ packages don't need doc comments
-
-  exclusions:
+linters-settings:
+  depguard:
     rules:
-      # Tests commonly use package-level helpers and short identifiers.
-      - path: _test\.go
-        linters:
-          - errcheck
-          - revive
+      main:
+        allow:
+          - $gostd
+          - modernc.org/sqlite
+          - github.com/anchapin/nexus-proxy
+        deny:
+          - pkg: default
+            desc: "Only stdlib, modernc.org/sqlite, and internal packages are allowed"
+  revive:
+    rules:
+      - name: package-comments
+        disabled: true # only cmd/ entry points skip package doc comments
 
-      # Don't fail on TODO comments in early-stage code; revisit later.
-      - path: (.+)\.go$
-        text: TODO\(
+issues:
+  exclude-rules:
+    # cmd/ packages are tiny wiring shims; no package doc comment needed.
+    # Scoped narrowly so internal/ packages keep the lint signal.
+    - path: ^cmd/
+      linters:
+        - revive
 
-      # cmd/ helpers write to io.Writer in "fire-and-forget" style;
-      # ignoring write errors is the intentional design (same as v1).
-      - path: cmd/
-        linters:
-          - errcheck
-        text: fmt\.F(print|printf|println)
+    # Tests commonly use package-level helpers and short identifiers.
+    # Note: bodyclose and sqlclosecheck are intentionally NOT exempted
+    # here — they catch real leaks in test helpers too.
+    - path: _test\.go
+      linters:
+        - errcheck
+        - revive
 
-      # resp.Body.Close and rows.Close ignored in non-critical paths
-      # (matches v1 behaviour which excluded these via less-granular rules).
-      - path: (.+)\.go$
-        linters:
-          - errcheck
-        text: resp\.Body\.Close|rows\.Close|stmt\.Close
-
-      # staticcheck QF (quick-fix) suggestions that were silently ignored in v1:
-      # QF1008: embedded field selectors, QF1002: tagged switch, QF1011: type inference,
-      # QF1001: De Morgan's law. These are stylistic; v1 staticcheck didn't flag them.
-      - path: (.+)\.go$
-        linters:
-          - staticcheck
-        text: QF1008|QF1002|QF1011|QF1001
-
-formatters:
-  enable:
-    - goimports      # import grouping
-    - gofmt          # canonical formatting
+  # Don't fail on TODO comments in early-stage code; revisit later.
+  exclude: ['TODO\(']
