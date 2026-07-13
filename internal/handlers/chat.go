@@ -170,8 +170,32 @@ type RejectionObserverFunc func(RejectionEvent)
 // ObserveRejection implements RejectionObserver.
 func (f RejectionObserverFunc) ObserveRejection(e RejectionEvent) { f(e) }
 
+// FusionOutcomeEvent carries the outcome of a fusion panel after
+// PanelStreaming returns (issue #187). It lets operators compute the
+// fusion agreement rate: skipped/(skipped+invoked).
+type FusionOutcomeEvent struct {
+	RequestID      string
+	ArbiterSkipped bool
+}
+
+// FusionOutcomeObserver is the hook invoked once per fusion request
+// with the PanelStreaming outcome (issue #187). Safe for concurrent
+// use, must not block, nil means "no observer". The handler does not
+// import the observability package; main.go wires a closure that
+// forwards to RouteCounters.ObserveFusionOutcome.
+type FusionOutcomeObserver interface {
+	ObserveFusionOutcome(FusionOutcomeEvent)
+}
+
+// FusionOutcomeObserverFunc adapts a plain function to the
+// FusionOutcomeObserver interface.
+type FusionOutcomeObserverFunc func(FusionOutcomeEvent)
+
+// ObserveFusionOutcome implements FusionOutcomeObserver.
+func (f FusionOutcomeObserverFunc) ObserveFusionOutcome(e FusionOutcomeEvent) { f(e) }
+
 // MetricsEvent carries the per-request data needed by the savings
-// dashboard (issue #4). Fields track the full Round-trip metrics:
+// dashboard (issue #4). Fields track the full round-trip metrics:
 // route/model/input-tokens are routing dimensions; TOON/RAG/cost are
 // the savings dimensions the dashboard renders. The handler builds
 // one of these after every proxied request (success, failure, or
@@ -429,6 +453,13 @@ type Deps struct {
 	// observability package — main.go wires a closure that adapts
 	// the event to the in-process rejection counter.
 	RejectionObserver RejectionObserver
+
+	// FusionOutcomeObserver is invoked once per fusion request after
+	// PanelStreaming returns, with the arbiter outcome (issue #187).
+	// Safe for concurrent use, must not block, nil is "no observer".
+	// The handler does not import observability; main.go wires a
+	// closure that forwards to RouteCounters.ObserveFusionOutcome.
+	FusionOutcomeObserver FusionOutcomeObserver
 
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
@@ -932,6 +963,12 @@ func Chat(d Deps) http.Handler {
 						slog.Float64("similarity", outcome.Similarity),
 						slog.String("request_id", reqID),
 					)
+				}
+				if d.FusionOutcomeObserver != nil {
+					d.FusionOutcomeObserver.ObserveFusionOutcome(FusionOutcomeEvent{
+						RequestID:      reqID,
+						ArbiterSkipped: outcome.ArbiterSkipped,
+					})
 				}
 			} else {
 				upErr = upstream.Panel(

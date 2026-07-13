@@ -518,6 +518,12 @@ func main() {
 	rejectionObs := handlers.RejectionObserverFunc(func(e handlers.RejectionEvent) {
 		routeCounters.ObserveRejection(e.Reason)
 	})
+	// Fusion outcome observer (issue #187). Records whether the fusion
+	// arbiter was skipped (panel members agreed) or invoked (disagreement).
+	// Surfaces as nexus_fusion_arbiter_total{outcome="skipped"|"invoked"}.
+	fusionOutcomeObs := handlers.FusionOutcomeObserverFunc(func(e handlers.FusionOutcomeEvent) {
+		routeCounters.ObserveFusionOutcome(e.ArbiterSkipped)
+	})
 	mux.Handle("/metrics", routeCounters.Handler())
 	slog.Info("metrics endpoint serves prometheus text format",
 		slog.String("path", "/metrics"),
@@ -540,6 +546,7 @@ func main() {
 		LocalCooldown:         localCooldown,
 		RouteDecisionObserver: routeDecisionObs,
 		RejectionObserver:     rejectionObs,
+		FusionOutcomeObserver: fusionOutcomeObs,
 	})
 	// Apply the per-client rate limiter (issue #75) as the outermost
 	// wrapper so a flood of requests is rejected before any middleware

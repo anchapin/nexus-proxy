@@ -237,3 +237,84 @@ func TestRouteCountersRejectionConcurrentSafe(t *testing.T) {
 		t.Errorf("expected rejection metric in output")
 	}
 }
+
+// TestRouteCountersFusionOutcome verifies the issue #187 fusion arbiter
+// counter family: ObserveFusionOutcome increments the skipped or invoked
+// counter and WriteTo emits nexus_fusion_arbiter_total{outcome} lines.
+func TestRouteCountersFusionOutcome(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveFusionOutcome(true)  // skipped
+	rc.ObserveFusionOutcome(true)  // skipped
+	rc.ObserveFusionOutcome(false) // invoked
+	rc.ObserveFusionOutcome(false) // invoked
+	rc.ObserveFusionOutcome(false) // invoked
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_fusion_arbiter_total", "metric family header"},
+		{`# TYPE nexus_fusion_arbiter_total counter`, "counter type line"},
+		{`nexus_fusion_arbiter_total{outcome="skipped"} 2`, "skipped counted twice"},
+		{`nexus_fusion_arbiter_total{outcome="invoked"} 3`, "invoked counted three times"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+}
+
+// TestRouteCountersFusionOutcomeDeterministicOrder verifies that repeated
+// scrapes produce identical output (sorted by outcome label) so
+// Prometheus diff alerts are not triggered by reordering.
+func TestRouteCountersFusionOutcomeDeterministicOrder(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveFusionOutcome(false) // invoked
+	rc.ObserveFusionOutcome(true)  // skipped
+
+	var first, second strings.Builder
+	_, _ = rc.WriteTo(&first)
+	_, _ = rc.WriteTo(&second)
+	if first.String() != second.String() {
+		t.Errorf("fusion output not deterministic between scrapes")
+	}
+}
+
+// TestRouteCountersFusionOutcomeConcurrentSafe exercises ObserveFusionOutcome
+// from many goroutines; the race detector is the primary assertion.
+func TestRouteCountersFusionOutcomeConcurrentSafe(t *testing.T) {
+	rc := NewRouteCounters()
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			rc.ObserveFusionOutcome(n%2 == 0) // alternate skipped/invoked
+		}(i)
+	}
+	wg.Wait()
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+	if !strings.Contains(out, "nexus_fusion_arbiter_total") {
+		t.Errorf("expected fusion arbiter metric in output")
+	}
+}
+
+// TestRouteCountersFusionOutcomeNilSafe verifies that nil receiver does not panic.
+func TestRouteCountersFusionOutcomeNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	// Must not panic.
+	rc.ObserveFusionOutcome(true)
+	rc.ObserveFusionOutcome(false)
+}
