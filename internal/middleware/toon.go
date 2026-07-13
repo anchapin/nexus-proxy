@@ -15,15 +15,41 @@ import (
 	"strings"
 )
 
-// JSONArrayBlock matches a fenced ```json ... ``` block whose body is a JSON
-// array of objects. We only compress the array-of-objects shape because TOON
-// is columnar — primitives and arrays of primitives don't benefit.
-var JSONArrayBlock = regexp.MustCompile("(?s)" + "```" + `json\s*(\[\s*\{.*?\}\s*\])\s*` + "```")
+// JSONArrayBlockRE is a loose fenced-block extractor. It captures any ```
+// wrapper (with or without a language tag) and its content. Validation that
+// the content is a JSON array of objects is done via json.Unmarshal in the
+// compression loop — this keeps the regex simple and avoids missing valid
+// shapes due to regex edge cases.
+var JSONArrayBlockRE = regexp.MustCompile("(?s)```(json)?\\s*([\\s\\S]*?)\\s*```")
 
-// CompressJSONBlocks rewrites every ```json [ {...}, ... ] ``` block in the
+// compressJSONBlock extracts a JSON array candidate from a fenced block and
+// returns the TOON replacement string. Returns ("", false) if the block
+// content cannot be parsed as []map[string]interface{}.
+func compressJSONBlock(block string) (toon string, ok bool) {
+	var arr []map[string]interface{}
+	if err := json.Unmarshal([]byte(block), &arr); err != nil {
+		return "", false
+	}
+	if len(arr) == 0 {
+		// Empty array — SerializeToTOON handles this gracefully but skip
+		// compressing empty blocks to keep output readable.
+		return "", false
+	}
+	out, err := SerializeToTOON([]byte(block))
+	if err != nil {
+		return "", false
+	}
+	return out, true
+}
+
+// CompressJSONBlocks rewrites every fenced JSON array block in the
 // user/assistant message content into a TOON text block. Returns true if any
 // block was rewritten. Schema is inferred from the first object's keys (sorted
 // lexicographically for stable column order).
+//
+// Unlike the old single-regex approach, this two-pass strategy accepts:
+//   - Any ``` wrapper (```json`, “ `, or bare)
+//   - Multi-line arrays whose objects span several lines
 //
 // Gotchas to be aware of when re-parsing TOON output downstream:
 //   - Commas inside string values are replaced with the full-width U+FF0C
@@ -42,13 +68,17 @@ func CompressJSONBlocks(messages []interface{}) bool {
 			continue
 		}
 		content, _ := msg["content"].(string)
-		matches := JSONArrayBlock.FindAllStringSubmatch(content, -1)
+
+		// Pass 1: loose regex extracts all fenced candidates.
+		matches := JSONArrayBlockRE.FindAllStringSubmatch(content, -1)
 		for _, m := range matches {
-			if len(m) < 2 {
+			// m[0] = full match, m[1] = optional language, m[2] = content
+			if len(m) < 3 {
 				continue
 			}
-			toon, err := SerializeToTOON([]byte(m[1]))
-			if err != nil {
+			cand := strings.TrimSpace(m[2])
+			toon, ok := compressJSONBlock(cand)
+			if !ok {
 				continue
 			}
 			block := "```text\n" + toon + "```"
