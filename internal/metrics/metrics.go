@@ -104,14 +104,14 @@ type Request struct {
 	BaselineCostUSD float64
 	SavingsUSD      float64
 
-	OutputTokens         int
-	TTFTMs               int64
-	TotalLatencyMs       float64
-	TPS                  float64
-	Streaming            bool
-	FusionArbiterSkipped   bool
+	OutputTokens            int
+	TTFTMs                  int64
+	TotalLatencyMs          float64
+	TPS                     float64
+	Streaming               bool
+	FusionArbiterSkipped    bool
 	FusionJaccardSimilarity float64
-	Error                  string
+	Error                   string
 
 	// Route-source metadata (issue #74).
 	RouteSource   string

@@ -212,15 +212,15 @@ type MetricsEvent struct {
 	BaselineCostUSD float64
 	SavingsUSD      float64
 
-	OutputTokens           int
-	TTFTMs                 int64
-	TotalLatencyMs         float64
-	TPS                    float64
-	Streaming              bool
-	FusionArbiterSkipped   bool
+	OutputTokens            int
+	TTFTMs                  int64
+	TotalLatencyMs          float64
+	TPS                     float64
+	Streaming               bool
+	FusionArbiterSkipped    bool
 	FusionJaccardSimilarity float64
-	ToolCallCount          int
-	Error                  string
+	ToolCallCount           int
+	Error                   string
 
 	RouteSource   string
 	RouteReason   string
@@ -1221,30 +1221,30 @@ func Chat(d Deps) http.Handler {
 			}
 			tps := telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 			d.MetricsObserver.Submit(MetricsEvent{
-				Timestamp:              rec.Timestamp,
-				RequestID:              reqID,
-				Route:                  string(route),
-				Model:                  model,
-				InputTokens:            rec.InputTokens,
-				TOONSavingsTokens:      savings,
-				RAGInjected:            ragInjected,
-				RAGFilename:            ragFilename,
-				EstimatedCostUSD:       cost,
-				BaselineCostUSD:        baselineCost,
-				SavingsUSD:             savingsCost,
-				OutputTokens:           outputTokens,
-				TTFTMs:                 ttftMs,
-				TotalLatencyMs:         totalMs,
-				TPS:                    tps,
-				Streaming:              streaming,
-				FusionArbiterSkipped:   fusionArbiterSkipped,
+				Timestamp:               rec.Timestamp,
+				RequestID:               reqID,
+				Route:                   string(route),
+				Model:                   model,
+				InputTokens:             rec.InputTokens,
+				TOONSavingsTokens:       savings,
+				RAGInjected:             ragInjected,
+				RAGFilename:             ragFilename,
+				EstimatedCostUSD:        cost,
+				BaselineCostUSD:         baselineCost,
+				SavingsUSD:              savingsCost,
+				OutputTokens:            outputTokens,
+				TTFTMs:                  ttftMs,
+				TotalLatencyMs:          totalMs,
+				TPS:                     tps,
+				Streaming:               streaming,
+				FusionArbiterSkipped:    fusionArbiterSkipped,
 				FusionJaccardSimilarity: fusionJaccardSimilarity,
-				ToolCallCount:          toolCallCount,
-				Error:                  rec.Error,
-				RouteSource:            string(decision.Source),
-				RouteReason:            decision.Reason,
-				SLMConfidence:          decision.Confidence,
-				SLMTaskType:            decision.TaskType,
+				ToolCallCount:           toolCallCount,
+				Error:                   rec.Error,
+				RouteSource:             string(decision.Source),
+				RouteReason:             decision.Reason,
+				SLMConfidence:           decision.Confidence,
+				SLMTaskType:             decision.TaskType,
 			})
 		} else {
 			d.Recorder.Record(rec)
@@ -1581,22 +1581,22 @@ func buildRecord(
 	}
 	outputTokens := int(bytesOut / 4)
 	rec := telemetry.Record{
-		Timestamp:              time.Now().UTC(),
-		RequestID:              requestID,
-		Model:                  model,
-		Route:                  string(route),
-		InputTokens:            telemetry.EstimateTokens(latestPrompt),
-		OutputTokens:           outputTokens,
-		TTFTMs:                 ttftMs,
-		TotalLatencyMs:         totalMs,
-		Streaming:              streaming,
-		FusionArbiterSkipped:   fusionArbiterSkipped,
+		Timestamp:               time.Now().UTC(),
+		RequestID:               requestID,
+		Model:                   model,
+		Route:                   string(route),
+		InputTokens:             telemetry.EstimateTokens(latestPrompt),
+		OutputTokens:            outputTokens,
+		TTFTMs:                  ttftMs,
+		TotalLatencyMs:          totalMs,
+		Streaming:               streaming,
+		FusionArbiterSkipped:    fusionArbiterSkipped,
 		FusionJaccardSimilarity: fusionJaccardSimilarity,
-		ToolCallCount:          toolCallCount,
-		RouteSource:            string(decision.Source),
-		RouteReason:            decision.Reason,
-		SLMConfidence:          decision.Confidence,
-		SLMTaskType:            decision.TaskType,
+		ToolCallCount:           toolCallCount,
+		RouteSource:             string(decision.Source),
+		RouteReason:             decision.Reason,
+		SLMConfidence:           decision.Confidence,
+		SLMTaskType:             decision.TaskType,
 	}
 	rec.TPS = telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 	if upErr != nil {

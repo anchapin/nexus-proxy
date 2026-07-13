@@ -70,20 +70,20 @@ const writeBufferSize = 16 << 10
 // neutral, 0 for non-SLM sources); SLMTaskType is the Categorize()
 // bucket (empty for non-SLM sources).
 type Record struct {
-	Timestamp            time.Time `json:"timestamp"`
-	RequestID            string    `json:"request_id"`
-	Model                string    `json:"model"`
-	Route                string    `json:"route"`
-	InputTokens          int       `json:"input_tokens"`
-	OutputTokens         int       `json:"output_tokens"`
-	TTFTMs               int64     `json:"ttft_ms"`
-	TotalLatencyMs       float64   `json:"total_latency_ms"`
-	TPS                  float64   `json:"tps"`
-	Streaming            bool      `json:"streaming"`
-	FusionArbiterSkipped   bool        `json:"fusion_arbiter_skipped,omitempty"`
-	FusionJaccardSimilarity float64    `json:"fusion_jaccard_similarity,omitempty"`
-	ToolCallCount        int          `json:"tool_call_count,omitempty"`
-	Error                string    `json:"error,omitempty"`
+	Timestamp               time.Time `json:"timestamp"`
+	RequestID               string    `json:"request_id"`
+	Model                   string    `json:"model"`
+	Route                   string    `json:"route"`
+	InputTokens             int       `json:"input_tokens"`
+	OutputTokens            int       `json:"output_tokens"`
+	TTFTMs                  int64     `json:"ttft_ms"`
+	TotalLatencyMs          float64   `json:"total_latency_ms"`
+	TPS                     float64   `json:"tps"`
+	Streaming               bool      `json:"streaming"`
+	FusionArbiterSkipped    bool      `json:"fusion_arbiter_skipped,omitempty"`
+	FusionJaccardSimilarity float64   `json:"fusion_jaccard_similarity,omitempty"`
+	ToolCallCount           int       `json:"tool_call_count,omitempty"`
+	Error                   string    `json:"error,omitempty"`
 
 	// Route-source metadata (issue #74). Omitempty keeps legacy
 	// JSONL rows byte-for-byte compatible when these fields are
