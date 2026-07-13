@@ -121,6 +121,11 @@ func main() {
 	// router defaults, so this is safe even when the feature is off.
 	slm.ConfidenceFloor = cfg.RoutingConfidenceFloor
 	slm.ConfidenceCeiling = cfg.RoutingConfidenceCeiling
+	// SLM routing decision cache (issue #162). Size 0 disables the cache.
+	// TTL 0 means no expiry (pure LRU eviction). Defaults: size=1024, TTL=5m.
+	if cfg.SLMCacheSize > 0 {
+		slm = slm.WithCache(cfg.SLMCacheSize, cfg.SLMCacheTTL)
+	}
 	re := regexp.MustCompile(formattingRegexPattern)
 
 	// Ollama health poller (issue #8). When NEXUS_HEALTH_POLL_INTERVAL
