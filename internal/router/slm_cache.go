@@ -28,7 +28,7 @@ type SLMCache struct {
 // TTL enforcement.
 type cachedDecision struct {
 	Route Route
-stamp  time.Time
+	stamp time.Time
 }
 
 // DefaultSLMCacheTTL is the default cache entry lifetime. 30 seconds
@@ -72,8 +72,8 @@ func (c *SLMCache) Set(prompt string, route Route) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries[prompt] = cachedDecision{
-		Route:  route,
-		stamp:  time.Now(),
+		Route: route,
+		stamp: time.Now(),
 	}
 }
 

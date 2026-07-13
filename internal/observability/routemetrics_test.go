@@ -271,6 +271,41 @@ func TestRouteCountersFusionOutcome(t *testing.T) {
 	}
 }
 
+// TestObserveCascadeFallback verifies the issue #205 cascade fallback
+// counter family: ObserveCascadeFallback increments a per-reason counter
+// and WriteTo emits nexus_cascade_fallback_total{reason} lines.
+func TestObserveCascadeFallback(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveCascadeFallback("timeout")
+	rc.ObserveCascadeFallback("timeout")
+	rc.ObserveCascadeFallback("transport_error")
+	rc.ObserveCascadeFallback("malformed_toolcall")
+	rc.ObserveCascadeFallback("malformed_toolcall")
+	rc.ObserveCascadeFallback("malformed_toolcall")
+
+	var sb2 strings.Builder
+	if _, err := rc.WriteTo(&sb2); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out2 := sb2.String()
+
+	checks2 := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_cascade_fallback_total", "metric family header"},
+		{`# TYPE nexus_cascade_fallback_total counter`, "counter type line"},
+		{`nexus_cascade_fallback_total{reason="timeout"} 2`, "timeout counted twice"},
+		{`nexus_cascade_fallback_total{reason="transport_error"} 1`, "transport_error counted once"},
+		{`nexus_cascade_fallback_total{reason="malformed_toolcall"} 3`, "malformed_toolcall counted three times"},
+	}
+	for _, c := range checks2 {
+		if !strings.Contains(out2, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out2)
+		}
+	}
+}
+
 // TestRAGCountersHitMiss verifies the issue #186 RAG retrieval
 // metric family: ObserveRAGHit increments per-filename counters and
 // ObserveRAGMiss increments per-reason counters. WriteTo emits
@@ -412,8 +447,50 @@ func TestRAGCountersNilSafe(t *testing.T) {
 	var rc *RouteCounters
 	rc.ObserveRAGHit("example.go")
 	rc.ObserveRAGMiss("threshold")
+}
+
+// TestObserveCascadeFallbackNilSafe verifies that nil receivers are safe.
+func TestObserveCascadeFallbackNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	// Must not panic.
+	rc.ObserveCascadeFallback("timeout")
 	n, err := rc.WriteTo(&strings.Builder{})
 	if err != nil || n != 0 {
 		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
+	}
+}
+
+// TestObserveCascadeFallbackEmptyReason verifies that empty reason is a no-op.
+func TestObserveCascadeFallbackEmptyReason(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveCascadeFallback("") // should be no-op
+	rc.ObserveCascadeFallback("timeout")
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+	// Should only have timeout, not an empty-string entry
+	if strings.Contains(out, `reason=""`) {
+		t.Errorf("empty reason should not appear in output:\n%s", out)
+	}
+	if !strings.Contains(out, `reason="timeout"} 1`) {
+		t.Errorf("timeout should appear in output:\n%s", out)
+	}
+}
+
+// TestObserveCascadeFallbackDeterministicOrder verifies sorted output.
+func TestObserveCascadeFallbackDeterministicOrder(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveCascadeFallback("transport_error")
+	rc.ObserveCascadeFallback("timeout")
+	rc.ObserveCascadeFallback("malformed_toolcall")
+
+	var first, second strings.Builder
+	_, _ = rc.WriteTo(&first)
+	_, _ = rc.WriteTo(&second)
+	if first.String() != second.String() {
+		t.Errorf("cascade fallback output not deterministic between scrapes")
 	}
 }

@@ -97,6 +97,13 @@ type counterKey struct {
 // body_too_large, bad_request, rate_limit, ...) defined as constants
 // in internal/handlers so the chat handler and the rate-limit
 // middleware agree on the vocabulary without importing this package.
+//
+// A fifth family (issue #205) records cascade fallback events:
+//
+// 腔   - nexus_cascade_fallback_total{reason}
+//
+// The reason label values are "timeout", "transport_error", or
+// "malformed_toolcall".
 type RouteCounters struct {
 	mu sync.Mutex
 
@@ -109,6 +116,7 @@ type RouteCounters struct {
 	fusionArbiter            map[string]*uint64
 	rRAGHits                 map[string]*uint64
 	rRAGMisses               map[string]*uint64
+	cascadeFallbacks         map[string]*uint64
 }
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
@@ -124,6 +132,7 @@ func NewRouteCounters() *RouteCounters {
 		fusionArbiter:            make(map[string]*uint64),
 		rRAGHits:                 make(map[string]*uint64),
 		rRAGMisses:               make(map[string]*uint64),
+		cascadeFallbacks:         make(map[string]*uint64),
 	}
 }
 
@@ -298,6 +307,18 @@ func (rc *RouteCounters) ObserveSLMCacheMiss() {
 	atomic.AddUint64(rc.slmCacheMisses, 1)
 }
 
+// ObserveCascadeFallback records a single cascade fallback event,
+// partitioned by reason (issue #205). Call this after Cascade.Run
+// returns when FallbackReason is non-empty. The method is safe for
+// concurrent use and never blocks; nil receivers are a no-op.
+// reason is one of "timeout", "transport_error", or "malformed_toolcall".
+func (rc *RouteCounters) ObserveCascadeFallback(reason string) {
+	if rc == nil || reason == "" {
+		return
+	}
+	atomic.AddUint64(rc.cascadeFallbackSlot(reason), 1)
+}
+
 // reasonSlot returns the *uint64 for reason, creating it if absent.
 // Same lock-then-atomic pattern as slot: the mutex guards the map
 // mutation only, the increment happens lock-free.
@@ -308,6 +329,20 @@ func (rc *RouteCounters) reasonSlot(reason string) *uint64 {
 		v := uint64(0)
 		p = &v
 		rc.rejections[reason] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
+// cascadeFallbackSlot returns the *uint64 for cascade fallback reason,
+// creating it if absent. Same lock-then-atomic pattern as slot.
+func (rc *RouteCounters) cascadeFallbackSlot(reason string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.cascadeFallbacks[reason]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.cascadeFallbacks[reason] = p
 	}
 	rc.mu.Unlock()
 	return p
@@ -391,6 +426,13 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	if n, err := writeRAGSeries(w, "nexus_rag_retrieval_total",
 		"RAG retrieval outcomes partitioned by hit/miss and reason or filename.",
 		rc.rRAGHits, rc.rRAGMisses); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeRejectionSeries(w, "nexus_cascade_fallback_total",
+		"Cascade fallback events partitioned by reason (timeout, transport_error, malformed_toolcall).",
+		rc.cascadeFallbacks); err != nil {
 		return total, err
 	} else {
 		total += n

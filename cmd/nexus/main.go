@@ -538,6 +538,14 @@ func main() {
 	fusionOutcomeObs := handlers.FusionOutcomeObserverFunc(func(e handlers.FusionOutcomeEvent) {
 		routeCounters.ObserveFusionOutcome(e.ArbiterSkipped)
 	})
+	// Cascade fallback observer (issue #205): the chat handler dispatches
+	// one CascadeFallbackEvent per request when a retryable step failure
+	// caused the cascade to fall back to the next step. The closure
+	// forwards the reason to the in-process counter so it surfaces in
+	// /metrics as nexus_cascade_fallback_total{reason}.
+	cascadeFallbackObs := handlers.CascadeFallbackObserverFunc(func(e handlers.CascadeFallbackEvent) {
+		routeCounters.ObserveCascadeFallback(e.Reason)
+	})
 	mux.Handle("/metrics", routeCounters.Handler())
 	slog.Info("metrics endpoint serves prometheus text format",
 		slog.String("path", "/metrics"),
@@ -565,25 +573,26 @@ func main() {
 	}
 
 	chatHandler := handlers.Chat(handlers.Deps{
-		Config:                cfg,
-		Client:                httpClient,
-		RAG:                   store,
-		SLM:                   slm,
-		FormattingRegex:       re,
-		Confidence:            confidenceObs,
-		SLMCache:              slmCache,
-		JudgeObserver:         judgeObs,
-		QualityObserver:       qualityO,
-		MetricsObserver:       metricsObs,
-		Recorder:              recorder,
-		Health:                hpoller,
-		BudgetObserver:        budgetObserver(probeMgr),
-		LocalLimiter:          localLimiter,
-		LocalCooldown:         localCooldown,
-		RouteDecisionObserver: routeDecisionObs,
-		RejectionObserver:     rejectionObs,
-		FusionOutcomeObserver: fusionOutcomeObs,
-		RAGObserver:           ragObserver,
+		Config:                  cfg,
+		Client:                  httpClient,
+		RAG:                     store,
+		SLM:                     slm,
+		FormattingRegex:         re,
+		Confidence:              confidenceObs,
+		SLMCache:                slmCache,
+		JudgeObserver:           judgeObs,
+		QualityObserver:         qualityO,
+		MetricsObserver:         metricsObs,
+		Recorder:                recorder,
+		Health:                  hpoller,
+		BudgetObserver:          budgetObserver(probeMgr),
+		LocalLimiter:            localLimiter,
+		LocalCooldown:           localCooldown,
+		RouteDecisionObserver:   routeDecisionObs,
+		RejectionObserver:       rejectionObs,
+		FusionOutcomeObserver:   fusionOutcomeObs,
+		RAGObserver:             ragObserver,
+		CascadeFallbackObserver: cascadeFallbackObs,
 	})
 	// Apply the per-client rate limiter (issue #75) as the outermost
 	// wrapper so a flood of requests is rejected before any middleware
