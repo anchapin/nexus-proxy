@@ -147,6 +147,17 @@ const (
 	RejectionRateLimit = "rate_limit"
 )
 
+// Header names for per-request debug tracing (issue #242).
+const (
+	// NexusTraceIDHeader is the inbound header an operator sets to
+	// request a structured debug trace for a specific request. The
+	// value must match the request's X-Request-Id (or the generated
+	// id when no X-Request-Id was supplied) for the trace to fire.
+	// This lets operators trace a single complaint request without
+	// enabling NEXUS_DEBUG=true globally.
+	NexusTraceIDHeader = "X-Nexus-Trace-ID"
+)
+
 // RejectionEvent carries the minimal context a rejection observer
 // needs: which request was rejected and why. The handler dispatches
 // one per early-return path (issue #119) so the Prometheus counter
@@ -599,6 +610,13 @@ const DefaultObservedCap = 256 * 1024 // 256 KiB
 // Prometheus counter stays in sync with the response surface. The
 // rate-limit middleware's 429 path is instrumented separately (it fires
 // before this handler) via a hook wired in main.go.
+//
+// Per-request debug tracing (issue #242): the operator can request a
+// structured debug trace for a specific request without enabling
+// NEXUS_DEBUG=true globally by passing the X-Nexus-Trace-ID header
+// with a value equal to that request's X-Request-Id (or the generated
+// request id when no X-Request-Id was supplied). This traces exactly
+// one request without flooding logs for all traffic.
 func Chat(d Deps) http.Handler {
 	if d.maxObservedBytes <= 0 {
 		d.maxObservedBytes = DefaultObservedCap
@@ -610,16 +628,24 @@ func Chat(d Deps) http.Handler {
 		reqID := requestID(r)
 		started := time.Now()
 
+		// Per-request debug trace flag (issue #242). True when the
+		// global NEXUS_DEBUG=true OR when the operator sent the
+		// X-Nexus-Trace-ID header with a value matching this
+		// request's id. Lets operators trace a single complaint
+		// request without flooding logs for all traffic.
+		traceThisRequest := d.Config.Debug ||
+			r.Header.Get(NexusTraceIDHeader) == reqID
+
 		// Debug trace scaffolding (issue #33). Allocated up front so
 		// each lifecycle step can populate its sub-trace; emitted as
 		// a single batch at the very end. The trace variable is a
 		// single DebugTrace value — not a pointer — so the hot path
-		// (Debug=false) never allocates at all. The conditional at
-		// emit time keeps the production cost at zero.
+		// (traceThisRequest=false) never allocates at all. The
+		// conditional at emit time keeps the production cost at zero.
 		var trace DebugTrace
 		trace.Request.RequestID = reqID
 		trace.Request.Stream = true // overridden after parse if harness says stream=false
-		if d.Config.Debug {
+		if traceThisRequest {
 			slog.Debug("[DEBUG] handler entered",
 				slog.String("request_id", reqID),
 			)
@@ -711,7 +737,7 @@ func Chat(d Deps) http.Handler {
 		// middleware mutates messages. Populating these fields is
 		// cheap (a few assignments) so we do it unconditionally; the
 		// DebugTrace.Emit call is the only path that actually reads
-		// them, and that's gated by d.Config.Debug below.
+		// them, and that's gated by traceThisRequest below.
 		trace.Request.Messages = len(rawMessages)
 		trace.Request.InboundBodyBytes = len(bodyBytes)
 		if m, ok := body["model"].(string); ok {
@@ -1180,9 +1206,11 @@ func Chat(d Deps) http.Handler {
 			// captureWriter is installed when at least one observer
 			// is set OR debug tracing is on (issue #33); otherwise
 			// the dispatch writes directly through obs with zero
-			// overhead.
+			// overhead. traceThisRequest covers both the global
+			// NEXUS_DEBUG flag and the per-request X-Nexus-Trace-ID
+			// opt-in (issue #242).
 			rw := http.ResponseWriter(obs)
-			if d.JudgeObserver != nil || d.QualityObserver != nil || d.Config.Debug {
+			if d.JudgeObserver != nil || d.QualityObserver != nil || traceThisRequest {
 				capw = newCaptureWriter(obs, d.maxObservedBytes)
 				rw = capw
 			}
@@ -1440,10 +1468,12 @@ func Chat(d Deps) http.Handler {
 		// describes the full request lifecycle. Emission happens
 		// AFTER the metrics dispatch so the trace can include the
 		// final response status (which http.Error may have set
-		// before we got here). The trace is gated on the
-		// pre-existing flag, so the production path pays zero
-		// allocations when NEXUS_DEBUG is unset.
-		if d.Config.Debug {
+		// before we got here). The trace is gated on
+		// traceThisRequest (issue #242), which covers both the
+		// global NEXUS_DEBUG flag and the per-request
+		// X-Nexus-Trace-ID opt-in, so the production path pays
+		// zero allocations when neither is set.
+		if traceThisRequest {
 			trace.Response.Status = obs.StatusCode()
 			trace.Response.TTFTMs = ttftMs
 			trace.Response.TotalBytes = obs.BytesOut()
