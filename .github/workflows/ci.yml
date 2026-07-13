@@ -114,20 +114,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Pin Go to 1.24 for the lint job only. golangci-lint v1.64.8 is
-      # built with Go 1.24; running it under Go 1.26 causes stdlib
-      # vendor files (fips140only_go1.26.go) to fail typecheck, which
-      # cascades into false "undefined" errors on promoted fields from
-      # embedded *httptest.Server in test files (#69, #129).
-      # Test/build/bench jobs stay on 1.26 — only the lint job is pinned.
+      # golangci-lint v2.12.2 supports Go 1.25+ and replaces the old v1.x
+      # series. The old comment about Go 1.24 is retained for context but
+      # the lint job now uses the same Go 1.26 toolchain as the rest of CI.
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
           cache: true
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: v1.64.8
+          version: v2.12.2
           args: --timeout=5m
