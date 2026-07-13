@@ -196,3 +196,27 @@ func TestRejectionObserverFuncAdapter(t *testing.T) {
 		t.Errorf("adapter captured %+v", got)
 	}
 }
+
+// TestRejectionQueueConstants verifies the queue overflow rejection
+// constants have the expected string values (issue #168).
+func TestRejectionQueueConstants(t *testing.T) {
+	if RejectionJudgeQueue != "judge_queue" {
+		t.Errorf("RejectionJudgeQueue = %q, want %q", RejectionJudgeQueue, "judge_queue")
+	}
+	if RejectionQualityQueue != "quality_queue" {
+		t.Errorf("RejectionQualityQueue = %q, want %q", RejectionQualityQueue, "quality_queue")
+	}
+}
+
+// TestRejectionObserverFuncQueueOverflow exercises the RejectionObserverFunc
+// adapter with the queue overflow reasons so the wiring in main.go is covered.
+func TestRejectionObserverFuncQueueOverflow(t *testing.T) {
+	for _, reason := range []string{RejectionJudgeQueue, RejectionQualityQueue} {
+		var got RejectionEvent
+		f := RejectionObserverFunc(func(e RejectionEvent) { got = e })
+		f.ObserveRejection(RejectionEvent{RequestID: "req-queue", Reason: reason})
+		if got.RequestID != "req-queue" || got.Reason != reason {
+			t.Errorf("adapter captured %+v for reason %q", got, reason)
+		}
+	}
+}
