@@ -178,6 +178,10 @@ func newCheckOllamaFixture(t *testing.T) *checkOllamaFixture {
 			_, _ = w.Write([]byte(`{"models":[]}`))
 		case "/api/ps":
 			_, _ = w.Write([]byte(`{"models":[]}`))
+		case "/api/embeddings":
+			// Return a valid embedding response so the embedding
+			// model check passes without every test having to stub it.
+			_, _ = w.Write([]byte(`{"embedding":[0.1,0.2,0.3]}`))
 		default:
 			http.NotFound(w, r)
 		}

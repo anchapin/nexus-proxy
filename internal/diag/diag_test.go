@@ -16,16 +16,18 @@ import (
 )
 
 // ollamaFixture wires an httptest server with the endpoints the diag
-// checks depend on (currently /api/tags). Tests register the canned
-// model inventory via the Tags handler and the canned /api/ps body
-// via PS; both default to "empty + healthy" so a happy-path test
-// only needs to override the fields it cares about.
+// checks depend on (currently /api/tags and /api/embeddings). Tests
+// register the canned model inventory via the Tags handler and the
+// canned /api/ps body via PS; both default to "empty + healthy" so a
+// happy-path test only needs to override the fields it cares about.
 type ollamaFixture struct {
 	*httptest.Server
-	tagsBody atomic.Value // string — JSON document for /api/tags
-	psBody   atomic.Value // string — JSON document for /api/ps
-	tagCalls atomic.Int32
-	psCalls  atomic.Int32
+	tagsBody   atomic.Value // string — JSON document for /api/tags
+	psBody     atomic.Value // string — JSON document for /api/ps
+	embedBody  atomic.Value // string — JSON document for /api/embeddings
+	tagCalls   atomic.Int32
+	psCalls    atomic.Int32
+	embedCalls atomic.Int32
 }
 
 func newOllamaFixture(t *testing.T) *ollamaFixture {
@@ -47,6 +49,16 @@ func newOllamaFixture(t *testing.T) *ollamaFixture {
 			body, _ := f.psBody.Load().(string)
 			if body == "" {
 				body = `{"models":[]}`
+			}
+			_, _ = w.Write([]byte(body))
+		case "/api/embeddings":
+			f.embedCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			body, _ := f.embedBody.Load().(string)
+			if body == "" {
+				// Default: return a valid embedding response so the
+				// check passes without every test having to stub it.
+				body = `{"embedding":[0.1,0.2,0.3]}`
 			}
 			_, _ = w.Write([]byte(body))
 		default:
@@ -201,6 +213,85 @@ func TestRunModelMatchedByBaseName(t *testing.T) {
 	got := checkByName(res, checkLocalModel)
 	if got.Status != StatusPass {
 		t.Errorf("local model = %s (detail=%s), want pass", got.Status, got.Detail)
+	}
+}
+
+func TestRunEmbeddingModelFunctional(t *testing.T) {
+	// Embedding model is listed AND responds to /api/embeddings with
+	// a non-empty vector — check should pass.
+	ollama := newOllamaFixture(t)
+	ollama.tagsBody.Store(`{"models":[{"name":"nomic-embed-text"}]}`)
+	ollama.embedBody.Store(`{"embedding":[0.1,0.2,0.3,0.4,0.5]}`)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkEmbeddingModel)
+	if got.Status != StatusPass {
+		t.Errorf("embedding = %s (detail=%s), want pass", got.Status, got.Detail)
+	}
+	if !strings.Contains(got.Detail, "5-dim") {
+		t.Errorf("detail should report vector dimensions: %s", got.Detail)
+	}
+	if ollama.embedCalls.Load() == 0 {
+		t.Error("/api/embeddings was never called")
+	}
+}
+
+func TestRunEmbeddingModelEmptyVectorIsFail(t *testing.T) {
+	// Ollama responds with 200 but an empty embedding — the model
+	// is corrupt or incompatible; should be a failure.
+	ollama := newOllamaFixture(t)
+	ollama.tagsBody.Store(`{"models":[{"name":"nomic-embed-text"}]}`)
+	ollama.embedBody.Store(`{"embedding":[]}`)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkEmbeddingModel)
+	if got.Status != StatusFail {
+		t.Errorf("embedding = %s (detail=%s), want fail", got.Status, got.Detail)
+	}
+	if !strings.Contains(got.Detail, "empty embedding") {
+		t.Errorf("detail should mention empty embedding: %s", got.Detail)
+	}
+}
+
+func TestRunEmbeddingModelAPIFailure(t *testing.T) {
+	// Embedding model is in the inventory but /api/embeddings returns
+	// a non-200 status — the model is pulled but not functional.
+	ollama := newOllamaFixture(t)
+	ollama.tagsBody.Store(`{"models":[{"name":"nomic-embed-text"}]}`)
+	// Override the embeddings handler to return 500 after the call is made.
+	originalHandler := ollama.Server.Config.Handler
+	ollama.Server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/embeddings" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"model not loaded"}`))
+			return
+		}
+		originalHandler.ServeHTTP(w, r)
+	})
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkEmbeddingModel)
+	if got.Status != StatusFail {
+		t.Errorf("embedding = %s (detail=%s), want fail", got.Status, got.Detail)
+	}
+	if !strings.Contains(got.Detail, "500") {
+		t.Errorf("detail should mention status 500: %s", got.Detail)
+	}
+}
+
+func TestRunEmbeddingModelNoModelConfigured(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	ollama.tagsBody.Store(`{"models":[{"name":"qwen3-coder:8b"}]}`)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.EmbeddingModel = ""
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkEmbeddingModel)
+	if got.Status != StatusFail {
+		t.Errorf("embedding = %s, want fail when no model configured", got.Status)
 	}
 }
 
