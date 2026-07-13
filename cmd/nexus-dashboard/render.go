@@ -60,13 +60,10 @@ func allEmpty(summs []metrics.Summary) bool {
 func renderTable(summs []metrics.Summary, costPer1k float64, w io.Writer) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	// Header. The route distribution is split into three columns
-	// (LOCAL / FRONTIER / FUSION) per the issue spec. SPENT shows
-	// actual estimated cost; SAVED shows the cost-avoidance figure
-	// (baseline - actual, issue #73). $$ SAVED (TOON) remains the
-	// TOON-compression-only valuation for backward compatibility.
-	fmt.Fprintln(tw, "DATE\tTOTAL\tLOCAL\tFRONTIER\tFUSION\tTOON SAVED\t$$ SAVED (TOON)\tSPENT\tSAVED")
+	// (LOCAL / FRONTIER / FUSION) per the issue spec.
+	fmt.Fprintln(tw, "DATE\tTOTAL\tLOCAL\tFRONTIER\tFUSION\tTOON SAVED\t$$ SAVED (TOON)")
 	for _, s := range summs {
-		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\t%s\t%s\n",
 			s.Date.Format("2006-01-02"),
 			s.RequestCount,
 			s.LocalCount,
@@ -74,8 +71,6 @@ func renderTable(summs []metrics.Summary, costPer1k float64, w io.Writer) error 
 			s.FusionCount,
 			comma(s.TOONSavingsTokens),
 			formatUSD(savingsUSD(s, costPer1k)),
-			formatUSD(s.EstimatedCostTotal),
-			formatUSD(s.SavingsTotal),
 		)
 	}
 	if err := tw.Flush(); err != nil {
@@ -102,8 +97,6 @@ type dayJSON struct {
 	Fusion              int     `json:"fusion"`
 	TOONSavedTokens     int     `json:"toon_saved_tokens"`
 	EstimatedSavingsUSD float64 `json:"estimated_savings_usd"`
-	SpentUSD            float64 `json:"spent_usd"`
-	SavedUSD            float64 `json:"saved_usd"`
 }
 
 // renderJSON writes the summaries as a JSON array. The output is a top
@@ -122,8 +115,6 @@ func renderJSON(summs []metrics.Summary, costPer1k float64, w io.Writer) error {
 			Fusion:              s.FusionCount,
 			TOONSavedTokens:     s.TOONSavingsTokens,
 			EstimatedSavingsUSD: roundUSD(savingsUSD(s, costPer1k)),
-			SpentUSD:            roundUSD(s.EstimatedCostTotal),
-			SavedUSD:            roundUSD(s.SavingsTotal),
 		})
 	}
 	enc := json.NewEncoder(w)

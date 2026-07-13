@@ -1,0 +1,179 @@
+# Nexus Proxy — structured YAML configuration (issue #31)
+#
+# Copy this file to `nexus.yaml` (in the same directory you'll launch the
+# binary from) and edit values to taste. The file is optional — when
+# absent, the binary boots from env vars alone, identical to the
+# pre-#31 behaviour.
+#
+# Precedence chain (highest wins):
+#
+#   1. --config <path>      (CLI flag, parsed by main.go)
+#   2. NEXUS_CONFIG         (env var pointing at a file)
+#   3. nexus.yaml / nexus.yml / nexus.json in CWD
+#   4. ${VAR} placeholders inside any value above resolve from env vars
+#   5. env vars override file values
+#   6. built-in defaults apply last
+#
+# Notes on secrets: prefer leaving `api_key:` as a `${VAR}` placeholder
+# so secrets stay in your shell / systemd unit / secret manager rather
+# than on disk. The parser expands `${VAR}` and `$VAR` at load time.
+
+# --- HTTP server ----------------------------------------------------------
+server:
+  # Bind address (issue #1).
+  addr: ":8000"
+  # Hard cap on request body size in bytes (issue #11). Default 1 MiB
+  # matches typical OpenAI chat-completions requests.
+  max_body_bytes: 1048576
+
+# --- Structured logging (issue #3) ---------------------------------------
+log:
+  # Minimum log level: debug | info | warn | error. Default: info.
+  level: info
+  # Wire format: json | text. Default: json.
+  format: json
+
+# --- Local Ollama ---------------------------------------------------------
+ollama:
+  # Base URL of the local Ollama daemon. Trailing slash is auto-trimmed.
+  url: http://localhost:11434
+  # Small, fast model used by the routing SLM (Qwen3-Coder recommended).
+  router_model: qwen3-coder:4b
+  # Model used to actually execute local-bound requests.
+  local_model: qwen3-coder:8b
+  # Embedding model for RAG few-shot retrieval.
+  embedding_model: nomic-embed-text
+
+# --- Frontier API (OpenAI-compatible) ------------------------------------
+frontier:
+  # Chat-completions endpoint URL.
+  url: https://api.openai.com/v1/chat/completions
+  # Model name passed through to the endpoint.
+  model: gpt-4o
+  # Bearer token. Reference an env var so secrets don't land on disk:
+  api_key: ${NEXUS_FRONTIER_API_KEY}
+
+# --- Cascade fallback (issue #14) ----------------------------------------
+# Optional second fallback in the local-route cascade. Leave api_key
+# empty (or unset) to skip z.ai entirely.
+zai:
+  url: https://api.z.ai/v1/chat/completions
+  model: glm-4.6
+  api_key: ${NEXUS_ZAI_API_KEY}
+
+# --- RAG ------------------------------------------------------------------
+rag:
+  # Directory of golden code snippets; auto-created if missing.
+  examples_dir: ./few_shot_examples
+  # Cosine similarity threshold (0.0-1.0) above which a few-shot is
+  # injected into the system prompt.
+  threshold: 0.55
+
+# --- Routing timeouts -----------------------------------------------------
+routing:
+  # Estimated input tokens above this force-route to frontier (VRAM
+  # guardrail). The chat handler uses the live probe measurement when
+  # available and falls back to this value otherwise.
+  token_guardrail: 6000
+  # Per-call timeout for the Qwen3-Coder routing decision.
+  slm_timeout: 8s
+  # Per-panel-member fetch timeout for the fusion route.
+  fusion_timeout: 120s
+  # Per-attempt timeout for each cascade fallback member.
+  cascade_timeout: 30s
+  # Per-call timeout for the fusion arbiter synthesis step (issue #12).
+  arbiter_timeout: 60s
+
+# --- Ollama health poller (issue #8) ------------------------------------
+health:
+  # Background poll cadence for /api/tags. Set to "0s" to disable
+  # polling entirely (the chat handler then treats Ollama as always
+  # healthy and pays the upstream timeout when it's down).
+  poll_interval: 30s
+  # Consecutive failed probes before the breaker trips and the local
+  # route is treated as unhealthy. Reopens on the next successful probe.
+  breaker_threshold: 3
+  # Per-probe HTTP timeout. Probes that exceed this count as failures.
+  probe_timeout: 5s
+  # Controls /readyz behaviour (issue #42). "degraded" (default)
+  # always returns 200 when the process is alive and surfaces the
+  # real subsystem state via the body's "degraded" field. "strict"
+  # returns 503 when neither Ollama nor a frontier API key can serve
+  # traffic, so the orchestrator stops sending the pod new requests.
+  # Unknown values fall back to "degraded".
+  readiness_mode: degraded
+
+# --- Async LLM-as-a-Judge evaluator (issue #15) -------------------------
+# Disabled when sample_rate is <= 0. Falls back to the frontier URL
+# when `url:` is empty.
+judge:
+  url: https://api.z.ai/v1/chat/completions
+  model: gpt-4o
+  api_key: ${NEXUS_JUDGE_API_KEY}
+  # Fraction (0.0-1.0) of completed local-route requests that get graded.
+  sample_rate: 0.1
+  # Max simultaneous judge calls; keeps frontier rate-limit headroom.
+  concurrency: 2
+  # Buffered queue size; enqueue is non-blocking and drops on overflow.
+  queue: 64
+  # Per-call judge timeout.
+  timeout: 30s
+  # Rough USD per 1k tokens (input+output) used for cost estimates.
+  cost_per_1k: 0.002
+
+# --- Telemetry ------------------------------------------------------------
+# JSON-lines log written by the background telemetry goroutine. Set
+# `path:` to "" to disable recording entirely. Schema: one JSON
+# object per line — see internal/telemetry.Record.
+telemetry:
+  path: ./nexus-telemetry.jsonl
+
+# --- Metrics store (issue #4) ---------------------------------------------
+# SQLite database for the savings dashboard. Set `db_path:` to "" to
+# disable the metrics store. Parent directories are created on demand.
+metrics:
+  db_path: ~/.cache/nexus-proxy/metrics.db
+
+# --- AST/compiler verifier (issue #13) ------------------------------------
+# Detected file edits in upstream responses are enqueued for a
+# background `cargo check` / `npx tsc`. Set `concurrency:` to 0 to
+# disable entirely; the chat hot path is unaffected.
+quality:
+  # Max parallel verifier workers.
+  concurrency: 2
+  # Buffered queue size; enqueue is non-blocking and drops on overflow.
+  queue: 64
+  # Per-check timeout (cargo / tsc) — anything slower is scored as 0.
+  timeout: 60s
+  # Stderr bytes retained per verdict (truncated from the tail).
+  stderr_cap: 2048
+
+# --- VRAM probe (issue #6) ------------------------------------------------
+probe:
+  # Background re-probe cadence. Set to "0s" to disable periodic
+  # polling; the boot probe still runs synchronously once.
+  interval: 60s
+  # Per-probe HTTP timeout.
+  timeout: 5s
+  # VRAM->token heuristic. 256 KiB per token works out to ~32k tokens
+  # of safe headroom on an 8 GiB GPU.
+  bytes_per_token: 262144
+
+# --- HTTP connection pool (issue #34) --------------------------------------
+# Every outbound call shares a single *http.Client wired with a custom
+# *http.Transport. The Go stdlib default (MaxIdleConnsPerHost=2) is the
+# very bottleneck this fixes; raise the per-host idle cap so the chat
+# handler + SLM + RAG goroutines can all hit the local Ollama without
+# fighting for two idle conns.
+http:
+  # Total idle conns across all hosts (default 100).
+  max_idle_conns: 100
+  # Idle conns retained per host (default 16). Raise for higher-fanout
+  # workloads; lower to keep the pool small.
+  max_idle_conns_per_host: 16
+  # Total (in-flight + idle) conns per host. 0 == unlimited.
+  max_conns_per_host: 0
+  # How long an idle connection stays in the pool.
+  idle_conn_timeout: 90s
+  # Disable HTTP keep-alive (rarely wanted; default false).
+  disable_keepalives: false

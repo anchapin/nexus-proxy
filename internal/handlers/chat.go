@@ -47,16 +47,18 @@ type LocalCompletion struct {
 // goroutine that serves the request so the observer should not block
 // long. The handler also enforces a body-size cap before invoking
 // the hook so a runaway model cannot blow the observer's memory.
+// Submit reports whether the sample was accepted (true) or dropped
+// (false, e.g. queue full).
 type JudgeObserver interface {
-	Submit(LocalCompletion)
+	Submit(LocalCompletion) bool
 }
 
 // JudgeObserverFunc adapts a plain function to the JudgeObserver
 // interface so wiring from main.go stays a one-liner.
-type JudgeObserverFunc func(LocalCompletion)
+type JudgeObserverFunc func(LocalCompletion) bool
 
 // Submit implements JudgeObserver.
-func (f JudgeObserverFunc) Submit(c LocalCompletion) { f(c) }
+func (f JudgeObserverFunc) Submit(c LocalCompletion) bool { return f(c) }
 
 // QualityEvent is emitted to the QualityObserver hook each time the
 // handler detects a tool call in an upstream response that looks like
@@ -169,6 +171,37 @@ type RejectionObserverFunc func(RejectionEvent)
 
 // ObserveRejection implements RejectionObserver.
 func (f RejectionObserverFunc) ObserveRejection(e RejectionEvent) { f(e) }
+
+// StreamTruncationEvent is emitted to the StreamTruncationObserver
+// hook when the streaming proxy detects a mid-stream upstream TCP
+// drop and emits a synthetic `data: [DONE]` sentinel so the
+// downstream harness does not hang (issue #118). Carries the route so
+// the Prometheus counter can partition truncations by destination
+// (local / frontier / fusion).
+type StreamTruncationEvent struct {
+	RequestID string
+	Route     string
+}
+
+// StreamTruncationObserver is the hook invoked when an upstream
+// stream is truncated mid-flight (issue #118): upstream.StreamWithContext
+// hit an io.ErrUnexpectedEOF / connection-reset after forwarding at
+// least one chunk and self-healed by emitting a truncation event +
+// [DONE]. Same invariants as the other observer hooks: safe for
+// concurrent use, must not block, nil means "no observer". The
+// handler does not import the observability package; main.go wires a
+// closure that forwards to RouteCounters.ObserveStreamTruncation.
+type StreamTruncationObserver interface {
+	ObserveStreamTruncation(StreamTruncationEvent)
+}
+
+// StreamTruncationObserverFunc adapts a plain function to the
+// StreamTruncationObserver interface so wiring from main.go stays a
+// one-liner.
+type StreamTruncationObserverFunc func(StreamTruncationEvent)
+
+// ObserveStreamTruncation implements StreamTruncationObserver.
+func (f StreamTruncationObserverFunc) ObserveStreamTruncation(e StreamTruncationEvent) { f(e) }
 
 // MetricsEvent carries the per-request data needed by the savings
 // dashboard (issue #4). Fields track the full Round-trip metrics:
@@ -430,6 +463,19 @@ type Deps struct {
 	// the event to the in-process rejection counter.
 	RejectionObserver RejectionObserver
 
+	// StreamTruncationObserver is invoked when the streaming proxy
+	// detects a mid-stream upstream TCP drop (issue #118).
+	// upstream.StreamWithContext self-heals by emitting a truncation
+	// event + `data: [DONE]` so the harness does not hang, and
+	// returns upstream.ErrUpstreamTruncated; the handler dispatches
+	// this hook so /metrics records the truncation and stamps
+	// X-Nexus-Truncated on the response. Implementations must be
+	// safe for concurrent use and must not block. Nil is treated as
+	// "no observer"; the hot path is unaffected. The handler does
+	// not import the observability package — main.go wires a closure
+	// that adapts the event to the in-process truncation counter.
+	StreamTruncationObserver StreamTruncationObserver
+
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
 	// copy used for sampling is bounded. Zero uses DefaultObservedCap.
@@ -665,7 +711,20 @@ func Chat(d Deps) http.Handler {
 		// (see internal/telemetry.EstimateTokens).
 		preCompressionChars := totalMessageChars(messages)
 		trace.Transforms.TOONBytesBefore = preCompressionChars
-		if middleware.CompressJSONBlocks(messages) {
+		// TOON compression runs in two passes: the fenced-block path
+		// (CompressJSONBlocks) always fires, then the unfenced-array
+		// path (CompressUnfencedJSONArrays, issue #123) handles bare
+		// `[ {...} ]` arrays pasted without a code fence. The unfenced
+		// pass is gated by NEXUS_TOON_UNFENCED so operators with a
+		// downstream parser that depends on raw JSON can revert. Both
+		// passes shrink the message between the pre/post snapshots
+		// below, so the existing token-savings accounting captures
+		// them without bespoke bookkeeping.
+		toonRewrote := middleware.CompressJSONBlocks(messages)
+		if d.Config.TOONUnfenced && middleware.CompressUnfencedJSONArrays(messages) {
+			toonRewrote = true
+		}
+		if toonRewrote {
 			if d.Config.PromptInjectionIsolated() {
 				messages = middleware.AppendSystemNoteIsolated(messages, d.Config.TOONNotice)
 			} else {
@@ -1060,12 +1119,16 @@ func Chat(d Deps) http.Handler {
 					toolCallCount = len(res.ToolCalls)
 					if res.Succeeded && capw != nil {
 						if d.JudgeObserver != nil {
-							d.JudgeObserver.Submit(LocalCompletion{
+							if !d.JudgeObserver.Submit(LocalCompletion{
 								RequestID:   reqID,
 								Instruction: latestPrompt,
 								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
-							})
+							}) {
+								slog.Warn("judge sample dropped by observer",
+									slog.String("request_id", reqID),
+								)
+							}
 						}
 						if d.QualityObserver != nil {
 							emitDetectedEdits(capw.Buffer(), reqID, d.QualityObserver)
@@ -1131,12 +1194,16 @@ func Chat(d Deps) http.Handler {
 					}
 					if capw != nil {
 						if d.JudgeObserver != nil {
-							d.JudgeObserver.Submit(LocalCompletion{
+							if !d.JudgeObserver.Submit(LocalCompletion{
 								RequestID:   reqID,
 								Instruction: latestPrompt,
 								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
-							})
+							}) {
+								slog.Warn("judge sample dropped by observer",
+									slog.String("request_id", reqID),
+								)
+							}
 						}
 						if d.QualityObserver != nil {
 							emitDetectedEdits(capw.Buffer(), reqID, d.QualityObserver)
@@ -1168,6 +1235,31 @@ func Chat(d Deps) http.Handler {
 			} else {
 				upErr = upstream.BufferedFetch(obs, d.Client,
 					d.Config.FrontierURL, d.Config.FrontierKey, body)
+			}
+			// Issue #118: a mid-stream upstream TCP drop is self-healed
+			// inside upstream.StreamWithContext (it emits a truncation
+			// event + `data: [DONE]`) and returned as
+			// upstream.ErrUpstreamTruncated. The response is already
+			// committed (200 + flushed SSE frames), so we MUST NOT call
+			// http.Error (that would write a 502 body into a stream the
+			// client already terminated). Surface the truncation on the
+			// response header and the observability hook, then clear the
+			// error so the generic upstream-error branch below is
+			// skipped. Only the streaming path can truncate; the
+			// BufferedFetch branch never returns this sentinel.
+			if upErr != nil && errors.Is(upErr, upstream.ErrUpstreamTruncated) {
+				w.Header().Set("X-Nexus-Truncated", "true")
+				if d.StreamTruncationObserver != nil {
+					d.StreamTruncationObserver.ObserveStreamTruncation(StreamTruncationEvent{
+						RequestID: reqID,
+						Route:     string(route),
+					})
+				}
+				slog.Warn("upstream stream truncated; emitted synthetic [DONE]",
+					slog.String("route", string(route)),
+					slog.String("request_id", reqID),
+				)
+				upErr = nil
 			}
 			if upErr != nil {
 				slog.Error("upstream error",
@@ -1312,10 +1404,14 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 
 // requestID extracts (or generates) a correlation id for the judge
 // hook. The handler honours an inbound X-Request-Id so a caller can
-// thread its own id through; otherwise we mint a short hex token.
+// thread its own id through; otherwise we mint a short hex token. The
+// inbound value is sanitized (issue #39) so a crafted header cannot
+// inject log entries or break downstream JSON consumers.
 func requestID(r *http.Request) string {
 	if v := r.Header.Get("X-Request-Id"); v != "" {
-		return v
+		if clean := sanitizeRequestID(v); clean != "" {
+			return clean
+		}
 	}
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -1603,16 +1699,25 @@ func buildRecord(
 
 // --- metrics (issue #4) helpers ----------------------------------------
 
-// totalMessageChars marshals messages and returns the JSON byte
-// length. Used to compute the TOON savings token estimate. Mirrors
-// json.Marshal's own overflow behaviour (returns roughly the same
-// bytes the proxy would emit across the wire).
+// totalMessageChars walks the message structure and sums the length
+// of all string values. This approximates the JSON byte length without
+// the allocation and overhead of json.Marshal. Used to compute the
+// TOON savings token estimate. The delta (pre - post) is accurate
+// because TOON compression only mutates string content fields.
 func totalMessageChars(messages []interface{}) int {
-	b, err := json.Marshal(messages)
-	if err != nil {
-		return 0
+	var total int
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		for _, v := range msg {
+			if s, ok := v.(string); ok {
+				total += len(s)
+			}
+		}
 	}
-	return len(b)
+	return total
 }
 
 // totalTokenSavings returns the tokens saved by the TOON

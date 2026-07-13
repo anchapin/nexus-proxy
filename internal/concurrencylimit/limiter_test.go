@@ -15,7 +15,7 @@ import (
 func vramFn(initial int64) (*atomic.Int64, func() int64) {
 	v := atomic.Int64{}
 	v.Store(initial)
-	return &v, func() int64 { return v.Load() }
+	return &v, v.Load
 }
 
 // --- Disabled limiter: probe-disabled behaviour is unchanged ---------

@@ -1,5 +1,7 @@
 package metrics
 
+// SQLite metrics store (issue #4). Uses modernc.org/sqlite — the only
+// allowed third-party runtime dependency. See AGENTS.md and README.md.
 import (
 	"context"
 	"database/sql"
@@ -468,6 +470,7 @@ func (s *SQLiteStore) ProviderStats(since time.Time) ([]router.ProviderStats, er
 	if err != nil {
 		return nil, fmt.Errorf("metrics: provider stats aggregate: %w", err)
 	}
+	defer rows.Close()
 	type aggRow struct {
 		name        string
 		sampleCount int
@@ -478,12 +481,10 @@ func (s *SQLiteStore) ProviderStats(since time.Time) ([]router.ProviderStats, er
 	for rows.Next() {
 		var r aggRow
 		if err := rows.Scan(&r.name, &r.sampleCount, &r.avgCost, &r.errorCount); err != nil {
-			rows.Close()
 			return nil, fmt.Errorf("metrics: scan aggregate: %w", err)
 		}
 		aggs = append(aggs, r)
 	}
-	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("metrics: aggregate rows: %w", err)
 	}
