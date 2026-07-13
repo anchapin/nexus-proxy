@@ -93,9 +93,14 @@ type Request struct {
 	Model             string
 	InputTokens       int
 	TOONSavingsTokens int
-	RAGInjected       bool
-	RAGFilename       string
-	EstimatedCostUSD  float64
+	// TOONCompressionMethod records which TOON compression pattern was
+	// applied to this request's messages (issue #247): "fenced" for
+	// ```json [...] ``` blocks, "nested" for {"files": [...]} arrays,
+	// or "" when no compression was applied.
+	TOONCompressionMethod string
+	RAGInjected           bool
+	RAGFilename           string
+	EstimatedCostUSD      float64
 
 	// BaselineCostUSD is what this request would have cost if sent
 	// to the configured baseline (frontier) provider at the baseline

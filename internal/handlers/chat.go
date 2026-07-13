@@ -276,15 +276,17 @@ func (f CascadeFallbackObserverFunc) ObserveCascadeFallback(e CascadeFallbackEve
 // dashboard joins these to answer "what fraction of frontier traffic
 // came from a low-confidence SLM escalation?".
 type MetricsEvent struct {
-	Timestamp         time.Time
-	RequestID         string
-	Route             string
-	Model             string
-	InputTokens       int
-	TOONSavingsTokens int
-	RAGInjected       bool
-	RAGFilename       string
-	EstimatedCostUSD  float64
+	Timestamp             time.Time
+	RequestID             string
+	Route                 string
+	Model                 string
+	InputTokens           int
+	TOONSavingsTokens     int
+	TOONCompressionMethod string // issue #247: "fenced", "nested", or "" (no compression)
+
+	RAGInjected      bool
+	RAGFilename      string
+	EstimatedCostUSD float64
 
 	// BaselineCostUSD is what the request would have cost at the
 	// configured frontier baseline rate (issue #73). SavingsUSD is
@@ -810,13 +812,16 @@ func Chat(d Deps) http.Handler {
 		// (see internal/telemetry.EstimateTokens).
 		preCompressionChars := totalMessageChars(messages)
 		trace.Transforms.TOONBytesBefore = preCompressionChars
-		if middleware.CompressJSONBlocks(messages) {
+		toonCompressionMethod := middleware.CompressJSONBlocks(messages)
+		if toonCompressionMethod != "" {
 			if d.Config.PromptInjectionIsolated() {
 				messages = middleware.AppendSystemNoteIsolated(messages, d.Config.TOONNotice)
 			} else {
 				messages = middleware.AppendSystemNote(messages, d.Config.TOONNotice)
 			}
-			slog.Info("toon compressed messages", slog.String("request_id", reqID))
+			slog.Info("toon compressed messages",
+				slog.String("request_id", reqID),
+				slog.String("method", string(toonCompressionMethod)))
 		}
 		postCompressionChars := totalMessageChars(messages)
 		trace.Transforms.TOONApplied = postCompressionChars != preCompressionChars
@@ -1390,6 +1395,7 @@ func Chat(d Deps) http.Handler {
 				Model:                   model,
 				InputTokens:             rec.InputTokens,
 				TOONSavingsTokens:       savings,
+				TOONCompressionMethod:   string(toonCompressionMethod),
 				RAGInjected:             ragInjected,
 				RAGFilename:             ragFilename,
 				EstimatedCostUSD:        cost,
