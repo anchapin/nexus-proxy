@@ -254,7 +254,7 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 
 	// Check cache first if enabled.
 	if p.SLMCache != nil {
-		if cached, hit := p.SLMCache.Get(req.Prompt); hit {
+		if cached, hit := p.SLMCache.Get(req.Context, req.Prompt); hit {
 			// We still categorize for observability even on cache hit,
 			// but we use the cached route directly.
 			if p.Confidence != nil {
@@ -297,7 +297,7 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	}
 	// Cache the successful decision for future identical prompts.
 	if p.SLMCache != nil {
-		p.SLMCache.Set(req.Prompt, dec)
+		p.SLMCache.Set(req.Context, req.Prompt, dec)
 	}
 	return Decision{
 		Route:           dec,

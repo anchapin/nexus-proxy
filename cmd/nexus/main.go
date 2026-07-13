@@ -585,12 +585,20 @@ func main() {
 	// requests don't trigger an SLM call.
 	var slmCache *router.SLMCache
 	if cfg.SLMCacheEnabled() {
-		slmCache = router.NewSLMCache(cfg.SLMCacheTTL)
-		slog.Info("slm decision cache enabled",
-			slog.Duration("ttl", cfg.SLMCacheTTL),
-		)
+		if cfg.SLMCacheSemanticThreshold > 0 {
+			slmCache = router.NewSLMCacheWithEmbedder(cfg.SLMCacheTTL, ragEmbedder, cfg.SLMCacheSemanticThreshold)
+			slog.Info("slm decision cache enabled (with semantic deduplication)",
+				slog.Duration("ttl", cfg.SLMCacheTTL),
+				slog.Float64("semantic_threshold", cfg.SLMCacheSemanticThreshold),
+			)
+		} else {
+			slmCache = router.NewSLMCache(cfg.SLMCacheTTL)
+			slog.Info("slm decision cache enabled",
+				slog.Duration("ttl", cfg.SLMCacheTTL),
+			)
+		}
 	} else {
-		slog.Info("slm decision cache disabled (NEXUS_SLM_CACHE_TTL<=0)")
+		slog.Info("slm decision cache disabled (NEXUS_SLMCACHE_TTL<=0)")
 	}
 
 	chatHandler := handlers.Chat(handlers.Deps{
