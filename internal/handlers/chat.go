@@ -314,9 +314,9 @@ type MetricsEvent struct {
 	FusionJaccardSimilarity float64
 	// FusionArbiterCostUSD (issue #239): estimated cost of the arbiter
 	// call when it ran. 0 when the arbiter was skipped or for non-fusion routes.
-	FusionArbiterCostUSD    float64
-	ToolCallCount          int
-	Error                   string
+	FusionArbiterCostUSD float64
+	ToolCallCount        int
+	Error                string
 
 	RouteSource   string
 	RouteReason   string
