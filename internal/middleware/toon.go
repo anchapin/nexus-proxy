@@ -136,9 +136,13 @@ func CompressJSONBlocks(messages []interface{}) CompressionMethod {
 			if err != nil {
 				continue
 			}
-			// Replace the full match (including leading whitespace/newline) with the TOON block
+			// Preserve leading context (newline/whitespace) by replacing only
+			// from end of leading context to end of full match with the TOON block.
+			// m[1] is the end of leading context (start of captured array).
+			leadingContext := content[m[0]:m[2]] // e.g., "\n"
+			replacement := leadingContext + toon
 			fullMatch := content[m[0]:m[1]]
-			content = strings.Replace(content, fullMatch, toon, 1)
+			content = strings.Replace(content, fullMatch, replacement, 1)
 			unfenced = true
 		}
 
