@@ -238,11 +238,7 @@ func (c *SLMClient) DecideWithConfidence(ctx context.Context, prompt string, con
 
 	route, err := c.decide(ctx, prompt, systemPrompt)
 	if err != nil {
-		// Unwrap ErrFallback so the caller sees err==nil (test contract).
 		// Do NOT cache fallback results — transient failures must be retried.
-		if errors.Is(err, ErrFallback) {
-			return RouteFrontier, nil
-		}
 		return RouteFrontier, err
 	}
 

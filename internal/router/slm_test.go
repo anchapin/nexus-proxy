@@ -454,11 +454,10 @@ func TestSLMCacheTransportErrorNotCached(t *testing.T) {
 	})
 	c := NewSLMClient("http://x", "m", time.Second, client).WithCache(10, 5*time.Minute)
 
-	// First call: transport error, falls back to frontier (ErrFallback is
-	// unwrapped to nil so caller sees err==nil; route is always frontier).
+	// First call: transport error returns ErrFallback; route is frontier.
 	r1, err := c.Decide(context.Background(), "flaky prompt")
-	if err != nil {
-		t.Fatalf("first Decide: expected nil (ErrFallback unwrapped), got %v", err)
+	if err == nil {
+		t.Fatalf("first Decide: expected transport error, got nil")
 	}
 	if r1 != RouteFrontier {
 		t.Errorf("first route = %q, want frontier (error fallback)", r1)

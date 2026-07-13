@@ -606,7 +606,8 @@ func Chat(d Deps) http.Handler {
 					Error:          reason,
 					TotalLatencyMs: totalMs,
 				})
-			} else {
+			}
+			if d.Recorder != nil {
 				d.Recorder.Record(telemetry.Record{
 					Timestamp:      ts,
 					RequestID:      reqID,
@@ -1383,7 +1384,8 @@ func Chat(d Deps) http.Handler {
 				SLMConfidence:        decision.Confidence,
 				SLMTaskType:          decision.TaskType,
 			})
-		} else {
+		}
+		if d.Recorder != nil {
 			d.Recorder.Record(rec)
 		}
 

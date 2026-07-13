@@ -46,20 +46,19 @@ linters:
           - errcheck
         text: fmt\.F(print|printf|println)
 
-      # internal/observability/prometheus.go writes metrics to io.Writer in
-      # "fire-and-forget" style (same as cmd/ helpers). Unchecked errors
-      # are intentional per the v1 behaviour which excluded these paths.
-      - path: internal/observability/prometheus\.go$
-        linters:
-          - errcheck
-        text: fmt\.F(print|printf|println)
-
       # resp.Body.Close and rows.Close ignored in non-critical paths
       # (matches v1 behaviour which excluded these via less-granular rules).
       - path: (.+)\.go$
         linters:
           - errcheck
         text: resp\.Body\.Close|rows\.Close|stmt\.Close
+
+      # Prometheus metrics handlers write to io.Writer in fire-and-forget style;
+      # ignoring write errors is the intentional design (same as v1 behaviour).
+      - path: internal/observability/prometheus\.go$
+        linters:
+          - errcheck
+        text: fmt\.F(print|printf|println)
 
       # staticcheck QF (quick-fix) suggestions that were silently ignored in v1:
       # QF1008: embedded field selectors, QF1002: tagged switch, QF1011: type inference,
