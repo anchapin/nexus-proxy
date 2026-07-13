@@ -53,6 +53,14 @@ linters:
           - errcheck
         text: resp\.Body\.Close|rows\.Close|stmt\.Close
 
+      # staticcheck QF (quick-fix) suggestions that were silently ignored in v1:
+      # QF1008: embedded field selectors, QF1002: tagged switch, QF1011: type inference,
+      # QF1001: De Morgan's law. These are stylistic; v1 staticcheck didn't flag them.
+      - path: (.+)\.go$
+        linters:
+          - staticcheck
+        text: QF1008|QF1002|QF1011|QF1001
+
 formatters:
   enable:
     - goimports      # import grouping
