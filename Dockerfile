@@ -53,12 +53,6 @@ WORKDIR /tmp
 # pod network. Override with NEXUS_ADDR=:9000 etc.
 EXPOSE 8000
 
-# Distroless/static has no shell, no curl, no wget. HEALTHCHECK NONE
-# lets the orchestrator (Docker, k8s, Nomad) drive liveness from
-# GET /healthz at the platform layer instead — the proxy already serves
-# "ok" on that endpoint for that exact reason.
-HEALTHCHECK NONE
-
 # Run as the bundled nonroot user (UID 65532, GID 65532). The proxy
 # is env-only by design (no .env file, no flag parsing) so it starts
 # cleanly with the platform defaults supplied by `docker run -e`.
