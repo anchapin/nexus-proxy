@@ -121,6 +121,7 @@ func main() {
 	if cfg.HealthPollInterval > 0 {
 		hpoller = health.New(
 			cfg.OllamaURL,
+			cfg.LocalModel,
 			cfg.HealthPollInterval,
 			cfg.HealthBreakerThreshold,
 			cfg.HealthProbeTimeout,

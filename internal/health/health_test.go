@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -11,37 +12,60 @@ import (
 	"time"
 )
 
-// flakyServer is an httptest.Server whose /api/tags endpoint returns
-// the configured status code and increments a call counter. Tests
+// flakyServer is an httptest.Server whose /api/tags and /api/chat endpoints
+// return the configured status code and increment call counters. Tests
 // dial it directly so the breaker and probe path can be exercised
 // without timing flake.
 type flakyServer struct {
 	*httptest.Server
-	mu       sync.Mutex
-	calls    int
-	failNext int // when > 0, the next N requests return 503 and decrement
+	mu        sync.Mutex
+	tagsCalls int
+	chatCalls int
+	tagsFail  int // when > 0, the next N /api/tags requests return 503
+	chatFail  int // when > 0, the next N /api/chat requests return 503
 }
 
 func newFlakyServer() *flakyServer {
 	f := &flakyServer{}
 	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
-		f.calls++
-		fail := f.failNext
-		if fail > 0 {
-			f.failNext--
-		}
-		f.mu.Unlock()
-		if r.URL.Path != "/api/tags" {
+		switch r.URL.Path {
+		case "/api/tags":
+			f.tagsCalls++
+			fail := f.tagsFail
+			if fail > 0 {
+				f.tagsFail--
+			}
+			f.mu.Unlock()
+			if fail > 0 {
+				http.Error(w, "boom", http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"models":[]}`))
+		case "/api/chat":
+			f.chatCalls++
+			fail := f.chatFail
+			if fail > 0 {
+				f.chatFail--
+			}
+			f.mu.Unlock()
+			if fail > 0 {
+				http.Error(w, "model not loaded", http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			resp := struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			}{}
+			resp.Message.Content = "ok"
+			_ = json.NewEncoder(w).Encode(resp)
+		default:
+			f.mu.Unlock()
 			http.NotFound(w, r)
-			return
 		}
-		if fail > 0 {
-			http.Error(w, "boom", http.StatusServiceUnavailable)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"models":[]}`))
 	}))
 	return f
 }
@@ -49,13 +73,23 @@ func newFlakyServer() *flakyServer {
 func (f *flakyServer) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.calls
+	return f.tagsCalls + f.chatCalls
 }
 
 func (f *flakyServer) failNextN(n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.failNext = n
+	// Fail both endpoints for the next n requests.
+	f.tagsFail = n
+	f.chatFail = n
+}
+
+// failChatNextN fails only the /api/chat endpoint for the next n requests.
+// Used to test the case where Ollama is up but the model is not loaded.
+func (f *flakyServer) failChatNextN(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.chatFail = n
 }
 
 func TestIsLocalHealthyNilSafe(t *testing.T) {
@@ -71,7 +105,7 @@ func TestIsLocalHealthyNilSafe(t *testing.T) {
 func TestInitialProbeHealthy(t *testing.T) {
 	srv := newFlakyServer()
 	defer srv.Close()
-	h := New(srv.URL, 50*time.Millisecond, 3, time.Second, nil)
+	h := New(srv.URL, "qwen3-coder:8b", 50*time.Millisecond, 3, time.Second, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	h.Run(ctx)
@@ -89,7 +123,7 @@ func TestInitialProbeUnhealthyTripsBreakerAfterThreshold(t *testing.T) {
 	// recovery probe would reset the counter mid-test and the
 	// post-trip assertion would race with a later success probe.
 	srv.failNextN(10000)
-	h := New(srv.URL, 30*time.Millisecond, 3, time.Second, nil)
+	h := New(srv.URL, "qwen3-coder:8b", 30*time.Millisecond, 3, time.Second, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	h.Run(ctx)
@@ -120,7 +154,7 @@ func TestBreakerRecoversOnSuccess(t *testing.T) {
 	defer srv.Close()
 	// Fail 3 then succeed.
 	srv.failNextN(3)
-	h := New(srv.URL, 30*time.Millisecond, 3, time.Second, nil)
+	h := New(srv.URL, "qwen3-coder:8b", 30*time.Millisecond, 3, time.Second, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	h.Run(ctx)
@@ -158,7 +192,7 @@ func TestBreakerRecoversOnSuccess(t *testing.T) {
 
 func TestProbeErrorOnUnreachableHost(t *testing.T) {
 	// Port 1 is virtually guaranteed to refuse connections.
-	h := New("http://127.0.0.1:1", 50*time.Millisecond, 3, 200*time.Millisecond, &http.Client{
+	h := New("http://127.0.0.1:1", "qwen3-coder:8b", 50*time.Millisecond, 3, 200*time.Millisecond, &http.Client{
 		Timeout: 200 * time.Millisecond,
 	})
 	if err := h.Probe(context.Background()); err == nil {
@@ -172,7 +206,7 @@ func TestSubThresholdFailuresStayHealthy(t *testing.T) {
 	// Fail twice (below threshold of 3) then succeed; subsequent
 	// probes should succeed and reset the counter.
 	srv.failNextN(2)
-	h := New(srv.URL, 30*time.Millisecond, 3, time.Second, nil)
+	h := New(srv.URL, "qwen3-coder:8b", 30*time.Millisecond, 3, time.Second, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	h.Run(ctx)
@@ -196,24 +230,38 @@ func TestSubThresholdFailuresStayHealthy(t *testing.T) {
 }
 
 func TestProbe4xxTreatedAsHealthy(t *testing.T) {
-	// A 401 (e.g. reverse proxy in front of Ollama) means Ollama is up.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "auth required", http.StatusUnauthorized)
+	// A 401 on /api/tags (e.g. reverse proxy in front of Ollama) means
+	// Ollama is up. The probe also calls /api/chat, which must succeed to
+	// confirm the model is available.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/tags" {
+			http.Error(w, "auth required", http.StatusUnauthorized)
+			return
+		}
+		// /api/chat must return 200 for the model to be considered available.
+		w.Header().Set("Content-Type", "application/json")
+		resp := struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		}{}
+		resp.Message.Content = "ok"
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
-	h := New(srv.URL, 50*time.Millisecond, 3, time.Second, srv.Client())
+	h := New(srv.URL, "qwen3-coder:8b", 50*time.Millisecond, 3, time.Second, srv.Client())
 	if err := h.Probe(context.Background()); err != nil {
 		t.Fatalf("Probe: %v", err)
 	}
 	if !h.IsLocalHealthy() {
-		t.Fatal("4xx must be treated as healthy")
+		t.Fatal("4xx on /api/tags must be treated as healthy when /api/chat succeeds")
 	}
 }
 
 func TestConcurrentIsLocalHealthyIsRaceFree(t *testing.T) {
 	srv := newFlakyServer()
 	defer srv.Close()
-	h := New(srv.URL, 20*time.Millisecond, 3, time.Second, nil)
+	h := New(srv.URL, "qwen3-coder:8b", 20*time.Millisecond, 3, time.Second, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	h.Run(ctx)
@@ -234,5 +282,37 @@ func TestConcurrentIsLocalHealthyIsRaceFree(t *testing.T) {
 	wg.Wait()
 	if mismatches.Load() != 0 {
 		t.Fatalf("got %d mismatches", mismatches.Load())
+	}
+}
+
+// TestModelNotLoadedVerifiesModel tests that when /api/tags succeeds but
+// /api/chat fails (model not loaded), the health probe reports unhealthy.
+// This is the core fix for issue #204: the health probe must verify model
+// availability, not just server reachability.
+func TestModelNotLoadedVerifiesModel(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+	// Make the chat endpoint fail to simulate the model not being loaded.
+	srv.failChatNextN(3)
+	h := New(srv.URL, "qwen3-coder:8b", 30*time.Millisecond, 3, time.Second, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.Run(ctx)
+	defer h.Close()
+
+	// Wait for the breaker to trip (3 consecutive failures from chat failures).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !h.IsLocalHealthy() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if h.IsLocalHealthy() {
+		t.Fatalf("expected unhealthy when model not loaded; failureCount=%d",
+			h.FailureCount())
+	}
+	if h.FailureCount() < 3 {
+		t.Fatalf("failureCount=%d, want >=3", h.FailureCount())
 	}
 }
