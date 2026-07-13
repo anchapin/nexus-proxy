@@ -1,0 +1,53 @@
+# Git
+.git/
+.gitignore
+
+# Documentation & scripts (not needed inside image)
+docs/
+scripts/
+
+# Markdown files (README, AGENTS.md, etc.)
+*.md
+
+# GitHub config & CI (not needed inside image)
+.github/
+
+# Build artifacts
+bin/
+*.exe
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Go build output
+/vendor/
+
+# Local config & secrets
+.env
+.env.local
+.env.example
+config.yaml
+config.local.yaml
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile
+docker-compose.yml
+
+# Misc
+go.work
+go.work.sum
+AGENTS.md
+Nexus Proxy PRD and Architecture.md
