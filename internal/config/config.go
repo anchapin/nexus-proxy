@@ -86,9 +86,9 @@ type Config struct {
 	// "openai" or "cohere" is selected the corresponding API key must
 	// also be configured. The base URL for the remote backends defaults
 	// to the standard public endpoints; override via NEXUS_EMBEDDER_BASE_URL.
-	EmbedderType     ragpkg.EmbedderType // "ollama" | "openai" | "cohere"
-	EmbedderBaseURL  string              // base URL for openai/cohere embedder
-	CohereAPIKey     string              // NEXUS_COHERE_API_KEY
+	EmbedderType    ragpkg.EmbedderType // "ollama" | "openai" | "cohere"
+	EmbedderBaseURL string              // base URL for openai/cohere embedder
+	CohereAPIKey    string              // NEXUS_COHERE_API_KEY
 
 	// RAG persistence (issue #46). When RAGDBPath is set, the few-shot
 	// embeddings are cached on disk and reloaded on boot without
@@ -107,13 +107,13 @@ type Config struct {
 	RAGEmbedCacheSize int // max LRU entries (256)
 
 	// Routing
-	TokenGuardrail     int           // estimated tokens above this force frontier (6000)
-	SLMTimeout         time.Duration // Qwen3-Coder routing timeout (8s)
+	TokenGuardrail            int           // estimated tokens above this force frontier (6000)
+	SLMTimeout                time.Duration // Qwen3-Coder routing timeout (8s)
 	SLMCacheMaxEntries        int           // max entries in SLM routing decision cache (512)
 	SLMCacheSemanticThreshold float64       // cosine similarity floor for semantic cache hits (0.0..1.0, issue #245)
-	FusionTimeout            time.Duration // per-panel-member fetch timeout (120s)
-	CascadeTimeout     time.Duration // per-attempt timeout for cascade fallback (30s)
-	ArbiterTimeout     time.Duration // per-call timeout for the fusion arbiter stream (60s)
+	FusionTimeout             time.Duration // per-panel-member fetch timeout (120s)
+	CascadeTimeout            time.Duration // per-attempt timeout for cascade fallback (30s)
+	ArbiterTimeout            time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
 	// Frontier provider selector (issue #45). When more than one
 	// frontier provider is configured (frontier + z.ai), the chat
