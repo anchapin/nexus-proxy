@@ -296,50 +296,6 @@ func TestChatRecorderReceivesRouteDecisionFields(t *testing.T) {
 	}
 }
 
-// TestSanitizeHeaderValueAdversarial exercises the route-decision
-// header sanitiser against payload strings designed to inject CRLF,
-// nulls, or extreme length (issue #74). The sanitiser is the
-// boundary between the planner's Decision (which can carry
-// attacker-influenced text via the SLM error path) and the wire
-// header block.
-func TestSanitizeHeaderValueAdversarial(t *testing.T) {
-	cases := []struct {
-		name, in, want string
-	}{
-		{"empty", "", ""},
-		{"clean", "frontier", "frontier"},
-		{"crlf", "a\r\nb", "ab"},
-		{"only_newline", "\n", ""},
-		{"low_control", "a\x01b\x02c", "a b c"},
-		{"pathological_long", strings.Repeat("x", MaxHeaderValue*4), strings.Repeat("x", MaxHeaderValue)},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := SanitizeHeaderValue(c.in); got != c.want {
-				t.Errorf("SanitizeHeaderValue(%q) = %q (len %d), want %q (len %d)",
-					c.in, got, len(got), c.want, len(c.want))
-			}
-		})
-	}
-}
-
-// TestRouteDecisionObserverFuncAdapter exercises the func adapter so
-// the closure wiring in cmd/nexus stays a one-liner.
-func TestRouteDecisionObserverFuncAdapter(t *testing.T) {
-	var captured RouteDecisionEvent
-	RouteDecisionObserverFunc(func(e RouteDecisionEvent) { captured = e }).Observe(RouteDecisionEvent{
-		RequestID:  "r-1",
-		Route:      "frontier",
-		Source:     "guardrail",
-		Reason:     "vram",
-		Confidence: 0.5,
-		TaskType:   "",
-	})
-	if captured.RequestID != "r-1" || captured.Route != "frontier" || captured.Source != "guardrail" {
-		t.Errorf("adapter dropped or mangled event: %+v", captured)
-	}
-}
-
 // TestChatBothObserversReceiveRecord (issue #164) confirms that when
 // both MetricsObserver and Recorder are wired, both receive a record
 // for a successful proxied request. Previously the if/else dispatch
@@ -410,5 +366,158 @@ func TestRejectionBothObserversReceiveRecord(t *testing.T) {
 	}
 	if rows[0].Route != "rejected" {
 		t.Errorf("record route = %q, want \"rejected\"", rows[0].Route)
+	}
+}
+
+// TestSanitizeHeaderValueAdversarial exercises the route-decision
+// header sanitiser against payload strings designed to inject CRLF,
+// nulls, or extreme length (issue #74). The sanitiser is the
+// boundary between the planner's Decision (which can carry
+// attacker-influenced text via the SLM error path) and the wire
+// header block.
+func TestSanitizeHeaderValueAdversarial(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"empty", "", ""},
+		{"clean", "frontier", "frontier"},
+		{"crlf", "a\r\nb", "ab"},
+		{"only_newline", "\n", ""},
+		{"low_control", "a\x01b\x02c", "a b c"},
+		{"pathological_long", strings.Repeat("x", MaxHeaderValue*4), strings.Repeat("x", MaxHeaderValue)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := SanitizeHeaderValue(c.in); got != c.want {
+				t.Errorf("SanitizeHeaderValue(%q) = %q (len %d), want %q (len %d)",
+					c.in, got, len(got), c.want, len(c.want))
+			}
+		})
+	}
+}
+
+// TestRouteDecisionObserverFuncAdapter exercises the func adapter so
+// the closure wiring in cmd/nexus stays a one-liner.
+func TestRouteDecisionObserverFuncAdapter(t *testing.T) {
+	var captured RouteDecisionEvent
+	RouteDecisionObserverFunc(func(e RouteDecisionEvent) { captured = e }).Observe(RouteDecisionEvent{
+		RequestID:  "r-1",
+		Route:      "frontier",
+		Source:     "guardrail",
+		Reason:     "vram",
+		Confidence: 0.5,
+		TaskType:   "",
+	})
+	if captured.RequestID != "r-1" || captured.Route != "frontier" || captured.Source != "guardrail" {
+		t.Errorf("adapter dropped or mangled event: %+v", captured)
+	}
+}
+
+// TestLatencyObserverFuncAdapter exercises the LatencyObserverFunc
+// adapter so the closure wiring in cmd/nexus stays a one-liner.
+func TestLatencyObserverFuncAdapter(t *testing.T) {
+	var captured LatencyEvent
+	LatencyObserverFunc(func(e LatencyEvent) { captured = e }).ObserveLatency(LatencyEvent{
+		Route:          "local",
+		LatencySeconds: 0.123,
+		TTFTSeconds:    0.045,
+		IsError:        false,
+	})
+	if captured.Route != "local" || captured.LatencySeconds != 0.123 || captured.TTFTSeconds != 0.045 || captured.IsError != false {
+		t.Errorf("adapter dropped or mangled event: %+v", captured)
+	}
+}
+
+// recordingLatencyObserver captures every LatencyEvent for test assertions.
+type recordingLatencyObserver struct {
+	mu     sync.Mutex
+	events []LatencyEvent
+}
+
+func (r *recordingLatencyObserver) ObserveLatency(e LatencyEvent) {
+	r.mu.Lock()
+	r.events = append(r.events, e)
+	r.mu.Unlock()
+}
+
+func (r *recordingLatencyObserver) snapshot() []LatencyEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]LatencyEvent, len(r.events))
+	copy(out, r.events)
+	return out
+}
+
+// TestChatLatencyObserverCalled verifies the LatencyObserver hook is
+// invoked after the upstream response completes with the correct
+// timing values and error flag (issue #165).
+func TestChatLatencyObserverCalled(t *testing.T) {
+	deps, rt := baseDeps(t)
+	obs := &recordingLatencyObserver{}
+	deps.LatencyObserver = obs
+
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
+	})
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rw.Code)
+	}
+	events := obs.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("latency observer events = %d, want 1", len(events))
+	}
+	e := events[0]
+	if e.Route != "local" {
+		t.Errorf("Route = %q, want \"local\"", e.Route)
+	}
+	if e.LatencySeconds <= 0 {
+		t.Errorf("LatencySeconds = %v, want > 0", e.LatencySeconds)
+	}
+	if e.IsError {
+		t.Errorf("IsError = true, want false for successful request")
+	}
+}
+
+// TestChatLatencyObserverCalledForLocalRoute verifies the LatencyObserver
+// hook is invoked with the correct route for a DSL-matched local request.
+func TestChatLatencyObserverCalledForLocalRoute(t *testing.T) {
+	deps, rt := baseDeps(t)
+	obs := &recordingLatencyObserver{}
+	deps.LatencyObserver = obs
+
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
+	})
+	// "css" triggers the DSL pattern for local route.
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rw.Code)
+	}
+	events := obs.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("latency observer events = %d, want 1", len(events))
+	}
+	e := events[0]
+	if e.Route != "local" {
+		t.Errorf("Route = %q, want \"local\"", e.Route)
+	}
+	if e.LatencySeconds <= 0 {
+		t.Errorf("LatencySeconds = %v, want > 0", e.LatencySeconds)
+	}
+	if e.IsError {
+		t.Errorf("IsError = true, want false for successful request")
 	}
 }
