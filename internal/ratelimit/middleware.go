@@ -159,21 +159,26 @@ func (m *Middleware) allow(ip string, now time.Time) bool {
 }
 
 // bucketFor returns the bucket for ip, creating it on first sighting.
-// The per-map lock is held only for the lookup/create; the per-bucket
-// lock (in allow) serializes token consumption.
+// All bucket allocation and map insertion happen atomically inside the
+// per-map critical section so no bucket is ever orphaned by a concurrent
+// bucketFor call for the same IP. The per-bucket lock (in allow)
+// serializes token consumption.
 func (m *Middleware) bucketFor(ip string, now time.Time) *bucket {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	b, ok := m.buckets[ip]
-	if !ok {
-		// Start full so a brand-new client gets its full burst.
-		b = &bucket{
-			tokens:     float64(m.burst),
-			lastRefill: now,
-			lastSeen:   now,
-		}
-		m.buckets[ip] = b
+	if b, ok := m.buckets[ip]; ok {
+		return b
 	}
+	// Start full so a brand-new client gets its full burst.
+	// Allocation is deliberately inside the critical section so that
+	// the pointer is never accessible to another goroutine until it is
+	// safely inserted into the map (fixes issue #248 race window).
+	b := &bucket{
+		tokens:     float64(m.burst),
+		lastRefill: now,
+		lastSeen:   now,
+	}
+	m.buckets[ip] = b
 	return b
 }
 

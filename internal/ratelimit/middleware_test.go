@@ -264,3 +264,34 @@ func TestMiddleware_SetRejectionHookRemoves(t *testing.T) {
 		t.Errorf("hook fired %d after nil removal, want 0", fired)
 	}
 }
+
+// TestMiddleware_BucketRaceConcurrencyFix verifies issue #248: many
+// concurrent goroutines requesting the same previously-unseen IP must
+// result in exactly one bucket, not one per goroutine.
+func TestMiddleware_BucketRaceConcurrencyFix(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 1000, resolver) // big burst to avoid 429 noise
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	const goroutines = 50
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodPost, "/", nil)
+			req.RemoteAddr = "192.168.99.99:9999" // same IP for all goroutines
+			h.ServeHTTP(httptest.NewRecorder(), req)
+		}()
+	}
+	wg.Wait()
+
+	// Issue #248: only ONE bucket should exist for that IP. A race window
+	// during bucket creation would have let each goroutine allocate its own
+	// bucket before inserting, orphaning all but the last.
+	if count := m.BucketCount(); count != 1 {
+		t.Errorf("expected exactly 1 bucket for concurrent same-IP requests, got %d (race window not fixed)", count)
+	}
+}
