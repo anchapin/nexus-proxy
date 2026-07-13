@@ -276,17 +276,17 @@ func (f CascadeFallbackObserverFunc) ObserveCascadeFallback(e CascadeFallbackEve
 // dashboard joins these to answer "what fraction of frontier traffic
 // came from a low-confidence SLM escalation?".
 type MetricsEvent struct {
-	Timestamp         time.Time
-	RequestID         string
-	Route             string
-	Model             string
-	InputTokens       int
-	TOONSavingsTokens int
+	Timestamp             time.Time
+	RequestID             string
+	Route                 string
+	Model                 string
+	InputTokens           int
+	TOONSavingsTokens     int
 	TOONCompressionMethod string // issue #247: "fenced", "nested", or "" (no compression)
 
-	RAGInjected       bool
-	RAGFilename       string
-	EstimatedCostUSD  float64
+	RAGInjected      bool
+	RAGFilename      string
+	EstimatedCostUSD float64
 
 	// BaselineCostUSD is what the request would have cost at the
 	// configured frontier baseline rate (issue #73). SavingsUSD is

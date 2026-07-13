@@ -35,9 +35,9 @@ var ObjectArrayBlock = regexp.MustCompile(
 type CompressionMethod string
 
 const (
-	CompressionMethodFenced  CompressionMethod = "fenced"
-	CompressionMethodNested  CompressionMethod = "nested"
-	CompressionMethodNone    CompressionMethod = ""
+	CompressionMethodFenced CompressionMethod = "fenced"
+	CompressionMethodNested CompressionMethod = "nested"
+	CompressionMethodNone   CompressionMethod = ""
 )
 
 // CompressJSONBlocks rewrites every ```json [ {...}, ... ] ``` block in the

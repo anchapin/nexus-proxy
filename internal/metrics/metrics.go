@@ -98,9 +98,9 @@ type Request struct {
 	// ```json [...] ``` blocks, "nested" for {"files": [...]} arrays,
 	// or "" when no compression was applied.
 	TOONCompressionMethod string
-	RAGInjected       bool
-	RAGFilename       string
-	EstimatedCostUSD  float64
+	RAGInjected           bool
+	RAGFilename           string
+	EstimatedCostUSD      float64
 
 	// BaselineCostUSD is what this request would have cost if sent
 	// to the configured baseline (frontier) provider at the baseline
