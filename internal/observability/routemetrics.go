@@ -100,7 +100,7 @@ type counterKey struct {
 //
 // A fifth family (issue #205) records cascade fallback events:
 //
-//腔   - nexus_cascade_fallback_total{reason}
+// 腔   - nexus_cascade_fallback_total{reason}
 //
 // The reason label values are "timeout", "transport_error", or
 // "malformed_toolcall".
