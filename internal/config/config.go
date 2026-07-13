@@ -352,7 +352,17 @@ type Config struct {
 	TrustedProxiesRaw string
 	RateLimitRPM      int
 	RateLimitBurst    int
+
+	// Rolling 24h frontier spend guard (issue #183). When BudgetDailyLimit
+	// is positive, the guard tracks frontier/fusion costs in a rolling
+	// 24h window and rejects new requests with 429 when the budget is
+	// exhausted. Zero or negative disables the guard entirely (pre-#183
+	// behaviour: no budget enforcement).
+	BudgetDailyLimit float64 // USD; NEXUS_BUDGET_DAILY_LIMIT
 }
+
+// BudgetEnabled returns true when the rolling 24h budget guard is active.
+func (c Config) BudgetEnabled() bool { return c.BudgetDailyLimit > 0 }
 
 // DefaultMetricsDBPath returns the canonical metrics DB location:
 // $XDG_CACHE_HOME/nexus-proxy/metrics.db (or the OS default for
@@ -956,6 +966,17 @@ func Load() (Config, error) {
 		rateBurst = 0
 	}
 	cfg.RateLimitBurst = rateBurst
+
+	// Rolling 24h frontier spend guard (issue #183). Zero or negative
+	// disables the guard entirely (pre-#183 behaviour).
+	budgetDailyLimit, err := getEnvFloat("NEXUS_BUDGET_DAILY_LIMIT", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if budgetDailyLimit < 0 {
+		budgetDailyLimit = 0
+	}
+	cfg.BudgetDailyLimit = budgetDailyLimit
 
 	return cfg, nil
 }
