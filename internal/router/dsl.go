@@ -34,7 +34,12 @@ type Route string
 
 // DSL runs the heuristic fast-pass. Returns one of RouteLocal, RouteFusion,
 // or "" if no rule matched (caller should fall back to the SLM).
-func DSL(prompt string, formattingRegex *regexp.Regexp) (Route, bool) {
+//
+// formattingRegex matches simple formatting keywords (css, format, docstring,
+// lint, typo, boilerplate). localPatternsRegex matches common coding task
+// keywords (refactor, security scan, generate tests, explain this code,
+// performance analysis, etc.). Both may be nil.
+func DSL(prompt string, formattingRegex, localPatternsRegex *regexp.Regexp) (Route, bool) {
 	lower := toLowerASCII(prompt)
 
 	if stringsContains(lower, "architectural design") ||
@@ -42,6 +47,9 @@ func DSL(prompt string, formattingRegex *regexp.Regexp) (Route, bool) {
 		return RouteFusion, true
 	}
 	if formattingRegex != nil && formattingRegex.MatchString(lower) {
+		return RouteLocal, true
+	}
+	if localPatternsRegex != nil && localPatternsRegex.MatchString(lower) {
 		return RouteLocal, true
 	}
 	return "", false
