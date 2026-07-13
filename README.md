@@ -369,6 +369,70 @@ defaults. The most useful ones:
 | `NEXUS_TRUSTED_PROXIES`   | *(empty = trust nobody)*      | CIDR allowlist for X-Forwarded-For (issue #75) |
 | `NEXUS_RATE_LIMIT_RPM`    | `0` (disabled)                | Per-client requests/min ceiling (issue #75) |
 | `NEXUS_RATE_LIMIT_BURST`  | `0` (= RPM)                  | Token-bucket burst capacity (issue #75) |
+| `NEXUS_COST_BASELINE_PROVIDER` | `frontier`               | Provider name for the cost-avoidance baseline |
+| `NEXUS_COST_BASELINE_MODEL`   | `NEXUS_FRONTIER_MODEL`    | Model name for the cost-avoidance baseline |
+| `NEXUS_COST_BASELINE_RATE_PER_1K` | `NEXUS_FRONTIER_COST_PER_1K` | USD per 1k tokens for baseline valuation |
+
+## Cost Savings
+
+Nexus Proxy records a **savings USD** figure for every proxied request, so
+operators can track cost-avoidance over time.
+
+### How savings are calculated
+
+The formula is:
+
+```
+savings_usd = max(baseline_cost - actual_cost, 0)
+```
+
+**Baseline cost** is what the request *would have* cost if sent to the
+configured baseline provider at the baseline rate — regardless of which
+route the request actually took. It is computed from the total token count
+(input + output) at the baseline rate, so even a `route=local` request
+that incurred zero actual cost still shows a positive baseline.
+
+**Actual cost** is the real cost incurred:
+
+| Route       | Actual cost basis                                     |
+| ----------- | ---------------------------------------------------- |
+| `local`     | $0 (Ollama is free; GPU is a sunk cost)              |
+| `frontier`  | frontier rate × total tokens                         |
+| `fusion`    | $0 — both panel members run locally; the arbiter is a fast local call |
+
+Because actual cost for `local` and `fusion` is $0, the full baseline
+cost appears as savings. For `frontier` requests the savings is
+`baseline − frontier`, which is zero when both use the same rate.
+
+### Baseline configuration
+
+Three env vars control the baseline:
+
+| Variable                        | Purpose                                          |
+| ------------------------------- | ------------------------------------------------ |
+| `NEXUS_COST_BASELINE_PROVIDER` | Provider name for baseline valuation (default: `frontier`) |
+| `NEXUS_COST_BASELINE_MODEL`    | Model name for baseline (default: `NEXUS_FRONTIER_MODEL`) |
+| `NEXUS_COST_BASELINE_RATE_PER_1K` | USD per 1k tokens for baseline valuation (default: `NEXUS_FRONTIER_COST_PER_1K`) |
+
+Set `NEXUS_COST_BASELINE_RATE_PER_1K` to your actual frontier provider's
+per-token rate to make the savings figure realistic. If the rate is `0`
+or unset, baseline cost is recorded as `0` and the savings field is
+omitted for that request.
+
+### Currency and precision
+
+All monetary values are in **USD**. The `savings_usd` column in the
+SQLite metrics store holds values with 6 decimal places of precision
+(e.g. `0.001200`). The `nexus-dashboard` command rounds to 2 decimal
+places for display.
+
+### Aggregation
+
+The SQLite metrics store (`NEXUS_METRICS_DB`) persists one row per
+request with `baseline_cost_usd`, `actual_cost_usd`, and `savings_usd`.
+Sum `savings_usd` over any time window to obtain the total cost
+avoided. The `nexus-dashboard` command (`cmd/nexus-dashboard/main.go`)
+produces a daily rollup using this data.
 
 ## Status
 
