@@ -77,6 +77,12 @@ const recordRequestErrorTimeout = 5 * time.Second
 // other case (legacy Panel path always invokes the arbiter; non-fusion
 // routes are always false).
 //
+// FusionJaccardSimilarity (issue #200) mirrors telemetry.Record: the
+// actual Jaccard ratio between the two panel members' contents when
+// both returned content. 0 when fewer than two members returned content.
+// Enables operators to tune NEXUS_FUSION_AGREEMENT_THRESHOLD based on
+// actual distribution data.
+//
 // Route-source metadata (issue #74) mirrors telemetry.Record so the
 // SQLite store and the JSONL recorder carry identical routing metadata
 // for every request.
@@ -98,13 +104,14 @@ type Request struct {
 	BaselineCostUSD float64
 	SavingsUSD      float64
 
-	OutputTokens         int
-	TTFTMs               int64
-	TotalLatencyMs       float64
-	TPS                  float64
-	Streaming            bool
-	FusionArbiterSkipped bool
-	Error                string
+	OutputTokens            int
+	TTFTMs                  int64
+	TotalLatencyMs          float64
+	TPS                     float64
+	Streaming               bool
+	FusionArbiterSkipped    bool
+	FusionJaccardSimilarity float64
+	Error                   string
 
 	// Route-source metadata (issue #74).
 	RouteSource   string
