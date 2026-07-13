@@ -20,22 +20,22 @@ func (p *frontierProvider) BaseURL() string       { return p.baseURL }
 func (p *frontierProvider) Model() string         { return p.model }
 func (p *frontierProvider) CostPer1KUSD() float64 { return p.costPer1KUSD }
 
-func NewFrontierProvider(baseURL, model, apiKeyInput string, costPer1KUSD float64) Provider {
+func NewFrontierProvider(baseURL, model, keyInput string, costPer1KUSD float64) Provider {
 	return &frontierProvider{
 		name:         "frontier",
 		baseURL:      baseURL,
 		model:        model,
-		apiKey:       apiKeyInput,
+		apiKey:       keyInput,
 		costPer1KUSD: costPer1KUSD,
 	}
 }
 
-func NewZAIProvider(baseURL, model, apiKeyInput string, costPer1KUSD float64) Provider {
+func NewZAIProvider(baseURL, model, keyInput string, costPer1KUSD float64) Provider {
 	return &frontierProvider{
 		name:         "zai",
 		baseURL:      baseURL,
 		model:        model,
-		apiKey:       apiKeyInput,
+		apiKey:       keyInput,
 		costPer1KUSD: costPer1KUSD,
 	}
 }
