@@ -216,7 +216,7 @@ jobs:
           upload-release-assets: false
 
       - name: Stage SBOM with version filename
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: nexus-sbom
           path: dist/
@@ -245,13 +245,13 @@ jobs:
         run: echo "version=${{ inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
       - name: Download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: binaries
           path: dist/
 
       - name: Download SBOM
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: sbom
           path: dist/
