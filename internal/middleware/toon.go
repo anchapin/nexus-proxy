@@ -20,6 +20,16 @@ import (
 // is columnar — primitives and arrays of primitives don't benefit.
 var JSONArrayBlock = regexp.MustCompile("(?s)" + "```" + `json\s*(\[\s*\{.*?\}\s*\])\s*` + "```")
 
+// ObjectArrayBlock matches a JSON object containing a key whose value is a JSON
+// array of objects. This handles the common "files", "results", "items" key
+// pattern seen in tool results and multi-file diffs. The pattern handles simple
+// objects (no deeply nested structures) which covers the vast majority of
+// structured data in prompts.
+var ObjectArrayBlock = regexp.MustCompile(
+	`"` + `(?:files|results|items|objects)` + `"` + `\s*:\s*` +
+		`(\[\s*\{.*?\}(?:\s*,\s*\{.*?\})*\s*\])`,
+)
+
 // CompressJSONBlocks rewrites every ```json [ {...}, ... ] ``` block in the
 // user/assistant message content into a TOON text block. Returns true if any
 // block was rewritten. Schema is inferred from the first object's keys (sorted
@@ -42,6 +52,8 @@ func CompressJSONBlocks(messages []interface{}) bool {
 			continue
 		}
 		content, _ := msg["content"].(string)
+
+		// Handle fenced ```json [...] ``` blocks.
 		matches := JSONArrayBlock.FindAllStringSubmatch(content, -1)
 		for _, m := range matches {
 			if len(m) < 2 {
@@ -55,6 +67,37 @@ func CompressJSONBlocks(messages []interface{}) bool {
 			content = strings.Replace(content, m[0], block, 1)
 			rewrote = true
 		}
+
+		// Handle JSON arrays nested inside objects (e.g., {"files": [...]}).
+		objMatches := ObjectArrayBlock.FindAllStringSubmatchIndex(content, -1)
+		for _, m := range objMatches {
+			if len(m) < 4 {
+				continue
+			}
+			// m[0], m[1]: full match (from opening " of key to closing ] of array)
+			// m[2], m[3]: captured group (the array itself)
+			fullMatch := content[m[0]:m[1]]
+			arrayMatch := content[m[2]:m[3]]
+			toon, err := SerializeToTOON([]byte(arrayMatch))
+			if err != nil {
+				continue
+			}
+			// Extract key from full match: "key": [...] -> "key": <toon>
+			colonIdx := strings.Index(fullMatch, ":")
+			if colonIdx == -1 {
+				continue
+			}
+			keyPart := fullMatch[:colonIdx+1]
+			replacement := keyPart + " " + strings.TrimSpace(toon)
+			// If preceded by {, include it in the replacement to avoid leaving it orphaned
+			if m[0] > 0 && content[m[0]-1] == '{' {
+				content = strings.Replace(content, "{"+fullMatch, "{"+replacement, 1)
+			} else {
+				content = strings.Replace(content, fullMatch, replacement, 1)
+			}
+			rewrote = true
+		}
+
 		if rewrote {
 			msg["content"] = content
 		}
