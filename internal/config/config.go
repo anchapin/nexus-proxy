@@ -857,11 +857,10 @@ func Load() (Config, error) {
 	}
 	cfg.ModelsCacheTTL = modelsCacheTTL
 
-	// Prompt-injection hardening (issue #76). Defaults to off so a
-	// stock deployment boots with byte-for-byte legacy behaviour.
-	// Operators opt into warn (log only) or strict (reject 400) by
-	// setting NEXUS_PROMPT_INJECTION_MODE. Unknown values fall back
-	// to off rather than failing boot.
+	// Prompt-injection hardening (issue #76). Defaults to warn so a
+	// stock deployment logs injection attempts out of the box.
+	// Operators can set NEXUS_PROMPT_INJECTION_MODE=off to disable,
+	// or strict to reject 400. Unknown values fall back to warn.
 	cfg.PromptInjectionMode = middleware.ParseInjectionMode(
 		os.Getenv("NEXUS_PROMPT_INJECTION_MODE"),
 	)
