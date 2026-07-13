@@ -87,7 +87,8 @@ func (w *Watcher) run(parent context.Context) {
 	defer close(w.doneCh)
 
 	if err := w.scanOnce(parent); err != nil && !errors.Is(err, context.Canceled) {
-		slog.Warn("[RAG INDEXER] initial scan failed",
+		slog.Warn("rag: initial scan failed",
+			slog.String("component", "rag"),
 			slog.String("dir", w.dir),
 			slog.Any("err", err),
 		)
@@ -104,7 +105,8 @@ func (w *Watcher) run(parent context.Context) {
 			return
 		case <-t.C:
 			if err := w.scanOnce(parent); err != nil && !errors.Is(err, context.Canceled) {
-				slog.Warn("[RAG INDEXER] scan failed",
+				slog.Warn("rag: scan failed",
+					slog.String("component", "rag"),
 					slog.String("dir", w.dir),
 					slog.Any("err", err),
 				)
@@ -139,7 +141,8 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 			continue
 		}
 		if isSymlink(f) {
-			slog.Warn("[RAG INDEXER] skipping symlink in examples dir (issue #107)",
+			slog.Warn("rag: skipping symlink in examples dir (issue #107)",
+				slog.String("component", "rag"),
 				slog.String("filename", f.Name()),
 				slog.String("dir", w.dir),
 			)
@@ -159,7 +162,8 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 		}
 
 		if err := w.indexFile(ctx, name); err != nil {
-			slog.Warn("[RAG INDEXER] index failed",
+			slog.Warn("rag: index failed",
+				slog.String("component", "rag"),
 				slog.String("filename", name),
 				slog.Any("err", err),
 			)
@@ -175,14 +179,16 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 			continue
 		}
 		if err := w.store.Remove(ctx, name); err != nil {
-			slog.Warn("[RAG INDEXER] remove failed",
+			slog.Warn("rag: remove failed",
+				slog.String("component", "rag"),
 				slog.String("filename", name),
 				slog.Any("err", err),
 			)
 			continue
 		}
 		delete(w.known, name)
-		slog.Info("[RAG INDEXER] removed",
+		slog.Info("rag: removed",
+			slog.String("component", "rag"),
 			slog.String("filename", name),
 		)
 	}
