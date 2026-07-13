@@ -104,6 +104,115 @@ func TestStreamTransportError(t *testing.T) {
 	}
 }
 
+// truncatingReader yields data then returns terminalErr instead of a
+// clean io.EOF. It lets streaming tests reproduce a mid-stream TCP
+// drop (io.ErrUnexpectedEOF — what the HTTP chunked reader surfaces
+// when the connection closes before the terminating 0-length chunk)
+// and a post-[DONE] connection reset, without spinning up an
+// httptest.Server. terminalErr must be non-nil.
+type truncatingReader struct {
+	data        []byte
+	pos         int
+	terminalErr error
+}
+
+func (r *truncatingReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, r.terminalErr
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	return n, nil
+}
+
+// TestStreamEmitsDoneOnUpstreamTruncation reproduces issue #118: the
+// upstream yields one complete SSE chunk then drops the connection
+// mid-stream (io.ErrUnexpectedEOF instead of a clean io.EOF). The
+// proxy must forward the partial chunk, emit a truncation event, emit
+// the terminating data: [DONE] sentinel so the harness does not hang,
+// stamp X-Nexus-Truncated, and return ErrUpstreamTruncated.
+func TestStreamEmitsDoneOnUpstreamTruncation(t *testing.T) {
+	chunk := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(&truncatingReader{data: []byte(chunk), terminalErr: io.ErrUnexpectedEOF}),
+		}, nil
+	})}
+	rw := newRW()
+	err := StreamWithContext(context.Background(), rw, client, "http://x", "", map[string]interface{}{"model": "m"})
+	if !errors.Is(err, ErrUpstreamTruncated) {
+		t.Fatalf("StreamWithContext error = %v, want ErrUpstreamTruncated", err)
+	}
+	if got := rw.header.Get("X-Nexus-Truncated"); got != "true" {
+		t.Errorf("X-Nexus-Truncated = %q, want \"true\"", got)
+	}
+	out := rw.body.String()
+	if !strings.Contains(out, chunk) {
+		t.Errorf("forwarded chunk missing from body: %q", out)
+	}
+	if !strings.Contains(out, `"type":"upstream_truncated"`) {
+		t.Errorf("body missing truncation event: %q", out)
+	}
+	if !strings.HasSuffix(out, "data: [DONE]\n\n") {
+		t.Errorf("body must end with [DONE] sentinel, got %q", out)
+	}
+}
+
+// TestStreamHappyPathDoneTerminatedUnchanged locks the happy path: a
+// complete upstream that emits its own data: [DONE] and then a clean
+// io.EOF must pass through byte-for-byte unchanged, return nil, and
+// NOT stamp X-Nexus-Truncated (issue #118 acceptance: successful
+// streams must not gain a synthetic terminator).
+func TestStreamHappyPathDoneTerminatedUnchanged(t *testing.T) {
+	body := "data: {\"choices\":[]}\n\ndata: [DONE]\n\n"
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})}
+	rw := newRW()
+	if err := Stream(rw, client, "http://x", "", map[string]interface{}{"model": "m"}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if rw.body.String() != body {
+		t.Errorf("body changed on happy path:\ngot:  %q\nwant: %q", rw.body.String(), body)
+	}
+	if got := rw.header.Get("X-Nexus-Truncated"); got != "" {
+		t.Errorf("X-Nexus-Truncated should be unset on happy path, got %q", got)
+	}
+}
+
+// TestStreamNoTruncationWhenDoneAlreadySeen pins the graceful/abrupt
+// distinction: once the upstream's own data: [DONE] has flowed
+// through, the SSE stream is complete even if the connection then
+// drops (io.ErrUnexpectedEOF). No synthetic truncation event must be
+// appended and Stream returns nil — the harness already saw its
+// terminator.
+func TestStreamNoTruncationWhenDoneAlreadySeen(t *testing.T) {
+	body := "data: {\"choices\":[]}\n\ndata: [DONE]\n\n"
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(&truncatingReader{data: []byte(body), terminalErr: io.ErrUnexpectedEOF}),
+		}, nil
+	})}
+	rw := newRW()
+	if err := Stream(rw, client, "http://x", "", map[string]interface{}{"model": "m"}); err != nil {
+		t.Fatalf("Stream: %v (want nil — [DONE] already seen)", err)
+	}
+	if rw.body.String() != body {
+		t.Errorf("body changed after [DONE] was seen:\ngot:  %q\nwant: %q", rw.body.String(), body)
+	}
+	if got := rw.header.Get("X-Nexus-Truncated"); got != "" {
+		t.Errorf("X-Nexus-Truncated should be unset when [DONE] already seen, got %q", got)
+	}
+}
+
 func TestFetchPanelHappyPath(t *testing.T) {
 	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
 		return &http.Response{

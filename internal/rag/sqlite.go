@@ -91,7 +91,7 @@ func OpenPersistentStore(path string, embedder Embedder, threshold float64) (*Pe
 	}
 	if path != ":memory:" {
 		if dir := filepath.Dir(path); dir != "" && dir != "." {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
 				return nil, fmt.Errorf("rag: mkdir %q: %w", dir, err)
 			}
 		}
@@ -110,6 +110,11 @@ func OpenPersistentStore(path string, embedder Embedder, threshold float64) (*Pe
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("rag: ping %q: %w", path, err)
+	}
+	// Tighten permissions on the SQLite DB file so an upgrade from a
+	// pre-fix binary locks it down (issue #108).
+	if path != ":memory:" {
+		chmodIfWider(path, 0o600)
 	}
 	if _, err := db.ExecContext(context.Background(), ragSchema); err != nil {
 		_ = db.Close()
@@ -217,9 +222,12 @@ func (p *PersistentStore) LoadOrIndex(ctx context.Context, dir string) (int, err
 // file read/embed errors are logged and skipped — but every
 // successful embedding also lands in SQLite so the next boot can
 // skip Ollama entirely.
+//
+// Security: symlinks are skipped (issue #107) to prevent confidentiality
+// leaks via injected few-shot examples.
 func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
+		if mkErr := os.MkdirAll(dir, 0o700); mkErr != nil {
 			return fmt.Errorf("rag: create examples dir %q: %w", dir, mkErr)
 		}
 		slog.Info("rag created examples directory",
@@ -227,6 +235,11 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 			slog.String("hint", "drop golden code snippets here"),
 		)
 		return nil
+	}
+
+	safeDir, err := resolveDir(dir)
+	if err != nil {
+		return err
 	}
 
 	files, err := os.ReadDir(dir)
@@ -238,7 +251,30 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 		if f.IsDir() {
 			continue
 		}
+		if isSymlink(f) {
+			slog.Warn("rag: skipping symlink in examples dir (issue #107)",
+				slog.String("filename", f.Name()),
+				slog.String("dir", dir),
+			)
+			continue
+		}
 		path := filepath.Join(dir, f.Name())
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			slog.Error("rag: cannot resolve path, skipping",
+				slog.String("filename", f.Name()),
+				slog.Any("err", err),
+			)
+			continue
+		}
+		if !verifyInsideDir(safeDir, resolved) {
+			slog.Warn("rag: skipping file that escapes examples dir (issue #107)",
+				slog.String("filename", f.Name()),
+				slog.String("resolved", resolved),
+				slog.String("base", safeDir),
+			)
+			continue
+		}
 		content, err := os.ReadFile(path)
 		if err != nil {
 			slog.Error("rag read file",
@@ -364,4 +400,33 @@ func decodeEmbedding(b []byte) ([]float64, error) {
 		return nil, err
 	}
 	return v, nil
+}
+
+// chmodIfWider checks the current mode of path and, if any
+// group/other bits are set, tightens the file to the requested mode.
+// Errors are logged — chmod failures are non-fatal.
+func chmodIfWider(path string, mode os.FileMode) {
+	info, err := os.Stat(path)
+	if err != nil {
+		slog.Warn("rag: stat for chmod",
+			slog.String("path", path),
+			slog.Any("err", err),
+		)
+		return
+	}
+	perm := info.Mode().Perm()
+	if perm&0o077 == 0 {
+		return
+	}
+	slog.Warn("rag: tightening file permissions",
+		slog.String("path", path),
+		slog.Int("was", int(perm)),
+		slog.Int("now", int(mode)),
+	)
+	if err := os.Chmod(path, mode); err != nil {
+		slog.Warn("rag: chmod failed",
+			slog.String("path", path),
+			slog.Any("err", err),
+		)
+	}
 }

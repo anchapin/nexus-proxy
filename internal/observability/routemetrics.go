@@ -61,11 +61,10 @@ func BucketConfidence(c float64) string {
 // allocation on the hot path — the caller passes already-owned
 // strings from the Decision.
 type counterKey struct {
-	route         string
-	source        string
-	confBucket    string
-	taskType      string
-	escalatedFrom string
+	route      string
+	source     string
+	confBucket string
+	taskType   string
 }
 
 // RouteCounters is a concurrency-safe collection of route-decision
@@ -84,6 +83,10 @@ type counterKey struct {
 // before they reached an upstream:
 //   - nexus_requests_rejected_total{reason}
 //
+// A fifth family (issue #118) records upstream streams the proxy
+// terminated early because of a mid-stream TCP drop:
+//   - nexus_stream_truncated_total{route}
+//
 // The reason label values are short, bounded strings (method,
 // body_too_large, bad_request, rate_limit, ...) defined as constants
 // in internal/handlers so the chat handler and the rate-limit
@@ -95,15 +98,38 @@ type RouteCounters struct {
 	slmDecisions             map[counterKey]*uint64
 	lowConfidenceEscalations map[counterKey]*uint64
 	rejections               map[string]*uint64
+
+	// streamTruncations tracks the total number of upstream streams
+	// the proxy terminated early because of a mid-stream TCP drop
+	// (issue #118), partitioned by route so operators can see whether
+	// local or frontier upstreams are the source of drops. Same
+	// lock-then-atomic pattern as the rejections map.
+	streamTruncations map[string]*uint64
+
+	// judgeDropped tracks the total number of judge samples dropped
+	// because the evaluation queue was full (issue #111). It is a
+	// single label-free counter — the evaluator's atomic Dropped()
+	// value is synced into this slot by the onDrop callback.
+	judgeDropped *uint64
+
+	// tracingDropped tracks the total number of spans dropped by the
+	// trace exporter because its buffer was full (issue #122). It is a
+	// single label-free counter — the exporter's atomic Dropped()
+	// value is synced into this slot by the onDrop callback.
+	tracingDropped *uint64
 }
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
 func NewRouteCounters() *RouteCounters {
+	v := uint64(0)
 	return &RouteCounters{
 		routeDecisions:           make(map[counterKey]*uint64),
 		slmDecisions:             make(map[counterKey]*uint64),
 		lowConfidenceEscalations: make(map[counterKey]*uint64),
 		rejections:               make(map[string]*uint64),
+		streamTruncations:        make(map[string]*uint64),
+		judgeDropped:             &v,
+		tracingDropped:           &v,
 	}
 }
 
@@ -116,10 +142,7 @@ func NewRouteCounters() *RouteCounters {
 //   - source: the decision source ("guardrail", "dsl", "slm", "slm-error", "escalation")
 //   - confidence: the SLM confidence in [0,1] (0.5 neutral; pass 0 for non-SLM)
 //   - taskType: the SLM category bucket (empty for non-SLM sources)
-//   - escalatedFrom: when source=="escalation", the prior route that
-//     was overridden (e.g. "local" when a low-confidence local decision
-//     was bumped to frontier); empty otherwise.
-func (rc *RouteCounters) Observe(route, source string, confidence float64, taskType, escalatedFrom string) {
+func (rc *RouteCounters) Observe(route, source string, confidence float64, taskType string) {
 	if rc == nil {
 		return
 	}
@@ -155,11 +178,13 @@ func (rc *RouteCounters) Observe(route, source string, confidence float64, taskT
 		}
 	}
 
-	// Source==escalation is the planner's defensive nil-SLM path.
-	// Record it under low-confidence escalations too so the counter
-	// captures every frontier-bound override.
-	if source == "escalation" && escalatedFrom != "" {
-		ek := counterKey{taskType: taskType, escalatedFrom: escalatedFrom}
+	// Source==escalation is the planner's defensive nil-SLM path
+	// (the SLM timed out or was nil, so the planner fell back to
+	// frontier). Record it under low-confidence escalations so the
+	// counter captures every frontier-bound override, not just the
+	// SLM-confidence ones above.
+	if source == "escalation" {
+		ek := counterKey{taskType: taskType}
 		atomic.AddUint64(rc.slot(rc.lowConfidenceEscalations, ek), 1)
 	}
 }
@@ -176,6 +201,61 @@ func (rc *RouteCounters) ObserveRejection(reason string) {
 		return
 	}
 	atomic.AddUint64(rc.reasonSlot(reason), 1)
+}
+
+// ObserveJudgeDrop synchronises the evaluator's running drop total
+// into the nexus_judge_dropped_total Prometheus counter (issue #111).
+// The evaluator's onDrop callback passes the cumulative count so we
+// use Store (not Add) to mirror the authoritative value without
+// double-counting.
+func (rc *RouteCounters) ObserveJudgeDrop(total uint64) {
+	if rc == nil {
+		return
+	}
+	atomic.StoreUint64(rc.judgeDropped, total)
+}
+
+// ObserveTracingDrop synchronises the trace exporter's running drop
+// total into the nexus_tracing_dropped_total Prometheus counter (issue
+// #122). The exporter's onDrop callback passes the cumulative count so
+// we use Store (not Add) to mirror the authoritative value without
+// double-counting.
+func (rc *RouteCounters) ObserveTracingDrop(total uint64) {
+	if rc == nil {
+		return
+	}
+	atomic.StoreUint64(rc.tracingDropped, total)
+}
+
+// ObserveStreamTruncation records one upstream stream the proxy
+// terminated early because of a mid-stream TCP drop (issue #118),
+// partitioned by route so operators can see whether local or frontier
+// upstreams are the source of drops. Call this from the chat handler
+// via the StreamTruncationObserver hook when upstream.StreamWithContext
+// returns ErrUpstreamTruncated. Safe for concurrent use; a nil
+// receiver is a no-op. route is the short label value ("local" |
+// "frontier" | "fusion") that appears in the Prometheus exposition.
+func (rc *RouteCounters) ObserveStreamTruncation(route string) {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(rc.routeTruncationSlot(route), 1)
+}
+
+// routeTruncationSlot returns the *uint64 for route, creating it if
+// absent. Same lock-then-atomic pattern as reasonSlot: the mutex
+// guards the map mutation only, the increment happens lock-free on
+// the returned pointer.
+func (rc *RouteCounters) routeTruncationSlot(route string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.streamTruncations[route]
+	if !ok {
+		val := uint64(0)
+		p = &val
+		rc.streamTruncations[route] = p
+	}
+	rc.mu.Unlock()
+	return p
 }
 
 // reasonSlot returns the *uint64 for reason, creating it if absent.
@@ -251,10 +331,40 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	}
 	if n, err := writeRejectionSeries(w, "nexus_requests_rejected_total",
 		"Requests the proxy rejected before they reached an upstream.",
-		rc.rejections); err != nil {
+		"reason", rc.rejections); err != nil {
 		return total, err
 	} else {
 		total += n
+	}
+	// Upstream mid-stream TCP-drop counter (issue #118). Labelled by
+	// route so a single PromQL query breaks truncations out by
+	// destination (local / frontier / fusion). Only the streaming
+	// paths can truncate; the buffered / cascade paths emit their own
+	// [DONE] and never hit this counter.
+	if n, err := writeRejectionSeries(w, "nexus_stream_truncated_total",
+		"Upstream streams the proxy terminated early because of a mid-stream TCP drop (issue #118).",
+		"route", rc.streamTruncations); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	// Judge queue overflow counter (issue #111). Label-free — a
+	// single monotonic counter tracks the cumulative total.
+	v := atomic.LoadUint64(rc.judgeDropped)
+	n, err := fmt.Fprintf(w, "# HELP nexus_judge_dropped_total Judge samples dropped because the evaluation queue was full.\n# TYPE nexus_judge_dropped_total counter\nnexus_judge_dropped_total %d\n", v)
+	total += int64(n)
+	if err != nil {
+		return total, err
+	}
+
+	// Trace exporter back-pressure counter (issue #122). Label-free
+	// monotonic counter tracking spans dropped due to a full export
+	// buffer.
+	v = atomic.LoadUint64(rc.tracingDropped)
+	n, err = fmt.Fprintf(w, "# HELP nexus_tracing_dropped_total Trace spans dropped because the exporter buffer was full.\n# TYPE nexus_tracing_dropped_total counter\nnexus_tracing_dropped_total %d\n", v)
+	total += int64(n)
+	if err != nil {
+		return total, err
 	}
 	return total, nil
 }
@@ -294,12 +404,14 @@ func writeSeries(w io.Writer, name, help string, m map[counterKey]*uint64, label
 	return total, nil
 }
 
-// writeRejectionSeries emits the nexus_requests_rejected_total
-// family. It is a string-keyed variant of writeSeries so the
-// rejection counters (keyed only by reason) do not need to reuse the
-// multi-field counterKey struct. Output is sorted by reason for
+// writeRejectionSeries emits a string-keyed, single-label counter
+// family. It is the string-keyed variant of writeSeries so the
+// rejection counters (labelled only by reason) and the stream-
+// truncation counters (labelled only by route) do not need to reuse
+// the multi-field counterKey struct. label is the Prometheus label
+// name ("reason" or "route"); output is sorted by key for
 // deterministic scrape diffs.
-func writeRejectionSeries(w io.Writer, name, help string, m map[string]*uint64) (int64, error) {
+func writeRejectionSeries(w io.Writer, name, help, label string, m map[string]*uint64) (int64, error) {
 	var total int64
 	n, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", name, help, name)
 	if err != nil {
@@ -316,7 +428,7 @@ func writeRejectionSeries(w io.Writer, name, help string, m map[string]*uint64) 
 	sort.Strings(keys)
 	for _, k := range keys {
 		v := atomic.LoadUint64(m[k])
-		n, err := fmt.Fprintf(w, "%s{reason=%q} %d\n", name, sanitizeLabel(k), v)
+		n, err := fmt.Fprintf(w, "%s{%s=\"%s\"} %d\n", name, label, sanitizeLabel(k), v)
 		if err != nil {
 			return total + int64(n), err
 		}
@@ -369,8 +481,6 @@ func labelValue(k counterKey, label string) string {
 		return k.confBucket
 	case "task_type":
 		return k.taskType
-	case "escalated_from":
-		return k.escalatedFrom
 	default:
 		return ""
 	}

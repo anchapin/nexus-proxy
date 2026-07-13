@@ -92,7 +92,7 @@ type Record struct {
 // across the proxy (router VRAM guardrail, telemetry input). Centralising
 // the rule here keeps the two call sites consistent.
 func EstimateTokens(s string) int {
-	if len(s) <= 0 {
+	if len(s) == 0 {
 		return 0
 	}
 	return len(s) / 4
@@ -162,14 +162,17 @@ func NewJSONLRecorder(path string) (*JSONLRecorder, error) {
 		return nil, fmt.Errorf("telemetry: empty path")
 	}
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("telemetry: mkdir %q: %w", dir, err)
 		}
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("telemetry: open %q: %w", path, err)
 	}
+	// Tighten permissions on an existing file so an upgrade from a
+	// pre-fix binary locks down the log (issue #108).
+	chmodIfWider(path, 0o600)
 	r := &JSONLRecorder{
 		ch:   make(chan Record, bufferedChannelSize),
 		path: path,
@@ -244,6 +247,36 @@ func (r *JSONLRecorder) Close() error {
 	close(r.ch)
 	r.wg.Wait()
 	return nil
+}
+
+// chmodIfWider checks the current mode of path and, if any
+// group/other bits are set, tightens the file to the requested mode.
+// Errors are logged — chmod failures are non-fatal (the file was
+// already created with the restrictive mode by OpenFile).
+func chmodIfWider(path string, mode os.FileMode) {
+	info, err := os.Stat(path)
+	if err != nil {
+		slog.Warn("telemetry: stat for chmod",
+			slog.String("path", path),
+			slog.Any("err", err),
+		)
+		return
+	}
+	perm := info.Mode().Perm()
+	if perm&0o077 == 0 {
+		return // already owner-only
+	}
+	slog.Warn("telemetry: tightening file permissions",
+		slog.String("path", path),
+		slog.Int("was", int(perm)),
+		slog.Int("now", int(mode)),
+	)
+	if err := os.Chmod(path, mode); err != nil {
+		slog.Warn("telemetry: chmod failed",
+			slog.String("path", path),
+			slog.Any("err", err),
+		)
+	}
 }
 
 func writeJSONLine(w *bufio.Writer, rec Record) error {

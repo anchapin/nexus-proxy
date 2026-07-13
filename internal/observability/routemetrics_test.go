@@ -30,12 +30,12 @@ func TestBucketConfidence(t *testing.T) {
 
 func TestRouteCountersObserveRouteDecisions(t *testing.T) {
 	rc := NewRouteCounters()
-	rc.Observe("frontier", "guardrail", 0, "", "")
-	rc.Observe("frontier", "guardrail", 0, "", "")
-	rc.Observe("local", "dsl", 0, "", "")
-	rc.Observe("frontier", "slm", 0.6, "coding", "")
-	rc.Observe("frontier", "slm", 0.2, "coding", "") // low-confidence escalation
-	rc.Observe("local", "slm", 0.9, "format", "")
+	rc.Observe("frontier", "guardrail", 0, "")
+	rc.Observe("frontier", "guardrail", 0, "")
+	rc.Observe("local", "dsl", 0, "")
+	rc.Observe("frontier", "slm", 0.6, "coding")
+	rc.Observe("frontier", "slm", 0.2, "coding") // low-confidence escalation
+	rc.Observe("local", "slm", 0.9, "format")
 
 	var sb strings.Builder
 	if _, err := rc.WriteTo(&sb); err != nil {
@@ -64,10 +64,10 @@ func TestRouteCountersObserveRouteDecisions(t *testing.T) {
 
 func TestRouteCountersSLMDecisionsByConfidence(t *testing.T) {
 	rc := NewRouteCounters()
-	rc.Observe("local", "slm", 0.9, "coding", "")    // high
-	rc.Observe("frontier", "slm", 0.5, "coding", "") // medium
-	rc.Observe("frontier", "slm", 0.1, "coding", "") // low
-	rc.Observe("frontier", "slm-error", 0, "", "")   // none bucket
+	rc.Observe("local", "slm", 0.9, "coding")    // high
+	rc.Observe("frontier", "slm", 0.5, "coding") // medium
+	rc.Observe("frontier", "slm", 0.1, "coding") // low
+	rc.Observe("frontier", "slm-error", 0, "")   // none bucket
 
 	var sb strings.Builder
 	if _, err := rc.WriteTo(&sb); err != nil {
@@ -90,10 +90,10 @@ func TestRouteCountersSLMDecisionsByConfidence(t *testing.T) {
 
 func TestRouteCountersDeterministicOutput(t *testing.T) {
 	rc := NewRouteCounters()
-	rc.Observe("frontier", "slm", 0.6, "b", "")
-	rc.Observe("local", "dsl", 0, "", "")
-	rc.Observe("frontier", "guardrail", 0, "", "")
-	rc.Observe("local", "slm", 0.9, "a", "")
+	rc.Observe("frontier", "slm", 0.6, "b")
+	rc.Observe("local", "dsl", 0, "")
+	rc.Observe("frontier", "guardrail", 0, "")
+	rc.Observe("local", "slm", 0.9, "a")
 
 	var first, second strings.Builder
 	_, _ = rc.WriteTo(&first)
@@ -114,7 +114,7 @@ func TestRouteCountersConcurrentSafe(t *testing.T) {
 			if n%2 == 0 {
 				route = "local"
 			}
-			rc.Observe(route, "slm", 0.5, "coding", "")
+			rc.Observe(route, "slm", 0.5, "coding")
 		}(i)
 	}
 	wg.Wait()
@@ -134,7 +134,7 @@ func TestRouteCountersConcurrentSafe(t *testing.T) {
 func TestRouteCountersNilSafe(t *testing.T) {
 	var rc *RouteCounters
 	// Must not panic.
-	rc.Observe("frontier", "guardrail", 0, "", "")
+	rc.Observe("frontier", "guardrail", 0, "")
 	rc.ObserveRejection("bad_request")
 	n, err := rc.WriteTo(&strings.Builder{})
 	if err != nil || n != 0 {
@@ -144,7 +144,7 @@ func TestRouteCountersNilSafe(t *testing.T) {
 
 func TestRouteCountersHandlerContentType(t *testing.T) {
 	rc := NewRouteCounters()
-	rc.Observe("frontier", "guardrail", 0, "", "")
+	rc.Observe("frontier", "guardrail", 0, "")
 	h := rc.Handler()
 	if h == nil {
 		t.Fatal("Handler() returned nil")
@@ -235,5 +235,119 @@ func TestRouteCountersRejectionConcurrentSafe(t *testing.T) {
 	out := sb.String()
 	if !strings.Contains(out, "nexus_requests_rejected_total") {
 		t.Errorf("expected rejection metric in output")
+	}
+}
+
+// TestRouteCountersStreamTruncation exercises the issue #118
+// truncation counter: ObserveStreamTruncation increments per route,
+// the metric family header is always emitted, and the values surface
+// in the Prometheus exposition with a route label.
+func TestRouteCountersStreamTruncation(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveStreamTruncation("frontier")
+	rc.ObserveStreamTruncation("frontier")
+	rc.ObserveStreamTruncation("local")
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"# HELP nexus_stream_truncated_total", "metric family HELP header"},
+		{"# TYPE nexus_stream_truncated_total counter", "metric family TYPE line"},
+		{`nexus_stream_truncated_total{route="frontier"} 2`, "frontier counted twice"},
+		{`nexus_stream_truncated_total{route="local"} 1`, "local counted once"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+}
+
+// TestRouteCountersStreamTruncationNilSafe confirms the hook is a
+// no-op on a nil receiver so the chat handler can invoke it
+// unconditionally (issue #118 wiring mirrors the other observers).
+func TestRouteCountersStreamTruncationNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveStreamTruncation("frontier") // must not panic
+}
+
+// TestRouteCountersStreamTruncationConcurrentSafe exercises
+// ObserveStreamTruncation from many goroutines; the race detector is
+// the primary assertion (same guarantee as the rejection counter).
+func TestRouteCountersStreamTruncationConcurrentSafe(t *testing.T) {
+	rc := NewRouteCounters()
+	routes := []string{"local", "frontier", "fusion"}
+	var wg sync.WaitGroup
+	for i := 0; i < 300; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			rc.ObserveStreamTruncation(routes[n%len(routes)])
+		}(i)
+	}
+	wg.Wait()
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	if !strings.Contains(sb.String(), "nexus_stream_truncated_total") {
+		t.Errorf("expected truncation metric in output")
+	}
+}
+
+// TestRouteCountersTracingDrop verifies the issue #122 tracing drop
+// counter: ObserveTracingDrop stores the cumulative total and WriteTo
+// emits nexus_tracing_dropped_total with HELP/TYPE lines.
+func TestRouteCountersTracingDrop(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveTracingDrop(7)
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_tracing_dropped_total", "metric family header"},
+		{"# TYPE nexus_tracing_dropped_total counter", "counter type line"},
+		{"nexus_tracing_dropped_total 7", "dropped count"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+}
+
+// TestRouteCountersTracingDropNilSafe confirms the hook is a no-op on
+// a nil receiver so callers can invoke it unconditionally.
+func TestRouteCountersTracingDropNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveTracingDrop(42) // must not panic
+}
+
+// TestRouteCountersTracingDropDeterministicOrder verifies that
+// repeated scrapes produce identical output.
+func TestRouteCountersTracingDropDeterministicOrder(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveTracingDrop(3)
+
+	var first, second strings.Builder
+	_, _ = rc.WriteTo(&first)
+	_, _ = rc.WriteTo(&second)
+	if first.String() != second.String() {
+		t.Errorf("non-deterministic output across scrapes\n--- first ---\n%s\n--- second ---\n%s", first.String(), second.String())
 	}
 }
