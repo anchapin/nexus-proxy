@@ -1333,7 +1333,7 @@ func Chat(d Deps) http.Handler {
 				RouteSource:          string(decision.Source),
 				RouteReason:          decision.Reason,
 				SLMConfidence:        decision.Confidence,
-				SLMTaskType:         decision.TaskType,
+				SLMTaskType:          decision.TaskType,
 			})
 		}
 		if d.Recorder != nil {
