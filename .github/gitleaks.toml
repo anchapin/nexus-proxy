@@ -11,11 +11,11 @@ useDefault = true
 [[allowlists]]
 description = "Example env file — placeholders only, no real secrets"
 paths = [
-  '''^\.env\.example$''',
+  '''\.env\.example$''',
 ]
 
 [[allowlists]]
 description = "Provider constructor functions — no real secrets"
 paths = [
-  "internal/providers/frontier.go",
+  '''internal/providers/frontier\.go'''  ,
 ]
