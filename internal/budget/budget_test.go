@@ -144,6 +144,34 @@ func TestGuardLimitAccessor(t *testing.T) {
 	}
 }
 
+// TestGuardSourceLabel verifies that the source label is stored with
+// each entry and surfaced in the alerter callback.
+func TestGuardSourceLabel(t *testing.T) {
+	var lastSource string
+	g := NewGuard(100.0)
+	g.SetAlerter(AlerterFunc(func(_ State, _ float64, source string) {
+		lastSource = source
+	}))
+
+	g.Record(10.0, "frontier")
+	if lastSource != "frontier" {
+		t.Errorf("source = %q, want frontier", lastSource)
+	}
+
+	g.Record(5.0, "judge")
+	if lastSource != "judge" {
+		t.Errorf("source = %q, want judge", lastSource)
+	}
+}
+
+// AlerterFunc is a thin adapter so tests can use a plain function as
+// an Alerter without defining an interface implementation.
+type AlerterFunc func(State, float64, string)
+
+func (f AlerterFunc) OnExceed(State)                            {}
+func (f AlerterFunc) OnSpend(state State, cost float64, src string) { f(state, cost, src) }
+func (f AlerterFunc) OnApproaching(State)                        {}
+
 // TestGuardNilAlerterNoPanic verifies that operations don't panic when
 // no alerter is set.
 func TestGuardNilAlerterNoPanic(t *testing.T) {

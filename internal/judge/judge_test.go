@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/budget"
 )
 
 // rtFunc is a tiny test double that satisfies both http.RoundTripper
@@ -624,6 +626,64 @@ func TestEvaluatorCloseDrains(t *testing.T) {
 	if got := len(store.Scores()); got != 5 {
 		t.Errorf("Close did not drain: got %d/5 scores", got)
 	}
+}
+
+// TestBudgetGuardIntegration verifies that a configured BudgetGuard receives
+// Record calls with source="judge" after each successful evaluation (issue #240).
+func TestBudgetGuardIntegration(t *testing.T) {
+	var (
+		mu           sync.Mutex
+		recordedCost float64
+		recordedSrc  string
+	)
+	fn := rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"3"}}]}`)),
+		}, nil
+	})
+
+	bg := newBudgetGuardForTest(t)
+	bg.SetAlerter(budgetAlerterFunc(func(_ interface{}, cost float64, src string) {
+		mu.Lock()
+		defer mu.Unlock()
+		recordedCost = cost
+		recordedSrc = src
+	}))
+
+	e, store := newTestEvaluator(t, Config{
+		BudgetGuard: bg,
+	}, fn)
+	defer e.Close()
+
+	if !e.Enqueue(Sample{RequestID: "r-bg", Instruction: "x", Output: "y"}) {
+		t.Fatal("Enqueue should accept")
+	}
+	waitForScores(t, store, 1, 2*time.Second)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if recordedCost <= 0 {
+		t.Errorf("BudgetGuard cost = %v, want > 0", recordedCost)
+	}
+	if recordedSrc != "judge" {
+		t.Errorf("BudgetGuard source = %q, want judge", recordedSrc)
+	}
+}
+
+// budgetAlerterFunc is a thin adapter so tests can use a plain function
+// as a budget.Alerter without defining an interface implementation.
+type budgetAlerterFunc func(interface{}, float64, string)
+
+func (f budgetAlerterFunc) OnExceed(budget.State)                            {}
+func (f budgetAlerterFunc) OnSpend(state budget.State, cost float64, src string) {
+	f(state, cost, src)
+}
+func (f budgetAlerterFunc) OnApproaching(budget.State) {}
+
+func newBudgetGuardForTest(t *testing.T) *budget.Guard {
+	t.Helper()
+	return budget.NewGuard(1000.0)
 }
 
 // Compile-time guard: judge.HTTPClient must accept *http.Client.
