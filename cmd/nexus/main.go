@@ -576,6 +576,11 @@ func main() {
 	streamTruncationObs := handlers.StreamTruncationObserverFunc(func(e handlers.StreamTruncationEvent) {
 		routeCounters.ObserveStreamTruncation(e.Route)
 	})
+	// LatencyObserver (issue #165): forward latency/TTFT/error metrics
+	// to the histogram families in /metrics.
+	latencyObs := handlers.LatencyObserverFunc(func(e handlers.LatencyEvent) {
+		routeCounters.ObserveLatency(e.Route, e.LatencySeconds, e.TTFTSeconds, e.IsError)
+	})
 	mux.Handle("/metrics", routeCounters.Handler())
 	slog.Info("metrics endpoint serves prometheus text format",
 		slog.String("path", "/metrics"),
@@ -599,6 +604,7 @@ func main() {
 		RouteDecisionObserver:    routeDecisionObs,
 		RejectionObserver:        rejectionObs,
 		StreamTruncationObserver: streamTruncationObs,
+		LatencyObserver:          latencyObs,
 	})
 	// Apply the per-client rate limiter (issue #75) as the outermost
 	// wrapper so a flood of requests is rejected before any middleware

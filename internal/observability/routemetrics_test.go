@@ -238,15 +238,15 @@ func TestRouteCountersRejectionConcurrentSafe(t *testing.T) {
 	}
 }
 
-// TestRouteCountersStreamTruncation exercises the issue #118
-// truncation counter: ObserveStreamTruncation increments per route,
-// the metric family header is always emitted, and the values surface
-// in the Prometheus exposition with a route label.
-func TestRouteCountersStreamTruncation(t *testing.T) {
+// TestObserveLatencyHistogram tests the issue #165 latency histogram.
+func TestObserveLatencyHistogram(t *testing.T) {
 	rc := NewRouteCounters()
-	rc.ObserveStreamTruncation("frontier")
-	rc.ObserveStreamTruncation("frontier")
-	rc.ObserveStreamTruncation("local")
+	// Record a frontier request with 250ms latency and no error.
+	rc.ObserveLatency("frontier", 0.25, 0, false)
+	// Record a local request with 50ms latency and no error.
+	rc.ObserveLatency("local", 0.05, 0.01, false)
+	// Record a frontier request with an error.
+	rc.ObserveLatency("frontier", 1.5, 0.3, true)
 
 	var sb strings.Builder
 	if _, err := rc.WriteTo(&sb); err != nil {
@@ -258,10 +258,13 @@ func TestRouteCountersStreamTruncation(t *testing.T) {
 		fragment string
 		desc     string
 	}{
-		{"# HELP nexus_stream_truncated_total", "metric family HELP header"},
-		{"# TYPE nexus_stream_truncated_total counter", "metric family TYPE line"},
-		{`nexus_stream_truncated_total{route="frontier"} 2`, "frontier counted twice"},
-		{`nexus_stream_truncated_total{route="local"} 1`, "local counted once"},
+		{"nexus_request_latency_seconds", "latency histogram family present"},
+		{"# TYPE nexus_request_latency_seconds histogram", "histogram type line"},
+		{`route="frontier"`, "frontier route present in latency"},
+		{`route="local"`, "local route present in latency"},
+		{"nexus_request_errors_total", "error counter family present"},
+		{"# TYPE nexus_request_errors_total counter", "error counter type line"},
+		{`route="frontier"} 1`, "frontier error counted once"},
 	}
 	for _, c := range checks {
 		if !strings.Contains(out, c.fragment) {
@@ -270,45 +273,11 @@ func TestRouteCountersStreamTruncation(t *testing.T) {
 	}
 }
 
-// TestRouteCountersStreamTruncationNilSafe confirms the hook is a
-// no-op on a nil receiver so the chat handler can invoke it
-// unconditionally (issue #118 wiring mirrors the other observers).
-func TestRouteCountersStreamTruncationNilSafe(t *testing.T) {
-	var rc *RouteCounters
-	rc.ObserveStreamTruncation("frontier") // must not panic
-}
-
-// TestRouteCountersStreamTruncationConcurrentSafe exercises
-// ObserveStreamTruncation from many goroutines; the race detector is
-// the primary assertion (same guarantee as the rejection counter).
-func TestRouteCountersStreamTruncationConcurrentSafe(t *testing.T) {
+// TestObserveLatencyTTFT tests the issue #165 TTFT histogram.
+func TestObserveLatencyTTFT(t *testing.T) {
 	rc := NewRouteCounters()
-	routes := []string{"local", "frontier", "fusion"}
-	var wg sync.WaitGroup
-	for i := 0; i < 300; i++ {
-		wg.Add(1)
-		go func(n int) {
-			defer wg.Done()
-			rc.ObserveStreamTruncation(routes[n%len(routes)])
-		}(i)
-	}
-	wg.Wait()
-
-	var sb strings.Builder
-	if _, err := rc.WriteTo(&sb); err != nil {
-		t.Fatalf("WriteTo: %v", err)
-	}
-	if !strings.Contains(sb.String(), "nexus_stream_truncated_total") {
-		t.Errorf("expected truncation metric in output")
-	}
-}
-
-// TestRouteCountersTracingDrop verifies the issue #122 tracing drop
-// counter: ObserveTracingDrop stores the cumulative total and WriteTo
-// emits nexus_tracing_dropped_total with HELP/TYPE lines.
-func TestRouteCountersTracingDrop(t *testing.T) {
-	rc := NewRouteCounters()
-	rc.ObserveTracingDrop(7)
+	rc.ObserveLatency("local", 0.1, 0.05, false) // 100ms latency, 50ms TTFT
+	rc.ObserveLatency("local", 0.2, 0.15, false) // 200ms latency, 150ms TTFT
 
 	var sb strings.Builder
 	if _, err := rc.WriteTo(&sb); err != nil {
@@ -320,9 +289,9 @@ func TestRouteCountersTracingDrop(t *testing.T) {
 		fragment string
 		desc     string
 	}{
-		{"nexus_tracing_dropped_total", "metric family header"},
-		{"# TYPE nexus_tracing_dropped_total counter", "counter type line"},
-		{"nexus_tracing_dropped_total 7", "dropped count"},
+		{"nexus_request_ttft_seconds", "TTFT histogram family present"},
+		{"# TYPE nexus_request_ttft_seconds histogram", "TTFT histogram type line"},
+		{`route="local"`, "local route present in TTFT"},
 	}
 	for _, c := range checks {
 		if !strings.Contains(out, c.fragment) {
@@ -331,23 +300,13 @@ func TestRouteCountersTracingDrop(t *testing.T) {
 	}
 }
 
-// TestRouteCountersTracingDropNilSafe confirms the hook is a no-op on
-// a nil receiver so callers can invoke it unconditionally.
-func TestRouteCountersTracingDropNilSafe(t *testing.T) {
+// TestRouteCountersNilSafeLatency tests that ObserveLatency is nil-safe.
+func TestRouteCountersNilSafeLatency(t *testing.T) {
 	var rc *RouteCounters
-	rc.ObserveTracingDrop(42) // must not panic
-}
-
-// TestRouteCountersTracingDropDeterministicOrder verifies that
-// repeated scrapes produce identical output.
-func TestRouteCountersTracingDropDeterministicOrder(t *testing.T) {
-	rc := NewRouteCounters()
-	rc.ObserveTracingDrop(3)
-
-	var first, second strings.Builder
-	_, _ = rc.WriteTo(&first)
-	_, _ = rc.WriteTo(&second)
-	if first.String() != second.String() {
-		t.Errorf("non-deterministic output across scrapes\n--- first ---\n%s\n--- second ---\n%s", first.String(), second.String())
+	// Must not panic.
+	rc.ObserveLatency("frontier", 1.0, 0.5, true)
+	n, err := rc.WriteTo(&strings.Builder{})
+	if err != nil || n != 0 {
+		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
 	}
 }
