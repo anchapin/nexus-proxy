@@ -74,19 +74,19 @@ type counterKey struct {
 // lookup (guarded by a mutex) followed by an atomic increment, so
 // contention is minimal.
 //
-// Three metric families are exposed:
+// Four metric families are exposed:
 //   - nexus_route_decisions_total{route,source}
 //   - nexus_slm_decisions_total{route,confidence_bucket,task_type}
 //   - nexus_slm_low_confidence_escalations_total{task_type}
-//
-// A fourth family (issue #119) records requests the proxy rejected
-// before they reached an upstream:
 //   - nexus_requests_rejected_total{reason}
 //
 // A fifth family (issue #187) records fusion arbiter outcomes:
 //   - nexus_fusion_arbiter_total{outcome}
 //     where outcome is "skipped" (agreement reached, arbiter not invoked)
 //     or "invoked" (disagreement, arbiter was called).
+//
+// A sixth family (issue #186) records RAG retrieval outcomes:
+//   - nexus_rag_retrieval_total{hit}
 //
 // The reason label values are short, bounded strings (method,
 // body_too_large, bad_request, rate_limit, ...) defined as constants
@@ -100,6 +100,8 @@ type RouteCounters struct {
 	lowConfidenceEscalations map[counterKey]*uint64
 	rejections               map[string]*uint64
 	fusionArbiter            map[string]*uint64
+	rRAGHits                 map[string]*uint64
+	rRAGMisses               map[string]*uint64
 }
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
@@ -110,6 +112,8 @@ func NewRouteCounters() *RouteCounters {
 		lowConfidenceEscalations: make(map[counterKey]*uint64),
 		rejections:               make(map[string]*uint64),
 		fusionArbiter:            make(map[string]*uint64),
+		rRAGHits:                 make(map[string]*uint64),
+		rRAGMisses:               make(map[string]*uint64),
 	}
 }
 
@@ -214,6 +218,53 @@ func (rc *RouteCounters) fusionSlot(outcome string) *uint64 {
 	return p
 }
 
+// ObserveRAGHit records a RAG retrieval hit (issue #186). filename
+// is the source file of the matched example and is attached as a
+// label so operators can see which snippets are being retrieved.
+func (rc *RouteCounters) ObserveRAGHit(filename string) {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(rc.ragHitSlot(filename), 1)
+}
+
+// ObserveRAGMiss records a RAG retrieval miss (issue #186). reason
+// is the miss cause: "empty_store" when the RAG store has no indexed
+// examples, "threshold" when the best match scored below the similarity
+// floor, or "embed_error" when the embedding call failed.
+func (rc *RouteCounters) ObserveRAGMiss(reason string) {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(rc.ragMissSlot(reason), 1)
+}
+
+// ragHitSlot returns the *uint64 for a hit filename, creating it if absent.
+func (rc *RouteCounters) ragHitSlot(filename string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.rRAGHits[filename]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.rRAGHits[filename] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
+// ragMissSlot returns the *uint64 for a miss reason, creating it if absent.
+func (rc *RouteCounters) ragMissSlot(reason string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.rRAGMisses[reason]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.rRAGMisses[reason] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
 // reasonSlot returns the *uint64 for reason, creating it if absent.
 // Same lock-then-atomic pattern as slot: the mutex guards the map
 // mutation only, the increment happens lock-free.
@@ -295,6 +346,13 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	if n, err := writeFusionSeries(w, "nexus_fusion_arbiter_total",
 		"Fusion panel outcomes: arbiter skipped (agreement) or invoked (disagreement).",
 		rc.fusionArbiter); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeRAGSeries(w, "nexus_rag_retrieval_total",
+		"RAG retrieval outcomes partitioned by hit/miss and reason or filename.",
+		rc.rRAGHits, rc.rRAGMisses); err != nil {
 		return total, err
 	} else {
 		total += n
@@ -394,6 +452,69 @@ func writeFusionSeries(w io.Writer, name, help string, m map[string]*uint64) (in
 			return total + int64(n), err
 		}
 		total += int64(n)
+	}
+	return total, nil
+}
+
+// writeRAGSeries emits the nexus_rag_retrieval_total family.
+// hits and misses share the same metric name but are distinguished by
+// the "hit" label (true/false). filename is attached to hits so
+// operators can see which snippets fire most often; reason is attached
+// to misses so they can diagnose why retrieval fails. Output is sorted
+// by hit then by key for deterministic scrape diffs.
+func writeRAGSeries(w io.Writer, name, help string, hits, misses map[string]*uint64) (int64, error) {
+	var total int64
+	n, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", name, help, name)
+	if err != nil {
+		return total + int64(n), err
+	}
+	total += int64(n)
+
+	writeHitPairs := func(m map[string]*uint64) (int64, error) {
+		var subTotal int64
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			v := atomic.LoadUint64(m[k])
+			n, err := fmt.Fprintf(w, "%s{hit=%q,filename=%q} %d\n", name, "true", sanitizeLabel(k), v)
+			if err != nil {
+				return subTotal + int64(n), err
+			}
+			subTotal += int64(n)
+		}
+		return subTotal, nil
+	}
+
+	writeMissPairs := func(m map[string]*uint64) (int64, error) {
+		var subTotal int64
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			v := atomic.LoadUint64(m[k])
+			n, err := fmt.Fprintf(w, "%s{hit=%q,reason=%q} %d\n", name, "false", sanitizeLabel(k), v)
+			if err != nil {
+				return subTotal + int64(n), err
+			}
+			subTotal += int64(n)
+		}
+		return subTotal, nil
+	}
+
+	if n, err := writeHitPairs(hits); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeMissPairs(misses); err != nil {
+		return total, err
+	} else {
+		total += n
 	}
 	return total, nil
 }
