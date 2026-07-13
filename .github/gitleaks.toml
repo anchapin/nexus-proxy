@@ -15,7 +15,7 @@ paths = [
 ]
 
 [[allowlists]]
-description = "Provider constructor functions — no real secrets"
+description = "Provider package — constructor function signatures are false positives"
 paths = [
-  "internal/providers/frontier.go",
+  "internal/providers/",
 ]
