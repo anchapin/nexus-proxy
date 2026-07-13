@@ -5,8 +5,8 @@
 // detects/rejects suspicious prompt-injection patterns.
 //
 // Modes:
-//   - off (default): legacy append behaviour, byte-for-byte unchanged.
-//   - warn: proxy text is wrapped in delimiters and placed in a
+//   - off: legacy append behaviour, byte-for-byte unchanged.
+//   - warn (default): proxy text is wrapped in delimiters and placed in a
 //     dedicated leading system message; suspicious user system
 //     messages are logged but not rejected.
 //   - strict: same as warn, plus suspicious patterns are rejected
@@ -52,18 +52,16 @@ const (
 	ProxyPolicyEnd   = "[NEXUS PROXY POLICY END]"
 )
 
-// ParseInjectionMode maps the NEXUS_PROMPT_INJECTION_MODE env value
-// to an InjectionMode. Unknown / empty values fall back to
-// InjectionModeOff so a stock deployment boots with the legacy
-// behaviour (backward compatible).
 func ParseInjectionMode(raw string) InjectionMode {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "off":
+		return InjectionModeOff
 	case "warn":
 		return InjectionModeWarn
 	case "strict":
 		return InjectionModeStrict
 	default:
-		return InjectionModeOff
+		return InjectionModeWarn
 	}
 }
 
