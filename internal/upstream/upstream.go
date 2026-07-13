@@ -13,8 +13,28 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"syscall"
 	"time"
 )
+
+// ErrClientAbort is returned by streamPanelResultAsSSE when the client
+// disconnects mid-stream (EPIPE, ECONNRESET). Callers must treat it as
+// a non-error client-abort condition: log at info level and return early
+// without continuing to the arbiter.
+var ErrClientAbort = errors.New("client abort")
+
+// IsClientAbort reports whether err is a client-side connection error
+// (EPIPE, ECONNRESET, broken pipe) that indicates the client disconnected
+// mid-response. These are logged at info level rather than error level.
+func IsClientAbort(err error) bool {
+	if err == nil {
+		return false
+	}
+	// errors.Is walks the chain of wrapped errors.
+	return errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, ErrClientAbort)
+}
 
 // Client is the minimal interface used by the stream and fusion helpers. The
 // default http.Client satisfies it; tests can pass a stub.
@@ -520,6 +540,17 @@ func PanelStreaming(
 	outcome.Source = winner.Source
 
 	if err := streamPanelResultAsSSE(w, winner); err != nil {
+		if errors.Is(err, ErrClientAbort) {
+			// Client disconnected mid-stream. The speculative chunk
+			// never made it; do not invoke the arbiter — there is
+			// nobody to receive its output. Log at info level so
+			// operators can distinguish "client dropped" from "slow
+			// arbiter" in the access log (issue #167).
+			slog.Info("fusion speculative write: client aborted",
+				slog.String("source", outcome.Source),
+			)
+			return outcome, nil
+		}
 		return outcome, fmt.Errorf("fusion: stream speculative: %w", err)
 	}
 
@@ -657,12 +688,21 @@ func streamPanelResultAsSSE(w http.ResponseWriter, r PanelResult) error {
 		return fmt.Errorf("fusion: marshal speculative chunk: %w", err)
 	}
 	if _, err := w.Write([]byte("data: ")); err != nil {
+		if IsClientAbort(err) {
+			return ErrClientAbort
+		}
 		return err
 	}
 	if _, err := w.Write(b); err != nil {
+		if IsClientAbort(err) {
+			return ErrClientAbort
+		}
 		return err
 	}
 	if _, err := w.Write([]byte("\n\n")); err != nil {
+		if IsClientAbort(err) {
+			return ErrClientAbort
+		}
 		return err
 	}
 	if f, ok := w.(http.Flusher); ok {

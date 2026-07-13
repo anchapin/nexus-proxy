@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1330,5 +1331,122 @@ func TestFetchPanelPreservesToolCalls(t *testing.T) {
 	}
 	if got.ToolCalls[0].Function.Name != "exec" {
 		t.Errorf("name = %q", got.ToolCalls[0].Function.Name)
+	}
+}
+
+// --- Issue #167: client abort during speculative SSE write tests ----------
+
+// brokenPipeRW is a ResponseWriter that fails on the first Write with EPIPE,
+// simulating a client that disconnected mid-stream.
+type brokenPipeRW struct {
+	header http.Header
+	status int
+	writes int // number of Write calls attempted
+}
+
+func newBrokenPipeRW() *brokenPipeRW {
+	return &brokenPipeRW{header: http.Header{}}
+}
+
+func (b *brokenPipeRW) Header() http.Header { return b.header }
+func (b *brokenPipeRW) WriteHeader(s int)   { b.status = s }
+func (b *brokenPipeRW) Flush()              {}
+func (b *brokenPipeRW) Write(p []byte) (int, error) {
+	b.writes++
+	// Simulate EPIPE: the client disconnected.
+	return len(p), &writeErr{errno: syscall.EPIPE}
+}
+
+// writeErr wraps syscall.Errno so errors.Is works correctly.
+type writeErr struct {
+	errno syscall.Errno
+}
+
+func (e *writeErr) Error() string { return e.errno.Error() }
+func (e *writeErr) Unwrap() error { return e.errno }
+
+// TestPanelStreamingClientAbortSkipsArbiter verifies that when the client
+// disconnects during the speculative SSE write (EPIPE), PanelStreaming
+// returns nil (not an error) and does NOT invoke the arbiter. This is the
+// fix for issue #167: client abort should be logged at info level and
+// return early, not treated as an upstream error.
+func TestPanelStreamingClientAbortSkipsArbiter(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local answer"}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier answer"}}]}`)
+	})
+	// The arbiter handler sets a flag so we can assert it was never called.
+	var arbiterCalled int
+	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		arbiterCalled++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "data: {\"synth\":\"arbiter-out\"}\n\n")
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newBrokenPipeRW()
+	outcome, err := PanelStreaming(
+		rw, client,
+		"http://local.local", "local-m",
+		frontierURL, "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		5*time.Second, 5*time.Second,
+		false, 0.85,
+	)
+	// Issue #167: client abort is NOT returned as an error — we return nil
+	// so the handler does not render a 502 error page to a disconnected client.
+	if err != nil {
+		t.Fatalf("PanelStreaming: got error %v, want nil (client abort)", err)
+	}
+	// The arbiter must NOT have been invoked — the client is gone, there
+	// is nobody to receive the arbiter synthesis.
+	if arbiterCalled != 0 {
+		t.Errorf("arbiter called %d times, want 0 (client aborted)", arbiterCalled)
+	}
+	// The speculative write was attempted at least once (the broken pipe fired).
+	if rw.writes == 0 {
+		t.Errorf("rw.writes = 0, want >= 1 (write should have been attempted)")
+	}
+	// outcome.Source should still be set from the winner selection.
+	if outcome.Source != "local" && outcome.Source != "frontier" {
+		t.Errorf("outcome.Source = %q, want local or frontier", outcome.Source)
+	}
+	_ = outcome // outcome.Similarity is 0 since we never reached agreement check
+}
+
+// TestIsClientAbort verifies the IsClientAbort helper correctly identifies
+// EPIPE, ECONNRESET, and ErrClientAbort.
+func TestIsClientAbort(t *testing.T) {
+	epipeErr := &writeErr{errno: syscall.EPIPE}
+	connresetErr := &writeErr{errno: syscall.ECONNRESET}
+	otherErr := errors.New("some other error")
+
+	if !IsClientAbort(epipeErr) {
+		t.Error("IsClientAbort(EPIPE) = false, want true")
+	}
+	if !IsClientAbort(connresetErr) {
+		t.Error("IsClientAbort(ECONNRESET) = false, want true")
+	}
+	if !IsClientAbort(ErrClientAbort) {
+		t.Error("IsClientAbort(ErrClientAbort) = false, want true")
+	}
+	if IsClientAbort(otherErr) {
+		t.Error("IsClientAbort(other error) = true, want false")
+	}
+	if IsClientAbort(nil) {
+		t.Error("IsClientAbort(nil) = true, want false")
 	}
 }
