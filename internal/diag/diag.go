@@ -20,6 +20,7 @@
 package diag
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -119,7 +120,7 @@ func Run(ctx context.Context, cfg config.Config, opts Options) Result {
 	models, modelsOK := fetchAvailableModels(ctx, opts)
 	r = append(r, modelCheck(checkRouterModel, cfg.RouterModel, models, modelsOK))
 	r = append(r, modelCheck(checkLocalModel, cfg.LocalModel, models, modelsOK))
-	r = append(r, modelCheck(checkEmbeddingModel, cfg.EmbeddingModel, models, modelsOK))
+	r = append(r, checkEmbeddingModelFn(ctx, cfg.EmbeddingModel, models, modelsOK, opts))
 	r = append(r, checkFrontierKeyFn(ctx, cfg, opts))
 	r = append(r, checkZAIKeyFn(cfg))
 	r = append(r, checkVRAMProbeFn(ctx, cfg, opts))
@@ -156,6 +157,97 @@ func (r Result) Warned() int {
 }
 
 // --- Ollama reachability + model inventory ---------------------------------
+
+// checkEmbeddingModelFn probes the configured embedding model with a
+// trivial call to /api/embeddings to confirm end-to-end readiness.
+// Unlike the chat/router model checks (which only verify the model is
+// pulled), this check validates that the model can actually generate
+// embeddings — catching corrupt or incompatible models that would
+// otherwise silently fail at runtime (issue #199).
+func checkEmbeddingModelFn(ctx context.Context, model string, available map[string]struct{}, inventoryOK bool, opts Options) Check {
+	if model == "" {
+		return Check{
+			Name:   checkEmbeddingModel,
+			Status: StatusFail,
+			Detail: "no embedding model configured",
+		}
+	}
+	if !inventoryOK {
+		return Check{
+			Name:   checkEmbeddingModel,
+			Status: StatusSkip,
+			Detail: fmt.Sprintf("could not list models — %q not verified", model),
+		}
+	}
+	if _, ok := available[model]; !ok {
+		return Check{
+			Name:   checkEmbeddingModel,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("model %q not pulled — Run: ollama pull %s", model, model),
+		}
+	}
+	// Probe with a trivial prompt; a successful 200 with a non-empty
+	// embedding vector confirms the model is functional.
+	payload, _ := json.Marshal(map[string]string{"model": model, "prompt": "hello"})
+	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		opts.OllamaURL+"/api/embeddings", bytes.NewReader(payload))
+	if err != nil {
+		return Check{
+			Name:   checkEmbeddingModel,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("embedding model %q: bad request: %v", model, err),
+		}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := opts.HTTPClient.Do(req)
+	if err != nil {
+		return Check{
+			Name:   checkEmbeddingModel,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("embedding model %q: cannot reach: %v", model, err),
+		}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return Check{
+			Name:   checkEmbeddingModel,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("embedding model %q returned status %d", model, resp.StatusCode),
+		}
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return Check{
+			Name:   checkEmbeddingModel,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("embedding model %q: could not read response: %v", model, err),
+		}
+	}
+	var raw struct {
+		Embedding []float64 `json:"embedding"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return Check{
+			Name:   checkEmbeddingModel,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("embedding model %q: decode error: %v", model, err),
+		}
+	}
+	if len(raw.Embedding) == 0 {
+		return Check{
+			Name:   checkEmbeddingModel,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("embedding model %q returned empty embedding vector", model),
+		}
+	}
+	return Check{
+		Name:   checkEmbeddingModel,
+		Status: StatusPass,
+		Detail: fmt.Sprintf("model %q functional (%d-dim vector)", model, len(raw.Embedding)),
+	}
+}
 
 // checkOllamaReachableFn performs GET /api/tags and reports whether
 // the endpoint answered. A 2xx response is pass; 5xx or any other
