@@ -224,6 +224,32 @@ type RAGObserverFunc func(RAGEvent)
 // ObserveRAG implements RAGObserver.
 func (f RAGObserverFunc) ObserveRAG(e RAGEvent) { f(e) }
 
+// CascadeFallbackEvent carries the reason for a cascade fallback (issue #205).
+// The handler dispatches one when a retryable step failure causes the cascade
+// to fall back to the next step. The reason is one of "timeout",
+// "transport_error", or "malformed_toolcall".
+type CascadeFallbackEvent struct {
+	RequestID string
+	Reason    string // "timeout", "transport_error", or "malformed_toolcall"
+}
+
+// CascadeFallbackObserver is the hook invoked when the cascade falls back
+// to a later step due to a retryable error (issue #205). Implementations
+// must be safe for concurrent use and must not block. Nil means "no
+// observer" — the hot path is unaffected. The handler does not import
+// the observability package; main.go wires a closure that forwards to
+// RouteCounters.ObserveCascadeFallback.
+type CascadeFallbackObserver interface {
+	ObserveCascadeFallback(CascadeFallbackEvent)
+}
+
+// CascadeFallbackObserverFunc adapts a plain function to the
+// CascadeFallbackObserver interface.
+type CascadeFallbackObserverFunc func(CascadeFallbackEvent)
+
+// ObserveCascadeFallback implements CascadeFallbackObserver.
+func (f CascadeFallbackObserverFunc) ObserveCascadeFallback(e CascadeFallbackEvent) { f(e) }
+
 // MetricsEvent carries the per-request data needed by the savings
 // dashboard (issue #4). Fields track the full round-trip metrics:
 // route/model/input-tokens are routing dimensions; TOON/RAG/cost are
@@ -507,6 +533,18 @@ type Deps struct {
 	// import the observability package — main.go wires a closure
 	// that adapts the event to the in-process RAG counter.
 	RAGObserver RAGObserver
+
+	// CascadeFallbackObserver is invoked when the cascade falls back to a
+	// later step due to a retryable error (issue #205). The handler
+	// dispatches exactly one event per request when FallbackReason is
+	// non-empty (i.e., the cascade fell back at least once). The
+	// reason is one of "timeout", "transport_error", or
+	// "malformed_toolcall". Implementations must be safe for concurrent
+	// use and must not block. Nil means "no observer"; the hot path is
+	// unaffected. The handler does not import the observability package —
+	// main.go wires a closure that forwards to
+	// RouteCounters.ObserveCascadeFallback.
+	CascadeFallbackObserver CascadeFallbackObserver
 
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
@@ -1145,6 +1183,16 @@ func Chat(d Deps) http.Handler {
 				// entirely and starts at frontier.
 				res, err := cas.Run(rw, d.Client, body)
 				logCascadeTelemetry(res, err, reqID)
+				// Issue #205: record cascade fallback metric when a retryable
+				// step failure caused the cascade to fall back to the next
+				// step. The observer is nil-safe; nil means no observability
+				// wiring so the hot path is unaffected.
+				if res.FallbackReason != "" && d.CascadeFallbackObserver != nil {
+					d.CascadeFallbackObserver.ObserveCascadeFallback(CascadeFallbackEvent{
+						RequestID: reqID,
+						Reason:    res.FallbackReason,
+					})
+				}
 				// Issue #80: arm the local-route cooldown when the
 				// cascade reports the local step failed before a
 				// fallback served the request. Subsequent requests
