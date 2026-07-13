@@ -143,6 +143,10 @@ const (
 	// emitted by the rate-limit middleware. The reason is recorded
 	// by the middleware hook wired in main.go.
 	RejectionRateLimit = "rate_limit"
+	// RejectionBudget marks a 429 Too Many Requests response
+	// emitted when the rolling 24h frontier spend budget is exhausted
+	// (issue #183).
+	RejectionBudget = "budget_exhausted"
 	// RejectionJudgeQueue marks a judge evaluator enqueue failure
 	// (internal/judge queue full).
 	RejectionJudgeQueue = "judge_queue"
@@ -449,6 +453,19 @@ type Deps struct {
 	// handler behaves identically to before issue #6 when no
 	// probe is wired.
 	BudgetObserver BudgetObserver
+
+	// BudgetGuard is the rolling 24h frontier spend guard (issue
+	// #183). When non-nil the handler calls BudgetGuard.Check with
+	// the estimated frontier cost before issuing a route=frontier or
+	// route=fusion request; a false return is treated as a 429
+	// rejection. After a successful frontier/fusion response the
+	// handler calls BudgetGuard.Record with the estimated USD cost so
+	// the rolling window stays current. Nil means budget guard is
+	// disabled (pre-#183 behaviour).
+	BudgetGuard interface {
+		Check(cost float64) bool
+		Record(spent float64)
+	}
 
 	// LocalLimiter bounds concurrent local-route requests (issue
 	// #81). When non-nil the handler Acquires a slot before issuing
@@ -1017,6 +1034,24 @@ func Chat(d Deps) http.Handler {
 			trace.Upstream.Model = d.Config.FrontierModel
 			trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
 			if streaming && d.Config.FusionProgressiveDelivery {
+				// Budget guard check (issue #183): fusion includes a
+				// frontier panel member, so it counts toward the daily
+				// budget. Reject before spinning up either member.
+				inputTokens := telemetry.EstimateTokens(latestPrompt)
+				cost := frontierCostEstimate(string(router.RouteFusion), d.Config.FrontierModel, inputTokens, d.Config.JudgeCostPer1KUSD)
+				if d.BudgetGuard != nil && d.BudgetGuard.Check(cost) {
+					slog.Warn("budget exhausted, rejecting fusion request",
+						slog.String("request_id", reqID),
+					)
+					if d.RejectionObserver != nil {
+						d.RejectionObserver.ObserveRejection(RejectionEvent{
+							RequestID: reqID,
+							Reason:    RejectionBudget,
+						})
+					}
+					http.Error(w, "Budget exhausted", http.StatusTooManyRequests)
+					return
+				}
 				var outcome upstream.PanelOutcome
 				outcome, upErr = upstream.PanelStreaming(
 					obs, d.Client,
@@ -1037,6 +1072,22 @@ func Chat(d Deps) http.Handler {
 					)
 				}
 			} else {
+				// Budget guard check for non-progressive fusion (issue #183).
+				inputTokens := telemetry.EstimateTokens(latestPrompt)
+				cost := frontierCostEstimate(string(router.RouteFusion), d.Config.FrontierModel, inputTokens, d.Config.JudgeCostPer1KUSD)
+				if d.BudgetGuard != nil && d.BudgetGuard.Check(cost) {
+					slog.Warn("budget exhausted, rejecting fusion request",
+						slog.String("request_id", reqID),
+					)
+					if d.RejectionObserver != nil {
+						d.RejectionObserver.ObserveRejection(RejectionEvent{
+							RequestID: reqID,
+							Reason:    RejectionBudget,
+						})
+					}
+					http.Error(w, "Budget exhausted", http.StatusTooManyRequests)
+					return
+				}
 				upErr = upstream.Panel(
 					obs, d.Client,
 					d.Config.OllamaURL, d.Config.LocalModel,
@@ -1268,6 +1319,23 @@ func Chat(d Deps) http.Handler {
 
 		default:
 			model = d.Config.FrontierModel
+			// Budget guard check (issue #183): reject before issuing a
+			// frontier request when the daily budget is exhausted.
+			inputTokens := telemetry.EstimateTokens(latestPrompt)
+			cost := frontierCostEstimate(string(router.RouteFrontier), model, inputTokens, d.Config.JudgeCostPer1KUSD)
+			if d.BudgetGuard != nil && d.BudgetGuard.Check(cost) {
+				slog.Warn("budget exhausted, rejecting frontier request",
+					slog.String("request_id", reqID),
+				)
+				if d.RejectionObserver != nil {
+					d.RejectionObserver.ObserveRejection(RejectionEvent{
+						RequestID: reqID,
+						Reason:    RejectionBudget,
+					})
+				}
+				http.Error(w, "Budget exhausted", http.StatusTooManyRequests)
+				return
+			}
 			// Honor the harness's stream flag (issue #10). Stream
 			// preserves SSE framing for chunked deliveries;
 			// BufferedFetch collects the full body and returns a
@@ -1390,6 +1458,15 @@ func Chat(d Deps) http.Handler {
 				SLMConfidence:        decision.Confidence,
 				SLMTaskType:          decision.TaskType,
 			})
+		}
+		// BudgetGuard record (issue #183): after a successful frontier or
+		// fusion response, record the estimated input-token cost so the
+		// rolling 24h window stays current. No-op when BudgetGuard is nil
+		// (guard disabled). Only frontier/fusion routes have non-zero cost.
+		if d.BudgetGuard != nil && upErr == nil {
+			inputTokens := telemetry.EstimateTokens(latestPrompt)
+			cost := frontierCostEstimate(string(route), model, inputTokens, d.Config.JudgeCostPer1KUSD)
+			d.BudgetGuard.Record(cost)
 		}
 		if d.Recorder != nil {
 			d.Recorder.Record(rec)

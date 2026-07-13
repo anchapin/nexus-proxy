@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/auth"
+	"github.com/anchapin/nexus-proxy/internal/budget"
 	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
 	"github.com/anchapin/nexus-proxy/internal/config"
@@ -563,6 +564,21 @@ func main() {
 	// RouteCounters.Handler() so a scrape is always an atomic
 	// snapshot.
 	routeCounters = observability.NewRouteCounters()
+
+	// Rolling 24h frontier spend guard (issue #183). When
+	// BudgetDailyLimit > 0 the guard is active; nil means budget
+	// disabled (pre-#183 behaviour). The guard is passed to the chat
+	// handler via handlers.Deps.BudgetGuard.
+	var budgetGuard *budget.Guard
+	if cfg.BudgetEnabled() {
+		budgetGuard = budget.NewGuard(cfg.BudgetDailyLimit)
+		slog.Info("budget guard enabled",
+			slog.Float64("daily_limit_usd", cfg.BudgetDailyLimit),
+		)
+	} else {
+		slog.Info("budget guard disabled (NEXUS_BUDGET_DAILY_LIMIT <= 0)")
+	}
+
 	// Wire the evaluator's drop counter into Prometheus (issue
 	// #111). The evaluator's onDrop callback passes the cumulative
 	// drop total which ObserveJudgeDrop stores atomically.
@@ -622,6 +638,7 @@ func main() {
 		Recorder:                 recorder,
 		Health:                   hpoller,
 		BudgetObserver:           budgetObserver(probeMgr),
+		BudgetGuard:              budgetGuard,
 		LocalLimiter:             localLimiter,
 		LocalCooldown:            localCooldown,
 		RouteDecisionObserver:    routeDecisionObs,
@@ -658,12 +675,12 @@ func main() {
 		slog.String("ollama_url", cfg.OllamaURL),
 	)
 
-	// /status endpoint (issues #109 + #111). Exposes operator-facing
-	// diagnostics: frontier configured (boolean only — no URL or
-	// model name), judge state (enabled, queue depth, dropped count,
-	// concurrency), VRAM budget, and uptime. Behind auth by default;
-	// set NEXUS_STATUS_PUBLIC=true for a public status page.
-	mux.HandleFunc("/status", statusHandler(hpoller, probeMgr, cfg, judgeEval, time.Now()))
+	// /status endpoint (issue #109, #183). Exposes operator-facing
+	// diagnostics: frontier configured, judge enabled, VRAM budget,
+	// uptime, and rolling 24h frontier spend budget when active.
+	// Behind auth by default; set NEXUS_STATUS_PUBLIC=true for a
+	// public status page (e.g. behind a reverse-proxy ACL).
+	mux.HandleFunc("/status", statusHandler(hpoller, probeMgr, cfg, budgetGuard, judgeEval != nil, time.Now()))
 	if cfg.StatusPublic {
 		slog.Info("status endpoint is PUBLIC (NEXUS_STATUS_PUBLIC=true)")
 	} else {
@@ -1073,18 +1090,12 @@ func publicPathExempt(cfg config.Config) func(*http.Request) bool {
 	}
 }
 
-// statusHandler returns the /status handler (issues #109 + #111).
-// Unlike /healthz (which is designed for liveness probes), /status
-// exposes operator-facing diagnostics: whether the frontier API is
-// configured, whether the judge evaluator is enabled, the current
-// VRAM budget, uptime, and — when the evaluator is non-nil — a
-// nested judge object with queue depth, dropped count, and
-// concurrency. The frontier field is a boolean (not the URL or
-// model name) so the response is safe to expose publicly if the
-// operator opts in via NEXUS_STATUS_PUBLIC=true. The judge object is
-// omitted entirely when the evaluator is nil so operators see a
-// clean "no judge" state rather than zero-value noise.
-func statusHandler(hpoller *health.Health, mgr *probe.Manager, cfg config.Config, eval *judge.Evaluator, startTime time.Time) http.HandlerFunc {
+// statusHandler returns the /status handler (issue #109, #183). It
+// extends /healthz with the rolling 24h frontier spend budget when
+// the budget guard is active, and adds judgeEnabled, uptime, and
+// frontierConfigured fields. Status code is always 200 when the
+// binary is alive.
+func statusHandler(hpoller *health.Health, mgr *probe.Manager, cfg config.Config, guard *budget.Guard, judgeEnabled bool, startTime time.Time) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -1099,43 +1110,50 @@ func statusHandler(hpoller *health.Health, mgr *probe.Manager, cfg config.Config
 			displayTokens = cfg.TokenGuardrail
 			source = string(probe.SourceStatic)
 		}
-		type judgeStatus struct {
-			Enabled     bool   `json:"enabled"`
-			QueueDepth  int    `json:"queue_depth"`
-			Dropped     uint64 `json:"dropped"`
-			Concurrency int    `json:"concurrency"`
+
+		type budgetStatus struct {
+			SpentUSD     float64   `json:"spent_usd,omitempty"`
+			LimitUSD     float64   `json:"limit_usd,omitempty"`
+			RemainingUSD float64   `json:"remaining_usd,omitempty"`
+			Exhausted    bool      `json:"exhausted,omitempty"`
+			NextResetAt  time.Time `json:"next_reset_at,omitempty"`
 		}
+		var bs *budgetStatus
+		if guard != nil {
+			st := guard.State()
+			bs = &budgetStatus{
+				SpentUSD:     st.Spent,
+				LimitUSD:     st.Limit,
+				RemainingUSD: st.Remaining,
+				Exhausted:    st.Exhausted,
+				NextResetAt:  st.NextReset,
+			}
+		}
+
 		resp := struct {
-			Status             string       `json:"status"`
-			FrontierConfigured bool         `json:"frontier_configured"`
-			OllamaHealthy      bool         `json:"ollama_healthy"`
-			JudgeEnabled       bool         `json:"judge_enabled"`
-			BudgetTokens       int          `json:"budget_tokens"`
-			BudgetSource       string       `json:"budget_source"`
-			FreeVRAMBytes      int64        `json:"free_vram_bytes,omitempty"`
-			ModelContext       int          `json:"model_context,omitempty"`
-			StaticFallback     int          `json:"static_fallback_tokens"`
-			UptimeSeconds      int64        `json:"uptime_seconds"`
-			Judge              *judgeStatus `json:"judge,omitempty"`
+			Status             string        `json:"status"`
+			FrontierConfigured bool          `json:"frontier_configured"`
+			OllamaHealthy      bool          `json:"ollama_healthy"`
+			JudgeEnabled       bool          `json:"judge_enabled"`
+			VRAMBudgetTokens   int           `json:"vram_budget_tokens"`
+			VRAMBudgetSource   string        `json:"vram_budget_source"`
+			FreeVRAMBytes      int64         `json:"free_vram_bytes,omitempty"`
+			ModelContext       int           `json:"model_context,omitempty"`
+			StaticFallback     int           `json:"static_fallback_tokens"`
+			Budget             *budgetStatus `json:"budget,omitempty"`
+			UptimeSeconds      int64         `json:"uptime_seconds"`
 		}{
 			Status:             "ok",
 			FrontierConfigured: cfg.FrontierKey != "",
 			OllamaHealthy:      hpoller == nil || hpoller.IsLocalHealthy(),
-			JudgeEnabled:       eval != nil && eval.Enabled(),
-			BudgetTokens:       displayTokens,
-			BudgetSource:       source,
+			JudgeEnabled:       judgeEnabled,
+			VRAMBudgetTokens:   displayTokens,
+			VRAMBudgetSource:   source,
 			FreeVRAMBytes:      budget.FreeVRAMBytes,
 			ModelContext:       budget.ModelContext,
 			StaticFallback:     cfg.TokenGuardrail,
+			Budget:             bs,
 			UptimeSeconds:      int64(time.Since(startTime).Seconds()),
-		}
-		if eval != nil {
-			resp.Judge = &judgeStatus{
-				Enabled:     eval.Enabled(),
-				QueueDepth:  eval.QueueDepth(),
-				Dropped:     eval.Dropped(),
-				Concurrency: eval.Concurrency(),
-			}
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}
