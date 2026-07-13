@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/anchapin/nexus-proxy/internal/auth"
 	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
 	"github.com/anchapin/nexus-proxy/internal/config"
@@ -34,6 +35,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/ratelimit"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/transport"
 )
 
 const (
@@ -86,9 +88,27 @@ func main() {
 	logger := cfg.NewLogger()
 	slog.SetDefault(logger)
 
-	emb := rag.NewOllamaEmbedder(cfg.OllamaURL, cfg.EmbeddingModel, nil)
+	// Shared pooled HTTP client for all outbound upstream calls (issue #184).
+	// Connection pooling reduces TCP handshake overhead across Ollama,
+	// frontier API, and arbiter calls. Created once and passed to every
+	// collaborator so all traffic shares the same transport.
+	httpClient := transport.NewFromEnv()
+
+	emb := rag.NewOllamaEmbedder(cfg.OllamaURL, cfg.EmbeddingModel, httpClient)
 	bootCtx, cancel := context.WithTimeout(context.Background(), bootRAGTimeout)
 	defer cancel()
+
+	// RAG embedding cache (issue #115). Wrap the Ollama embedder with
+	// a bounded LRU so repeat prompts skip the /api/embeddings
+	// round-trip. A size of 0 disables the cache (falls back to the
+	// raw embedder).
+	var ragEmbedder rag.Embedder = emb
+	if cfg.RAGEmbedCacheSize > 0 {
+		ragEmbedder = rag.NewCachedEmbedder(emb, cfg.RAGEmbedCacheSize)
+		slog.Info("rag embedding cache enabled",
+			slog.Int("max_entries", cfg.RAGEmbedCacheSize),
+		)
+	}
 
 	// RAG store (issue #46). When NEXUS_RAG_DB is set, open the
 	// SQLite-backed PersistentStore and LoadOrIndex it. The boot
@@ -98,15 +118,19 @@ func main() {
 	// in-memory-only Store with the original IndexDir semantics —
 	// the proxy is byte-for-byte identical to the pre-issue-46
 	// behaviour.
-	store, persistentStore, ragWatcher := buildRAGStore(cfg, emb, bootCtx)
+	store, persistentStore, ragWatcher := buildRAGStore(cfg, ragEmbedder, bootCtx)
 
-	slm := router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, cfg.SLMTimeout, nil)
+	slm := router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, cfg.SLMTimeout, httpClient)
 	// Judge-guided adaptive routing (issue #47): the confidence
 	// floor/ceiling bound the neutral band the SLM uses when a
 	// confidence signal is supplied. Zero values fall back to the
 	// router defaults, so this is safe even when the feature is off.
 	slm.ConfidenceFloor = cfg.RoutingConfidenceFloor
 	slm.ConfidenceCeiling = cfg.RoutingConfidenceCeiling
+	// SLM routing decision cache (issue #162). Zero values fall back
+	// to the NewSLMClient defaults (5m TTL, 512 max entries).
+	slm.CacheTTL = cfg.SLMCacheTTL
+	slm.CacheMaxEntries = cfg.SLMCacheMaxEntries
 	re := regexp.MustCompile(formattingRegexPattern)
 
 	// Ollama health poller (issue #8). When NEXUS_HEALTH_POLL_INTERVAL
@@ -121,10 +145,11 @@ func main() {
 	if cfg.HealthPollInterval > 0 {
 		hpoller = health.New(
 			cfg.OllamaURL,
+			cfg.LocalModel,
 			cfg.HealthPollInterval,
 			cfg.HealthBreakerThreshold,
 			cfg.HealthProbeTimeout,
-			http.DefaultClient,
+			httpClient,
 		)
 		go hpoller.Run(context.Background())
 		defer func() {
@@ -145,7 +170,7 @@ func main() {
 	// the probe is disabled (NEXUS_PROBE_INTERVAL=0) the manager
 	// still runs the boot probe once and the chat handler falls
 	// back to the static value when it produces no budget.
-	probeImpl := probe.NewOllamaProbe(cfg.OllamaURL, http.DefaultClient)
+	probeImpl := probe.NewOllamaProbe(cfg.OllamaURL, httpClient)
 	probeImpl.BytesPerToken = cfg.ProbeBytesPerToken
 	probeMgr := probe.NewManager(probeImpl, cfg.ProbePollInterval, cfg.ProbeTimeout)
 	go probeMgr.Run(context.Background())
@@ -318,7 +343,7 @@ func main() {
 			}
 		}
 
-		judgeEval = judge.NewEvaluator(evalCfg, http.DefaultClient, storage)
+		judgeEval = judge.NewEvaluator(evalCfg, httpClient, storage)
 		judgeObs = handlers.JudgeObserverFunc(func(c handlers.LocalCompletion) {
 			if !judgeEval.Sample() {
 				return
@@ -491,6 +516,12 @@ func main() {
 	routeCounters := observability.NewRouteCounters()
 	routeDecisionObs := handlers.RouteDecisionObserverFunc(func(e handlers.RouteDecisionEvent) {
 		routeCounters.Observe(e.Route, e.Source, e.Confidence, e.TaskType, "")
+		// Issue #206: record SLM cache hit/miss.
+		if e.CacheHit {
+			routeCounters.ObserveSLMCacheHit()
+		} else {
+			routeCounters.ObserveSLMCacheMiss()
+		}
 	})
 	// Rejection observer (issue #119). The chat handler dispatches
 	// one RejectionEvent per early-return path; the closure forwards
@@ -501,28 +532,67 @@ func main() {
 	rejectionObs := handlers.RejectionObserverFunc(func(e handlers.RejectionEvent) {
 		routeCounters.ObserveRejection(e.Reason)
 	})
+	// Fusion outcome observer (issue #187). Records whether the fusion
+	// arbiter was skipped (panel members agreed) or invoked (disagreement).
+	// Surfaces as nexus_fusion_arbiter_total{outcome="skipped"|"invoked"}.
+	fusionOutcomeObs := handlers.FusionOutcomeObserverFunc(func(e handlers.FusionOutcomeEvent) {
+		routeCounters.ObserveFusionOutcome(e.ArbiterSkipped)
+	})
+	// Cascade fallback observer (issue #205): the chat handler dispatches
+	// one CascadeFallbackEvent per request when a retryable step failure
+	// caused the cascade to fall back to the next step. The closure
+	// forwards the reason to the in-process counter so it surfaces in
+	// /metrics as nexus_cascade_fallback_total{reason}.
+	cascadeFallbackObs := handlers.CascadeFallbackObserverFunc(func(e handlers.CascadeFallbackEvent) {
+		routeCounters.ObserveCascadeFallback(e.Reason)
+	})
 	mux.Handle("/metrics", routeCounters.Handler())
 	slog.Info("metrics endpoint serves prometheus text format",
 		slog.String("path", "/metrics"),
 	)
 
+	ragObserver := handlers.RAGObserverFunc(func(e handlers.RAGEvent) {
+		if e.Hit {
+			routeCounters.ObserveRAGHit(e.Filename)
+		} else {
+			routeCounters.ObserveRAGMiss(e.MissReason)
+		}
+	})
+
+	// SLM decision cache (issue #206). When NEXUS_SLM_CACHE_TTL > 0,
+	// deduplicate identical prompts within the TTL window so repeated
+	// requests don't trigger an SLM call.
+	var slmCache *router.SLMCache
+	if cfg.SLMCacheEnabled() {
+		slmCache = router.NewSLMCache(cfg.SLMCacheTTL)
+		slog.Info("slm decision cache enabled",
+			slog.Duration("ttl", cfg.SLMCacheTTL),
+		)
+	} else {
+		slog.Info("slm decision cache disabled (NEXUS_SLM_CACHE_TTL<=0)")
+	}
+
 	chatHandler := handlers.Chat(handlers.Deps{
-		Config:                cfg,
-		Client:                http.DefaultClient,
-		RAG:                   store,
-		SLM:                   slm,
-		FormattingRegex:       re,
-		Confidence:            confidenceObs,
-		JudgeObserver:         judgeObs,
-		QualityObserver:       qualityO,
-		MetricsObserver:       metricsObs,
-		Recorder:              recorder,
-		Health:                hpoller,
-		BudgetObserver:        budgetObserver(probeMgr),
-		LocalLimiter:          localLimiter,
-		LocalCooldown:         localCooldown,
-		RouteDecisionObserver: routeDecisionObs,
-		RejectionObserver:     rejectionObs,
+		Config:                  cfg,
+		Client:                  httpClient,
+		RAG:                     store,
+		SLM:                     slm,
+		FormattingRegex:         re,
+		Confidence:              confidenceObs,
+		SLMCache:                slmCache,
+		JudgeObserver:           judgeObs,
+		QualityObserver:         qualityO,
+		MetricsObserver:         metricsObs,
+		Recorder:                recorder,
+		Health:                  hpoller,
+		BudgetObserver:          budgetObserver(probeMgr),
+		LocalLimiter:            localLimiter,
+		LocalCooldown:           localCooldown,
+		RouteDecisionObserver:   routeDecisionObs,
+		RejectionObserver:       rejectionObs,
+		FusionOutcomeObserver:   fusionOutcomeObs,
+		RAGObserver:             ragObserver,
+		CascadeFallbackObserver: cascadeFallbackObs,
 	})
 	// Apply the per-client rate limiter (issue #75) as the outermost
 	// wrapper so a flood of requests is rejected before any middleware
@@ -553,6 +623,18 @@ func main() {
 		slog.String("ollama_url", cfg.OllamaURL),
 	)
 
+	// /status endpoint (issue #109). Exposes operator-facing
+	// diagnostics: frontier configured (boolean only — no URL or
+	// model name), judge enabled, VRAM budget, and uptime. Behind
+	// auth by default; set NEXUS_STATUS_PUBLIC=true for a public
+	// status page (e.g. behind a reverse-proxy ACL).
+	mux.HandleFunc("/status", statusHandler(hpoller, probeMgr, cfg, judgeEval != nil, time.Now()))
+	if cfg.StatusPublic {
+		slog.Info("status endpoint is PUBLIC (NEXUS_STATUS_PUBLIC=true)")
+	} else {
+		slog.Info("status endpoint is gated behind auth (set NEXUS_STATUS_PUBLIC=true to expose)")
+	}
+
 	// OpenAI-compatible model discovery (issue #78). GET /v1/models
 	// returns the configured local/router/frontier models (and any
 	// Ollama /api/tags entries when NEXUS_MODELS_CACHE_TTL > 0);
@@ -563,7 +645,7 @@ func main() {
 	if cfg.ModelsEndpointEnabled {
 		mh := handlers.Models(handlers.ModelsDeps{
 			Config: cfg,
-			Client: http.DefaultClient,
+			Client: httpClient,
 		})
 		mux.Handle("/v1/models", mh)
 		mux.Handle("/v1/models/", mh)
@@ -579,6 +661,23 @@ func main() {
 		slog.String("local_model", cfg.LocalModel),
 		slog.String("frontier_model", cfg.FrontierModel),
 	)
+
+	// Inbound auth (issue #109). When NEXUS_PROXY_API_KEY is set,
+	// wrap the mux with a bearer-token gate. /healthz and /metrics
+	// are always exempt (probes + scrapers); /status is exempt only
+	// when NEXUS_STATUS_PUBLIC=true. When the key is empty the
+	// middleware is a pass-through (zero overhead).
+	var rootHandler http.Handler = mux
+	if cfg.AuthEnabled() {
+		authMw := auth.NewMiddleware(cfg.ProxyAPIKey, publicPathExempt(cfg))
+		rootHandler = authMw.Wrap(mux)
+		slog.Info("inbound auth enabled",
+			slog.Bool("status_public", cfg.StatusPublic),
+		)
+	} else {
+		slog.Info("inbound auth disabled (NEXUS_PROXY_API_KEY unset)")
+	}
+
 	// Panic recovery (issue #110) is the OUTERMOST middleware, wrapping
 	// the entire mux so a panic anywhere downstream — a nil dereference
 	// in a handler, a regex surprise in the prompt pipeline, a JSON
@@ -588,7 +687,7 @@ func main() {
 	// TCP reset with no body. Zero overhead on the happy path.
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           handlers.Recover()(mux),
+		Handler:           handlers.Recover()(rootHandler),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
@@ -714,7 +813,7 @@ func (b *confidenceBridge) Close() error { return b.inner.Close() }
 // The watcher is started only when persistence is enabled AND
 // NEXUS_RAG_POLL_INTERVAL > 0; an interval of zero leaves
 // persistence on but disables runtime updates (boot-only load).
-func buildRAGStore(cfg config.Config, emb *rag.OllamaEmbedder, bootCtx context.Context) (rag.RAGStore, *rag.PersistentStore, *rag.Watcher) {
+func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context) (rag.RAGStore, *rag.PersistentStore, *rag.Watcher) {
 	if !cfg.RAGPersistentEnabled() {
 		slog.Info("rag persistent store disabled (NEXUS_RAG_DB is empty); using in-memory store")
 		store := rag.NewStore(emb, cfg.RAGThreshold)
@@ -914,6 +1013,71 @@ func healthzHandler(hpoller *health.Health, mgr *probe.Manager, cfg config.Confi
 			FreeVRAMBytes:  budget.FreeVRAMBytes,
 			ModelContext:   budget.ModelContext,
 			StaticFallback: cfg.TokenGuardrail,
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+}
+
+// publicPathExempt returns true for paths that must bypass the
+// inbound auth gate (issue #109). /healthz and /metrics are always
+// exempt so K8s probes and Prometheus scrapers work without
+// credentials. /status is exempt only when NEXUS_STATUS_PUBLIC=true
+// (default false) — the diagnostics surface (frontier configured,
+// judge enabled, VRAM state) is reconnaissance-grade and should be
+// gated by default.
+func publicPathExempt(cfg config.Config) func(*http.Request) bool {
+	return func(r *http.Request) bool {
+		switch r.URL.Path {
+		case "/healthz", "/metrics":
+			return true
+		case "/status":
+			return cfg.StatusPublic
+		default:
+			return false
+		}
+	}
+}
+
+// statusHandler returns the /status handler (issue #109). Unlike
+// /healthz (which is designed for liveness probes), /status exposes
+// operator-facing diagnostics: whether the frontier API is
+// configured, whether the judge evaluator is enabled, the current
+// VRAM budget, and uptime. The frontier field is a boolean (not the
+// URL or model name) so the response is safe to expose publicly if
+// the operator opts in via NEXUS_STATUS_PUBLIC=true.
+func statusHandler(hpoller *health.Health, mgr *probe.Manager, cfg config.Config, judgeEnabled bool, startTime time.Time) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		budget := probe.Budget{Source: probe.SourceStatic}
+		if mgr != nil {
+			budget = mgr.Get()
+		}
+		displayTokens := budget.Tokens
+		if displayTokens <= 0 {
+			displayTokens = cfg.TokenGuardrail
+		}
+
+		resp := struct {
+			Status             string `json:"status"`
+			FrontierConfigured bool   `json:"frontier_configured"`
+			OllamaHealthy      bool   `json:"ollama_healthy"`
+			JudgeEnabled       bool   `json:"judge_enabled"`
+			BudgetTokens       int    `json:"budget_tokens"`
+			BudgetSource       string `json:"budget_source"`
+			FreeVRAMBytes      int64  `json:"free_vram_bytes,omitempty"`
+			ModelContext       int    `json:"model_context,omitempty"`
+			UptimeSeconds      int64  `json:"uptime_seconds"`
+		}{
+			Status:             "ok",
+			FrontierConfigured: cfg.FrontierKey != "",
+			OllamaHealthy:      hpoller == nil || hpoller.IsLocalHealthy(),
+			JudgeEnabled:       judgeEnabled,
+			BudgetTokens:       displayTokens,
+			BudgetSource:       string(budget.Source),
+			FreeVRAMBytes:      budget.FreeVRAMBytes,
+			ModelContext:       budget.ModelContext,
+			UptimeSeconds:      int64(time.Since(startTime).Seconds()),
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}

@@ -101,6 +101,10 @@ type RouteDecisionEvent struct {
 	Reason     string
 	Confidence float64
 	TaskType   string
+	// CacheHit is true when the decision came from the SLM cache
+	// (issue #206) — a duplicate prompt was served from cache without
+	// calling the SLM.
+	CacheHit bool
 }
 
 // RouteDecisionObserver is the hook invoked once per proxied request
@@ -170,8 +174,84 @@ type RejectionObserverFunc func(RejectionEvent)
 // ObserveRejection implements RejectionObserver.
 func (f RejectionObserverFunc) ObserveRejection(e RejectionEvent) { f(e) }
 
+// FusionOutcomeEvent carries the outcome of a fusion panel after
+// PanelStreaming returns (issue #187). It lets operators compute the
+// fusion agreement rate: skipped/(skipped+invoked).
+type FusionOutcomeEvent struct {
+	RequestID      string
+	ArbiterSkipped bool
+}
+
+// FusionOutcomeObserver is the hook invoked once per fusion request
+// with the PanelStreaming outcome (issue #187). Safe for concurrent
+// use, must not block, nil means "no observer". The handler does not
+// import the observability package; main.go wires a closure that
+// forwards to RouteCounters.ObserveFusionOutcome.
+type FusionOutcomeObserver interface {
+	ObserveFusionOutcome(FusionOutcomeEvent)
+}
+
+// FusionOutcomeObserverFunc adapts a plain function to the
+// FusionOutcomeObserver interface.
+type FusionOutcomeObserverFunc func(FusionOutcomeEvent)
+
+// ObserveFusionOutcome implements FusionOutcomeObserver.
+func (f FusionOutcomeObserverFunc) ObserveFusionOutcome(e FusionOutcomeEvent) { f(e) }
+
+// RAGEvent carries the outcome of a single RAG retrieval attempt
+// (issue #186). Hit is true when Retrieve returned a non-nil example;
+// Filename is the matched snippet (meaningful only when Hit is true).
+// MissReason is the miss cause when Hit is false: "empty_store" when
+// the store has no indexed examples, "threshold" when the best match
+// fell below the similarity floor, or "embed_error" when the embedding
+// call failed.
+type RAGEvent struct {
+	Hit        bool
+	Filename   string
+	MissReason string
+}
+
+// RAGObserver is the hook invoked once per RAG retrieval attempt,
+// allowing the observability layer to record hit/miss rates (issue #186).
+// Safe for concurrent use; must not block. Nil is a valid no-op.
+type RAGObserver interface {
+	ObserveRAG(RAGEvent)
+}
+
+// RAGObserverFunc adapts a plain function to the RAGObserver interface.
+type RAGObserverFunc func(RAGEvent)
+
+// ObserveRAG implements RAGObserver.
+func (f RAGObserverFunc) ObserveRAG(e RAGEvent) { f(e) }
+
+// CascadeFallbackEvent carries the reason for a cascade fallback (issue #205).
+// The handler dispatches one when a retryable step failure causes the cascade
+// to fall back to the next step. The reason is one of "timeout",
+// "transport_error", or "malformed_toolcall".
+type CascadeFallbackEvent struct {
+	RequestID string
+	Reason    string // "timeout", "transport_error", or "malformed_toolcall"
+}
+
+// CascadeFallbackObserver is the hook invoked when the cascade falls back
+// to a later step due to a retryable error (issue #205). Implementations
+// must be safe for concurrent use and must not block. Nil means "no
+// observer" — the hot path is unaffected. The handler does not import
+// the observability package; main.go wires a closure that forwards to
+// RouteCounters.ObserveCascadeFallback.
+type CascadeFallbackObserver interface {
+	ObserveCascadeFallback(CascadeFallbackEvent)
+}
+
+// CascadeFallbackObserverFunc adapts a plain function to the
+// CascadeFallbackObserver interface.
+type CascadeFallbackObserverFunc func(CascadeFallbackEvent)
+
+// ObserveCascadeFallback implements CascadeFallbackObserver.
+func (f CascadeFallbackObserverFunc) ObserveCascadeFallback(e CascadeFallbackEvent) { f(e) }
+
 // MetricsEvent carries the per-request data needed by the savings
-// dashboard (issue #4). Fields track the full Round-trip metrics:
+// dashboard (issue #4). Fields track the full round-trip metrics:
 // route/model/input-tokens are routing dimensions; TOON/RAG/cost are
 // the savings dimensions the dashboard renders. The handler builds
 // one of these after every proxied request (success, failure, or
@@ -212,14 +292,15 @@ type MetricsEvent struct {
 	BaselineCostUSD float64
 	SavingsUSD      float64
 
-	OutputTokens         int
-	TTFTMs               int64
-	TotalLatencyMs       float64
-	TPS                  float64
-	Streaming            bool
-	FusionArbiterSkipped bool
-	ToolCallCount        int
-	Error                string
+	OutputTokens            int
+	TTFTMs                  int64
+	TotalLatencyMs          float64
+	TPS                     float64
+	Streaming               bool
+	FusionArbiterSkipped    bool
+	FusionJaccardSimilarity float64
+	ToolCallCount           int
+	Error                   string
 
 	RouteSource   string
 	RouteReason   string
@@ -328,6 +409,14 @@ type Deps struct {
 	// judge; main.go bridges JudgeScore -> RecordOutcome.
 	Confidence router.ConfidenceStore
 
+	// SLMCache is the optional time-bounded prompt→route cache
+	// (issue #206). When non-nil the planner checks the cache before
+	// calling the SLM; a cache hit returns the cached route without
+	// calling the SLM. When nil the SLM is always called
+	// (pre-cache behaviour). The cache TTL is configured at cache
+	// construction time via NewSLMCache.
+	SLMCache *router.SLMCache
+
 	// JudgeObserver is optional. When nil, the handler does not
 	// buffer the streamed response for judge sampling — every
 	// request takes the fast path with zero added overhead.
@@ -429,6 +518,34 @@ type Deps struct {
 	// observability package — main.go wires a closure that adapts
 	// the event to the in-process rejection counter.
 	RejectionObserver RejectionObserver
+
+	// FusionOutcomeObserver is invoked once per fusion request after
+	// PanelStreaming returns, with the arbiter outcome (issue #187).
+	// Safe for concurrent use, must not block, nil is "no observer".
+	// The handler does not import observability; main.go wires a
+	// closure that forwards to RouteCounters.ObserveFusionOutcome.
+	FusionOutcomeObserver FusionOutcomeObserver
+
+	// RAGObserver is invoked once per RAG retrieval attempt (issue #186)
+	// with the hit/miss outcome so the observability layer can record
+	// RAG effectiveness metrics. Implementations must be safe for
+	// concurrent use and must not block. Nil is treated as "no
+	// observer"; the hot path is unaffected. The handler does not
+	// import the observability package — main.go wires a closure
+	// that adapts the event to the in-process RAG counter.
+	RAGObserver RAGObserver
+
+	// CascadeFallbackObserver is invoked when the cascade falls back to a
+	// later step due to a retryable error (issue #205). The handler
+	// dispatches exactly one event per request when FallbackReason is
+	// non-empty (i.e., the cascade fell back at least once). The
+	// reason is one of "timeout", "transport_error", or
+	// "malformed_toolcall". Implementations must be safe for concurrent
+	// use and must not block. Nil means "no observer"; the hot path is
+	// unaffected. The handler does not import the observability package —
+	// main.go wires a closure that forwards to
+	// RouteCounters.ObserveCascadeFallback.
+	CascadeFallbackObserver CascadeFallbackObserver
 
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
@@ -643,16 +760,45 @@ func Chat(d Deps) http.Handler {
 		var ragInjected bool
 		var ragFilename string
 		var ragScore float64
-		if ex, score, err := d.RAG.Retrieve(r.Context(), latestPrompt); err == nil && ex != nil {
-			messages = middleware.InjectRAG(messages, rag.FormatInjection(ex))
+		ragEx, ragScore, ragErr := d.RAG.Retrieve(r.Context(), latestPrompt)
+		switch {
+		case ragErr != nil:
+			slog.Info("rag miss",
+				slog.String("reason", "embed_error"),
+				slog.String("request_id", reqID),
+			)
+			if d.RAGObserver != nil {
+				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "embed_error"})
+			}
+		case ragEx != nil:
+			messages = middleware.InjectRAG(messages, rag.FormatInjection(ragEx))
 			slog.Info("rag hit",
-				slog.String("filename", ex.Filename),
-				slog.Float64("score", score),
+				slog.String("filename", ragEx.Filename),
+				slog.Float64("score", ragScore),
 				slog.String("request_id", reqID),
 			)
 			ragInjected = true
-			ragFilename = ex.Filename
-			ragScore = score
+			ragFilename = ragEx.Filename
+			if d.RAGObserver != nil {
+				d.RAGObserver.ObserveRAG(RAGEvent{Hit: true, Filename: ragEx.Filename})
+			}
+		case d.RAG.Size() == 0:
+			slog.Info("rag miss",
+				slog.String("reason", "empty_store"),
+				slog.String("request_id", reqID),
+			)
+			if d.RAGObserver != nil {
+				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "empty_store"})
+			}
+		default:
+			slog.Info("rag miss",
+				slog.String("reason", "threshold"),
+				slog.Float64("score", ragScore),
+				slog.String("request_id", reqID),
+			)
+			if d.RAGObserver != nil {
+				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "threshold"})
+			}
 		}
 		trace.Transforms.RAGInjected = ragInjected
 		trace.Transforms.RAGFilename = ragFilename
@@ -715,6 +861,7 @@ func Chat(d Deps) http.Handler {
 			SLM:             d.SLM,
 			Confidence:      d.Confidence,
 			FormattingRegex: d.FormattingRegex,
+			SLMCache:        d.SLMCache,
 		}
 		decision := planner.Plan(router.PlanRequest{
 			Prompt:          latestPrompt,
@@ -742,6 +889,7 @@ func Chat(d Deps) http.Handler {
 			Reason:     decision.Reason,
 			Confidence: decision.Confidence,
 			TaskType:   decision.TaskType,
+			CacheHit:   decision.CacheHit,
 		}
 		w.Header().Set("X-Nexus-Route", SanitizeHeaderValue(routeEvent.Route))
 		w.Header().Set("X-Nexus-Route-Source", SanitizeHeaderValue(routeEvent.Source))
@@ -874,6 +1022,7 @@ func Chat(d Deps) http.Handler {
 		var model string
 		var upErr error
 		var fusionArbiterSkipped bool
+		var fusionJaccardSimilarity float64
 		// toolCallCount is populated from the cascade result on the
 		// local streaming route (issue #72) and forwarded to telemetry
 		// + metrics so the dashboard can report how many tool calls
@@ -926,12 +1075,19 @@ func Chat(d Deps) http.Handler {
 					d.Config.FusionAgreementThreshold,
 				)
 				fusionArbiterSkipped = outcome.ArbiterSkipped
+				fusionJaccardSimilarity = outcome.Similarity
 				if outcome.ArbiterSkipped {
 					slog.Info("fusion arbiter skipped",
 						slog.String("source", outcome.Source),
 						slog.Float64("similarity", outcome.Similarity),
 						slog.String("request_id", reqID),
 					)
+				}
+				if d.FusionOutcomeObserver != nil {
+					d.FusionOutcomeObserver.ObserveFusionOutcome(FusionOutcomeEvent{
+						RequestID:      reqID,
+						ArbiterSkipped: outcome.ArbiterSkipped,
+					})
 				}
 			} else {
 				upErr = upstream.Panel(
@@ -1030,6 +1186,16 @@ func Chat(d Deps) http.Handler {
 				// entirely and starts at frontier.
 				res, err := cas.Run(rw, d.Client, body)
 				logCascadeTelemetry(res, err, reqID)
+				// Issue #205: record cascade fallback metric when a retryable
+				// step failure caused the cascade to fall back to the next
+				// step. The observer is nil-safe; nil means no observability
+				// wiring so the hot path is unaffected.
+				if res.FallbackReason != "" && d.CascadeFallbackObserver != nil {
+					d.CascadeFallbackObserver.ObserveCascadeFallback(CascadeFallbackEvent{
+						RequestID: reqID,
+						Reason:    res.FallbackReason,
+					})
+				}
 				// Issue #80: arm the local-route cooldown when the
 				// cascade reports the local step failed before a
 				// fallback served the request. Subsequent requests
@@ -1205,7 +1371,7 @@ func Chat(d Deps) http.Handler {
 			}
 		}
 		outputTokens := int(obs.BytesOut() / 4)
-		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr, fusionArbiterSkipped, toolCallCount, decision)
+		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr, fusionArbiterSkipped, fusionJaccardSimilarity, toolCallCount, decision)
 		if d.MetricsObserver != nil {
 			postCompressionChars := totalMessageChars(messages)
 			savings := totalTokenSavings(preCompressionChars, postCompressionChars)
@@ -1218,29 +1384,30 @@ func Chat(d Deps) http.Handler {
 			}
 			tps := telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 			d.MetricsObserver.Submit(MetricsEvent{
-				Timestamp:            rec.Timestamp,
-				RequestID:            reqID,
-				Route:                string(route),
-				Model:                model,
-				InputTokens:          rec.InputTokens,
-				TOONSavingsTokens:    savings,
-				RAGInjected:          ragInjected,
-				RAGFilename:          ragFilename,
-				EstimatedCostUSD:     cost,
-				BaselineCostUSD:      baselineCost,
-				SavingsUSD:           savingsCost,
-				OutputTokens:         outputTokens,
-				TTFTMs:               ttftMs,
-				TotalLatencyMs:       totalMs,
-				TPS:                  tps,
-				Streaming:            streaming,
-				FusionArbiterSkipped: fusionArbiterSkipped,
-				ToolCallCount:        toolCallCount,
-				Error:                rec.Error,
-				RouteSource:          string(decision.Source),
-				RouteReason:          decision.Reason,
-				SLMConfidence:        decision.Confidence,
-				SLMTaskType:          decision.TaskType,
+				Timestamp:               rec.Timestamp,
+				RequestID:               reqID,
+				Route:                   string(route),
+				Model:                   model,
+				InputTokens:             rec.InputTokens,
+				TOONSavingsTokens:       savings,
+				RAGInjected:             ragInjected,
+				RAGFilename:             ragFilename,
+				EstimatedCostUSD:        cost,
+				BaselineCostUSD:         baselineCost,
+				SavingsUSD:              savingsCost,
+				OutputTokens:            outputTokens,
+				TTFTMs:                  ttftMs,
+				TotalLatencyMs:          totalMs,
+				TPS:                     tps,
+				Streaming:               streaming,
+				FusionArbiterSkipped:    fusionArbiterSkipped,
+				FusionJaccardSimilarity: fusionJaccardSimilarity,
+				ToolCallCount:           toolCallCount,
+				Error:                   rec.Error,
+				RouteSource:             string(decision.Source),
+				RouteReason:             decision.Reason,
+				SLMConfidence:           decision.Confidence,
+				SLMTaskType:             decision.TaskType,
 			})
 		} else {
 			d.Recorder.Record(rec)
@@ -1563,6 +1730,7 @@ func buildRecord(
 	model, latestPrompt string,
 	upErr error,
 	fusionArbiterSkipped bool,
+	fusionJaccardSimilarity float64,
 	toolCallCount int,
 	decision router.Decision,
 ) telemetry.Record {
@@ -1576,21 +1744,22 @@ func buildRecord(
 	}
 	outputTokens := int(bytesOut / 4)
 	rec := telemetry.Record{
-		Timestamp:            time.Now().UTC(),
-		RequestID:            requestID,
-		Model:                model,
-		Route:                string(route),
-		InputTokens:          telemetry.EstimateTokens(latestPrompt),
-		OutputTokens:         outputTokens,
-		TTFTMs:               ttftMs,
-		TotalLatencyMs:       totalMs,
-		Streaming:            streaming,
-		FusionArbiterSkipped: fusionArbiterSkipped,
-		ToolCallCount:        toolCallCount,
-		RouteSource:          string(decision.Source),
-		RouteReason:          decision.Reason,
-		SLMConfidence:        decision.Confidence,
-		SLMTaskType:          decision.TaskType,
+		Timestamp:               time.Now().UTC(),
+		RequestID:               requestID,
+		Model:                   model,
+		Route:                   string(route),
+		InputTokens:             telemetry.EstimateTokens(latestPrompt),
+		OutputTokens:            outputTokens,
+		TTFTMs:                  ttftMs,
+		TotalLatencyMs:          totalMs,
+		Streaming:               streaming,
+		FusionArbiterSkipped:    fusionArbiterSkipped,
+		FusionJaccardSimilarity: fusionJaccardSimilarity,
+		ToolCallCount:           toolCallCount,
+		RouteSource:             string(decision.Source),
+		RouteReason:             decision.Reason,
+		SLMConfidence:           decision.Confidence,
+		SLMTaskType:             decision.TaskType,
 	}
 	rec.TPS = telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 	if upErr != nil {

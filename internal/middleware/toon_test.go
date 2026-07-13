@@ -1,6 +1,9 @@
 package middleware
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestSerializeToTOON(t *testing.T) {
 	in := []byte(`[{"id":1,"name":"alpha"},{"id":2,"name":"beta, comma"}]`)
@@ -75,6 +78,82 @@ func TestCompressJSONBlocksNoMatch(t *testing.T) {
 	}
 	if CompressJSONBlocks(msgs) {
 		t.Error("expected no-op when no fences present")
+	}
+}
+
+func TestCompressJSONBlocksNestedArray(t *testing.T) {
+	// Issue #203: nested JSON arrays like {"files": [...]} should be compressed.
+	msgs := []interface{}{
+		map[string]interface{}{
+			"role":    "user",
+			"content": `Here are the results: {"files": [{"name": "a.txt"}, {"name": "b.txt"}]}`,
+		},
+	}
+	if !CompressJSONBlocks(msgs) {
+		t.Fatal("expected rewrote = true")
+	}
+	content := msgs[0].(map[string]interface{})["content"].(string)
+	if !contains(content, `items[2]{name}`) {
+		t.Errorf("TOON not present in %q", content)
+	}
+	// The original array format should be replaced
+	if contains(content, `{"files": [{"name": "a.txt"}]`) {
+		t.Errorf("original array should be compressed, got %q", content)
+	}
+}
+
+func TestCompressJSONBlocksNestedArrayMultipleObjects(t *testing.T) {
+	msgs := []interface{}{
+		map[string]interface{}{
+			"role":    "user",
+			"content": `{"results": [{"id": 1, "name": "alpha"}, {"id": 2, "name": "beta"}]}`,
+		},
+	}
+	if !CompressJSONBlocks(msgs) {
+		t.Fatal("expected rewrote = true")
+	}
+	content := msgs[0].(map[string]interface{})["content"].(string)
+	if !contains(content, `items[2]{id,name}`) {
+		t.Errorf("TOON not present in %q", content)
+	}
+}
+
+func TestCompressJSONBlocksNestedArrayDifferentKeys(t *testing.T) {
+	// Test "items" and "objects" keys as well.
+	for _, key := range []string{"items", "objects"} {
+		msgs := []interface{}{
+			map[string]interface{}{
+				"role":    "user",
+				"content": fmt.Sprintf(`{"%s": [{"x": 1}, {"x": 2}]}`, key),
+			},
+		}
+		if !CompressJSONBlocks(msgs) {
+			t.Errorf("expected rewrote = true for key %q", key)
+		}
+		content := msgs[0].(map[string]interface{})["content"].(string)
+		if !contains(content, `items[2]{x}`) {
+			t.Errorf("TOON not present for key %q: %q", key, content)
+		}
+	}
+}
+
+func TestCompressJSONBlocksNestedArrayPreservesOtherContent(t *testing.T) {
+	// Content outside the nested array should be preserved.
+	msgs := []interface{}{
+		map[string]interface{}{
+			"role":    "user",
+			"content": `Prefix {"files": [{"a": 1}]} Suffix`,
+		},
+	}
+	if !CompressJSONBlocks(msgs) {
+		t.Fatal("expected rewrote = true")
+	}
+	content := msgs[0].(map[string]interface{})["content"].(string)
+	if !contains(content, "Prefix ") {
+		t.Errorf("prefix lost, got %q", content)
+	}
+	if !contains(content, " Suffix") {
+		t.Errorf("suffix lost, got %q", content)
 	}
 }
 

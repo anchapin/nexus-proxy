@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -77,10 +78,40 @@ func (s *Store) Size() int {
 // construction and never mutated.
 func (s *Store) Threshold() float64 { return s.threshold }
 
+// isSymlink reports whether a DirEntry represents a symbolic link.
+// os.ReadDir uses Lstat under the hood, so the ModeSymlink bit is
+// set on the entry itself — we never follow the link.
+func isSymlink(f os.DirEntry) bool {
+	return f.Type()&os.ModeSymlink != 0
+}
+
+// resolveDir resolves symlinks in dir once so that every file-path
+// check later can compare against a canonical prefix. This also
+// prevents the parent-symlink variant (e.g. "examples/sub/../../etc/passwd").
+func resolveDir(dir string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", fmt.Errorf("rag: resolve examples dir %q: %w", dir, err)
+	}
+	return resolved, nil
+}
+
+// verifyInsideDir checks that resolvedPath is rooted inside baseDir.
+// This catches path-traversal attempts where a symlinked subdirectory
+// escapes the intended examples directory.
+func verifyInsideDir(baseDir, resolvedPath string) bool {
+	return strings.HasPrefix(resolvedPath, baseDir+string(filepath.Separator)) || resolvedPath == baseDir
+}
+
 // IndexDir walks dir, embedding every regular file's contents. It is
 // permissive: a missing directory is created (and indexing returns empty),
 // per-file read or embed errors are logged and skipped. This matches the
 // prototype's behaviour but the errors are now observable instead of silent.
+//
+// Security: symlinks are skipped (issue #107) to prevent confidentiality
+// leaks via injected few-shot examples. The directory path is resolved
+// once to canonicalize it, and every file's resolved path is verified
+// to remain inside the resolved directory.
 func (s *Store) IndexDir(ctx context.Context, dir string) error {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
@@ -93,6 +124,11 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 		return nil
 	}
 
+	safeDir, err := resolveDir(dir)
+	if err != nil {
+		return err
+	}
+
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("rag: read examples dir %q: %w", dir, err)
@@ -102,7 +138,30 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 		if f.IsDir() {
 			continue
 		}
+		if isSymlink(f) {
+			slog.Warn("rag: skipping symlink in examples dir (issue #107)",
+				slog.String("filename", f.Name()),
+				slog.String("dir", dir),
+			)
+			continue
+		}
 		path := filepath.Join(dir, f.Name())
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			slog.Error("rag: cannot resolve path, skipping",
+				slog.String("filename", f.Name()),
+				slog.Any("err", err),
+			)
+			continue
+		}
+		if !verifyInsideDir(safeDir, resolved) {
+			slog.Warn("rag: skipping file that escapes examples dir (issue #107)",
+				slog.String("filename", f.Name()),
+				slog.String("resolved", resolved),
+				slog.String("base", safeDir),
+			)
+			continue
+		}
 		content, err := os.ReadFile(path)
 		if err != nil {
 			slog.Error("rag read file", slog.String("filename", f.Name()), slog.Any("err", err))

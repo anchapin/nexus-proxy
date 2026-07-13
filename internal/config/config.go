@@ -66,6 +66,16 @@ type Config struct {
 	ZAIModel string // "glm-4.6"
 	ZAIKey   string // empty == skipped from cascade
 
+	// Inbound auth (issue #109). When ProxyAPIKey is non-empty, every
+	// non-exempt endpoint requires a matching Bearer token in the
+	// Authorization header. /healthz and /metrics stay exempt for K8s
+	// probes and Prometheus scrapers. /status is exempt only when
+	// StatusPublic is true (default false) — the diagnostics surface
+	// (frontier configured, judge enabled, VRAM state) is
+	// reconnaissance-grade and should be gated by default.
+	ProxyAPIKey  string // NEXUS_PROXY_API_KEY; empty disables auth
+	StatusPublic bool   // NEXUS_STATUS_PUBLIC; exposes /status without auth
+
 	// RAG
 	ExamplesDir  string  // "./few_shot_examples"
 	RAGThreshold float64 // cosine similarity cutoff for retrieval (0.55)
@@ -79,12 +89,20 @@ type Config struct {
 	RAGDBPath       string        // on-disk SQLite database for the RAG store
 	RAGPollInterval time.Duration // watcher cadence; 0 disables the watcher
 
+	// RAG embedding cache (issue #115). Prompt embeddings are
+	// deterministic for a given model+text pair, so they are memoized
+	// in a bounded LRU. A value of 0 disables the cache (every
+	// Retrieve re-embeds); the default keeps memory flat while
+	// skipping the Ollama round-trip for repeat prompts.
+	RAGEmbedCacheSize int // max LRU entries (256)
+
 	// Routing
-	TokenGuardrail int           // estimated tokens above this force frontier (6000)
-	SLMTimeout     time.Duration // Qwen3-Coder routing timeout (8s)
-	FusionTimeout  time.Duration // per-panel-member fetch timeout (120s)
-	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
-	ArbiterTimeout time.Duration // per-call timeout for the fusion arbiter stream (60s)
+	TokenGuardrail     int           // estimated tokens above this force frontier (6000)
+	SLMTimeout         time.Duration // Qwen3-Coder routing timeout (8s)
+	SLMCacheMaxEntries int           // max entries in SLM routing decision cache (512)
+	FusionTimeout      time.Duration // per-panel-member fetch timeout (120s)
+	CascadeTimeout     time.Duration // per-attempt timeout for cascade fallback (30s)
+	ArbiterTimeout     time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
 	// Frontier provider selector (issue #45). When more than one
 	// frontier provider is configured (frontier + z.ai), the chat
@@ -152,6 +170,11 @@ type Config struct {
 	RoutingConfidenceMinSamples int
 	RoutingConfidenceWindow     time.Duration
 
+	// SLM decision cache (issue #206). Deduplicates identical prompts
+	// within a TTL window so repeated requests don't trigger an SLM call.
+	// NEXUS_SLM_CACHE_TTL <= 0 disables the cache.
+	SLMCacheTTL time.Duration
+
 	// Health (issue #8). The chat handler consults
 	// internal/health.Health before issuing local-bound requests;
 	// when Ollama is unreachable it short-circuits to frontier
@@ -194,6 +217,22 @@ type Config struct {
 	// between the cascade observing failure and the health poller
 	// catching up. Zero disables the circuit (pre-#80 behaviour).
 	LocalCooldown time.Duration // default 10s; 0 disables
+
+	// Rolling 24h frontier spend guard (issue #183, #201). The guard
+	// tracks USD costs over a sliding 24-hour window and rejects new
+	// frontier/fusion requests with HTTP 429 when the daily limit is
+	// exhausted. BudgetEnabled is true when BudgetDailyLimit > 0.
+	//
+	// Alerting (issue #201): When BudgetAlertEnabled is true, the guard
+	// invokes the alerter callbacks when spend is recorded, when the
+	// budget is exceeded, and when spend crosses the approaching
+	// threshold (BudgetAlertThreshold fraction of the limit, default 80%).
+	// The alerter updates Prometheus counters and logs at warn/error
+	// level. Set BudgetAlertWebhookURL to enable webhook alerting.
+	BudgetDailyLimit      float64 // USD; NEXUS_BUDGET_DAILY_LIMIT
+	BudgetAlertEnabled    bool    // true iff NEXUS_BUDGET_ALERT_ENABLED is "true"
+	BudgetAlertThreshold  float64 // fraction of limit that triggers "approaching" alert [0,1]; default 0.8
+	BudgetAlertWebhookURL string  // optional webhook URL for JSON alert payloads
 
 	// HTTP request body cap (issue #11). The chat handler applies this
 	// with http.MaxBytesReader before reading the request body, so an
@@ -362,6 +401,8 @@ func Load() (Config, error) {
 		ZAIURL:         getEnv("NEXUS_ZAI_URL", "https://api.z.ai/v1/chat/completions"),
 		ZAIModel:       getEnv("NEXUS_ZAI_MODEL", "glm-4.6"),
 		ZAIKey:         getEnv("NEXUS_ZAI_API_KEY", ""),
+		ProxyAPIKey:    getEnv("NEXUS_PROXY_API_KEY", ""),
+		StatusPublic:   getEnvBool("NEXUS_STATUS_PUBLIC", false),
 		ExamplesDir:    getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
 		MetaPrompt:     defaultMetaPrompt,
 		TOONNotice:     defaultTOONNotice,
@@ -390,6 +431,15 @@ func Load() (Config, error) {
 	}
 	cfg.RAGPollInterval = pollInterval
 
+	// RAG embedding cache size (issue #115). Default 256 keeps the
+	// cache useful for repetitive coding prompts while bounding
+	// memory. Set to 0 to disable.
+	embedCacheSize, err := getEnvInt("NEXUS_RAG_EMBED_CACHE_SIZE", 256)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RAGEmbedCacheSize = embedCacheSize
+
 	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
 	if err != nil {
 		return cfg, err
@@ -401,6 +451,17 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.SLMTimeout = slmTimeout
+
+	// SLM routing decision cache (issue #162). Max
+	// entries caps memory at ~512 entries with simple LRU eviction.
+	slmCacheMax, err := getEnvInt("NEXUS_SLM_CACHE_MAX_ENTRIES", 512)
+	if err != nil {
+		return cfg, err
+	}
+	if slmCacheMax < 0 {
+		slmCacheMax = 0
+	}
+	cfg.SLMCacheMaxEntries = slmCacheMax
 
 	fusionTimeout, err := getEnvDuration("NEXUS_FUSION_TIMEOUT", 120*time.Second)
 	if err != nil {
@@ -535,6 +596,15 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.RoutingConfidenceWindow = confWindow
+
+	// SLM decision cache TTL (issue #206). Set
+	// NEXUS_SLM_CACHE_TTL to "0" to disable the cache entirely;
+	// the planner then always calls the SLM (pre-cache behaviour).
+	slmCacheTTL, err := getEnvDuration("NEXUS_SLM_CACHE_TTL", 30*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.SLMCacheTTL = slmCacheTTL
 
 	// Ollama health poller (issue #8). Defaults: 30s poll cadence,
 	// 3-failure breaker, 5s per-probe HTTP timeout. Set
@@ -809,11 +879,10 @@ func Load() (Config, error) {
 	}
 	cfg.ModelsCacheTTL = modelsCacheTTL
 
-	// Prompt-injection hardening (issue #76). Defaults to off so a
-	// stock deployment boots with byte-for-byte legacy behaviour.
-	// Operators opt into warn (log only) or strict (reject 400) by
-	// setting NEXUS_PROMPT_INJECTION_MODE. Unknown values fall back
-	// to off rather than failing boot.
+	// Prompt-injection hardening (issue #76). Defaults to warn so a
+	// stock deployment logs injection attempts out of the box.
+	// Operators can set NEXUS_PROMPT_INJECTION_MODE=off to disable,
+	// or strict to reject 400. Unknown values fall back to warn.
 	cfg.PromptInjectionMode = middleware.ParseInjectionMode(
 		os.Getenv("NEXUS_PROMPT_INJECTION_MODE"),
 	)
@@ -836,6 +905,34 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.TrustedProxies = parsed
+
+	// Rolling 24h frontier spend guard (issue #183, #201). When
+	// BudgetDailyLimit > 0 the guard is active. Alerting is
+	// separately enabled via BudgetAlertEnabled.
+	budgetDailyLimit, err := getEnvFloat("NEXUS_BUDGET_DAILY_LIMIT", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if budgetDailyLimit < 0 {
+		budgetDailyLimit = 0
+	}
+	cfg.BudgetDailyLimit = budgetDailyLimit
+
+	cfg.BudgetAlertEnabled = parseBoolEnv("NEXUS_BUDGET_ALERT_ENABLED", false)
+
+	budgetAlertThreshold, err := getEnvFloat("NEXUS_BUDGET_ALERT_THRESHOLD", 0.8)
+	if err != nil {
+		return cfg, err
+	}
+	if budgetAlertThreshold < 0 {
+		budgetAlertThreshold = 0
+	}
+	if budgetAlertThreshold > 1 {
+		budgetAlertThreshold = 1
+	}
+	cfg.BudgetAlertThreshold = budgetAlertThreshold
+
+	cfg.BudgetAlertWebhookURL = getEnv("NEXUS_BUDGET_ALERT_WEBHOOK_URL", "")
 
 	// Per-client rate ceiling (requests/minute). Zero or negative
 	// disables the limiter entirely so a stock deployment is
@@ -1000,6 +1097,10 @@ func (c Config) PromptInjectionIsolated() bool {
 // opened. Disabled when MetricsDBPath is empty.
 func (c Config) MetricsEnabled() bool { return c.MetricsDBPath != "" }
 
+// BudgetEnabled reports whether the rolling 24h frontier spend guard is
+// active (issue #183). Disabled when BudgetDailyLimit <= 0.
+func (c Config) BudgetEnabled() bool { return c.BudgetDailyLimit > 0 }
+
 // RateLimitEnabled reports whether the per-client rate limiter is
 // active (issue #75). Disabled when RateLimitRPM <= 0 so a stock
 // deployment is byte-for-byte identical to the pre-#75 path.
@@ -1094,6 +1195,18 @@ func (c Config) RoutingConfidenceEnabled() bool {
 	return c.RoutingConfidenceDB != "" && c.JudgeEnabled
 }
 
+// AuthEnabled reports whether the inbound API-key gate (issue #109)
+// is active. When false, all endpoints are open — the binary behaves
+// identically to the pre-auth proxy.
+func (c Config) AuthEnabled() bool { return c.ProxyAPIKey != "" }
+
+// SLMCacheEnabled reports whether the SLM decision cache (issue #206)
+// should be active. Disabled when SLMCacheTTL <= 0, which preserves
+// the pre-cache behaviour of always calling the SLM.
+func (c Config) SLMCacheEnabled() bool {
+	return c.SLMCacheTTL > 0
+}
+
 // RAGPersistentEnabled reports whether the SQLite-backed RAG store
 // (issue #46) should be opened. Disabled when RAGDBPath is empty,
 // which preserves the legacy in-memory-only behaviour for operators
@@ -1150,6 +1263,22 @@ func getEnvInt(key string, def int) (int, error) {
 		return 0, fmt.Errorf("config: %s must be an integer: %w", key, err)
 	}
 	return n, nil
+}
+
+// getEnvBool reads a boolean environment variable. Accepts
+// "true"/"1"/"yes" (case-insensitive) as true; anything else is
+// false. Returns def when the variable is unset or empty.
+func getEnvBool(key string, def bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def
+	}
+	switch strings.ToLower(v) {
+	case "true", "1", "yes":
+		return true
+	default:
+		return false
+	}
 }
 
 func getEnvFloat(key string, def float64) (float64, error) {
