@@ -82,6 +82,8 @@ type Config struct {
 	// Routing
 	TokenGuardrail int           // estimated tokens above this force frontier (6000)
 	SLMTimeout     time.Duration // Qwen3-Coder routing timeout (8s)
+	SLMCacheTTL    time.Duration // TTL for SLM routing decision cache (5m)
+	SLMCacheMaxEntries int       // max entries in SLM routing decision cache (512)
 	FusionTimeout  time.Duration // per-panel-member fetch timeout (120s)
 	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
 	ArbiterTimeout time.Duration // per-call timeout for the fusion arbiter stream (60s)
@@ -401,6 +403,24 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.SLMTimeout = slmTimeout
+
+	// SLM routing decision cache (issue #162). TTL defaults to 5m so
+	// repeated prompts within a coding session hit the cache; max
+	// entries caps memory at ~512 entries with simple LRU eviction.
+	slmCacheTTL, err := getEnvDuration("NEXUS_SLM_CACHE_TTL", 5*time.Minute)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.SLMCacheTTL = slmCacheTTL
+
+	slmCacheMax, err := getEnvInt("NEXUS_SLM_CACHE_MAX_ENTRIES", 512)
+	if err != nil {
+		return cfg, err
+	}
+	if slmCacheMax < 0 {
+		slmCacheMax = 0
+	}
+	cfg.SLMCacheMaxEntries = slmCacheMax
 
 	fusionTimeout, err := getEnvDuration("NEXUS_FUSION_TIMEOUT", 120*time.Second)
 	if err != nil {

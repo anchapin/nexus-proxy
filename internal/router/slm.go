@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -30,6 +32,26 @@ type SLMClient struct {
 	// back to DefaultConfidenceFloor / DefaultConfidenceCeiling.
 	ConfidenceFloor   float64
 	ConfidenceCeiling float64
+
+	// SLM routing decision cache (issue #162). Caches identical prompts
+	// keyed by FNV-1a hash of (prompt, systemPrompt) so that repeated
+	// prompts (e.g. looping coding agents, repeated RAG queries) avoid
+	// a full 8s Ollama round-trip. cacheTTL controls entry expiry;
+	// cacheMaxEntries caps memory use with LRU eviction.
+	CacheTTL       time.Duration // default 5m
+	CacheMaxEntries int           // default 512
+
+	cacheMu    sync.RWMutex
+	cache      map[string]*cacheEntry
+	cacheOrder []string          // LRU order for eviction
+	hits       int64
+	misses     int64
+}
+
+// cacheEntry pairs a route decision with its expiry time.
+type cacheEntry struct {
+	Route    Route
+	ExpiresAt time.Time
 }
 
 // NewSLMClient constructs a client. Pass nil for Client to use
@@ -38,7 +60,15 @@ func NewSLMClient(baseURL, model string, timeout time.Duration, client *http.Cli
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &SLMClient{BaseURL: baseURL, Model: model, Timeout: timeout, Client: client}
+	return &SLMClient{
+		BaseURL:         baseURL,
+		Model:           model,
+		Timeout:         timeout,
+		Client:          client,
+		CacheTTL:        5 * time.Minute,
+		CacheMaxEntries: 512,
+		cache:           make(map[string]*cacheEntry),
+	}
 }
 
 // slmSystemPrompt is the static instruction we send to the routing SLM.
@@ -108,8 +138,83 @@ func (c *SLMClient) systemPromptFor(confidence float64) string {
 	}
 }
 
+// cacheKey returns the FNV-1a hash key for a (prompt, systemPrompt) pair.
+// The same logical prompt always produces the same key regardless of
+// SLMClient pointer equality, so callers can use this for pre-check.
+func cacheKey(prompt, systemPrompt string) string {
+	h := fnv.New64a()
+	h.Write([]byte(prompt))
+	h.Write([]byte(systemPrompt))
+	return fmt.Sprintf("%x", h.Sum64())
+}
+
+// CacheStats returns the current cache hit and miss counts.
+func (c *SLMClient) CacheStats() (hits, misses int64) {
+	c.cacheMu.RLock()
+	defer c.cacheMu.RUnlock()
+	return c.hits, c.misses
+}
+
+// evictStale removes expired entries and enforces the max-entries cap via
+// simple FIFO eviction: expired entries are always removed; if the cache
+// is still over capacity after expired entry removal, the oldest entry
+// (by map iteration order, which is insertion order for the map key set)
+// is evicted. This is a best-effort LRU approximation — good enough for
+// the cache size limits in use (512 entries).
+func (c *SLMClient) evictStale() {
+	now := time.Now()
+	ttl := c.CacheTTL
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	max := c.CacheMaxEntries
+	if max <= 0 {
+		max = 512
+	}
+
+	// Phase 1: remove all expired entries.
+	for k, e := range c.cache {
+		if now.After(e.ExpiresAt) {
+			delete(c.cache, k)
+		}
+	}
+
+	// Phase 2: if still over capacity, evict oldest entries.
+	if len(c.cache) >= max {
+		evict := len(c.cache) - max + 1
+		// Map iteration order is intentionally undefined, but for a
+		// small map (≤512) iteration is deterministic within a single
+		// program run. Evict the first evict keys encountered.
+		removed := 0
+		for k := range c.cache {
+			delete(c.cache, k)
+			removed++
+			if removed >= evict {
+				break
+			}
+		}
+	}
+}
+
 // decide performs the HTTP round-trip with the supplied system prompt.
 func (c *SLMClient) decide(ctx context.Context, prompt, systemPrompt string) (Route, error) {
+	var key string
+	caching := c.CacheMaxEntries > 0
+	if caching {
+		key = cacheKey(prompt, systemPrompt)
+		// Fast path: check cache before HTTP call (issue #162).
+		c.cacheMu.RLock()
+		entry, ok := c.cache[key]
+		hit := ok && time.Now().Before(entry.ExpiresAt)
+		if hit {
+			c.hits++
+		}
+		c.cacheMu.RUnlock()
+		if hit {
+			return entry.Route, nil
+		}
+	}
+
 	payload, _ := json.Marshal(map[string]interface{}{
 		"model": c.Model,
 		"messages": []map[string]string{
@@ -166,12 +271,31 @@ func (c *SLMClient) decide(ctx context.Context, prompt, systemPrompt string) (Ro
 		return RouteFrontier, err
 	}
 
+	var route Route
 	switch Route(strings.ToLower(decision.Route)) {
 	case RouteLocal, RouteFusion:
-		return Route(strings.ToLower(decision.Route)), nil
+		route = Route(strings.ToLower(decision.Route))
 	default:
-		return RouteFrontier, nil
+		route = RouteFrontier
 	}
+
+	// Populate cache on successful HTTP response (issue #162).
+	if caching {
+		c.cacheMu.Lock()
+		c.evictStale()
+		ttl := c.CacheTTL
+		if ttl <= 0 {
+			ttl = 5 * time.Minute
+		}
+		c.cache[key] = &cacheEntry{
+			Route:     route,
+			ExpiresAt: time.Now().Add(ttl),
+		}
+		c.misses++
+		c.cacheMu.Unlock()
+	}
+
+	return route, nil
 }
 
 // slmDecision is the parsed route-decision object returned by the routing
