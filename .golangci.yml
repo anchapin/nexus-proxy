@@ -13,10 +13,9 @@ linters:
   enable:
     # Bug catchers
     - errcheck       # unchecked errors
-    - gosimple       # simplifications
     - govet          # stdlib vet
     - ineffassign    # unused assignments
-    - staticcheck    # broad static analysis
+    - staticcheck    # gosimple merged here in v2; broad static analysis
     - unused         # unused identifiers
 
     # Style / hygiene
