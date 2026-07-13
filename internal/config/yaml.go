@@ -23,9 +23,9 @@ type YAMLConfig struct {
 	ReadTimeout     string `yaml:"server_read_timeout"`
 	WriteTimeout    string `yaml:"server_write_timeout"`
 	IdleTimeout     string `yaml:"server_idle_timeout"`
-	MaxHeaderBytes int    `yaml:"server_max_header_bytes"`
+	MaxHeaderBytes  int    `yaml:"server_max_header_bytes"`
 	ShutdownTimeout string `yaml:"shutdown_timeout"`
-	MaxBodyBytes   int    `yaml:"max_body_bytes"`
+	MaxBodyBytes    int    `yaml:"max_body_bytes"`
 
 	// Logging
 	LogLevel  string `yaml:"log_level"`
@@ -36,10 +36,10 @@ type YAMLConfig struct {
 	DebugBodyBytes int  `yaml:"debug_body_bytes"`
 
 	// Ollama
-	OllamaURL       string `yaml:"ollama_url"`
-	RouterModel     string `yaml:"router_model"`
-	LocalModel      string `yaml:"local_model"`
-	EmbeddingModel  string `yaml:"embedding_model"`
+	OllamaURL      string `yaml:"ollama_url"`
+	RouterModel    string `yaml:"router_model"`
+	LocalModel     string `yaml:"local_model"`
+	EmbeddingModel string `yaml:"embedding_model"`
 
 	// Frontier
 	FrontierURL       string  `yaml:"frontier_url"`
@@ -48,9 +48,9 @@ type YAMLConfig struct {
 	FrontierCostPer1K float64 `yaml:"frontier_cost_per_1k"`
 
 	// Z.ai
-	ZAIURL      string  `yaml:"zai_url"`
-	ZAIModel    string  `yaml:"zai_model"`
-	ZAIKey      string  `yaml:"zai_api_key"`
+	ZAIURL       string  `yaml:"zai_url"`
+	ZAIModel     string  `yaml:"zai_model"`
+	ZAIKey       string  `yaml:"zai_api_key"`
 	ZAICostPer1K float64 `yaml:"zai_cost_per_1k"`
 
 	// Auth
@@ -58,15 +58,15 @@ type YAMLConfig struct {
 	StatusPublic bool   `yaml:"status_public"`
 
 	// Cost baseline
-	CostBaselineProvider string  `yaml:"cost_baseline_provider"`
-	CostBaselineModel    string  `yaml:"cost_baseline_model"`
+	CostBaselineProvider  string  `yaml:"cost_baseline_provider"`
+	CostBaselineModel     string  `yaml:"cost_baseline_model"`
 	CostBaselineRatePer1K float64 `yaml:"cost_baseline_rate_per_1k"`
 
 	// Budget
-	BudgetDailyLimit     float64 `yaml:"budget_daily_limit"`
-	BudgetAlertEnabled   bool    `yaml:"budget_alert_enabled"`
-	BudgetAlertThreshold float64 `yaml:"budget_alert_threshold"`
-	BudgetAlertWebhookURL string `yaml:"budget_alert_webhook_url"`
+	BudgetDailyLimit      float64 `yaml:"budget_daily_limit"`
+	BudgetAlertEnabled    bool    `yaml:"budget_alert_enabled"`
+	BudgetAlertThreshold  float64 `yaml:"budget_alert_threshold"`
+	BudgetAlertWebhookURL string  `yaml:"budget_alert_webhook_url"`
 
 	// Selector
 	SelectorWindow          string `yaml:"selector_window"`
@@ -74,61 +74,61 @@ type YAMLConfig struct {
 	SelectorRefreshInterval string `yaml:"selector_refresh_interval"`
 
 	// RAG
-	ExamplesDir      string   `yaml:"examples_dir"`
-	RAGThreshold     float64  `yaml:"rag_threshold"`
-	EmbedderType     string   `yaml:"embedder_type"`
-	EmbedderBaseURL  string   `yaml:"embedder_base_url"`
-	CohereAPIKey     string   `yaml:"cohere_api_key"`
-	RAGDBPath        string   `yaml:"rag_db_path"`
-	RAGPollInterval  string   `yaml:"rag_poll_interval"`
+	ExamplesDir       string  `yaml:"examples_dir"`
+	RAGThreshold      float64 `yaml:"rag_threshold"`
+	EmbedderType      string  `yaml:"embedder_type"`
+	EmbedderBaseURL   string  `yaml:"embedder_base_url"`
+	CohereAPIKey      string  `yaml:"cohere_api_key"`
+	RAGDBPath         string  `yaml:"rag_db_path"`
+	RAGPollInterval   string  `yaml:"rag_poll_interval"`
 	RAGEmbedCacheSize int     `yaml:"rag_embed_cache_size"`
 
 	// Routing
-	TokenGuardrail              int     `yaml:"token_guardrail"`
-	SLMTimeout                  string  `yaml:"slm_timeout"`
-	SLMCacheMaxEntries          int     `yaml:"slm_cache_max_entries"`
-	SLMCacheTTL                 string  `yaml:"slm_cache_ttl"`
-	SLMCacheSemanticThreshold   float64 `yaml:"slm_cache_similarity_threshold"`
-	FusionTimeout               string  `yaml:"fusion_timeout"`
-	CascadeTimeout              string  `yaml:"cascade_timeout"`
-	ArbiterTimeout              string  `yaml:"arbiter_timeout"`
+	TokenGuardrail            int     `yaml:"token_guardrail"`
+	SLMTimeout                string  `yaml:"slm_timeout"`
+	SLMCacheMaxEntries        int     `yaml:"slm_cache_max_entries"`
+	SLMCacheTTL               string  `yaml:"slm_cache_ttl"`
+	SLMCacheSemanticThreshold float64 `yaml:"slm_cache_similarity_threshold"`
+	FusionTimeout             string  `yaml:"fusion_timeout"`
+	CascadeTimeout            string  `yaml:"cascade_timeout"`
+	ArbiterTimeout            string  `yaml:"arbiter_timeout"`
 
 	// Fusion
 	FusionProgressiveDelivery bool    `yaml:"fusion_progressive_delivery"`
-	FusionAgreementThreshold   float64 `yaml:"fusion_agreement_threshold"`
+	FusionAgreementThreshold  float64 `yaml:"fusion_agreement_threshold"`
 
 	// Health
-	HealthPollInterval      string `yaml:"health_poll_interval"`
+	HealthPollInterval     string `yaml:"health_poll_interval"`
 	HealthBreakerThreshold int    `yaml:"health_breaker_threshold"`
-	HealthProbeTimeout      string `yaml:"health_probe_timeout"`
+	HealthProbeTimeout     string `yaml:"health_probe_timeout"`
 
 	// Probe
-	ProbeInterval     string `yaml:"probe_interval"`
-	ProbeTimeout     string `yaml:"probe_timeout"`
-	ProbeBytesPerToken int   `yaml:"probe_bytes_per_token"`
+	ProbeInterval      string `yaml:"probe_interval"`
+	ProbeTimeout       string `yaml:"probe_timeout"`
+	ProbeBytesPerToken int    `yaml:"probe_bytes_per_token"`
 
 	// Local concurrency
-	LocalMaxConcurrent    int   `yaml:"local_max_concurrent"`
-	LocalVRAMBytesPerSlot int64 `yaml:"local_vram_bytes_per_slot"`
+	LocalMaxConcurrent    int    `yaml:"local_max_concurrent"`
+	LocalVRAMBytesPerSlot int64  `yaml:"local_vram_bytes_per_slot"`
 	LocalCooldown         string `yaml:"local_cooldown"`
 
 	// Judge
-	JudgeURL        string  `yaml:"judge_url"`
-	JudgeModel      string  `yaml:"judge_model"`
-	JudgeAPIKey     string  `yaml:"judge_api_key"`
-	JudgeSampleRate float64 `yaml:"judge_sample_rate"`
-	JudgeConcurrency int    `yaml:"judge_concurrency"`
-	JudgeQueueDepth  int    `yaml:"judge_queue"`
-	JudgeTimeout    string  `yaml:"judge_timeout"`
+	JudgeURL          string  `yaml:"judge_url"`
+	JudgeModel        string  `yaml:"judge_model"`
+	JudgeAPIKey       string  `yaml:"judge_api_key"`
+	JudgeSampleRate   float64 `yaml:"judge_sample_rate"`
+	JudgeConcurrency  int     `yaml:"judge_concurrency"`
+	JudgeQueueDepth   int     `yaml:"judge_queue"`
+	JudgeTimeout      string  `yaml:"judge_timeout"`
 	JudgeCostPer1KUSD float64 `yaml:"judge_cost_per_1k"`
-	JudgeDBPath     string  `yaml:"judge_db_path"`
+	JudgeDBPath       string  `yaml:"judge_db_path"`
 
 	// Routing confidence
-	RoutingConfidenceDB          string  `yaml:"routing_confidence_db"`
-	RoutingConfidenceFloor       float64 `yaml:"routing_confidence_floor"`
-	RoutingConfidenceCeiling     float64 `yaml:"routing_confidence_ceiling"`
-	RoutingConfidenceMinSamples  int     `yaml:"routing_confidence_min_samples"`
-	RoutingConfidenceWindow      string  `yaml:"routing_confidence_window"`
+	RoutingConfidenceDB         string  `yaml:"routing_confidence_db"`
+	RoutingConfidenceFloor      float64 `yaml:"routing_confidence_floor"`
+	RoutingConfidenceCeiling    float64 `yaml:"routing_confidence_ceiling"`
+	RoutingConfidenceMinSamples int     `yaml:"routing_confidence_min_samples"`
+	RoutingConfidenceWindow     string  `yaml:"routing_confidence_window"`
 
 	// Quality
 	QualityConcurrency int    `yaml:"quality_concurrency"`
@@ -149,7 +149,7 @@ type YAMLConfig struct {
 
 	// Models
 	ModelsEndpointEnabled bool   `yaml:"models_endpoint_enabled"`
-	ModelsCacheTTL       string `yaml:"models_cache_ttl"`
+	ModelsCacheTTL        string `yaml:"models_cache_ttl"`
 
 	// Trusted proxies
 	TrustedProxies string `yaml:"trusted_proxies"`
@@ -815,54 +815,54 @@ func (yc YAMLConfig) toConfig() Config {
 		MetricsDBPath:  yc.stringDefault(yc.MetricsDBPath, DefaultMetricsDBPath()),
 
 		// Non-string fields with defaults
-		RAGThreshold:           yc.floatDefault(yc.RAGThreshold, 0.55),
-		RAGDBPath:              yc.stringDefault(yc.RAGDBPath, DefaultRAGDBPath()),
-		RAGEmbedCacheSize:      yc.intDefault(yc.RAGEmbedCacheSize, 256),
-		TokenGuardrail:         yc.intDefault(yc.TokenGuardrail, 6000),
-		SLMTimeout:             yc.durationDefault(yc.SLMTimeout, 8*time.Second),
-		SLMCacheMaxEntries:     yc.intDefault(yc.SLMCacheMaxEntries, 512),
-		SLMCacheTTL:            yc.durationDefault(yc.SLMCacheTTL, 30*time.Second),
+		RAGThreshold:              yc.floatDefault(yc.RAGThreshold, 0.55),
+		RAGDBPath:                 yc.stringDefault(yc.RAGDBPath, DefaultRAGDBPath()),
+		RAGEmbedCacheSize:         yc.intDefault(yc.RAGEmbedCacheSize, 256),
+		TokenGuardrail:            yc.intDefault(yc.TokenGuardrail, 6000),
+		SLMTimeout:                yc.durationDefault(yc.SLMTimeout, 8*time.Second),
+		SLMCacheMaxEntries:        yc.intDefault(yc.SLMCacheMaxEntries, 512),
+		SLMCacheTTL:               yc.durationDefault(yc.SLMCacheTTL, 30*time.Second),
 		SLMCacheSemanticThreshold: clampFloat(yc.floatDefault(yc.SLMCacheSemanticThreshold, 0.0), 0, 1),
-		FusionTimeout:          yc.durationDefault(yc.FusionTimeout, 120*time.Second),
-		CascadeTimeout:         yc.durationDefault(yc.CascadeTimeout, 30*time.Second),
-		ArbiterTimeout:         yc.durationDefault(yc.ArbiterTimeout, 60*time.Second),
+		FusionTimeout:             yc.durationDefault(yc.FusionTimeout, 120*time.Second),
+		CascadeTimeout:            yc.durationDefault(yc.CascadeTimeout, 30*time.Second),
+		ArbiterTimeout:            yc.durationDefault(yc.ArbiterTimeout, 60*time.Second),
 
 		FusionProgressiveDelivery: yc.boolFieldDefault(yc.FusionProgressiveDelivery, true),
 		FusionAgreementThreshold:  yc.floatDefault(yc.FusionAgreementThreshold, 0.85),
 
-		JudgeURL:         yc.stringDefault(yc.JudgeURL, "https://api.z.ai/v1/chat/completions"),
-		JudgeModel:      yc.stringDefault(yc.JudgeModel, ""), // Falls back to FrontierModel later
-		JudgeAPIKey:     yc.JudgeAPIKey,
-		JudgeSampleRate: yc.floatDefault(yc.JudgeSampleRate, 0.1),
-		JudgeConcurrency: yc.intDefault(yc.JudgeConcurrency, 2),
-		JudgeQueueDepth:  yc.intDefault(yc.JudgeQueueDepth, 64),
-		JudgeTimeout:     yc.durationDefault(yc.JudgeTimeout, 30*time.Second),
+		JudgeURL:          yc.stringDefault(yc.JudgeURL, "https://api.z.ai/v1/chat/completions"),
+		JudgeModel:        yc.stringDefault(yc.JudgeModel, ""), // Falls back to FrontierModel later
+		JudgeAPIKey:       yc.JudgeAPIKey,
+		JudgeSampleRate:   yc.floatDefault(yc.JudgeSampleRate, 0.1),
+		JudgeConcurrency:  yc.intDefault(yc.JudgeConcurrency, 2),
+		JudgeQueueDepth:   yc.intDefault(yc.JudgeQueueDepth, 64),
+		JudgeTimeout:      yc.durationDefault(yc.JudgeTimeout, 30*time.Second),
 		JudgeCostPer1KUSD: yc.floatDefault(yc.JudgeCostPer1KUSD, 0.002),
-		JudgeDBPath:     yc.stringDefault(yc.JudgeDBPath, DefaultJudgeDBPath()),
+		JudgeDBPath:       yc.stringDefault(yc.JudgeDBPath, DefaultJudgeDBPath()),
 
-		RoutingConfidenceDB:          yc.stringDefault(yc.RoutingConfidenceDB, DefaultRoutingConfidenceDBPath()),
-		RoutingConfidenceFloor:       yc.floatDefault(yc.RoutingConfidenceFloor, 0.4),
-		RoutingConfidenceCeiling:     yc.floatDefault(yc.RoutingConfidenceCeiling, 0.85),
-		RoutingConfidenceMinSamples:  yc.intDefault(yc.RoutingConfidenceMinSamples, 5),
+		RoutingConfidenceDB:         yc.stringDefault(yc.RoutingConfidenceDB, DefaultRoutingConfidenceDBPath()),
+		RoutingConfidenceFloor:      yc.floatDefault(yc.RoutingConfidenceFloor, 0.4),
+		RoutingConfidenceCeiling:    yc.floatDefault(yc.RoutingConfidenceCeiling, 0.85),
+		RoutingConfidenceMinSamples: yc.intDefault(yc.RoutingConfidenceMinSamples, 5),
 		RoutingConfidenceWindow:     yc.durationDefault(yc.RoutingConfidenceWindow, 168*time.Hour),
 
-		HealthPollInterval:      yc.durationDefault(yc.HealthPollInterval, 30*time.Second),
-		HealthBreakerThreshold:  yc.intDefault(yc.HealthBreakerThreshold, 3),
-		HealthProbeTimeout:      yc.durationDefault(yc.HealthProbeTimeout, 5*time.Second),
+		HealthPollInterval:     yc.durationDefault(yc.HealthPollInterval, 30*time.Second),
+		HealthBreakerThreshold: yc.intDefault(yc.HealthBreakerThreshold, 3),
+		HealthProbeTimeout:     yc.durationDefault(yc.HealthProbeTimeout, 5*time.Second),
 
-		ProbePollInterval: yc.durationDefault(yc.ProbeInterval, 60*time.Second),
-		ProbeTimeout:      yc.durationDefault(yc.ProbeTimeout, 5*time.Second),
+		ProbePollInterval:  yc.durationDefault(yc.ProbeInterval, 60*time.Second),
+		ProbeTimeout:       yc.durationDefault(yc.ProbeTimeout, 5*time.Second),
 		ProbeBytesPerToken: yc.intDefault(yc.ProbeBytesPerToken, 256*1024),
 
-		LocalMaxConcurrent:   yc.intDefault(yc.LocalMaxConcurrent, 0),
+		LocalMaxConcurrent:    yc.intDefault(yc.LocalMaxConcurrent, 0),
 		LocalVRAMBytesPerSlot: yc.int64Default(yc.LocalVRAMBytesPerSlot, DefaultLocalVRAMBytesPerSlot),
-		LocalCooldown:        yc.durationDefault(yc.LocalCooldown, 10*time.Second),
+		LocalCooldown:         yc.durationDefault(yc.LocalCooldown, 10*time.Second),
 
 		MaxBodyBytes:    yc.intDefault(yc.MaxBodyBytes, DefaultMaxBodyBytes),
 		ReadTimeout:     yc.durationDefault(yc.ReadTimeout, DefaultServerReadTimeout),
 		WriteTimeout:    yc.durationDefault(yc.WriteTimeout, 0),
 		IdleTimeout:     yc.durationDefault(yc.IdleTimeout, DefaultServerIdleTimeout),
-		MaxHeaderBytes: yc.intDefault(yc.MaxHeaderBytes, DefaultServerMaxHeaderBytes),
+		MaxHeaderBytes:  yc.intDefault(yc.MaxHeaderBytes, DefaultServerMaxHeaderBytes),
 		ShutdownTimeout: yc.durationDefault(yc.ShutdownTimeout, DefaultShutdownTimeout),
 
 		BudgetDailyLimit:      yc.floatDefault(yc.BudgetDailyLimit, 0),
@@ -871,20 +871,20 @@ func (yc YAMLConfig) toConfig() Config {
 		BudgetAlertWebhookURL: yc.BudgetAlertWebhookURL,
 
 		SelectorWindow:          yc.durationDefault(yc.SelectorWindow, time.Hour),
-		SelectorMinSamples:       yc.intDefault(yc.SelectorMinSamples, 5),
-		SelectorRefreshInterval:  yc.durationDefault(yc.SelectorRefreshInterval, 60*time.Second),
-		FrontierCostPer1K:      yc.floatDefault(yc.FrontierCostPer1K, 0.005),
-		ZAICostPer1K:          yc.floatDefault(yc.ZAICostPer1K, 0.002),
+		SelectorMinSamples:      yc.intDefault(yc.SelectorMinSamples, 5),
+		SelectorRefreshInterval: yc.durationDefault(yc.SelectorRefreshInterval, 60*time.Second),
+		FrontierCostPer1K:       yc.floatDefault(yc.FrontierCostPer1K, 0.005),
+		ZAICostPer1K:            yc.floatDefault(yc.ZAICostPer1K, 0.002),
 
 		CostBaselineProvider:  yc.stringDefault(yc.CostBaselineProvider, "frontier"),
-		CostBaselineModel:     yc.stringDefault(yc.CostBaselineModel, ""), // Falls back to FrontierModel later
+		CostBaselineModel:     yc.stringDefault(yc.CostBaselineModel, ""),   // Falls back to FrontierModel later
 		CostBaselineRatePer1K: yc.floatDefault(yc.CostBaselineRatePer1K, 0), // Falls back to FrontierCostPer1K later
 
 		QualityConcurrency: yc.intDefault(yc.QualityConcurrency, 2),
-		QualityQueueDepth:   yc.intDefault(yc.QualityQueueDepth, 64),
-		QualityTimeout:      yc.durationDefault(yc.QualityTimeout, 60*time.Second),
-		QualityStderrCap:    yc.intDefault(yc.QualityStderrCap, 2*1024),
-		QualityEnabled:      yc.intDefault(yc.QualityConcurrency, 2) > 0,
+		QualityQueueDepth:  yc.intDefault(yc.QualityQueueDepth, 64),
+		QualityTimeout:     yc.durationDefault(yc.QualityTimeout, 60*time.Second),
+		QualityStderrCap:   yc.intDefault(yc.QualityStderrCap, 2*1024),
+		QualityEnabled:     yc.intDefault(yc.QualityConcurrency, 2) > 0,
 
 		PromptInjectionMode: middleware.ParseInjectionMode(yc.PromptInjectionMode),
 
