@@ -17,5 +17,6 @@ paths = [
 [[allowlists]]
 description = "Provider constructor functions — no real secrets"
 paths = [
-  '''internal/providers/frontier\.go''',
+  "internal/providers/frontier.go",
 ]
+rules = ["generic-api-key"]
