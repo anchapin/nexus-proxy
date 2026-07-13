@@ -13,3 +13,10 @@ description = "Example env file — placeholders only, no real secrets"
 paths = [
   '''^\.env\.example$''',
 ]
+
+[[allowlists]]
+description = "Provider constructor function signatures use keyInput param — no real secrets"
+paths = [
+  '''internal/providers/frontier\.go''',
+]
+rules = ["generic-api-key"]
