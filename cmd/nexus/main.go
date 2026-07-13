@@ -120,6 +120,10 @@ func main() {
 	// router defaults, so this is safe even when the feature is off.
 	slm.ConfidenceFloor = cfg.RoutingConfidenceFloor
 	slm.ConfidenceCeiling = cfg.RoutingConfidenceCeiling
+	// SLM routing decision cache (issue #162). Zero values fall back
+	// to the NewSLMClient defaults (5m TTL, 512 max entries).
+	slm.CacheTTL = cfg.SLMCacheTTL
+	slm.CacheMaxEntries = cfg.SLMCacheMaxEntries
 	re := regexp.MustCompile(formattingRegexPattern)
 
 	// Ollama health poller (issue #8). When NEXUS_HEALTH_POLL_INTERVAL
