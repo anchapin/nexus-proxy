@@ -80,13 +80,13 @@ type Config struct {
 	RAGPollInterval time.Duration // watcher cadence; 0 disables the watcher
 
 	// Routing
-	TokenGuardrail int           // estimated tokens above this force frontier (6000)
-	SLMTimeout     time.Duration // Qwen3-Coder routing timeout (8s)
-	SLMCacheTTL    time.Duration // TTL for SLM routing decision cache (5m)
-	SLMCacheMaxEntries int       // max entries in SLM routing decision cache (512)
-	FusionTimeout  time.Duration // per-panel-member fetch timeout (120s)
-	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
-	ArbiterTimeout time.Duration // per-call timeout for the fusion arbiter stream (60s)
+	TokenGuardrail     int           // estimated tokens above this force frontier (6000)
+	SLMTimeout         time.Duration // Qwen3-Coder routing timeout (8s)
+	SLMCacheTTL        time.Duration // TTL for SLM routing decision cache (5m)
+	SLMCacheMaxEntries int           // max entries in SLM routing decision cache (512)
+	FusionTimeout      time.Duration // per-panel-member fetch timeout (120s)
+	CascadeTimeout     time.Duration // per-attempt timeout for cascade fallback (30s)
+	ArbiterTimeout     time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
 	// Frontier provider selector (issue #45). When more than one
 	// frontier provider is configured (frontier + z.ai), the chat

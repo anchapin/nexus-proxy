@@ -38,19 +38,18 @@ type SLMClient struct {
 	// prompts (e.g. looping coding agents, repeated RAG queries) avoid
 	// a full 8s Ollama round-trip. cacheTTL controls entry expiry;
 	// cacheMaxEntries caps memory use with LRU eviction.
-	CacheTTL       time.Duration // default 5m
+	CacheTTL        time.Duration // default 5m
 	CacheMaxEntries int           // default 512
 
-	cacheMu    sync.RWMutex
-	cache      map[string]*cacheEntry
-	cacheOrder []string          // LRU order for eviction
-	hits       int64
-	misses     int64
+	cacheMu sync.RWMutex
+	cache   map[string]*cacheEntry
+	hits    int64
+	misses  int64
 }
 
 // cacheEntry pairs a route decision with its expiry time.
 type cacheEntry struct {
-	Route    Route
+	Route     Route
 	ExpiresAt time.Time
 }
 
@@ -271,11 +270,8 @@ func (c *SLMClient) decide(ctx context.Context, prompt, systemPrompt string) (Ro
 		return RouteFrontier, err
 	}
 
-	var route Route
-	switch Route(strings.ToLower(decision.Route)) {
-	case RouteLocal, RouteFusion:
-		route = Route(strings.ToLower(decision.Route))
-	default:
+	route := Route(strings.ToLower(decision.Route))
+	if route != RouteLocal && route != RouteFusion {
 		route = RouteFrontier
 	}
 
