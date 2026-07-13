@@ -145,13 +145,13 @@ func TestChatRejectionMissingMessages(t *testing.T) {
 
 // TestChatRejectionUsesMetricsObserver confirms that when a
 // MetricsObserver is wired, the rejection is dispatched to it (with
-// route="rejected") instead of the legacy Recorder. This matches the
-// same preference the successful-request path uses (issue #4).
+// route="rejected"). With the fix for issue #164 both the
+// MetricsObserver and the Recorder receive events when both are wired.
 func TestChatRejectionUsesMetricsObserver(t *testing.T) {
 	deps, _ := baseDeps(t)
 	mo := &recordingMetricsObserver{}
 	deps.MetricsObserver = mo
-	deps.Recorder = &recordingRecorder{} // should NOT receive a record
+	deps.Recorder = &recordingRecorder{}
 	rr := &rejectionRecorder{}
 	deps.RejectionObserver = rr
 
@@ -168,6 +168,17 @@ func TestChatRejectionUsesMetricsObserver(t *testing.T) {
 	}
 	if events[0].Error != RejectionMethod {
 		t.Errorf("metrics error = %q, want %q", events[0].Error, RejectionMethod)
+	}
+	// Recorder also receives the rejection (issue #164 fix).
+	rows := deps.Recorder.(*recordingRecorder).snapshot()
+	if len(rows) != 1 {
+		t.Fatalf("recorder rows = %d, want 1", len(rows))
+	}
+	if rows[0].Route != "rejected" {
+		t.Errorf("record route = %q, want \"rejected\"", rows[0].Route)
+	}
+	if rows[0].Error != RejectionMethod {
+		t.Errorf("record error = %q, want %q", rows[0].Error, RejectionMethod)
 	}
 }
 

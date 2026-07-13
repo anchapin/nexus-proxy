@@ -339,3 +339,76 @@ func TestRouteDecisionObserverFuncAdapter(t *testing.T) {
 		t.Errorf("adapter dropped or mangled event: %+v", captured)
 	}
 }
+
+// TestChatBothObserversReceiveRecord (issue #164) confirms that when
+// both MetricsObserver and Recorder are wired, both receive a record
+// for a successful proxied request. Previously the if/else dispatch
+// silenced the Recorder when MetricsObserver was set.
+func TestChatBothObserversReceiveRecord(t *testing.T) {
+	deps, rt := baseDeps(t)
+	mo := &recordingMetricsObserver{}
+	deps.MetricsObserver = mo
+	rec := &recordingRecorder{}
+	deps.Recorder = rec
+
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
+	})
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rw.Code)
+	}
+	events := mo.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("metrics events = %d, want 1", len(events))
+	}
+	if events[0].Route != "local" {
+		t.Errorf("metrics route = %q, want \"local\"", events[0].Route)
+	}
+	rows := rec.snapshot()
+	if len(rows) != 1 {
+		t.Fatalf("recorder rows = %d, want 1", len(rows))
+	}
+	if rows[0].Route != "local" {
+		t.Errorf("record route = %q, want \"local\"", rows[0].Route)
+	}
+}
+
+// TestRejectionBothObserversReceiveRecord (issue #164) confirms that
+// when both MetricsObserver and Recorder are wired, both receive a
+// record for a rejected request.
+func TestRejectionBothObserversReceiveRecord(t *testing.T) {
+	deps, _ := baseDeps(t)
+	mo := &recordingMetricsObserver{}
+	deps.MetricsObserver = mo
+	rec := &recordingRecorder{}
+	deps.Recorder = rec
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil)
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", rw.Code)
+	}
+	events := mo.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("metrics events = %d, want 1", len(events))
+	}
+	if events[0].Route != "rejected" {
+		t.Errorf("metrics route = %q, want \"rejected\"", events[0].Route)
+	}
+	rows := rec.snapshot()
+	if len(rows) != 1 {
+		t.Fatalf("recorder rows = %d, want 1", len(rows))
+	}
+	if rows[0].Route != "rejected" {
+		t.Errorf("record route = %q, want \"rejected\"", rows[0].Route)
+	}
+}
