@@ -146,6 +146,12 @@ type Planner struct {
 	// formatting branch of the DSL (the architecture keywords still
 	// fire).
 	FormattingRegex *regexp.Regexp
+
+	// LocalPatternsRegex is the DSL fast-pass regex for common coding
+	// task keywords (refactor, security scan, generate tests, explain this
+	// code, performance analysis, ...). May be nil; a nil regex disables
+	// the local-patterns branch of the DSL.
+	LocalPatternsRegex *regexp.Regexp
 }
 
 // PlanRequest carries the per-request inputs the planner needs. The
@@ -203,7 +209,7 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	}
 
 	// Stage 2: DSL fast-pass.
-	if r, hit := DSL(req.Prompt, p.FormattingRegex); hit {
+	if r, hit := DSL(req.Prompt, p.FormattingRegex, p.LocalPatternsRegex); hit {
 		return Decision{
 			Route:           r,
 			Source:          SourceDSL,
