@@ -55,6 +55,11 @@ const writeBufferSize = 16 << 10
 // the arbiter is always invoked. The dashboard joins on this flag
 // to report "fraction of fusion traffic that achieved agreement".
 //
+// FusionJaccardSimilarity (issue #200) is the actual Jaccard ratio
+// between the two panel members' contents when both returned content.
+// 0 when fewer than two members returned content. Enables operators
+// to tune NEXUS_FUSION_AGREEMENT_THRESHOLD based on actual distribution.
+//
 // Route-source fields (issue #74) carry the planner's Decision
 // metadata so downstream consumers (JSONL log, SQLite metrics,
 // dashboard) can attribute each request to the stage that produced
@@ -75,8 +80,9 @@ type Record struct {
 	TotalLatencyMs       float64   `json:"total_latency_ms"`
 	TPS                  float64   `json:"tps"`
 	Streaming            bool      `json:"streaming"`
-	FusionArbiterSkipped bool      `json:"fusion_arbiter_skipped,omitempty"`
-	ToolCallCount        int       `json:"tool_call_count,omitempty"`
+	FusionArbiterSkipped   bool        `json:"fusion_arbiter_skipped,omitempty"`
+	FusionJaccardSimilarity float64    `json:"fusion_jaccard_similarity,omitempty"`
+	ToolCallCount        int          `json:"tool_call_count,omitempty"`
 	Error                string    `json:"error,omitempty"`
 
 	// Route-source metadata (issue #74). Omitempty keeps legacy

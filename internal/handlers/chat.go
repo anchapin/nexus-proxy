@@ -212,14 +212,15 @@ type MetricsEvent struct {
 	BaselineCostUSD float64
 	SavingsUSD      float64
 
-	OutputTokens         int
-	TTFTMs               int64
-	TotalLatencyMs       float64
-	TPS                  float64
-	Streaming            bool
-	FusionArbiterSkipped bool
-	ToolCallCount        int
-	Error                string
+	OutputTokens           int
+	TTFTMs                 int64
+	TotalLatencyMs         float64
+	TPS                    float64
+	Streaming              bool
+	FusionArbiterSkipped   bool
+	FusionJaccardSimilarity float64
+	ToolCallCount          int
+	Error                  string
 
 	RouteSource   string
 	RouteReason   string
@@ -874,6 +875,7 @@ func Chat(d Deps) http.Handler {
 		var model string
 		var upErr error
 		var fusionArbiterSkipped bool
+		var fusionJaccardSimilarity float64
 		// toolCallCount is populated from the cascade result on the
 		// local streaming route (issue #72) and forwarded to telemetry
 		// + metrics so the dashboard can report how many tool calls
@@ -926,6 +928,7 @@ func Chat(d Deps) http.Handler {
 					d.Config.FusionAgreementThreshold,
 				)
 				fusionArbiterSkipped = outcome.ArbiterSkipped
+				fusionJaccardSimilarity = outcome.Similarity
 				if outcome.ArbiterSkipped {
 					slog.Info("fusion arbiter skipped",
 						slog.String("source", outcome.Source),
@@ -1205,7 +1208,7 @@ func Chat(d Deps) http.Handler {
 			}
 		}
 		outputTokens := int(obs.BytesOut() / 4)
-		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr, fusionArbiterSkipped, toolCallCount, decision)
+		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr, fusionArbiterSkipped, fusionJaccardSimilarity, toolCallCount, decision)
 		if d.MetricsObserver != nil {
 			postCompressionChars := totalMessageChars(messages)
 			savings := totalTokenSavings(preCompressionChars, postCompressionChars)
@@ -1218,29 +1221,30 @@ func Chat(d Deps) http.Handler {
 			}
 			tps := telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 			d.MetricsObserver.Submit(MetricsEvent{
-				Timestamp:            rec.Timestamp,
-				RequestID:            reqID,
-				Route:                string(route),
-				Model:                model,
-				InputTokens:          rec.InputTokens,
-				TOONSavingsTokens:    savings,
-				RAGInjected:          ragInjected,
-				RAGFilename:          ragFilename,
-				EstimatedCostUSD:     cost,
-				BaselineCostUSD:      baselineCost,
-				SavingsUSD:           savingsCost,
-				OutputTokens:         outputTokens,
-				TTFTMs:               ttftMs,
-				TotalLatencyMs:       totalMs,
-				TPS:                  tps,
-				Streaming:            streaming,
-				FusionArbiterSkipped: fusionArbiterSkipped,
-				ToolCallCount:        toolCallCount,
-				Error:                rec.Error,
-				RouteSource:          string(decision.Source),
-				RouteReason:          decision.Reason,
-				SLMConfidence:        decision.Confidence,
-				SLMTaskType:          decision.TaskType,
+				Timestamp:              rec.Timestamp,
+				RequestID:              reqID,
+				Route:                  string(route),
+				Model:                  model,
+				InputTokens:            rec.InputTokens,
+				TOONSavingsTokens:      savings,
+				RAGInjected:            ragInjected,
+				RAGFilename:            ragFilename,
+				EstimatedCostUSD:       cost,
+				BaselineCostUSD:        baselineCost,
+				SavingsUSD:             savingsCost,
+				OutputTokens:           outputTokens,
+				TTFTMs:                 ttftMs,
+				TotalLatencyMs:         totalMs,
+				TPS:                    tps,
+				Streaming:              streaming,
+				FusionArbiterSkipped:   fusionArbiterSkipped,
+				FusionJaccardSimilarity: fusionJaccardSimilarity,
+				ToolCallCount:          toolCallCount,
+				Error:                  rec.Error,
+				RouteSource:            string(decision.Source),
+				RouteReason:            decision.Reason,
+				SLMConfidence:          decision.Confidence,
+				SLMTaskType:            decision.TaskType,
 			})
 		} else {
 			d.Recorder.Record(rec)
@@ -1563,6 +1567,7 @@ func buildRecord(
 	model, latestPrompt string,
 	upErr error,
 	fusionArbiterSkipped bool,
+	fusionJaccardSimilarity float64,
 	toolCallCount int,
 	decision router.Decision,
 ) telemetry.Record {
@@ -1576,21 +1581,22 @@ func buildRecord(
 	}
 	outputTokens := int(bytesOut / 4)
 	rec := telemetry.Record{
-		Timestamp:            time.Now().UTC(),
-		RequestID:            requestID,
-		Model:                model,
-		Route:                string(route),
-		InputTokens:          telemetry.EstimateTokens(latestPrompt),
-		OutputTokens:         outputTokens,
-		TTFTMs:               ttftMs,
-		TotalLatencyMs:       totalMs,
-		Streaming:            streaming,
-		FusionArbiterSkipped: fusionArbiterSkipped,
-		ToolCallCount:        toolCallCount,
-		RouteSource:          string(decision.Source),
-		RouteReason:          decision.Reason,
-		SLMConfidence:        decision.Confidence,
-		SLMTaskType:          decision.TaskType,
+		Timestamp:              time.Now().UTC(),
+		RequestID:              requestID,
+		Model:                  model,
+		Route:                  string(route),
+		InputTokens:            telemetry.EstimateTokens(latestPrompt),
+		OutputTokens:           outputTokens,
+		TTFTMs:                 ttftMs,
+		TotalLatencyMs:         totalMs,
+		Streaming:              streaming,
+		FusionArbiterSkipped:   fusionArbiterSkipped,
+		FusionJaccardSimilarity: fusionJaccardSimilarity,
+		ToolCallCount:          toolCallCount,
+		RouteSource:            string(decision.Source),
+		RouteReason:            decision.Reason,
+		SLMConfidence:          decision.Confidence,
+		SLMTaskType:            decision.TaskType,
 	}
 	rec.TPS = telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 	if upErr != nil {

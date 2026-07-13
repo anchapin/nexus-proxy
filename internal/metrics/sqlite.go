@@ -32,7 +32,7 @@ import (
 //
 // The route_source / route_reason / slm_confidence / slm_task_type
 // columns (issue #74) are added here for fresh databases. Existing
-// databases are migrated via migrateRouteSourceColumns at Open time
+// databases are migrated via runAdditiveMigrations at Open time
 // so additive ALTER TABLE statements bring them up to the same shape
 // without data loss.
 const requestsSchema = `
@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS requests (
     tps REAL NOT NULL DEFAULT 0,
     streaming INTEGER NOT NULL DEFAULT 1,
     fusion_arbiter_skipped INTEGER NOT NULL DEFAULT 0,
+    fusion_jaccard_similarity REAL NOT NULL DEFAULT 0,
     error TEXT NOT NULL DEFAULT '',
     route_source TEXT NOT NULL DEFAULT '',
     route_reason TEXT NOT NULL DEFAULT '',
@@ -65,26 +66,29 @@ CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
 CREATE INDEX IF NOT EXISTS idx_requests_request_id ON requests(request_id);
 `
 
-// routeSourceMigrations is the set of additive ALTER TABLE statements
-// that bring an existing requests table up to the issue #74 schema.
+// additiveMigrations is the set of additive ALTER TABLE statements
+// that bring an existing requests table up to the current schema.
 // Each is idempotent: SQLite errors on duplicate-column are swallowed
-// by the caller (migrateRouteSourceColumns) so re-running against an
+// by the caller (runAdditiveMigrations) so re-running against an
 // already-migrated database is a no-op.
-var routeSourceMigrations = []string{
+var additiveMigrations = []string{
+	// Issue #74: route-source columns
 	`ALTER TABLE requests ADD COLUMN route_source TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN route_reason TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN slm_confidence REAL NOT NULL DEFAULT 0`,
 	`ALTER TABLE requests ADD COLUMN slm_task_type TEXT NOT NULL DEFAULT ''`,
+	// Issue #200: Jaccard similarity
+	`ALTER TABLE requests ADD COLUMN fusion_jaccard_similarity REAL NOT NULL DEFAULT 0`,
 }
 
-// migrateRouteSourceColumns runs the additive ALTER TABLE migrations
-// for issue #74. Each statement is attempted individually; "duplicate
-// column" errors mean the column already exists (the database was
-// created or migrated by a newer build) and are silently ignored.
-// Any other error aborts Open so the operator sees the problem at
-// boot rather than on the first failed INSERT.
-func migrateRouteSourceColumns(ctx context.Context, db *sql.DB) error {
-	for _, stmt := range routeSourceMigrations {
+// runAdditiveMigrations executes the additive ALTER TABLE migrations.
+// Each statement is attempted individually; "duplicate column" errors
+// mean the column already exists (the database was created or migrated
+// by a newer build) and are silently ignored. Any other error aborts
+// Open so the operator sees the problem at boot rather than on the
+// first failed INSERT.
+func runAdditiveMigrations(ctx context.Context, db *sql.DB) error {
+	for _, stmt := range additiveMigrations {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			// modernc.org/sqlite returns the error string
 			// containing "duplicate column name" for the
@@ -121,9 +125,10 @@ const insertSQL = `INSERT INTO requests
      input_tokens, output_tokens, toon_savings_tokens,
      rag_injected, rag_filename, estimated_cost_usd,
      baseline_cost_usd, savings_usd,
-     ttft_ms, total_latency_ms, tps, streaming, fusion_arbiter_skipped, error,
+     ttft_ms, total_latency_ms, tps, streaming,
+     fusion_arbiter_skipped, fusion_jaccard_similarity, error,
      route_source, route_reason, slm_confidence, slm_task_type)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // SQLiteStore is the production Store implementation (issue #4).
 // Writes are funnelled through a buffered channel and a single
@@ -183,7 +188,7 @@ func newSQLiteStore(path string, lg Logger) (*SQLiteStore, error) {
 	// requestsSchema above), so every ALTER will no-op on the
 	// "duplicate column name" error and the migration completes in
 	// microseconds.
-	if err := migrateRouteSourceColumns(context.Background(), db); err != nil {
+	if err := runAdditiveMigrations(context.Background(), db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("metrics: migrate route-source: %w", err)
 	}
@@ -328,7 +333,7 @@ func (s *SQLiteStore) writeOne(req Request) {
 		ragInjected, req.RAGFilename, req.EstimatedCostUSD,
 		req.BaselineCostUSD, req.SavingsUSD,
 		req.TTFTMs, req.TotalLatencyMs, req.TPS, streaming,
-		fusionArbiterSkipped, req.Error,
+		fusionArbiterSkipped, req.FusionJaccardSimilarity, req.Error,
 		req.RouteSource, req.RouteReason, req.SLMConfidence, req.SLMTaskType,
 	)
 	if err != nil {
