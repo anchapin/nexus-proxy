@@ -99,8 +99,9 @@ type Config struct {
 	// Routing
 	TokenGuardrail     int           // estimated tokens above this force frontier (6000)
 	SLMTimeout         time.Duration // Qwen3-Coder routing timeout (8s)
-	SLMCacheMaxEntries int           // max entries in SLM routing decision cache (512)
-	FusionTimeout      time.Duration // per-panel-member fetch timeout (120s)
+	SLMCacheMaxEntries        int           // max entries in SLM routing decision cache (512)
+	SLMCacheSemanticThreshold float64       // cosine similarity floor for semantic cache hits (0.0..1.0, issue #245)
+	FusionTimeout            time.Duration // per-panel-member fetch timeout (120s)
 	CascadeTimeout     time.Duration // per-attempt timeout for cascade fallback (30s)
 	ArbiterTimeout     time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
@@ -616,6 +617,22 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.SLMCacheTTL = slmCacheTTL
+
+	// Semantic similarity threshold for SLM cache (issue #245).
+	// 0.0 disables semantic deduplication; >0 uses cosine-similarity
+	// fallback in the SLMCache so prompts with the same intent but
+	// different wording share the same cached route decision.
+	slmCacheSemThreshold, err := getEnvFloat("NEXUS_SLMCACHE_SIMILARITY_THRESHOLD", 0.0)
+	if err != nil {
+		return cfg, err
+	}
+	if slmCacheSemThreshold < 0 {
+		slmCacheSemThreshold = 0
+	}
+	if slmCacheSemThreshold > 1.0 {
+		slmCacheSemThreshold = 1.0
+	}
+	cfg.SLMCacheSemanticThreshold = slmCacheSemThreshold
 
 	// Ollama health poller (issue #8). Defaults: 30s poll cadence,
 	// 3-failure breaker, 5s per-probe HTTP timeout. Set
