@@ -308,9 +308,30 @@ func main() {
 			Timeout:     cfg.JudgeTimeout,
 			CostPer1K:   cfg.JudgeCostPer1KUSD,
 		}
-		// Issue #16 will swap this for a SQLite-backed Storage. The
-		// interface is identical so the swap is a one-line change.
-		var storage judge.Storage = judge.NewMemoryStorage()
+		// Issue #198: open the SQLite-backed judge store when
+		// NEXUS_JUDGE_DB is set (default path if unset). On error
+		// we log and fall back to the in-memory MemoryStorage so
+		// the proxy stays alive — judge scores are best-effort
+		// telemetry, not a correctness requirement.
+		var storage judge.Storage
+		if cfg.JudgeDBEnabled() {
+			store, err := judge.OpenSQLiteStore(cfg.JudgeDBPath)
+			if err != nil {
+				slog.Error("judge SQLite store open failed, falling back to in-memory",
+					slog.String("path", cfg.JudgeDBPath),
+					slog.Any("err", err),
+				)
+				storage = judge.NewMemoryStorage()
+			} else {
+				storage = store
+				slog.Info("judge SQLite store opened",
+					slog.String("path", store.Path()),
+				)
+			}
+		} else {
+			storage = judge.NewMemoryStorage()
+			slog.Info("judge SQLite store disabled (NEXUS_JUDGE_DB is empty); using in-memory store")
+		}
 
 		// Judge-guided adaptive routing (issue #47). When enabled we
 		// open the confidence store and wrap the judge storage in a

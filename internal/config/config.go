@@ -252,8 +252,7 @@ type Config struct {
 	JudgeQueueDepth   int           // buffered channel size (default 64)
 	JudgeTimeout      time.Duration // per-call judge timeout (default 30s)
 	JudgeCostPer1KUSD float64       // rough USD/1k-token rate for cost estimates
-
-	// Quality (async AST/compiler verifier, issue #13). Detected
+	JudgeDBPath       string        // on-disk SQLite database for judge scores; empty disables Detected
 	// edits enqueue a background `cargo check` / `npx tsc` and the
 	// verdict (1 = clean, 0 = fail/timeout) is reported via a
 	// callback to cmd/nexus/main.go. QualityEnabled is true iff
@@ -383,6 +382,18 @@ func DefaultRAGDBPath() string {
 		base = "./.cache"
 	}
 	return filepath.Join(base, "nexus-proxy", "rag.db")
+}
+
+// DefaultJudgeDBPath returns the canonical location for the judge
+// SQLite store (issue #198): $XDG_CACHE_HOME/nexus-proxy/judge.db.
+// Operators override with NEXUS_JUDGE_DB (empty disables persistence,
+// falling back to the in-memory MemoryStorage).
+func DefaultJudgeDBPath() string {
+	base, err := os.UserCacheDir()
+	if err != nil || base == "" {
+		base = "./.cache"
+	}
+	return filepath.Join(base, "nexus-proxy", "judge.db")
 }
 
 // Load reads configuration from environment variables, applying defaults
@@ -813,6 +824,11 @@ func Load() (Config, error) {
 	}
 	cfg.JudgeCostPer1KUSD = costRate
 
+	// Judge SQLite persistence (issue #198). When set, scores are
+	// written to an on-disk SQLite store that survives restarts.
+	// Empty (the default) uses the in-memory MemoryStorage.
+	cfg.JudgeDBPath = getEnvAllowEmpty("NEXUS_JUDGE_DB", DefaultJudgeDBPath())
+
 	// The judge is "enabled" iff the operator actually configured
 	// sampling above zero. Zero/negative rate keeps the worker pool
 	// dormant even if the env vars are partially populated (a common
@@ -1219,6 +1235,11 @@ func (c Config) RAGPersistentEnabled() bool { return c.RAGDBPath != "" }
 func (c Config) RAGWatcherEnabled() bool {
 	return c.RAGPersistentEnabled() && c.RAGPollInterval > 0
 }
+
+// JudgeDBEnabled reports whether the SQLite-backed judge store
+// (issue #198) should be opened. Disabled when JudgeDBPath is empty,
+// which preserves the legacy in-memory-only behaviour.
+func (c Config) JudgeDBEnabled() bool { return c.JudgeDBPath != "" }
 
 // NewLogger returns a *slog.Logger configured per LogLevel / LogFormat,
 // always writing to stderr. Centralising the construction in config
