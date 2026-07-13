@@ -111,6 +111,13 @@ type Decision struct {
 	// SourceSLMError; empty otherwise. Carried as a string (not error)
 	// so the Decision is a plain value with no lifetime concerns.
 	SLMError string
+
+	// CacheHit is true when the decision came from the SLM cache
+	// (issue #206) — the prompt was a cache hit and the cached route
+	// was returned without calling the SLM. False when the decision
+	// came from the SLM (or from guardrail/DSL which never hit the
+	// cache).
+	CacheHit bool
 }
 
 // SLMDecider is the minimal interface the planner needs from the SLM
@@ -152,6 +159,13 @@ type Planner struct {
 	// code, performance analysis, ...). May be nil; a nil regex disables
 	// the local-patterns branch of the DSL.
 	LocalPatternsRegex *regexp.Regexp
+
+	// SLMCache is the optional time-bounded prompt→route cache
+	// (issue #206). When non-nil the planner checks the cache before
+	// calling the SLM; a hit returns the cached route without calling
+	// the SLM. A miss calls the SLM and stores the result. When nil the
+	// SLM is always called (pre-cache behaviour).
+	SLMCache *SLMCache
 }
 
 // PlanRequest carries the per-request inputs the planner needs. The
@@ -227,12 +241,39 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	// the SLM, biasing toward frontier for categories the local model
 	// has handled poorly. When no store is wired (judge disabled) we
 	// take the plain neutral Decide path so routing is unchanged.
+	//
+	// When SLMCache is wired (issue #206), we check the cache first.
+	// A cache hit returns the cached decision immediately (CacheHit=true);
+	// a cache miss calls the SLM and stores the result (CacheHit=false).
 	var (
 		dec        Route
 		err        error
 		confidence float64 = NeutralConfidence
 		category   string
 	)
+
+	// Check cache first if enabled.
+	if p.SLMCache != nil {
+		if cached, hit := p.SLMCache.Get(req.Prompt); hit {
+			// We still categorize for observability even on cache hit,
+			// but we use the cached route directly.
+			if p.Confidence != nil {
+				category = Categorize(req.Prompt)
+				confidence = p.Confidence.LocalConfidence(category)
+			}
+			return Decision{
+				Route:           cached,
+				Source:          SourceSLM,
+				Confidence:      confidence,
+				TaskType:        category,
+				EstimatedTokens: estimatedTokens,
+				BudgetSource:    req.GuardrailSource,
+				BudgetTokens:    req.GuardrailBudget,
+				CacheHit:        true,
+			}
+		}
+	}
+
 	if p.Confidence != nil {
 		category = Categorize(req.Prompt)
 		confidence = p.Confidence.LocalConfidence(category)
@@ -251,7 +292,12 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 			BudgetSource:    req.GuardrailSource,
 			BudgetTokens:    req.GuardrailBudget,
 			SLMError:        err.Error(),
+			CacheHit:        false,
 		}
+	}
+	// Cache the successful decision for future identical prompts.
+	if p.SLMCache != nil {
+		p.SLMCache.Set(req.Prompt, dec)
 	}
 	return Decision{
 		Route:           dec,
@@ -261,6 +307,7 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 		EstimatedTokens: estimatedTokens,
 		BudgetSource:    req.GuardrailSource,
 		BudgetTokens:    req.GuardrailBudget,
+		CacheHit:        false,
 	}
 }
 

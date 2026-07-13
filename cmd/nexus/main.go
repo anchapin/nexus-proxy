@@ -515,7 +515,13 @@ func main() {
 	// snapshot.
 	routeCounters := observability.NewRouteCounters()
 	routeDecisionObs := handlers.RouteDecisionObserverFunc(func(e handlers.RouteDecisionEvent) {
-		routeCounters.Observe(e.Route, e.Source, e.Confidence, e.TaskType)
+		routeCounters.Observe(e.Route, e.Source, e.Confidence, e.TaskType, "")
+		// Issue #206: record SLM cache hit/miss.
+		if e.CacheHit {
+			routeCounters.ObserveSLMCacheHit()
+		} else {
+			routeCounters.ObserveSLMCacheMiss()
+		}
 	})
 	// Rejection observer (issue #119). The chat handler dispatches
 	// one RejectionEvent per early-return path; the closure forwards
@@ -545,6 +551,19 @@ func main() {
 		}
 	})
 
+	// SLM decision cache (issue #206). When NEXUS_SLM_CACHE_TTL > 0,
+	// deduplicate identical prompts within the TTL window so repeated
+	// requests don't trigger an SLM call.
+	var slmCache *router.SLMCache
+	if cfg.SLMCacheEnabled() {
+		slmCache = router.NewSLMCache(cfg.SLMCacheTTL)
+		slog.Info("slm decision cache enabled",
+			slog.Duration("ttl", cfg.SLMCacheTTL),
+		)
+	} else {
+		slog.Info("slm decision cache disabled (NEXUS_SLM_CACHE_TTL<=0)")
+	}
+
 	chatHandler := handlers.Chat(handlers.Deps{
 		Config:                cfg,
 		Client:                httpClient,
@@ -552,6 +571,7 @@ func main() {
 		SLM:                   slm,
 		FormattingRegex:       re,
 		Confidence:            confidenceObs,
+		SLMCache:              slmCache,
 		JudgeObserver:         judgeObs,
 		QualityObserver:       qualityO,
 		MetricsObserver:       metricsObs,

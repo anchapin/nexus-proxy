@@ -99,7 +99,6 @@ type Config struct {
 	// Routing
 	TokenGuardrail     int           // estimated tokens above this force frontier (6000)
 	SLMTimeout         time.Duration // Qwen3-Coder routing timeout (8s)
-	SLMCacheTTL        time.Duration // TTL for SLM routing decision cache (5m)
 	SLMCacheMaxEntries int           // max entries in SLM routing decision cache (512)
 	FusionTimeout      time.Duration // per-panel-member fetch timeout (120s)
 	CascadeTimeout     time.Duration // per-attempt timeout for cascade fallback (30s)
@@ -170,6 +169,11 @@ type Config struct {
 	RoutingConfidenceCeiling    float64
 	RoutingConfidenceMinSamples int
 	RoutingConfidenceWindow     time.Duration
+
+	// SLM decision cache (issue #206). Deduplicates identical prompts
+	// within a TTL window so repeated requests don't trigger an SLM call.
+	// NEXUS_SLM_CACHE_TTL <= 0 disables the cache.
+	SLMCacheTTL time.Duration
 
 	// Health (issue #8). The chat handler consults
 	// internal/health.Health before issuing local-bound requests;
@@ -432,15 +436,8 @@ func Load() (Config, error) {
 	}
 	cfg.SLMTimeout = slmTimeout
 
-	// SLM routing decision cache (issue #162). TTL defaults to 5m so
-	// repeated prompts within a coding session hit the cache; max
+	// SLM routing decision cache (issue #162). Max
 	// entries caps memory at ~512 entries with simple LRU eviction.
-	slmCacheTTL, err := getEnvDuration("NEXUS_SLM_CACHE_TTL", 5*time.Minute)
-	if err != nil {
-		return cfg, err
-	}
-	cfg.SLMCacheTTL = slmCacheTTL
-
 	slmCacheMax, err := getEnvInt("NEXUS_SLM_CACHE_MAX_ENTRIES", 512)
 	if err != nil {
 		return cfg, err
@@ -583,6 +580,15 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.RoutingConfidenceWindow = confWindow
+
+	// SLM decision cache TTL (issue #206). Set
+	// NEXUS_SLM_CACHE_TTL to "0" to disable the cache entirely;
+	// the planner then always calls the SLM (pre-cache behaviour).
+	slmCacheTTL, err := getEnvDuration("NEXUS_SLM_CACHE_TTL", 30*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.SLMCacheTTL = slmCacheTTL
 
 	// Ollama health poller (issue #8). Defaults: 30s poll cadence,
 	// 3-failure breaker, 5s per-probe HTTP timeout. Set
@@ -1145,6 +1151,13 @@ func (c Config) RoutingConfidenceEnabled() bool {
 // is active. When false, all endpoints are open — the binary behaves
 // identically to the pre-auth proxy.
 func (c Config) AuthEnabled() bool { return c.ProxyAPIKey != "" }
+
+// SLMCacheEnabled reports whether the SLM decision cache (issue #206)
+// should be active. Disabled when SLMCacheTTL <= 0, which preserves
+// the pre-cache behaviour of always calling the SLM.
+func (c Config) SLMCacheEnabled() bool {
+	return c.SLMCacheTTL > 0
+}
 
 // RAGPersistentEnabled reports whether the SQLite-backed RAG store
 // (issue #46) should be opened. Disabled when RAGDBPath is empty,
