@@ -11,8 +11,8 @@ import (
 var ErrNoProviders = errors.New("providers: no providers registered")
 
 type Registry struct {
-	selector *router.ProviderSelector
-	cache    *router.ProviderStatsCache
+	selector  *router.ProviderSelector
+	cache     *router.ProviderStatsCache
 	providers []Provider
 	mu        sync.RWMutex
 }
