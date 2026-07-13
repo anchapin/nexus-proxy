@@ -428,6 +428,7 @@ func PanelStreaming(
 	arbiterTimeout time.Duration,
 	skipLocal bool,
 	agreementThreshold float64,
+	requestID string,
 ) (PanelOutcome, error) {
 	var outcome PanelOutcome
 
@@ -534,6 +535,7 @@ func PanelStreaming(
 	if len(winner.ToolCalls) > 0 {
 		outcome.ArbiterSkipped = true
 		slog.Info("fusion tool-call winner, arbiter skipped",
+			slog.String("request_id", requestID),
 			slog.String("source", outcome.Source),
 			slog.Int("tool_calls", len(winner.ToolCalls)),
 		)
@@ -558,6 +560,7 @@ func PanelStreaming(
 	if outcome.Similarity >= agreementThreshold {
 		outcome.ArbiterSkipped = true
 		slog.Info("fusion agreement, arbiter skipped",
+			slog.String("request_id", requestID),
 			slog.String("source", outcome.Source),
 			slog.Float64("similarity", outcome.Similarity),
 			slog.Float64("threshold", agreementThreshold),
@@ -576,6 +579,7 @@ func PanelStreaming(
 	// text is the authoritative final answer in the operator's
 	// mental model.
 	slog.Info("fusion disagreement, invoking arbiter",
+		slog.String("request_id", requestID),
 		slog.String("first_source", outcome.Source),
 		slog.Float64("similarity", outcome.Similarity),
 		slog.Float64("threshold", agreementThreshold),

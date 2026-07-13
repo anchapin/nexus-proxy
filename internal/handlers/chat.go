@@ -1078,6 +1078,7 @@ func Chat(d Deps) http.Handler {
 					d.Config.ArbiterTimeout,
 					skipLocal,
 					d.Config.FusionAgreementThreshold,
+					reqID,
 				)
 				fusionArbiterSkipped = outcome.ArbiterSkipped
 				fusionJaccardSimilarity = outcome.Similarity
