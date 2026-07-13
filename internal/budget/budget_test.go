@@ -1,6 +1,7 @@
 package budget
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -161,3 +162,43 @@ func TestGuardNilAlerterNoPanic(t *testing.T) {
 		g.CheckApproaching()
 	}()
 }
+
+// TestGuardOnSpendIncludesSource verifies that OnSpend is called with the
+// source label that was passed to Record (issue #240).
+func TestGuardOnSpendIncludesSource(t *testing.T) {
+	var (
+		mu             sync.Mutex
+		recordedSource string
+		recordedCost   float64
+		recordedSpend  float64
+	)
+	g := NewGuard(100.0)
+	g.SetAlerter(AlerterFunc(func(s State, cost float64, source string) {
+		mu.Lock()
+		defer mu.Unlock()
+		recordedCost = cost
+		recordedSource = source
+		recordedSpend = s.Spent
+	}))
+
+	g.Record(25.0, "judge")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if recordedCost != 25.0 {
+		t.Errorf("OnSpend cost = %.2f, want 25.0", recordedCost)
+	}
+	if recordedSource != "judge" {
+		t.Errorf("OnSpend source = %q, want %q", recordedSource, "judge")
+	}
+	if recordedSpend != 25.0 {
+		t.Errorf("OnSpend state.Spent = %.2f, want 25.0", recordedSpend)
+	}
+}
+
+// AlerterFunc is a functional adapter for testing alerter callbacks.
+type AlerterFunc func(State, float64, string)
+
+func (f AlerterFunc) OnExceed(State)            {}
+func (f AlerterFunc) OnSpend(s State, cost float64, source string) { f(s, cost, source) }
+func (f AlerterFunc) OnApproaching(State)      {}

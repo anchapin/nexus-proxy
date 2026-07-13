@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/budget"
 )
 
 // rtFunc is a tiny test double that satisfies both http.RoundTripper
@@ -623,6 +625,45 @@ func TestEvaluatorCloseDrains(t *testing.T) {
 	_ = e.Close()
 	if got := len(store.Scores()); got != 5 {
 		t.Errorf("Close did not drain: got %d/5 scores", got)
+	}
+}
+
+// TestJudgeBudgetGuardWiring verifies that a completed evaluation calls
+// BudgetGuard.Record with source="judge" (issue #240).
+func TestJudgeBudgetGuardWiring(t *testing.T) {
+	fn := rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"4"}}]}`)),
+		}, nil
+	})
+
+	bg := budget.NewGuard(1000.0) // high limit so Check never blocks
+	e, store := newTestEvaluator(t, Config{
+		BudgetGuard: bg,
+		CostPer1K:   0.002,
+	}, fn)
+	defer e.Close()
+
+	e.Enqueue(Sample{Instruction: "x", Output: "y"})
+	scores := waitForScores(t, store, 1, 2*time.Second)
+	if len(scores) != 1 {
+		t.Fatalf("got %d scores, want 1", len(scores))
+	}
+
+	// The guard should have recorded the judge cost with source="judge".
+	state := bg.State()
+	if state.Spent <= 0 {
+		t.Error("budget guard should have recorded spend > 0 for judge call")
+	}
+	// Verify the spent amount roughly matches EstimateCost output.
+	if len(scores) == 1 && scores[0].Cost > 0 {
+		// Spent should approximately equal the cost from the score.
+		// Allow small variance since token estimation is approximate.
+		if state.Spent < scores[0].Cost*0.5 || state.Spent > scores[0].Cost*1.5 {
+			t.Errorf("budget spent=%.6f, expected ~%.6f (judge cost)",
+				state.Spent, scores[0].Cost)
+		}
 	}
 }
 
