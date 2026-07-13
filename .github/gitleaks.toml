@@ -8,14 +8,9 @@
 [extend]
 useDefault = true
 
-[[allowlists]]
-description = "Example env file — placeholders only, no real secrets"
+[allowlist]
+description = "Example env file and provider constructors — no real secrets"
 paths = [
   ".env.example",
-]
-
-[[allowlists]]
-description = "Provider package — constructor function signatures are false positives"
-paths = [
   "internal/providers/",
 ]
