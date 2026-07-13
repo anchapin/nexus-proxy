@@ -85,9 +85,9 @@ type Record struct {
 	// FusionArbiterCostUSD (issue #239) is the estimated cost of the
 	// arbiter call when it ran (route=fusion and agreement threshold
 	// not met). 0 when the arbiter was skipped or for non-fusion routes.
-	FusionArbiterCostUSD    float64   `json:"fusion_arbiter_cost_usd,omitempty"`
-	ToolCallCount           int       `json:"tool_call_count,omitempty"`
-	Error                   string    `json:"error,omitempty"`
+	FusionArbiterCostUSD float64 `json:"fusion_arbiter_cost_usd,omitempty"`
+	ToolCallCount        int     `json:"tool_call_count,omitempty"`
+	Error                string  `json:"error,omitempty"`
 
 	// Route-source metadata (issue #74). Omitempty keeps legacy
 	// JSONL rows byte-for-byte compatible when these fields are
