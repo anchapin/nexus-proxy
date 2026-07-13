@@ -84,6 +84,11 @@ type counterKey struct {
 // before they reached an upstream:
 //   - nexus_requests_rejected_total{reason}
 //
+// A fifth family (issue #187) records fusion arbiter outcomes:
+//   - nexus_fusion_arbiter_total{outcome}
+//     where outcome is "skipped" (agreement reached, arbiter not invoked)
+//     or "invoked" (disagreement, arbiter was called).
+//
 // The reason label values are short, bounded strings (method,
 // body_too_large, bad_request, rate_limit, ...) defined as constants
 // in internal/handlers so the chat handler and the rate-limit
@@ -95,6 +100,7 @@ type RouteCounters struct {
 	slmDecisions             map[counterKey]*uint64
 	lowConfidenceEscalations map[counterKey]*uint64
 	rejections               map[string]*uint64
+	fusionArbiter            map[string]*uint64
 }
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
@@ -104,6 +110,7 @@ func NewRouteCounters() *RouteCounters {
 		slmDecisions:             make(map[counterKey]*uint64),
 		lowConfidenceEscalations: make(map[counterKey]*uint64),
 		rejections:               make(map[string]*uint64),
+		fusionArbiter:            make(map[string]*uint64),
 	}
 }
 
@@ -176,6 +183,37 @@ func (rc *RouteCounters) ObserveRejection(reason string) {
 		return
 	}
 	atomic.AddUint64(rc.reasonSlot(reason), 1)
+}
+
+// ObserveFusionOutcome records the outcome of a fusion panel after
+// PanelStreaming returns (issue #187). arbiterSkipped is true when
+// the two panel members agreed (SimilarityRatio >= agreementThreshold)
+// and the arbiter was not invoked; false when disagreement triggered
+// arbiter synthesis. This gives operators the data to compute the
+// fusion agreement rate: skipped/(skipped+invoked).
+func (rc *RouteCounters) ObserveFusionOutcome(arbiterSkipped bool) {
+	if rc == nil {
+		return
+	}
+	outcome := "invoked"
+	if arbiterSkipped {
+		outcome = "skipped"
+	}
+	atomic.AddUint64(rc.fusionSlot(outcome), 1)
+}
+
+// fusionSlot returns the *uint64 for the fusion outcome label, creating
+// it if absent. Same lock-then-atomic pattern as slot.
+func (rc *RouteCounters) fusionSlot(outcome string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.fusionArbiter[outcome]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.fusionArbiter[outcome] = p
+	}
+	rc.mu.Unlock()
+	return p
 }
 
 // reasonSlot returns the *uint64 for reason, creating it if absent.
@@ -256,6 +294,13 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += n
 	}
+	if n, err := writeFusionSeries(w, "nexus_fusion_arbiter_total",
+		"Fusion panel outcomes: arbiter skipped (agreement) or invoked (disagreement).",
+		rc.fusionArbiter); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
 	return total, nil
 }
 
@@ -295,7 +340,7 @@ func writeSeries(w io.Writer, name, help string, m map[counterKey]*uint64, label
 }
 
 // writeRejectionSeries emits the nexus_requests_rejected_total
-// family. It is a string-keyed variant of writeSeries so the
+// family. It is a String-keyed variant of writeSeries so the
 // rejection counters (keyed only by reason) do not need to reuse the
 // multi-field counterKey struct. Output is sorted by reason for
 // deterministic scrape diffs.
@@ -317,6 +362,36 @@ func writeRejectionSeries(w io.Writer, name, help string, m map[string]*uint64) 
 	for _, k := range keys {
 		v := atomic.LoadUint64(m[k])
 		n, err := fmt.Fprintf(w, "%s{reason=%q} %d\n", name, sanitizeLabel(k), v)
+		if err != nil {
+			return total + int64(n), err
+		}
+		total += int64(n)
+	}
+	return total, nil
+}
+
+// writeFusionSeries emits the nexus_fusion_arbiter_total family (issue #187).
+// outcome="skipped" when the two panel members agreed and the arbiter was not invoked;
+// outcome="invoked" when disagreement triggered arbiter synthesis.
+// Output is sorted by outcome label for deterministic scrape diffs.
+func writeFusionSeries(w io.Writer, name, help string, m map[string]*uint64) (int64, error) {
+	var total int64
+	n, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", name, help, name)
+	if err != nil {
+		return total + int64(n), err
+	}
+	total += int64(n)
+	if len(m) == 0 {
+		return total, nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := atomic.LoadUint64(m[k])
+		n, err := fmt.Fprintf(w, "%s{outcome=%q} %d\n", name, sanitizeLabel(k), v)
 		if err != nil {
 			return total + int64(n), err
 		}
