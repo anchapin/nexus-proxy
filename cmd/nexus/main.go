@@ -536,6 +536,14 @@ func main() {
 		slog.String("path", "/metrics"),
 	)
 
+	ragObserver := handlers.RAGObserverFunc(func(e handlers.RAGEvent) {
+		if e.Hit {
+			routeCounters.ObserveRAGHit(e.Filename)
+		} else {
+			routeCounters.ObserveRAGMiss(e.MissReason)
+		}
+	})
+
 	chatHandler := handlers.Chat(handlers.Deps{
 		Config:                cfg,
 		Client:                httpClient,
@@ -554,6 +562,7 @@ func main() {
 		RouteDecisionObserver: routeDecisionObs,
 		RejectionObserver:     rejectionObs,
 		FusionOutcomeObserver: fusionOutcomeObs,
+		RAGObserver:           ragObserver,
 	})
 	// Apply the per-client rate limiter (issue #75) as the outermost
 	// wrapper so a flood of requests is rejected before any middleware

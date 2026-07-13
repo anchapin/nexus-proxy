@@ -194,6 +194,32 @@ type FusionOutcomeObserverFunc func(FusionOutcomeEvent)
 // ObserveFusionOutcome implements FusionOutcomeObserver.
 func (f FusionOutcomeObserverFunc) ObserveFusionOutcome(e FusionOutcomeEvent) { f(e) }
 
+// RAGEvent carries the outcome of a single RAG retrieval attempt
+// (issue #186). Hit is true when Retrieve returned a non-nil example;
+// Filename is the matched snippet (meaningful only when Hit is true).
+// MissReason is the miss cause when Hit is false: "empty_store" when
+// the store has no indexed examples, "threshold" when the best match
+// fell below the similarity floor, or "embed_error" when the embedding
+// call failed.
+type RAGEvent struct {
+	Hit        bool
+	Filename   string
+	MissReason string
+}
+
+// RAGObserver is the hook invoked once per RAG retrieval attempt,
+// allowing the observability layer to record hit/miss rates (issue #186).
+// Safe for concurrent use; must not block. Nil is a valid no-op.
+type RAGObserver interface {
+	ObserveRAG(RAGEvent)
+}
+
+// RAGObserverFunc adapts a plain function to the RAGObserver interface.
+type RAGObserverFunc func(RAGEvent)
+
+// ObserveRAG implements RAGObserver.
+func (f RAGObserverFunc) ObserveRAG(e RAGEvent) { f(e) }
+
 // MetricsEvent carries the per-request data needed by the savings
 // dashboard (issue #4). Fields track the full round-trip metrics:
 // route/model/input-tokens are routing dimensions; TOON/RAG/cost are
@@ -461,6 +487,15 @@ type Deps struct {
 	// closure that forwards to RouteCounters.ObserveFusionOutcome.
 	FusionOutcomeObserver FusionOutcomeObserver
 
+	// RAGObserver is invoked once per RAG retrieval attempt (issue #186)
+	// with the hit/miss outcome so the observability layer can record
+	// RAG effectiveness metrics. Implementations must be safe for
+	// concurrent use and must not block. Nil is treated as "no
+	// observer"; the hot path is unaffected. The handler does not
+	// import the observability package — main.go wires a closure
+	// that adapts the event to the in-process RAG counter.
+	RAGObserver RAGObserver
+
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
 	// copy used for sampling is bounded. Zero uses DefaultObservedCap.
@@ -674,16 +709,45 @@ func Chat(d Deps) http.Handler {
 		var ragInjected bool
 		var ragFilename string
 		var ragScore float64
-		if ex, score, err := d.RAG.Retrieve(r.Context(), latestPrompt); err == nil && ex != nil {
-			messages = middleware.InjectRAG(messages, rag.FormatInjection(ex))
+		ragEx, ragScore, ragErr := d.RAG.Retrieve(r.Context(), latestPrompt)
+		switch {
+		case ragErr != nil:
+			slog.Info("rag miss",
+				slog.String("reason", "embed_error"),
+				slog.String("request_id", reqID),
+			)
+			if d.RAGObserver != nil {
+				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "embed_error"})
+			}
+		case ragEx != nil:
+			messages = middleware.InjectRAG(messages, rag.FormatInjection(ragEx))
 			slog.Info("rag hit",
-				slog.String("filename", ex.Filename),
-				slog.Float64("score", score),
+				slog.String("filename", ragEx.Filename),
+				slog.Float64("score", ragScore),
 				slog.String("request_id", reqID),
 			)
 			ragInjected = true
-			ragFilename = ex.Filename
-			ragScore = score
+			ragFilename = ragEx.Filename
+			if d.RAGObserver != nil {
+				d.RAGObserver.ObserveRAG(RAGEvent{Hit: true, Filename: ragEx.Filename})
+			}
+		case d.RAG.Size() == 0:
+			slog.Info("rag miss",
+				slog.String("reason", "empty_store"),
+				slog.String("request_id", reqID),
+			)
+			if d.RAGObserver != nil {
+				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "empty_store"})
+			}
+		default:
+			slog.Info("rag miss",
+				slog.String("reason", "threshold"),
+				slog.Float64("score", ragScore),
+				slog.String("request_id", reqID),
+			)
+			if d.RAGObserver != nil {
+				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "threshold"})
+			}
 		}
 		trace.Transforms.RAGInjected = ragInjected
 		trace.Transforms.RAGFilename = ragFilename

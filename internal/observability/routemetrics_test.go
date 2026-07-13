@@ -271,6 +271,46 @@ func TestRouteCountersFusionOutcome(t *testing.T) {
 	}
 }
 
+// TestRAGCountersHitMiss verifies the issue #186 RAG retrieval
+// metric family: ObserveRAGHit increments per-filename counters and
+// ObserveRAGMiss increments per-reason counters. WriteTo emits
+// nexus_rag_retrieval_total{hit="true",filename="..."} and
+// nexus_rag_retrieval_total{hit="false",reason="..."} lines.
+func TestRAGCountersHitMiss(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveRAGHit("example1.go")
+	rc.ObserveRAGHit("example1.go") // same file again
+	rc.ObserveRAGHit("example2.go")
+	rc.ObserveRAGMiss("empty_store")
+	rc.ObserveRAGMiss("threshold")
+	rc.ObserveRAGMiss("threshold")
+	rc.ObserveRAGMiss("embed_error")
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_rag_retrieval_total", "metric family header"},
+		{`# TYPE nexus_rag_retrieval_total counter`, "counter type line"},
+		{`nexus_rag_retrieval_total{hit="true",filename="example1.go"} 2`, "example1.go hit counted twice"},
+		{`nexus_rag_retrieval_total{hit="true",filename="example2.go"} 1`, "example2.go hit counted once"},
+		{`nexus_rag_retrieval_total{hit="false",reason="empty_store"} 1`, "empty_store miss counted once"},
+		{`nexus_rag_retrieval_total{hit="false",reason="threshold"} 2`, "threshold miss counted twice"},
+		{`nexus_rag_retrieval_total{hit="false",reason="embed_error"} 1`, "embed_error miss counted once"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+}
+
 // TestRouteCountersFusionOutcomeDeterministicOrder verifies that repeated
 // scrapes produce identical output (sorted by outcome label) so
 // Prometheus diff alerts are not triggered by reordering.
@@ -284,6 +324,24 @@ func TestRouteCountersFusionOutcomeDeterministicOrder(t *testing.T) {
 	_, _ = rc.WriteTo(&second)
 	if first.String() != second.String() {
 		t.Errorf("fusion output not deterministic between scrapes")
+	}
+}
+
+// TestRAGCountersDeterministicOrder verifies that repeated scrapes
+// produce identical output so Prometheus diff alerts are not triggered
+// by reordering.
+func TestRAGCountersDeterministicOrder(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveRAGMiss("threshold")
+	rc.ObserveRAGHit("b.go")
+	rc.ObserveRAGMiss("embed_error")
+	rc.ObserveRAGHit("a.go")
+
+	var first, second strings.Builder
+	_, _ = rc.WriteTo(&first)
+	_, _ = rc.WriteTo(&second)
+	if first.String() != second.String() {
+		t.Errorf("RAG output not deterministic between scrapes")
 	}
 }
 
@@ -311,10 +369,51 @@ func TestRouteCountersFusionOutcomeConcurrentSafe(t *testing.T) {
 	}
 }
 
+// TestRAGCountersConcurrentSafe exercises ObserveRAGHit and
+// ObserveRAGMiss from many goroutines; the race detector is the
+// primary assertion.
+func TestRAGCountersConcurrentSafe(t *testing.T) {
+	rc := NewRouteCounters()
+	filenames := []string{"a.go", "b.go", "c.go"}
+	reasons := []string{"threshold", "empty_store", "embed_error"}
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			if n%2 == 0 {
+				rc.ObserveRAGHit(filenames[n%len(filenames)])
+			} else {
+				rc.ObserveRAGMiss(reasons[n%len(reasons)])
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+	if !strings.Contains(out, "nexus_rag_retrieval_total") {
+		t.Errorf("expected rag_retrieval metric in output")
+	}
+}
+
 // TestRouteCountersFusionOutcomeNilSafe verifies that nil receiver does not panic.
 func TestRouteCountersFusionOutcomeNilSafe(t *testing.T) {
 	var rc *RouteCounters
-	// Must not panic.
 	rc.ObserveFusionOutcome(true)
 	rc.ObserveFusionOutcome(false)
+}
+
+// TestRAGCountersNilSafe verifies that nil receivers are safe.
+func TestRAGCountersNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveRAGHit("example.go")
+	rc.ObserveRAGMiss("threshold")
+	n, err := rc.WriteTo(&strings.Builder{})
+	if err != nil || n != 0 {
+		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
+	}
 }
