@@ -111,6 +111,12 @@ type RouteCounters struct {
 	// single label-free counter — the evaluator's atomic Dropped()
 	// value is synced into this slot by the onDrop callback.
 	judgeDropped *uint64
+
+	// tracingDropped tracks the total number of spans dropped by the
+	// trace exporter because its buffer was full (issue #122). It is a
+	// single label-free counter — the exporter's atomic Dropped()
+	// value is synced into this slot by the onDrop callback.
+	tracingDropped *uint64
 }
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
@@ -123,6 +129,7 @@ func NewRouteCounters() *RouteCounters {
 		rejections:               make(map[string]*uint64),
 		streamTruncations:        make(map[string]*uint64),
 		judgeDropped:             &v,
+		tracingDropped:           &v,
 	}
 }
 
@@ -206,6 +213,18 @@ func (rc *RouteCounters) ObserveJudgeDrop(total uint64) {
 		return
 	}
 	atomic.StoreUint64(rc.judgeDropped, total)
+}
+
+// ObserveTracingDrop synchronises the trace exporter's running drop
+// total into the nexus_tracing_dropped_total Prometheus counter (issue
+// #122). The exporter's onDrop callback passes the cumulative count so
+// we use Store (not Add) to mirror the authoritative value without
+// double-counting.
+func (rc *RouteCounters) ObserveTracingDrop(total uint64) {
+	if rc == nil {
+		return
+	}
+	atomic.StoreUint64(rc.tracingDropped, total)
 }
 
 // ObserveStreamTruncation records one upstream stream the proxy
@@ -333,6 +352,16 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	// single monotonic counter tracks the cumulative total.
 	v := atomic.LoadUint64(rc.judgeDropped)
 	n, err := fmt.Fprintf(w, "# HELP nexus_judge_dropped_total Judge samples dropped because the evaluation queue was full.\n# TYPE nexus_judge_dropped_total counter\nnexus_judge_dropped_total %d\n", v)
+	total += int64(n)
+	if err != nil {
+		return total, err
+	}
+
+	// Trace exporter back-pressure counter (issue #122). Label-free
+	// monotonic counter tracking spans dropped due to a full export
+	// buffer.
+	v = atomic.LoadUint64(rc.tracingDropped)
+	n, err = fmt.Fprintf(w, "# HELP nexus_tracing_dropped_total Trace spans dropped because the exporter buffer was full.\n# TYPE nexus_tracing_dropped_total counter\nnexus_tracing_dropped_total %d\n", v)
 	total += int64(n)
 	if err != nil {
 		return total, err

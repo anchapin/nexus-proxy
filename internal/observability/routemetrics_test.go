@@ -302,3 +302,52 @@ func TestRouteCountersStreamTruncationConcurrentSafe(t *testing.T) {
 		t.Errorf("expected truncation metric in output")
 	}
 }
+
+// TestRouteCountersTracingDrop verifies the issue #122 tracing drop
+// counter: ObserveTracingDrop stores the cumulative total and WriteTo
+// emits nexus_tracing_dropped_total with HELP/TYPE lines.
+func TestRouteCountersTracingDrop(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveTracingDrop(7)
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_tracing_dropped_total", "metric family header"},
+		{"# TYPE nexus_tracing_dropped_total counter", "counter type line"},
+		{"nexus_tracing_dropped_total 7", "dropped count"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+}
+
+// TestRouteCountersTracingDropNilSafe confirms the hook is a no-op on
+// a nil receiver so callers can invoke it unconditionally.
+func TestRouteCountersTracingDropNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveTracingDrop(42) // must not panic
+}
+
+// TestRouteCountersTracingDropDeterministicOrder verifies that
+// repeated scrapes produce identical output.
+func TestRouteCountersTracingDropDeterministicOrder(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveTracingDrop(3)
+
+	var first, second strings.Builder
+	_, _ = rc.WriteTo(&first)
+	_, _ = rc.WriteTo(&second)
+	if first.String() != second.String() {
+		t.Errorf("non-deterministic output across scrapes\n--- first ---\n%s\n--- second ---\n%s", first.String(), second.String())
+	}
+}

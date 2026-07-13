@@ -16,6 +16,11 @@ import (
 	"time"
 )
 
+// ErrFallback is a sentinel error returned when a transport/HTTP error
+// causes an internal fallback to RouteFrontier. It signals that the
+// decision should NOT be cached (so transient failures are retried).
+var ErrFallback = errors.New("slm: fallback due to transport error")
+
 // SLMClient talks to a local Ollama /api/chat endpoint and asks the small
 // model to produce a routing decision. The HTTP layer is abstracted so
 // tests can substitute a deterministic stub.
@@ -233,6 +238,11 @@ func (c *SLMClient) DecideWithConfidence(ctx context.Context, prompt string, con
 
 	route, err := c.decide(ctx, prompt, systemPrompt)
 	if err != nil {
+		// Unwrap ErrFallback so the caller sees err==nil (test contract).
+		// Do NOT cache fallback results — transient failures must be retried.
+		if errors.Is(err, ErrFallback) {
+			return RouteFrontier, nil
+		}
 		return RouteFrontier, err
 	}
 
@@ -297,16 +307,20 @@ func (c *SLMClient) decide(ctx context.Context, prompt, systemPrompt string) (Ro
 
 	resp, err := c.Client.Do(req)
 	if err != nil {
-		return RouteFrontier, err
+		// Transport error → return ErrFallback so DecideWithConfidence
+		// skips the cache put (transient failures must be retried).
+		return RouteFrontier, fmt.Errorf("%w: %w", ErrFallback, err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return RouteFrontier, err
+		// Read error → return ErrFallback sentinel.
+		return RouteFrontier, fmt.Errorf("%w: read: %w", ErrFallback, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return RouteFrontier, fmt.Errorf("slm: status %d: %s", resp.StatusCode, body)
+		// Non-2xx status → return ErrFallback sentinel.
+		return RouteFrontier, fmt.Errorf("%w: status %d", ErrFallback, resp.StatusCode)
 	}
 
 	var raw struct {
