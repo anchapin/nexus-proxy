@@ -218,6 +218,22 @@ type Config struct {
 	// catching up. Zero disables the circuit (pre-#80 behaviour).
 	LocalCooldown time.Duration // default 10s; 0 disables
 
+	// Rolling 24h frontier spend guard (issue #183, #201). The guard
+	// tracks USD costs over a sliding 24-hour window and rejects new
+	// frontier/fusion requests with HTTP 429 when the daily limit is
+	// exhausted. BudgetEnabled is true when BudgetDailyLimit > 0.
+	//
+	// Alerting (issue #201): When BudgetAlertEnabled is true, the guard
+	// invokes the alerter callbacks when spend is recorded, when the
+	// budget is exceeded, and when spend crosses the approaching
+	// threshold (BudgetAlertThreshold fraction of the limit, default 80%).
+	// The alerter updates Prometheus counters and logs at warn/error
+	// level. Set BudgetAlertWebhookURL to enable webhook alerting.
+	BudgetDailyLimit      float64 // USD; NEXUS_BUDGET_DAILY_LIMIT
+	BudgetAlertEnabled    bool    // true iff NEXUS_BUDGET_ALERT_ENABLED is "true"
+	BudgetAlertThreshold  float64 // fraction of limit that triggers "approaching" alert [0,1]; default 0.8
+	BudgetAlertWebhookURL string  // optional webhook URL for JSON alert payloads
+
 	// HTTP request body cap (issue #11). The chat handler applies this
 	// with http.MaxBytesReader before reading the request body, so an
 	// oversized POST cannot exhaust proxy memory before the guardrail
@@ -890,6 +906,34 @@ func Load() (Config, error) {
 	}
 	cfg.TrustedProxies = parsed
 
+	// Rolling 24h frontier spend guard (issue #183, #201). When
+	// BudgetDailyLimit > 0 the guard is active. Alerting is
+	// separately enabled via BudgetAlertEnabled.
+	budgetDailyLimit, err := getEnvFloat("NEXUS_BUDGET_DAILY_LIMIT", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if budgetDailyLimit < 0 {
+		budgetDailyLimit = 0
+	}
+	cfg.BudgetDailyLimit = budgetDailyLimit
+
+	cfg.BudgetAlertEnabled = parseBoolEnv("NEXUS_BUDGET_ALERT_ENABLED", false)
+
+	budgetAlertThreshold, err := getEnvFloat("NEXUS_BUDGET_ALERT_THRESHOLD", 0.8)
+	if err != nil {
+		return cfg, err
+	}
+	if budgetAlertThreshold < 0 {
+		budgetAlertThreshold = 0
+	}
+	if budgetAlertThreshold > 1 {
+		budgetAlertThreshold = 1
+	}
+	cfg.BudgetAlertThreshold = budgetAlertThreshold
+
+	cfg.BudgetAlertWebhookURL = getEnv("NEXUS_BUDGET_ALERT_WEBHOOK_URL", "")
+
 	// Per-client rate ceiling (requests/minute). Zero or negative
 	// disables the limiter entirely so a stock deployment is
 	// byte-for-byte identical to the pre-#75 path. Burst is the
@@ -1052,6 +1096,10 @@ func (c Config) PromptInjectionIsolated() bool {
 // MetricsEnabled reports whether the SQLite metrics store should be
 // opened. Disabled when MetricsDBPath is empty.
 func (c Config) MetricsEnabled() bool { return c.MetricsDBPath != "" }
+
+// BudgetEnabled reports whether the rolling 24h frontier spend guard is
+// active (issue #183). Disabled when BudgetDailyLimit <= 0.
+func (c Config) BudgetEnabled() bool { return c.BudgetDailyLimit > 0 }
 
 // RateLimitEnabled reports whether the per-client rate limiter is
 // active (issue #75). Disabled when RateLimitRPM <= 0 so a stock
