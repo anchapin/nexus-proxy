@@ -93,7 +93,7 @@ type Config struct {
 	QueueDepth  int           // buffered channel size (default 64)
 	Timeout     time.Duration // per-call judge timeout (default 30s)
 	CostPer1K   float64       // USD per 1k tokens (input+output); default 0.002
-	BudgetGuard *budget.Guard  // optional budget guard to record judge costs
+	BudgetGuard *budget.Guard // optional budget guard to record judge costs
 }
 
 // applyDefaults fills zero fields with sane values. It mutates cfg.

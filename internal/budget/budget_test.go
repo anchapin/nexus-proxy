@@ -168,9 +168,9 @@ func TestGuardSourceLabel(t *testing.T) {
 // an Alerter without defining an interface implementation.
 type AlerterFunc func(State, float64, string)
 
-func (f AlerterFunc) OnExceed(State)                            {}
+func (f AlerterFunc) OnExceed(State)                                {}
 func (f AlerterFunc) OnSpend(state State, cost float64, src string) { f(state, cost, src) }
-func (f AlerterFunc) OnApproaching(State)                        {}
+func (f AlerterFunc) OnApproaching(State)                           {}
 
 // TestGuardNilAlerterNoPanic verifies that operations don't panic when
 // no alerter is set.

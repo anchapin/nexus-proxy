@@ -675,7 +675,7 @@ func TestBudgetGuardIntegration(t *testing.T) {
 // as a budget.Alerter without defining an interface implementation.
 type budgetAlerterFunc func(interface{}, float64, string)
 
-func (f budgetAlerterFunc) OnExceed(budget.State)                            {}
+func (f budgetAlerterFunc) OnExceed(budget.State) {}
 func (f budgetAlerterFunc) OnSpend(state budget.State, cost float64, src string) {
 	f(state, cost, src)
 }
