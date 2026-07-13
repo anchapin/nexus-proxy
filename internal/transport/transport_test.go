@@ -295,6 +295,9 @@ func TestNewFromEnv_ReadsEnvVars(t *testing.T) {
 		os.Unsetenv("NEXUS_HTTP_MAX_CONNS_PER_HOST")
 		os.Unsetenv("NEXUS_HTTP_IDLE_CONN_TIMEOUT")
 		os.Unsetenv("NEXUS_HTTP_DIAL_CONTEXT_TIMEOUT")
+		os.Unsetenv("NEXUS_HTTP_CLIENT_CERT_FILE")
+		os.Unsetenv("NEXUS_HTTP_CLIENT_KEY_FILE")
+		os.Unsetenv("NEXUS_HTTP_CA_FILE")
 	}
 	restore()
 	defer restore()
@@ -310,5 +313,138 @@ func TestNewFromEnv_ReadsEnvVars(t *testing.T) {
 	}
 	if tr.MaxConnsPerHost != 400 {
 		t.Errorf("MaxConnsPerHost = %d, want 400", tr.MaxConnsPerHost)
+	}
+}
+
+func TestNew_NoTLSClientConfigByDefault(t *testing.T) {
+	client := New(Config{})
+	tr := client.Transport.(*http.Transport)
+	if tr.TLSClientConfig != nil {
+		t.Errorf("TLSClientConfig = %v, want nil (no client cert configured)", tr.TLSClientConfig)
+	}
+}
+
+func TestNew_TLSClientConfigSetWithCerts(t *testing.T) {
+	// Use test cert files from the crypto/tls package's test data.
+	// tls.LoadX509KeyPair requires real cert/key files, so we point at
+	// the stdlib test fixtures.
+	certFile := os.Getenv("SSL_CERT_FILE")
+	keyFile := os.Getenv("SSL_KEY_FILE")
+	if certFile == "" || keyFile == "" {
+		t.Skip("SSL_CERT_FILE / SSL_KEY_FILE not set; skipping mTLS test")
+	}
+
+	cfg := Config{
+		ClientCertFile: certFile,
+		ClientKeyFile:  keyFile,
+	}
+	client := New(cfg)
+	tr := client.Transport.(*http.Transport)
+
+	if tr.TLSClientConfig == nil {
+		t.Fatal("TLSClientConfig = nil, want non-nil when client certs are configured")
+	}
+	if tr.TLSClientConfig.GetClientCertificate == nil {
+		t.Error("TLSClientConfig.GetClientCertificate = nil, want non-nil")
+	}
+}
+
+func TestNew_TLSClientConfigWithCAFile(t *testing.T) {
+	caFile := os.Getenv("SSL_CERT_FILE")
+	if caFile == "" {
+		t.Skip("SSL_CERT_FILE not set; skipping CA file test")
+	}
+
+	cfg := Config{
+		ClientCertFile: os.Getenv("SSL_CERT_FILE"),
+		ClientKeyFile:  os.Getenv("SSL_KEY_FILE"),
+		CAFile:         caFile,
+	}
+	client := New(cfg)
+	tr := client.Transport.(*http.Transport)
+
+	if tr.TLSClientConfig == nil {
+		t.Fatal("TLSClientConfig = nil, want non-nil when CA file is configured")
+	}
+	if tr.TLSClientConfig.RootCAs == nil {
+		t.Error("TLSClientConfig.RootCAs = nil, want non-nil CA pool")
+	}
+}
+
+func TestConfig_HasClientCert(t *testing.T) {
+	tests := []struct {
+		name   string
+		cfg    Config
+		expect bool
+	}{
+		{
+			name:   "both empty",
+			cfg:    Config{},
+			expect: false,
+		},
+		{
+			name:   "only cert",
+			cfg:    Config{ClientCertFile: "cert.pem"},
+			expect: false,
+		},
+		{
+			name:   "only key",
+			cfg:    Config{ClientKeyFile: "key.pem"},
+			expect: false,
+		},
+		{
+			name:   "both set",
+			cfg:    Config{ClientCertFile: "cert.pem", ClientKeyFile: "key.pem"},
+			expect: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.hasClientCert()
+			if got != tt.expect {
+				t.Errorf("hasClientCert() = %v, want %v", got, tt.expect)
+			}
+		})
+	}
+}
+
+func TestLoadConfigFromEnv_MTLSEnvVars(t *testing.T) {
+	restore := func() {
+		os.Unsetenv("NEXUS_HTTP_CLIENT_CERT_FILE")
+		os.Unsetenv("NEXUS_HTTP_CLIENT_KEY_FILE")
+		os.Unsetenv("NEXUS_HTTP_CA_FILE")
+	}
+	restore()
+	defer restore()
+
+	os.Setenv("NEXUS_HTTP_CLIENT_CERT_FILE", "/path/to/cert.pem")
+	os.Setenv("NEXUS_HTTP_CLIENT_KEY_FILE", "/path/to/key.pem")
+	os.Setenv("NEXUS_HTTP_CA_FILE", "/path/to/ca.pem")
+
+	cfg := loadConfigFromEnv()
+	if cfg.ClientCertFile != "/path/to/cert.pem" {
+		t.Errorf("ClientCertFile = %q, want %q", cfg.ClientCertFile, "/path/to/cert.pem")
+	}
+	if cfg.ClientKeyFile != "/path/to/key.pem" {
+		t.Errorf("ClientKeyFile = %q, want %q", cfg.ClientKeyFile, "/path/to/key.pem")
+	}
+	if cfg.CAFile != "/path/to/ca.pem" {
+		t.Errorf("CAFile = %q, want %q", cfg.CAFile, "/path/to/ca.pem")
+	}
+}
+
+func TestNew_InvalidCertPathFallsBackToNilTLSConfig(t *testing.T) {
+	cfg := Config{
+		ClientCertFile: "/nonexistent/cert.pem",
+		ClientKeyFile:  "/nonexistent/key.pem",
+	}
+	client := New(cfg)
+	tr := client.Transport.(*http.Transport)
+
+	// Invalid cert paths cause buildTLSConfig to fail, so TLSClientConfig
+	// falls back to nil rather than panicking.
+	if tr.TLSClientConfig != nil {
+		t.Errorf("TLSClientConfig = %v, want nil on invalid cert path", tr.TLSClientConfig)
 	}
 }
