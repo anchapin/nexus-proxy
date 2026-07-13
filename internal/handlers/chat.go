@@ -301,7 +301,10 @@ type MetricsEvent struct {
 	Streaming               bool
 	FusionArbiterSkipped    bool
 	FusionJaccardSimilarity float64
-	ToolCallCount           int
+	// FusionArbiterCostUSD (issue #239): estimated cost of the arbiter
+	// call when it ran. 0 when the arbiter was skipped or for non-fusion routes.
+	FusionArbiterCostUSD    float64
+	ToolCallCount          int
 	Error                   string
 
 	RouteSource   string
@@ -1388,6 +1391,17 @@ func Chat(d Deps) http.Handler {
 			if savingsCost < 0 {
 				savingsCost = 0
 			}
+			// FusionArbiterCostUSD (issue #239): when the arbiter ran
+			// (fusion route with disagreement), estimate its cost using
+			// FrontierCostPer1K. The arbiter prompt is approximately
+			// the latestPrompt plus the two panel responses; we use
+			// inputTokens as a conservative proxy since the streamed
+			// responses are not retained after serving.
+			var fusionArbiterCostUSD float64
+			if route == router.RouteFusion && !fusionArbiterSkipped {
+				fusionArbiterCostUSD = frontierCostEstimate(
+					string(router.RouteFrontier), model, inputTokens, d.Config.FrontierCostPer1K)
+			}
 			tps := telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 			d.MetricsObserver.Submit(MetricsEvent{
 				Timestamp:               rec.Timestamp,
@@ -1409,6 +1423,7 @@ func Chat(d Deps) http.Handler {
 				Streaming:               streaming,
 				FusionArbiterSkipped:    fusionArbiterSkipped,
 				FusionJaccardSimilarity: fusionJaccardSimilarity,
+				FusionArbiterCostUSD:    fusionArbiterCostUSD,
 				ToolCallCount:           toolCallCount,
 				Error:                   rec.Error,
 				RouteSource:             string(decision.Source),

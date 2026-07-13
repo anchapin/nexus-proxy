@@ -119,8 +119,8 @@ func TestCompressJSONBlocksNestedArrayMultipleObjects(t *testing.T) {
 }
 
 func TestCompressJSONBlocksNestedArrayDifferentKeys(t *testing.T) {
-	// Test "items" and "objects" keys as well.
-	for _, key := range []string{"items", "objects"} {
+	// Issue #244: expanded to cover "data", "entries", "records" keys.
+	for _, key := range []string{"items", "objects", "data", "entries", "records"} {
 		msgs := []interface{}{
 			map[string]interface{}{
 				"role":    "user",
@@ -134,6 +134,89 @@ func TestCompressJSONBlocksNestedArrayDifferentKeys(t *testing.T) {
 		if !contains(content, `items[2]{x}`) {
 			t.Errorf("TOON not present for key %q: %q", key, content)
 		}
+	}
+}
+
+func TestCompressJSONBlocksUnfencedArray(t *testing.T) {
+	// Issue #244: unfenced JSON arrays should be compressed.
+	msgs := []interface{}{
+		map[string]interface{}{
+			"role":    "user",
+			"content": "Results:\n[{\"name\": \"a.txt\"}, {\"name\": \"b.txt\"}]\n",
+		},
+	}
+	if CompressJSONBlocks(msgs) != CompressionMethodUnfenced {
+		t.Fatal("expected rewrote = unfenced")
+	}
+	content := msgs[0].(map[string]interface{})["content"].(string)
+	if !contains(content, `items[2]{name}`) {
+		t.Errorf("TOON not present in %q", content)
+	}
+}
+
+func TestCompressJSONBlocksUnfencedArrayMultipleObjects(t *testing.T) {
+	msgs := []interface{}{
+		map[string]interface{}{
+			"role":    "user",
+			"content": `[{"id": 1, "name": "alpha"}, {"id": 2, "name": "beta"}]`,
+		},
+	}
+	if CompressJSONBlocks(msgs) != CompressionMethodUnfenced {
+		t.Fatal("expected rewrote = unfenced")
+	}
+	content := msgs[0].(map[string]interface{})["content"].(string)
+	if !contains(content, `items[2]{id,name}`) {
+		t.Errorf("TOON not present in %q", content)
+	}
+}
+
+func TestCompressJSONBlocksUnfencedArrayWithNewlinePrefix(t *testing.T) {
+	// Array at start of content (no preceding context).
+	msgs := []interface{}{
+		map[string]interface{}{
+			"role":    "assistant",
+			"content": "[{\"a\": 1}, {\"a\": 2}]",
+		},
+	}
+	if CompressJSONBlocks(msgs) != CompressionMethodUnfenced {
+		t.Fatal("expected rewrote = unfenced")
+	}
+	content := msgs[0].(map[string]interface{})["content"].(string)
+	if !contains(content, `items[2]{a}`) {
+		t.Errorf("TOON not present in %q", content)
+	}
+}
+
+func TestCompressJSONBlocksUnfencedArrayPreservesOtherContent(t *testing.T) {
+	// Content outside the unfenced array should be preserved.
+	msgs := []interface{}{
+		map[string]interface{}{
+			"role":    "user",
+			"content": "Before\n[{\"x\": 1}]\nAfter",
+		},
+	}
+	if CompressJSONBlocks(msgs) != CompressionMethodUnfenced {
+		t.Fatal("expected rewrote = unfenced")
+	}
+	content := msgs[0].(map[string]interface{})["content"].(string)
+	if !contains(content, "Before\n") {
+		t.Errorf("prefix lost, got %q", content)
+	}
+	if !contains(content, "\nAfter") {
+		t.Errorf("suffix lost, got %q", content)
+	}
+}
+
+func TestCompressJSONBlocksUnfencedArrayNoMatchOnCasualBrackets(t *testing.T) {
+	// Casual bracket usage like "[ see above ]" should not be matched.
+	msgs := []interface{}{
+		map[string]interface{}{
+			"role":    "user",
+			"content": "The results are [see above] for the analysis.",
+		},
+	}
+	if CompressJSONBlocks(msgs) != CompressionMethodNone {
+		t.Errorf("should not match casual brackets, got %q", msgs[0].(map[string]interface{})["content"])
 	}
 }
 

@@ -357,3 +357,150 @@ func (o *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 	}
 	return raw.Embedding, nil
 }
+
+// OpenAIEmbedder calls the OpenAI /v1/embeddings endpoint. It is safe for
+// concurrent use via a shared http.Client.
+type OpenAIEmbedder struct {
+	BaseURL  string // e.g. "https://api.openai.com/v1"
+	Model    string // e.g. "text-embedding-3-small"
+	APIKey   string
+	Client   *http.Client
+	Audience string // optional OAuth audience for cURL-compatible header
+}
+
+// NewOpenAIEmbedder returns an embedder wired to the OpenAI embeddings endpoint.
+func NewOpenAIEmbedder(baseURL, model, apiKey string, client *http.Client) *OpenAIEmbedder {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	return &OpenAIEmbedder{BaseURL: baseURL, Model: model, APIKey: apiKey, Client: client}
+}
+
+// Embed fetches the embedding vector for text via the OpenAI /v1/embeddings API.
+func (o *OpenAIEmbedder) Embed(ctx context.Context, text string) ([]float64, error) {
+	payload, _ := json.Marshal(map[string]any{
+		"model": o.Model,
+		"input": text,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		o.BaseURL+"/embeddings", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+o.APIKey)
+	if o.Audience != "" {
+		req.Header.Set("ocp-apim-subscription-key", o.Audience)
+	}
+	resp, err := o.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("openai embed %s: status %d: %s", o.Model, resp.StatusCode, body)
+	}
+	var raw struct {
+		Data []struct {
+			Embedding []float64 `json:"embedding"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("openai embed: decode: %w", err)
+	}
+	if len(raw.Data) == 0 || len(raw.Data[0].Embedding) == 0 {
+		return nil, fmt.Errorf("openai embed: empty embedding for model %s", o.Model)
+	}
+	return raw.Data[0].Embedding, nil
+}
+
+// CohereEmbedder calls the Cohere /v1/embed endpoint. It is safe for
+// concurrent use via a shared http.Client.
+type CohereEmbedder struct {
+	BaseURL string // e.g. "https://api.cohere.ai/v1"
+	Model   string // e.g. "embed-english-v3.0"
+	APIKey  string
+	Client  *http.Client
+}
+
+// NewCohereEmbedder returns an embedder wired to the Cohere embeddings endpoint.
+func NewCohereEmbedder(baseURL, model, apiKey string, client *http.Client) *CohereEmbedder {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	return &CohereEmbedder{BaseURL: baseURL, Model: model, APIKey: apiKey, Client: client}
+}
+
+// Embed fetches the embedding vector for text via the Cohere /v1/embed API.
+func (c *CohereEmbedder) Embed(ctx context.Context, text string) ([]float64, error) {
+	payload, _ := json.Marshal(map[string]any{
+		"model": c.Model,
+		"texts": []string{text},
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.BaseURL+"/embed", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	resp, err := c.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("cohere embed %s: status %d: %s", c.Model, resp.StatusCode, body)
+	}
+	var raw struct {
+		Embeddings [][]float64 `json:"embeddings"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("cohere embed: decode: %w", err)
+	}
+	if len(raw.Embeddings) == 0 || len(raw.Embeddings[0]) == 0 {
+		return nil, fmt.Errorf("cohere embed: empty embedding for model %s", c.Model)
+	}
+	return raw.Embeddings[0], nil
+}
+
+// EmbedderType is the discriminator for the embedder factory.
+type EmbedderType string
+
+const (
+	EmbedderTypeOllama  EmbedderType = "ollama"
+	EmbedderTypeOpenAI  EmbedderType = "openai"
+	EmbedderTypeCohere EmbedderType = "cohere"
+)
+
+// NewEmbedder constructs an Embedder from the given config fields.
+// The returned Embedder must be wrapped with NewCachedEmbedder by the
+// caller when the cache is desired (as in main.go).
+func NewEmbedder(embedderType EmbedderType, baseURL, model, apiKey string, client *http.Client) (Embedder, error) {
+	switch embedderType {
+	case EmbedderTypeOpenAI:
+		if apiKey == "" {
+			return nil, fmt.Errorf("rag: NEXUS_EMBEDDER_TYPE=openai requires NEXUS_FRONTIER_API_KEY to be set")
+		}
+		return NewOpenAIEmbedder(baseURL, model, apiKey, client), nil
+	case EmbedderTypeCohere:
+		if apiKey == "" {
+			return nil, fmt.Errorf("rag: NEXUS_EMBEDDER_TYPE=cohere requires NEXUS_COHERE_API_KEY to be set")
+		}
+		return NewCohereEmbedder(baseURL, model, apiKey, client), nil
+	case EmbedderTypeOllama:
+		fallthrough
+	default:
+		return NewOllamaEmbedder(baseURL, model, client), nil
+	}
+}

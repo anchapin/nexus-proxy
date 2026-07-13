@@ -94,7 +94,14 @@ func main() {
 	// collaborator so all traffic shares the same transport.
 	httpClient := transport.NewFromEnv()
 
-	emb := rag.NewOllamaEmbedder(cfg.OllamaURL, cfg.EmbeddingModel, httpClient)
+	emb, err := rag.NewEmbedder(cfg.EmbedderType, cfg.EmbedderBaseURL, cfg.EmbeddingModel, cfg.FrontierKey, httpClient)
+	if err != nil {
+		log.Fatalf("rag embedder: %v", err)
+	}
+	slog.Info("rag embedder configured",
+		slog.String("type", string(cfg.EmbedderType)),
+		slog.String("model", cfg.EmbeddingModel),
+	)
 	bootCtx, cancel := context.WithTimeout(context.Background(), bootRAGTimeout)
 	defer cancel()
 
@@ -585,12 +592,20 @@ func main() {
 	// requests don't trigger an SLM call.
 	var slmCache *router.SLMCache
 	if cfg.SLMCacheEnabled() {
-		slmCache = router.NewSLMCache(cfg.SLMCacheTTL)
-		slog.Info("slm decision cache enabled",
-			slog.Duration("ttl", cfg.SLMCacheTTL),
-		)
+		if cfg.SLMCacheSemanticThreshold > 0 {
+			slmCache = router.NewSLMCacheWithEmbedder(cfg.SLMCacheTTL, ragEmbedder, cfg.SLMCacheSemanticThreshold)
+			slog.Info("slm decision cache enabled (with semantic deduplication)",
+				slog.Duration("ttl", cfg.SLMCacheTTL),
+				slog.Float64("semantic_threshold", cfg.SLMCacheSemanticThreshold),
+			)
+		} else {
+			slmCache = router.NewSLMCache(cfg.SLMCacheTTL)
+			slog.Info("slm decision cache enabled",
+				slog.Duration("ttl", cfg.SLMCacheTTL),
+			)
+		}
 	} else {
-		slog.Info("slm decision cache disabled (NEXUS_SLM_CACHE_TTL<=0)")
+		slog.Info("slm decision cache disabled (NEXUS_SLMCACHE_TTL<=0)")
 	}
 
 	chatHandler := handlers.Chat(handlers.Deps{
