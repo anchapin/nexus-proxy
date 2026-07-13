@@ -22,9 +22,17 @@
 // headers are stripped from any structured payload, and the response
 // body preview is capped at NEXUS_DEBUG_BODY_BYTES (default 512).
 //
-// When Debug is false (the default) this file adds zero allocations: the
-// handler skips trace construction entirely and the production fast path
-// is byte-for-byte identical to before this issue.
+// Per-request tracing (issue #242): the operator can also request a
+// trace for a single request without enabling NEXUS_DEBUG=true
+// globally. By passing the X-Nexus-Trace-ID header with a value
+// matching the request's X-Request-Id (or generated id), exactly one
+// request is traced. This is useful for investigating a specific
+// user complaint without flooding logs for all traffic.
+//
+// When neither NEXUS_DEBUG is set nor X-Nexus-Trace-ID matches, this
+// file adds zero allocations: the handler skips trace construction
+// entirely and the production fast path is byte-for-byte identical to
+// before this issue.
 package handlers
 
 import (
