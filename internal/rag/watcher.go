@@ -104,6 +104,7 @@ func (w *Watcher) run(parent context.Context) {
 		case <-w.stopCh:
 			return
 		case <-t.C:
+<<<<<<< HEAD
 			if err := w.scanOnce(parent); err != nil && !errors.Is(err, context.Canceled) {
 				slog.Warn("rag: scan failed",
 					slog.String("component", "rag"),
@@ -111,6 +112,15 @@ func (w *Watcher) run(parent context.Context) {
 					slog.Any("err", err),
 				)
 			}
+=======
+		if err := w.scanOnce(parent); err != nil && !errors.Is(err, context.Canceled) {
+			slog.Warn("rag: scan failed",
+				slog.String("component", "rag"),
+				slog.String("dir", w.dir),
+				slog.Any("err", err),
+			)
+		}
+>>>>>>> 92285a4 (fix #169: use slog.String("component", "rag") instead of legacy [RAG INDEXER] prefix)
 		}
 	}
 }
