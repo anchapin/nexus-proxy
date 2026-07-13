@@ -101,6 +101,10 @@ type RouteDecisionEvent struct {
 	Reason     string
 	Confidence float64
 	TaskType   string
+	// CacheHit is true when the decision came from the SLM cache
+	// (issue #206) — a duplicate prompt was served from cache without
+	// calling the SLM.
+	CacheHit bool
 }
 
 // RouteDecisionObserver is the hook invoked once per proxied request
@@ -377,6 +381,14 @@ type Deps struct {
 	// to the pre-issue-47 behaviour. The handler talks to router, never
 	// judge; main.go bridges JudgeScore -> RecordOutcome.
 	Confidence router.ConfidenceStore
+
+	// SLMCache is the optional time-bounded prompt→route cache
+	// (issue #206). When non-nil the planner checks the cache before
+	// calling the SLM; a cache hit returns the cached route without
+	// calling the SLM. When nil the SLM is always called
+	// (pre-cache behaviour). The cache TTL is configured at cache
+	// construction time via NewSLMCache.
+	SLMCache *router.SLMCache
 
 	// JudgeObserver is optional. When nil, the handler does not
 	// buffer the streamed response for judge sampling — every
@@ -810,6 +822,7 @@ func Chat(d Deps) http.Handler {
 			SLM:             d.SLM,
 			Confidence:      d.Confidence,
 			FormattingRegex: d.FormattingRegex,
+			SLMCache:        d.SLMCache,
 		}
 		decision := planner.Plan(router.PlanRequest{
 			Prompt:          latestPrompt,
@@ -837,6 +850,7 @@ func Chat(d Deps) http.Handler {
 			Reason:     decision.Reason,
 			Confidence: decision.Confidence,
 			TaskType:   decision.TaskType,
+			CacheHit:   decision.CacheHit,
 		}
 		w.Header().Set("X-Nexus-Route", SanitizeHeaderValue(routeEvent.Route))
 		w.Header().Set("X-Nexus-Route-Source", SanitizeHeaderValue(routeEvent.Source))

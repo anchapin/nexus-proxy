@@ -78,6 +78,11 @@ type counterKey struct {
 //   - nexus_route_decisions_total{route,source}
 //   - nexus_slm_decisions_total{route,confidence_bucket,task_type}
 //   - nexus_slm_low_confidence_escalations_total{task_type}
+//   - nexus_slm_cache_hits_total
+//   - nexus_slm_cache_misses_total
+//
+// A fifth family (issue #119) records requests the proxy rejected
+// before they reached an upstream:
 //   - nexus_requests_rejected_total{reason}
 //
 // A fifth family (issue #187) records fusion arbiter outcomes:
@@ -98,6 +103,8 @@ type RouteCounters struct {
 	routeDecisions           map[counterKey]*uint64
 	slmDecisions             map[counterKey]*uint64
 	lowConfidenceEscalations map[counterKey]*uint64
+	slmCacheHits             *uint64
+	slmCacheMisses           *uint64
 	rejections               map[string]*uint64
 	fusionArbiter            map[string]*uint64
 	rRAGHits                 map[string]*uint64
@@ -106,10 +113,13 @@ type RouteCounters struct {
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
 func NewRouteCounters() *RouteCounters {
+	hits, misses := uint64(0), uint64(0)
 	return &RouteCounters{
 		routeDecisions:           make(map[counterKey]*uint64),
 		slmDecisions:             make(map[counterKey]*uint64),
 		lowConfidenceEscalations: make(map[counterKey]*uint64),
+		slmCacheHits:             &hits,
+		slmCacheMisses:           &misses,
 		rejections:               make(map[string]*uint64),
 		fusionArbiter:            make(map[string]*uint64),
 		rRAGHits:                 make(map[string]*uint64),
@@ -126,7 +136,7 @@ func NewRouteCounters() *RouteCounters {
 //   - source: the decision source ("guardrail", "dsl", "slm", "slm-error", "escalation")
 //   - confidence: the SLM confidence in [0,1] (0.5 neutral; pass 0 for non-SLM)
 //   - taskType: the SLM category bucket (empty for non-SLM sources)
-func (rc *RouteCounters) Observe(route, source string, confidence float64, taskType string) {
+func (rc *RouteCounters) Observe(route, source string, confidence float64, taskType, model string) {
 	if rc == nil {
 		return
 	}
@@ -265,6 +275,29 @@ func (rc *RouteCounters) ragMissSlot(reason string) *uint64 {
 	return p
 }
 
+// ObserveSLMCacheHit records one SLM decision cache hit (issue #206).
+// The cache deduplicates identical prompts within a TTL window; a hit
+// means the same prompt was seen recently and the cached decision was
+// returned instead of calling the SLM. Safe for concurrent use; nil
+// receivers are a no-op.
+func (rc *RouteCounters) ObserveSLMCacheHit() {
+	if rc == nil || rc.slmCacheHits == nil {
+		return
+	}
+	atomic.AddUint64(rc.slmCacheHits, 1)
+}
+
+// ObserveSLMCacheMiss records one SLM decision cache miss (issue #206).
+// A miss means the prompt was not in the cache (or was expired), so
+// the SLM was called to produce a decision. Safe for concurrent use;
+// nil receivers are a no-op.
+func (rc *RouteCounters) ObserveSLMCacheMiss() {
+	if rc == nil || rc.slmCacheMisses == nil {
+		return
+	}
+	atomic.AddUint64(rc.slmCacheMisses, 1)
+}
+
 // reasonSlot returns the *uint64 for reason, creating it if absent.
 // Same lock-then-atomic pattern as slot: the mutex guards the map
 // mutation only, the increment happens lock-free.
@@ -332,6 +365,11 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	if n, err := writeSeries(w, "nexus_slm_low_confidence_escalations_total",
 		"Requests escalated to frontier because the SLM confidence was below the low threshold.",
 		rc.lowConfidenceEscalations, []string{"task_type"}); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeSLMCacheSeries(w, rc.slmCacheHits, rc.slmCacheMisses); err != nil {
 		return total, err
 	} else {
 		total += n
@@ -466,7 +504,7 @@ func writeRAGSeries(w io.Writer, name, help string, hits, misses map[string]*uin
 	var total int64
 	n, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", name, help, name)
 	if err != nil {
-		return total + int64(n), err
+		return total, err
 	}
 	total += int64(n)
 
@@ -516,6 +554,41 @@ func writeRAGSeries(w io.Writer, name, help string, hits, misses map[string]*uin
 	} else {
 		total += n
 	}
+	return total, nil
+}
+
+// writeSLMCacheSeries emits the nexus_slm_cache_hits_total and
+// nexus_slm_cache_misses_total counters (issue #206). These track
+// the SLM decision cache hit rate so operators can tune the cache
+// TTL and diagnose cache ineffectiveness. The hits and misses pointers
+// may be nil; nil is treated as zero.
+func writeSLMCacheSeries(w io.Writer, hits, misses *uint64) (int64, error) {
+	var total int64
+	hitsVal := atomic.LoadUint64(hits)
+	missesVal := atomic.LoadUint64(misses)
+
+	n, err := fmt.Fprintf(w, "# HELP nexus_slm_cache_hits_total SLM decision cache hits.\n# TYPE nexus_slm_cache_hits_total counter\n")
+	if err != nil {
+		return total, err
+	}
+	total += int64(n)
+	n, err = fmt.Fprintf(w, "nexus_slm_cache_hits_total %d\n", hitsVal)
+	if err != nil {
+		return total, err
+	}
+	total += int64(n)
+
+	n, err = fmt.Fprintf(w, "# HELP nexus_slm_cache_misses_total SLM decision cache misses.\n# TYPE nexus_slm_cache_misses_total counter\n")
+	if err != nil {
+		return total, err
+	}
+	total += int64(n)
+	n, err = fmt.Fprintf(w, "nexus_slm_cache_misses_total %d\n", missesVal)
+	if err != nil {
+		return total, err
+	}
+	total += int64(n)
+
 	return total, nil
 }
 
