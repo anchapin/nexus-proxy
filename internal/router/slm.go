@@ -162,10 +162,6 @@ func (c *SLMClient) CacheStats() (hits, misses int64) {
 // the cache size limits in use (512 entries).
 func (c *SLMClient) evictStale() {
 	now := time.Now()
-	ttl := c.CacheTTL
-	if ttl <= 0 {
-		ttl = 5 * time.Minute
-	}
 	max := c.CacheMaxEntries
 	if max <= 0 {
 		max = 512
