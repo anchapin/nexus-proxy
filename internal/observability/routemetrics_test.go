@@ -276,8 +276,8 @@ func TestObserveLatencyHistogram(t *testing.T) {
 // TestObserveLatencyTTFT tests the issue #165 TTFT histogram.
 func TestObserveLatencyTTFT(t *testing.T) {
 	rc := NewRouteCounters()
-	rc.ObserveLatency("local", 0.1, 0.05, false)   // 100ms latency, 50ms TTFT
-	rc.ObserveLatency("local", 0.2, 0.15, false)  // 200ms latency, 150ms TTFT
+	rc.ObserveLatency("local", 0.1, 0.05, false) // 100ms latency, 50ms TTFT
+	rc.ObserveLatency("local", 0.2, 0.15, false) // 200ms latency, 150ms TTFT
 
 	var sb strings.Builder
 	if _, err := rc.WriteTo(&sb); err != nil {
