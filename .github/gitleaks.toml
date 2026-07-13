@@ -15,8 +15,7 @@ paths = [
 ]
 
 [[allowlists]]
-description = "Provider constructor function signatures use keyInput param — no real secrets"
+description = "Provider constructor functions — no real secrets"
 paths = [
   '''internal/providers/frontier\.go''',
 ]
-rules = ["generic-api-key"]
