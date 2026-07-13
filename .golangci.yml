@@ -39,6 +39,20 @@ linters:
       - path: (.+)\.go$
         text: TODO\(
 
+      # cmd/ helpers write to io.Writer in "fire-and-forget" style;
+      # ignoring write errors is the intentional design (same as v1).
+      - path: cmd/
+        linters:
+          - errcheck
+        text: fmt\.F(print|printf|println)
+
+      # resp.Body.Close and rows.Close ignored in non-critical paths
+      # (matches v1 behaviour which excluded these via less-granular rules).
+      - path: (.+)\.go$
+        linters:
+          - errcheck
+        text: resp\.Body\.Close|rows\.Close|stmt\.Close
+
 formatters:
   enable:
     - goimports      # import grouping
