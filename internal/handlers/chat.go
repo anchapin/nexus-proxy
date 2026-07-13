@@ -143,6 +143,12 @@ const (
 	// emitted by the rate-limit middleware. The reason is recorded
 	// by the middleware hook wired in main.go.
 	RejectionRateLimit = "rate_limit"
+	// RejectionJudgeQueue marks a judge evaluator enqueue failure
+	// (internal/judge queue full).
+	RejectionJudgeQueue = "judge_queue"
+	// RejectionQualityQueue marks a quality verifier submit failure
+	// (internal/quality queue full).
+	RejectionQualityQueue = "quality_queue"
 )
 
 // RejectionEvent carries the minimal context a rejection observer

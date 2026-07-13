@@ -290,6 +290,14 @@ func main() {
 		judgeObs        handlers.JudgeObserver
 		confidenceStore *router.SQLiteConfidenceStore
 		confidenceObs   router.ConfidenceStore
+		// routeCounters and rejectionObs are declared early so the
+		// judge/quality overflow closures can capture them. They are
+		// initialized properly after observability.NewRouteCounters
+		// (issue #119 wiring). The nil value is safe because the
+		// overflow paths only call rejectionObs at request time, which
+		// is always after setup completes.
+		routeCounters *observability.RouteCounters
+		rejectionObs  handlers.RejectionObserver
 	)
 	if cfg.JudgeEnabled && cfg.JudgeAPIKey != "" {
 		evalCfg := judge.Config{
@@ -351,8 +359,17 @@ func main() {
 				Output:      c.Output,
 				LocalModel:  c.LocalModel,
 			})
-			if !enqueued && bridge != nil {
-				bridge.forget(c.RequestID)
+			if !enqueued {
+				if bridge != nil {
+					bridge.forget(c.RequestID)
+				}
+				slog.Warn("judge queue full, dropped request", slog.String("request_id", c.RequestID))
+				if rejectionObs != nil {
+					rejectionObs.ObserveRejection(handlers.RejectionEvent{
+						RequestID: c.RequestID,
+						Reason:    handlers.RejectionJudgeQueue,
+					})
+				}
 			}
 			return enqueued
 		})
@@ -482,6 +499,12 @@ func main() {
 					slog.String("request_id", e.RequestID),
 					slog.String("path", e.Path),
 				)
+				if rejectionObs != nil {
+					rejectionObs.ObserveRejection(handlers.RejectionEvent{
+						RequestID: e.RequestID,
+						Reason:    handlers.RejectionQualityQueue,
+					})
+				}
 			}
 		})
 		slog.Info("quality verifier enabled",
@@ -539,7 +562,7 @@ func main() {
 	// signature. /metrics is served by the handler returned by
 	// RouteCounters.Handler() so a scrape is always an atomic
 	// snapshot.
-	routeCounters := observability.NewRouteCounters()
+	routeCounters = observability.NewRouteCounters()
 	// Wire the evaluator's drop counter into Prometheus (issue
 	// #111). The evaluator's onDrop callback passes the cumulative
 	// drop total which ObserveJudgeDrop stores atomically.
@@ -563,7 +586,7 @@ func main() {
 	// /metrics as nexus_requests_rejected_total{reason}. The
 	// rate-limit middleware's 429 path is wired separately below
 	// because it fires before the chat handler.
-	rejectionObs := handlers.RejectionObserverFunc(func(e handlers.RejectionEvent) {
+	rejectionObs = handlers.RejectionObserverFunc(func(e handlers.RejectionEvent) {
 		routeCounters.ObserveRejection(e.Reason)
 	})
 	// Stream-truncation observer (issue #118). When the streaming
