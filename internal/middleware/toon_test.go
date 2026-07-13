@@ -295,6 +295,72 @@ func TestScanJSONArrayEnd(t *testing.T) {
 	}
 }
 
+func TestCompressJSONBlocks_Unfenced(t *testing.T) {
+	// Issue #166: bare ``` [ ... ] ``` (no "json" language tag) was ignored.
+	msgs := []interface{}{
+		map[string]interface{}{
+			"role": "user", "content": "Here:\n```\n[{\"a\":1},{\"a\":2}]\n```\nDone.",
+		},
+	}
+	if !CompressJSONBlocks(msgs) {
+		t.Fatal("expected rewrote = true")
+	}
+	content := msgs[0].(map[string]interface{})["content"].(string)
+	if !contains(content, "```text\nitems[2]{a}:\n  1\n  2\n```") {
+		t.Errorf("TOON block not present in %q", content)
+	}
+	if contains(content, "```\n[") {
+		t.Errorf("original unfenced block should be gone, got %q", content)
+	}
+}
+
+func TestCompressJSONBlocks_Multiline(t *testing.T) {
+	// Issue #166: multi-line JSON arrays where objects span lines were missed.
+	msgs := []interface{}{
+		map[string]interface{}{
+			"role": "assistant", "content": "```json\n[\n  {\"a\": 1},\n  {\"a\": 2}\n]\n```",
+		},
+	}
+	if !CompressJSONBlocks(msgs) {
+		t.Fatal("expected rewrote = true")
+	}
+	content := msgs[0].(map[string]interface{})["content"].(string)
+	if !contains(content, "items[2]{a}:\n") {
+		t.Errorf("TOON block not present in %q", content)
+	}
+	if contains(content, "{\"a\":") {
+		t.Errorf("original multi-line block should be rewritten, got %q", content)
+	}
+}
+
+func TestCompressJSONBlocks_NonArrayJSON(t *testing.T) {
+	// Valid JSON but not an array of objects — should be left alone.
+	msgs := []interface{}{
+		map[string]interface{}{
+			"role": "user", "content": "```json\n[1, 2, 3]\n```",
+		},
+	}
+	if CompressJSONBlocks(msgs) {
+		t.Error("primitive array should not be compressed")
+	}
+}
+
+func TestCompressJSONBlocks_NestedObjects(t *testing.T) {
+	// Array of objects with nested values — should be compressed.
+	msgs := []interface{}{
+		map[string]interface{}{
+			"role": "user", "content": "```\n[{\"name\":\"Alice\",\"address\":{\"city\":\"NYC\"}},{\"name\":\"Bob\",\"address\":{\"city\":\"LA\"}}]\n```",
+		},
+	}
+	if !CompressJSONBlocks(msgs) {
+		t.Fatal("expected rewrote = true")
+	}
+	content := msgs[0].(map[string]interface{})["content"].(string)
+	if !contains(content, "items[2]{") {
+		t.Errorf("TOON block not present in %q", content)
+	}
+}
+
 func TestAppendSystemNoteExisting(t *testing.T) {
 	msgs := []interface{}{
 		map[string]interface{}{"role": "system", "content": "hello"},
