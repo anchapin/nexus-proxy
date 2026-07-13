@@ -66,7 +66,7 @@ func New(cfg Config) *http.Client {
 		MaxConnsPerHost:       cfg.MaxConnsPerHost,
 		IdleConnTimeout:       cfg.IdleConnTimeout,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout:  1 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 	}
 
 	return &http.Client{

@@ -113,9 +113,9 @@ func TestNew_ZeroValuesGetDefaults(t *testing.T) {
 
 func TestConfig_ApplyDefaults(t *testing.T) {
 	tests := []struct {
-		name    string
-		cfg     Config
-		want    Config
+		name string
+		cfg  Config
+		want Config
 	}{
 		{
 			name: "zero values get defaults",
