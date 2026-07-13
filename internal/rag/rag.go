@@ -478,8 +478,8 @@ func (c *CohereEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 type EmbedderType string
 
 const (
-	EmbedderTypeOllama  EmbedderType = "ollama"
-	EmbedderTypeOpenAI  EmbedderType = "openai"
+	EmbedderTypeOllama EmbedderType = "ollama"
+	EmbedderTypeOpenAI EmbedderType = "openai"
 	EmbedderTypeCohere EmbedderType = "cohere"
 )
 
