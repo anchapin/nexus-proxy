@@ -30,9 +30,21 @@ var ObjectArrayBlock = regexp.MustCompile(
 		`(\[\s*\{.*?\}(?:\s*,\s*\{.*?\})*\s*\])`,
 )
 
+// CompressionMethod indicates which TOON compression pattern was applied
+// to a request's messages (issue #247).
+type CompressionMethod string
+
+const (
+	CompressionMethodFenced  CompressionMethod = "fenced"
+	CompressionMethodNested  CompressionMethod = "nested"
+	CompressionMethodNone    CompressionMethod = ""
+)
+
 // CompressJSONBlocks rewrites every ```json [ {...}, ... ] ``` block in the
-// user/assistant message content into a TOON text block. Returns true if any
-// block was rewritten. Schema is inferred from the first object's keys (sorted
+// user/assistant message content into a TOON text block. Returns the
+// compression method used: "fenced" for ```json [...] ``` blocks, "nested"
+// for {"files": [...]} object-nested arrays, or "" when no compression
+// was applied. Schema is inferred from the first object's keys (sorted
 // lexicographically for stable column order).
 //
 // Gotchas to be aware of when re-parsing TOON output downstream:
@@ -40,8 +52,8 @@ var ObjectArrayBlock = regexp.MustCompile(
 //     so they cannot collide with the column separator.
 //   - Newlines inside string values are replaced with spaces — multi-line
 //     strings round-trip lossy.
-func CompressJSONBlocks(messages []interface{}) bool {
-	rewrote := false
+func CompressJSONBlocks(messages []interface{}) CompressionMethod {
+	fenced, nested := false, false
 	for _, raw := range messages {
 		msg, ok := raw.(map[string]interface{})
 		if !ok {
@@ -65,7 +77,7 @@ func CompressJSONBlocks(messages []interface{}) bool {
 			}
 			block := "```text\n" + toon + "```"
 			content = strings.Replace(content, m[0], block, 1)
-			rewrote = true
+			fenced = true
 		}
 
 		// Handle JSON arrays nested inside objects (e.g., {"files": [...]}).
@@ -95,14 +107,20 @@ func CompressJSONBlocks(messages []interface{}) bool {
 			} else {
 				content = strings.Replace(content, fullMatch, replacement, 1)
 			}
-			rewrote = true
+			nested = true
 		}
 
-		if rewrote {
+		if fenced || nested {
 			msg["content"] = content
 		}
 	}
-	return rewrote
+	if fenced {
+		return CompressionMethodFenced
+	}
+	if nested {
+		return CompressionMethodNested
+	}
+	return CompressionMethodNone
 }
 
 // SerializeToTOON converts a JSON array of objects into the canonical TOON

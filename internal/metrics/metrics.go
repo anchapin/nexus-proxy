@@ -93,6 +93,11 @@ type Request struct {
 	Model             string
 	InputTokens       int
 	TOONSavingsTokens int
+	// TOONCompressionMethod records which TOON compression pattern was
+	// applied to this request's messages (issue #247): "fenced" for
+	// ```json [...] ``` blocks, "nested" for {"files": [...]} arrays,
+	// or "" when no compression was applied.
+	TOONCompressionMethod string
 	RAGInjected       bool
 	RAGFilename       string
 	EstimatedCostUSD  float64

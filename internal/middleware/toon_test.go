@@ -50,8 +50,8 @@ func TestCompressJSONBlocksRewritesUserMessage(t *testing.T) {
 			"role": "user", "content": "Here:\n```json\n[{\"a\":1},{\"a\":2}]\n```\nDone.",
 		},
 	}
-	if !CompressJSONBlocks(msgs) {
-		t.Fatal("expected rewrote = true")
+	if CompressJSONBlocks(msgs) != CompressionMethodFenced {
+		t.Fatal("expected rewrote = fenced")
 	}
 	content := msgs[0].(map[string]interface{})["content"].(string)
 	if !contains(content, "```text\nitems[2]{a}:\n  1\n  2\n```") {
@@ -67,7 +67,7 @@ func TestCompressJSONBlocksIgnoresNonUserAssistant(t *testing.T) {
 		map[string]interface{}{"role": "system", "content": "```json\n[{\"a\":1}]\n```"},
 		map[string]interface{}{"role": "tool", "content": "```json\n[{\"a\":1}]\n```"},
 	}
-	if CompressJSONBlocks(msgs) {
+	if CompressJSONBlocks(msgs) != CompressionMethodNone {
 		t.Error("should not touch system/tool messages")
 	}
 }
@@ -76,7 +76,7 @@ func TestCompressJSONBlocksNoMatch(t *testing.T) {
 	msgs := []interface{}{
 		map[string]interface{}{"role": "user", "content": "no blocks here"},
 	}
-	if CompressJSONBlocks(msgs) {
+	if CompressJSONBlocks(msgs) != CompressionMethodNone {
 		t.Error("expected no-op when no fences present")
 	}
 }
@@ -89,8 +89,8 @@ func TestCompressJSONBlocksNestedArray(t *testing.T) {
 			"content": `Here are the results: {"files": [{"name": "a.txt"}, {"name": "b.txt"}]}`,
 		},
 	}
-	if !CompressJSONBlocks(msgs) {
-		t.Fatal("expected rewrote = true")
+	if CompressJSONBlocks(msgs) != CompressionMethodNested {
+		t.Fatal("expected rewrote = nested")
 	}
 	content := msgs[0].(map[string]interface{})["content"].(string)
 	if !contains(content, `items[2]{name}`) {
@@ -109,8 +109,8 @@ func TestCompressJSONBlocksNestedArrayMultipleObjects(t *testing.T) {
 			"content": `{"results": [{"id": 1, "name": "alpha"}, {"id": 2, "name": "beta"}]}`,
 		},
 	}
-	if !CompressJSONBlocks(msgs) {
-		t.Fatal("expected rewrote = true")
+	if CompressJSONBlocks(msgs) != CompressionMethodNested {
+		t.Fatal("expected rewrote = nested")
 	}
 	content := msgs[0].(map[string]interface{})["content"].(string)
 	if !contains(content, `items[2]{id,name}`) {
@@ -127,8 +127,8 @@ func TestCompressJSONBlocksNestedArrayDifferentKeys(t *testing.T) {
 				"content": fmt.Sprintf(`{"%s": [{"x": 1}, {"x": 2}]}`, key),
 			},
 		}
-		if !CompressJSONBlocks(msgs) {
-			t.Errorf("expected rewrote = true for key %q", key)
+		if CompressJSONBlocks(msgs) != CompressionMethodNested {
+			t.Errorf("expected rewrote = nested for key %q", key)
 		}
 		content := msgs[0].(map[string]interface{})["content"].(string)
 		if !contains(content, `items[2]{x}`) {
@@ -145,8 +145,8 @@ func TestCompressJSONBlocksNestedArrayPreservesOtherContent(t *testing.T) {
 			"content": `Prefix {"files": [{"a": 1}]} Suffix`,
 		},
 	}
-	if !CompressJSONBlocks(msgs) {
-		t.Fatal("expected rewrote = true")
+	if CompressJSONBlocks(msgs) != CompressionMethodNested {
+		t.Fatal("expected rewrote = nested")
 	}
 	content := msgs[0].(map[string]interface{})["content"].(string)
 	if !contains(content, "Prefix ") {
