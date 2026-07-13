@@ -34,6 +34,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/ratelimit"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/transport"
 )
 
 const (
@@ -86,7 +87,13 @@ func main() {
 	logger := cfg.NewLogger()
 	slog.SetDefault(logger)
 
-	emb := rag.NewOllamaEmbedder(cfg.OllamaURL, cfg.EmbeddingModel, nil)
+	// Shared pooled HTTP client for all outbound upstream calls (issue #184).
+	// Connection pooling reduces TCP handshake overhead across Ollama,
+	// frontier API, and arbiter calls. Created once and passed to every
+	// collaborator so all traffic shares the same transport.
+	httpClient := transport.NewFromEnv()
+
+	emb := rag.NewOllamaEmbedder(cfg.OllamaURL, cfg.EmbeddingModel, httpClient)
 	bootCtx, cancel := context.WithTimeout(context.Background(), bootRAGTimeout)
 	defer cancel()
 
@@ -100,7 +107,7 @@ func main() {
 	// behaviour.
 	store, persistentStore, ragWatcher := buildRAGStore(cfg, emb, bootCtx)
 
-	slm := router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, cfg.SLMTimeout, nil)
+	slm := router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, cfg.SLMTimeout, httpClient)
 	// Judge-guided adaptive routing (issue #47): the confidence
 	// floor/ceiling bound the neutral band the SLM uses when a
 	// confidence signal is supplied. Zero values fall back to the
@@ -124,7 +131,7 @@ func main() {
 			cfg.HealthPollInterval,
 			cfg.HealthBreakerThreshold,
 			cfg.HealthProbeTimeout,
-			http.DefaultClient,
+			httpClient,
 		)
 		go hpoller.Run(context.Background())
 		defer func() {
@@ -145,7 +152,7 @@ func main() {
 	// the probe is disabled (NEXUS_PROBE_INTERVAL=0) the manager
 	// still runs the boot probe once and the chat handler falls
 	// back to the static value when it produces no budget.
-	probeImpl := probe.NewOllamaProbe(cfg.OllamaURL, http.DefaultClient)
+	probeImpl := probe.NewOllamaProbe(cfg.OllamaURL, httpClient)
 	probeImpl.BytesPerToken = cfg.ProbeBytesPerToken
 	probeMgr := probe.NewManager(probeImpl, cfg.ProbePollInterval, cfg.ProbeTimeout)
 	go probeMgr.Run(context.Background())
@@ -318,7 +325,7 @@ func main() {
 			}
 		}
 
-		judgeEval = judge.NewEvaluator(evalCfg, http.DefaultClient, storage)
+		judgeEval = judge.NewEvaluator(evalCfg, httpClient, storage)
 		judgeObs = handlers.JudgeObserverFunc(func(c handlers.LocalCompletion) {
 			if !judgeEval.Sample() {
 				return
@@ -508,7 +515,7 @@ func main() {
 
 	chatHandler := handlers.Chat(handlers.Deps{
 		Config:                cfg,
-		Client:                http.DefaultClient,
+		Client:                httpClient,
 		RAG:                   store,
 		SLM:                   slm,
 		FormattingRegex:       re,
@@ -563,7 +570,7 @@ func main() {
 	if cfg.ModelsEndpointEnabled {
 		mh := handlers.Models(handlers.ModelsDeps{
 			Config: cfg,
-			Client: http.DefaultClient,
+			Client: httpClient,
 		})
 		mux.Handle("/v1/models", mh)
 		mux.Handle("/v1/models/", mh)
