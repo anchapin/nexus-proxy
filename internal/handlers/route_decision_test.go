@@ -339,3 +339,112 @@ func TestRouteDecisionObserverFuncAdapter(t *testing.T) {
 		t.Errorf("adapter dropped or mangled event: %+v", captured)
 	}
 }
+
+// TestLatencyObserverFuncAdapter exercises the LatencyObserverFunc
+// adapter so the closure wiring in cmd/nexus stays a one-liner.
+func TestLatencyObserverFuncAdapter(t *testing.T) {
+	var captured LatencyEvent
+	LatencyObserverFunc(func(e LatencyEvent) { captured = e }).ObserveLatency(LatencyEvent{
+		Route:          "local",
+		LatencySeconds: 0.123,
+		TTFTSeconds:    0.045,
+		IsError:        false,
+	})
+	if captured.Route != "local" || captured.LatencySeconds != 0.123 || captured.TTFTSeconds != 0.045 || captured.IsError != false {
+		t.Errorf("adapter dropped or mangled event: %+v", captured)
+	}
+}
+
+// recordingLatencyObserver captures every LatencyEvent for test assertions.
+type recordingLatencyObserver struct {
+	mu     sync.Mutex
+	events []LatencyEvent
+}
+
+func (r *recordingLatencyObserver) ObserveLatency(e LatencyEvent) {
+	r.mu.Lock()
+	r.events = append(r.events, e)
+	r.mu.Unlock()
+}
+
+func (r *recordingLatencyObserver) snapshot() []LatencyEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]LatencyEvent, len(r.events))
+	copy(out, r.events)
+	return out
+}
+
+// TestChatLatencyObserverCalled verifies the LatencyObserver hook is
+// invoked after the upstream response completes with the correct
+// timing values and error flag (issue #165).
+func TestChatLatencyObserverCalled(t *testing.T) {
+	deps, rt := baseDeps(t)
+	obs := &recordingLatencyObserver{}
+	deps.LatencyObserver = obs
+
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
+	})
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rw.Code)
+	}
+	events := obs.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("latency observer events = %d, want 1", len(events))
+	}
+	e := events[0]
+	if e.Route != "local" {
+		t.Errorf("Route = %q, want \"local\"", e.Route)
+	}
+	if e.LatencySeconds <= 0 {
+		t.Errorf("LatencySeconds = %v, want > 0", e.LatencySeconds)
+	}
+	if e.IsError {
+		t.Errorf("IsError = true, want false for successful request")
+	}
+}
+
+// TestChatLatencyObserverCalledForLocalRoute verifies the LatencyObserver
+// hook is invoked with the correct route for a DSL-matched local request.
+func TestChatLatencyObserverCalledForLocalRoute(t *testing.T) {
+	deps, rt := baseDeps(t)
+	obs := &recordingLatencyObserver{}
+	deps.LatencyObserver = obs
+
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
+	})
+	// "css" triggers the DSL pattern for local route.
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rw.Code)
+	}
+	events := obs.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("latency observer events = %d, want 1", len(events))
+	}
+	e := events[0]
+	if e.Route != "local" {
+		t.Errorf("Route = %q, want \"local\"", e.Route)
+	}
+	if e.LatencySeconds <= 0 {
+		t.Errorf("LatencySeconds = %v, want > 0", e.LatencySeconds)
+	}
+	if e.IsError {
+		t.Errorf("IsError = true, want false for successful request")
+	}
+}

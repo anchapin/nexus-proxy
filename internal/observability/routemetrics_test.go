@@ -237,3 +237,76 @@ func TestRouteCountersRejectionConcurrentSafe(t *testing.T) {
 		t.Errorf("expected rejection metric in output")
 	}
 }
+
+// TestObserveLatencyHistogram tests the issue #165 latency histogram.
+func TestObserveLatencyHistogram(t *testing.T) {
+	rc := NewRouteCounters()
+	// Record a frontier request with 250ms latency and no error.
+	rc.ObserveLatency("frontier", 0.25, 0, false)
+	// Record a local request with 50ms latency and no error.
+	rc.ObserveLatency("local", 0.05, 0.01, false)
+	// Record a frontier request with an error.
+	rc.ObserveLatency("frontier", 1.5, 0.3, true)
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_request_latency_seconds", "latency histogram family present"},
+		{"# TYPE nexus_request_latency_seconds histogram", "histogram type line"},
+		{`route="frontier"`, "frontier route present in latency"},
+		{`route="local"`, "local route present in latency"},
+		{"nexus_request_errors_total", "error counter family present"},
+		{"# TYPE nexus_request_errors_total counter", "error counter type line"},
+		{`route="frontier"} 1`, "frontier error counted once"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+}
+
+// TestObserveLatencyTTFT tests the issue #165 TTFT histogram.
+func TestObserveLatencyTTFT(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveLatency("local", 0.1, 0.05, false)   // 100ms latency, 50ms TTFT
+	rc.ObserveLatency("local", 0.2, 0.15, false)  // 200ms latency, 150ms TTFT
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_request_ttft_seconds", "TTFT histogram family present"},
+		{"# TYPE nexus_request_ttft_seconds histogram", "TTFT histogram type line"},
+		{`route="local"`, "local route present in TTFT"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+}
+
+// TestRouteCountersNilSafeLatency tests that ObserveLatency is nil-safe.
+func TestRouteCountersNilSafeLatency(t *testing.T) {
+	var rc *RouteCounters
+	// Must not panic.
+	rc.ObserveLatency("frontier", 1.0, 0.5, true)
+	n, err := rc.WriteTo(&strings.Builder{})
+	if err != nil || n != 0 {
+		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
+	}
+}

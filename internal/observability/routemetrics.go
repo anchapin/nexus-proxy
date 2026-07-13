@@ -38,6 +38,14 @@ const (
 	bucketNone   = "none" // guardrail / DSL / non-SLM sources
 )
 
+// Latency histogram bucket upper boundaries in seconds (issue #165).
+// Covers 5 ms → 10 s, suitable for a coding-agent proxy.
+var latencyBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0}
+
+// TTFT histogram bucket upper boundaries in seconds (issue #165).
+// Covers 100 ms → 5 s; TTFT is typically faster than total latency.
+var ttftBuckets = []float64{0.1, 0.25, 0.5, 1.0, 2.5, 5.0}
+
 // BucketConfidence collapses a raw SLM confidence into a short,
 // bounded-cardinality label. Non-SLM sources (guardrail, DSL) carry
 // no meaningful confidence, so callers should pass bucketNone by
@@ -67,6 +75,14 @@ type counterKey struct {
 	taskType   string
 }
 
+// latencyKey is the label set for a latency / TTFT histogram series.
+// The le field holds the bucket upper-bound as a string (e.g. "0.1")
+// so it can appear directly in the Prometheus label set.
+type latencyKey struct {
+	route string
+	le    string
+}
+
 // RouteCounters is a concurrency-safe collection of route-decision
 // counters. The zero value is NOT safe to use directly because Go
 // zero-value maps are nil — always construct via NewRouteCounters.
@@ -83,6 +99,11 @@ type counterKey struct {
 // before they reached an upstream:
 //   - nexus_requests_rejected_total{reason}
 //
+// Three latency families (issue #165) record per-request performance:
+//   - nexus_request_latency_seconds{route,le}
+//   - nexus_request_ttft_seconds{route,le}
+//   - nexus_request_errors_total{route}
+//
 // The reason label values are short, bounded strings (method,
 // body_too_large, bad_request, rate_limit, ...) defined as constants
 // in internal/handlers so the chat handler and the rate-limit
@@ -94,6 +115,15 @@ type RouteCounters struct {
 	slmDecisions             map[counterKey]*uint64
 	lowConfidenceEscalations map[counterKey]*uint64
 	rejections               map[string]*uint64
+
+	// Histogram series for latency / TTFT (issue #165). Each bucket
+	// is a separate counter keyed by route + le. Counters are
+	// atomically incremented; map mutations are guarded by the mutex.
+	latencyBuckets map[latencyKey]*uint64
+	ttftBuckets    map[latencyKey]*uint64
+
+	// Error counter per route (issue #165).
+	errors map[latencyKey]*uint64
 }
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
@@ -103,6 +133,9 @@ func NewRouteCounters() *RouteCounters {
 		slmDecisions:             make(map[counterKey]*uint64),
 		lowConfidenceEscalations: make(map[counterKey]*uint64),
 		rejections:               make(map[string]*uint64),
+		latencyBuckets:           make(map[latencyKey]*uint64),
+		ttftBuckets:              make(map[latencyKey]*uint64),
+		errors:                   make(map[latencyKey]*uint64),
 	}
 }
 
@@ -176,6 +209,47 @@ func (rc *RouteCounters) ObserveRejection(reason string) {
 	atomic.AddUint64(rc.reasonSlot(reason), 1)
 }
 
+// ObserveLatency records a single request's end-to-end latency, TTFT,
+// and error flag for the histogram families added in issue #165. Call
+// this once per proxied request after the upstream response has been
+// fully streamed (or failed). The method is safe for concurrent use
+// and never blocks; nil receivers are a no-op.
+//
+// Latency and TTFT are recorded in seconds. The observation is bucketed
+// into the standard Prometheus exponential histogram buckets so operators
+// can compute P50/P95/P99 via histogram_quantile.
+//
+// route is the chosen route ("local", "frontier", "fusion").
+// latencySeconds is the total wall-clock time from request receipt.
+// ttftSeconds is the time to first token (0 if not streaming).
+// isError is true when the upstream returned an error.
+func (rc *RouteCounters) ObserveLatency(route string, latencySeconds, ttftSeconds float64, isError bool) {
+	if rc == nil {
+		return
+	}
+	// Latency histogram: increment every bucket where le >= latency.
+	for _, le := range latencyBuckets {
+		if le >= latencySeconds {
+			k := latencyKey{route: route, le: fmt.Sprintf("%.3g", le)}
+			atomic.AddUint64(rc.latencySlot(k), 1)
+		}
+	}
+	// TTFT histogram: only meaningful for streaming requests (ttft > 0).
+	if ttftSeconds > 0 {
+		for _, le := range ttftBuckets {
+			if le >= ttftSeconds {
+				k := latencyKey{route: route, le: fmt.Sprintf("%.3g", le)}
+				atomic.AddUint64(rc.ttftSlot(k), 1)
+			}
+		}
+	}
+	// Error counter.
+	if isError {
+		k := latencyKey{route: route, le: ""}
+		atomic.AddUint64(rc.errorSlot(k), 1)
+	}
+}
+
 // reasonSlot returns the *uint64 for reason, creating it if absent.
 // Same lock-then-atomic pattern as slot: the mutex guards the map
 // mutation only, the increment happens lock-free.
@@ -186,6 +260,48 @@ func (rc *RouteCounters) reasonSlot(reason string) *uint64 {
 		v := uint64(0)
 		p = &v
 		rc.rejections[reason] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
+// latencySlot returns the *uint64 for a latency/ttft histogram bucket,
+// creating it if absent. Guarded by rc.mu.
+func (rc *RouteCounters) latencySlot(k latencyKey) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.latencyBuckets[k]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.latencyBuckets[k] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
+// ttftSlot returns the *uint64 for a TTFT histogram bucket, creating
+// it if absent. Guarded by rc.mu.
+func (rc *RouteCounters) ttftSlot(k latencyKey) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.ttftBuckets[k]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.ttftBuckets[k] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
+// errorSlot returns the *uint64 for an error counter, creating it if
+// absent. Guarded by rc.mu.
+func (rc *RouteCounters) errorSlot(k latencyKey) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.errors[k]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.errors[k] = p
 	}
 	rc.mu.Unlock()
 	return p
@@ -254,6 +370,27 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += n
 	}
+	if n, err := writeLatencyHistogram(w, "nexus_request_latency_seconds",
+		"End-to-end request latency in seconds, bucketed by route.",
+		rc.latencyBuckets); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeLatencyHistogram(w, "nexus_request_ttft_seconds",
+		"Time to first token in seconds, bucketed by route.",
+		rc.ttftBuckets); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeErrorSeries(w, "nexus_request_errors_total",
+		"Count of requests that encountered an upstream error, by route.",
+		rc.errors); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
 	return total, nil
 }
 
@@ -317,6 +454,83 @@ func writeRejectionSeries(w io.Writer, name, help string, m map[string]*uint64) 
 		n, err := fmt.Fprintf(w, "%s{reason=\"%s\"} %d\n", name, sanitizeLabel(k), v)
 		if err != nil {
 			return total + int64(n), err
+		}
+		total += int64(n)
+	}
+	return total, nil
+}
+
+// writeLatencyHistogram emits a Prometheus histogram family. The map
+// keys are route+le pairs; each bucket is emitted as a counter sample
+// with a le label. Output is sorted by route then le.
+func writeLatencyHistogram(w io.Writer, name, help string, m map[latencyKey]*uint64) (int64, error) {
+	var total int64
+	n, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s histogram\n", name, help, name)
+	if err != nil {
+		return total + int64(n), err
+	}
+	total += int64(n)
+	if len(m) == 0 {
+		return total, nil
+	}
+
+	// Group keys by route for ordered emission.
+	type bucketCount struct {
+		le  string
+		cnt uint64
+	}
+	byRoute := make(map[string][]bucketCount)
+	for k := range m {
+		byRoute[k.route] = append(byRoute[k.route], bucketCount{le: k.le, cnt: atomic.LoadUint64(m[k])})
+	}
+	var routes []string
+	for r := range byRoute {
+		routes = append(routes, r)
+	}
+	sort.Strings(routes)
+
+	for _, route := range routes {
+		counts := byRoute[route]
+		// Sort by le ascending.
+		sort.Slice(counts, func(i, j int) bool {
+			return counts[i].le < counts[j].le
+		})
+		for _, bc := range counts {
+			n, err := fmt.Fprintf(w, "%s{route=%q,le=%q} %d\n", name, route, bc.le, bc.cnt)
+			if err != nil {
+				return total, err
+			}
+			total += int64(n)
+		}
+	}
+	return total, nil
+}
+
+// writeErrorSeries emits the nexus_request_errors_total family.
+// It is a latencyKey-keyed variant of writeRejectionSeries so the
+// error counters (keyed by route only, le="") reuse the same struct.
+func writeErrorSeries(w io.Writer, name, help string, m map[latencyKey]*uint64) (int64, error) {
+	var total int64
+	n, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", name, help, name)
+	if err != nil {
+		return total + int64(n), err
+	}
+	total += int64(n)
+	if len(m) == 0 {
+		return total, nil
+	}
+	var keys []latencyKey
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return keys[i].route < keys[j].route
+	})
+	for _, k := range keys {
+		v := atomic.LoadUint64(m[k])
+		n, err := fmt.Fprintf(w, "%s{route=%q} %d\n", name, sanitizeLabel(k.route), v)
+		if err != nil {
+			return total, err
 		}
 		total += int64(n)
 	}

@@ -170,6 +170,33 @@ type RejectionObserverFunc func(RejectionEvent)
 // ObserveRejection implements RejectionObserver.
 func (f RejectionObserverFunc) ObserveRejection(e RejectionEvent) { f(e) }
 
+// LatencyEvent carries the per-request latency metrics needed by the
+// histogram families added in issue #165. All timing fields are in
+// seconds; isError is true when the upstream returned an error.
+type LatencyEvent struct {
+	Route            string
+	LatencySeconds   float64
+	TTFTSeconds      float64
+	IsError          bool
+}
+
+// LatencyObserver is the hook the chat handler invokes once per proxied
+// request with a LatencyEvent payload (issue #165). Same invariants as
+// the other observer hooks: safe to call from many goroutines, must not
+// block, may be nil. The handler does not import the observability
+// package; main.go wires a closure that forwards to
+// RouteCounters.ObserveLatency.
+type LatencyObserver interface {
+	ObserveLatency(LatencyEvent)
+}
+
+// LatencyObserverFunc adapts a plain function to the LatencyObserver
+// interface so wiring from main.go stays a one-liner.
+type LatencyObserverFunc func(LatencyEvent)
+
+// ObserveLatency implements LatencyObserver.
+func (f LatencyObserverFunc) ObserveLatency(e LatencyEvent) { f(e) }
+
 // MetricsEvent carries the per-request data needed by the savings
 // dashboard (issue #4). Fields track the full Round-trip metrics:
 // route/model/input-tokens are routing dimensions; TOON/RAG/cost are
@@ -429,6 +456,16 @@ type Deps struct {
 	// observability package — main.go wires a closure that adapts
 	// the event to the in-process rejection counter.
 	RejectionObserver RejectionObserver
+
+	// LatencyObserver is invoked once per proxied request with the
+	// end-to-end latency, TTFT, and error flag (issue #165).
+	// Implementations must be safe for concurrent use; the handler
+	// invokes the observer on the request goroutine so observers
+	// should not block for long. Nil is treated as "no observer";
+	// the hot path is unaffected. The handler does not import the
+	// observability package — main.go wires a closure that forwards
+	// to RouteCounters.ObserveLatency.
+	LatencyObserver LatencyObserver
 
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
@@ -1206,6 +1243,19 @@ func Chat(d Deps) http.Handler {
 		}
 		outputTokens := int(obs.BytesOut() / 4)
 		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr, fusionArbiterSkipped, toolCallCount, decision)
+		// LatencyObserver (issue #165): emit after the record so the
+		// timing values are final. Converting ms -> s here to match
+		// the seconds unit the histogram family uses.
+		if d.LatencyObserver != nil {
+			latencySeconds := totalMs / 1000.0
+			ttftSeconds := float64(ttftMs) / 1000.0
+			d.LatencyObserver.ObserveLatency(LatencyEvent{
+				Route:          string(route),
+				LatencySeconds: latencySeconds,
+				TTFTSeconds:    ttftSeconds,
+				IsError:        upErr != nil,
+			})
+		}
 		if d.MetricsObserver != nil {
 			postCompressionChars := totalMessageChars(messages)
 			savings := totalTokenSavings(preCompressionChars, postCompressionChars)
