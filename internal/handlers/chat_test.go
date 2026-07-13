@@ -687,10 +687,11 @@ type recordingObserver struct {
 	seen []LocalCompletion
 }
 
-func (r *recordingObserver) Submit(c LocalCompletion) {
+func (r *recordingObserver) Submit(c LocalCompletion) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.seen = append(r.seen, c)
+	return true
 }
 
 func (r *recordingObserver) Snapshot() []LocalCompletion {
@@ -1023,6 +1024,127 @@ type errTransport struct{}
 
 func (errTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return nil, errors.New("simulated network down")
+}
+
+// frontierTruncTransport serves a frontier response that yields one
+// complete SSE chunk and then drops the connection mid-stream
+// (io.ErrUnexpectedEOF), reproducing issue #118 at the handler level.
+// RecordingTransport cannot simulate this — its RoundTrip always
+// returns a fully-buffered body that ends in a clean io.EOF.
+type frontierTruncTransport struct{}
+
+func (frontierTruncTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	chunk := "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(&truncBodyReader{data: []byte(chunk)}),
+	}, nil
+}
+
+// truncBodyReader yields data then returns io.ErrUnexpectedEOF,
+// mimicking an HTTP chunked body whose connection closed before the
+// terminating 0-length chunk.
+type truncBodyReader struct {
+	data []byte
+	pos  int
+}
+
+func (r *truncBodyReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.ErrUnexpectedEOF
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	return n, nil
+}
+
+// truncationObserverRecorder captures StreamTruncationEvent
+// dispatches so handler tests can assert the hook fired with the
+// expected route. Mirrors the rejectionRecorder pattern.
+type truncationObserverRecorder struct {
+	mu     sync.Mutex
+	events []StreamTruncationEvent
+}
+
+func (r *truncationObserverRecorder) ObserveStreamTruncation(e StreamTruncationEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, e)
+}
+
+func (r *truncationObserverRecorder) snapshot() []StreamTruncationEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]StreamTruncationEvent, len(r.events))
+	copy(out, r.events)
+	return out
+}
+
+// TestChatFrontierStreamTruncationHandled exercises issue #118 at the
+// handler level: a guardrail-forced frontier stream that drops
+// mid-stream is self-healed inside upstream.StreamWithContext
+// (truncation event + [DONE]). The handler must keep the 200 status
+// (NOT write a 502 into the already-committed SSE stream), stamp
+// X-Nexus-Truncated, and dispatch the StreamTruncationObserver so
+// /metrics records the truncation.
+func TestChatFrontierStreamTruncationHandled(t *testing.T) {
+	deps, _ := baseDeps(t)
+	deps.Client = &http.Client{Transport: frontierTruncTransport{}}
+	obs := &truncationObserverRecorder{}
+	deps.StreamTruncationObserver = obs
+
+	// Large prompt forces the token guardrail -> route=frontier.
+	body := `{"stream":true,"messages":[{"role":"user","content":"` + strings.Repeat("a", 30000) + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (proxy self-healed); body=%q", rw.Code, rw.Body.String())
+	}
+	out := rw.Body.String()
+	if !strings.Contains(out, `"type":"upstream_truncated"`) {
+		t.Errorf("body missing truncation event: %q", out)
+	}
+	if !strings.HasSuffix(out, "data: [DONE]\n\n") {
+		t.Errorf("body must end with [DONE] sentinel, got %q", out)
+	}
+	if got := rw.Header().Get("X-Nexus-Truncated"); got != "true" {
+		t.Errorf("X-Nexus-Truncated = %q, want \"true\"", got)
+	}
+	events := obs.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("StreamTruncationObserver events = %d, want 1", len(events))
+	}
+	if events[0].Route != string(router.RouteFrontier) {
+		t.Errorf("truncation route = %q, want %q", events[0].Route, router.RouteFrontier)
+	}
+}
+
+// TestChatFrontierStreamTruncationObserverNilSafe confirms a nil
+// StreamTruncationObserver does not break the truncation path — the
+// proxy still self-heals with [DONE] and X-Nexus-Truncated (issue
+// #118 wiring: the hook is optional, like the other observers).
+func TestChatFrontierStreamTruncationObserverNilSafe(t *testing.T) {
+	deps, _ := baseDeps(t)
+	deps.Client = &http.Client{Transport: frontierTruncTransport{}}
+	// deps.StreamTruncationObserver deliberately left nil.
+
+	body := `{"stream":true,"messages":[{"role":"user","content":"` + strings.Repeat("a", 30000) + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rw.Code, rw.Body.String())
+	}
+	if got := rw.Header().Get("X-Nexus-Truncated"); got != "true" {
+		t.Errorf("X-Nexus-Truncated = %q, want \"true\"", got)
+	}
+	if !strings.HasSuffix(rw.Body.String(), "data: [DONE]\n\n") {
+		t.Errorf("body must end with [DONE] sentinel, got %q", rw.Body.String())
+	}
 }
 
 // TestChatTelemetryJSONLRecorderEndToEnd wires the production

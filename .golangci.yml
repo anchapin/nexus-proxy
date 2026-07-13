@@ -46,6 +46,14 @@ linters:
           - errcheck
         text: fmt\.F(print|printf|println)
 
+      # internal/observability/prometheus.go writes metrics to io.Writer in
+      # "fire-and-forget" style (same as cmd/ helpers). Unchecked errors
+      # are intentional per the v1 behaviour which excluded these paths.
+      - path: internal/observability/prometheus\.go$
+        linters:
+          - errcheck
+        text: fmt\.F(print|printf|println)
+
       # resp.Body.Close and rows.Close ignored in non-critical paths
       # (matches v1 behaviour which excluded these via less-granular rules).
       - path: (.+)\.go$
