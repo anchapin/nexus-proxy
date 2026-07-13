@@ -34,8 +34,8 @@ func TestGuardCheckDisabled(t *testing.T) {
 // TestGuardRecordAndState verifies Record updates State correctly.
 func TestGuardRecordAndState(t *testing.T) {
 	g := NewGuard(100.0)
-	g.Record(25.0)
-	g.Record(30.0)
+	g.Record(25.0, "frontier")
+	g.Record(30.0, "frontier")
 
 	state := g.State()
 	if state.Spent != 55.0 {
@@ -55,7 +55,7 @@ func TestGuardRecordAndState(t *testing.T) {
 // TestGuardExhausted verifies Exhausted is true when spent >= limit.
 func TestGuardExhausted(t *testing.T) {
 	g := NewGuard(100.0)
-	g.Record(100.0)
+	g.Record(100.0, "frontier")
 
 	state := g.State()
 	if !state.Exhausted {
@@ -66,8 +66,8 @@ func TestGuardExhausted(t *testing.T) {
 // TestGuardRecordZeroOrNegative is a no-op.
 func TestGuardRecordZeroOrNegative(t *testing.T) {
 	g := NewGuard(100.0)
-	g.Record(0.0)
-	g.Record(-10.0)
+	g.Record(0.0, "frontier")
+	g.Record(-10.0, "frontier")
 
 	state := g.State()
 	if state.Spent != 0.0 {
@@ -79,7 +79,7 @@ func TestGuardRecordZeroOrNegative(t *testing.T) {
 // guard returns false even when spend would exceed the limit.
 func TestGuardCheckDisabledNeverBlocks(t *testing.T) {
 	g := NewGuard(0) // disabled
-	g.Record(1000.0)
+	g.Record(1000.0, "frontier")
 	if g.Check(50.0) {
 		t.Error("Check on disabled guard should always return false")
 	}
@@ -88,7 +88,7 @@ func TestGuardCheckDisabledNeverBlocks(t *testing.T) {
 // TestGuardSetLimit updates the limit dynamically.
 func TestGuardSetLimit(t *testing.T) {
 	g := NewGuard(100.0)
-	g.Record(50.0)
+	g.Record(50.0, "frontier")
 
 	g.SetLimit(40.0)
 	state := g.State()
@@ -113,7 +113,7 @@ func TestGuardCheckAfterSetLimit(t *testing.T) {
 // TestGuardStateNextReset verifies NextReset is set correctly.
 func TestGuardStateNextReset(t *testing.T) {
 	g := NewGuard(100.0)
-	g.Record(10.0)
+	g.Record(10.0, "frontier")
 
 	state := g.State()
 	if state.NextReset.IsZero() {
@@ -157,7 +157,7 @@ func TestGuardNilAlerterNoPanic(t *testing.T) {
 			}
 		}()
 		g.Check(50.0)
-		g.Record(50.0)
+		g.Record(50.0, "frontier")
 		g.CheckApproaching()
 	}()
 }

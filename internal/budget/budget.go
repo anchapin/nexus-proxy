@@ -23,10 +23,11 @@ const (
 	Window = 24 * time.Hour
 )
 
-// Entry is one recorded frontier call cost with its timestamp.
+// Entry is one recorded frontier call cost with its timestamp and source.
 type Entry struct {
-	At   time.Time
-	Cost float64 // USD
+	At     time.Time
+	Cost   float64 // USD
+	Source string  // label such as "frontier" or "judge"
 }
 
 // State is the budget guard's read-only snapshot returned by State().
@@ -53,8 +54,10 @@ type Guard struct {
 type Alerter interface {
 	// OnExceed is called when a request would exceed the budget.
 	OnExceed(State)
-	// OnSpend is called after a spend amount is recorded.
-	OnSpend(State, float64)
+	// OnSpend is called after a spend amount is recorded. The source
+	// label (e.g. "frontier" or "judge") allows the alerter to
+	// attribute spend to its origin.
+	OnSpend(State, float64, string)
 	// OnApproaching is called when spend crosses the approaching threshold
 	// (e.g., 80% of limit). It is called at most once per threshold crossing.
 	OnApproaching(State)
@@ -110,8 +113,11 @@ func (g *Guard) Check(cost float64) bool {
 // stale entries before inserting. Calling Record with cost=0 or when the
 // guard is disabled (limit=0) is a no-op.
 //
+// The source label (e.g. "frontier" or "judge") is stored with the entry
+// and passed to the alerter's OnSpend callback so spend can be attributed.
+//
 // If an alerter is set, it is called with the updated state after recording.
-func (g *Guard) Record(cost float64) {
+func (g *Guard) Record(cost float64, source string) {
 	if cost <= 0 {
 		return
 	}
@@ -121,12 +127,12 @@ func (g *Guard) Record(cost float64) {
 		return
 	}
 	g.evictLocked()
-	g.window = append(g.window, Entry{At: time.Now(), Cost: cost})
+	g.window = append(g.window, Entry{At: time.Now(), Cost: cost, Source: source})
 	state := g.copyStateLocked()
 	g.mu.Unlock()
 
 	if g.alerter != nil {
-		g.alerter.OnSpend(state, cost)
+		g.alerter.OnSpend(state, cost, source)
 	}
 }
 

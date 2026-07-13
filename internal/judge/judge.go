@@ -37,6 +37,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/budget"
 )
 
 // Sample is the input that triggers one judge attempt: the original
@@ -91,6 +93,7 @@ type Config struct {
 	QueueDepth  int           // buffered channel size (default 64)
 	Timeout     time.Duration // per-call judge timeout (default 30s)
 	CostPer1K   float64       // USD per 1k tokens (input+output); default 0.002
+	BudgetGuard *budget.Guard  // optional budget guard to record judge costs
 }
 
 // applyDefaults fills zero fields with sane values. It mutates cfg.
@@ -235,6 +238,10 @@ func (e *Evaluator) worker() {
 				slog.String("request_id", s.RequestID),
 				slog.Any("err", err),
 			)
+		}
+		// Wire judge cost into the budget guard (issue #240).
+		if e.cfg.BudgetGuard != nil && score.Cost > 0 {
+			e.cfg.BudgetGuard.Record(score.Cost, "judge")
 		}
 	}
 }
