@@ -82,6 +82,10 @@ type Record struct {
 	Streaming               bool      `json:"streaming"`
 	FusionArbiterSkipped    bool      `json:"fusion_arbiter_skipped,omitempty"`
 	FusionJaccardSimilarity float64   `json:"fusion_jaccard_similarity,omitempty"`
+	// FusionArbiterCostUSD (issue #239) is the estimated cost of the
+	// arbiter call when it ran (route=fusion and agreement threshold
+	// not met). 0 when the arbiter was skipped or for non-fusion routes.
+	FusionArbiterCostUSD    float64   `json:"fusion_arbiter_cost_usd,omitempty"`
 	ToolCallCount           int       `json:"tool_call_count,omitempty"`
 	Error                   string    `json:"error,omitempty"`
 

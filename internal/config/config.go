@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/middleware"
+	ragpkg "github.com/anchapin/nexus-proxy/internal/rag"
 )
 
 // Config holds all runtime knobs for the proxy. A zero value is invalid;
@@ -79,6 +80,15 @@ type Config struct {
 	// RAG
 	ExamplesDir  string  // "./few_shot_examples"
 	RAGThreshold float64 // cosine similarity cutoff for retrieval (0.55)
+
+	// RAG embedder plugin interface (issue #238). EmbedderType selects
+	// the backend: "ollama" (default), "openai", or "cohere". When
+	// "openai" or "cohere" is selected the corresponding API key must
+	// also be configured. The base URL for the remote backends defaults
+	// to the standard public endpoints; override via NEXUS_EMBEDDER_BASE_URL.
+	EmbedderType     ragpkg.EmbedderType // "ollama" | "openai" | "cohere"
+	EmbedderBaseURL  string              // base URL for openai/cohere embedder
+	CohereAPIKey     string              // NEXUS_COHERE_API_KEY
 
 	// RAG persistence (issue #46). When RAGDBPath is set, the few-shot
 	// embeddings are cached on disk and reloaded on boot without
@@ -451,6 +461,25 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.RAGEmbedCacheSize = embedCacheSize
+
+	// RAG embedder plugin interface (issue #238). The type selects
+	// which backend the RAG store uses for vector embeddings.
+	// Defaults to "ollama" so a stock deployment is unchanged.
+	cfg.EmbedderType = ragpkg.EmbedderType(strings.ToLower(strings.TrimSpace(
+		getEnv("NEXUS_EMBEDDER_TYPE", "ollama"))))
+	// Base URL for remote embedder backends (openai/cohere). The
+	// default matches each provider's public endpoint, so operators
+	// only need to set the API key.
+	switch cfg.EmbedderType {
+	case ragpkg.EmbedderTypeOpenAI:
+		cfg.EmbedderBaseURL = getEnv("NEXUS_EMBEDDER_BASE_URL", "https://api.openai.com/v1")
+	case ragpkg.EmbedderTypeCohere:
+		cfg.EmbedderBaseURL = getEnv("NEXUS_EMBEDDER_BASE_URL", "https://api.cohere.ai/v1")
+	default:
+		// Ollama: base URL is already in OllamaURL; reuse it.
+		cfg.EmbedderBaseURL = cfg.OllamaURL
+	}
+	cfg.CohereAPIKey = getEnv("NEXUS_COHERE_API_KEY", "")
 
 	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
 	if err != nil {

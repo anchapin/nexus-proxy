@@ -94,7 +94,14 @@ func main() {
 	// collaborator so all traffic shares the same transport.
 	httpClient := transport.NewFromEnv()
 
-	emb := rag.NewOllamaEmbedder(cfg.OllamaURL, cfg.EmbeddingModel, httpClient)
+	emb, err := rag.NewEmbedder(cfg.EmbedderType, cfg.EmbedderBaseURL, cfg.EmbeddingModel, cfg.FrontierKey, httpClient)
+	if err != nil {
+		log.Fatalf("rag embedder: %v", err)
+	}
+	slog.Info("rag embedder configured",
+		slog.String("type", string(cfg.EmbedderType)),
+		slog.String("model", cfg.EmbeddingModel),
+	)
 	bootCtx, cancel := context.WithTimeout(context.Background(), bootRAGTimeout)
 	defer cancel()
 

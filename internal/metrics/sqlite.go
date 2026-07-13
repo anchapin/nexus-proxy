@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS requests (
     streaming INTEGER NOT NULL DEFAULT 1,
     fusion_arbiter_skipped INTEGER NOT NULL DEFAULT 0,
     fusion_jaccard_similarity REAL NOT NULL DEFAULT 0,
+    fusion_arbiter_cost_usd REAL NOT NULL DEFAULT 0,
     error TEXT NOT NULL DEFAULT '',
     route_source TEXT NOT NULL DEFAULT '',
     route_reason TEXT NOT NULL DEFAULT '',
@@ -81,6 +82,8 @@ var additiveMigrations = []string{
 	`ALTER TABLE requests ADD COLUMN fusion_jaccard_similarity REAL NOT NULL DEFAULT 0`,
 	// Issue #247: TOON compression method
 	`ALTER TABLE requests ADD COLUMN toon_compression_method TEXT NOT NULL DEFAULT ''`,
+	// Issue #239: arbiter cost tracking
+	`ALTER TABLE requests ADD COLUMN fusion_arbiter_cost_usd REAL NOT NULL DEFAULT 0`,
 }
 
 // runAdditiveMigrations executes the additive ALTER TABLE migrations.
@@ -128,9 +131,9 @@ const insertSQL = `INSERT INTO requests
      rag_injected, rag_filename, estimated_cost_usd,
      baseline_cost_usd, savings_usd,
      ttft_ms, total_latency_ms, tps, streaming,
-     fusion_arbiter_skipped, fusion_jaccard_similarity, error,
+     fusion_arbiter_skipped, fusion_jaccard_similarity, fusion_arbiter_cost_usd, error,
      route_source, route_reason, slm_confidence, slm_task_type)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // SQLiteStore is the production Store implementation (issue #4).
 // Writes are funnelled through a buffered channel and a single
@@ -335,7 +338,7 @@ func (s *SQLiteStore) writeOne(req Request) {
 		ragInjected, req.RAGFilename, req.EstimatedCostUSD,
 		req.BaselineCostUSD, req.SavingsUSD,
 		req.TTFTMs, req.TotalLatencyMs, req.TPS, streaming,
-		fusionArbiterSkipped, req.FusionJaccardSimilarity, req.Error,
+		fusionArbiterSkipped, req.FusionJaccardSimilarity, req.FusionArbiterCostUSD, req.Error,
 		req.RouteSource, req.RouteReason, req.SLMConfidence, req.SLMTaskType,
 	)
 	if err != nil {
