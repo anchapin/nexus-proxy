@@ -128,7 +128,7 @@ const insertSQL = `INSERT INTO requests
      ttft_ms, total_latency_ms, tps, streaming,
      fusion_arbiter_skipped, fusion_jaccard_similarity, error,
      route_source, route_reason, slm_confidence, slm_task_type)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // SQLiteStore is the production Store implementation (issue #4).
 // Writes are funnelled through a buffered channel and a single
