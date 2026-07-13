@@ -48,8 +48,8 @@ func TestSQLiteStoreOnDisk(t *testing.T) {
 	for i := 0; i < n; i++ {
 		if err := store1.Record(JudgeScore{
 			RequestID: fmt.Sprintf("req-disk-%d", i),
-			Score:    i + 1,
-			Cost:     0.001,
+			Score:     i + 1,
+			Cost:      0.001,
 		}); err != nil {
 			t.Fatalf("Record %d: %v", i, err)
 		}

@@ -213,7 +213,7 @@ type Config struct {
 	JudgeQueueDepth   int           // buffered channel size (default 64)
 	JudgeTimeout      time.Duration // per-call judge timeout (default 30s)
 	JudgeCostPer1KUSD float64       // rough USD/1k-token rate for cost estimates
-	JudgeDBPath      string        // on-disk SQLite database for judge scores; empty disables Detected
+	JudgeDBPath       string        // on-disk SQLite database for judge scores; empty disables Detected
 	// edits enqueue a background `cargo check` / `npx tsc` and the
 	// verdict (1 = clean, 0 = fail/timeout) is reported via a
 	// callback to cmd/nexus/main.go. QualityEnabled is true iff

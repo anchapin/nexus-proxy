@@ -62,11 +62,9 @@ type SQLiteStore struct {
 	path string // "" for ":memory:"
 
 	ch      chan JudgeScore
-	dropped uint64
 	wg      sync.WaitGroup
 	closed  bool
 	closeMu sync.Mutex
-	closeFn func() error
 }
 
 // OpenSQLiteStore opens (or creates) a SQLite database at path and
