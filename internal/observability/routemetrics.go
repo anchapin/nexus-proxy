@@ -124,7 +124,6 @@ type RouteCounters struct {
 
 }
 
-
 // NewRouteCounters returns a ready-to-use RouteCounters.
 func NewRouteCounters() *RouteCounters {
 	hits, misses := uint64(0), uint64(0)

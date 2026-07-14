@@ -593,8 +593,6 @@ func main() {
 	// snapshot.
 	routeCounters := observability.NewRouteCounters()
 
-
-
 	routeDecisionObs := handlers.RouteDecisionObserverFunc(func(e handlers.RouteDecisionEvent) {
 		routeCounters.Observe(e.Route, e.Source, e.Confidence, e.TaskType, "")
 		// Issue #206: record SLM cache hit/miss.

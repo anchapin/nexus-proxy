@@ -110,7 +110,7 @@ type Config struct {
 	// consecutive Ollama /api/embeddings failures the breaker trips and
 	// enters a cooldown window during which Embed returns ErrCircuitOpen.
 	RAGCircuitBreakerThreshold int           // consecutive failures to trip; 0 = disabled
-	RAGCircuitBreakerCooldown time.Duration // cooldown duration after trip
+	RAGCircuitBreakerCooldown  time.Duration // cooldown duration after trip
 
 	// Routing
 	TokenGuardrail            int           // estimated tokens above this force frontier (6000)
