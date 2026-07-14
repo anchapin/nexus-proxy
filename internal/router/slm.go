@@ -2,24 +2,17 @@ package router
 
 import (
 	"bytes"
-	"container/list"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 )
-
-// ErrFallback is a sentinel error returned when a transport/HTTP error
-// causes an internal fallback to RouteFrontier. It signals that the
-// decision should NOT be cached (so transient failures are retried).
-var ErrFallback = errors.New("slm: fallback due to transport error")
 
 // SLMClient talks to a local Ollama /api/chat endpoint and asks the small
 // model to produce a routing decision. The HTTP layer is abstracted so
@@ -40,24 +33,24 @@ type SLMClient struct {
 	ConfidenceFloor   float64
 	ConfidenceCeiling float64
 
-	// SLM decision cache (issue #116). Caches routing decisions keyed by
-	// SHA256(prompt) to avoid repeated Ollama round-trips for identical
-	// prompts. Size 0 disables the cache. TTL 0 means no expiry (pure
-	// LRU eviction). Transport errors (network, non-200, parse failure)
-	// are never cached so transient failures are retried.
-	cacheMu   sync.Mutex
-	cache     map[string]*list.Element
-	cacheList *list.List
-	cacheSize int
-	cacheTTL  time.Duration
+	// SLM routing decision cache (issue #162). Caches identical prompts
+	// keyed by FNV-1a hash of (prompt, systemPrompt) so that repeated
+	// prompts (e.g. looping coding agents, repeated RAG queries) avoid
+	// a full 8s Ollama round-trip. cacheTTL controls entry expiry;
+	// cacheMaxEntries caps memory use with LRU eviction.
+	CacheTTL        time.Duration // default 5m
+	CacheMaxEntries int           // default 512
+
+	cacheMu sync.RWMutex
+	cache   map[string]*cacheEntry
+	hits    int64
+	misses  int64
 }
 
-type slmCacheEntry struct {
-	key        string
-	route      Route
-	confidence float64
-	taskType   string
-	timestamp  time.Time
+// cacheEntry pairs a route decision with its expiry time.
+type cacheEntry struct {
+	Route     Route
+	ExpiresAt time.Time
 }
 
 // NewSLMClient constructs a client. Pass nil for Client to use
@@ -67,115 +60,13 @@ func NewSLMClient(baseURL, model string, timeout time.Duration, client *http.Cli
 		client = http.DefaultClient
 	}
 	return &SLMClient{
-		BaseURL:   baseURL,
-		Model:     model,
-		Timeout:   timeout,
-		Client:    client,
-		cache:     make(map[string]*list.Element),
-		cacheList: list.New(),
-	}
-}
-
-// NewSLMClientWithCache constructs a client with the given cache size and
-// TTL. Size 0 disables the cache. TTL 0 means no expiry (pure LRU
-// eviction). Pass nil for Client to use http.DefaultClient.
-func NewSLMClientWithCache(baseURL, model string, timeout time.Duration, client *http.Client, cacheSize int, cacheTTL time.Duration) *SLMClient {
-	if client == nil {
-		client = http.DefaultClient
-	}
-	if cacheSize < 0 {
-		cacheSize = 0
-	}
-	if cacheTTL < 0 {
-		cacheTTL = 0
-	}
-	return &SLMClient{
-		BaseURL:   baseURL,
-		Model:     model,
-		Timeout:   timeout,
-		Client:    client,
-		cache:     make(map[string]*list.Element),
-		cacheList: list.New(),
-		cacheSize: cacheSize,
-		cacheTTL:  cacheTTL,
-	}
-}
-
-// WithCache configures the SLM decision cache. size <= 0 disables the
-// cache. ttl <= 0 means no expiry (pure LRU eviction). This is a
-// fluent setter so it can be chained: NewSLMClient(...).WithCache(1024, 5*time.Minute).
-func (c *SLMClient) WithCache(size int, ttl time.Duration) *SLMClient {
-	if size <= 0 {
-		c.cacheSize = 0
-		c.cache = nil
-		c.cacheList = nil
-		return c
-	}
-	c.cacheSize = size
-	c.cacheTTL = ttl
-	c.cache = make(map[string]*list.Element)
-	c.cacheList = list.New()
-	return c
-}
-
-func (c *SLMClient) cacheKey(prompt string) string {
-	h := sha256.Sum256([]byte(prompt))
-	return hex.EncodeToString(h[:])
-}
-
-// cacheGet returns (route, confidence, taskType, ok). ok=false on miss
-// or TTL expiry. On TTL expiry the stale entry is evicted.
-func (c *SLMClient) cacheGet(key string) (Route, float64, string, bool) {
-	if c.cacheSize <= 0 || c.cache == nil {
-		return "", 0, "", false
-	}
-	c.cacheMu.Lock()
-	defer c.cacheMu.Unlock()
-	el, ok := c.cache[key]
-	if !ok {
-		return "", 0, "", false
-	}
-	entry := el.Value.(*slmCacheEntry)
-	if c.cacheTTL > 0 && time.Since(entry.timestamp) > c.cacheTTL {
-		c.cacheList.Remove(el)
-		delete(c.cache, key)
-		return "", 0, "", false
-	}
-	c.cacheList.MoveToFront(el)
-	return entry.route, entry.confidence, entry.taskType, true
-}
-
-// cachePut stores a decision in the LRU cache.
-func (c *SLMClient) cachePut(key string, route Route, confidence float64, taskType string) {
-	if c.cacheSize <= 0 || c.cache == nil {
-		return
-	}
-	c.cacheMu.Lock()
-	defer c.cacheMu.Unlock()
-	// Double-check in case another goroutine already inserted
-	if el, ok := c.cache[key]; ok {
-		c.cacheList.MoveToFront(el)
-		entry := el.Value.(*slmCacheEntry)
-		entry.route = route
-		entry.confidence = confidence
-		entry.taskType = taskType
-		entry.timestamp = time.Now()
-		return
-	}
-	entry := &slmCacheEntry{
-		key:        key,
-		route:      route,
-		confidence: confidence,
-		taskType:   taskType,
-		timestamp:  time.Now(),
-	}
-	el := c.cacheList.PushFront(entry)
-	c.cache[key] = el
-	if c.cacheList.Len() > c.cacheSize {
-		if oldest := c.cacheList.Back(); oldest != nil {
-			c.cacheList.Remove(oldest)
-			delete(c.cache, oldest.Value.(*slmCacheEntry).key)
-		}
+		BaseURL:         baseURL,
+		Model:           model,
+		Timeout:         timeout,
+		Client:          client,
+		CacheTTL:        5 * time.Minute,
+		CacheMaxEntries: 512,
+		cache:           make(map[string]*cacheEntry),
 	}
 }
 
@@ -220,36 +111,8 @@ func (c *SLMClient) Decide(ctx context.Context, prompt string) (Route, error) {
 // historical judge scores (see ConfidenceStore). Below the floor the
 // system prompt gains a frontier bias; above the ceiling a local bias;
 // inside the neutral band the request is unchanged from Decide.
-//
-// Caching (issue #116): decisions are cached keyed on SHA256(prompt|confidence)
-// so that different bias notes do not collide. Transport errors (network,
-// non-200, parse failure) are never cached so transient failures are retried.
 func (c *SLMClient) DecideWithConfidence(ctx context.Context, prompt string, confidence float64) (Route, error) {
-	systemPrompt := c.systemPromptFor(confidence)
-
-	// Check cache first (issue #116). Key includes confidence since
-	// different confidence values produce different system prompts.
-	if c.cacheSize > 0 {
-		key := c.cacheKey(prompt + "|" + fmt.Sprintf("%.6f", confidence))
-		if route, _, _, ok := c.cacheGet(key); ok {
-			return route, nil
-		}
-	}
-
-	route, err := c.decide(ctx, prompt, systemPrompt)
-	if err != nil {
-		// Do NOT cache fallback results — transient failures must be retried.
-		return RouteFrontier, err
-	}
-
-	// Cache successful decisions only (issue #116). Errors fall through
-	// to frontier without polluting the cache.
-	if c.cacheSize > 0 {
-		key := c.cacheKey(prompt + "|" + fmt.Sprintf("%.6f", confidence))
-		c.cachePut(key, route, confidence, "")
-	}
-
-	return route, nil
+	return c.decide(ctx, prompt, c.systemPromptFor(confidence))
 }
 
 // systemPromptFor returns the SLM system prompt for the given confidence,
@@ -274,8 +137,79 @@ func (c *SLMClient) systemPromptFor(confidence float64) string {
 	}
 }
 
+// cacheKey returns the FNV-1a hash key for a (prompt, systemPrompt) pair.
+// The same logical prompt always produces the same key regardless of
+// SLMClient pointer equality, so callers can use this for pre-check.
+func cacheKey(prompt, systemPrompt string) string {
+	h := fnv.New64a()
+	h.Write([]byte(prompt))
+	h.Write([]byte(systemPrompt))
+	return fmt.Sprintf("%x", h.Sum64())
+}
+
+// CacheStats returns the current cache hit and miss counts.
+func (c *SLMClient) CacheStats() (hits, misses int64) {
+	c.cacheMu.RLock()
+	defer c.cacheMu.RUnlock()
+	return c.hits, c.misses
+}
+
+// evictStale removes expired entries and enforces the max-entries cap via
+// simple FIFO eviction: expired entries are always removed; if the cache
+// is still over capacity after expired entry removal, the oldest entry
+// (by map iteration order, which is insertion order for the map key set)
+// is evicted. This is a best-effort LRU approximation — good enough for
+// the cache size limits in use (512 entries).
+func (c *SLMClient) evictStale() {
+	now := time.Now()
+	max := c.CacheMaxEntries
+	if max <= 0 {
+		max = 512
+	}
+
+	// Phase 1: remove all expired entries.
+	for k, e := range c.cache {
+		if now.After(e.ExpiresAt) {
+			delete(c.cache, k)
+		}
+	}
+
+	// Phase 2: if still over capacity, evict oldest entries.
+	if len(c.cache) >= max {
+		evict := len(c.cache) - max + 1
+		// Map iteration order is intentionally undefined, but for a
+		// small map (≤512) iteration is deterministic within a single
+		// program run. Evict the first evict keys encountered.
+		removed := 0
+		for k := range c.cache {
+			delete(c.cache, k)
+			removed++
+			if removed >= evict {
+				break
+			}
+		}
+	}
+}
+
 // decide performs the HTTP round-trip with the supplied system prompt.
 func (c *SLMClient) decide(ctx context.Context, prompt, systemPrompt string) (Route, error) {
+	var key string
+	caching := c.CacheMaxEntries > 0
+	if caching {
+		key = cacheKey(prompt, systemPrompt)
+		// Fast path: check cache before HTTP call (issue #162).
+		c.cacheMu.RLock()
+		entry, ok := c.cache[key]
+		hit := ok && time.Now().Before(entry.ExpiresAt)
+		if hit {
+			c.hits++
+		}
+		c.cacheMu.RUnlock()
+		if hit {
+			return entry.Route, nil
+		}
+	}
+
 	payload, _ := json.Marshal(map[string]interface{}{
 		"model": c.Model,
 		"messages": []map[string]string{
@@ -303,20 +237,16 @@ func (c *SLMClient) decide(ctx context.Context, prompt, systemPrompt string) (Ro
 
 	resp, err := c.Client.Do(req)
 	if err != nil {
-		// Transport error → return ErrFallback so DecideWithConfidence
-		// skips the cache put (transient failures must be retried).
-		return RouteFrontier, fmt.Errorf("%w: %w", ErrFallback, err)
+		return RouteFrontier, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		// Read error → return ErrFallback sentinel.
-		return RouteFrontier, fmt.Errorf("%w: read: %w", ErrFallback, err)
+		return RouteFrontier, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		// Non-2xx status → return ErrFallback sentinel.
-		return RouteFrontier, fmt.Errorf("%w: status %d", ErrFallback, resp.StatusCode)
+		return RouteFrontier, fmt.Errorf("slm: status %d: %s", resp.StatusCode, body)
 	}
 
 	var raw struct {
@@ -336,12 +266,28 @@ func (c *SLMClient) decide(ctx context.Context, prompt, systemPrompt string) (Ro
 		return RouteFrontier, err
 	}
 
-	switch Route(strings.ToLower(decision.Route)) {
-	case RouteLocal, RouteFusion:
-		return Route(strings.ToLower(decision.Route)), nil
-	default:
-		return RouteFrontier, nil
+	route := Route(strings.ToLower(decision.Route))
+	if route != RouteLocal && route != RouteFusion {
+		route = RouteFrontier
 	}
+
+	// Populate cache on successful HTTP response (issue #162).
+	if caching {
+		c.cacheMu.Lock()
+		c.evictStale()
+		ttl := c.CacheTTL
+		if ttl <= 0 {
+			ttl = 5 * time.Minute
+		}
+		c.cache[key] = &cacheEntry{
+			Route:     route,
+			ExpiresAt: time.Now().Add(ttl),
+		}
+		c.misses++
+		c.cacheMu.Unlock()
+	}
+
+	return route, nil
 }
 
 // slmDecision is the parsed route-decision object returned by the routing

@@ -21,7 +21,9 @@
 package health
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -53,6 +55,7 @@ var ErrDisabled = errors.New("health: not configured")
 // atomic load; the poller mutates state via atomic.Store.
 type Health struct {
 	ollamaURL        string
+	localModel       string
 	pollInterval     time.Duration
 	breakerThreshold int32
 	probeTimeout     time.Duration
@@ -76,11 +79,13 @@ type Health struct {
 // New constructs a Health. Zero-valued knobs are filled with safe
 // defaults (30s poll, 3-failure breaker threshold, 5s probe timeout)
 // so a partial config is enough. A nil client falls back to
-// http.DefaultClient.
+// http.DefaultClient. localModel is the model name used for the
+// model-availability probe; it is stored verbatim and passed to
+// the chat completions endpoint.
 //
 // The returned Health has not yet probed; call Run to perform the
 // initial probe and start the background poller.
-func New(ollamaURL string, pollInterval time.Duration, breakerThreshold int, probeTimeout time.Duration, client *http.Client) *Health {
+func New(ollamaURL string, localModel string, pollInterval time.Duration, breakerThreshold int, probeTimeout time.Duration, client *http.Client) *Health {
 	if pollInterval <= 0 {
 		pollInterval = DefaultPollInterval
 	}
@@ -95,6 +100,7 @@ func New(ollamaURL string, pollInterval time.Duration, breakerThreshold int, pro
 	}
 	h := &Health{
 		ollamaURL:        ollamaURL,
+		localModel:       localModel,
 		pollInterval:     pollInterval,
 		breakerThreshold: int32(breakerThreshold),
 		probeTimeout:     probeTimeout,
@@ -202,14 +208,17 @@ func (h *Health) Probe(ctx context.Context) error {
 	return h.probe(ctx)
 }
 
-// probe performs one HTTP GET to /api/tags and updates the internal
-// health state. See Probe for the public, error-returning variant.
+// probe performs one HTTP GET to /api/tags to check server reachability
+// and one HTTP POST to /api/chat with a trivial request to verify the
+// model is loaded and functional. See Probe for the public, error-returning
+// variant.
 //
-// Status >= 500 is treated as failure (the daemon is reachable but
-// sick). 4xx is treated as success: the daemon answered, even if
-// some authentication layer rejected the request — Ollama itself
-// is up and the operator can investigate the auth layer separately.
+// Status >= 500 on either call is treated as failure (the daemon is
+// reachable but sick). 4xx on the tags check is treated as success: the
+// daemon answered, even if some authentication layer rejected the request.
+// For the model check, 4xx means the model is not available.
 func (h *Health) probe(ctx context.Context) error {
+	// First check server reachability via /api/tags.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.ollamaURL+"/api/tags", nil)
 	if err != nil {
 		h.recordFailure(err)
@@ -220,9 +229,56 @@ func (h *Health) probe(ctx context.Context) error {
 		h.recordFailure(err)
 		return err
 	}
+	resp.Body.Close()
+	if resp.StatusCode >= 500 {
+		err := fmt.Errorf("tags status %d", resp.StatusCode)
+		h.recordFailure(err)
+		return err
+	}
+
+	// Server is up; now verify the model is actually loaded by making
+	// a trivial chat request. This catches the case where Ollama is running
+	// but the model failed to load (e.g. VRAM exhaustion).
+	chatReq := struct {
+		Model    string `json:"model"`
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}{
+		Model: h.localModel,
+		Messages: []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}{
+			{Role: "user", Content: "hi"},
+		},
+	}
+	payload, err := json.Marshal(chatReq)
+	if err != nil {
+		h.recordFailure(err)
+		return err
+	}
+	req, err = http.NewRequestWithContext(ctx, http.MethodPost, h.ollamaURL+"/api/chat", bytes.NewReader(payload))
+	if err != nil {
+		h.recordFailure(err)
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = h.client.Do(req)
+	if err != nil {
+		h.recordFailure(err)
+		return err
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 500 {
-		err := fmt.Errorf("status %d", resp.StatusCode)
+		err := fmt.Errorf("chat status %d", resp.StatusCode)
+		h.recordFailure(err)
+		return err
+	}
+	// 4xx on the chat endpoint means the model is not available.
+	if resp.StatusCode >= 400 {
+		err := fmt.Errorf("model %s unavailable: status %d", h.localModel, resp.StatusCode)
 		h.recordFailure(err)
 		return err
 	}

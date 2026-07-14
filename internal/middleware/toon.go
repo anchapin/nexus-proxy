@@ -15,49 +15,58 @@ import (
 	"strings"
 )
 
-// JSONArrayBlockRE is a loose fenced-block extractor. It captures any ```
-// wrapper (with or without a language tag) and its content. Validation that
-// the content is a JSON array of objects is done via json.Unmarshal in the
-// compression loop — this keeps the regex simple and avoids missing valid
-// shapes due to regex edge cases.
-var JSONArrayBlockRE = regexp.MustCompile("(?s)```(json)?\\s*([\\s\\S]*?)\\s*```")
+// JSONArrayBlock matches a fenced ```json ... ``` block whose body is a JSON
+// array of objects. We only compress the array-of-objects shape because TOON
+// is columnar — primitives and arrays of primitives don't benefit.
+var JSONArrayBlock = regexp.MustCompile("(?s)" + "```" + `json\s*(\[\s*\{.*?\}\s*\])\s*` + "```")
 
-// compressJSONBlock extracts a JSON array candidate from a fenced block and
-// returns the TOON replacement string. Returns ("", false) if the block
-// content cannot be parsed as []map[string]interface{}.
-func compressJSONBlock(block string) (toon string, ok bool) {
-	var arr []map[string]interface{}
-	if err := json.Unmarshal([]byte(block), &arr); err != nil {
-		return "", false
-	}
-	if len(arr) == 0 {
-		// Empty array — SerializeToTOON handles this gracefully but skip
-		// compressing empty blocks to keep output readable.
-		return "", false
-	}
-	out, err := SerializeToTOON([]byte(block))
-	if err != nil {
-		return "", false
-	}
-	return out, true
-}
+// ObjectArrayBlock matches a JSON object containing a key whose value is a JSON
+// array of objects. This handles the common "files", "results", "items", "data",
+// "entries", "records" key patterns seen in tool results and multi-file diffs.
+// The pattern handles simple objects (no deeply nested structures) which covers
+// the vast majority of structured data in prompts.
+var ObjectArrayBlock = regexp.MustCompile(
+	`"` + `(?:files|results|items|objects|data|entries|records)` + `"` + `\s*:\s*` +
+		`(\[\s*\{.*?\}(?:\s*,\s*\{.*?\})*\s*\])`,
+)
 
-// CompressJSONBlocks rewrites every fenced JSON array block in the
-// user/assistant message content into a TOON text block. Returns true if any
-// block was rewritten. Schema is inferred from the first object's keys (sorted
-// lexicographically for stable column order).
-//
-// Unlike the old single-regex approach, this two-pass strategy accepts:
-//   - Any ``` wrapper (```json`, “ `, or bare)
-//   - Multi-line arrays whose objects span several lines
+// UnfencedArrayBlock matches a standalone JSON array of objects that appears
+// without code fences in user/assistant content. This captures compressible
+// arrays from tool results, search hits, and file listings that developers
+// paste inline. The leading newline/whitespace guard prevents matching casual
+// bracket pairs in prose. The trailing [\n\r\t ] is captured as part of the
+// match so the replacement can remove trailing context cleanly.
+var UnfencedArrayBlock = regexp.MustCompile(
+	`(?:^|[\n\r\t ])` + // start of string or preceded by whitespace/newline
+		`(\[\s*\{.*?\}(?:\s*,\s*\{.*?\})*\s*\])` + // the array itself
+		`[\n\r\t ]?`, // optional trailing whitespace/newline (consumed to avoid leaving it)
+)
+
+// CompressionMethod indicates which TOON compression pattern was applied
+// to a request's messages (issue #247).
+type CompressionMethod string
+
+const (
+	CompressionMethodFenced   CompressionMethod = "fenced"
+	CompressionMethodNested   CompressionMethod = "nested"
+	CompressionMethodUnfenced CompressionMethod = "unfenced"
+	CompressionMethodNone     CompressionMethod = ""
+)
+
+// CompressJSONBlocks rewrites every ```json [ {...}, ... ] ``` block in the
+// user/assistant message content into a TOON text block. Returns the
+// compression method used: "fenced" for ```json [...] ``` blocks, "nested"
+// for {"files": [...]} object-nested arrays, "unfenced" for standalone
+// [...] arrays, or "" when no compression was applied. Schema is inferred
+// from the first object's keys (sorted lexicographically for stable column order).
 //
 // Gotchas to be aware of when re-parsing TOON output downstream:
 //   - Commas inside string values are replaced with the full-width U+FF0C
 //     so they cannot collide with the column separator.
 //   - Newlines inside string values are replaced with spaces — multi-line
 //     strings round-trip lossy.
-func CompressJSONBlocks(messages []interface{}) bool {
-	rewrote := false
+func CompressJSONBlocks(messages []interface{}) CompressionMethod {
+	fenced, nested, unfenced := false, false, false
 	for _, raw := range messages {
 		msg, ok := raw.(map[string]interface{})
 		if !ok {
@@ -69,231 +78,88 @@ func CompressJSONBlocks(messages []interface{}) bool {
 		}
 		content, _ := msg["content"].(string)
 
-		// Pass 1: loose regex extracts all fenced candidates.
-		matches := JSONArrayBlockRE.FindAllStringSubmatch(content, -1)
+		// Handle fenced ```json [...] ``` blocks.
+		matches := JSONArrayBlock.FindAllStringSubmatch(content, -1)
 		for _, m := range matches {
-			// m[0] = full match, m[1] = optional language, m[2] = content
-			if len(m) < 3 {
+			if len(m) < 2 {
 				continue
 			}
-			cand := strings.TrimSpace(m[2])
-			toon, ok := compressJSONBlock(cand)
-			if !ok {
+			toon, err := SerializeToTOON([]byte(m[1]))
+			if err != nil {
 				continue
 			}
 			block := "```text\n" + toon + "```"
 			content = strings.Replace(content, m[0], block, 1)
-			rewrote = true
+			fenced = true
 		}
-		if rewrote {
+
+		// Handle JSON arrays nested inside objects (e.g., {"files": [...]}).
+		objMatches := ObjectArrayBlock.FindAllStringSubmatchIndex(content, -1)
+		for _, m := range objMatches {
+			if len(m) < 4 {
+				continue
+			}
+			// m[0], m[1]: full match (from opening " of key to closing ] of array)
+			// m[2], m[3]: captured group (the array itself)
+			fullMatch := content[m[0]:m[1]]
+			arrayMatch := content[m[2]:m[3]]
+			toon, err := SerializeToTOON([]byte(arrayMatch))
+			if err != nil {
+				continue
+			}
+			// Extract key from full match: "key": [...] -> "key": <toon>
+			colonIdx := strings.Index(fullMatch, ":")
+			if colonIdx == -1 {
+				continue
+			}
+			keyPart := fullMatch[:colonIdx+1]
+			replacement := keyPart + " " + strings.TrimSpace(toon)
+			// If preceded by {, include it in the replacement to avoid leaving it orphaned
+			if m[0] > 0 && content[m[0]-1] == '{' {
+				content = strings.Replace(content, "{"+fullMatch, "{"+replacement, 1)
+			} else {
+				content = strings.Replace(content, fullMatch, replacement, 1)
+			}
+			nested = true
+		}
+
+		// Handle unfenced standalone JSON arrays (no code fences).
+		unfencedMatches := UnfencedArrayBlock.FindAllStringSubmatchIndex(content, -1)
+		for _, m := range unfencedMatches {
+			if len(m) < 4 {
+				continue
+			}
+			// m[0], m[1]: full match (leading context + array + optional trailing ws)
+			// m[2], m[3]: captured group (the array itself)
+			arrayMatch := content[m[2]:m[3]]
+			toon, err := SerializeToTOON([]byte(arrayMatch))
+			if err != nil {
+				continue
+			}
+			// Preserve leading context (newline/whitespace) by replacing only
+			// from end of leading context to end of full match with the TOON block.
+			// m[1] is the end of leading context (start of captured array).
+			leadingContext := content[m[0]:m[2]] // e.g., "\n"
+			replacement := leadingContext + toon
+			fullMatch := content[m[0]:m[1]]
+			content = strings.Replace(content, fullMatch, replacement, 1)
+			unfenced = true
+		}
+
+		if fenced || nested || unfenced {
 			msg["content"] = content
 		}
 	}
-	return rewrote
-}
-
-// MinUnfencedRows is the minimum array length the unfenced pass rewrites.
-// Below this the TOON schema header costs more tokens than the columnar
-// rows save. The fenced path (CompressJSONBlocks) has no such floor because
-// a fenced block is already an explicit "this is data" signal from the
-// sender, so even a single-row fence is honoured.
-const MinUnfencedRows = 2
-
-// CompressUnfencedJSONArrays applies TOON compression to bare (unfenced)
-// JSON arrays-of-objects in user/assistant message content. Unlike
-// CompressJSONBlocks (which only rewrites ```json fences), this pass
-// handles arrays pasted without a fence and arrays embedded in prose —
-// the issue #123 case where a user drops `[{...},{...}]` directly into
-// the prompt with no code fence around it.
-//
-// Detection is a deliberately conservative two-stage pipeline:
-//
-//  1. A bracket-balancing scanner (findJSONArrayCandidates) locates
-//     candidate `[...]` substrings whose first element is an object,
-//     tracking nested `[]`, `{}`, and string literals with escape
-//     handling so brackets inside JSON strings do not fool it.
-//  2. Each candidate is validated by json.Unmarshal into
-//     `[]map[string]interface{}` and only arrays with >= MinUnfencedRows
-//     rows are rewritten. Candidates that fail to parse are left
-//     untouched — the scanner is a candidate generator, the parser is
-//     the authority, so false positives are impossible.
-//
-// Surrounding prose is preserved: only the matched byte range is
-// replaced, and the replacement uses the same ```text fence and
-// SerializeToTOON rules (full-width comma, newline -> space) as the
-// fenced path so downstream consumers see one TOON shape. Returns true
-// if any array was rewritten.
-func CompressUnfencedJSONArrays(messages []interface{}) bool {
-	rewrote := false
-	for _, raw := range messages {
-		msg, ok := raw.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		role, _ := msg["role"].(string)
-		if role != "user" && role != "assistant" {
-			continue
-		}
-		content, _ := msg["content"].(string)
-		// Cheap rejection: an array-of-objects needs both '[' and '{'.
-		// This keeps the common no-JSON prompt off the scanner entirely.
-		if !strings.Contains(content, "[") || !strings.Contains(content, "{") {
-			continue
-		}
-		newContent, changed := compressUnfencedArraysInString(content)
-		if changed {
-			msg["content"] = newContent
-			rewrote = true
-		}
+	if fenced {
+		return CompressionMethodFenced
 	}
-	return rewrote
-}
-
-// compressUnfencedArraysInString rewrites every qualifying unfenced
-// JSON array-of-objects in content into a fenced TOON block, leaving
-// all other bytes (including prose between arrays) untouched.
-func compressUnfencedArraysInString(content string) (string, bool) {
-	candidates := findJSONArrayCandidates(content)
-	if len(candidates) == 0 {
-		return content, false
+	if nested {
+		return CompressionMethodNested
 	}
-	// Replace right-to-left so the byte offsets of candidates to the
-	// left of the current replacement stay valid against the original
-	// scan.
-	out := content
-	changed := false
-	for i := len(candidates) - 1; i >= 0; i-- {
-		c := candidates[i]
-		sub := out[c.start:c.end]
-		toon, ok := serializeUnfencedCandidate([]byte(sub))
-		if !ok {
-			continue
-		}
-		replacement := "```text\n" + toon + "```"
-		out = out[:c.start] + replacement + out[c.end:]
-		changed = true
+	if unfenced {
+		return CompressionMethodUnfenced
 	}
-	return out, changed
-}
-
-// serializeUnfencedCandidate validates that b is a JSON array of >=
-// MinUnfencedRows objects and returns its TOON serialization. The bool
-// result is false for any non-array-of-objects shape, an array of
-// primitives, a single-element array, or a parse failure — callers
-// treat all of these as "leave untouched".
-func serializeUnfencedCandidate(b []byte) (string, bool) {
-	var data []map[string]interface{}
-	if err := json.Unmarshal(b, &data); err != nil {
-		return "", false
-	}
-	if len(data) < MinUnfencedRows {
-		return "", false
-	}
-	toon, err := SerializeToTOON(b)
-	if err != nil {
-		return "", false
-	}
-	return toon, true
-}
-
-// unfencedCandidate marks a [start, end) byte range in the original
-// content that the scanner believes may be a JSON array-of-objects.
-type unfencedCandidate struct{ start, end int }
-
-// findJSONArrayCandidates scans content for substrings that look like a
-// JSON array of objects: a '[' immediately followed (after optional
-// whitespace) by a '{', extended to its bracket-balanced ']'. Callers
-// MUST validate candidates with json.Unmarshal — the scanner only
-// balances structural delimiters, it does not enforce value shape, key
-// validity, or element homogeneity, so e.g. `[{"a":1}, 2]` is emitted
-// as a candidate and then rejected by the parser.
-func findJSONArrayCandidates(content string) []unfencedCandidate {
-	var out []unfencedCandidate
-	n := len(content)
-	i := 0
-	for i < n {
-		if content[i] != '[' {
-			i++
-			continue
-		}
-		// Peek: the next non-whitespace byte must be '{' to be a
-		// plausible array-of-objects. This rejects arrays of
-		// primitives (`[1,2,3]`) at the candidate stage.
-		j := i + 1
-		for j < n && isJSONSpace(content[j]) {
-			j++
-		}
-		if j >= n || content[j] != '{' {
-			i++
-			continue
-		}
-		end, ok := scanJSONArrayEnd(content, i)
-		if !ok {
-			i++
-			continue
-		}
-		out = append(out, unfencedCandidate{start: i, end: end})
-		// Resume scanning AFTER the candidate so we do not re-emit
-		// inner arrays (the outermost array is the one TOON wants).
-		i = end
-	}
-	return out
-}
-
-// scanJSONArrayEnd returns the index just past the ']' that closes the
-// array opened at content[start], tracking nested '[]' and '{}' as well
-// as string literals with JSON escape handling so brackets appearing
-// inside strings do not perturb the depth counters. Returns ok=false
-// for unbalanced input or input that ends inside an unterminated
-// string — the caller treats that as "not a candidate" and the parser
-// would reject it anyway.
-func scanJSONArrayEnd(content string, start int) (int, bool) {
-	depth := 0  // [...] nesting
-	bdepth := 0 // {...} nesting
-	inStr := false
-	escape := false
-	for i := start; i < len(content); i++ {
-		c := content[i]
-		if inStr {
-			switch {
-			case escape:
-				escape = false
-			case c == '\\':
-				escape = true
-			case c == '"':
-				inStr = false
-			}
-			continue
-		}
-		switch c {
-		case '"':
-			inStr = true
-		case '[':
-			depth++
-		case ']':
-			depth--
-			if depth == 0 && bdepth == 0 {
-				return i + 1, true
-			}
-			if depth < 0 {
-				return 0, false
-			}
-		case '{':
-			bdepth++
-		case '}':
-			bdepth--
-			if bdepth < 0 {
-				return 0, false
-			}
-		}
-	}
-	return 0, false
-}
-
-// isJSONSpace reports whether b is one of the four whitespace bytes
-// permitted between JSON tokens (RFC 8259 §2).
-func isJSONSpace(b byte) bool {
-	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+	return CompressionMethodNone
 }
 
 // SerializeToTOON converts a JSON array of objects into the canonical TOON

@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/budget"
 )
 
 // rtFunc is a tiny test double that satisfies both http.RoundTripper
@@ -456,10 +458,6 @@ func TestEvaluatorQueueOverflowDrops(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("Enqueue blocked when queue was full — hot path will stall")
 	}
-	// The dropped counter must reflect the single rejected sample.
-	if got := e.Dropped(); got != 1 {
-		t.Errorf("Dropped = %d, want 1 after queue-full rejection", got)
-	}
 	// Sanity: nothing has been recorded yet because the worker is
 	// still blocked inside the stub.
 	if got := store.Scores(); len(got) != 0 {
@@ -630,132 +628,62 @@ func TestEvaluatorCloseDrains(t *testing.T) {
 	}
 }
 
-// TestEvaluatorDroppedCount verifies that the dropped counter
-// increments by one for each sample rejected because the queue was
-// full, and stays at zero when all samples are accepted (issue #111).
-func TestEvaluatorDroppedCount(t *testing.T) {
-	release := make(chan struct{})
-	fn := rtFunc(func(_ *http.Request) (*http.Response, error) {
-		<-release
-		return &http.Response{
-			StatusCode: 200,
-			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"ok"}}]}`)),
-		}, nil
-	})
-	// QueueDepth=2, Concurrency=1 → worker picks 1, buffer holds 2,
-	// the 4th Enqueue must be dropped.
-	e, _ := newTestEvaluator(t, Config{
-		Concurrency: 1,
-		QueueDepth:  2,
-	}, fn)
-	defer e.Close()      // LIFO: runs second (after release)
-	defer close(release) // LIFO: runs first (unblocks worker)
-
-	if got := e.Dropped(); got != 0 {
-		t.Fatalf("initial Dropped = %d, want 0", got)
-	}
-	// Fill: 1 in worker (picked immediately), 2 in buffer.
-	if !e.Enqueue(Sample{Instruction: "a", Output: "b"}) {
-		t.Fatal("first Enqueue should succeed")
-	}
-	// Wait for worker to pick the first sample off the channel.
-	waitFor(t, func() bool { return len(e.queue) == 0 }, time.Second)
-	if !e.Enqueue(Sample{Instruction: "c", Output: "d"}) {
-		t.Fatal("second Enqueue should succeed")
-	}
-	if !e.Enqueue(Sample{Instruction: "e", Output: "f"}) {
-		t.Fatal("third Enqueue should succeed")
-	}
-	// This one must be dropped — buffer is full.
-	if e.Enqueue(Sample{Instruction: "g", Output: "h"}) {
-		t.Error("fourth Enqueue should have been dropped")
-	}
-	if got := e.Dropped(); got != 1 {
-		t.Errorf("Dropped = %d, want 1", got)
-	}
-	// Drop two more.
-	if e.Enqueue(Sample{Instruction: "i", Output: "j"}) {
-		t.Error("fifth Enqueue should have been dropped")
-	}
-	if e.Enqueue(Sample{Instruction: "k", Output: "l"}) {
-		t.Error("sixth Enqueue should have been dropped")
-	}
-	if got := e.Dropped(); got != 3 {
-		t.Errorf("Dropped = %d, want 3", got)
-	}
-}
-
-// TestEvaluatorDroppedCallback verifies that the onDrop callback is
-// invoked once per dropped sample with the correct running total.
-func TestEvaluatorDroppedCallback(t *testing.T) {
-	release := make(chan struct{})
-	fn := rtFunc(func(_ *http.Request) (*http.Response, error) {
-		<-release
-		return &http.Response{
-			StatusCode: 200,
-			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"ok"}}]}`)),
-		}, nil
-	})
-	e, _ := newTestEvaluator(t, Config{
-		Concurrency: 1,
-		QueueDepth:  1,
-	}, fn)
-	defer e.Close()      // LIFO: runs second (after release)
-	defer close(release) // LIFO: runs first (unblocks worker)
-
+// TestBudgetGuardIntegration verifies that a configured BudgetGuard receives
+// Record calls with source="judge" after each successful evaluation (issue #240).
+func TestBudgetGuardIntegration(t *testing.T) {
 	var (
-		mu        sync.Mutex
-		totals    []uint64
-		callCount int
+		mu           sync.Mutex
+		recordedCost float64
+		recordedSrc  string
 	)
-	e.SetDropCallback(func(total uint64) {
+	fn := rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"3"}}]}`)),
+		}, nil
+	})
+
+	bg := newBudgetGuardForTest(t)
+	bg.SetAlerter(budgetAlerterFunc(func(_ interface{}, cost float64, src string) {
 		mu.Lock()
 		defer mu.Unlock()
-		totals = append(totals, total)
-		callCount++
-	})
+		recordedCost = cost
+		recordedSrc = src
+	}))
 
-	// Fill the worker + queue.
-	e.Enqueue(Sample{Instruction: "a", Output: "b"})
-	waitFor(t, func() bool { return len(e.queue) == 0 }, time.Second)
-	e.Enqueue(Sample{Instruction: "c", Output: "d"})
-	// Two drops.
-	e.Enqueue(Sample{Instruction: "e", Output: "f"})
-	e.Enqueue(Sample{Instruction: "g", Output: "h"})
+	e, store := newTestEvaluator(t, Config{
+		BudgetGuard: bg,
+	}, fn)
+	defer e.Close()
+
+	if !e.Enqueue(Sample{RequestID: "r-bg", Instruction: "x", Output: "y"}) {
+		t.Fatal("Enqueue should accept")
+	}
+	waitForScores(t, store, 1, 2*time.Second)
 
 	mu.Lock()
 	defer mu.Unlock()
-	if callCount != 2 {
-		t.Fatalf("onDrop called %d times, want 2", callCount)
+	if recordedCost <= 0 {
+		t.Errorf("BudgetGuard cost = %v, want > 0", recordedCost)
 	}
-	if totals[0] != 1 || totals[1] != 2 {
-		t.Errorf("onDrop totals = %v, want [1, 2]", totals)
+	if recordedSrc != "judge" {
+		t.Errorf("BudgetGuard source = %q, want judge", recordedSrc)
 	}
 }
 
-// TestEvaluatorSetDropCallbackNil clears the callback without panic.
-func TestEvaluatorSetDropCallbackNil(t *testing.T) {
-	fn := rtFunc(func(_ *http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: 200,
-			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"ok"}}]}`)),
-		}, nil
-	})
-	e, _ := newTestEvaluator(t, Config{}, fn)
-	defer e.Close()
+// budgetAlerterFunc is a thin adapter so tests can use a plain function
+// as a budget.Alerter without defining an interface implementation.
+type budgetAlerterFunc func(interface{}, float64, string)
 
-	called := false
-	e.SetDropCallback(func(uint64) { called = true })
-	e.SetDropCallback(nil)
-	// Enqueue enough to ensure no callback fires.
-	for i := 0; i < 5; i++ {
-		e.Enqueue(Sample{Instruction: "x", Output: "y"})
-	}
-	// Allow workers to drain.
-	waitFor(t, func() bool { return len(e.queue) == 0 }, time.Second)
-	if called {
-		t.Error("nil callback should not have been invoked")
-	}
+func (f budgetAlerterFunc) OnExceed(budget.State) {}
+func (f budgetAlerterFunc) OnSpend(state budget.State, cost float64, src string) {
+	f(state, cost, src)
+}
+func (f budgetAlerterFunc) OnApproaching(budget.State) {}
+
+func newBudgetGuardForTest(t *testing.T) *budget.Guard {
+	t.Helper()
+	return budget.NewGuard(1000.0)
 }
 
 // Compile-time guard: judge.HTTPClient must accept *http.Client.

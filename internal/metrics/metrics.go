@@ -77,6 +77,12 @@ const recordRequestErrorTimeout = 5 * time.Second
 // other case (legacy Panel path always invokes the arbiter; non-fusion
 // routes are always false).
 //
+// FusionJaccardSimilarity (issue #200) mirrors telemetry.Record: the
+// actual Jaccard ratio between the two panel members' contents when
+// both returned content. 0 when fewer than two members returned content.
+// Enables operators to tune NEXUS_FUSION_AGREEMENT_THRESHOLD based on
+// actual distribution data.
+//
 // Route-source metadata (issue #74) mirrors telemetry.Record so the
 // SQLite store and the JSONL recorder carry identical routing metadata
 // for every request.
@@ -87,9 +93,14 @@ type Request struct {
 	Model             string
 	InputTokens       int
 	TOONSavingsTokens int
-	RAGInjected       bool
-	RAGFilename       string
-	EstimatedCostUSD  float64
+	// TOONCompressionMethod records which TOON compression pattern was
+	// applied to this request's messages (issue #247): "fenced" for
+	// ```json [...] ``` blocks, "nested" for {"files": [...]} arrays,
+	// or "" when no compression was applied.
+	TOONCompressionMethod string
+	RAGInjected           bool
+	RAGFilename           string
+	EstimatedCostUSD      float64
 
 	// BaselineCostUSD is what this request would have cost if sent
 	// to the configured baseline (frontier) provider at the baseline
@@ -98,12 +109,17 @@ type Request struct {
 	BaselineCostUSD float64
 	SavingsUSD      float64
 
-	OutputTokens         int
-	TTFTMs               int64
-	TotalLatencyMs       float64
-	TPS                  float64
-	Streaming            bool
-	FusionArbiterSkipped bool
+	OutputTokens            int
+	TTFTMs                  int64
+	TotalLatencyMs          float64
+	TPS                     float64
+	Streaming               bool
+	FusionArbiterSkipped    bool
+	FusionJaccardSimilarity float64
+	// FusionArbiterCostUSD (issue #239) mirrors telemetry.Record:
+	// estimated cost of the arbiter call when it ran. 0 when the
+	// arbiter was skipped or for non-fusion routes.
+	FusionArbiterCostUSD float64
 	Error                string
 
 	// Route-source metadata (issue #74).

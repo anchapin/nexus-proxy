@@ -1,0 +1,153 @@
+# Nexus Proxy — config.yaml
+#
+# YAML configuration file for the proxy. All fields are optional; omitted
+# fields fall back to the same defaults as Load() (the env-only path).
+# Environment variables always override YAML values — use YAML for the base
+# configuration and env vars to override specific values per-environment.
+#
+# YAML keys are snake_case aliases for NEXUS_* env vars:
+#   NEXUS_ADDR           -> addr
+#   NEXUS_FRONTIER_API_KEY -> frontier_api_key
+#   NEXUS_TOKEN_GUARDRAIL -> token_guardrail
+#   etc.
+#
+# Duration fields accept Go duration strings: "8s", "2m", "1h", etc.
+# Boolean fields: "true", "false", "yes", "no", "on", "off" (case-insensitive).
+
+# --- HTTP server ----------------------------------------------------------
+addr: ":8000"
+server_read_timeout: "30s"
+server_write_timeout: "0"     # 0 = disabled (streaming-safe)
+server_idle_timeout: "120s"
+server_max_header_bytes: 1048576  # 1 MiB
+shutdown_timeout: "30s"
+max_body_bytes: 1048576       # request body cap
+
+# --- Structured logging ---------------------------------------------------
+log_level: "info"             # debug | info | warn | error
+log_format: "json"            # json | text
+
+# --- Debug tracing --------------------------------------------------------
+debug: false
+debug_body_bytes: 512
+
+# --- Local Ollama ---------------------------------------------------------
+ollama_url: "http://localhost:11434"
+router_model: "qwen3-coder:4b"
+local_model: "qwen3-coder:8b"
+embedding_model: "nomic-embed-text"
+
+# --- Frontier API ---------------------------------------------------------
+frontier_url: "https://api.openai.com/v1/chat/completions"
+frontier_model: "gpt-4o"
+frontier_api_key: ""          # Required for frontier traffic
+frontier_cost_per_1k: 0.005  # USD per 1k input tokens
+
+# --- Z.ai fallback -------------------------------------------------------
+zai_url: "https://api.z.ai/v1/chat/completions"
+zai_model: "glm-4.6"
+zai_api_key: ""              # Leave empty to skip z.ai in cascade
+zai_cost_per_1k: 0.002
+
+# --- Inbound auth ---------------------------------------------------------
+proxy_api_key: ""             # Set to enable Bearer-token auth
+status_public: false         # Expose /status without auth?
+
+# --- Cost baseline --------------------------------------------------------
+cost_baseline_provider: "frontier"
+cost_baseline_model: "gpt-4o"
+cost_baseline_rate_per_1k: 0.005
+
+# --- Spend guard ----------------------------------------------------------
+budget_daily_limit: 0         # USD; 0 = disabled
+budget_alert_enabled: false
+budget_alert_threshold: 0.8   # Fraction of limit for "approaching" alert
+budget_alert_webhook_url: ""  # Optional webhook for JSON alert payloads
+
+# --- Frontier provider selector -------------------------------------------
+selector_window: "1h"         # Look-back window for observed outcomes
+selector_min_samples: 5       # Per-provider observation floor
+selector_refresh_interval: "60s"
+
+# --- RAG -----------------------------------------------------------------
+examples_dir: "./few_shot_examples"
+rag_threshold: 0.55          # Cosine similarity cutoff
+embedder_type: "ollama"      # ollama | openai | cohere
+embedder_base_url: ""         # Override for openai/cohere backends
+cohere_api_key: ""
+rag_db_path: "~/.cache/nexus-proxy/rag.db"  # Empty = in-memory only
+rag_poll_interval: "30s"      # 0 = disable file watcher
+rag_embed_cache_size: 256     # LRU entries; 0 = disabled
+
+# --- Routing -------------------------------------------------------------
+token_guardrail: 6000        # Tokens above this force frontier
+slm_timeout: "8s"
+slm_cache_max_entries: 512
+slm_cache_ttl: "30s"
+slm_cache_similarity_threshold: 0.0  # 0 = disable semantic deduplication
+fusion_timeout: "120s"
+cascade_timeout: "30s"
+arbiter_timeout: "60s"
+
+# --- Fusion --------------------------------------------------------------
+fusion_progressive_delivery: true  # Stream first panel member to complete
+fusion_agreement_threshold: 0.85   # Jaccard similarity to skip arbiter
+
+# --- Ollama health poller -----------------------------------------------
+health_poll_interval: "30s"
+health_breaker_threshold: 3
+health_probe_timeout: "5s"
+
+# --- VRAM probe ---------------------------------------------------------
+probe_interval: "60s"         # 0 = boot snapshot only
+probe_timeout: "5s"
+probe_bytes_per_token: 262144  # 256 KiB per token
+
+# --- Local-route concurrency ----------------------------------------------
+local_max_concurrent: 0       # Hard ceiling; 0 = disabled
+local_vram_bytes_per_slot: 2147483648  # 2 GiB per slot
+local_cooldown: "10s"         # Post-cascade-failure cooldown; 0 = disabled
+
+# --- Async LLM-as-a-Judge ------------------------------------------------
+judge_url: "https://api.z.ai/v1/chat/completions"
+judge_model: "gpt-4o"
+judge_api_key: ""
+judge_sample_rate: 0.1         # Fraction of local-route requests to grade
+judge_concurrency: 2
+judge_queue: 64
+judge_timeout: "30s"
+judge_cost_per_1k: 0.002
+judge_db_path: "~/.cache/nexus-proxy/judge.db"
+
+# --- Judge-guided routing -------------------------------------------------
+routing_confidence_db: "~/.cache/nexus-proxy/routing_confidence.db"
+routing_confidence_floor: 0.4
+routing_confidence_ceiling: 0.85
+routing_confidence_min_samples: 5
+routing_confidence_window: "168h"
+
+# --- AST/compiler verifier ------------------------------------------------
+quality_concurrency: 2
+quality_queue: 64
+quality_timeout: "60s"
+quality_stderr_cap: 2048
+
+# --- Middleware ----------------------------------------------------------
+meta_prompt: ""               # Appended to system prompt
+toon_notice: ""               # Appended when TOON compression is applied
+
+# --- Prompt injection -----------------------------------------------------
+prompt_injection_mode: "off"  # off | warn | strict
+
+# --- Telemetry ------------------------------------------------------------
+telemetry_path: "./nexus-telemetry.jsonl"   # Empty = disabled
+metrics_db_path: "~/.cache/nexus-proxy/metrics.db"
+
+# --- Model discovery ------------------------------------------------------
+models_endpoint_enabled: true
+models_cache_ttl: "5m"       # 0 = disable Ollama /api/tags poll
+
+# --- Trusted proxies + rate limiting ------------------------------------
+trusted_proxies: ""            # Comma-separated CIDR list; empty = trust nobody
+rate_limit_rpm: 0            # Per-client RPM; 0 = disabled
+rate_limit_burst: 0           # Token-bucket burst; 0 = use RPM

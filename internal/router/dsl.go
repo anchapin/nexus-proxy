@@ -4,7 +4,11 @@
 // small local model to judge complexity when the DSL has no opinion.
 package router
 
-import "regexp"
+import (
+	"regexp"
+
+	"github.com/anchapin/nexus-proxy/internal/telemetry"
+)
 
 // Route names are the canonical string identifiers used across packages.
 const (
@@ -14,15 +18,14 @@ const (
 )
 
 // Guardrail returns RouteFrontier when the prompt is too large for the
-// configured VRAM budget. The check uses a rough "4 chars per token"
-// heuristic — it is intentionally cheap and approximate. The threshold is
-// the maximum *estimated* token count the local model can safely handle.
-// When maxTokens <= 0 the guardrail is disabled and ("", false) is returned.
+// configured VRAM budget. The threshold is the maximum *estimated* token
+// count the local model can safely handle. When maxTokens <= 0 the
+// guardrail is disabled and ("", false) is returned.
 func Guardrail(prompt string, maxTokens int) (Route, bool) {
 	if maxTokens <= 0 {
 		return "", false
 	}
-	if len(prompt)/4 > maxTokens {
+	if telemetry.EstimateTokens(prompt) > maxTokens {
 		return RouteFrontier, true
 	}
 	return "", false
@@ -34,7 +37,12 @@ type Route string
 
 // DSL runs the heuristic fast-pass. Returns one of RouteLocal, RouteFusion,
 // or "" if no rule matched (caller should fall back to the SLM).
-func DSL(prompt string, formattingRegex *regexp.Regexp) (Route, bool) {
+//
+// formattingRegex matches simple formatting keywords (css, format, docstring,
+// lint, typo, boilerplate). localPatternsRegex matches common coding task
+// keywords (refactor, security scan, generate tests, explain this code,
+// performance analysis, etc.). Both may be nil.
+func DSL(prompt string, formattingRegex, localPatternsRegex *regexp.Regexp) (Route, bool) {
 	lower := toLowerASCII(prompt)
 
 	if stringsContains(lower, "architectural design") ||
@@ -42,6 +50,9 @@ func DSL(prompt string, formattingRegex *regexp.Regexp) (Route, bool) {
 		return RouteFusion, true
 	}
 	if formattingRegex != nil && formattingRegex.MatchString(lower) {
+		return RouteLocal, true
+	}
+	if localPatternsRegex != nil && localPatternsRegex.MatchString(lower) {
 		return RouteLocal, true
 	}
 	return "", false

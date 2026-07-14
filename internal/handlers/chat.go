@@ -35,6 +35,8 @@ import (
 // judge needs to score a response. The handler never imports judge —
 // the observer plugs in from cmd/nexus/main.go.
 type LocalCompletion struct {
+	TraceParent string
+	TraceState  string
 	RequestID   string
 	Instruction string
 	Output      string
@@ -47,18 +49,16 @@ type LocalCompletion struct {
 // goroutine that serves the request so the observer should not block
 // long. The handler also enforces a body-size cap before invoking
 // the hook so a runaway model cannot blow the observer's memory.
-// Submit reports whether the sample was accepted (true) or dropped
-// (false, e.g. queue full).
 type JudgeObserver interface {
-	Submit(LocalCompletion) bool
+	Submit(LocalCompletion)
 }
 
 // JudgeObserverFunc adapts a plain function to the JudgeObserver
 // interface so wiring from main.go stays a one-liner.
-type JudgeObserverFunc func(LocalCompletion) bool
+type JudgeObserverFunc func(LocalCompletion)
 
 // Submit implements JudgeObserver.
-func (f JudgeObserverFunc) Submit(c LocalCompletion) bool { return f(c) }
+func (f JudgeObserverFunc) Submit(c LocalCompletion) { f(c) }
 
 // QualityEvent is emitted to the QualityObserver hook each time the
 // handler detects a tool call in an upstream response that looks like
@@ -67,9 +67,11 @@ func (f JudgeObserverFunc) Submit(c LocalCompletion) bool { return f(c) }
 // that package so the dependency direction stays one-way (cmd/nexus
 // adapts between the two shapes).
 type QualityEvent struct {
-	RequestID string // correlates to the chat handler's request id
-	Path      string // path of the edited file
-	ToolName  string // write_file, edit_file, apply_patch, ...
+	TraceParent string
+	TraceState  string
+	RequestID   string // correlates to the chat handler's request id
+	Path        string // path of the edited file
+	ToolName    string // write_file, edit_file, apply_patch, ...
 }
 
 // QualityObserver is the hook the chat handler invokes with detected
@@ -103,6 +105,10 @@ type RouteDecisionEvent struct {
 	Reason     string
 	Confidence float64
 	TaskType   string
+	// CacheHit is true when the decision came from the SLM cache
+	// (issue #206) — a duplicate prompt was served from cache without
+	// calling the SLM.
+	CacheHit bool
 }
 
 // RouteDecisionObserver is the hook invoked once per proxied request
@@ -143,16 +149,6 @@ const (
 	// emitted by the rate-limit middleware. The reason is recorded
 	// by the middleware hook wired in main.go.
 	RejectionRateLimit = "rate_limit"
-	// RejectionBudget marks a 429 Too Many Requests response
-	// emitted when the rolling 24h frontier spend budget is exhausted
-	// (issue #183).
-	RejectionBudget = "budget_exhausted"
-	// RejectionJudgeQueue marks a judge evaluator enqueue failure
-	// (internal/judge queue full).
-	RejectionJudgeQueue = "judge_queue"
-	// RejectionQualityQueue marks a quality verifier submit failure
-	// (internal/quality queue full).
-	RejectionQualityQueue = "quality_queue"
 )
 
 // RejectionEvent carries the minimal context a rejection observer
@@ -182,66 +178,84 @@ type RejectionObserverFunc func(RejectionEvent)
 // ObserveRejection implements RejectionObserver.
 func (f RejectionObserverFunc) ObserveRejection(e RejectionEvent) { f(e) }
 
-// StreamTruncationEvent is emitted to the StreamTruncationObserver
-// hook when the streaming proxy detects a mid-stream upstream TCP
-// drop and emits a synthetic `data: [DONE]` sentinel so the
-// downstream harness does not hang (issue #118). Carries the route so
-// the Prometheus counter can partition truncations by destination
-// (local / frontier / fusion).
-type StreamTruncationEvent struct {
+// FusionOutcomeEvent carries the outcome of a fusion panel after
+// PanelStreaming returns (issue #187). It lets operators compute the
+// fusion agreement rate: skipped/(skipped+invoked).
+type FusionOutcomeEvent struct {
+	RequestID      string
+	ArbiterSkipped bool
+}
+
+// FusionOutcomeObserver is the hook invoked once per fusion request
+// with the PanelStreaming outcome (issue #187). Safe for concurrent
+// use, must not block, nil means "no observer". The handler does not
+// import the observability package; main.go wires a closure that
+// forwards to RouteCounters.ObserveFusionOutcome.
+type FusionOutcomeObserver interface {
+	ObserveFusionOutcome(FusionOutcomeEvent)
+}
+
+// FusionOutcomeObserverFunc adapts a plain function to the
+// FusionOutcomeObserver interface.
+type FusionOutcomeObserverFunc func(FusionOutcomeEvent)
+
+// ObserveFusionOutcome implements FusionOutcomeObserver.
+func (f FusionOutcomeObserverFunc) ObserveFusionOutcome(e FusionOutcomeEvent) { f(e) }
+
+// RAGEvent carries the outcome of a single RAG retrieval attempt
+// (issue #186). Hit is true when Retrieve returned a non-nil example;
+// Filename is the matched snippet (meaningful only when Hit is true).
+// MissReason is the miss cause when Hit is false: "empty_store" when
+// the store has no indexed examples, "threshold" when the best match
+// fell below the similarity floor, or "embed_error" when the embedding
+// call failed.
+type RAGEvent struct {
+	Hit        bool
+	Filename   string
+	MissReason string
+}
+
+// RAGObserver is the hook invoked once per RAG retrieval attempt,
+// allowing the observability layer to record hit/miss rates (issue #186).
+// Safe for concurrent use; must not block. Nil is a valid no-op.
+type RAGObserver interface {
+	ObserveRAG(RAGEvent)
+}
+
+// RAGObserverFunc adapts a plain function to the RAGObserver interface.
+type RAGObserverFunc func(RAGEvent)
+
+// ObserveRAG implements RAGObserver.
+func (f RAGObserverFunc) ObserveRAG(e RAGEvent) { f(e) }
+
+// CascadeFallbackEvent carries the reason for a cascade fallback (issue #205).
+// The handler dispatches one when a retryable step failure causes the cascade
+// to fall back to the next step. The reason is one of "timeout",
+// "transport_error", or "malformed_toolcall".
+type CascadeFallbackEvent struct {
 	RequestID string
-	Route     string
+	Reason    string // "timeout", "transport_error", or "malformed_toolcall"
 }
 
-// StreamTruncationObserver is the hook invoked when an upstream
-// stream is truncated mid-flight (issue #118): upstream.StreamWithContext
-// hit an io.ErrUnexpectedEOF / connection-reset after forwarding at
-// least one chunk and self-healed by emitting a truncation event +
-// [DONE]. Same invariants as the other observer hooks: safe for
-// concurrent use, must not block, nil means "no observer". The
-// handler does not import the observability package; main.go wires a
-// closure that forwards to RouteCounters.ObserveStreamTruncation.
-type StreamTruncationObserver interface {
-	ObserveStreamTruncation(StreamTruncationEvent)
+// CascadeFallbackObserver is the hook invoked when the cascade falls back
+// to a later step due to a retryable error (issue #205). Implementations
+// must be safe for concurrent use and must not block. Nil means "no
+// observer" — the hot path is unaffected. The handler does not import
+// the observability package; main.go wires a closure that forwards to
+// RouteCounters.ObserveCascadeFallback.
+type CascadeFallbackObserver interface {
+	ObserveCascadeFallback(CascadeFallbackEvent)
 }
 
-// StreamTruncationObserverFunc adapts a plain function to the
-// StreamTruncationObserver interface so wiring from main.go stays a
-// one-liner.
-type StreamTruncationObserverFunc func(StreamTruncationEvent)
+// CascadeFallbackObserverFunc adapts a plain function to the
+// CascadeFallbackObserver interface.
+type CascadeFallbackObserverFunc func(CascadeFallbackEvent)
 
-// ObserveStreamTruncation implements StreamTruncationObserver.
-func (f StreamTruncationObserverFunc) ObserveStreamTruncation(e StreamTruncationEvent) { f(e) }
-
-// LatencyEvent carries the per-request latency metrics needed by the
-// histogram families added in issue #165. All timing fields are in
-// seconds; isError is true when the upstream returned an error.
-type LatencyEvent struct {
-	Route          string
-	LatencySeconds float64
-	TTFTSeconds    float64
-	IsError        bool
-}
-
-// LatencyObserver is the hook the chat handler invokes once per proxied
-// request with a LatencyEvent payload (issue #165). Same invariants as
-// the other observer hooks: safe to call from many goroutines, must not
-// block, may be nil. The handler does not import the observability
-// package; main.go wires a closure that forwards to
-// RouteCounters.ObserveLatency.
-type LatencyObserver interface {
-	ObserveLatency(LatencyEvent)
-}
-
-// LatencyObserverFunc adapts a plain function to the LatencyObserver
-// interface so wiring from main.go stays a one-liner.
-type LatencyObserverFunc func(LatencyEvent)
-
-// ObserveLatency implements LatencyObserver.
-func (f LatencyObserverFunc) ObserveLatency(e LatencyEvent) { f(e) }
+// ObserveCascadeFallback implements CascadeFallbackObserver.
+func (f CascadeFallbackObserverFunc) ObserveCascadeFallback(e CascadeFallbackEvent) { f(e) }
 
 // MetricsEvent carries the per-request data needed by the savings
-// dashboard (issue #4). Fields track the full Round-trip metrics:
+// dashboard (issue #4). Fields track the full round-trip metrics:
 // route/model/input-tokens are routing dimensions; TOON/RAG/cost are
 // the savings dimensions the dashboard renders. The handler builds
 // one of these after every proxied request (success, failure, or
@@ -266,15 +280,17 @@ func (f LatencyObserverFunc) ObserveLatency(e LatencyEvent) { f(e) }
 // dashboard joins these to answer "what fraction of frontier traffic
 // came from a low-confidence SLM escalation?".
 type MetricsEvent struct {
-	Timestamp         time.Time
-	RequestID         string
-	Route             string
-	Model             string
-	InputTokens       int
-	TOONSavingsTokens int
-	RAGInjected       bool
-	RAGFilename       string
-	EstimatedCostUSD  float64
+	Timestamp             time.Time
+	RequestID             string
+	Route                 string
+	Model                 string
+	InputTokens           int
+	TOONSavingsTokens     int
+	TOONCompressionMethod string // issue #247: "fenced", "nested", or "" (no compression)
+
+	RAGInjected      bool
+	RAGFilename      string
+	EstimatedCostUSD float64
 
 	// BaselineCostUSD is what the request would have cost at the
 	// configured frontier baseline rate (issue #73). SavingsUSD is
@@ -282,12 +298,16 @@ type MetricsEvent struct {
 	BaselineCostUSD float64
 	SavingsUSD      float64
 
-	OutputTokens         int
-	TTFTMs               int64
-	TotalLatencyMs       float64
-	TPS                  float64
-	Streaming            bool
-	FusionArbiterSkipped bool
+	OutputTokens            int
+	TTFTMs                  int64
+	TotalLatencyMs          float64
+	TPS                     float64
+	Streaming               bool
+	FusionArbiterSkipped    bool
+	FusionJaccardSimilarity float64
+	// FusionArbiterCostUSD (issue #239): estimated cost of the arbiter
+	// call when it ran. 0 when the arbiter was skipped or for non-fusion routes.
+	FusionArbiterCostUSD float64
 	ToolCallCount        int
 	Error                string
 
@@ -398,6 +418,14 @@ type Deps struct {
 	// judge; main.go bridges JudgeScore -> RecordOutcome.
 	Confidence router.ConfidenceStore
 
+	// SLMCache is the optional time-bounded prompt→route cache
+	// (issue #206). When non-nil the planner checks the cache before
+	// calling the SLM; a cache hit returns the cached route without
+	// calling the SLM. When nil the SLM is always called
+	// (pre-cache behaviour). The cache TTL is configured at cache
+	// construction time via NewSLMCache.
+	SLMCache *router.SLMCache
+
 	// JudgeObserver is optional. When nil, the handler does not
 	// buffer the streamed response for judge sampling — every
 	// request takes the fast path with zero added overhead.
@@ -454,19 +482,6 @@ type Deps struct {
 	// probe is wired.
 	BudgetObserver BudgetObserver
 
-	// BudgetGuard is the rolling 24h frontier spend guard (issue
-	// #183). When non-nil the handler calls BudgetGuard.Check with
-	// the estimated frontier cost before issuing a route=frontier or
-	// route=fusion request; a false return is treated as a 429
-	// rejection. After a successful frontier/fusion response the
-	// handler calls BudgetGuard.Record with the estimated USD cost so
-	// the rolling window stays current. Nil means budget guard is
-	// disabled (pre-#183 behaviour).
-	BudgetGuard interface {
-		Check(cost float64) bool
-		Record(spent float64)
-	}
-
 	// LocalLimiter bounds concurrent local-route requests (issue
 	// #81). When non-nil the handler Acquires a slot before issuing
 	// the local upstream dispatch and Releases it once the dispatch
@@ -513,28 +528,33 @@ type Deps struct {
 	// the event to the in-process rejection counter.
 	RejectionObserver RejectionObserver
 
-	// StreamTruncationObserver is invoked when the streaming proxy
-	// detects a mid-stream upstream TCP drop (issue #118).
-	// upstream.StreamWithContext self-heals by emitting a truncation
-	// event + `data: [DONE]` so the harness does not hang, and
-	// returns upstream.ErrUpstreamTruncated; the handler dispatches
-	// this hook so /metrics records the truncation and stamps
-	// X-Nexus-Truncated on the response. Implementations must be
-	// safe for concurrent use and must not block. Nil is treated as
-	// "no observer"; the hot path is unaffected. The handler does
-	// not import the observability package — main.go wires a closure
-	// that adapts the event to the in-process truncation counter.
-	StreamTruncationObserver StreamTruncationObserver
+	// FusionOutcomeObserver is invoked once per fusion request after
+	// PanelStreaming returns, with the arbiter outcome (issue #187).
+	// Safe for concurrent use, must not block, nil is "no observer".
+	// The handler does not import observability; main.go wires a
+	// closure that forwards to RouteCounters.ObserveFusionOutcome.
+	FusionOutcomeObserver FusionOutcomeObserver
 
-	// LatencyObserver is invoked once per proxied request with the
-	// end-to-end latency, TTFT, and error flag (issue #165).
-	// Implementations must be safe for concurrent use; the handler
-	// invokes the observer on the request goroutine so observers
-	// should not block for long. Nil is treated as "no observer";
-	// the hot path is unaffected. The handler does not import the
-	// observability package — main.go wires a closure that forwards
-	// to RouteCounters.ObserveLatency.
-	LatencyObserver LatencyObserver
+	// RAGObserver is invoked once per RAG retrieval attempt (issue #186)
+	// with the hit/miss outcome so the observability layer can record
+	// RAG effectiveness metrics. Implementations must be safe for
+	// concurrent use and must not block. Nil is treated as "no
+	// observer"; the hot path is unaffected. The handler does not
+	// import the observability package — main.go wires a closure
+	// that adapts the event to the in-process RAG counter.
+	RAGObserver RAGObserver
+
+	// CascadeFallbackObserver is invoked when the cascade falls back to a
+	// later step due to a retryable error (issue #205). The handler
+	// dispatches exactly one event per request when FallbackReason is
+	// non-empty (i.e., the cascade fell back at least once). The
+	// reason is one of "timeout", "transport_error", or
+	// "malformed_toolcall". Implementations must be safe for concurrent
+	// use and must not block. Nil means "no observer"; the hot path is
+	// unaffected. The handler does not import the observability package —
+	// main.go wires a closure that forwards to
+	// RouteCounters.ObserveCascadeFallback.
+	CascadeFallbackObserver CascadeFallbackObserver
 
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
@@ -629,8 +649,7 @@ func Chat(d Deps) http.Handler {
 					Error:          reason,
 					TotalLatencyMs: totalMs,
 				})
-			}
-			if d.Recorder != nil {
+			} else {
 				d.Recorder.Record(telemetry.Record{
 					Timestamp:      ts,
 					RequestID:      reqID,
@@ -750,16 +769,45 @@ func Chat(d Deps) http.Handler {
 		var ragInjected bool
 		var ragFilename string
 		var ragScore float64
-		if ex, score, err := d.RAG.Retrieve(r.Context(), latestPrompt); err == nil && ex != nil {
-			messages = middleware.InjectRAG(messages, rag.FormatInjection(ex))
+		ragEx, ragScore, ragErr := d.RAG.Retrieve(r.Context(), latestPrompt)
+		switch {
+		case ragErr != nil:
+			slog.Info("rag miss",
+				slog.String("reason", "embed_error"),
+				slog.String("request_id", reqID),
+			)
+			if d.RAGObserver != nil {
+				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "embed_error"})
+			}
+		case ragEx != nil:
+			messages = middleware.InjectRAG(messages, rag.FormatInjection(ragEx))
 			slog.Info("rag hit",
-				slog.String("filename", ex.Filename),
-				slog.Float64("score", score),
+				slog.String("filename", ragEx.Filename),
+				slog.Float64("score", ragScore),
 				slog.String("request_id", reqID),
 			)
 			ragInjected = true
-			ragFilename = ex.Filename
-			ragScore = score
+			ragFilename = ragEx.Filename
+			if d.RAGObserver != nil {
+				d.RAGObserver.ObserveRAG(RAGEvent{Hit: true, Filename: ragEx.Filename})
+			}
+		case d.RAG.Size() == 0:
+			slog.Info("rag miss",
+				slog.String("reason", "empty_store"),
+				slog.String("request_id", reqID),
+			)
+			if d.RAGObserver != nil {
+				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "empty_store"})
+			}
+		default:
+			slog.Info("rag miss",
+				slog.String("reason", "threshold"),
+				slog.Float64("score", ragScore),
+				slog.String("request_id", reqID),
+			)
+			if d.RAGObserver != nil {
+				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "threshold"})
+			}
 		}
 		trace.Transforms.RAGInjected = ragInjected
 		trace.Transforms.RAGFilename = ragFilename
@@ -771,26 +819,16 @@ func Chat(d Deps) http.Handler {
 		// (see internal/telemetry.EstimateTokens).
 		preCompressionChars := totalMessageChars(messages)
 		trace.Transforms.TOONBytesBefore = preCompressionChars
-		// TOON compression runs in two passes: the fenced-block path
-		// (CompressJSONBlocks) always fires, then the unfenced-array
-		// path (CompressUnfencedJSONArrays, issue #123) handles bare
-		// `[ {...} ]` arrays pasted without a code fence. The unfenced
-		// pass is gated by NEXUS_TOON_UNFENCED so operators with a
-		// downstream parser that depends on raw JSON can revert. Both
-		// passes shrink the message between the pre/post snapshots
-		// below, so the existing token-savings accounting captures
-		// them without bespoke bookkeeping.
-		toonRewrote := middleware.CompressJSONBlocks(messages)
-		if d.Config.TOONUnfenced && middleware.CompressUnfencedJSONArrays(messages) {
-			toonRewrote = true
-		}
-		if toonRewrote {
+		toonCompressionMethod := middleware.CompressJSONBlocks(messages)
+		if toonCompressionMethod != "" {
 			if d.Config.PromptInjectionIsolated() {
 				messages = middleware.AppendSystemNoteIsolated(messages, d.Config.TOONNotice)
 			} else {
 				messages = middleware.AppendSystemNote(messages, d.Config.TOONNotice)
 			}
-			slog.Info("toon compressed messages", slog.String("request_id", reqID))
+			slog.Info("toon compressed messages",
+				slog.String("request_id", reqID),
+				slog.String("method", string(toonCompressionMethod)))
 		}
 		postCompressionChars := totalMessageChars(messages)
 		trace.Transforms.TOONApplied = postCompressionChars != preCompressionChars
@@ -835,6 +873,7 @@ func Chat(d Deps) http.Handler {
 			SLM:             d.SLM,
 			Confidence:      d.Confidence,
 			FormattingRegex: d.FormattingRegex,
+			SLMCache:        d.SLMCache,
 		}
 		decision := planner.Plan(router.PlanRequest{
 			Prompt:          latestPrompt,
@@ -862,6 +901,7 @@ func Chat(d Deps) http.Handler {
 			Reason:     decision.Reason,
 			Confidence: decision.Confidence,
 			TaskType:   decision.TaskType,
+			CacheHit:   decision.CacheHit,
 		}
 		w.Header().Set("X-Nexus-Route", SanitizeHeaderValue(routeEvent.Route))
 		w.Header().Set("X-Nexus-Route-Source", SanitizeHeaderValue(routeEvent.Source))
@@ -994,6 +1034,7 @@ func Chat(d Deps) http.Handler {
 		var model string
 		var upErr error
 		var fusionArbiterSkipped bool
+		var fusionJaccardSimilarity float64
 		// toolCallCount is populated from the cascade result on the
 		// local streaming route (issue #72) and forwarded to telemetry
 		// + metrics so the dashboard can report how many tool calls
@@ -1034,24 +1075,6 @@ func Chat(d Deps) http.Handler {
 			trace.Upstream.Model = d.Config.FrontierModel
 			trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
 			if streaming && d.Config.FusionProgressiveDelivery {
-				// Budget guard check (issue #183): fusion includes a
-				// frontier panel member, so it counts toward the daily
-				// budget. Reject before spinning up either member.
-				inputTokens := telemetry.EstimateTokens(latestPrompt)
-				cost := frontierCostEstimate(string(router.RouteFusion), d.Config.FrontierModel, inputTokens, d.Config.JudgeCostPer1KUSD)
-				if d.BudgetGuard != nil && d.BudgetGuard.Check(cost) {
-					slog.Warn("budget exhausted, rejecting fusion request",
-						slog.String("request_id", reqID),
-					)
-					if d.RejectionObserver != nil {
-						d.RejectionObserver.ObserveRejection(RejectionEvent{
-							RequestID: reqID,
-							Reason:    RejectionBudget,
-						})
-					}
-					http.Error(w, "Budget exhausted", http.StatusTooManyRequests)
-					return
-				}
 				var outcome upstream.PanelOutcome
 				outcome, upErr = upstream.PanelStreaming(
 					obs, d.Client,
@@ -1062,8 +1085,10 @@ func Chat(d Deps) http.Handler {
 					d.Config.ArbiterTimeout,
 					skipLocal,
 					d.Config.FusionAgreementThreshold,
+					reqID,
 				)
 				fusionArbiterSkipped = outcome.ArbiterSkipped
+				fusionJaccardSimilarity = outcome.Similarity
 				if outcome.ArbiterSkipped {
 					slog.Info("fusion arbiter skipped",
 						slog.String("source", outcome.Source),
@@ -1071,23 +1096,13 @@ func Chat(d Deps) http.Handler {
 						slog.String("request_id", reqID),
 					)
 				}
-			} else {
-				// Budget guard check for non-progressive fusion (issue #183).
-				inputTokens := telemetry.EstimateTokens(latestPrompt)
-				cost := frontierCostEstimate(string(router.RouteFusion), d.Config.FrontierModel, inputTokens, d.Config.JudgeCostPer1KUSD)
-				if d.BudgetGuard != nil && d.BudgetGuard.Check(cost) {
-					slog.Warn("budget exhausted, rejecting fusion request",
-						slog.String("request_id", reqID),
-					)
-					if d.RejectionObserver != nil {
-						d.RejectionObserver.ObserveRejection(RejectionEvent{
-							RequestID: reqID,
-							Reason:    RejectionBudget,
-						})
-					}
-					http.Error(w, "Budget exhausted", http.StatusTooManyRequests)
-					return
+				if d.FusionOutcomeObserver != nil {
+					d.FusionOutcomeObserver.ObserveFusionOutcome(FusionOutcomeEvent{
+						RequestID:      reqID,
+						ArbiterSkipped: outcome.ArbiterSkipped,
+					})
 				}
+			} else {
 				upErr = upstream.Panel(
 					obs, d.Client,
 					d.Config.OllamaURL, d.Config.LocalModel,
@@ -1184,6 +1199,16 @@ func Chat(d Deps) http.Handler {
 				// entirely and starts at frontier.
 				res, err := cas.Run(rw, d.Client, body)
 				logCascadeTelemetry(res, err, reqID)
+				// Issue #205: record cascade fallback metric when a retryable
+				// step failure caused the cascade to fall back to the next
+				// step. The observer is nil-safe; nil means no observability
+				// wiring so the hot path is unaffected.
+				if res.FallbackReason != "" && d.CascadeFallbackObserver != nil {
+					d.CascadeFallbackObserver.ObserveCascadeFallback(CascadeFallbackEvent{
+						RequestID: reqID,
+						Reason:    res.FallbackReason,
+					})
+				}
 				// Issue #80: arm the local-route cooldown when the
 				// cascade reports the local step failed before a
 				// fallback served the request. Subsequent requests
@@ -1213,19 +1238,15 @@ func Chat(d Deps) http.Handler {
 					toolCallCount = len(res.ToolCalls)
 					if res.Succeeded && capw != nil {
 						if d.JudgeObserver != nil {
-							if !d.JudgeObserver.Submit(LocalCompletion{
+							d.JudgeObserver.Submit(LocalCompletion{
 								RequestID:   reqID,
 								Instruction: latestPrompt,
 								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
-							}) {
-								slog.Warn("judge sample dropped by observer",
-									slog.String("request_id", reqID),
-								)
-							}
+							})
 						}
 						if d.QualityObserver != nil {
-							emitDetectedEdits(capw.Buffer(), reqID, d.QualityObserver)
+							emitDetectedEdits(capw.Buffer(), reqID, "", "", d.QualityObserver)
 						}
 					}
 				}
@@ -1288,19 +1309,15 @@ func Chat(d Deps) http.Handler {
 					}
 					if capw != nil {
 						if d.JudgeObserver != nil {
-							if !d.JudgeObserver.Submit(LocalCompletion{
+							d.JudgeObserver.Submit(LocalCompletion{
 								RequestID:   reqID,
 								Instruction: latestPrompt,
 								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
-							}) {
-								slog.Warn("judge sample dropped by observer",
-									slog.String("request_id", reqID),
-								)
-							}
+							})
 						}
 						if d.QualityObserver != nil {
-							emitDetectedEdits(capw.Buffer(), reqID, d.QualityObserver)
+							emitDetectedEdits(capw.Buffer(), reqID, "", "", d.QualityObserver)
 						}
 					}
 				}
@@ -1319,23 +1336,6 @@ func Chat(d Deps) http.Handler {
 
 		default:
 			model = d.Config.FrontierModel
-			// Budget guard check (issue #183): reject before issuing a
-			// frontier request when the daily budget is exhausted.
-			inputTokens := telemetry.EstimateTokens(latestPrompt)
-			cost := frontierCostEstimate(string(router.RouteFrontier), model, inputTokens, d.Config.JudgeCostPer1KUSD)
-			if d.BudgetGuard != nil && d.BudgetGuard.Check(cost) {
-				slog.Warn("budget exhausted, rejecting frontier request",
-					slog.String("request_id", reqID),
-				)
-				if d.RejectionObserver != nil {
-					d.RejectionObserver.ObserveRejection(RejectionEvent{
-						RequestID: reqID,
-						Reason:    RejectionBudget,
-					})
-				}
-				http.Error(w, "Budget exhausted", http.StatusTooManyRequests)
-				return
-			}
 			// Honor the harness's stream flag (issue #10). Stream
 			// preserves SSE framing for chunked deliveries;
 			// BufferedFetch collects the full body and returns a
@@ -1346,31 +1346,6 @@ func Chat(d Deps) http.Handler {
 			} else {
 				upErr = upstream.BufferedFetch(obs, d.Client,
 					d.Config.FrontierURL, d.Config.FrontierKey, body)
-			}
-			// Issue #118: a mid-stream upstream TCP drop is self-healed
-			// inside upstream.StreamWithContext (it emits a truncation
-			// event + `data: [DONE]`) and returned as
-			// upstream.ErrUpstreamTruncated. The response is already
-			// committed (200 + flushed SSE frames), so we MUST NOT call
-			// http.Error (that would write a 502 body into a stream the
-			// client already terminated). Surface the truncation on the
-			// response header and the observability hook, then clear the
-			// error so the generic upstream-error branch below is
-			// skipped. Only the streaming path can truncate; the
-			// BufferedFetch branch never returns this sentinel.
-			if upErr != nil && errors.Is(upErr, upstream.ErrUpstreamTruncated) {
-				w.Header().Set("X-Nexus-Truncated", "true")
-				if d.StreamTruncationObserver != nil {
-					d.StreamTruncationObserver.ObserveStreamTruncation(StreamTruncationEvent{
-						RequestID: reqID,
-						Route:     string(route),
-					})
-				}
-				slog.Warn("upstream stream truncated; emitted synthetic [DONE]",
-					slog.String("route", string(route)),
-					slog.String("request_id", reqID),
-				)
-				upErr = nil
 			}
 			if upErr != nil {
 				slog.Error("upstream error",
@@ -1409,19 +1384,7 @@ func Chat(d Deps) http.Handler {
 			}
 		}
 		outputTokens := int(obs.BytesOut() / 4)
-		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr, fusionArbiterSkipped, toolCallCount, decision)
-		// LatencyObserver (issue #165): emit after the record so the
-		// latency metrics include all time up to last byte.
-		if d.LatencyObserver != nil {
-			latencySeconds := totalMs / 1000.0
-			ttftSeconds := float64(ttftMs) / 1000.0
-			d.LatencyObserver.ObserveLatency(LatencyEvent{
-				Route:          string(route),
-				LatencySeconds: latencySeconds,
-				TTFTSeconds:    ttftSeconds,
-				IsError:        upErr != nil,
-			})
-		}
+		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr, fusionArbiterSkipped, fusionJaccardSimilarity, toolCallCount, decision)
 		if d.MetricsObserver != nil {
 			postCompressionChars := totalMessageChars(messages)
 			savings := totalTokenSavings(preCompressionChars, postCompressionChars)
@@ -1432,43 +1395,47 @@ func Chat(d Deps) http.Handler {
 			if savingsCost < 0 {
 				savingsCost = 0
 			}
+			// FusionArbiterCostUSD (issue #239): when the arbiter ran
+			// (fusion route with disagreement), estimate its cost using
+			// FrontierCostPer1K. The arbiter prompt is approximately
+			// the latestPrompt plus the two panel responses; we use
+			// inputTokens as a conservative proxy since the streamed
+			// responses are not retained after serving.
+			var fusionArbiterCostUSD float64
+			if route == router.RouteFusion && !fusionArbiterSkipped {
+				fusionArbiterCostUSD = frontierCostEstimate(
+					string(router.RouteFrontier), model, inputTokens, d.Config.FrontierCostPer1K)
+			}
 			tps := telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 			d.MetricsObserver.Submit(MetricsEvent{
-				Timestamp:            rec.Timestamp,
-				RequestID:            reqID,
-				Route:                string(route),
-				Model:                model,
-				InputTokens:          rec.InputTokens,
-				TOONSavingsTokens:    savings,
-				RAGInjected:          ragInjected,
-				RAGFilename:          ragFilename,
-				EstimatedCostUSD:     cost,
-				BaselineCostUSD:      baselineCost,
-				SavingsUSD:           savingsCost,
-				OutputTokens:         outputTokens,
-				TTFTMs:               ttftMs,
-				TotalLatencyMs:       totalMs,
-				TPS:                  tps,
-				Streaming:            streaming,
-				FusionArbiterSkipped: fusionArbiterSkipped,
-				ToolCallCount:        toolCallCount,
-				Error:                rec.Error,
-				RouteSource:          string(decision.Source),
-				RouteReason:          decision.Reason,
-				SLMConfidence:        decision.Confidence,
-				SLMTaskType:          decision.TaskType,
+				Timestamp:               rec.Timestamp,
+				RequestID:               reqID,
+				Route:                   string(route),
+				Model:                   model,
+				InputTokens:             rec.InputTokens,
+				TOONSavingsTokens:       savings,
+				TOONCompressionMethod:   string(toonCompressionMethod),
+				RAGInjected:             ragInjected,
+				RAGFilename:             ragFilename,
+				EstimatedCostUSD:        cost,
+				BaselineCostUSD:         baselineCost,
+				SavingsUSD:              savingsCost,
+				OutputTokens:            outputTokens,
+				TTFTMs:                  ttftMs,
+				TotalLatencyMs:          totalMs,
+				TPS:                     tps,
+				Streaming:               streaming,
+				FusionArbiterSkipped:    fusionArbiterSkipped,
+				FusionJaccardSimilarity: fusionJaccardSimilarity,
+				FusionArbiterCostUSD:    fusionArbiterCostUSD,
+				ToolCallCount:           toolCallCount,
+				Error:                   rec.Error,
+				RouteSource:             string(decision.Source),
+				RouteReason:             decision.Reason,
+				SLMConfidence:           decision.Confidence,
+				SLMTaskType:             decision.TaskType,
 			})
-		}
-		// BudgetGuard record (issue #183): after a successful frontier or
-		// fusion response, record the estimated input-token cost so the
-		// rolling 24h window stays current. No-op when BudgetGuard is nil
-		// (guard disabled). Only frontier/fusion routes have non-zero cost.
-		if d.BudgetGuard != nil && upErr == nil {
-			inputTokens := telemetry.EstimateTokens(latestPrompt)
-			cost := frontierCostEstimate(string(route), model, inputTokens, d.Config.JudgeCostPer1KUSD)
-			d.BudgetGuard.Record(cost)
-		}
-		if d.Recorder != nil {
+		} else {
 			d.Recorder.Record(rec)
 		}
 
@@ -1536,14 +1503,10 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 
 // requestID extracts (or generates) a correlation id for the judge
 // hook. The handler honours an inbound X-Request-Id so a caller can
-// thread its own id through; otherwise we mint a short hex token. The
-// inbound value is sanitized (issue #39) so a crafted header cannot
-// inject log entries or break downstream JSON consumers.
+// thread its own id through; otherwise we mint a short hex token.
 func requestID(r *http.Request) string {
 	if v := r.Header.Get("X-Request-Id"); v != "" {
-		if clean := sanitizeRequestID(v); clean != "" {
-			return clean
-		}
+		return v
 	}
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -1705,7 +1668,7 @@ const qualityPathWindowBytes = 4 * 1024
 // The function is O(len(body)) and best-effort: malformed JSON,
 // missing fields, or windows that don't contain a path field are
 // silently skipped. Deduplication is per-call, by path.
-func emitDetectedEdits(body, reqID string, obs QualityObserver) {
+func emitDetectedEdits(body, reqID, traceParent, traceState string, obs QualityObserver) {
 	if obs == nil || body == "" {
 		return
 	}
@@ -1793,6 +1756,7 @@ func buildRecord(
 	model, latestPrompt string,
 	upErr error,
 	fusionArbiterSkipped bool,
+	fusionJaccardSimilarity float64,
 	toolCallCount int,
 	decision router.Decision,
 ) telemetry.Record {
@@ -1806,21 +1770,22 @@ func buildRecord(
 	}
 	outputTokens := int(bytesOut / 4)
 	rec := telemetry.Record{
-		Timestamp:            time.Now().UTC(),
-		RequestID:            requestID,
-		Model:                model,
-		Route:                string(route),
-		InputTokens:          telemetry.EstimateTokens(latestPrompt),
-		OutputTokens:         outputTokens,
-		TTFTMs:               ttftMs,
-		TotalLatencyMs:       totalMs,
-		Streaming:            streaming,
-		FusionArbiterSkipped: fusionArbiterSkipped,
-		ToolCallCount:        toolCallCount,
-		RouteSource:          string(decision.Source),
-		RouteReason:          decision.Reason,
-		SLMConfidence:        decision.Confidence,
-		SLMTaskType:          decision.TaskType,
+		Timestamp:               time.Now().UTC(),
+		RequestID:               requestID,
+		Model:                   model,
+		Route:                   string(route),
+		InputTokens:             telemetry.EstimateTokens(latestPrompt),
+		OutputTokens:            outputTokens,
+		TTFTMs:                  ttftMs,
+		TotalLatencyMs:          totalMs,
+		Streaming:               streaming,
+		FusionArbiterSkipped:    fusionArbiterSkipped,
+		FusionJaccardSimilarity: fusionJaccardSimilarity,
+		ToolCallCount:           toolCallCount,
+		RouteSource:             string(decision.Source),
+		RouteReason:             decision.Reason,
+		SLMConfidence:           decision.Confidence,
+		SLMTaskType:             decision.TaskType,
 	}
 	rec.TPS = telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 	if upErr != nil {
@@ -1831,25 +1796,16 @@ func buildRecord(
 
 // --- metrics (issue #4) helpers ----------------------------------------
 
-// totalMessageChars walks the message structure and sums the length
-// of all string values. This approximates the JSON byte length without
-// the allocation and overhead of json.Marshal. Used to compute the
-// TOON savings token estimate. The delta (pre - post) is accurate
-// because TOON compression only mutates string content fields.
+// totalMessageChars marshals messages and returns the JSON byte
+// length. Used to compute the TOON savings token estimate. Mirrors
+// json.Marshal's own overflow behaviour (returns roughly the same
+// bytes the proxy would emit across the wire).
 func totalMessageChars(messages []interface{}) int {
-	var total int
-	for _, raw := range messages {
-		msg, ok := raw.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		for _, v := range msg {
-			if s, ok := v.(string); ok {
-				total += len(s)
-			}
-		}
+	b, err := json.Marshal(messages)
+	if err != nil {
+		return 0
 	}
-	return total
+	return len(b)
 }
 
 // totalTokenSavings returns the tokens saved by the TOON

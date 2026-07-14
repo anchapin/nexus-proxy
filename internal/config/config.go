@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/middleware"
+	ragpkg "github.com/anchapin/nexus-proxy/internal/rag"
 )
 
 // Config holds all runtime knobs for the proxy. A zero value is invalid;
@@ -80,6 +81,15 @@ type Config struct {
 	ExamplesDir  string  // "./few_shot_examples"
 	RAGThreshold float64 // cosine similarity cutoff for retrieval (0.55)
 
+	// RAG embedder plugin interface (issue #238). EmbedderType selects
+	// the backend: "ollama" (default), "openai", or "cohere". When
+	// "openai" or "cohere" is selected the corresponding API key must
+	// also be configured. The base URL for the remote backends defaults
+	// to the standard public endpoints; override via NEXUS_EMBEDDER_BASE_URL.
+	EmbedderType    ragpkg.EmbedderType // "ollama" | "openai" | "cohere"
+	EmbedderBaseURL string              // base URL for openai/cohere embedder
+	CohereAPIKey    string              // NEXUS_COHERE_API_KEY
+
 	// RAG persistence (issue #46). When RAGDBPath is set, the few-shot
 	// embeddings are cached on disk and reloaded on boot without
 	// re-hitting Ollama. RAGPollInterval > 0 enables a background
@@ -97,21 +107,13 @@ type Config struct {
 	RAGEmbedCacheSize int // max LRU entries (256)
 
 	// Routing
-	TokenGuardrail int           // estimated tokens above this force frontier (6000)
-	SLMTimeout     time.Duration // Qwen3-Coder routing timeout (8s)
-	// SLM routing decision cache (issue #116). The SLM decision is
-	// deterministic for a given prompt (temperature=0.1), so identical
-	// prompts pay the same 8s Ollama round-trip repeatedly. The cache
-	// is keyed on SHA256(prompt) and stores the parsed Decision
-	// (route, confidence, task_type). A size of 0 disables the cache.
-	// TTL of 0 means no expiry (entries evicted only by LRU). SLM
-	// transport errors (network, non-200, parse failure) are NOT cached
-	// so a transient Ollama failure is retried on the next request.
-	SLMCacheSize   int           // max LRU entries (default 1024)
-	SLMCacheTTL    time.Duration // entry TTL (default 5m; 0 = no expiry)
-	FusionTimeout  time.Duration // per-panel-member fetch timeout (120s)
-	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
-	ArbiterTimeout time.Duration // per-call timeout for the fusion arbiter stream (60s)
+	TokenGuardrail            int           // estimated tokens above this force frontier (6000)
+	SLMTimeout                time.Duration // Qwen3-Coder routing timeout (8s)
+	SLMCacheMaxEntries        int           // max entries in SLM routing decision cache (512)
+	SLMCacheSemanticThreshold float64       // cosine similarity floor for semantic cache hits (0.0..1.0, issue #245)
+	FusionTimeout             time.Duration // per-panel-member fetch timeout (120s)
+	CascadeTimeout            time.Duration // per-attempt timeout for cascade fallback (30s)
+	ArbiterTimeout            time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
 	// Frontier provider selector (issue #45). When more than one
 	// frontier provider is configured (frontier + z.ai), the chat
@@ -179,6 +181,11 @@ type Config struct {
 	RoutingConfidenceMinSamples int
 	RoutingConfidenceWindow     time.Duration
 
+	// SLM decision cache (issue #206). Deduplicates identical prompts
+	// within a TTL window so repeated requests don't trigger an SLM call.
+	// NEXUS_SLM_CACHE_TTL <= 0 disables the cache.
+	SLMCacheTTL time.Duration
+
 	// Health (issue #8). The chat handler consults
 	// internal/health.Health before issuing local-bound requests;
 	// when Ollama is unreachable it short-circuits to frontier
@@ -222,6 +229,22 @@ type Config struct {
 	// catching up. Zero disables the circuit (pre-#80 behaviour).
 	LocalCooldown time.Duration // default 10s; 0 disables
 
+	// Rolling 24h frontier spend guard (issue #183, #201). The guard
+	// tracks USD costs over a sliding 24-hour window and rejects new
+	// frontier/fusion requests with HTTP 429 when the daily limit is
+	// exhausted. BudgetEnabled is true when BudgetDailyLimit > 0.
+	//
+	// Alerting (issue #201): When BudgetAlertEnabled is true, the guard
+	// invokes the alerter callbacks when spend is recorded, when the
+	// budget is exceeded, and when spend crosses the approaching
+	// threshold (BudgetAlertThreshold fraction of the limit, default 80%).
+	// The alerter updates Prometheus counters and logs at warn/error
+	// level. Set BudgetAlertWebhookURL to enable webhook alerting.
+	BudgetDailyLimit      float64 // USD; NEXUS_BUDGET_DAILY_LIMIT
+	BudgetAlertEnabled    bool    // true iff NEXUS_BUDGET_ALERT_ENABLED is "true"
+	BudgetAlertThreshold  float64 // fraction of limit that triggers "approaching" alert [0,1]; default 0.8
+	BudgetAlertWebhookURL string  // optional webhook URL for JSON alert payloads
+
 	// HTTP request body cap (issue #11). The chat handler applies this
 	// with http.MaxBytesReader before reading the request body, so an
 	// oversized POST cannot exhaust proxy memory before the guardrail
@@ -240,8 +263,7 @@ type Config struct {
 	JudgeQueueDepth   int           // buffered channel size (default 64)
 	JudgeTimeout      time.Duration // per-call judge timeout (default 30s)
 	JudgeCostPer1KUSD float64       // rough USD/1k-token rate for cost estimates
-
-	// Quality (async AST/compiler verifier, issue #13). Detected
+	JudgeDBPath       string        // on-disk SQLite database for judge scores; empty disables Detected
 	// edits enqueue a background `cargo check` / `npx tsc` and the
 	// verdict (1 = clean, 0 = fail/timeout) is reported via a
 	// callback to cmd/nexus/main.go. QualityEnabled is true iff
@@ -257,16 +279,6 @@ type Config struct {
 	// Middleware prompts
 	MetaPrompt string // appended to system prompt by prompt_engine
 	TOONNotice string // appended when TOON compression is applied
-
-	// TOON unfenced-array detection (issue #123). When true (the
-	// default), the middleware runs a second TOON pass over
-	// user/assistant content that rewrites bare (unfenced) and
-	// prose-embedded JSON arrays-of-objects with >=2 rows. The
-	// fenced-block path always runs regardless of this flag; setting
-	// it to false restores the pre-issue-123 behaviour where only
-	// ```json fences are compressed, useful for downstream parsers
-	// that depend on raw JSON reaching the model.
-	TOONUnfenced bool
 
 	// Prompt-injection hardening (issue #76). Controls whether the
 	// proxy isolates its policy text from user-supplied system content
@@ -313,15 +325,6 @@ type Config struct {
 	Debug          bool
 	DebugBodyBytes int
 
-	// Distributed tracing (issue #41, #122). When TracingEndpoint is
-	// non-empty, an OTLP/JSON exporter is started and registered as the
-	// process-wide tracer. The exporter buffers spans in a bounded
-	// channel and POSTs them asynchronously; dropped spans are counted
-	// and surfaced on /metrics as nexus_tracing_dropped_total.
-	TracingEndpoint  string        // OTLP/JSON endpoint including /v1/traces
-	TracingTimeout   time.Duration // per-batch POST timeout
-	TracingQueueSize int           // buffer capacity; 0 uses default (256)
-
 	// OpenAI-compatible model discovery (issue #78). When enabled the
 	// proxy serves GET /v1/models and GET /v1/models/{id} listing the
 	// configured local, router, and frontier models, plus any models
@@ -352,17 +355,7 @@ type Config struct {
 	TrustedProxiesRaw string
 	RateLimitRPM      int
 	RateLimitBurst    int
-
-	// Rolling 24h frontier spend guard (issue #183). When BudgetDailyLimit
-	// is positive, the guard tracks frontier/fusion costs in a rolling
-	// 24h window and rejects new requests with 429 when the budget is
-	// exhausted. Zero or negative disables the guard entirely (pre-#183
-	// behaviour: no budget enforcement).
-	BudgetDailyLimit float64 // USD; NEXUS_BUDGET_DAILY_LIMIT
 }
-
-// BudgetEnabled returns true when the rolling 24h budget guard is active.
-func (c Config) BudgetEnabled() bool { return c.BudgetDailyLimit > 0 }
 
 // DefaultMetricsDBPath returns the canonical metrics DB location:
 // $XDG_CACHE_HOME/nexus-proxy/metrics.db (or the OS default for
@@ -402,6 +395,18 @@ func DefaultRAGDBPath() string {
 	return filepath.Join(base, "nexus-proxy", "rag.db")
 }
 
+// DefaultJudgeDBPath returns the canonical location for the judge
+// SQLite store (issue #198): $XDG_CACHE_HOME/nexus-proxy/judge.db.
+// Operators override with NEXUS_JUDGE_DB (empty disables persistence,
+// falling back to the in-memory MemoryStorage).
+func DefaultJudgeDBPath() string {
+	base, err := os.UserCacheDir()
+	if err != nil || base == "" {
+		base = "./.cache"
+	}
+	return filepath.Join(base, "nexus-proxy", "judge.db")
+}
+
 // Load reads configuration from environment variables, applying defaults
 // suitable for local development. It returns an error only when a required
 // value is malformed; missing optional values fall back to defaults.
@@ -420,7 +425,6 @@ func Load() (Config, error) {
 		ZAIKey:         getEnv("NEXUS_ZAI_API_KEY", ""),
 		ProxyAPIKey:    getEnv("NEXUS_PROXY_API_KEY", ""),
 		StatusPublic:   getEnvBool("NEXUS_STATUS_PUBLIC", false),
-		TOONUnfenced:   getEnvBool("NEXUS_TOON_UNFENCED", true),
 		ExamplesDir:    getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
 		MetaPrompt:     defaultMetaPrompt,
 		TOONNotice:     defaultTOONNotice,
@@ -458,6 +462,25 @@ func Load() (Config, error) {
 	}
 	cfg.RAGEmbedCacheSize = embedCacheSize
 
+	// RAG embedder plugin interface (issue #238). The type selects
+	// which backend the RAG store uses for vector embeddings.
+	// Defaults to "ollama" so a stock deployment is unchanged.
+	cfg.EmbedderType = ragpkg.EmbedderType(strings.ToLower(strings.TrimSpace(
+		getEnv("NEXUS_EMBEDDER_TYPE", "ollama"))))
+	// Base URL for remote embedder backends (openai/cohere). The
+	// default matches each provider's public endpoint, so operators
+	// only need to set the API key.
+	switch cfg.EmbedderType {
+	case ragpkg.EmbedderTypeOpenAI:
+		cfg.EmbedderBaseURL = getEnv("NEXUS_EMBEDDER_BASE_URL", "https://api.openai.com/v1")
+	case ragpkg.EmbedderTypeCohere:
+		cfg.EmbedderBaseURL = getEnv("NEXUS_EMBEDDER_BASE_URL", "https://api.cohere.ai/v1")
+	default:
+		// Ollama: base URL is already in OllamaURL; reuse it.
+		cfg.EmbedderBaseURL = cfg.OllamaURL
+	}
+	cfg.CohereAPIKey = getEnv("NEXUS_COHERE_API_KEY", "")
+
 	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
 	if err != nil {
 		return cfg, err
@@ -470,25 +493,16 @@ func Load() (Config, error) {
 	}
 	cfg.SLMTimeout = slmTimeout
 
-	// SLM cache (issue #116). Size 0 disables the cache; TTL 0 means
-	// no expiry (LRU-only eviction). Defaults: size=1024, TTL=5m.
-	slmCacheSize, err := getEnvInt("NEXUS_SLM_CACHE_SIZE", 1024)
+	// SLM routing decision cache (issue #162). Max
+	// entries caps memory at ~512 entries with simple LRU eviction.
+	slmCacheMax, err := getEnvInt("NEXUS_SLM_CACHE_MAX_ENTRIES", 512)
 	if err != nil {
 		return cfg, err
 	}
-	if slmCacheSize < 0 {
-		slmCacheSize = 0
+	if slmCacheMax < 0 {
+		slmCacheMax = 0
 	}
-	cfg.SLMCacheSize = slmCacheSize
-
-	slmCacheTTL, err := getEnvDuration("NEXUS_SLM_CACHE_TTL", 5*time.Minute)
-	if err != nil {
-		return cfg, err
-	}
-	if slmCacheTTL < 0 {
-		slmCacheTTL = 0
-	}
-	cfg.SLMCacheTTL = slmCacheTTL
+	cfg.SLMCacheMaxEntries = slmCacheMax
 
 	fusionTimeout, err := getEnvDuration("NEXUS_FUSION_TIMEOUT", 120*time.Second)
 	if err != nil {
@@ -623,6 +637,31 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.RoutingConfidenceWindow = confWindow
+
+	// SLM decision cache TTL (issue #206). Set
+	// NEXUS_SLM_CACHE_TTL to "0" to disable the cache entirely;
+	// the planner then always calls the SLM (pre-cache behaviour).
+	slmCacheTTL, err := getEnvDuration("NEXUS_SLM_CACHE_TTL", 30*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.SLMCacheTTL = slmCacheTTL
+
+	// Semantic similarity threshold for SLM cache (issue #245).
+	// 0.0 disables semantic deduplication; >0 uses cosine-similarity
+	// fallback in the SLMCache so prompts with the same intent but
+	// different wording share the same cached route decision.
+	slmCacheSemThreshold, err := getEnvFloat("NEXUS_SLMCACHE_SIMILARITY_THRESHOLD", 0.0)
+	if err != nil {
+		return cfg, err
+	}
+	if slmCacheSemThreshold < 0 {
+		slmCacheSemThreshold = 0
+	}
+	if slmCacheSemThreshold > 1.0 {
+		slmCacheSemThreshold = 1.0
+	}
+	cfg.SLMCacheSemanticThreshold = slmCacheSemThreshold
 
 	// Ollama health poller (issue #8). Defaults: 30s poll cadence,
 	// 3-failure breaker, 5s per-probe HTTP timeout. Set
@@ -831,6 +870,11 @@ func Load() (Config, error) {
 	}
 	cfg.JudgeCostPer1KUSD = costRate
 
+	// Judge SQLite persistence (issue #198). When set, scores are
+	// written to an on-disk SQLite store that survives restarts.
+	// Empty (the default) uses the in-memory MemoryStorage.
+	cfg.JudgeDBPath = getEnvAllowEmpty("NEXUS_JUDGE_DB", DefaultJudgeDBPath())
+
 	// The judge is "enabled" iff the operator actually configured
 	// sampling above zero. Zero/negative rate keeps the worker pool
 	// dormant even if the env vars are partially populated (a common
@@ -885,26 +929,6 @@ func Load() (Config, error) {
 	}
 	cfg.DebugBodyBytes = debugBodyBytes
 
-	// Distributed tracing (issue #41, #122). Empty endpoint disables
-	// tracing entirely; the exporter's zero-value methods are no-ops.
-	cfg.TracingEndpoint = getEnvAllowEmpty("NEXUS_TRACING_ENDPOINT", "")
-	if cfg.TracingEndpoint != "" {
-		tracingTimeout, err := getEnvDuration("NEXUS_TRACING_TIMEOUT", 10*time.Second)
-		if err != nil {
-			return cfg, err
-		}
-		cfg.TracingTimeout = tracingTimeout
-
-		tracingQueueSize, err := getEnvInt("NEXUS_TRACING_QUEUE_SIZE", 256)
-		if err != nil {
-			return cfg, err
-		}
-		if tracingQueueSize < 0 {
-			tracingQueueSize = 0
-		}
-		cfg.TracingQueueSize = tracingQueueSize
-	}
-
 	// OpenAI-compatible model discovery (issue #78). Enabled by
 	// default so a stock deployment is discoverable by OpenAI-
 	// compatible clients; operators who do not want the proxy to
@@ -917,11 +941,10 @@ func Load() (Config, error) {
 	}
 	cfg.ModelsCacheTTL = modelsCacheTTL
 
-	// Prompt-injection hardening (issue #76). Defaults to off so a
-	// stock deployment boots with byte-for-byte legacy behaviour.
-	// Operators opt into warn (log only) or strict (reject 400) by
-	// setting NEXUS_PROMPT_INJECTION_MODE. Unknown values fall back
-	// to off rather than failing boot.
+	// Prompt-injection hardening (issue #76). Defaults to warn so a
+	// stock deployment logs injection attempts out of the box.
+	// Operators can set NEXUS_PROMPT_INJECTION_MODE=off to disable,
+	// or strict to reject 400. Unknown values fall back to warn.
 	cfg.PromptInjectionMode = middleware.ParseInjectionMode(
 		os.Getenv("NEXUS_PROMPT_INJECTION_MODE"),
 	)
@@ -945,6 +968,34 @@ func Load() (Config, error) {
 	}
 	cfg.TrustedProxies = parsed
 
+	// Rolling 24h frontier spend guard (issue #183, #201). When
+	// BudgetDailyLimit > 0 the guard is active. Alerting is
+	// separately enabled via BudgetAlertEnabled.
+	budgetDailyLimit, err := getEnvFloat("NEXUS_BUDGET_DAILY_LIMIT", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if budgetDailyLimit < 0 {
+		budgetDailyLimit = 0
+	}
+	cfg.BudgetDailyLimit = budgetDailyLimit
+
+	cfg.BudgetAlertEnabled = parseBoolEnv("NEXUS_BUDGET_ALERT_ENABLED", false)
+
+	budgetAlertThreshold, err := getEnvFloat("NEXUS_BUDGET_ALERT_THRESHOLD", 0.8)
+	if err != nil {
+		return cfg, err
+	}
+	if budgetAlertThreshold < 0 {
+		budgetAlertThreshold = 0
+	}
+	if budgetAlertThreshold > 1 {
+		budgetAlertThreshold = 1
+	}
+	cfg.BudgetAlertThreshold = budgetAlertThreshold
+
+	cfg.BudgetAlertWebhookURL = getEnv("NEXUS_BUDGET_ALERT_WEBHOOK_URL", "")
+
 	// Per-client rate ceiling (requests/minute). Zero or negative
 	// disables the limiter entirely so a stock deployment is
 	// byte-for-byte identical to the pre-#75 path. Burst is the
@@ -966,17 +1017,6 @@ func Load() (Config, error) {
 		rateBurst = 0
 	}
 	cfg.RateLimitBurst = rateBurst
-
-	// Rolling 24h frontier spend guard (issue #183). Zero or negative
-	// disables the guard entirely (pre-#183 behaviour).
-	budgetDailyLimit, err := getEnvFloat("NEXUS_BUDGET_DAILY_LIMIT", 0)
-	if err != nil {
-		return cfg, err
-	}
-	if budgetDailyLimit < 0 {
-		budgetDailyLimit = 0
-	}
-	cfg.BudgetDailyLimit = budgetDailyLimit
 
 	return cfg, nil
 }
@@ -1099,10 +1139,6 @@ func (c Config) EffectiveDebugBodyBytes() int {
 // Disabled when TelemetryPath is empty.
 func (c Config) TelemetryEnabled() bool { return c.TelemetryPath != "" }
 
-// TracingEnabled reports whether the OTLP/JSON trace exporter should
-// be started. Disabled when TracingEndpoint is empty.
-func (c Config) TracingEnabled() bool { return c.TracingEndpoint != "" }
-
 // ModelsCacheEnabled reports whether the Ollama /api/tags poll should
 // supplement the configured models list (issue #78). Disabled when
 // ModelsCacheTTL is zero or negative — the handler then serves only
@@ -1122,6 +1158,10 @@ func (c Config) PromptInjectionIsolated() bool {
 // MetricsEnabled reports whether the SQLite metrics store should be
 // opened. Disabled when MetricsDBPath is empty.
 func (c Config) MetricsEnabled() bool { return c.MetricsDBPath != "" }
+
+// BudgetEnabled reports whether the rolling 24h frontier spend guard is
+// active (issue #183). Disabled when BudgetDailyLimit <= 0.
+func (c Config) BudgetEnabled() bool { return c.BudgetDailyLimit > 0 }
 
 // RateLimitEnabled reports whether the per-client rate limiter is
 // active (issue #75). Disabled when RateLimitRPM <= 0 so a stock
@@ -1222,6 +1262,13 @@ func (c Config) RoutingConfidenceEnabled() bool {
 // identically to the pre-auth proxy.
 func (c Config) AuthEnabled() bool { return c.ProxyAPIKey != "" }
 
+// SLMCacheEnabled reports whether the SLM decision cache (issue #206)
+// should be active. Disabled when SLMCacheTTL <= 0, which preserves
+// the pre-cache behaviour of always calling the SLM.
+func (c Config) SLMCacheEnabled() bool {
+	return c.SLMCacheTTL > 0
+}
+
 // RAGPersistentEnabled reports whether the SQLite-backed RAG store
 // (issue #46) should be opened. Disabled when RAGDBPath is empty,
 // which preserves the legacy in-memory-only behaviour for operators
@@ -1234,6 +1281,11 @@ func (c Config) RAGPersistentEnabled() bool { return c.RAGDBPath != "" }
 func (c Config) RAGWatcherEnabled() bool {
 	return c.RAGPersistentEnabled() && c.RAGPollInterval > 0
 }
+
+// JudgeDBEnabled reports whether the SQLite-backed judge store
+// (issue #198) should be opened. Disabled when JudgeDBPath is empty,
+// which preserves the legacy in-memory-only behaviour.
+func (c Config) JudgeDBEnabled() bool { return c.JudgeDBPath != "" }
 
 // NewLogger returns a *slog.Logger configured per LogLevel / LogFormat,
 // always writing to stderr. Centralising the construction in config

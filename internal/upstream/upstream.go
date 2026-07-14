@@ -567,6 +567,7 @@ func PanelStreaming(
 	arbiterTimeout time.Duration,
 	skipLocal bool,
 	agreementThreshold float64,
+	requestID string,
 ) (PanelOutcome, error) {
 	var outcome PanelOutcome
 
@@ -607,6 +608,7 @@ func PanelStreaming(
 	}
 
 	results := make(chan PanelResult, 2)
+	var cancelLocal, cancelFrontier context.CancelFunc
 	if skipLocal {
 		// Issue #8: synthetic local failure so the arbiter-style
 		// code paths below degrade cleanly. The handler sets
@@ -618,6 +620,7 @@ func PanelStreaming(
 	} else {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
+			cancelLocal = cancel
 			defer cancel()
 			msg, err := FetchPanel(ctx, client,
 				localBaseURL+"/v1/chat/completions", "", localModel, body)
@@ -626,6 +629,7 @@ func PanelStreaming(
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
+		cancelFrontier = cancel
 		defer cancel()
 		msg, err := FetchPanel(ctx, client,
 			frontierURL, "", frontierModel, body)
@@ -651,10 +655,13 @@ func PanelStreaming(
 	// member that returned structured tool calls should be the
 	// speculative winner even if it arrived second.
 	winner := first
+	winnerFromSecond := false
 	if first.Err != nil {
 		winner = second
+		winnerFromSecond = true
 	} else if len(second.ToolCalls) > 0 && len(first.ToolCalls) == 0 {
 		winner = second
+		winnerFromSecond = true
 	}
 	outcome.Source = winner.Source
 
@@ -684,9 +691,24 @@ func PanelStreaming(
 	if len(winner.ToolCalls) > 0 {
 		outcome.ArbiterSkipped = true
 		slog.Info("fusion tool-call winner, arbiter skipped",
+			slog.String("request_id", requestID),
 			slog.String("source", outcome.Source),
 			slog.Int("tool_calls", len(winner.ToolCalls)),
 		)
+		// Cancel the slow member's goroutine to stop in-flight work.
+		// The slow member's result was already consumed in the main
+		// flow (second := <-results), so no drain is needed.
+		if winnerFromSecond {
+			// winner is second; first (local) is slow
+			if cancelLocal != nil {
+				cancelLocal()
+			}
+		} else {
+			// winner is first; second (frontier) is slow
+			if cancelFrontier != nil {
+				cancelFrontier()
+			}
+		}
 		if err := writeSSEDone(w); err != nil {
 			return outcome, err
 		}
@@ -695,8 +717,21 @@ func PanelStreaming(
 
 	// One-member case (the other errored, or skipLocal ran frontier
 	// alone). The speculative answer IS the answer; no arbiter.
+	// The slow member's result was already consumed in the main flow.
 	if first.Err != nil || second.Err != nil {
 		outcome.ArbiterSkipped = true
+		// Cancel the slow member's goroutine to stop in-flight work.
+		if winnerFromSecond {
+			// winner is second; first (local) is slow
+			if cancelLocal != nil {
+				cancelLocal()
+			}
+		} else {
+			// winner is first; second (frontier) is slow
+			if cancelFrontier != nil {
+				cancelFrontier()
+			}
+		}
 		if err := writeSSEDone(w); err != nil {
 			return outcome, err
 		}
@@ -708,10 +743,25 @@ func PanelStreaming(
 	if outcome.Similarity >= agreementThreshold {
 		outcome.ArbiterSkipped = true
 		slog.Info("fusion agreement, arbiter skipped",
+			slog.String("request_id", requestID),
 			slog.String("source", outcome.Source),
 			slog.Float64("similarity", outcome.Similarity),
 			slog.Float64("threshold", agreementThreshold),
 		)
+		// Cancel the slow member's goroutine to stop in-flight work.
+		// Both results are already consumed from the channel (lines 499-500),
+		// so no drain is needed; cancelling aborts the slow HTTP request.
+		if winnerFromSecond {
+			// winner is second; first (local) is slow
+			if cancelLocal != nil {
+				cancelLocal()
+			}
+		} else {
+			// winner is first; second (frontier) is slow
+			if cancelFrontier != nil {
+				cancelFrontier()
+			}
+		}
 		if err := writeSSEDone(w); err != nil {
 			return outcome, err
 		}
@@ -726,6 +776,7 @@ func PanelStreaming(
 	// text is the authoritative final answer in the operator's
 	// mental model.
 	slog.Info("fusion disagreement, invoking arbiter",
+		slog.String("request_id", requestID),
 		slog.String("first_source", outcome.Source),
 		slog.Float64("similarity", outcome.Similarity),
 		slog.Float64("threshold", agreementThreshold),
@@ -743,6 +794,20 @@ func PanelStreaming(
 	defer cancelArbiter()
 	if err := StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody); err != nil {
 		return outcome, fmt.Errorf("fusion: arbiter stream: %w", err)
+	}
+	// Cancel the slow member's goroutine — its result was already consumed
+	// (second := <-results) but the goroutine may still be trying to send
+	// on the full channel, which would deadlock if we didn't cancel.
+	if winnerFromSecond {
+		// winner is second; first (local) is slow
+		if cancelLocal != nil {
+			cancelLocal()
+		}
+	} else {
+		// winner is first; second (frontier) is slow
+		if cancelFrontier != nil {
+			cancelFrontier()
+		}
 	}
 	if err := writeSSEDone(w); err != nil {
 		return outcome, err
