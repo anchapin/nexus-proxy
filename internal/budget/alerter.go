@@ -26,6 +26,10 @@ type PrometheusAlerter struct {
 	// uint64 encoding of a float64 (math.Float64bits).
 	LastSpent atomic.Uint64
 
+	// lastSource stores the source label of the most recent spend event
+	// (e.g. "frontier" or "judge"). Accessed via LastSource().
+	lastSource atomic.Value // stores string
+
 	// LastState stores the most recent state snapshot.
 	LastState atomic.Value // stores State
 
@@ -46,6 +50,7 @@ func NewPrometheusAlerter(logger *slog.Logger) *PrometheusAlerter {
 		LogLevel: slog.LevelWarn,
 	}
 	a.LastState.Store(State{})
+	a.lastSource.Store("")
 	return a
 }
 
@@ -63,10 +68,20 @@ func (a *PrometheusAlerter) OnExceed(s State) {
 	}
 }
 
-// OnSpend implements Alerter. It stores the spend amount and state.
-func (a *PrometheusAlerter) OnSpend(s State, amount float64) {
+// OnSpend implements Alerter. It stores the spend amount, source, and state.
+// The source label (e.g. "frontier" or "judge") is stored and logged so
+// spend can be attributed to its origin.
+func (a *PrometheusAlerter) OnSpend(s State, amount float64, source string) {
 	a.LastSpent.Store(math.Float64bits(amount))
+	a.lastSource.Store(source)
 	a.LastState.Store(s)
+	if a.Logger != nil {
+		a.Logger.Log(context.TODO(), slog.LevelInfo, "budget spend recorded",
+			slog.Float64("spent_usd", amount),
+			slog.Float64("total_spent_usd", s.Spent),
+			slog.String("source", source),
+		)
+	}
 }
 
 // OnApproaching implements Alerter. It increments the approaching counter,
@@ -97,3 +112,7 @@ func (a *PrometheusAlerter) LastSpentAmount() float64 {
 
 // State returns the most recent state snapshot.
 func (a *PrometheusAlerter) State() State { return a.LastState.Load().(State) }
+
+// LastSource returns the source label of the most recent spend event
+// (e.g. "frontier" or "judge").
+func (a *PrometheusAlerter) LastSource() string { return a.lastSource.Load().(string) }

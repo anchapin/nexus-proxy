@@ -34,8 +34,8 @@ func TestGuardCheckDisabled(t *testing.T) {
 // TestGuardRecordAndState verifies Record updates State correctly.
 func TestGuardRecordAndState(t *testing.T) {
 	g := NewGuard(100.0)
-	g.Record(25.0)
-	g.Record(30.0)
+	g.Record(25.0, "frontier")
+	g.Record(30.0, "frontier")
 
 	state := g.State()
 	if state.Spent != 55.0 {
@@ -55,7 +55,7 @@ func TestGuardRecordAndState(t *testing.T) {
 // TestGuardExhausted verifies Exhausted is true when spent >= limit.
 func TestGuardExhausted(t *testing.T) {
 	g := NewGuard(100.0)
-	g.Record(100.0)
+	g.Record(100.0, "frontier")
 
 	state := g.State()
 	if !state.Exhausted {
@@ -66,8 +66,8 @@ func TestGuardExhausted(t *testing.T) {
 // TestGuardRecordZeroOrNegative is a no-op.
 func TestGuardRecordZeroOrNegative(t *testing.T) {
 	g := NewGuard(100.0)
-	g.Record(0.0)
-	g.Record(-10.0)
+	g.Record(0.0, "frontier")
+	g.Record(-10.0, "frontier")
 
 	state := g.State()
 	if state.Spent != 0.0 {
@@ -79,7 +79,7 @@ func TestGuardRecordZeroOrNegative(t *testing.T) {
 // guard returns false even when spend would exceed the limit.
 func TestGuardCheckDisabledNeverBlocks(t *testing.T) {
 	g := NewGuard(0) // disabled
-	g.Record(1000.0)
+	g.Record(1000.0, "frontier")
 	if g.Check(50.0) {
 		t.Error("Check on disabled guard should always return false")
 	}
@@ -88,7 +88,7 @@ func TestGuardCheckDisabledNeverBlocks(t *testing.T) {
 // TestGuardSetLimit updates the limit dynamically.
 func TestGuardSetLimit(t *testing.T) {
 	g := NewGuard(100.0)
-	g.Record(50.0)
+	g.Record(50.0, "frontier")
 
 	g.SetLimit(40.0)
 	state := g.State()
@@ -113,7 +113,7 @@ func TestGuardCheckAfterSetLimit(t *testing.T) {
 // TestGuardStateNextReset verifies NextReset is set correctly.
 func TestGuardStateNextReset(t *testing.T) {
 	g := NewGuard(100.0)
-	g.Record(10.0)
+	g.Record(10.0, "frontier")
 
 	state := g.State()
 	if state.NextReset.IsZero() {
@@ -144,6 +144,34 @@ func TestGuardLimitAccessor(t *testing.T) {
 	}
 }
 
+// TestGuardSourceLabel verifies that the source label is stored with
+// each entry and surfaced in the alerter callback.
+func TestGuardSourceLabel(t *testing.T) {
+	var lastSource string
+	g := NewGuard(100.0)
+	g.SetAlerter(AlerterFunc(func(_ State, _ float64, source string) {
+		lastSource = source
+	}))
+
+	g.Record(10.0, "frontier")
+	if lastSource != "frontier" {
+		t.Errorf("source = %q, want frontier", lastSource)
+	}
+
+	g.Record(5.0, "judge")
+	if lastSource != "judge" {
+		t.Errorf("source = %q, want judge", lastSource)
+	}
+}
+
+// AlerterFunc is a thin adapter so tests can use a plain function as
+// an Alerter without defining an interface implementation.
+type AlerterFunc func(State, float64, string)
+
+func (f AlerterFunc) OnExceed(State)                                {}
+func (f AlerterFunc) OnSpend(state State, cost float64, src string) { f(state, cost, src) }
+func (f AlerterFunc) OnApproaching(State)                           {}
+
 // TestGuardNilAlerterNoPanic verifies that operations don't panic when
 // no alerter is set.
 func TestGuardNilAlerterNoPanic(t *testing.T) {
@@ -157,7 +185,7 @@ func TestGuardNilAlerterNoPanic(t *testing.T) {
 			}
 		}()
 		g.Check(50.0)
-		g.Record(50.0)
+		g.Record(50.0, "frontier")
 		g.CheckApproaching()
 	}()
 }

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/auth"
+	"github.com/anchapin/nexus-proxy/internal/budget"
 	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
 	"github.com/anchapin/nexus-proxy/internal/config"
@@ -305,6 +306,22 @@ func main() {
 		confidenceStore *router.SQLiteConfidenceStore
 		confidenceObs   router.ConfidenceStore
 	)
+
+	// Budget guard for tracking spend (issue #183). Created early so it
+	// can be passed to the judge evaluator. When BudgetEnabled is false
+	// the guard is a no-op (limit=0).
+	var budgetGuard *budget.Guard
+	if cfg.BudgetEnabled() {
+		budgetGuard = budget.NewGuard(cfg.BudgetDailyLimit)
+		if cfg.BudgetAlertEnabled {
+			alerter := budget.NewPrometheusAlerter(slog.Default())
+			budgetGuard.SetAlerter(alerter)
+			slog.Info("budget alerting enabled",
+				slog.Float64("limit_usd", cfg.BudgetDailyLimit),
+			)
+		}
+	}
+
 	if cfg.JudgeEnabled && cfg.JudgeAPIKey != "" {
 		evalCfg := judge.Config{
 			URL:         cfg.JudgeURL,
@@ -315,6 +332,7 @@ func main() {
 			QueueDepth:  cfg.JudgeQueueDepth,
 			Timeout:     cfg.JudgeTimeout,
 			CostPer1K:   cfg.JudgeCostPer1KUSD,
+			BudgetGuard: budgetGuard,
 		}
 		// Issue #198: open the SQLite-backed judge store when
 		// NEXUS_JUDGE_DB is set (default path if unset). On error
