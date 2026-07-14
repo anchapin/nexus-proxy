@@ -24,6 +24,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/tokenizer"
 )
 
 // bufferedChannelSize caps the in-flight queue per recorder. Each record
@@ -102,10 +104,7 @@ type Record struct {
 // across the proxy (router VRAM guardrail, telemetry input). Centralising
 // the rule here keeps the two call sites consistent.
 func EstimateTokens(s string) int {
-	if len(s) <= 0 {
-		return 0
-	}
-	return len(s) / 4
+	return tokenizer.CountTokens(s)
 }
 
 // ComputeTPS derives tokens-per-second from output tokens and the generation
