@@ -35,6 +35,8 @@ import (
 // judge needs to score a response. The handler never imports judge —
 // the observer plugs in from cmd/nexus/main.go.
 type LocalCompletion struct {
+	TraceParent string
+	TraceState  string
 	RequestID   string
 	Instruction string
 	Output      string
@@ -65,9 +67,11 @@ func (f JudgeObserverFunc) Submit(c LocalCompletion) { f(c) }
 // that package so the dependency direction stays one-way (cmd/nexus
 // adapts between the two shapes).
 type QualityEvent struct {
-	RequestID string // correlates to the chat handler's request id
-	Path      string // path of the edited file
-	ToolName  string // write_file, edit_file, apply_patch, ...
+	TraceParent string
+	TraceState  string
+	RequestID   string // correlates to the chat handler's request id
+	Path        string // path of the edited file
+	ToolName    string // write_file, edit_file, apply_patch, ...
 }
 
 // QualityObserver is the hook the chat handler invokes with detected
@@ -1081,6 +1085,7 @@ func Chat(d Deps) http.Handler {
 					d.Config.ArbiterTimeout,
 					skipLocal,
 					d.Config.FusionAgreementThreshold,
+					reqID,
 				)
 				fusionArbiterSkipped = outcome.ArbiterSkipped
 				fusionJaccardSimilarity = outcome.Similarity
