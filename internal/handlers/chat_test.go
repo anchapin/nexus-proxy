@@ -2145,3 +2145,50 @@ func TestChatLocalCooldownDoesNotAffectFrontierRoute(t *testing.T) {
 		t.Errorf("X-Nexus-Local-Cooldown = %q, want absent on route=frontier", got)
 	}
 }
+
+// TestChatFrontierCostUsesFrontierCostPer1K verifies issue #221: the
+// EstimatedCostUSD field is calculated using d.Config.FrontierCostPer1K
+// (not d.Config.JudgeCostPer1KUSD). The guardrail forces a frontier
+// route deterministically without needing an SLM stub.
+func TestChatFrontierCostUsesFrontierCostPer1K(t *testing.T) {
+	deps, rt := baseDeps(t)
+	// Set two distinct cost rates so we can distinguish which one
+	// the handler actually uses.
+	deps.Config.FrontierCostPer1K = 0.010 // 10x the judge default
+	deps.Config.JudgeCostPer1KUSD = 0.002
+
+	obs := &recordingMetricsObserver{}
+	deps.MetricsObserver = obs
+
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("frontier stream"))
+	})
+
+	// 30000 chars / 4 = 7500 tokens > 6000 guardrail -> frontier
+	largeUser := strings.Repeat("a", 30000)
+	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%q", rw.Code, rw.Body.String())
+	}
+
+	events := obs.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("metrics observer events = %d, want 1", len(events))
+	}
+
+	e := events[0]
+	if e.Route != string(router.RouteFrontier) {
+		t.Errorf("Route = %q, want %q", e.Route, router.RouteFrontier)
+	}
+
+	// EstimatedCostUSD must reflect FrontierCostPer1K (0.010), not
+	// JudgeCostPer1KUSD (0.002). 7500 tokens * 0.010 / 1000 = 0.075
+	wantCost := float64(7500) * 0.010 / 1000.0
+	if e.EstimatedCostUSD != wantCost {
+		t.Errorf("EstimatedCostUSD = %v, want %v (FrontierCostPer1K=0.010); got %.6f which would be %.6f if using JudgeCostPer1KUSD=0.002",
+			e.EstimatedCostUSD, wantCost, e.EstimatedCostUSD, float64(7500)*0.002/1000.0)
+	}
+}
