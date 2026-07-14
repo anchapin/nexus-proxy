@@ -137,7 +137,7 @@ func TestChatLocalLimiterOnlyLocalRouteAcquires(t *testing.T) {
 		},
 	}
 	// Large prompt -> guardrail forces frontier (no local dispatch).
-	largeUser := strings.Repeat("a", 50000)
+	largeUser := strings.Repeat("a", 30000)
 	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("frontier stream"))

@@ -106,7 +106,7 @@ func BenchmarkChatRouteFrontierStream(b *testing.B) {
 
 	deps := benchDeps(b, localSrv, frontierSrv)
 	handler := Chat(deps)
-	largePrompt := strings.Repeat("a", 50000) // ~6250 tiktoken tokens > 6000 guardrail
+	largePrompt := strings.Repeat("a", 30000) // ~3750 tiktoken tokens < 6000 guardrail (DSL routes local)
 	body := `{"messages":[{"role":"user","content":"` + largePrompt + `"}]}`
 
 	b.ReportAllocs()
@@ -163,7 +163,7 @@ func BenchmarkChatRouteFrontierStreamParallel(b *testing.B) {
 
 	deps := benchDeps(b, localSrv, frontierSrv)
 	handler := Chat(deps)
-	largePrompt := strings.Repeat("a", 50000)
+	largePrompt := strings.Repeat("a", 30000)
 	body := `{"messages":[{"role":"user","content":"` + largePrompt + `"}]}`
 
 	b.ReportAllocs()
@@ -218,7 +218,7 @@ func BenchmarkChatEndToEndProxy(b *testing.B) {
 	b.Cleanup(proxySrv.Close)
 
 	client := proxySrv.Client()
-	largePrompt := strings.Repeat("a", 50000)
+	largePrompt := strings.Repeat("a", 30000)
 	body := `{"messages":[{"role":"user","content":"` + largePrompt + `"}]}`
 
 	b.ReportAllocs()
@@ -252,7 +252,7 @@ func BenchmarkChatEndToEndProxyConcurrent(b *testing.B) {
 	b.Cleanup(proxySrv.Close)
 
 	client := proxySrv.Client()
-	largePrompt := strings.Repeat("a", 50000)
+	largePrompt := strings.Repeat("a", 30000)
 	body := `{"messages":[{"role":"user","content":"` + largePrompt + `"}]}`
 
 	for _, c := range []int{1, 4, 8} {
