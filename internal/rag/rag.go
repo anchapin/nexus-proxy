@@ -532,13 +532,13 @@ func (s *Store) snapshot() []FewShotExample {
 // OllamaEmbedder calls the Ollama /api/embeddings endpoint. It is safe for
 // concurrent use via a shared http.Client.
 type OllamaEmbedder struct {
-	BaseURL   string // e.g. "http://localhost:11434"
-	Model     string // e.g. "nomic-embed-text"
-	Client    *http.Client
-	BreakerConfig        // optional; zero-value means breaker disabled
-	breakerThreshold    atomic.Int32
-	cooldownUntil        atomic.Int64 // nanoseconds since Unix epoch; 0 = never tripped
-	failureCount         atomic.Int32
+	BaseURL          string // e.g. "http://localhost:11434"
+	Model            string // e.g. "nomic-embed-text"
+	Client           *http.Client
+	BreakerConfig    // optional; zero-value means breaker disabled
+	breakerThreshold atomic.Int32
+	cooldownUntil    atomic.Int64 // nanoseconds since Unix epoch; 0 = never tripped
+	failureCount     atomic.Int32
 }
 
 // NewOllamaEmbedder returns an embedder wired to the given Ollama instance.
