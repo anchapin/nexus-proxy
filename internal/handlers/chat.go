@@ -821,82 +821,16 @@ func Chat(d Deps) http.Handler {
 			}
 		}
 
-		// RAG injection metadata. Set by the RAG retrieval step below.
-		var ragInjected bool
-		var ragFilename string
-		var ragScore float64
-
 		messages := rawMessages
 
-		// 1. Apply prompt engineering (issue #224).
-		// Done inline so it runs before the configurable chain (which skips it).
+		// Apply prompt engineering.
 		if d.Config.PromptInjectionIsolated() {
 			messages = middleware.ApplyPromptEngineeringIsolated(messages, d.Config.MetaPrompt)
 		} else {
 			messages = middleware.ApplyPromptEngineering(messages, d.Config.MetaPrompt)
 		}
-
-		// Apply the middleware chain (issue #224). Each middleware's
-		// Transform is called in order; the result is passed to the next.
-		//
-		// The chain is configurable via NEXUS_MIDDLEWARE_CHAIN. The default
-		// order matches the pre-#224 hardcoded sequence:
-		//   promptEngineering → rag → compressJSONBlocks → appendSystemNote
-		//
-		// RAG is handled as a special case before the chain because it
-		// needs the request context to call d.RAG.Retrieve. The chain
-		// middleware receive messages that already have RAG injected so the
-		// Transform signature stays clean (no ctx parameter).
-		//
-		// Do RAG when: (a) ContextAwareRAG is set (operator included rag in
-		// chain) OR (b) d.RAG is set but ContextAwareRAG is nil (backward
-		// compatibility for tests that set d.RAG without the ctx-aware type).
-		if d.ContextAwareRAG != nil || d.RAG != nil {
-			// RAG retrieval with request context.
-			if ex, score, err := d.RAG.Retrieve(r.Context(), middleware.ExtractLatestUserPrompt(messages)); err == nil && ex != nil {
-				messages = middleware.InjectRAG(messages, rag.FormatInjection(ex))
-				slog.Info("rag hit",
-					slog.String("filename", ex.Filename),
-					slog.Float64("score", score),
-					slog.String("request_id", reqID),
-				)
-				ragInjected = true
-				ragFilename = ex.Filename
-				ragScore = score
-			}
-		}
-
-		// Snapshot the JSON size BEFORE TOON compression so the
-		// metrics observer can attribute tokens saved by the
-		// round-trip pass. Uses the cheap "4 chars per token"
-		// heuristic the rest of the project uses for telemetry
-		// (see internal/telemetry.EstimateTokens).
-		preCompressionChars := totalMessageChars(messages)
-		trace.Transforms.TOONBytesBefore = preCompressionChars
-
-		// Iterate the middleware chain. The chain starts AFTER RAG so
-		// middleware in the chain don't receive request ctx.
-		chain := d.MiddlewareChain
-		if len(chain) == 0 {
-			chain = middleware.DefaultChain()
-		}
-		for _, m := range chain {
-			if m.Name() == "rag" || m.Name() == "promptEngineering" {
-				// Already handled above (RAG) or is no-op placeholder
-				// (promptEngineering already applied via Config).
-				continue
-			}
-			var err error
-			messages, err = m.Transform(messages)
-			if err != nil {
-				slog.Warn("middleware transform error",
-					slog.String("middleware", m.Name()),
-					slog.Any("err", err),
-					slog.String("request_id", reqID),
-				)
-			}
-		}
 		latestPrompt := middleware.ExtractLatestUserPrompt(messages)
+
 		// Record whether the meta-prompt actually appended to a
 		// system slot — "applied" only when there is now a system
 		// message containing the operator-configured enhancement.

@@ -443,7 +443,7 @@ func Load() (Config, error) {
 		MetaPrompt:     defaultMetaPrompt,
 		TOONNotice:     defaultTOONNotice,
 		TOONUnfenced:   getEnvBool("NEXUS_TOON_UNFENCED", true),
-		MiddlewareChain: getEnv("NEXUS_MIDDLEWARE_CHAIN", ""),)
+		MiddlewareChain: getEnv("NEXUS_MIDDLEWARE_CHAIN", ""),
 		TelemetryPath:  getEnvAllowEmpty("NEXUS_TELEMETRY_PATH", "./nexus-telemetry.jsonl"),
 		MetricsDBPath:  getEnvAllowEmpty("NEXUS_METRICS_DB", DefaultMetricsDBPath()),
 	}
