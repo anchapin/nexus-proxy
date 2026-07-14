@@ -1612,7 +1612,7 @@ func TestPanelStreamingClientAbortSkipsArbiter(t *testing.T) {
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
 		5*time.Second, 5*time.Second,
-		false, 0.85,
+		false, 0.85, "test-request",
 	)
 	// Issue #167: client abort is NOT returned as an error — we return nil
 	// so the handler does not render a 502 error page to a disconnected client.

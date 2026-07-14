@@ -690,7 +690,9 @@ func Chat(d Deps) http.Handler {
 					Error:          reason,
 					TotalLatencyMs: totalMs,
 				})
-			} else {
+			}
+			// Both observers receive the record when both are wired (issue #164).
+			if d.Recorder != nil {
 				d.Recorder.Record(telemetry.Record{
 					Timestamp:      ts,
 					RequestID:      reqID,
@@ -1389,11 +1391,27 @@ func Chat(d Deps) http.Handler {
 					d.Config.FrontierURL, d.Config.FrontierKey, body)
 			}
 			if upErr != nil {
-				slog.Error("upstream error",
-					slog.Any("err", upErr),
-					slog.String("request_id", reqID),
-				)
-				http.Error(w, "Upstream error", http.StatusBadGateway)
+				if errors.Is(upErr, upstream.ErrUpstreamTruncated) {
+					// Upstream already wrote a partial body + truncation
+					// event; self-heal by setting X-Nexus-Truncated and
+					// dispatching the observer (issue #118). Do NOT call
+					// http.Error — the SSE headers are already committed
+					// and a 502 would corrupt the truncated body already
+					// written to the wire.
+					w.Header().Set("X-Nexus-Truncated", "true")
+					if d.StreamTruncationObserver != nil {
+						d.StreamTruncationObserver.ObserveStreamTruncation(StreamTruncationEvent{
+							Route:     string(route),
+							Truncated: true,
+						})
+					}
+				} else {
+					slog.Error("upstream error",
+						slog.Any("err", upErr),
+						slog.String("request_id", reqID),
+					)
+					http.Error(w, "Upstream error", http.StatusBadGateway)
+				}
 			}
 			// Debug trace (issue #33): route=frontier is a single
 			// endpoint with no cascade — populate the trace with
@@ -1476,8 +1494,30 @@ func Chat(d Deps) http.Handler {
 				SLMConfidence:           decision.Confidence,
 				SLMTaskType:             decision.TaskType,
 			})
-		} else {
+		}
+		// Both observers receive the record when both are wired (issue #164).
+		if d.Recorder != nil {
 			d.Recorder.Record(rec)
+		}
+
+		// LatencyObserver (issue #165): fired after the upstream response
+		// completes so callers can record end-to-end latency histograms.
+		// ttftMs is already computed above; convert to float64 seconds.
+		if d.LatencyObserver != nil {
+			var ttftSecs float64
+			if ttftMs > 0 {
+				ttftSecs = float64(ttftMs) / 1000.0
+			}
+			var isErr bool
+			if upErr != nil || obs.StatusCode() >= 400 {
+				isErr = true
+			}
+			d.LatencyObserver.ObserveLatency(LatencyEvent{
+				Route:          string(route),
+				LatencySeconds: totalMs / 1000.0,
+				TTFTSeconds:    ttftSecs,
+				IsError:        isErr,
+			})
 		}
 
 		// Debug trace emission (issue #33). When Debug is on we
@@ -1545,9 +1585,17 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 // requestID extracts (or generates) a correlation id for the judge
 // hook. The handler honours an inbound X-Request-Id so a caller can
 // thread its own id through; otherwise we mint a short hex token.
+//
+// The inbound value is sanitised (issue #39): characters outside
+// [a-zA-Z0-9._:-] are stripped so a crafted header cannot inject log
+// entries or break downstream JSON consumers, and the length is capped
+// at 128 bytes. When the value is empty after sanitization the
+// handler falls through to a generated hex id.
 func requestID(r *http.Request) string {
 	if v := r.Header.Get("X-Request-Id"); v != "" {
-		return v
+		if clean := sanitizeRequestID(v); clean != "" {
+			return clean
+		}
 	}
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
