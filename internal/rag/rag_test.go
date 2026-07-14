@@ -5,7 +5,10 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestCosineSimilarity(t *testing.T) {
@@ -34,9 +37,13 @@ func TestCosineSimilarity(t *testing.T) {
 type stubEmbedder struct {
 	vecs map[string][]float64
 	err  error
+	// callCount is accessed atomically to avoid data races when
+	// the concurrent test exercises the cache with multiple goroutines.
+	callCount int64
 }
 
-func (s stubEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
+func (s *stubEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
+	atomic.AddInt64(&s.callCount, 1)
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -47,7 +54,7 @@ func (s stubEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
 }
 
 func TestRetrieveThreshold(t *testing.T) {
-	emb := stubEmbedder{vecs: map[string][]float64{
+	emb := &stubEmbedder{vecs: map[string][]float64{
 		"prompt":     {1, 0, 0},
 		"matching":   {0.9, 0.1, 0},
 		"unrelated":  {0, 1, 0},
@@ -76,7 +83,7 @@ func TestRetrieveThreshold(t *testing.T) {
 }
 
 func TestRetrieveEmptyStore(t *testing.T) {
-	store := NewStore(stubEmbedder{}, 0.55)
+	store := NewStore(&stubEmbedder{}, 0.55)
 	ex, _, err := store.Retrieve(context.Background(), "anything")
 	if err != nil {
 		t.Fatalf("Retrieve: %v", err)
@@ -87,7 +94,7 @@ func TestRetrieveEmptyStore(t *testing.T) {
 }
 
 func TestRetrieveBelowThreshold(t *testing.T) {
-	emb := stubEmbedder{vecs: map[string][]float64{
+	emb := &stubEmbedder{vecs: map[string][]float64{
 		"prompt": {1, 0, 0},
 		"weak":   {0.3, 0.4, 0},
 	}}
@@ -105,7 +112,7 @@ func TestRetrieveBelowThreshold(t *testing.T) {
 }
 
 func TestRetrieveEmbedderError(t *testing.T) {
-	store := NewStore(stubEmbedder{err: errSentinel}, 0.55)
+	store := NewStore(&stubEmbedder{err: errSentinel}, 0.55)
 	store.examples = []FewShotExample{{Filename: "x.go", Content: "x", Embedding: []float64{1, 0}}}
 	if _, _, err := store.Retrieve(context.Background(), "prompt"); err == nil {
 		t.Error("expected error from embedder")
@@ -117,7 +124,7 @@ func TestRetrieveEmbedderError(t *testing.T) {
 // handler goroutine is mid-Retrieve. The store must serialise via
 // its RWMutex or `go test -race` flags the access.
 func TestStoreConcurrentRetrieveAndAdd(t *testing.T) {
-	emb := stubEmbedder{vecs: map[string][]float64{
+	emb := &stubEmbedder{vecs: map[string][]float64{
 		"prompt": {1, 0, 0},
 		"a":      {0.9, 0.1, 0},
 		"b":      {0.1, 0.9, 0},
@@ -177,7 +184,7 @@ func TestIndexDirSkipsSymlinks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store := NewStore(stubEmbedder{vecs: map[string][]float64{
+	store := NewStore(&stubEmbedder{vecs: map[string][]float64{
 		"safe content": {1, 0, 0},
 	}}, 0.0)
 
@@ -217,7 +224,7 @@ func TestIndexDirRejectsEscapingSymlinks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store := NewStore(stubEmbedder{vecs: map[string][]float64{
+	store := NewStore(&stubEmbedder{vecs: map[string][]float64{
 		"escaped!": {1, 0, 0},
 	}}, 0.0)
 
@@ -230,5 +237,203 @@ func TestIndexDirRejectsEscapingSymlinks(t *testing.T) {
 	// TestIndexDirSkipsSymlinks proves.
 	if store.Size() != 1 {
 		t.Errorf("expected 1 indexed file, got %d", store.Size())
+	}
+}
+
+// Tests for EmbedCache (issue #227).
+
+func TestEmbedCacheDisabled(t *testing.T) {
+	// When max entries or TTL is zero, EmbedCache is a pass-through.
+	inner := &stubEmbedder{vecs: map[string][]float64{"hello": {1, 2, 3}}}
+	cache := NewEmbedCache(inner, 0, 5*time.Minute) // max=0 → no cache
+	vec, err := cache.Embed(context.Background(), "hello")
+	if err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+	if vec[0] != 1 || vec[1] != 2 || vec[2] != 3 {
+		t.Errorf("unexpected vector: %v", vec)
+	}
+	if inner.callCount != 1 {
+		t.Errorf("callCount = %d, want 1", inner.callCount)
+	}
+}
+
+func TestEmbedCacheHit(t *testing.T) {
+	inner := &stubEmbedder{vecs: map[string][]float64{"hello": {1, 2, 3}}}
+	cache := NewEmbedCache(inner, 100, 5*time.Minute)
+
+	// First call: cache miss, calls inner.
+	_, err := cache.Embed(context.Background(), "hello")
+	if err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+	if inner.callCount != 1 {
+		t.Errorf("first call: inner.callCount = %d, want 1", inner.callCount)
+	}
+
+	// Second call with same key: cache hit, does not call inner.
+	vec2, err := cache.Embed(context.Background(), "hello")
+	if err != nil {
+		t.Fatalf("Embed (cached): %v", err)
+	}
+	if inner.callCount != 1 {
+		t.Errorf("second call: inner.callCount = %d, want 1 (cached)", inner.callCount)
+	}
+	if vec2[0] != 1 || vec2[1] != 2 || vec2[2] != 3 {
+		t.Errorf("unexpected vector: %v", vec2)
+	}
+
+	hits, misses := cache.CacheStats()
+	if hits != 1 {
+		t.Errorf("hits = %d, want 1", hits)
+	}
+	if misses != 1 {
+		t.Errorf("misses = %d, want 1", misses)
+	}
+}
+
+func TestEmbedCacheLRUEviction(t *testing.T) {
+	inner := &stubEmbedder{vecs: map[string][]float64{
+		"a": {1, 0, 0},
+		"b": {0, 1, 0},
+		"c": {0, 0, 1},
+	}}
+	cache := NewEmbedCache(inner, 2, 5*time.Minute) // capacity = 2
+
+	cache.Embed(context.Background(), "a") // miss → a
+	cache.Embed(context.Background(), "b") // miss → b
+	cache.Embed(context.Background(), "c") // miss → c (evicts a)
+
+	// Accessing "a" again should be a miss (it was evicted).
+	cache.Embed(context.Background(), "a") // miss → a re-inserted, c evicted
+	// Accessing "b" should be a miss (it was evicted when c was inserted).
+	cache.Embed(context.Background(), "b") // miss → b re-inserted, a evicted
+
+	hits, misses := cache.CacheStats()
+	if hits != 0 {
+		t.Errorf("hits = %d, want 0 (a,b,c were all evicted before their re-access)", hits)
+	}
+	if misses != 5 {
+		t.Errorf("misses = %d, want 5 (a,b,c,a,b)", misses)
+	}
+}
+
+func TestEmbedCacheTTLExpiry(t *testing.T) {
+	inner := &stubEmbedder{}
+	cache := NewEmbedCache(inner, 100, 10*time.Millisecond)
+
+	cache.Embed(context.Background(), "key") // miss
+	if inner.callCount != 1 {
+		t.Fatalf("first call: inner.callCount = %d, want 1", inner.callCount)
+	}
+
+	// Second call within TTL: hit.
+	cache.Embed(context.Background(), "key")
+	if inner.callCount != 1 {
+		t.Errorf("second call within TTL: inner.callCount = %d, want 1", inner.callCount)
+	}
+
+	// Wait for TTL to expire.
+	time.Sleep(15 * time.Millisecond)
+
+	// Third call after TTL: miss (entry expired).
+	cache.Embed(context.Background(), "key")
+	if inner.callCount != 2 {
+		t.Errorf("call after TTL expiry: inner.callCount = %d, want 2", inner.callCount)
+	}
+}
+
+func TestEmbedCacheErrorPassthrough(t *testing.T) {
+	inner := &stubEmbedder{err: errSentinel}
+	cache := NewEmbedCache(inner, 100, 5*time.Minute)
+	_, err := cache.Embed(context.Background(), "hello")
+	if err == nil {
+		t.Error("expected error, got nil")
+	}
+	if inner.callCount != 1 {
+		t.Errorf("callCount = %d, want 1", inner.callCount)
+	}
+}
+
+func TestEmbedCacheConcurrent(t *testing.T) {
+	inner := &stubEmbedder{}
+	cache := NewEmbedCache(inner, 100, 5*time.Minute)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				cache.Embed(context.Background(), "same-key")
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Only one inner call should have been made for "same-key".
+	if inner.callCount != 1 {
+		t.Errorf("inner.callCount = %d, want 1 (all goroutines should hit same cache entry)", inner.callCount)
+	}
+	hits, misses := cache.CacheStats()
+	if hits != 499 { // 10 goroutines × 50 calls - 1 miss = 499 hits
+		t.Errorf("hits = %d, want 499", hits)
+	}
+	if misses != 1 {
+		t.Errorf("misses = %d, want 1", misses)
+	}
+}
+
+func TestEmbedCacheHitCount(t *testing.T) {
+	inner := &stubEmbedder{vecs: map[string][]float64{"a": {1}}}
+	cache := NewEmbedCache(inner, 10, 5*time.Minute)
+
+	before := cache.HitCount()
+	cache.Embed(context.Background(), "a") // miss
+	afterMiss := cache.HitCount()
+	cache.Embed(context.Background(), "a") // hit
+	afterHit := cache.HitCount()
+
+	if afterMiss != before {
+		t.Errorf("afterMiss hitCount = %d, want %d (should not change on miss)", afterMiss, before)
+	}
+	if afterHit != before+1 {
+		t.Errorf("afterHit hitCount = %d, want %d", afterHit, before+1)
+	}
+}
+
+func TestStoreWithCachingEmbedder(t *testing.T) {
+	// Verify that Store.EmbedHitCount() delegates to the wrapped *EmbedCache.
+	inner := &stubEmbedder{vecs: map[string][]float64{
+		"prompt": {1, 0, 0},
+		"match":  {0.9, 0.1, 0},
+	}}
+	cache := NewEmbedCache(inner, 100, 5*time.Minute)
+	store := NewStore(cache, 0.55)
+	store.Add("match.go", "matching", inner.vecs["match"])
+
+	// First Retrieve: cache miss (prompt not cached).
+	store.Retrieve(context.Background(), "prompt")
+	if inner.callCount != 1 {
+		t.Errorf("first Retrieve: inner.callCount = %d, want 1", inner.callCount)
+	}
+
+	// Second Retrieve with same prompt: cache hit.
+	store.Retrieve(context.Background(), "prompt")
+	if inner.callCount != 1 {
+		t.Errorf("second Retrieve: inner.callCount = %d, want 1 (cached)", inner.callCount)
+	}
+
+	hits, misses := store.CacheStats()
+	if hits != 1 {
+		t.Errorf("hits = %d, want 1", hits)
+	}
+	if misses != 1 {
+		t.Errorf("misses = %d, want 1", misses)
+	}
+
+	hitCount := store.EmbedHitCount()
+	if hitCount != 1 {
+		t.Errorf("EmbedHitCount = %d, want 1", hitCount)
 	}
 }

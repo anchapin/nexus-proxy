@@ -898,16 +898,18 @@ func (b *confidenceBridge) Close() error { return b.inner.Close() }
 // NEXUS_RAG_POLL_INTERVAL > 0; an interval of zero leaves
 // persistence on but disables runtime updates (boot-only load).
 func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context) (rag.RAGStore, *rag.PersistentStore, *rag.Watcher) {
+	// emb is already wrapped with CachedEmbedder by the caller (issue #115)
+	cachedEmb := emb
 	if !cfg.RAGPersistentEnabled() {
 		slog.Info("rag persistent store disabled (NEXUS_RAG_DB is empty); using in-memory store")
-		store := rag.NewStore(emb, cfg.RAGThreshold)
+		store := rag.NewStore(cachedEmb, cfg.RAGThreshold)
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
 		return store, nil, nil
 	}
 
-	ps, err := rag.OpenPersistentStore(cfg.RAGDBPath, emb, cfg.RAGThreshold)
+	ps, err := rag.OpenPersistentStore(cfg.RAGDBPath, cachedEmb, cfg.RAGThreshold)
 	if err != nil {
 		// Persistence is a best-effort optimisation. Fall back to
 		// the in-memory store so the proxy still serves traffic —
@@ -917,7 +919,7 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 			slog.String("path", cfg.RAGDBPath),
 			slog.Any("err", err),
 		)
-		store := rag.NewStore(emb, cfg.RAGThreshold)
+		store := rag.NewStore(cachedEmb, cfg.RAGThreshold)
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
@@ -934,7 +936,7 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 			slog.Any("err", err),
 		)
 		_ = ps.Close()
-		store := rag.NewStore(emb, cfg.RAGThreshold)
+		store := rag.NewStore(cachedEmb, cfg.RAGThreshold)
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}

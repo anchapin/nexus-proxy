@@ -329,6 +329,7 @@ type MetricsEvent struct {
 
 	RAGInjected      bool
 	RAGFilename      string
+	RAGCacheHit      bool // true when the RAG embedding was served from the embed cache (issue #227)
 	EstimatedCostUSD float64
 
 	// BaselineCostUSD is what the request would have cost at the
@@ -870,6 +871,7 @@ func Chat(d Deps) http.Handler {
 		}
 		trace.Transforms.RAGInjected = ragInjected
 		trace.Transforms.RAGFilename = ragFilename
+		trace.Transforms.RAGCacheHit = false // issue #227: EmbedCache tracking not active with CachedEmbedder (issue #115)
 		trace.Transforms.RAGScore = ragScore
 		// Snapshot the JSON size BEFORE TOON compression so the
 		// metrics observer can attribute tokens saved by the
@@ -1503,6 +1505,7 @@ func Chat(d Deps) http.Handler {
 				TOONCompressionMethod:   string(toonCompressionMethod),
 				RAGInjected:             ragInjected,
 				RAGFilename:             ragFilename,
+				RAGCacheHit:             false, // issue #227: EmbedCache tracking not active with CachedEmbedder (issue #115)
 				EstimatedCostUSD:        cost,
 				BaselineCostUSD:         baselineCost,
 				SavingsUSD:              savingsCost,
