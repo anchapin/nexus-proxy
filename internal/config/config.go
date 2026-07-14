@@ -285,9 +285,9 @@ type Config struct {
 	QualityStderrCap   int           // stderr bytes retained per verdict (default 2 KiB)
 
 	// Middleware prompts
-	MetaPrompt string // appended to system prompt by prompt_engine
-	TOONNotice  string // appended when TOON compression is applied
-	TOONUnfenced bool // issue #123: compress bare (unfenced) JSON arrays; default true
+	MetaPrompt   string // appended to system prompt by prompt_engine
+	TOONNotice   string // appended when TOON compression is applied
+	TOONUnfenced bool   // issue #123: compress bare (unfenced) JSON arrays; default true
 
 	// Prompt-injection hardening (issue #76). Controls whether the
 	// proxy isolates its policy text from user-supplied system content
@@ -437,7 +437,7 @@ func Load() (Config, error) {
 		ExamplesDir:    getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
 		MetaPrompt:     defaultMetaPrompt,
 		TOONNotice:     defaultTOONNotice,
-		TOONUnfenced:  getEnvBool("NEXUS_TOON_UNFENCED", true),
+		TOONUnfenced:   getEnvBool("NEXUS_TOON_UNFENCED", true),
 		TelemetryPath:  getEnvAllowEmpty("NEXUS_TELEMETRY_PATH", "./nexus-telemetry.jsonl"),
 		MetricsDBPath:  getEnvAllowEmpty("NEXUS_METRICS_DB", DefaultMetricsDBPath()),
 	}

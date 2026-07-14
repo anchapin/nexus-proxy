@@ -380,7 +380,7 @@ func TestPanelArbiterTimeoutBoundsHangingCall(t *testing.T) {
 		5*time.Second, // perFetchTimeout (panel members)
 		arbiterTO,     // arbiterTimeout
 		false,         // skipLocal
-  nil, 0*time.Second,
+		nil, 0*time.Second,
 	)
 	elapsed := time.Since(start)
 
@@ -435,7 +435,7 @@ func TestPanelArbiterHappyPathNoRegression(t *testing.T) {
 		5*time.Second, // perFetchTimeout
 		5*time.Second, // arbiterTimeout
 		false,         // skipLocal
-  nil, 0*time.Second,
+		nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -491,7 +491,7 @@ func TestPanelSkipLocalOmitsLocalFetch(t *testing.T) {
 		5*time.Second, // perFetchTimeout
 		5*time.Second, // arbiterTimeout
 		true,          // skipLocal
-  nil, 0*time.Second,
+		nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -541,7 +541,7 @@ func TestPanelSkipLocalArbiterPromptHasDegradedMarker(t *testing.T) {
 		"the user prompt",
 		5*time.Second, 5*time.Second,
 		true, // skipLocal
-  nil, 0*time.Second,
+		nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -732,7 +732,7 @@ func TestPanelArbiterHonorsStreamFlagFalse(t *testing.T) {
 		5*time.Second,
 		5*time.Second,
 		false, // skipLocal (issue #8)
-  nil, 0*time.Second,
+		nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -794,7 +794,7 @@ func TestPanelArbiterHonorsStreamFlagTrueRegression(t *testing.T) {
 		5*time.Second,
 		5*time.Second,
 		false, // skipLocal (issue #8)
-  nil, 0*time.Second,
+		nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -850,7 +850,7 @@ func TestPanelStreamingAgreementSkipsArbiter(t *testing.T) {
 		false,         // skipLocal
 		0.85,          // agreementThreshold
 		"test-request-id",
-  nil, 0*time.Second,
+		nil, 0*time.Second,
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -941,7 +941,7 @@ func TestPanelStreamingAgreementCancelsSlowMember(t *testing.T) {
 		false,         // skipLocal
 		0.85,          // agreementThreshold
 		"test-request-id",
-  nil, 0*time.Second,
+		nil, 0*time.Second,
 	)
 
 	if err != nil {
@@ -1012,7 +1012,7 @@ func TestPanelStreamingDisagreementRunsArbiter(t *testing.T) {
 		false,
 		0.85,
 		"test-request-id",
-  nil, 0*time.Second,
+		nil, 0*time.Second,
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1083,7 +1083,7 @@ func TestPanelStreamingDegradedSkipLocal(t *testing.T) {
 		true, // skipLocal
 		0.85,
 		"test-request-id",
-  nil, 0*time.Second,
+		nil, 0*time.Second,
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1146,7 +1146,7 @@ func TestPanelStreamingOneMemberFailedSkipsArbiter(t *testing.T) {
 		5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
-  nil, 0*time.Second,
+		nil, 0*time.Second,
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1197,7 +1197,7 @@ func TestPanelStreamingBothMembersFailedSurfacesError(t *testing.T) {
 		5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
-  nil, 0*time.Second,
+		nil, 0*time.Second,
 	)
 	if err == nil {
 		t.Fatal("expected error when both members fail")
@@ -1249,7 +1249,7 @@ func TestPanelStreamingHonorsStreamFalseFallsBackToPanel(t *testing.T) {
 		5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
-  nil, 0*time.Second,
+		nil, 0*time.Second,
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1317,7 +1317,7 @@ func TestPanelStreamingThresholdClamping(t *testing.T) {
 			false,
 			-1.0, // negative: clamped to 0 → "always skip when both succeed"
 			"test-request-id",
-   nil, 0*time.Second,
+			nil, 0*time.Second,
 		)
 		if err != nil {
 			t.Fatalf("PanelStreaming: %v", err)
@@ -1362,7 +1362,7 @@ func TestPanelStreamingThresholdClamping(t *testing.T) {
 			false,
 			2.0, // >1: clamps to 1 → only identical content skips
 			"test-request-id",
-   nil, 0*time.Second,
+			nil, 0*time.Second,
 		)
 		if err != nil {
 			t.Fatalf("PanelStreaming: %v", err)
@@ -1411,7 +1411,7 @@ func TestPanelStreamingSpeculativeSourceIdentified(t *testing.T) {
 		5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
-  nil, 0*time.Second,
+		nil, 0*time.Second,
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1460,7 +1460,7 @@ func TestPanelStreamingSetsProgressiveHeader(t *testing.T) {
 		5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
-  nil, 0*time.Second,
+		nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
 	}
@@ -1511,7 +1511,7 @@ func TestPanelStreamingToolCallWinnerSkipsArbiter(t *testing.T) {
 		5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
-  nil, 0*time.Second,
+		nil, 0*time.Second,
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1631,7 +1631,7 @@ func TestPanelStreamingClientAbortSkipsArbiter(t *testing.T) {
 		"test prompt",
 		5*time.Second, 5*time.Second,
 		false, 0.85, "test-request",
-  nil, 0*time.Second,
+		nil, 0*time.Second,
 	)
 	// Issue #167: client abort is NOT returned as an error — we return nil
 	// so the handler does not render a 502 error page to a disconnected client.

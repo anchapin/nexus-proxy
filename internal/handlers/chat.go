@@ -472,9 +472,9 @@ type Deps struct {
 	// The handler never imports the judge package; main.go wires
 	// a closure that adapts LocalCompletion to the judge's
 	// Sample/Enqueue entry points.
-	LatencyObserver LatencyObserver
+	LatencyObserver          LatencyObserver
 	StreamTruncationObserver StreamTruncationObserver
-	JudgeObserver JudgeObserver
+	JudgeObserver            JudgeObserver
 
 	// QualityObserver is optional. When non-nil, the handler scans
 	// the captured upstream body for tool-call patterns that look

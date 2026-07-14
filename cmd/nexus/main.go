@@ -675,7 +675,7 @@ func main() {
 		RAGObserver:             ragObserver,
 		CascadeFallbackObserver: cascadeFallbackObs,
 		ArbiterCacheObserver:    arbiterCacheObserver,
-		ArbiterCache:           arbiterCache,
+		ArbiterCache:            arbiterCache,
 	})
 	// Apply the per-client rate limiter (issue #75) as the outermost
 	// wrapper so a flood of requests is rejected before any middleware

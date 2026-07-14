@@ -9,8 +9,8 @@ import (
 
 // ArbiterCacheEntry is a single cached arbiter synthesis response.
 type ArbiterCacheEntry struct {
-	Synthesis  string    // the arbiter's text synthesis
-	CachedAt   time.Time // when this entry was written
+	Synthesis   string        // the arbiter's text synthesis
+	CachedAt    time.Time     // when this entry was written
 	TTLDuration time.Duration // original TTL at write time (for expiration check)
 }
 

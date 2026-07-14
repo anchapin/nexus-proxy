@@ -89,12 +89,12 @@ type bufferResponseWriter struct {
 	buf *bytes.Buffer
 }
 
-func (b *bufferResponseWriter) Header() http.Header   { return make(http.Header) }
+func (b *bufferResponseWriter) Header() http.Header { return make(http.Header) }
 func (b *bufferResponseWriter) Write(d []byte) (int, error) {
 	return b.buf.Write(d)
 }
 func (b *bufferResponseWriter) WriteHeader(int) {}
-func (b *bufferResponseWriter) Flush() {}
+func (b *bufferResponseWriter) Flush()          {}
 
 // Stream POSTs payload to targetURL and flushes every newline-terminated
 // chunk from the upstream response body straight to w. This preserves the
