@@ -554,7 +554,7 @@ func TestRunCheckExitsClean(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	exit, stderr, err := runCheck(ctx, dir, KindRust)
+	exit, stderr, err := runCheck(ctx, dir, KindRust, "", "")
 	if err != nil {
 		t.Fatalf("runCheck returned err=%v on clean exit", err)
 	}

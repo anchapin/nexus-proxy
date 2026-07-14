@@ -17,6 +17,8 @@ package router
 import (
 	"context"
 	"regexp"
+
+	"github.com/anchapin/nexus-proxy/internal/telemetry"
 )
 
 // DecisionSource names which stage of the planner produced the route.
@@ -93,9 +95,9 @@ type Decision struct {
 	// categorize.
 	TaskType string
 
-	// EstimatedTokens is the cheap len(prompt)/4 token estimate the
-	// guardrail uses. Carried in the Decision so the handler can stamp
-	// it on the trace without recomputing.
+	// EstimatedTokens is the tiktoken/cl100k_base token estimate the
+	// guardrail uses (issue #231). Carried in the Decision so the
+	// handler can stamp it on the trace without recomputing.
 	EstimatedTokens int
 
 	// BudgetSource is the label identifying where the guardrail budget
@@ -207,7 +209,7 @@ type PlanRequest struct {
 // Every failure mode (SLM error, nil SLM client) defaults to
 // RouteFrontier — the safe choice.
 func (p *Planner) Plan(req PlanRequest) Decision {
-	estimatedTokens := len(req.Prompt) / 4
+	estimatedTokens := telemetry.EstimateTokens(req.Prompt)
 
 	// Stage 1: VRAM-aware guardrail.
 	if g, hit := Guardrail(req.Prompt, req.GuardrailBudget); hit {

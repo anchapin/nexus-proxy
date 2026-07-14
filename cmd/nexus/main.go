@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/auth"
+	"github.com/anchapin/nexus-proxy/internal/budget"
 	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
 	"github.com/anchapin/nexus-proxy/internal/config"
@@ -28,6 +29,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/judge"
 	"github.com/anchapin/nexus-proxy/internal/metrics"
+	"github.com/anchapin/nexus-proxy/internal/middleware"
 	"github.com/anchapin/nexus-proxy/internal/observability"
 	"github.com/anchapin/nexus-proxy/internal/probe"
 	"github.com/anchapin/nexus-proxy/internal/quality"
@@ -304,6 +306,22 @@ func main() {
 		confidenceStore *router.SQLiteConfidenceStore
 		confidenceObs   router.ConfidenceStore
 	)
+
+	// Budget guard for tracking spend (issue #183). Created early so it
+	// can be passed to the judge evaluator. When BudgetEnabled is false
+	// the guard is a no-op (limit=0).
+	var budgetGuard *budget.Guard
+	if cfg.BudgetEnabled() {
+		budgetGuard = budget.NewGuard(cfg.BudgetDailyLimit)
+		if cfg.BudgetAlertEnabled {
+			alerter := budget.NewPrometheusAlerter(slog.Default())
+			budgetGuard.SetAlerter(alerter)
+			slog.Info("budget alerting enabled",
+				slog.Float64("limit_usd", cfg.BudgetDailyLimit),
+			)
+		}
+	}
+
 	if cfg.JudgeEnabled && cfg.JudgeAPIKey != "" {
 		evalCfg := judge.Config{
 			URL:         cfg.JudgeURL,
@@ -314,6 +332,7 @@ func main() {
 			QueueDepth:  cfg.JudgeQueueDepth,
 			Timeout:     cfg.JudgeTimeout,
 			CostPer1K:   cfg.JudgeCostPer1KUSD,
+			BudgetGuard: budgetGuard,
 		}
 		// Issue #198: open the SQLite-backed judge store when
 		// NEXUS_JUDGE_DB is set (default path if unset). On error
@@ -384,6 +403,8 @@ func main() {
 				Instruction: c.Instruction,
 				Output:      c.Output,
 				LocalModel:  c.LocalModel,
+				TraceParent: c.TraceParent,
+				TraceState:  c.TraceState,
 			}) {
 				if bridge != nil {
 					bridge.forget(c.RequestID)
@@ -504,9 +525,11 @@ func main() {
 		})
 		qualityO = handlers.QualityObserverFunc(func(e handlers.QualityEvent) {
 			if !verifier.Submit(quality.Event{
-				RequestID: e.RequestID,
-				Path:      e.Path,
-				ToolName:  e.ToolName,
+				RequestID:   e.RequestID,
+				Path:        e.Path,
+				ToolName:    e.ToolName,
+				TraceParent: e.TraceParent,
+				TraceState:  e.TraceState,
 			}) {
 				slog.Warn("quality queue full, dropped request",
 					slog.String("request_id", e.RequestID),
@@ -714,16 +737,17 @@ func main() {
 		slog.Info("inbound auth disabled (NEXUS_PROXY_API_KEY unset)")
 	}
 
-	// Panic recovery (issue #110) is the OUTERMOST middleware, wrapping
-	// the entire mux so a panic anywhere downstream — a nil dereference
-	// in a handler, a regex surprise in the prompt pipeline, a JSON
-	// parse after MaxBytesReader — is converted into a structured
-	// slog.Error plus a 500 JSON envelope (or a trailing SSE error
-	// frame when the response already started streaming) instead of a
-	// TCP reset with no body. Zero overhead on the happy path.
+	// Security headers (issue #235) are the OUTERMOST layer so every
+	// response — including 401, 429, and 500 error envelopes — carries
+	// the hardening headers. Inside that we apply panic recovery so a
+	// nil dereference or surprise regex anywhere downstream is turned
+	// into a structured slog.Error plus a 500 JSON envelope (or a
+	// trailing SSE error frame when the response already started
+	// streaming) instead of a TCP reset with no body. Zero overhead
+	// on the happy path.
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           handlers.Recover()(rootHandler),
+		Handler:           middleware.SecurityHeaders()(handlers.Recover()(rootHandler)),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,

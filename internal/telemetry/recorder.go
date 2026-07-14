@@ -24,6 +24,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/tokenizer"
 )
 
 // bufferedChannelSize caps the in-flight queue per recorder. Each record
@@ -98,14 +100,13 @@ type Record struct {
 	SLMTaskType   string  `json:"slm_task_type,omitempty"`
 }
 
-// EstimateTokens returns the cheap "4 chars per token" heuristic used
-// across the proxy (router VRAM guardrail, telemetry input). Centralising
-// the rule here keeps the two call sites consistent.
+// EstimateTokens returns the cl100k_base token count for s. It replaces the
+// naive len(s)/4 heuristic so that token estimates fall within 15% of actual
+// counts for English prose, code, CJK, whitespace-heavy, and conversation-
+// history prompts (issue #231). Centralising the rule here keeps the two call
+// sites consistent.
 func EstimateTokens(s string) int {
-	if len(s) <= 0 {
-		return 0
-	}
-	return len(s) / 4
+	return tokenizer.CountTokens(s)
 }
 
 // ComputeTPS derives tokens-per-second from output tokens and the generation
