@@ -35,15 +35,12 @@ import (
 // judge needs to score a response. The handler never imports judge —
 // the observer plugs in from cmd/nexus/main.go.
 type LocalCompletion struct {
+	TraceParent string
+	TraceState  string
 	RequestID   string
 	Instruction string
 	Output      string
 	LocalModel  string
-
-	// TraceParent and TraceState carry the W3C trace context from the
-	// inbound request so async judge evaluation can be a proper child span.
-	TraceParent string
-	TraceState  string
 }
 
 // JudgeObserver is the hook the chat handler invokes when a
@@ -70,14 +67,11 @@ func (f JudgeObserverFunc) Submit(c LocalCompletion) { f(c) }
 // that package so the dependency direction stays one-way (cmd/nexus
 // adapts between the two shapes).
 type QualityEvent struct {
-	RequestID string // correlates to the chat handler's request id
-	Path      string // path of the edited file
-	ToolName  string // write_file, edit_file, apply_patch, ...
-
-	// TraceParent and TraceState carry the W3C trace context from the
-	// inbound request so async quality verification can be a proper child span.
 	TraceParent string
 	TraceState  string
+	RequestID   string // correlates to the chat handler's request id
+	Path        string // path of the edited file
+	ToolName    string // write_file, edit_file, apply_patch, ...
 }
 
 // QualityObserver is the hook the chat handler invokes with detected
@@ -155,17 +149,6 @@ const (
 	// emitted by the rate-limit middleware. The reason is recorded
 	// by the middleware hook wired in main.go.
 	RejectionRateLimit = "rate_limit"
-)
-
-// Header names for per-request debug tracing (issue #242).
-const (
-	// NexusTraceIDHeader is the inbound header an operator sets to
-	// request a structured debug trace for a specific request. The
-	// value must match the request's X-Request-Id (or the generated
-	// id when no X-Request-Id was supplied) for the trace to fire.
-	// This lets operators trace a single complaint request without
-	// enabling NEXUS_DEBUG=true globally.
-	NexusTraceIDHeader = "X-Nexus-Trace-ID"
 )
 
 // RejectionEvent carries the minimal context a rejection observer
@@ -620,13 +603,6 @@ const DefaultObservedCap = 256 * 1024 // 256 KiB
 // Prometheus counter stays in sync with the response surface. The
 // rate-limit middleware's 429 path is instrumented separately (it fires
 // before this handler) via a hook wired in main.go.
-//
-// Per-request debug tracing (issue #242): the operator can request a
-// structured debug trace for a specific request without enabling
-// NEXUS_DEBUG=true globally by passing the X-Nexus-Trace-ID header
-// with a value equal to that request's X-Request-Id (or the generated
-// request id when no X-Request-Id was supplied). This traces exactly
-// one request without flooding logs for all traffic.
 func Chat(d Deps) http.Handler {
 	if d.maxObservedBytes <= 0 {
 		d.maxObservedBytes = DefaultObservedCap
@@ -638,30 +614,16 @@ func Chat(d Deps) http.Handler {
 		reqID := requestID(r)
 		started := time.Now()
 
-		// W3C trace context headers for async worker propagation (issue #233).
-		// Extracted early so they can be passed to the judge evaluator and
-		// quality verifier when their async observers are invoked.
-		traceParent := r.Header.Get("traceparent")
-		traceState := r.Header.Get("tracestate")
-
-		// Per-request debug trace flag (issue #242). True when the
-		// global NEXUS_DEBUG=true OR when the operator sent the
-		// X-Nexus-Trace-ID header with a value matching this
-		// request's id. Lets operators trace a single complaint
-		// request without flooding logs for all traffic.
-		traceThisRequest := d.Config.Debug ||
-			r.Header.Get(NexusTraceIDHeader) == reqID
-
 		// Debug trace scaffolding (issue #33). Allocated up front so
 		// each lifecycle step can populate its sub-trace; emitted as
 		// a single batch at the very end. The trace variable is a
 		// single DebugTrace value — not a pointer — so the hot path
-		// (traceThisRequest=false) never allocates at all. The
-		// conditional at emit time keeps the production cost at zero.
+		// (Debug=false) never allocates at all. The conditional at
+		// emit time keeps the production cost at zero.
 		var trace DebugTrace
 		trace.Request.RequestID = reqID
 		trace.Request.Stream = true // overridden after parse if harness says stream=false
-		if traceThisRequest {
+		if d.Config.Debug {
 			slog.Debug("[DEBUG] handler entered",
 				slog.String("request_id", reqID),
 			)
@@ -753,7 +715,7 @@ func Chat(d Deps) http.Handler {
 		// middleware mutates messages. Populating these fields is
 		// cheap (a few assignments) so we do it unconditionally; the
 		// DebugTrace.Emit call is the only path that actually reads
-		// them, and that's gated by traceThisRequest below.
+		// them, and that's gated by d.Config.Debug below.
 		trace.Request.Messages = len(rawMessages)
 		trace.Request.InboundBodyBytes = len(bodyBytes)
 		if m, ok := body["model"].(string); ok {
@@ -1222,11 +1184,9 @@ func Chat(d Deps) http.Handler {
 			// captureWriter is installed when at least one observer
 			// is set OR debug tracing is on (issue #33); otherwise
 			// the dispatch writes directly through obs with zero
-			// overhead. traceThisRequest covers both the global
-			// NEXUS_DEBUG flag and the per-request X-Nexus-Trace-ID
-			// opt-in (issue #242).
+			// overhead.
 			rw := http.ResponseWriter(obs)
-			if d.JudgeObserver != nil || d.QualityObserver != nil || traceThisRequest {
+			if d.JudgeObserver != nil || d.QualityObserver != nil || d.Config.Debug {
 				capw = newCaptureWriter(obs, d.maxObservedBytes)
 				rw = capw
 			}
@@ -1283,12 +1243,10 @@ func Chat(d Deps) http.Handler {
 								Instruction: latestPrompt,
 								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
-								TraceParent: traceParent,
-								TraceState:  traceState,
 							})
 						}
 						if d.QualityObserver != nil {
-							emitDetectedEdits(capw.Buffer(), reqID, traceParent, traceState, d.QualityObserver)
+							emitDetectedEdits(capw.Buffer(), reqID, "", "", d.QualityObserver)
 						}
 					}
 				}
@@ -1356,12 +1314,10 @@ func Chat(d Deps) http.Handler {
 								Instruction: latestPrompt,
 								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
-								TraceParent: traceParent,
-								TraceState:  traceState,
 							})
 						}
 						if d.QualityObserver != nil {
-							emitDetectedEdits(capw.Buffer(), reqID, traceParent, traceState, d.QualityObserver)
+							emitDetectedEdits(capw.Buffer(), reqID, "", "", d.QualityObserver)
 						}
 					}
 				}
@@ -1488,12 +1444,10 @@ func Chat(d Deps) http.Handler {
 		// describes the full request lifecycle. Emission happens
 		// AFTER the metrics dispatch so the trace can include the
 		// final response status (which http.Error may have set
-		// before we got here). The trace is gated on
-		// traceThisRequest (issue #242), which covers both the
-		// global NEXUS_DEBUG flag and the per-request
-		// X-Nexus-Trace-ID opt-in, so the production path pays
-		// zero allocations when neither is set.
-		if traceThisRequest {
+		// before we got here). The trace is gated on the
+		// pre-existing flag, so the production path pays zero
+		// allocations when NEXUS_DEBUG is unset.
+		if d.Config.Debug {
 			trace.Response.Status = obs.StatusCode()
 			trace.Response.TTFTMs = ttftMs
 			trace.Response.TotalBytes = obs.BytesOut()
@@ -1733,11 +1687,9 @@ func emitDetectedEdits(body, reqID, traceParent, traceState string, obs QualityO
 		}
 		seen[path] = true
 		obs.Submit(QualityEvent{
-			RequestID:   reqID,
-			Path:        path,
-			ToolName:    "edit", // best-effort label; verifier doesn't depend on the exact name
-			TraceParent: traceParent,
-			TraceState:  traceState,
+			RequestID: reqID,
+			Path:      path,
+			ToolName:  "edit", // best-effort label; verifier doesn't depend on the exact name
 		})
 	}
 }
