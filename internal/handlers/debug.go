@@ -77,10 +77,11 @@ type TransformTrace struct {
 	PromptEngineeringApplied bool
 	RAGInjected              bool
 	RAGFilename              string
+	RAGCacheHit              bool    // true when embedding was served from cache (issue #227)
 	RAGScore                 float64
 	TOONApplied              bool
 	TOONBytesBefore          int
-	TOONBytesAfter           int
+	TOONBytesAfter          int
 	TOONTokensSaved          int
 }
 
@@ -94,6 +95,7 @@ func (t TransformTrace) Log(logger *slog.Logger, reqID string) {
 			slog.Group("rag",
 				slog.Bool("injected", t.RAGInjected),
 				slog.String("filename", t.RAGFilename),
+				slog.Bool("cache_hit", t.RAGCacheHit),
 				slog.Float64("score", t.RAGScore),
 			),
 			slog.Group("toon",

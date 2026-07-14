@@ -11,6 +11,7 @@ package rag
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -22,6 +23,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // FewShotExample is one indexed code snippet with its embedding.
@@ -37,6 +40,176 @@ type Embedder interface {
 	Embed(ctx context.Context, text string) ([]float64, error)
 }
 
+// embedCacheEntry pairs a prompt embedding with its expiry time so TTL-based
+// eviction works alongside the LRU order.
+type embedCacheEntry struct {
+	key    string    // stored so we can evict by key when the list evicts
+	vec    []float64 // embedding vector
+	expire time.Time // TTL boundary
+}
+
+// EmbedCache is a并发-safe LRU cache for prompt embeddings keyed on the
+// exact prompt string. It wraps an Embedder and eliminates redundant
+// /api/embeddings round-trips for duplicate prompts within a configurable
+// TTL window (issue #227).
+type EmbedCache struct {
+	inner  Embedder
+	max    int           // max entries; 0 disables the cache
+	ttl    time.Duration // per-entry TTL; 0 means no expiry
+	mu     sync.Mutex
+	lru    *list.List              // front = most-recently-used
+	index  map[string]*list.Element // prompt → linked-list node
+	hits   int64
+	misses int64
+	// hitCount is an atomic counter incremented on every cache hit.
+	// Handlers snapshot it before and after Retrieve to estimate
+	// per-request cache hits without being disturbed by concurrent requests.
+	hitCount int64
+	// loading tracks in-flight inner.Embed calls so concurrent goroutines
+	// for the same key share a single upstream request.
+	loading map[string]chan loadResult
+}
+
+// loadResult is the result of an inner.Embed call, shared across waiters.
+type loadResult struct {
+	vec []float64
+	err error
+}
+
+// NewEmbedCache returns a cache that wraps inner. max is the LRU capacity
+// (entries are evicted oldest-first when full); ttl is the per-entry time-to-live
+// (zero = no expiry). Both max and ttl must be > 0 for caching to be active;
+// when either is zero the cache is a no-op pass-through to inner.
+func NewEmbedCache(inner Embedder, max int, ttl time.Duration) *EmbedCache {
+	return &EmbedCache{
+		inner:   inner,
+		max:     max,
+		ttl:     ttl,
+		lru:     list.New(),
+		index:   make(map[string]*list.Element),
+		loading: make(map[string]chan loadResult),
+	}
+}
+
+// Embed returns the cached embedding for text if present and not expired,
+// otherwise calls inner.Embed and caches the result. Thread-safe.
+func (c *EmbedCache) Embed(ctx context.Context, text string) ([]float64, error) {
+	if c.max <= 0 || c.ttl <= 0 {
+		return c.inner.Embed(ctx, text)
+	}
+
+	key := text
+
+	// Fast path: check for a live cache entry under the write lock.
+	c.mu.Lock()
+	if el, ok := c.index[key]; ok {
+		ent := el.Value.(embedCacheEntry)
+		if time.Now().Before(ent.expire) {
+			c.lru.MoveToFront(el)
+			c.hits++
+			atomic.AddInt64(&c.hitCount, 1)
+			vec := ent.vec
+			c.mu.Unlock()
+			out := make([]float64, len(vec))
+			copy(out, vec)
+			return out, nil
+		}
+		// Expired — remove from both structures.
+		c.lru.Remove(el)
+		delete(c.index, key)
+	}
+
+	// Check if another goroutine is already loading this key.
+	// If so, release the lock and wait for that goroutine's result.
+	if waitCh, ok := c.loading[key]; ok {
+		c.mu.Unlock()
+		result := <-waitCh
+		if result.err != nil {
+			return nil, result.err
+		}
+		// We waited for a concurrent load and got a hit.
+		atomic.AddInt64(&c.hits, 1)
+		atomic.AddInt64(&c.hitCount, 1)
+		out := make([]float64, len(result.vec))
+		copy(out, result.vec)
+		return out, nil
+	}
+
+	// Mark this key as being loaded. Use a buffered channel so we can
+	// signal completion without blocking the broadcasting goroutine.
+	loadCh := make(chan loadResult, 1)
+	c.loading[key] = loadCh
+	c.mu.Unlock()
+
+	// Call the underlying embedder while not holding the lock.
+	vec, err := c.inner.Embed(ctx, text)
+
+	// Broadcast result to any waiting goroutines and mark load complete.
+	c.mu.Lock()
+	delete(c.loading, key)
+	if err != nil {
+		c.misses++
+		c.mu.Unlock()
+		loadCh <- loadResult{err: err}
+		close(loadCh)
+		return nil, err
+	}
+
+	// Double-check: another goroutine may have inserted a fresh entry
+	// while we were loading.
+	if el, ok := c.index[key]; ok {
+		ent := el.Value.(embedCacheEntry)
+		if time.Now().Before(ent.expire) {
+			c.lru.MoveToFront(el)
+			c.hits++
+		} else {
+			c.lru.Remove(el)
+			delete(c.index, key)
+		}
+	}
+
+	// Insert unless a concurrent goroutine inserted while we loaded.
+	if _, exists := c.index[key]; !exists {
+		ent := embedCacheEntry{
+			key:    key,
+			vec:    vec,
+			expire: time.Now().Add(c.ttl),
+		}
+		el := c.lru.PushFront(ent)
+		c.index[key] = el
+		c.misses++
+		if c.lru.Len() > c.max {
+			oldest := c.lru.Back()
+			evictKey := oldest.Value.(embedCacheEntry).key
+			delete(c.index, evictKey)
+			c.lru.Remove(oldest)
+		}
+	}
+	c.mu.Unlock()
+
+	loadCh <- loadResult{vec: vec, err: nil}
+	close(loadCh)
+
+	out := make([]float64, len(vec))
+	copy(out, vec)
+	return out, nil
+}
+
+// CacheStats returns the cumulative hit and miss counts since the cache was
+// created. Used for observability; not thread-safe with concurrent access.
+func (c *EmbedCache) CacheStats() (hits, misses int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.hits, c.misses
+}
+
+// HitCount returns the current total hit count atomically. Used by the
+// chat handler to snapshot before/after a Retrieve call to estimate
+// per-request cache hits without being disturbed by concurrent requests.
+func (c *EmbedCache) HitCount() int64 {
+	return atomic.LoadInt64(&c.hitCount)
+}
+
 // RAGStore is the read+seed API the chat handler depends on. PersistentStore
 // (issue #46) embeds *Store and implements the same surface; the handler
 // is unaffected because both types satisfy this interface.
@@ -45,6 +218,22 @@ type RAGStore interface {
 	Add(filename, content string, embedding []float64)
 	Size() int
 	Threshold() float64
+}
+
+// EmbedCacheStats is the observability surface for the prompt embedding cache.
+// It is implemented by *EmbedCache and is also exposed by *Store (where it
+// delegates to the wrapped embedder when it is an *EmbedCache).
+type EmbedCacheStats interface {
+	// CacheStats returns the cumulative hit and miss counts.
+	CacheStats() (hits, misses int64)
+}
+
+// RAGCacheStatsProvider is implemented by RAGStore when the store wraps a
+// caching embedder. The chat handler type-asserts d.RAG to this interface
+// to snapshot the embed cache hit count before/after Retrieve and report
+// per-request cache hits via MetricsEvent (issue #227).
+type RAGCacheStatsProvider interface {
+	EmbedHitCount() int64
 }
 
 // Store holds the indexed few-shot examples.
@@ -101,6 +290,25 @@ func resolveDir(dir string) (string, error) {
 // escapes the intended examples directory.
 func verifyInsideDir(baseDir, resolvedPath string) bool {
 	return strings.HasPrefix(resolvedPath, baseDir+string(filepath.Separator)) || resolvedPath == baseDir
+}
+
+// CacheStats returns the cache hit/miss counts from the wrapped embedder
+// when it is an *EmbedCache. Returns zeros when caching is disabled
+// or the embedder is not a cache.
+func (s *Store) CacheStats() (hits, misses int64) {
+	if ec, ok := s.embedder.(*EmbedCache); ok {
+		return ec.CacheStats()
+	}
+	return 0, 0
+}
+
+// EmbedHitCount returns the current hit count from the wrapped *EmbedCache,
+// or 0 if the embedder is not a caching embedder. Safe to call concurrently.
+func (s *Store) EmbedHitCount() int64 {
+	if ec, ok := s.embedder.(*EmbedCache); ok {
+		return ec.HitCount()
+	}
+	return 0
 }
 
 // IndexDir walks dir, embedding every regular file's contents. It is
