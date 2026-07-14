@@ -86,6 +86,8 @@ var additiveMigrations = []string{
 	`ALTER TABLE requests ADD COLUMN toon_compression_method TEXT NOT NULL DEFAULT ''`,
 	// Issue #239: arbiter cost tracking
 	`ALTER TABLE requests ADD COLUMN fusion_arbiter_cost_usd REAL NOT NULL DEFAULT 0`,
+	// Issue #227: rag cache hit tracking
+	`ALTER TABLE requests ADD COLUMN rag_cache_hit INTEGER NOT NULL DEFAULT 0`,
 }
 
 // runAdditiveMigrations executes the additive ALTER TABLE migrations.
@@ -130,12 +132,12 @@ var schemaMigrations = []string{
 const insertSQL = `INSERT INTO requests
     (timestamp, request_id, route, model,
      input_tokens, output_tokens, toon_savings_tokens, toon_compression_method,
-     rag_injected, rag_filename, estimated_cost_usd,
+     rag_injected, rag_filename, rag_cache_hit, estimated_cost_usd,
      baseline_cost_usd, savings_usd,
      ttft_ms, total_latency_ms, tps, streaming,
      fusion_arbiter_skipped, fusion_jaccard_similarity, fusion_arbiter_cost_usd, error,
      route_source, route_reason, slm_confidence, slm_task_type)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // SQLiteStore is the production Store implementation (issue #4).
 // Writes are funnelled through a buffered channel and a single
@@ -337,7 +339,7 @@ func (s *SQLiteStore) writeOne(req Request) {
 	_, err := s.db.ExecContext(ctx, insertSQL,
 		ts.UTC(), req.RequestID, route, model,
 		req.InputTokens, req.OutputTokens, req.TOONSavingsTokens, req.TOONCompressionMethod,
-		ragInjected, req.RAGFilename, req.EstimatedCostUSD,
+		ragInjected, req.RAGFilename, req.RAGCacheHit, req.EstimatedCostUSD,
 		req.BaselineCostUSD, req.SavingsUSD,
 		req.TTFTMs, req.TotalLatencyMs, req.TPS, streaming,
 		fusionArbiterSkipped, req.FusionJaccardSimilarity, req.FusionArbiterCostUSD, req.Error,
