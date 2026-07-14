@@ -556,6 +556,29 @@ func main() {
 		}
 	}()
 
+	// Middleware chain (issue #224). Initialize the middleware registry
+	// with the config values so closures capture the per-config state.
+	// Empty MiddlewareChain uses the built-in default chain.
+	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.PromptInjectionIsolated())
+	var mwChain []middleware.Middleware
+	if cfg.MiddlewareChain != "" {
+		var err error
+		mwChain, err = middleware.BuildChain(cfg.MiddlewareChain)
+		if err != nil {
+			log.Fatalf("middleware chain: %v", err)
+		}
+		slog.Info("middleware chain configured",
+			slog.String("chain", cfg.MiddlewareChain),
+			slog.Int("count", len(mwChain)),
+		)
+	}
+	// ContextAwareRAG is the RAG middleware that needs request context.
+	// Nil when the chain doesn't contain "rag" (operator removed it).
+	var ctxAwareRAG middleware.ContextMiddleware
+	if len(mwChain) > 0 || cfg.MiddlewareChain == "" {
+		ctxAwareRAG = middleware.NewRAGMiddleware(store, cfg.RAGThreshold)
+	}
+
 	mux := http.NewServeMux()
 
 	// Route-decision counters (issue #74). The in-process counter set
@@ -659,6 +682,8 @@ func main() {
 		RAG:                     store,
 		SLM:                     slm,
 		FormattingRegex:         re,
+		MiddlewareChain:         mwChain,
+		ContextAwareRAG:         ctxAwareRAG,
 		Confidence:              confidenceObs,
 		SLMCache:                slmCache,
 		JudgeObserver:           judgeObs,

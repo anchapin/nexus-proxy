@@ -21,6 +21,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/health"
+	"github.com/anchapin/nexus-proxy/internal/middleware"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
@@ -56,6 +57,9 @@ func baseDeps(t *testing.T) (Deps, *upstream.RecordingTransport) {
 		FusionProgressiveDelivery: true,
 		FusionAgreementThreshold:  0.85,
 	}
+	// Re-initialize the middleware chain so closures capture cfg values
+	// instead of the empty defaults from the package init (issue #224).
+	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.PromptInjectionIsolated())
 	store := rag.NewStore(stubEmbedder{vec: []float64{0, 0, 0}}, 0.55)
 	store.Add("no-match.go", "x", []float64{0, 1, 0})
 	rt := upstream.NewRecordingTransport()

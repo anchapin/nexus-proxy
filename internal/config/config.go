@@ -289,6 +289,11 @@ type Config struct {
 	TOONNotice   string // appended when TOON compression is applied
 	TOONUnfenced bool   // issue #123: compress bare (unfenced) JSON arrays; default true
 
+	// Middleware chain (issue #224). Comma-separated ordered list of
+	// registered middleware names to apply per request. Empty uses the
+	// built-in default: "promptEngineering,rag,compressJSONBlocks,appendSystemNote".
+	MiddlewareChain string
+
 	// Prompt-injection hardening (issue #76). Controls whether the
 	// proxy isolates its policy text from user-supplied system content
 	// and whether suspicious injection patterns are logged or rejected.
@@ -438,6 +443,7 @@ func Load() (Config, error) {
 		MetaPrompt:     defaultMetaPrompt,
 		TOONNotice:     defaultTOONNotice,
 		TOONUnfenced:   getEnvBool("NEXUS_TOON_UNFENCED", true),
+		MiddlewareChain: getEnv("NEXUS_MIDDLEWARE_CHAIN", ""),)
 		TelemetryPath:  getEnvAllowEmpty("NEXUS_TELEMETRY_PATH", "./nexus-telemetry.jsonl"),
 		MetricsDBPath:  getEnvAllowEmpty("NEXUS_METRICS_DB", DefaultMetricsDBPath()),
 	}

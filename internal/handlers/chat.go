@@ -447,6 +447,19 @@ type Deps struct {
 	SLM             *router.SLMClient
 	FormattingRegex *regexp.Regexp
 
+	// MiddlewareChain is the ordered list of registered middleware names
+	// to apply to each request's messages slice (issue #224). The handler
+	// iterates the chain and calls each middleware's Transform method.
+	// Nil or empty defaults to the built-in chain.
+	MiddlewareChain []middleware.Middleware
+
+	// ContextAwareRAG is the optional ContextAwareRAG middleware that needs
+	// the request context to perform RAG retrieval. When non-nil and the
+	// chain contains "rag", the handler calls TransformContext instead of
+	// Transform for the RAG step. This keeps the generic Middleware
+	// interface clean (no context) while allowing RAG to receive ctx.
+	ContextAwareRAG middleware.ContextMiddleware
+
 	// Confidence is the optional judge-guided adaptive routing store
 	// (issue #47). When non-nil the handler categorizes the prompt,
 	// looks up the local model's historical confidence for that
@@ -808,16 +821,80 @@ func Chat(d Deps) http.Handler {
 			}
 		}
 
-		// Apply prompt engineering. In off mode (default) the legacy
-		// append path is used — byte-for-byte backward compatible.
-		// In warn/strict modes the isolated variant inserts a dedicated
-		// leading system message wrapped in proxy-policy delimiters so
-		// trusted text always precedes user-supplied system content.
-		var messages []interface{}
+		// RAG injection metadata. Set by the RAG retrieval step below.
+		var ragInjected bool
+		var ragFilename string
+		var ragScore float64
+
+		messages := rawMessages
+
+		// 1. Apply prompt engineering (issue #224).
+		// Done inline so it runs before the configurable chain (which skips it).
 		if d.Config.PromptInjectionIsolated() {
-			messages = middleware.ApplyPromptEngineeringIsolated(rawMessages, d.Config.MetaPrompt)
+			messages = middleware.ApplyPromptEngineeringIsolated(messages, d.Config.MetaPrompt)
 		} else {
-			messages = middleware.ApplyPromptEngineering(rawMessages, d.Config.MetaPrompt)
+			messages = middleware.ApplyPromptEngineering(messages, d.Config.MetaPrompt)
+		}
+
+		// Apply the middleware chain (issue #224). Each middleware's
+		// Transform is called in order; the result is passed to the next.
+		//
+		// The chain is configurable via NEXUS_MIDDLEWARE_CHAIN. The default
+		// order matches the pre-#224 hardcoded sequence:
+		//   promptEngineering → rag → compressJSONBlocks → appendSystemNote
+		//
+		// RAG is handled as a special case before the chain because it
+		// needs the request context to call d.RAG.Retrieve. The chain
+		// middleware receive messages that already have RAG injected so the
+		// Transform signature stays clean (no ctx parameter).
+		//
+		// Do RAG when: (a) ContextAwareRAG is set (operator included rag in
+		// chain) OR (b) d.RAG is set but ContextAwareRAG is nil (backward
+		// compatibility for tests that set d.RAG without the ctx-aware type).
+		if d.ContextAwareRAG != nil || d.RAG != nil {
+			// RAG retrieval with request context.
+			if ex, score, err := d.RAG.Retrieve(r.Context(), middleware.ExtractLatestUserPrompt(messages)); err == nil && ex != nil {
+				messages = middleware.InjectRAG(messages, rag.FormatInjection(ex))
+				slog.Info("rag hit",
+					slog.String("filename", ex.Filename),
+					slog.Float64("score", score),
+					slog.String("request_id", reqID),
+				)
+				ragInjected = true
+				ragFilename = ex.Filename
+				ragScore = score
+			}
+		}
+
+		// Snapshot the JSON size BEFORE TOON compression so the
+		// metrics observer can attribute tokens saved by the
+		// round-trip pass. Uses the cheap "4 chars per token"
+		// heuristic the rest of the project uses for telemetry
+		// (see internal/telemetry.EstimateTokens).
+		preCompressionChars := totalMessageChars(messages)
+		trace.Transforms.TOONBytesBefore = preCompressionChars
+
+		// Iterate the middleware chain. The chain starts AFTER RAG so
+		// middleware in the chain don't receive request ctx.
+		chain := d.MiddlewareChain
+		if len(chain) == 0 {
+			chain = middleware.DefaultChain()
+		}
+		for _, m := range chain {
+			if m.Name() == "rag" || m.Name() == "promptEngineering" {
+				// Already handled above (RAG) or is no-op placeholder
+				// (promptEngineering already applied via Config).
+				continue
+			}
+			var err error
+			messages, err = m.Transform(messages)
+			if err != nil {
+				slog.Warn("middleware transform error",
+					slog.String("middleware", m.Name()),
+					slog.Any("err", err),
+					slog.String("request_id", reqID),
+				)
+			}
 		}
 		latestPrompt := middleware.ExtractLatestUserPrompt(messages)
 		// Record whether the meta-prompt actually appended to a
