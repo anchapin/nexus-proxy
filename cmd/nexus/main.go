@@ -32,6 +32,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/middleware"
 	"github.com/anchapin/nexus-proxy/internal/observability"
 	"github.com/anchapin/nexus-proxy/internal/probe"
+	"github.com/anchapin/nexus-proxy/internal/providers"
 	"github.com/anchapin/nexus-proxy/internal/quality"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/ratelimit"
@@ -445,6 +446,22 @@ func main() {
 		}
 	}()
 
+	// Frontier provider registry (issue #223). When NEXUS_FRONTIER_PROVIDERS
+	// is set, ParseProvidersFromEnv parses the JSON array and returns a
+	// registry of Provider objects. When nil the chat handler falls back
+	// to the legacy config-based cascade (BuildLocalCascade) so existing
+	// deployments are byte-for-byte unchanged.
+	providerRegistry, err := providers.ParseProvidersFromEnv()
+	if err != nil {
+		log.Fatalf("providers: %v", err)
+	}
+	if providerRegistry != nil {
+		slog.Info("frontier provider registry loaded",
+			slog.Int("providers", providerRegistry.Len()),
+			slog.String("names", fmt.Sprintf("%v", providerRegistry.ProviderNames())),
+		)
+	}
+
 	// File watcher (issue #46). Spawned only when persistence is
 	// enabled AND the operator set NEXUS_RAG_POLL_INTERVAL > 0.
 	// Stop blocks on shutdown so the goroutine has a chance to
@@ -703,6 +720,7 @@ func main() {
 		CascadeFallbackObserver: cascadeFallbackObs,
 		ArbiterCacheObserver:    arbiterCacheObserver,
 		ArbiterCache:            arbiterCache,
+		Providers:               providerRegistry,
 	})
 	// Apply the per-client rate limiter (issue #75) as the outermost
 	// wrapper so a flood of requests is rejected before any middleware
