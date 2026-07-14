@@ -2,6 +2,7 @@ package router
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
@@ -41,14 +42,17 @@ type SLMClient struct {
 	CacheTTL        time.Duration // default 5m
 	CacheMaxEntries int           // default 512
 
-	cacheMu sync.RWMutex
-	cache   map[string]*cacheEntry
-	hits    int64
-	misses  int64
+	cacheMu   sync.RWMutex
+	cacheList *list.List               // LRU list: front=MRU, back=LRU
+	cacheMap  map[string]*list.Element // key -> list element for O(1) lookup
+	hits      int64
+	misses    int64
 }
 
 // cacheEntry pairs a route decision with its expiry time.
+// Key is stored so we can delete from cacheMap when this entry is evicted.
 type cacheEntry struct {
+	Key       string
 	Route     Route
 	ExpiresAt time.Time
 }
@@ -66,7 +70,8 @@ func NewSLMClient(baseURL, model string, timeout time.Duration, client *http.Cli
 		Client:          client,
 		CacheTTL:        5 * time.Minute,
 		CacheMaxEntries: 512,
-		cache:           make(map[string]*cacheEntry),
+		cacheList:       list.New(),
+		cacheMap:        make(map[string]*list.Element),
 	}
 }
 
@@ -78,7 +83,8 @@ func (c *SLMClient) WithCache(maxEntries int, ttl time.Duration) *SLMClient {
 	c.CacheMaxEntries = maxEntries
 	c.CacheTTL = ttl
 	if maxEntries > 0 {
-		c.cache = make(map[string]*cacheEntry)
+		c.cacheList = list.New()
+		c.cacheMap = make(map[string]*list.Element)
 	}
 	return c
 }
@@ -168,11 +174,10 @@ func (c *SLMClient) CacheStats() (hits, misses int64) {
 }
 
 // evictStale removes expired entries and enforces the max-entries cap via
-// simple FIFO eviction: expired entries are always removed; if the cache
-// is still over capacity after expired entry removal, the oldest entry
-// (by map iteration order, which is insertion order for the map key set)
-// is evicted. This is a best-effort LRU approximation — good enough for
-// the cache size limits in use (512 entries).
+// true LRU eviction: expired entries are always removed first; if the cache
+// is still over capacity after expired entry removal, the least-recently-used
+// entry (the back of the LRU list) is evicted. This ensures deterministic
+// eviction order regardless of Go map iteration order (issue #275).
 func (c *SLMClient) evictStale() {
 	now := time.Now()
 	max := c.CacheMaxEntries
@@ -180,26 +185,27 @@ func (c *SLMClient) evictStale() {
 		max = 512
 	}
 
-	// Phase 1: remove all expired entries.
-	for k, e := range c.cache {
-		if now.After(e.ExpiresAt) {
-			delete(c.cache, k)
+	// Phase 1: remove all expired entries by iterating the LRU list.
+	// Iterate from back to front so we can safely remove while iterating.
+	for e := c.cacheList.Back(); e != nil; e = e.Prev() {
+		entry := e.Value.(*cacheEntry)
+		if now.After(entry.ExpiresAt) {
+			delete(c.cacheMap, entry.Key)
+			c.cacheList.Remove(e)
 		}
 	}
 
-	// Phase 2: if still over capacity, evict oldest entries.
-	if len(c.cache) >= max {
-		evict := len(c.cache) - max + 1
-		// Map iteration order is intentionally undefined, but for a
-		// small map (≤512) iteration is deterministic within a single
-		// program run. Evict the first evict keys encountered.
-		removed := 0
-		for k := range c.cache {
-			delete(c.cache, k)
-			removed++
-			if removed >= evict {
+	// Phase 2: if still over capacity, evict LRU entries from the back.
+	if c.cacheList.Len() >= max {
+		evict := c.cacheList.Len() - max + 1
+		for i := 0; i < evict; i++ {
+			lruElem := c.cacheList.Back()
+			if lruElem == nil {
 				break
 			}
+			entry := lruElem.Value.(*cacheEntry)
+			delete(c.cacheMap, entry.Key)
+			c.cacheList.Remove(lruElem)
 		}
 	}
 }
@@ -212,14 +218,16 @@ func (c *SLMClient) decide(ctx context.Context, prompt, systemPrompt string) (Ro
 		key = cacheKey(prompt, systemPrompt)
 		// Fast path: check cache before HTTP call (issue #162).
 		c.cacheMu.RLock()
-		entry, ok := c.cache[key]
-		hit := ok && time.Now().Before(entry.ExpiresAt)
+		elem, ok := c.cacheMap[key]
+		hit := ok && time.Now().Before(elem.Value.(*cacheEntry).ExpiresAt)
 		if hit {
 			c.hits++
+			// Move to front (MRU position) since this entry was just accessed.
+			c.cacheList.MoveToFront(elem)
 		}
 		c.cacheMu.RUnlock()
 		if hit {
-			return entry.Route, nil
+			return elem.Value.(*cacheEntry).Route, nil
 		}
 	}
 
@@ -292,10 +300,14 @@ func (c *SLMClient) decide(ctx context.Context, prompt, systemPrompt string) (Ro
 		if ttl <= 0 {
 			ttl = 5 * time.Minute
 		}
-		c.cache[key] = &cacheEntry{
+		entry := &cacheEntry{
+			Key:       key,
 			Route:     route,
 			ExpiresAt: time.Now().Add(ttl),
 		}
+		// Add to front of list (MRU position) and map.
+		elem := c.cacheList.PushFront(entry)
+		c.cacheMap[key] = elem
 		c.misses++
 		c.cacheMu.Unlock()
 	}
