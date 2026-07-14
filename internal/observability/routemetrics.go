@@ -121,7 +121,9 @@ type RouteCounters struct {
 	rRAGMisses               map[string]*uint64
 	cascadeFallbacks         map[string]*uint64
 	arbiterCache             map[string]*uint64 // "hit" | "miss"
+
 }
+
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
 func NewRouteCounters() *RouteCounters {
@@ -445,6 +447,7 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += n
 	}
+
 	if n, err := writeFusionSeries(w, "nexus_fusion_arbiter_total",
 		"Fusion panel outcomes: arbiter skipped (agreement) or invoked (disagreement).",
 		rc.fusionArbiter); err != nil {
