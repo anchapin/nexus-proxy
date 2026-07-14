@@ -1196,7 +1196,7 @@ func TestChatNonLocalRouteDoesNotInvokeQualityObserver(t *testing.T) {
 // TestEmitDetectedEditsSkipsEmptyBody confirms the cheap no-op branch.
 func TestEmitDetectedEditsSkipsEmptyBody(t *testing.T) {
 	obs := &qualityRecordingObserver{}
-	emitDetectedEdits("", "req-1", obs)
+	emitDetectedEdits("", "req-1", "", "", obs)
 	if got := obs.Snapshot(); len(got) != 0 {
 		t.Errorf("got %d events on empty body, want 0", len(got))
 	}
@@ -1206,7 +1206,7 @@ func TestEmitDetectedEditsSkipsEmptyBody(t *testing.T) {
 // not panic when no observer is wired.
 func TestEmitDetectedEditsNilObserverIsSafe(t *testing.T) {
 	// Should not panic.
-	emitDetectedEdits(`{"name":"write_file","arguments":"{\"path\":\"/tmp/x\"}"}`, "req-1", nil)
+	emitDetectedEdits(`{"name":"write_file","arguments":"{\"path\":\"/tmp/x\"}"}`, "req-1", "", "", nil)
 }
 
 // TestChatRejectsOversizedBody is the acceptance test for issue #11: a
