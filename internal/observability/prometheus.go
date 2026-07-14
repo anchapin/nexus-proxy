@@ -287,6 +287,7 @@ type labelSample struct {
 
 // writeMeta emits the # HELP and # TYPE header lines for one metric
 // family. Called once per family before its sample lines.
+//
 //nolint:errcheck
 func writeMeta(w io.Writer, name, help, typ string) {
 	fmt.Fprintf(w, "# HELP %s %s\n", name, help)
@@ -294,6 +295,7 @@ func writeMeta(w io.Writer, name, help, typ string) {
 }
 
 // writeCounter emits a single-sample unlabelled counter family.
+//
 //nolint:errcheck
 func writeCounter(w io.Writer, name, help string, v uint64) {
 	writeMeta(w, name, help, "counter")
@@ -303,6 +305,7 @@ func writeCounter(w io.Writer, name, help string, v uint64) {
 // writeCounterLabeled emits a counter family with one label dimension.
 // Each labelSample becomes its own sample line. The label values are
 // emitted in the order given (callers pass them sorted by relevance).
+//nolint:errcheck
 func writeCounterLabeled(w io.Writer, name, help, label string, samples []labelSample) {
 	writeMeta(w, name, help, "counter")
 	for _, s := range samples {
@@ -314,6 +317,7 @@ func writeCounterLabeled(w io.Writer, name, help, label string, samples []labelS
 // Each route gets its own bucket lines, _sum, and _count.
 // Routes are emitted in a fixed order (local, frontier, fusion) for
 // deterministic output.
+//nolint:errcheck
 func writeHistogramLabeled(w io.Writer, name, help, label string, histograms map[string]*Histogram) {
 	writeMeta(w, name, help, "histogram")
 	// Fixed route order for deterministic output.
