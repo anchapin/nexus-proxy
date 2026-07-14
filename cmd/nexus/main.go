@@ -97,7 +97,8 @@ func main() {
 	// collaborator so all traffic shares the same transport.
 	httpClient := transport.NewFromEnv()
 
-	emb, err := rag.NewEmbedder(cfg.EmbedderType, cfg.EmbedderBaseURL, cfg.EmbeddingModel, cfg.FrontierKey, httpClient)
+	emb, err := rag.NewEmbedder(cfg.EmbedderType, cfg.EmbedderBaseURL, cfg.EmbeddingModel, cfg.FrontierKey, httpClient,
+		rag.BreakerConfig{Threshold: cfg.RAGCircuitBreakerThreshold, Cooldown: cfg.RAGCircuitBreakerCooldown})
 	if err != nil {
 		log.Fatalf("rag embedder: %v", err)
 	}
@@ -591,6 +592,7 @@ func main() {
 	// RouteCounters.Handler() so a scrape is always an atomic
 	// snapshot.
 	routeCounters := observability.NewRouteCounters()
+
 	routeDecisionObs := handlers.RouteDecisionObserverFunc(func(e handlers.RouteDecisionEvent) {
 		routeCounters.Observe(e.Route, e.Source, e.Confidence, e.TaskType, "")
 		// Issue #206: record SLM cache hit/miss.

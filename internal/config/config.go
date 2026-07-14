@@ -106,6 +106,12 @@ type Config struct {
 	// skipping the Ollama round-trip for repeat prompts.
 	RAGEmbedCacheSize int // max LRU entries (256)
 
+	// RAG circuit breaker (issue #222). After RAGCircuitBreakerThreshold
+	// consecutive Ollama /api/embeddings failures the breaker trips and
+	// enters a cooldown window during which Embed returns ErrCircuitOpen.
+	RAGCircuitBreakerThreshold int           // consecutive failures to trip; 0 = disabled
+	RAGCircuitBreakerCooldown  time.Duration // cooldown duration after trip
+
 	// Routing
 	TokenGuardrail            int           // estimated tokens above this force frontier (6000)
 	SLMTimeout                time.Duration // Qwen3-Coder routing timeout (8s)
@@ -496,6 +502,19 @@ func Load() (Config, error) {
 		cfg.EmbedderBaseURL = cfg.OllamaURL
 	}
 	cfg.CohereAPIKey = getEnv("NEXUS_COHERE_API_KEY", "")
+
+	// RAG circuit breaker (issue #222).
+	cbThreshold, err := getEnvInt("NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD", 3)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RAGCircuitBreakerThreshold = cbThreshold
+
+	cbCooldown, err := getEnvDuration("NEXUS_RAG_CIRCUIT_BREAKER_COOLDOWN", 30*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RAGCircuitBreakerCooldown = cbCooldown
 
 	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
 	if err != nil {

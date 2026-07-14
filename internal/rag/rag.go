@@ -27,6 +27,19 @@ import (
 	"time"
 )
 
+// ErrCircuitOpen is returned by OllamaEmbedder.Embed when the circuit
+// breaker has tripped and the cooldown window has not yet elapsed.
+// Callers should treat this as a transient failure and retry after the
+// cooldown expires.
+var ErrCircuitOpen = fmt.Errorf("rag: ollama embedder circuit breaker open")
+
+// BreakerConfig configures the circuit breaker on OllamaEmbedder.
+// A zero Threshold disables the breaker.
+type BreakerConfig struct {
+	Threshold int           // consecutive failures that trip the breaker; 0 = disabled
+	Cooldown  time.Duration // how long the breaker stays open after tripping
+}
+
 // FewShotExample is one indexed code snippet with its embedding.
 type FewShotExample struct {
 	Filename  string
@@ -519,21 +532,37 @@ func (s *Store) snapshot() []FewShotExample {
 // OllamaEmbedder calls the Ollama /api/embeddings endpoint. It is safe for
 // concurrent use via a shared http.Client.
 type OllamaEmbedder struct {
-	BaseURL string // e.g. "http://localhost:11434"
-	Model   string // e.g. "nomic-embed-text"
-	Client  *http.Client
+	BaseURL          string // e.g. "http://localhost:11434"
+	Model            string // e.g. "nomic-embed-text"
+	Client           *http.Client
+	BreakerConfig    // optional; zero-value means breaker disabled
+	breakerThreshold atomic.Int32
+	cooldownUntil    atomic.Int64 // nanoseconds since Unix epoch; 0 = never tripped
+	failureCount     atomic.Int32
 }
 
 // NewOllamaEmbedder returns an embedder wired to the given Ollama instance.
-func NewOllamaEmbedder(baseURL, model string, client *http.Client) *OllamaEmbedder {
+// Passing a zero BreakerConfig (Threshold==0) disables the circuit breaker.
+func NewOllamaEmbedder(baseURL, model string, client *http.Client, cb BreakerConfig) *OllamaEmbedder {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &OllamaEmbedder{BaseURL: baseURL, Model: model, Client: client}
+	e := &OllamaEmbedder{
+		BaseURL:       baseURL,
+		Model:         model,
+		Client:        client,
+		BreakerConfig: cb,
+	}
+	e.breakerThreshold.Store(int32(cb.Threshold))
+	return e
 }
 
-// Embed fetches the embedding vector for text.
+// Embed fetches the embedding vector for text. If the circuit breaker is
+// open it returns ErrCircuitOpen without calling Ollama.
 func (o *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float64, error) {
+	if o.isOpen() {
+		return nil, ErrCircuitOpen
+	}
 	payload, _ := json.Marshal(map[string]string{"model": o.Model, "prompt": text})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		o.BaseURL+"/api/embeddings", bytes.NewReader(payload))
@@ -543,26 +572,32 @@ func (o *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := o.Client.Do(req)
 	if err != nil {
+		o.recordFailure()
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		o.recordFailure()
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
+		o.recordFailure()
 		return nil, fmt.Errorf("ollama embed %s: status %d: %s", o.Model, resp.StatusCode, body)
 	}
 	var raw struct {
 		Embedding []float64 `json:"embedding"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
+		o.recordFailure()
 		return nil, fmt.Errorf("ollama embed: decode: %w", err)
 	}
 	if len(raw.Embedding) == 0 {
+		o.recordFailure()
 		return nil, fmt.Errorf("ollama embed: empty embedding for model %s", o.Model)
 	}
+	o.recordSuccess()
 	return raw.Embedding, nil
 }
 
@@ -694,7 +729,8 @@ const (
 // NewEmbedder constructs an Embedder from the given config fields.
 // The returned Embedder must be wrapped with NewCachedEmbedder by the
 // caller when the cache is desired (as in main.go).
-func NewEmbedder(embedderType EmbedderType, baseURL, model, apiKey string, client *http.Client) (Embedder, error) {
+// The breakerConfig is only used for the Ollama embedder.
+func NewEmbedder(embedderType EmbedderType, baseURL, model, apiKey string, client *http.Client, breakerConfig BreakerConfig) (Embedder, error) {
 	switch embedderType {
 	case EmbedderTypeOpenAI:
 		if apiKey == "" {
@@ -709,6 +745,66 @@ func NewEmbedder(embedderType EmbedderType, baseURL, model, apiKey string, clien
 	case EmbedderTypeOllama:
 		fallthrough
 	default:
-		return NewOllamaEmbedder(baseURL, model, client), nil
+		return NewOllamaEmbedder(baseURL, model, client, breakerConfig), nil
 	}
+}
+
+// isOpen reports whether the circuit breaker is currently in the open
+// (cooldown) state. A zero cooldownUntil means the breaker has never
+// tripped or has recovered.
+//
+// When the cooldown deadline has passed, both the failure counter and the
+// deadline are reset so that the next request starts fresh — if it fails it
+// will re-trip the breaker, creating a new cooldown window.
+func (o *OllamaEmbedder) isOpen() bool {
+	deadline := o.cooldownUntil.Load()
+	if deadline == 0 {
+		return false
+	}
+	if time.Now().UnixNano() >= deadline {
+		// Cooldown has expired; give the next request a clean slate.
+		o.failureCount.Store(0)
+		o.cooldownUntil.Store(0)
+		return false
+	}
+	return true
+}
+
+// recordFailure increments the consecutive-failure counter and trips the
+// breaker when the threshold is reached. The cooldown window is set to
+// BreakerCooldown from the current time.
+func (o *OllamaEmbedder) recordFailure() {
+	if o.breakerThreshold.Load() == 0 {
+		return // breaker disabled
+	}
+	count := o.failureCount.Add(1)
+	if count >= o.breakerThreshold.Load() {
+		// Trip: set the cooldown deadline. We add one nanosecond so that
+		// the comparison in isOpen is strict (deadline > now, not >=).
+		o.cooldownUntil.Store(time.Now().Add(o.BreakerConfig.Cooldown).UnixNano() + 1)
+		slog.Warn("rag: ollama embedder circuit breaker tripped",
+			slog.Int("failures", int(count)),
+			slog.Int("threshold", int(o.breakerThreshold.Load())),
+			slog.Duration("cooldown", o.BreakerConfig.Cooldown),
+		)
+	}
+}
+
+// recordSuccess resets the consecutive-failure counter and clears the
+// cooldown deadline. No-op when the breaker is already closed.
+func (o *OllamaEmbedder) recordSuccess() {
+	o.failureCount.Store(0)
+	o.cooldownUntil.Store(0)
+}
+
+// FailureCount returns the current consecutive-failure counter. Exported
+// for the Prometheus gauge provider in main.go.
+func (o *OllamaEmbedder) FailureCount() int {
+	return int(o.failureCount.Load())
+}
+
+// IsBreakerOpen reports whether the circuit is currently in the open
+// (cooldown) state. Exported for tests and operational dashboards.
+func (o *OllamaEmbedder) IsBreakerOpen() bool {
+	return o.isOpen()
 }
