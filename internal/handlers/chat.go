@@ -447,6 +447,19 @@ type Deps struct {
 	SLM             *router.SLMClient
 	FormattingRegex *regexp.Regexp
 
+	// MiddlewareChain is the ordered list of registered middleware names
+	// to apply to each request's messages slice (issue #224). The handler
+	// iterates the chain and calls each middleware's Transform method.
+	// Nil or empty defaults to the built-in chain.
+	MiddlewareChain []middleware.Middleware
+
+	// ContextAwareRAG is the optional ContextAwareRAG middleware that needs
+	// the request context to perform RAG retrieval. When non-nil and the
+	// chain contains "rag", the handler calls TransformContext instead of
+	// Transform for the RAG step. This keeps the generic Middleware
+	// interface clean (no context) while allowing RAG to receive ctx.
+	ContextAwareRAG middleware.ContextMiddleware
+
 	// Confidence is the optional judge-guided adaptive routing store
 	// (issue #47). When non-nil the handler categorizes the prompt,
 	// looks up the local model's historical confidence for that
@@ -808,18 +821,16 @@ func Chat(d Deps) http.Handler {
 			}
 		}
 
-		// Apply prompt engineering. In off mode (default) the legacy
-		// append path is used — byte-for-byte backward compatible.
-		// In warn/strict modes the isolated variant inserts a dedicated
-		// leading system message wrapped in proxy-policy delimiters so
-		// trusted text always precedes user-supplied system content.
-		var messages []interface{}
+		messages := rawMessages
+
+		// Apply prompt engineering.
 		if d.Config.PromptInjectionIsolated() {
-			messages = middleware.ApplyPromptEngineeringIsolated(rawMessages, d.Config.MetaPrompt)
+			messages = middleware.ApplyPromptEngineeringIsolated(messages, d.Config.MetaPrompt)
 		} else {
-			messages = middleware.ApplyPromptEngineering(rawMessages, d.Config.MetaPrompt)
+			messages = middleware.ApplyPromptEngineering(messages, d.Config.MetaPrompt)
 		}
 		latestPrompt := middleware.ExtractLatestUserPrompt(messages)
+
 		// Record whether the meta-prompt actually appended to a
 		// system slot — "applied" only when there is now a system
 		// message containing the operator-configured enhancement.

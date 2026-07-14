@@ -289,6 +289,11 @@ type Config struct {
 	TOONNotice   string // appended when TOON compression is applied
 	TOONUnfenced bool   // issue #123: compress bare (unfenced) JSON arrays; default true
 
+	// Middleware chain (issue #224). Comma-separated ordered list of
+	// registered middleware names to apply per request. Empty uses the
+	// built-in default: "promptEngineering,rag,compressJSONBlocks,appendSystemNote".
+	MiddlewareChain string
+
 	// Prompt-injection hardening (issue #76). Controls whether the
 	// proxy isolates its policy text from user-supplied system content
 	// and whether suspicious injection patterns are logged or rejected.
@@ -421,25 +426,26 @@ func DefaultJudgeDBPath() string {
 // value is malformed; missing optional values fall back to defaults.
 func Load() (Config, error) {
 	cfg := Config{
-		Addr:           getEnv("NEXUS_ADDR", ":8000"),
-		OllamaURL:      strings.TrimRight(getEnv("NEXUS_OLLAMA_URL", "http://localhost:11434"), "/"),
-		RouterModel:    getEnv("NEXUS_ROUTER_MODEL", "qwen3-coder:4b"),
-		LocalModel:     getEnv("NEXUS_LOCAL_MODEL", "qwen3-coder:8b"),
-		EmbeddingModel: getEnv("NEXUS_EMBEDDING_MODEL", "nomic-embed-text"),
-		FrontierURL:    getEnv("NEXUS_FRONTIER_URL", "https://api.openai.com/v1/chat/completions"),
-		FrontierModel:  getEnv("NEXUS_FRONTIER_MODEL", "gpt-4o"),
-		FrontierKey:    getEnv("NEXUS_FRONTIER_API_KEY", ""),
-		ZAIURL:         getEnv("NEXUS_ZAI_URL", "https://api.z.ai/v1/chat/completions"),
-		ZAIModel:       getEnv("NEXUS_ZAI_MODEL", "glm-4.6"),
-		ZAIKey:         getEnv("NEXUS_ZAI_API_KEY", ""),
-		ProxyAPIKey:    getEnv("NEXUS_PROXY_API_KEY", ""),
-		StatusPublic:   getEnvBool("NEXUS_STATUS_PUBLIC", false),
-		ExamplesDir:    getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
-		MetaPrompt:     defaultMetaPrompt,
-		TOONNotice:     defaultTOONNotice,
-		TOONUnfenced:   getEnvBool("NEXUS_TOON_UNFENCED", true),
-		TelemetryPath:  getEnvAllowEmpty("NEXUS_TELEMETRY_PATH", "./nexus-telemetry.jsonl"),
-		MetricsDBPath:  getEnvAllowEmpty("NEXUS_METRICS_DB", DefaultMetricsDBPath()),
+		Addr:            getEnv("NEXUS_ADDR", ":8000"),
+		OllamaURL:       strings.TrimRight(getEnv("NEXUS_OLLAMA_URL", "http://localhost:11434"), "/"),
+		RouterModel:     getEnv("NEXUS_ROUTER_MODEL", "qwen3-coder:4b"),
+		LocalModel:      getEnv("NEXUS_LOCAL_MODEL", "qwen3-coder:8b"),
+		EmbeddingModel:  getEnv("NEXUS_EMBEDDING_MODEL", "nomic-embed-text"),
+		FrontierURL:     getEnv("NEXUS_FRONTIER_URL", "https://api.openai.com/v1/chat/completions"),
+		FrontierModel:   getEnv("NEXUS_FRONTIER_MODEL", "gpt-4o"),
+		FrontierKey:     getEnv("NEXUS_FRONTIER_API_KEY", ""),
+		ZAIURL:          getEnv("NEXUS_ZAI_URL", "https://api.z.ai/v1/chat/completions"),
+		ZAIModel:        getEnv("NEXUS_ZAI_MODEL", "glm-4.6"),
+		ZAIKey:          getEnv("NEXUS_ZAI_API_KEY", ""),
+		ProxyAPIKey:     getEnv("NEXUS_PROXY_API_KEY", ""),
+		StatusPublic:    getEnvBool("NEXUS_STATUS_PUBLIC", false),
+		ExamplesDir:     getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
+		MetaPrompt:      defaultMetaPrompt,
+		TOONNotice:      defaultTOONNotice,
+		TOONUnfenced:    getEnvBool("NEXUS_TOON_UNFENCED", true),
+		MiddlewareChain: getEnv("NEXUS_MIDDLEWARE_CHAIN", ""),
+		TelemetryPath:   getEnvAllowEmpty("NEXUS_TELEMETRY_PATH", "./nexus-telemetry.jsonl"),
+		MetricsDBPath:   getEnvAllowEmpty("NEXUS_METRICS_DB", DefaultMetricsDBPath()),
 	}
 
 	threshold, err := getEnvFloat("NEXUS_RAG_THRESHOLD", 0.55)
