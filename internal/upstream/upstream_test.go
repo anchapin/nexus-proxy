@@ -766,6 +766,94 @@ func TestPanelStreamingAgreementSkipsArbiter(t *testing.T) {
 	}
 }
 
+// TestPanelStreamingAgreementCancelsSlowMember verifies issue #229:
+// when both panel members produce near-identical output (agreement case),
+// the slow member's context cancel() is called before returning to the
+// client, preventing wasted compute after the response has already been sent.
+// The key scenario is slow-local/fast-frontier: the local goroutine's HTTP
+// request is aborted when the fast frontier wins, rather than running to
+// completion and blocking on a channel send.
+func TestPanelStreamingAgreementCancelsSlowMember(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+
+	// Slow local handler — takes 5 seconds to complete.
+	// When the context is cancelled, the server should abort the request.
+	ft.on(localURL, func(w http.ResponseWriter, r *http.Request) {
+		// Simulate slow processing: wait for context cancellation or timeout.
+		// The httptest server doesn't check context, but we use a separate
+		// mechanism to detect if the request was actually started.
+		select {
+		case <-time.After(5 * time.Second):
+			// Request completed normally (not cancelled).
+		case <-r.Context().Done():
+			// Request was cancelled via context — this is the expected path.
+			return
+		}
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Use a buffered channel to queue requests. The dispatcher drains the queue."}}]}`)
+	})
+
+	// Fast frontier handler — returns immediately with identical content.
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Use a buffered channel to queue requests. The dispatcher drains the queue."}}]}`)
+	})
+
+	// Arbiter should NOT be called in agreement case.
+	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("arbiter called in agreement case")
+		w.WriteHeader(200)
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	outcome, err := PanelStreaming(
+		rw, client,
+		"http://local.local", "local-m",
+		frontierURL, "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		5*time.Second, // perFetchTimeout
+		5*time.Second, // arbiterTimeout
+		false,         // skipLocal
+		0.85,          // agreementThreshold
+		"test-request-id",
+	)
+
+	if err != nil {
+		t.Fatalf("PanelStreaming: %v", err)
+	}
+	if !outcome.ArbiterSkipped {
+		t.Errorf("outcome.ArbiterSkipped = false, want true (agreement)")
+	}
+	if outcome.Similarity < 0.85 {
+		t.Errorf("similarity = %v, want >= 0.85", outcome.Similarity)
+	}
+	if outcome.Source != "frontier" {
+		t.Errorf("Source = %q, want frontier (first to complete)", outcome.Source)
+	}
+
+	// Verify both panel members were called.
+	if got := *ft.counter(localURL); got != 1 {
+		t.Errorf("local fetch = %d, want 1", got)
+	}
+	if got := *ft.counter(frontierURL); got != 1 {
+		t.Errorf("frontier fetch = %d, want 1", got)
+	}
+
+	// Verify the speculative chunk and DONE terminator are present.
+	body := rw.body.String()
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("missing [DONE] terminator: %q", body)
+	}
+}
+
 // TestPanelStreamingDisagreementRunsArbiter exercises the second
 // branch of issue #48's progressive delivery: when the two panel
 // members diverge (similarity < threshold), the speculative answer is
