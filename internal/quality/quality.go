@@ -76,6 +76,11 @@ type Event struct {
 	Path      string // absolute (or cwd-relative) path of the edited file
 	ToolName  string // write_file, edit_file, apply_patch, ...
 	Args      []byte // raw arguments JSON (best-effort, may be empty)
+
+	// TraceParent and TraceState carry the W3C trace context from the
+	// inbound request so the async worker can create a child span (issue #233).
+	TraceParent string
+	TraceState  string
 }
 
 // Verdict is the structured result produced by one verification
@@ -332,7 +337,7 @@ func (v *ShellVerifier) Verify(e Event) Verdict {
 	ctx, cancel := context.WithTimeout(context.Background(), v.cfg.Timeout)
 	defer cancel()
 
-	exitCode, stderr, err := runCheck(ctx, root, kind)
+	exitCode, stderr, err := runCheck(ctx, root, kind, e.TraceParent, e.TraceState)
 	vv.ExitCode = exitCode
 	vv.Stderr = capStderr(stderr, v.cfg.StderrCap)
 	vv.DurationMs = v.cfg.Now().Sub(started).Milliseconds()
@@ -403,7 +408,7 @@ func (v *ShellVerifier) lookupProject(filePath string) (string, Kind, error) {
 // but cleanly, err is nil and exitCode is the OS-reported code (cast
 // from *exec.ExitError). err is non-nil only for fork / I/O
 // failures.
-func runCheck(ctx context.Context, repoRoot string, kind Kind) (int, []byte, error) {
+func runCheck(ctx context.Context, repoRoot string, kind Kind, traceParent, traceState string) (int, []byte, error) {
 	var cmd *exec.Cmd
 	if override := os.Getenv("NEXUS_QUALITY_SHELL_OVERRIDE"); override != "" {
 		cmd = exec.CommandContext(ctx, "/bin/sh", "-c", override)
@@ -422,6 +427,14 @@ func runCheck(ctx context.Context, repoRoot string, kind Kind) (int, []byte, err
 		}
 	}
 	cmd.Dir = repoRoot
+
+	// Propagate W3C trace context to subprocess via environment variables (issue #233).
+	if traceParent != "" {
+		cmd.Env = append(cmd.Env, "TRACEPARENT="+traceParent)
+	}
+	if traceState != "" {
+		cmd.Env = append(cmd.Env, "TRACESTATE="+traceState)
+	}
 
 	// WaitDelay bounds the time Wait() will spend draining I/O
 	// after the process has already exited. Without it, an orphan

@@ -39,6 +39,11 @@ type LocalCompletion struct {
 	Instruction string
 	Output      string
 	LocalModel  string
+
+	// TraceParent and TraceState carry the W3C trace context from the
+	// inbound request so async judge evaluation can be a proper child span.
+	TraceParent string
+	TraceState  string
 }
 
 // JudgeObserver is the hook the chat handler invokes when a
@@ -68,6 +73,11 @@ type QualityEvent struct {
 	RequestID string // correlates to the chat handler's request id
 	Path      string // path of the edited file
 	ToolName  string // write_file, edit_file, apply_patch, ...
+
+	// TraceParent and TraceState carry the W3C trace context from the
+	// inbound request so async quality verification can be a proper child span.
+	TraceParent string
+	TraceState  string
 }
 
 // QualityObserver is the hook the chat handler invokes with detected
@@ -627,6 +637,12 @@ func Chat(d Deps) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqID := requestID(r)
 		started := time.Now()
+
+		// W3C trace context headers for async worker propagation (issue #233).
+		// Extracted early so they can be passed to the judge evaluator and
+		// quality verifier when their async observers are invoked.
+		traceParent := r.Header.Get("traceparent")
+		traceState := r.Header.Get("tracestate")
 
 		// Per-request debug trace flag (issue #242). True when the
 		// global NEXUS_DEBUG=true OR when the operator sent the
@@ -1267,10 +1283,12 @@ func Chat(d Deps) http.Handler {
 								Instruction: latestPrompt,
 								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
+								TraceParent: traceParent,
+								TraceState:  traceState,
 							})
 						}
 						if d.QualityObserver != nil {
-							emitDetectedEdits(capw.Buffer(), reqID, d.QualityObserver)
+							emitDetectedEdits(capw.Buffer(), reqID, traceParent, traceState, d.QualityObserver)
 						}
 					}
 				}
@@ -1338,10 +1356,12 @@ func Chat(d Deps) http.Handler {
 								Instruction: latestPrompt,
 								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
+								TraceParent: traceParent,
+								TraceState:  traceState,
 							})
 						}
 						if d.QualityObserver != nil {
-							emitDetectedEdits(capw.Buffer(), reqID, d.QualityObserver)
+							emitDetectedEdits(capw.Buffer(), reqID, traceParent, traceState, d.QualityObserver)
 						}
 					}
 				}
@@ -1694,7 +1714,7 @@ const qualityPathWindowBytes = 4 * 1024
 // The function is O(len(body)) and best-effort: malformed JSON,
 // missing fields, or windows that don't contain a path field are
 // silently skipped. Deduplication is per-call, by path.
-func emitDetectedEdits(body, reqID string, obs QualityObserver) {
+func emitDetectedEdits(body, reqID, traceParent, traceState string, obs QualityObserver) {
 	if obs == nil || body == "" {
 		return
 	}
@@ -1713,9 +1733,11 @@ func emitDetectedEdits(body, reqID string, obs QualityObserver) {
 		}
 		seen[path] = true
 		obs.Submit(QualityEvent{
-			RequestID: reqID,
-			Path:      path,
-			ToolName:  "edit", // best-effort label; verifier doesn't depend on the exact name
+			RequestID:   reqID,
+			Path:        path,
+			ToolName:    "edit", // best-effort label; verifier doesn't depend on the exact name
+			TraceParent: traceParent,
+			TraceState:  traceState,
 		})
 	}
 }

@@ -403,6 +403,8 @@ func main() {
 				Instruction: c.Instruction,
 				Output:      c.Output,
 				LocalModel:  c.LocalModel,
+				TraceParent: c.TraceParent,
+				TraceState:  c.TraceState,
 			}) {
 				if bridge != nil {
 					bridge.forget(c.RequestID)
@@ -523,9 +525,11 @@ func main() {
 		})
 		qualityO = handlers.QualityObserverFunc(func(e handlers.QualityEvent) {
 			if !verifier.Submit(quality.Event{
-				RequestID: e.RequestID,
-				Path:      e.Path,
-				ToolName:  e.ToolName,
+				RequestID:   e.RequestID,
+				Path:        e.Path,
+				ToolName:    e.ToolName,
+				TraceParent: e.TraceParent,
+				TraceState:  e.TraceState,
 			}) {
 				slog.Warn("quality queue full, dropped request",
 					slog.String("request_id", e.RequestID),
