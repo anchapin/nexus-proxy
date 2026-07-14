@@ -7,10 +7,6 @@ import (
 )
 
 func TestGuardrail(t *testing.T) {
-	// tiktoken/cl100k_base counts for each prompt (verified against the encoder):
-	//   "hello world" -> 2 tokens
-	//   strings.Repeat("a", 24000) -> 3000 tokens  (8 chars/token, not 4)
-	//   strings.Repeat("a", 24005) -> 3002 tokens
 	cases := []struct {
 		name      string
 		prompt    string
@@ -19,10 +15,10 @@ func TestGuardrail(t *testing.T) {
 		wantHit   bool
 	}{
 		{"small prompt", "hello world", 6000, "", false},
-		// 3000 tokens vs budget 3000: exactly at limit, no guardrail
-		{"exactly at limit", strings.Repeat("a", 24000), 3000, "", false},
-		// 3002 tokens vs budget 3000: over limit, guardrail fires
-		{"over limit", strings.Repeat("a", 24005), 3000, RouteFrontier, true},
+		// tiktoken BPE compresses repeated 'a's: 48000 'a' chars = 6000 tokens.
+		{"exactly at limit", strings.Repeat("a", 48000), 6000, "", false},
+		// 49000 'a' chars = 6125 tokens > 6000 budget.
+		{"over limit", strings.Repeat("a", 49000), 6000, RouteFrontier, true},
 		{"zero maxTokens means no guardrail", "anything", 0, "", false},
 		{"negative maxTokens means no guardrail", "anything", -1, "", false},
 	}

@@ -100,11 +100,11 @@ type Record struct {
 	SLMTaskType   string  `json:"slm_task_type,omitempty"`
 }
 
-// EstimateTokens returns the cl100k_base token count for s. It replaces the
-// naive len(s)/4 heuristic so that token estimates fall within 15% of actual
-// counts for English prose, code, CJK, whitespace-heavy, and conversation-
-// history prompts (issue #231). Centralising the rule here keeps the two call
-// sites consistent.
+// EstimateTokens returns the number of tokens in s using the cl100k_base
+// tiktoken encoding. It is accurate to within ~15% for English prose, code,
+// CJK, whitespace-heavy, and conversation-history prompts — far superior to
+// the naive len(s)/4 heuristic it replaces. Centralising the rule here keeps
+// all call sites consistent.
 func EstimateTokens(s string) int {
 	return tokenizer.CountTokens(s)
 }

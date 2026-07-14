@@ -95,9 +95,9 @@ type Decision struct {
 	// categorize.
 	TaskType string
 
-	// EstimatedTokens is the tiktoken/cl100k_base token estimate the
-	// guardrail uses (issue #231). Carried in the Decision so the
-	// handler can stamp it on the trace without recomputing.
+	// EstimatedTokens is the tiktoken cl100k_base token estimate used
+	// by the guardrail. Carried in the Decision so the handler can
+	// stamp it on the trace without recomputing.
 	EstimatedTokens int
 
 	// BudgetSource is the label identifying where the guardrail budget

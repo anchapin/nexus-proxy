@@ -18,10 +18,9 @@ const (
 )
 
 // Guardrail returns RouteFrontier when the prompt is too large for the
-// configured VRAM budget. It uses tiktoken/cl100k_base token counting
-// (issue #231) so estimates are within 15%% of actual counts. The threshold
-// is the maximum *estimated* token count the local model can safely handle.
-// When maxTokens <= 0 the guardrail is disabled and ("", false) is returned.
+// configured VRAM budget. The threshold is the maximum *estimated* token
+// count the local model can safely handle. When maxTokens <= 0 the
+// guardrail is disabled and ("", false) is returned.
 func Guardrail(prompt string, maxTokens int) (Route, bool) {
 	if maxTokens <= 0 {
 		return "", false
