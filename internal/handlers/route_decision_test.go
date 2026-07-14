@@ -98,7 +98,7 @@ func TestChatSetsRouteDecisionHeadersForGuardrail(t *testing.T) {
 	deps, rt := baseDeps(t)
 	deps.RouteDecisionObserver = &routeDecisionRecorder{}
 
-	largeUser := strings.Repeat("a", 30000)
+	largeUser := strings.Repeat("a", 50000)
 	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "frontier stream")
@@ -207,7 +207,7 @@ func TestChatMetricsEventCarriesRouteDecisionFields(t *testing.T) {
 	obs := &recordingMetricsObserver{}
 	deps.MetricsObserver = obs
 
-	largeUser := strings.Repeat("a", 30000)
+	largeUser := strings.Repeat("a", 50000)
 	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "frontier stream")

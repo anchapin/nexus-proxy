@@ -550,7 +550,12 @@ func PanelStreaming(
 			cancelLocal()
 		}
 		// Drain the slow member's result to unblock its goroutine.
-		_ = <-results
+		// When winner == first: second goroutine is still running (hasn't
+		// sent yet) → drain is needed. When winner == second: first was
+		// already consumed at line 499, second at line 500 → both done.
+		if winner.Source == first.Source {
+			_ = <-results
+		}
 		if err := writeSSEDone(w); err != nil {
 			return outcome, err
 		}
@@ -568,8 +573,10 @@ func PanelStreaming(
 		} else if winner.Source == "frontier" && cancelLocal != nil {
 			cancelLocal()
 		}
-		// Drain the slow member's result to unblock its goroutine.
-		_ = <-results
+		// Note: we do NOT drain the channel here. Both goroutines have
+		// already sent their results (which we consumed at lines 499-500),
+		// so the channel is empty. The defer cancel() in each goroutine
+		// fires when the goroutine returns, which happens after the send.
 		if err := writeSSEDone(w); err != nil {
 			return outcome, err
 		}
