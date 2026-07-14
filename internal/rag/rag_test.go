@@ -184,7 +184,7 @@ func TestIndexDirSkipsSymlinks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store := NewStore(stubEmbedder{vecs: map[string][]float64{
+	store := NewStore(&stubEmbedder{vecs: map[string][]float64{
 		"safe content": {1, 0, 0},
 	}}, 0.0)
 
@@ -224,7 +224,7 @@ func TestIndexDirRejectsEscapingSymlinks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store := NewStore(stubEmbedder{vecs: map[string][]float64{
+	store := NewStore(&stubEmbedder{vecs: map[string][]float64{
 		"escaped!": {1, 0, 0},
 	}}, 0.0)
 
