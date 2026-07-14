@@ -287,12 +287,14 @@ type labelSample struct {
 
 // writeMeta emits the # HELP and # TYPE header lines for one metric
 // family. Called once per family before its sample lines.
+//nolint:errcheck
 func writeMeta(w io.Writer, name, help, typ string) {
 	fmt.Fprintf(w, "# HELP %s %s\n", name, help)
 	fmt.Fprintf(w, "# TYPE %s %s\n", name, typ)
 }
 
 // writeCounter emits a single-sample unlabelled counter family.
+//nolint:errcheck
 func writeCounter(w io.Writer, name, help string, v uint64) {
 	writeMeta(w, name, help, "counter")
 	fmt.Fprintf(w, "%s %d\n", name, v)
