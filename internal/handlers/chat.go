@@ -1246,7 +1246,7 @@ func Chat(d Deps) http.Handler {
 							})
 						}
 						if d.QualityObserver != nil {
-							emitDetectedEdits(capw.Buffer(), reqID, d.QualityObserver)
+							emitDetectedEdits(capw.Buffer(), reqID, "", "", d.QualityObserver)
 						}
 					}
 				}
@@ -1317,7 +1317,7 @@ func Chat(d Deps) http.Handler {
 							})
 						}
 						if d.QualityObserver != nil {
-							emitDetectedEdits(capw.Buffer(), reqID, d.QualityObserver)
+							emitDetectedEdits(capw.Buffer(), reqID, "", "", d.QualityObserver)
 						}
 					}
 				}
@@ -1668,7 +1668,7 @@ const qualityPathWindowBytes = 4 * 1024
 // The function is O(len(body)) and best-effort: malformed JSON,
 // missing fields, or windows that don't contain a path field are
 // silently skipped. Deduplication is per-call, by path.
-func emitDetectedEdits(body, reqID string, obs QualityObserver) {
+func emitDetectedEdits(body, reqID, traceParent, traceState string, obs QualityObserver) {
 	if obs == nil || body == "" {
 		return
 	}
