@@ -733,6 +733,7 @@ func TestPanelStreamingAgreementSkipsArbiter(t *testing.T) {
 		5*time.Second, // arbiterTimeout
 		false,         // skipLocal
 		0.85,          // agreementThreshold
+		"test-request-id",
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -804,6 +805,7 @@ func TestPanelStreamingDisagreementRunsArbiter(t *testing.T) {
 		5*time.Second,
 		false,
 		0.85,
+		"test-request-id",
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -873,6 +875,7 @@ func TestPanelStreamingDegradedSkipLocal(t *testing.T) {
 		5*time.Second, 5*time.Second,
 		true, // skipLocal
 		0.85,
+		"test-request-id",
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -934,6 +937,7 @@ func TestPanelStreamingOneMemberFailedSkipsArbiter(t *testing.T) {
 		"test prompt",
 		5*time.Second, 5*time.Second,
 		false, 0.85,
+		"test-request-id",
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -983,6 +987,7 @@ func TestPanelStreamingBothMembersFailedSurfacesError(t *testing.T) {
 		"test prompt",
 		5*time.Second, 5*time.Second,
 		false, 0.85,
+		"test-request-id",
 	)
 	if err == nil {
 		t.Fatal("expected error when both members fail")
@@ -1033,6 +1038,7 @@ func TestPanelStreamingHonorsStreamFalseFallsBackToPanel(t *testing.T) {
 		"test prompt",
 		5*time.Second, 5*time.Second,
 		false, 0.85,
+		"test-request-id",
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1099,6 +1105,7 @@ func TestPanelStreamingThresholdClamping(t *testing.T) {
 			5*time.Second, 5*time.Second,
 			false,
 			-1.0, // negative: clamped to 0 → "always skip when both succeed"
+			"test-request-id",
 		)
 		if err != nil {
 			t.Fatalf("PanelStreaming: %v", err)
@@ -1142,6 +1149,7 @@ func TestPanelStreamingThresholdClamping(t *testing.T) {
 			5*time.Second, 5*time.Second,
 			false,
 			2.0, // >1: clamps to 1 → only identical content skips
+			"test-request-id",
 		)
 		if err != nil {
 			t.Fatalf("PanelStreaming: %v", err)
@@ -1189,6 +1197,7 @@ func TestPanelStreamingSpeculativeSourceIdentified(t *testing.T) {
 		"test prompt",
 		5*time.Second, 5*time.Second,
 		false, 0.85,
+		"test-request-id",
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1236,6 +1245,7 @@ func TestPanelStreamingSetsProgressiveHeader(t *testing.T) {
 		"test prompt",
 		5*time.Second, 5*time.Second,
 		false, 0.85,
+		"test-request-id",
 	); err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
 	}
@@ -1285,6 +1295,7 @@ func TestPanelStreamingToolCallWinnerSkipsArbiter(t *testing.T) {
 		"test prompt",
 		5*time.Second, 5*time.Second,
 		false, 0.85,
+		"test-request-id",
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)

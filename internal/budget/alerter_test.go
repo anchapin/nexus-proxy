@@ -40,15 +40,18 @@ func TestPrometheusAlerterOnApproaching(t *testing.T) {
 	}
 }
 
-// TestPrometheusAlerterOnSpend verifies OnSpend stores the amount.
+// TestPrometheusAlerterOnSpend verifies OnSpend stores the amount and source.
 func TestPrometheusAlerterOnSpend(t *testing.T) {
 	a := NewPrometheusAlerter(nil) // no logger
 
 	state := State{Spent: 10, Limit: 100, Remaining: 90, Exhausted: false}
-	a.OnSpend(state, 10.0)
+	a.OnSpend(state, 10.0, "frontier")
 
 	if a.LastSpentAmount() != 10.0 {
 		t.Errorf("LastSpentAmount = %.2f, want 10.0", a.LastSpentAmount())
+	}
+	if a.LastSource() != "frontier" {
+		t.Errorf("LastSource = %q, want %q", a.LastSource(), "frontier")
 	}
 	got := a.State()
 	if got.Spent != state.Spent {
@@ -83,7 +86,7 @@ func TestPrometheusAlerterNilLoggerNoPanic(t *testing.T) {
 		}()
 		a.OnExceed(state)
 		a.OnApproaching(state)
-		a.OnSpend(state, 5.0)
+		a.OnSpend(state, 5.0, "frontier")
 	}()
 }
 
@@ -92,10 +95,10 @@ func TestPrometheusAlerterStateAccess(t *testing.T) {
 	a := NewPrometheusAlerter(nil)
 
 	initial := State{Spent: 0, Limit: 100, Remaining: 100, Exhausted: false}
-	a.OnSpend(initial, 0)
+	a.OnSpend(initial, 0, "frontier")
 
 	afterSpend := State{Spent: 25, Limit: 100, Remaining: 75, Exhausted: false}
-	a.OnSpend(afterSpend, 25.0)
+	a.OnSpend(afterSpend, 25.0, "frontier")
 
 	got := a.State()
 	if got.Spent != 25.0 {

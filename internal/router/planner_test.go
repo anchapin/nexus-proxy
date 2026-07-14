@@ -19,6 +19,8 @@ import (
 	"errors"
 	"regexp"
 	"testing"
+
+	"github.com/anchapin/nexus-proxy/internal/telemetry"
 )
 
 // stubSLM is a deterministic SLMDecider for planner tests. It records
@@ -83,9 +85,9 @@ func TestPlanner_Plan(t *testing.T) {
 				LocalPatternsRegex: localPatternsRegex,
 			},
 			req: PlanRequest{
-				// 30000 chars / 4 = 7500 > 6000 budget.
+				// 30000 a's -> ~3750 tiktoken tokens, exceeds 3000 budget.
 				Prompt:          stringOf('a', 30000),
-				GuardrailBudget: 6000,
+				GuardrailBudget: 3000,
 				GuardrailSource: "static-fallback",
 				Context:         context.Background(),
 			},
@@ -320,8 +322,8 @@ func TestPlanner_Plan(t *testing.T) {
 				t.Errorf("SLM called = %v, want %v", slmUsed, tt.wantSLMCalled)
 			}
 
-			// EstimatedTokens should always be len(prompt)/4.
-			wantTokens := len(tt.req.Prompt) / 4
+			// EstimatedTokens should always be telemetry.EstimateTokens (issue #231).
+			wantTokens := telemetry.EstimateTokens(tt.req.Prompt)
 			if dec.EstimatedTokens != wantTokens {
 				t.Errorf("EstimatedTokens = %d, want %d", dec.EstimatedTokens, wantTokens)
 			}

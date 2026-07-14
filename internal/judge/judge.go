@@ -37,6 +37,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/budget"
 )
 
 // Sample is the input that triggers one judge attempt: the original
@@ -48,6 +50,11 @@ type Sample struct {
 	Instruction string // latest user prompt (verbatim)
 	Output      string // full streamed local-model response
 	LocalModel  string // which local model produced Output
+
+	// TraceParent and TraceState carry the W3C trace context from the
+	// inbound request so the async worker can create a child span (issue #233).
+	TraceParent string
+	TraceState  string
 }
 
 // JudgeScore is the structured record produced by one judge attempt.
@@ -91,6 +98,7 @@ type Config struct {
 	QueueDepth  int           // buffered channel size (default 64)
 	Timeout     time.Duration // per-call judge timeout (default 30s)
 	CostPer1K   float64       // USD per 1k tokens (input+output); default 0.002
+	BudgetGuard *budget.Guard // optional budget guard to record judge costs
 }
 
 // applyDefaults fills zero fields with sane values. It mutates cfg.
@@ -236,6 +244,10 @@ func (e *Evaluator) worker() {
 				slog.Any("err", err),
 			)
 		}
+		// Wire judge cost into the budget guard (issue #240).
+		if e.cfg.BudgetGuard != nil && score.Cost > 0 {
+			e.cfg.BudgetGuard.Record(score.Cost, "judge")
+		}
 	}
 }
 
@@ -282,6 +294,13 @@ func (e *Evaluator) evaluateCtx(ctx context.Context, s Sample) JudgeScore {
 	req.Header.Set("Content-Type", "application/json")
 	if e.cfg.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+e.cfg.APIKey)
+	}
+	// Propagate W3C trace context for child-span creation (issue #233).
+	if s.TraceParent != "" {
+		req.Header.Set("traceparent", s.TraceParent)
+	}
+	if s.TraceState != "" {
+		req.Header.Set("tracestate", s.TraceState)
 	}
 
 	resp, err := e.client.Do(req)

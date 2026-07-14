@@ -66,6 +66,15 @@ services:
       NEXUS_TELEMETRY_PATH: "/tmp/nexus-telemetry.jsonl"
     ports:
       - "8000:8000"
+    healthcheck:
+      # Distroless ships wget; use it to probe /healthz since the image
+      # has no curl. start_period gives the proxy time to boot before
+      # Docker starts counting retries.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
     restart: unless-stopped
 
 volumes:

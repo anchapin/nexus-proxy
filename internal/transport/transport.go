@@ -10,6 +10,8 @@
 package transport
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"net"
 	"net/http"
 	"os"
@@ -37,6 +39,20 @@ type Config struct {
 	// DialContextTimeout is the maximum time a DialContext call
 	// may take. DefaultDefaultDialContextTimeout.
 	DialContextTimeout time.Duration
+
+	// ClientCertFile is the path to the client certificate file (PEM).
+	// When set alongside ClientKeyFile, the transport presents this
+	// certificate for mTLS. Empty disables client-cert auth.
+	ClientCertFile string
+
+	// ClientKeyFile is the path to the client private key file (PEM).
+	// Required when ClientCertFile is set.
+	ClientKeyFile string
+
+	// CAFile is the path to the CA certificate file (PEM) used to
+	// verify the server certificate. When set, the server certificate
+	// must be signed by this CA. Empty uses the system pool.
+	CAFile string
 }
 
 // New returns a shared, pre-configured *http.Client. The client holds
@@ -47,6 +63,10 @@ type Config struct {
 // time; it must never be mutated after construction. The client's
 // Transport is configured with a custom DialContext so timeouts are
 // wired correctly even when callers pass a background context.
+//
+// When ClientCertFile and ClientKeyFile are set, New builds a *tls.Config
+// with GetClientCertificate so the transport can present a client
+// certificate for mTLS environments (corporate proxies, service meshes).
 //
 // Tuning knobs are read from environment variables prefixed NEXUS_HTTP_;
 // see https://github.com/anchapin/nexus-proxy/issues/184.
@@ -69,6 +89,17 @@ func New(cfg Config) *http.Client {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
+	if cfg.hasClientCert() {
+		tlsConfig, err := buildTLSConfig(cfg)
+		if err != nil {
+			// Fall back to no TLS config rather than panicking;
+			// callers will get a connection error at request time.
+			transport.TLSClientConfig = nil
+		} else {
+			transport.TLSClientConfig = tlsConfig
+		}
+	}
+
 	return &http.Client{
 		Transport: transport,
 		Timeout:   0, // no per-request timeout; callers use context deadlines
@@ -80,6 +111,42 @@ func New(cfg Config) *http.Client {
 // for packages that need a client without taking a full Config.
 func NewFromEnv() *http.Client {
 	return New(loadConfigFromEnv())
+}
+
+// hasClientCert reports whether ClientCertFile and ClientKeyFile are both set.
+func (c *Config) hasClientCert() bool {
+	return c.ClientCertFile != "" && c.ClientKeyFile != ""
+}
+
+// buildTLSConfig constructs a *tls.Config from the certificate paths in cfg.
+// It sets GetClientCertificate so the transport can present a client cert
+// for mTLS. If CAFile is set, the server certificate is verified against it.
+func buildTLSConfig(cfg Config) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(cfg.ClientCertFile, cfg.ClientKeyFile)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return &cert, nil
+		},
+	}
+
+	if cfg.CAFile != "" {
+		caCert, err := os.ReadFile(cfg.CAFile)
+		if err != nil {
+			return nil, err
+		}
+		caPool := x509.NewCertPool()
+		if !caPool.AppendCertsFromPEM(caCert) {
+			return nil, err
+		}
+		tlsConfig.RootCAs = caPool
+	}
+
+	return tlsConfig, nil
 }
 
 func (c *Config) applyDefaults() {
@@ -100,6 +167,9 @@ func loadConfigFromEnv() Config {
 		MaxConnsPerHost:     parseEnvInt("NEXUS_HTTP_MAX_CONNS_PER_HOST", 0),
 		IdleConnTimeout:     parseEnvDuration("NEXUS_HTTP_IDLE_CONN_TIMEOUT", DefaultIdleConnTimeout),
 		DialContextTimeout:  parseEnvDuration("NEXUS_HTTP_DIAL_CONTEXT_TIMEOUT", DefaultDialContextTimeout),
+		ClientCertFile:      os.Getenv("NEXUS_HTTP_CLIENT_CERT_FILE"),
+		ClientKeyFile:       os.Getenv("NEXUS_HTTP_CLIENT_KEY_FILE"),
+		CAFile:              os.Getenv("NEXUS_HTTP_CA_FILE"),
 	}
 }
 
