@@ -9,6 +9,7 @@
 package auth
 
 import (
+	"crypto/subtle"
 	"net/http"
 	"strings"
 )
@@ -49,7 +50,9 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			http.Error(w, `{"error":"missing or malformed Authorization header"}`, http.StatusUnauthorized)
 			return
 		}
-		if token != m.key {
+		// Use crypto/subtle.ConstantTimeCompare to prevent timing attacks
+		// (issue #228). The == 0 return value means the strings differ.
+		if subtle.ConstantTimeCompare([]byte(token), []byte(m.key)) == 0 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="nexus-proxy", error="invalid_token"`)
 			http.Error(w, `{"error":"invalid API key"}`, http.StatusUnauthorized)
 			return
