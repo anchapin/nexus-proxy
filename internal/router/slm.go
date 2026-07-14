@@ -70,6 +70,19 @@ func NewSLMClient(baseURL, model string, timeout time.Duration, client *http.Cli
 	}
 }
 
+// WithCache sets the cache TTL and max-entries cap and returns the
+// same client for chaining. Call on the return value of NewSLMClient:
+//   - WithCache(0, 0)  disables caching
+//   - WithCache(10, 5*time.Minute) enables a 10-entry TTL cache
+func (c *SLMClient) WithCache(maxEntries int, ttl time.Duration) *SLMClient {
+	c.CacheMaxEntries = maxEntries
+	c.CacheTTL = ttl
+	if maxEntries > 0 {
+		c.cache = make(map[string]*cacheEntry)
+	}
+	return c
+}
+
 // slmSystemPrompt is the static instruction we send to the routing SLM.
 // Keeping it as a package var (not a config field) makes it trivial to grep
 // and to snapshot in tests.

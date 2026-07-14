@@ -50,15 +50,50 @@ type LocalCompletion struct {
 // long. The handler also enforces a body-size cap before invoking
 // the hook so a runaway model cannot blow the observer's memory.
 type JudgeObserver interface {
-	Submit(LocalCompletion)
+	Submit(LocalCompletion) bool
 }
 
 // JudgeObserverFunc adapts a plain function to the JudgeObserver
 // interface so wiring from main.go stays a one-liner.
-type JudgeObserverFunc func(LocalCompletion)
+type JudgeObserverFunc func(LocalCompletion) bool
 
 // Submit implements JudgeObserver.
-func (f JudgeObserverFunc) Submit(c LocalCompletion) { f(c) }
+func (f JudgeObserverFunc) Submit(c LocalCompletion) bool { f(c); return true }
+
+// LatencyEvent is emitted to the LatencyObserver hook after every
+// upstream response with timing metadata.
+type LatencyEvent struct {
+	Route          string
+	LatencySeconds float64
+	TTFTSeconds    float64
+	IsError        bool
+}
+
+// LatencyObserver is called after each request completes with timing
+// information for dashboards and alerting.
+type LatencyObserver interface {
+	ObserveLatency(LatencyEvent)
+}
+
+// LatencyObserverFunc adapts a plain function to the LatencyObserver
+// interface so wiring from main.go stays a one-liner.
+type LatencyObserverFunc func(LatencyEvent)
+
+// ObserveLatency implements LatencyObserver.
+func (f LatencyObserverFunc) ObserveLatency(e LatencyEvent) { f(e) }
+
+// StreamTruncationEvent is emitted when a streaming response is
+// truncated mid-stream by the cascade timeout.
+type StreamTruncationEvent struct {
+	Route     string
+	Truncated bool
+}
+
+// StreamTruncationObserver is called when a streaming response is
+// truncated mid-stream.
+type StreamTruncationObserver interface {
+	ObserveStreamTruncation(StreamTruncationEvent)
+}
 
 // QualityEvent is emitted to the QualityObserver hook each time the
 // handler detects a tool call in an upstream response that looks like
@@ -149,6 +184,10 @@ const (
 	// emitted by the rate-limit middleware. The reason is recorded
 	// by the middleware hook wired in main.go.
 	RejectionRateLimit = "rate_limit"
+	// RejectionJudgeQueue marks a rejection due to judge queue overflow.
+	RejectionJudgeQueue = "judge_queue"
+	// RejectionQualityQueue marks a rejection due to quality queue overflow.
+	RejectionQualityQueue = "quality_queue"
 )
 
 // RejectionEvent carries the minimal context a rejection observer
@@ -433,6 +472,8 @@ type Deps struct {
 	// The handler never imports the judge package; main.go wires
 	// a closure that adapts LocalCompletion to the judge's
 	// Sample/Enqueue entry points.
+	LatencyObserver LatencyObserver
+	StreamTruncationObserver StreamTruncationObserver
 	JudgeObserver JudgeObserver
 
 	// QualityObserver is optional. When non-nil, the handler scans

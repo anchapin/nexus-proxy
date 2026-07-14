@@ -499,7 +499,7 @@ func TestNormalizeReadinessMode(t *testing.T) {
 // never flags the discarded-return pattern). It is otherwise unused.
 func stubHealth(t *testing.T, healthy bool) *health.Health {
 	t.Helper()
-	h := health.New("http://ollama.local", 30*time.Second, 3, 5*time.Second, nil)
+	h := health.New("http://ollama.local", "qwen3-coder:8b", 30*time.Second, 3, 5*time.Second, nil)
 	if !healthy {
 		// Drive the failure counter past the breaker threshold so
 		// IsLocalHealthy flips to false. The probe URL is

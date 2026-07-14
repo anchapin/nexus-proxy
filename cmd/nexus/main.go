@@ -391,9 +391,9 @@ func main() {
 		}
 
 		judgeEval = judge.NewEvaluator(evalCfg, httpClient, storage)
-		judgeObs = handlers.JudgeObserverFunc(func(c handlers.LocalCompletion) {
+		judgeObs = handlers.JudgeObserverFunc(func(c handlers.LocalCompletion) bool {
 			if !judgeEval.Sample() {
-				return
+				return false
 			}
 			if bridge != nil {
 				bridge.note(c.RequestID, router.Categorize(c.Instruction))
@@ -410,7 +410,9 @@ func main() {
 					bridge.forget(c.RequestID)
 				}
 				slog.Warn("judge queue full, dropped request", slog.String("request_id", c.RequestID))
+				return false
 			}
+			return true
 		})
 		slog.Info("judge enabled",
 			slog.String("url", cfg.JudgeURL),
