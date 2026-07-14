@@ -469,10 +469,13 @@ func PanelStreaming(
 	}
 
 	results := make(chan PanelResult, 2)
+	// cancelLocal and cancelFrontier are invoked when the other member wins
+	// so the slow goroutine is cancelled immediately instead of running for
+	// up to perFetchTimeout after the response has already been sent (issue #229).
 	var cancelLocal, cancelFrontier context.CancelFunc
 	if skipLocal {
 		// Issue #8: synthetic local failure so the arbiter-style
-		// code paths below degrade cleanly. The handler sets
+		// code paths below degrade gracefully. The handler sets
 		// X-Nexus-Degraded=true; we don't duplicate the header here.
 		results <- PanelResult{
 			Source: "local",
@@ -542,19 +545,14 @@ func PanelStreaming(
 			slog.String("source", outcome.Source),
 			slog.Int("tool_calls", len(winner.ToolCalls)),
 		)
-		// Cancel the slow member's goroutine so it doesn't waste
-		// resources after the response has already been delivered.
-		if winner.Source == "local" && cancelFrontier != nil {
-			cancelFrontier()
-		} else if winner.Source == "frontier" && cancelLocal != nil {
+		// Cancel the slow member so its goroutine doesn't keep running
+		// for perFetchTimeout after we've already returned (issue #229).
+		winnerFromSecond := first.Err != nil || (len(second.ToolCalls) > 0 && len(first.ToolCalls) == 0)
+		if winnerFromSecond && cancelLocal != nil {
 			cancelLocal()
+		} else if !winnerFromSecond && cancelFrontier != nil {
+			cancelFrontier()
 		}
-		// Drain the slow member's result to unblock its goroutine.
-		// When winner == first: second goroutine is still running (hasn't
-		// sent yet) → drain is needed. When winner == second: first was
-		// already consumed at line 499, second at line 500 → both done.
-		if winner.Source == first.Source {
-			_ = <-results
 		}
 		if err := writeSSEDone(w); err != nil {
 			return outcome, err
@@ -566,17 +564,14 @@ func PanelStreaming(
 	// alone). The speculative answer IS the answer; no arbiter.
 	if first.Err != nil || second.Err != nil {
 		outcome.ArbiterSkipped = true
-		// Cancel the slow member's goroutine so it doesn't waste
-		// resources after the response has already been delivered.
-		if winner.Source == "local" && cancelFrontier != nil {
-			cancelFrontier()
-		} else if winner.Source == "frontier" && cancelLocal != nil {
+		// Cancel the slow member so its goroutine doesn't keep running
+		// for perFetchTimeout after we've already returned (issue #229).
+		winnerFromSecond := first.Err != nil || (len(second.ToolCalls) > 0 && len(first.ToolCalls) == 0)
+		if winnerFromSecond && cancelLocal != nil {
 			cancelLocal()
+		} else if !winnerFromSecond && cancelFrontier != nil {
+			cancelFrontier()
 		}
-		// Note: we do NOT drain the channel here. Both goroutines have
-		// already sent their results (which we consumed at lines 499-500),
-		// so the channel is empty. The defer cancel() in each goroutine
-		// fires when the goroutine returns, which happens after the send.
 		if err := writeSSEDone(w); err != nil {
 			return outcome, err
 		}
