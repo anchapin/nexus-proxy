@@ -469,6 +469,7 @@ func PanelStreaming(
 	}
 
 	results := make(chan PanelResult, 2)
+	var cancelLocal, cancelFrontier context.CancelFunc
 	if skipLocal {
 		// Issue #8: synthetic local failure so the arbiter-style
 		// code paths below degrade cleanly. The handler sets
@@ -480,6 +481,7 @@ func PanelStreaming(
 	} else {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
+			cancelLocal = cancel
 			defer cancel()
 			msg, err := FetchPanel(ctx, client,
 				localBaseURL+"/v1/chat/completions", "", localModel, body)
@@ -488,6 +490,7 @@ func PanelStreaming(
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
+		cancelFrontier = cancel
 		defer cancel()
 		msg, err := FetchPanel(ctx, client,
 			frontierURL, "", frontierModel, body)
@@ -539,6 +542,15 @@ func PanelStreaming(
 			slog.String("source", outcome.Source),
 			slog.Int("tool_calls", len(winner.ToolCalls)),
 		)
+		// Cancel the slow member's goroutine so it doesn't waste
+		// resources after the response has already been delivered.
+		if winner.Source == "local" && cancelFrontier != nil {
+			cancelFrontier()
+		} else if winner.Source == "frontier" && cancelLocal != nil {
+			cancelLocal()
+		}
+		// Drain the slow member's result to unblock its goroutine.
+		_ = <-results
 		if err := writeSSEDone(w); err != nil {
 			return outcome, err
 		}
@@ -549,6 +561,15 @@ func PanelStreaming(
 	// alone). The speculative answer IS the answer; no arbiter.
 	if first.Err != nil || second.Err != nil {
 		outcome.ArbiterSkipped = true
+		// Cancel the slow member's goroutine so it doesn't waste
+		// resources after the response has already been delivered.
+		if winner.Source == "local" && cancelFrontier != nil {
+			cancelFrontier()
+		} else if winner.Source == "frontier" && cancelLocal != nil {
+			cancelLocal()
+		}
+		// Drain the slow member's result to unblock its goroutine.
+		_ = <-results
 		if err := writeSSEDone(w); err != nil {
 			return outcome, err
 		}

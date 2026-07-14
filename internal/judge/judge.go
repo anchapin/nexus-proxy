@@ -50,6 +50,11 @@ type Sample struct {
 	Instruction string // latest user prompt (verbatim)
 	Output      string // full streamed local-model response
 	LocalModel  string // which local model produced Output
+
+	// TraceParent and TraceState carry the W3C trace context from the
+	// inbound request so the async worker can create a child span (issue #233).
+	TraceParent string
+	TraceState  string
 }
 
 // JudgeScore is the structured record produced by one judge attempt.
@@ -289,6 +294,13 @@ func (e *Evaluator) evaluateCtx(ctx context.Context, s Sample) JudgeScore {
 	req.Header.Set("Content-Type", "application/json")
 	if e.cfg.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+e.cfg.APIKey)
+	}
+	// Propagate W3C trace context for child-span creation (issue #233).
+	if s.TraceParent != "" {
+		req.Header.Set("traceparent", s.TraceParent)
+	}
+	if s.TraceState != "" {
+		req.Header.Set("tracestate", s.TraceState)
 	}
 
 	resp, err := e.client.Do(req)
