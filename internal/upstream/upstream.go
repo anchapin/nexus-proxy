@@ -553,7 +553,6 @@ func PanelStreaming(
 		} else if !winnerFromSecond && cancelFrontier != nil {
 			cancelFrontier()
 		}
-		}
 		if err := writeSSEDone(w); err != nil {
 			return outcome, err
 		}
