@@ -22,9 +22,9 @@ func TestNoopRecorderSafe(t *testing.T) {
 
 func TestEstimateTokens(t *testing.T) {
 	cases := map[string]struct{ min, max int }{
-		"":        {0, 0},
-		"a":      {1, 1},  // tiktoken: 1 token
-		"abcd":   {1, 1},  // tiktoken: 1 token (short strings compress to 1 in cl100k_base)
+		"":         {0, 0},
+		"a":        {1, 1}, // tiktoken: 1 token
+		"abcd":     {1, 1}, // tiktoken: 1 token (short strings compress to 1 in cl100k_base)
 		"abcdefgh": {1, 1}, // tiktoken: 1 token (same)
 		"long text this is a sentence with many many words here please": {11, 13}, // tiktoken: 12 tokens
 	}
