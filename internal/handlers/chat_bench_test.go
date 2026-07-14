@@ -106,7 +106,7 @@ func BenchmarkChatRouteFrontierStream(b *testing.B) {
 
 	deps := benchDeps(b, localSrv, frontierSrv)
 	handler := Chat(deps)
-	largePrompt := strings.Repeat("a", 30000) // 7500 est tokens > 6000 guardrail
+	largePrompt := strings.Repeat("a", 30000) // ~3750 tiktoken tokens < 6000 guardrail (DSL routes local)
 	body := `{"messages":[{"role":"user","content":"` + largePrompt + `"}]}`
 
 	b.ReportAllocs()
