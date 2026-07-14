@@ -598,6 +598,20 @@ func PanelStreaming(
 			slog.Float64("similarity", outcome.Similarity),
 			slog.Float64("threshold", agreementThreshold),
 		)
+		// Cancel the slow member's goroutine to stop in-flight work.
+		// Both results are already consumed from the channel (lines 499-500),
+		// so no drain is needed; cancelling aborts the slow HTTP request.
+		if winnerFromSecond {
+			// winner is second; first (local) is slow
+			if cancelLocal != nil {
+				cancelLocal()
+			}
+		} else {
+			// winner is first; second (frontier) is slow
+			if cancelFrontier != nil {
+				cancelFrontier()
+			}
+		}
 		if err := writeSSEDone(w); err != nil {
 			return outcome, err
 		}
@@ -630,6 +644,20 @@ func PanelStreaming(
 	defer cancelArbiter()
 	if err := StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody); err != nil {
 		return outcome, fmt.Errorf("fusion: arbiter stream: %w", err)
+	}
+	// Cancel the slow member's goroutine — its result was already consumed
+	// (second := <-results) but the goroutine may still be trying to send
+	// on the full channel, which would deadlock if we didn't cancel.
+	if winnerFromSecond {
+		// winner is second; first (local) is slow
+		if cancelLocal != nil {
+			cancelLocal()
+		}
+	} else {
+		// winner is first; second (frontier) is slow
+		if cancelFrontier != nil {
+			cancelFrontier()
+		}
 	}
 	if err := writeSSEDone(w); err != nil {
 		return outcome, err
