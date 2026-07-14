@@ -305,6 +305,7 @@ func writeCounter(w io.Writer, name, help string, v uint64) {
 // writeCounterLabeled emits a counter family with one label dimension.
 // Each labelSample becomes its own sample line. The label values are
 // emitted in the order given (callers pass them sorted by relevance).
+//
 //nolint:errcheck
 func writeCounterLabeled(w io.Writer, name, help, label string, samples []labelSample) {
 	writeMeta(w, name, help, "counter")
@@ -317,6 +318,7 @@ func writeCounterLabeled(w io.Writer, name, help, label string, samples []labelS
 // Each route gets its own bucket lines, _sum, and _count.
 // Routes are emitted in a fixed order (local, frontier, fusion) for
 // deterministic output.
+//
 //nolint:errcheck
 func writeHistogramLabeled(w io.Writer, name, help, label string, histograms map[string]*Histogram) {
 	writeMeta(w, name, help, "histogram")
@@ -339,6 +341,8 @@ func writeHistogramLabeled(w io.Writer, name, help, label string, histograms map
 // writeHistogram emits a histogram family: one bucket line per finite
 // upper bound plus the +Inf bucket, then _sum and _count.
 // Kept for backward compatibility with tests and single-route use cases.
+//
+//nolint:errcheck
 func writeHistogram(w io.Writer, name, help string, h *Histogram) {
 	if h == nil {
 		return
