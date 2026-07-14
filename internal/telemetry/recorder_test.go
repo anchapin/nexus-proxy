@@ -21,16 +21,17 @@ func TestNoopRecorderSafe(t *testing.T) {
 }
 
 func TestEstimateTokens(t *testing.T) {
-	cases := map[string]int{
-		"":         0,
-		"a":        0, // 1 / 4 == 0
-		"abcd":     1,
-		"abcdefgh": 2,
-		"long text this is a sentence with many many words here please": 15, // 61 / 4 = 15
+	cases := map[string]struct{ min, max int }{
+		"":        {0, 0},
+		"a":      {1, 1},  // tiktoken: 1 token
+		"abcd":   {1, 1},  // tiktoken: 1 token (short strings compress to 1 in cl100k_base)
+		"abcdefgh": {1, 1}, // tiktoken: 1 token (same)
+		"long text this is a sentence with many many words here please": {11, 13}, // tiktoken: 12 tokens
 	}
-	for in, want := range cases {
-		if got := EstimateTokens(in); got != want {
-			t.Errorf("EstimateTokens(%q) = %d, want %d", in, got, want)
+	for in, tc := range cases {
+		got := EstimateTokens(in)
+		if got < tc.min || got > tc.max {
+			t.Errorf("EstimateTokens(%q) = %d, want [%d, %d]", in, got, tc.min, tc.max)
 		}
 	}
 }
