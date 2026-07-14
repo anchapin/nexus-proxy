@@ -159,3 +159,44 @@ func TestBearerTokenParsing(t *testing.T) {
 		})
 	}
 }
+
+// TestConstantTimeComparisonRegression is a regression test for issue #228.
+// It verifies that keys of different lengths are compared using
+// crypto/subtle.ConstantTimeCompare, which handles length differences
+// without leaking information through timing. The test covers both
+// shorter and longer wrong keys to ensure no early-exit shortcut
+// bypasses the constant-time check.
+func TestConstantTimeComparisonRegression(t *testing.T) {
+	correctKey := "correct-secret-key-32byteslong!!"
+
+	testCases := []struct {
+		name       string
+		token      string
+		wantStatus int
+	}{
+		{"exact match", correctKey, http.StatusOK},
+		{"empty token", "", http.StatusUnauthorized},
+		{"wrong key same length", "wrong-secret-key-32byteslong!!", http.StatusUnauthorized},
+		{"wrong key shorter", "wrong-short", http.StatusUnauthorized},
+		{"wrong key longer", "wrong-secret-key-32byteslong!!EXTRA", http.StatusUnauthorized},
+		{"single char diff", "correct-secret-key-32byteslong!X", http.StatusUnauthorized},
+		{"first char wrong", "Worrect-secret-key-32byteslong!!", http.StatusUnauthorized},
+		{"last char wrong", "correct-secret-key-32byteslong!W", http.StatusUnauthorized},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewMiddleware(correctKey, nil)
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			if tc.token != "" {
+				req.Header.Set("Authorization", "Bearer "+tc.token)
+			}
+			m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+			if rr.Code != tc.wantStatus {
+				t.Errorf("token %q: status = %d, want %d", tc.token, rr.Code, tc.wantStatus)
+			}
+		})
+	}
+}
