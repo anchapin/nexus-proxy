@@ -100,7 +100,7 @@ type Request struct {
 	TOONCompressionMethod string
 	RAGInjected           bool
 	RAGFilename           string
-	RAGCacheHit           bool    // true when the RAG embedding was served from the embed cache (issue #227)
+	RAGCacheHit           bool // true when the RAG embedding was served from the embed cache (issue #227)
 	EstimatedCostUSD      float64
 
 	// BaselineCostUSD is what this request would have cost if sent
@@ -144,7 +144,7 @@ type Summary struct {
 	TotalInputTokens   int
 	TOONSavingsTokens  int
 	RAGInjectedCount   int
-	RAGCacheHitCount  int    // number of requests whose RAG embedding was served from the embed cache (issue #227)
+	RAGCacheHitCount   int // number of requests whose RAG embedding was served from the embed cache (issue #227)
 	EstimatedCostTotal float64
 
 	// BaselineCostTotal and SavingsTotal roll up the per-request

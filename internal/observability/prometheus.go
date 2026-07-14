@@ -171,7 +171,7 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	// Cumulative frontier cost (float-valued counter).
 	writeMeta(w, "nexus_estimated_cost_usd_total",
 		"Cumulative estimated frontier cost in USD across all proxied requests.", "counter")
-	//nolint:errcheck ResponseWriter error cannot be handled after headers committed.
+	//nolint:errcheck // ResponseWriter error cannot be handled after headers committed.
 	fmt.Fprintf(w, "nexus_estimated_cost_usd_total %s\n", formatFloat(c.EstimatedCostUSD()))
 
 	// --- Middleware instrumentation (issue #70) --------------------------

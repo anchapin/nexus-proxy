@@ -329,7 +329,7 @@ type MetricsEvent struct {
 
 	RAGInjected      bool
 	RAGFilename      string
-	RAGCacheHit     bool    // true when the RAG embedding was served from the embed cache (issue #227)
+	RAGCacheHit      bool // true when the RAG embedding was served from the embed cache (issue #227)
 	EstimatedCostUSD float64
 
 	// BaselineCostUSD is what the request would have cost at the
@@ -473,9 +473,9 @@ type Deps struct {
 	// The handler never imports the judge package; main.go wires
 	// a closure that adapts LocalCompletion to the judge's
 	// Sample/Enqueue entry points.
-	LatencyObserver LatencyObserver
+	LatencyObserver          LatencyObserver
 	StreamTruncationObserver StreamTruncationObserver
-	JudgeObserver JudgeObserver
+	JudgeObserver            JudgeObserver
 
 	// QualityObserver is optional. When non-nil, the handler scans
 	// the captured upstream body for tool-call patterns that look
@@ -1478,7 +1478,7 @@ func Chat(d Deps) http.Handler {
 				TOONCompressionMethod:   string(toonCompressionMethod),
 				RAGInjected:             ragInjected,
 				RAGFilename:             ragFilename,
-				RAGCacheHit:            false, // issue #227: EmbedCache tracking not active with CachedEmbedder (issue #115)
+				RAGCacheHit:             false, // issue #227: EmbedCache tracking not active with CachedEmbedder (issue #115)
 				EstimatedCostUSD:        cost,
 				BaselineCostUSD:         baselineCost,
 				SavingsUSD:              savingsCost,

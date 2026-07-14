@@ -57,7 +57,7 @@ type EmbedCache struct {
 	max    int           // max entries; 0 disables the cache
 	ttl    time.Duration // per-entry TTL; 0 means no expiry
 	mu     sync.Mutex
-	lru    *list.List              // front = most-recently-used
+	lru    *list.List               // front = most-recently-used
 	index  map[string]*list.Element // prompt → linked-list node
 	hits   int64
 	misses int64

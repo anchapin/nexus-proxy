@@ -77,11 +77,11 @@ type TransformTrace struct {
 	PromptEngineeringApplied bool
 	RAGInjected              bool
 	RAGFilename              string
-	RAGCacheHit              bool    // true when embedding was served from cache (issue #227)
+	RAGCacheHit              bool // true when embedding was served from cache (issue #227)
 	RAGScore                 float64
 	TOONApplied              bool
 	TOONBytesBefore          int
-	TOONBytesAfter          int
+	TOONBytesAfter           int
 	TOONTokensSaved          int
 }
 
