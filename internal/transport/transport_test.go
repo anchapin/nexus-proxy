@@ -324,29 +324,29 @@ func TestNewFromEnv_ReadsEnvVars(t *testing.T) {
 
 func TestHasClientCert(t *testing.T) {
 	tests := []struct {
-		name    string
-		cfg     Config
-		want    bool
+		name string
+		cfg  Config
+		want bool
 	}{
 		{
-			name:    "both cert and key set",
-			cfg:     Config{ClientCertFile: "cert.pem", ClientKeyFile: "key.pem"},
-			want:    true,
+			name: "both cert and key set",
+			cfg:  Config{ClientCertFile: "cert.pem", ClientKeyFile: "key.pem"},
+			want: true,
 		},
 		{
-			name:    "only cert set",
-			cfg:     Config{ClientCertFile: "cert.pem", ClientKeyFile: ""},
-			want:    false,
+			name: "only cert set",
+			cfg:  Config{ClientCertFile: "cert.pem", ClientKeyFile: ""},
+			want: false,
 		},
 		{
-			name:    "only key set",
-			cfg:     Config{ClientCertFile: "", ClientKeyFile: "key.pem"},
-			want:    false,
+			name: "only key set",
+			cfg:  Config{ClientCertFile: "", ClientKeyFile: "key.pem"},
+			want: false,
 		},
 		{
-			name:    "neither set",
-			cfg:     Config{ClientCertFile: "", ClientKeyFile: ""},
-			want:    false,
+			name: "neither set",
+			cfg:  Config{ClientCertFile: "", ClientKeyFile: ""},
+			want: false,
 		},
 	}
 
