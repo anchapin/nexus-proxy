@@ -24,14 +24,14 @@ func TestEstimateTokens(t *testing.T) {
 	// tiktoken/cl100k_base token counts for representative inputs.
 	// These values were verified against the actual tiktoken encoder (issue #231).
 	cases := map[string]int{
-		"":         0,
-		"a":        1,
-		"abcd":     1,
-		"abcdefgh": 1,
-		"hello world":                     2,
+		"":            0,
+		"a":           1,
+		"abcd":        1,
+		"abcdefgh":    1,
+		"hello world": 2,
 		"The quick brown fox jumps over the lazy dog": 9,
-		"日本語":     4,
-		"   lots   of   spaces   ":         7,
+		"日本語":                      4,
+		"   lots   of   spaces   ": 7,
 	}
 	for in, want := range cases {
 		if got := EstimateTokens(in); got != want {
