@@ -23,6 +23,16 @@ type CascadeStep struct {
 	Model  string
 }
 
+// Provider is the interface for a frontier provider. It is satisfied by
+// providers.ProviderConfig and allows the cascade to build steps from
+// any provider implementation.
+type Provider interface {
+	Name() string
+	BaseURL() string
+	Model() string
+	APIKey() string
+}
+
 // Cascade runs an ordered list of steps and falls back to the next one on
 // retryable failures: transport errors, HTTP 5xx/408/429, timeouts, and
 // malformed upstream responses (unparseable JSON or malformed tool_calls).
@@ -492,6 +502,23 @@ func BuildLocalCascade(cfg CascadeConfig) *Cascade {
 		})
 	}
 	return &Cascade{Steps: steps, Timeout: cfg.Timeout}
+}
+
+// BuildCascadeFromProviders builds a cascade from a slice of providers.
+// It appends each provider as a CascadeStep with the provider's Name as
+// the step name, BaseURL as the URL, Model as the model, and APIKey as
+// the API key. The timeout is taken from cfg.Timeout.
+func BuildCascadeFromProviders(providers []Provider, timeout time.Duration) *Cascade {
+	steps := make([]CascadeStep, 0, len(providers))
+	for _, p := range providers {
+		steps = append(steps, CascadeStep{
+			Name:   p.Name(),
+			URL:    strings.TrimRight(p.BaseURL(), "/") + "/v1/chat/completions",
+			Model:  p.Model(),
+			APIKey: p.APIKey(),
+		})
+	}
+	return &Cascade{Steps: steps, Timeout: timeout}
 }
 
 // truncateForLog clamps a response body for log/error messages. Bodies

@@ -23,6 +23,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/middleware"
+	"github.com/anchapin/nexus-proxy/internal/providers"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
@@ -627,6 +628,17 @@ type Deps struct {
 	// Nil means caching is disabled (the default for backwards
 	// compatibility).
 	ArbiterCache *upstream.ArbiterCache
+
+	// Providers is the optional registry of frontier providers (issue #223).
+	// When non-nil the handler uses it to build the cascade for
+	// route=frontier and route=local requests. When nil the handler
+	// falls back to the legacy config-based cascade built by
+	// BuildLocalCascade. The registry is nil-safe: a nil registry
+	// means "use legacy path" so unit tests and deployments that do
+	// not set NEXUS_FRONTIER_PROVIDERS are byte-for-byte identical
+	// to the pre-issue-#223 behaviour.
+	Providers *providers.ProviderRegistry
+
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
 	// copy used for sampling is bounded. Zero uses DefaultObservedCap.
@@ -1247,18 +1259,48 @@ func Chat(d Deps) http.Handler {
 			// stream flag (issue #10) so both branches share a single
 			// configured cascade; see below for the non-streaming
 			// degraded override.
-			cas := upstream.BuildLocalCascade(upstream.CascadeConfig{
-				LocalURL:      d.Config.OllamaURL,
-				LocalModel:    d.Config.LocalModel,
-				FrontierURL:   d.Config.FrontierURL,
-				FrontierModel: d.Config.FrontierModel,
-				FrontierKey:   d.Config.FrontierKey,
-				ZAIURL:        d.Config.ZAIURL,
-				ZAIModel:      d.Config.ZAIModel,
-				ZAIKey:        d.Config.ZAIKey,
-				Timeout:       d.Config.CascadeTimeout,
-				SkipLocal:     skipLocal,
-			})
+			//
+			// When d.Providers is set (issue #223), the cascade is built
+			// from the registry instead of the legacy config-based steps.
+			// This allows operators to register providers via
+			// NEXUS_FRONTIER_PROVIDERS without recompiling.
+			var cas *upstream.Cascade
+			if d.Providers != nil && d.Providers.Len() > 0 {
+				// Use providers from the registry (issue #223).
+				// Prepend the local step when not skipped.
+				steps := []upstream.CascadeStep{}
+				if !skipLocal {
+					steps = append(steps, upstream.CascadeStep{
+						Name:   "local",
+						URL:    strings.TrimRight(d.Config.OllamaURL, "/") + "/v1/chat/completions",
+						Model:  d.Config.LocalModel,
+						APIKey: "",
+					})
+				}
+				for _, p := range d.Providers.All() {
+					steps = append(steps, upstream.CascadeStep{
+						Name:   p.Name(),
+						URL:    strings.TrimRight(p.BaseURL(), "/") + "/v1/chat/completions",
+						Model:  p.Model(),
+						APIKey: p.APIKey(),
+					})
+				}
+				cas = &upstream.Cascade{Steps: steps, Timeout: d.Config.CascadeTimeout}
+			} else {
+				// Legacy path: build cascade from config (frontier + z.ai).
+				cas = upstream.BuildLocalCascade(upstream.CascadeConfig{
+					LocalURL:      d.Config.OllamaURL,
+					LocalModel:    d.Config.LocalModel,
+					FrontierURL:   d.Config.FrontierURL,
+					FrontierModel: d.Config.FrontierModel,
+					FrontierKey:   d.Config.FrontierKey,
+					ZAIURL:        d.Config.ZAIURL,
+					ZAIModel:      d.Config.ZAIModel,
+					ZAIKey:        d.Config.ZAIKey,
+					Timeout:       d.Config.CascadeTimeout,
+					SkipLocal:     skipLocal,
+				})
+			}
 
 			// Writer chain (outermost first):
 			//   upstream.Write -> captureWriter (judge + quality tee OR debug) ->
