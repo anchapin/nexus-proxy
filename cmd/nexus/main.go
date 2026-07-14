@@ -38,6 +38,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
 	"github.com/anchapin/nexus-proxy/internal/transport"
+	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
 
 const (
@@ -599,6 +600,25 @@ func main() {
 	cascadeFallbackObs := handlers.CascadeFallbackObserverFunc(func(e handlers.CascadeFallbackEvent) {
 		routeCounters.ObserveCascadeFallback(e.Reason)
 	})
+	// Arbiter cache observer (issue #232). The chat handler reports
+	// cache hits and misses for fusion arbiter synthesis via this
+	// closure, which forwards to the in-process counter so it
+	// surfaces in /metrics as nexus_fusion_arbiter_cache_total{hit}.
+	var arbiterCacheObserver func(bool)
+	if cfg.ArbiterCacheTTL > 0 {
+		arbiterCacheObserver = func(cacheHit bool) {
+			routeCounters.ObserveArbiterCacheHit(cacheHit)
+		}
+	}
+	// Arbiter synthesis cache (issue #232). Created when TTL > 0;
+	// nil means caching is disabled.
+	var arbiterCache *upstream.ArbiterCache
+	if cfg.ArbiterCacheTTL > 0 {
+		arbiterCache = upstream.NewArbiterCache()
+		slog.Info("fusion arbiter cache enabled",
+			slog.Duration("ttl", cfg.ArbiterCacheTTL),
+		)
+	}
 	mux.Handle("/metrics", routeCounters.Handler())
 	slog.Info("metrics endpoint serves prometheus text format",
 		slog.String("path", "/metrics"),
@@ -654,6 +674,8 @@ func main() {
 		FusionOutcomeObserver:   fusionOutcomeObs,
 		RAGObserver:             ragObserver,
 		CascadeFallbackObserver: cascadeFallbackObs,
+		ArbiterCacheObserver:    arbiterCacheObserver,
+		ArbiterCache:            arbiterCache,
 	})
 	// Apply the per-client rate limiter (issue #75) as the outermost
 	// wrapper so a flood of requests is rejected before any middleware

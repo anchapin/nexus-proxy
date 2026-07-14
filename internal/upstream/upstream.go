@@ -83,6 +83,19 @@ type Client interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
+// bufferResponseWriter wraps a bytes.Buffer to implement http.ResponseWriter
+// for capturing buffered responses without doing any actual HTTP writing.
+type bufferResponseWriter struct {
+	buf *bytes.Buffer
+}
+
+func (b *bufferResponseWriter) Header() http.Header { return make(http.Header) }
+func (b *bufferResponseWriter) Write(d []byte) (int, error) {
+	return b.buf.Write(d)
+}
+func (b *bufferResponseWriter) WriteHeader(int) {}
+func (b *bufferResponseWriter) Flush()          {}
+
 // Stream POSTs payload to targetURL and flushes every newline-terminated
 // chunk from the upstream response body straight to w. This preserves the
 // harness's expected SSE framing — each `data: {…}\n\n` arrives intact.
@@ -399,6 +412,34 @@ type PanelResult struct {
 // StreamWithContext so a slow synthesis endpoint cannot block the
 // handler indefinitely — without this the arbiter inherits the shared
 // http.DefaultClient which has no timeout.
+// Panel runs local and frontier fetches concurrently and waits for both.
+// Each member gets its own timeout (perFetchTimeout) so a slow frontier
+// can't pin the local one.
+//
+// When skipLocal is true the local Ollama fetch is omitted (issue #8
+// graceful-degradation path). The local slot in the arbiter prompt is
+// populated with a synthetic PanelResult whose Err is set to a sentinel
+// error, which formatCandidate renders as
+// "[local failed: ollama unavailable (degraded)]". The arbiter's
+// "synthesize the strongest answer" instruction already copes with one
+// candidate being unavailable, so the synthesis stream still produces a
+// useful reply using only the frontier member.
+//
+// arbiterURL/arbiterKey/arbiterModel identify the synthesis model. The
+// arbiter receives a single user message containing both candidates and
+// streams the synthesized reply via Stream. The arbiter call is bounded
+// by arbiterTimeout (issue #12, NEXUS_ARBITER_TIMEOUT, default 60s) via
+// StreamWithContext so a slow synthesis endpoint cannot block the
+// handler indefinitely — without this the arbiter inherits the shared
+// http.DefaultClient which has no timeout.
+//
+// arbiterCache/arbiterCacheTTL implement optional caching of arbiter
+// synthesis responses (issue #232). When arbiterCache is non-nil and
+// arbiterCacheTTL > 0, synthesis responses are cached keyed by a hash
+// of (first.Content, second.Content). Cache hits serve the cached text
+// without calling the arbiter. When nil or TTL=0 the cache is bypassed
+// and the arbiter is called on every disagreement. Returns true if the
+// response was served from cache (so the caller can record metrics).
 func Panel(
 	w http.ResponseWriter,
 	client Client,
@@ -409,7 +450,9 @@ func Panel(
 	perFetchTimeout time.Duration,
 	arbiterTimeout time.Duration,
 	skipLocal bool,
-) error {
+	arbiterCache *ArbiterCache,
+	arbiterCacheTTL time.Duration,
+) (cacheHit bool, _ error) {
 	results := make(chan PanelResult, 2)
 	if skipLocal {
 		// Synthetic local failure so the arbiter prompt shape stays
@@ -462,10 +505,74 @@ func Panel(
 	if s, ok := body["stream"].(bool); ok && !s {
 		stream = false
 	}
-	if stream {
-		return StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody)
+
+	// Issue #232: check arbiter cache before calling the arbiter endpoint.
+	// Cache is only populated for stream=false (BufferedFetch) since stream=true
+	// (StreamWithContext) passes SSE through directly and doesn't give us
+	// content to cache.
+	if arbiterCache != nil && arbiterCacheTTL > 0 {
+		if cached, ok := arbiterCache.Get(r1.Content, r2.Content); ok {
+			slog.Info("fusion arbiter cache hit",
+				slog.String("r1_source", r1.Source),
+				slog.String("r2_source", r2.Source),
+			)
+			cacheHit = true
+			if stream {
+				return true, streamCachedArbiterSynthesis(w, cached)
+			}
+			return true, writeCachedArbiterJSON(w, cached, arbiterModel)
+		}
 	}
-	return BufferedFetchWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody)
+
+	// When stream=true, use the original StreamWithContext to pass SSE through
+	// directly (no caching possible, but preserves passthrough behavior).
+	// When stream=false, use BufferedFetchWithContext with stream=false to get
+	// JSON, then format the response (can cache for future requests).
+	var synthesis string
+	var fetchErr error
+	if stream {
+		// stream=true: SSE passthrough, no caching
+		fetchErr = StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody)
+		if fetchErr != nil {
+			return false, fmt.Errorf("fusion: arbiter stream: %w", fetchErr)
+		}
+		if err := writeSSEDone(w); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	// stream=false: buffered fetch, can cache
+	{
+		bufBody := synthBody
+		bufBody["stream"] = false
+		var buf bytes.Buffer
+		bufW := &bufferResponseWriter{buf: &buf}
+		fetchErr = BufferedFetchWithContext(arbiterCtx, bufW, client, arbiterURL, arbiterKey, bufBody)
+		if fetchErr == nil {
+			var raw struct {
+				Choices []struct {
+					Message struct {
+						Content string `json:"content"`
+					} `json:"message"`
+				} `json:"choices"`
+			}
+			if err := json.Unmarshal(buf.Bytes(), &raw); err == nil {
+				if len(raw.Choices) > 0 {
+					synthesis = raw.Choices[0].Message.Content
+				}
+			}
+		}
+	}
+	if fetchErr != nil {
+		return false, fmt.Errorf("fusion: arbiter fetch: %w", fetchErr)
+	}
+
+	// Cache the synthesis for future identical panel members (issue #232).
+	if arbiterCache != nil && arbiterCacheTTL > 0 && synthesis != "" {
+		arbiterCache.Set(r1.Content, r2.Content, synthesis, arbiterCacheTTL)
+	}
+
+	return false, writeCachedArbiterJSON(w, synthesis, arbiterModel)
 }
 
 // arbiterDefaultTimeout is the per-call arbiter timeout used when
@@ -527,6 +634,11 @@ type PanelOutcome struct {
 	// members' contents. 0 when fewer than two members returned
 	// content.
 	Similarity float64
+	// ArbiterCacheHit is true when the arbiter synthesis was served
+	// from the cache (issue #232) without calling the arbiter.
+	// When false and the arbiter was invoked, the synthesis was
+	// fetched from the arbiter and cached for future requests.
+	ArbiterCacheHit bool
 }
 
 // PanelStreaming runs the fusion panel with progressive delivery
@@ -556,6 +668,13 @@ type PanelOutcome struct {
 // agreementThreshold is in [0,1]; values < 0 are clamped to 0 (every
 // disagreement runs the arbiter) and values > 1 are clamped to 1
 // (the arbiter is always skipped when both members succeed).
+//
+// arbiterCache/arbiterCacheTTL implement optional caching of arbiter
+// synthesis responses (issue #232). When arbiterCache is non-nil and
+// arbiterCacheTTL > 0, synthesis responses are cached keyed by a hash
+// of (first.Content, second.Content). Cache hits stream the cached
+// text without calling the arbiter. When nil or TTL=0 the cache is
+// bypassed and the arbiter is called on every disagreement.
 func PanelStreaming(
 	w http.ResponseWriter,
 	client Client,
@@ -568,6 +687,8 @@ func PanelStreaming(
 	skipLocal bool,
 	agreementThreshold float64,
 	requestID string,
+	arbiterCache *ArbiterCache,
+	arbiterCacheTTL time.Duration,
 ) (PanelOutcome, error) {
 	var outcome PanelOutcome
 
@@ -577,13 +698,15 @@ func PanelStreaming(
 	// hands PanelStreaming a stream=false body gets the existing
 	// JSON-object response shape (issue #10).
 	if s, ok := body["stream"].(bool); ok && !s {
-		if err := Panel(w, client,
+		cacheHit, err := Panel(w, client,
 			localBaseURL, localModel, frontierURL, frontierModel,
 			arbiterURL, arbiterKey, arbiterModel,
 			body, latestPrompt, perFetchTimeout, arbiterTimeout,
-			skipLocal); err != nil {
+			skipLocal, arbiterCache, arbiterCacheTTL)
+		if err != nil {
 			return outcome, err
 		}
+		outcome.ArbiterCacheHit = cacheHit
 		return outcome, nil
 	}
 
@@ -790,8 +913,31 @@ func PanelStreaming(
 		},
 		"stream": true,
 	}
+
+	// Issue #232: check arbiter cache before calling the arbiter endpoint.
+	// Cache hit: stream the cached synthesis as SSE.
+	// Cache miss: use StreamWithContext for SSE passthrough (original behavior)
+	// since progressive delivery prioritizes low latency over caching gains.
+	if arbiterCache != nil && arbiterCacheTTL > 0 {
+		if cached, ok := arbiterCache.Get(first.Content, second.Content); ok {
+			slog.Info("fusion arbiter cache hit (streaming)",
+				slog.String("first_source", first.Source),
+				slog.String("second_source", second.Source),
+			)
+			outcome.ArbiterCacheHit = true
+			if err := streamCachedArbiterSynthesis(w, cached); err != nil {
+				return outcome, err
+			}
+			return outcome, nil
+		}
+	}
+
 	arbiterCtx, cancelArbiter := context.WithTimeout(context.Background(), withDefaultArbiterTimeout(arbiterTimeout))
 	defer cancelArbiter()
+
+	// Use StreamWithContext for SSE passthrough. This preserves the original
+	// behavior where the arbiter's SSE is passed through directly. Caching
+	// synthesis content is only useful for the non-streaming Panel path.
 	if err := StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody); err != nil {
 		return outcome, fmt.Errorf("fusion: arbiter stream: %w", err)
 	}
@@ -893,6 +1039,68 @@ func streamPanelResultAsSSE(w http.ResponseWriter, r PanelResult) error {
 		f.Flush()
 	}
 	return nil
+}
+
+// streamCachedArbiterSynthesis streams a cached arbiter synthesis text as
+// SSE chunks (issue #232). This mimics the output of StreamWithContext
+// for the arbiter, but serves from cache instead. The synthesis is
+// streamed as a single delta chunk followed by [DONE]. Headers must
+// already be committed (WriteHeader called) when this runs.
+func streamCachedArbiterSynthesis(w http.ResponseWriter, synthesis string) error {
+	chunk := map[string]interface{}{
+		"object": "chat.completion.chunk",
+		"nexus":  map[string]string{"source": "arbiter-cached"},
+		"choices": []map[string]interface{}{
+			{"index": 0, "delta": map[string]interface{}{"content": synthesis}, "finish_reason": "stop"},
+		},
+	}
+	b, err := json.Marshal(chunk)
+	if err != nil {
+		return fmt.Errorf("fusion: marshal cached arbiter chunk: %w", err)
+	}
+	if _, err := w.Write([]byte("data: ")); err != nil {
+		return err
+	}
+	if _, err := w.Write(b); err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte("\n\n")); err != nil {
+		return err
+	}
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return writeSSEDone(w)
+}
+
+// writeCachedArbiterJSON writes a cached arbiter synthesis as a
+// non-streaming JSON chat completion response (issue #232). This mimics
+// the output of BufferedFetchWithContext for the arbiter, but serves
+// from cache instead. The model name is passed as modelName so the
+// response has the correct model field.
+func writeCachedArbiterJSON(w http.ResponseWriter, synthesis, modelName string) error {
+	resp := map[string]interface{}{
+		"object": "chat.completion",
+		"model":  modelName,
+		"choices": []map[string]interface{}{
+			{
+				"index": 0,
+				"message": map[string]string{
+					"role":    "assistant",
+					"content": synthesis,
+				},
+				"finish_reason": "stop",
+			},
+		},
+	}
+	b, err := json.Marshal(resp)
+	if err != nil {
+		return fmt.Errorf("fusion: marshal cached arbiter JSON: %w", err)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, werr := w.Write(b)
+	return werr
 }
 
 // writeSSEDone emits the OpenAI streaming terminator and flushes. SSE

@@ -164,6 +164,14 @@ type Config struct {
 	FusionProgressiveDelivery bool    // true iff NEXUS_FUSION_PROGRESSIVE is unset or "true" (default true)
 	FusionAgreementThreshold  float64 // Jaccard ratio [0,1] above which arbiter is skipped (default 0.85)
 
+	// Fusion arbiter synthesis cache (issue #232). When ArbiterCacheTTL > 0,
+	// arbiter synthesis responses are cached keyed by a hash of
+	// (first.Content, second.Content). Subsequent requests with identical
+	// panel-member content return the cached synthesis text instead of
+	// invoking the expensive frontier arbiter call. Set to 0 to disable
+	// the cache (all arbiter calls are made, no caching).
+	ArbiterCacheTTL time.Duration // NEXUS_ARBITER_CACHE_TTL; 0 disables
+
 	// Judge-guided adaptive routing (issue #47). Historical judge
 	// scores are aggregated by task category in a SQLite table and fed
 	// back to the SLM router as a confidence signal. All of this is
@@ -609,6 +617,17 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.FusionAgreementThreshold = agreementThreshold
+
+	// Fusion arbiter synthesis cache (issue #232). NEXUS_ARBITER_CACHE_TTL=0
+	// (the default) disables the cache entirely — every disagreement
+	// calls the arbiter. When set to a positive duration, identical
+	// panel-member content within the TTL window returns the cached
+	// synthesis text without calling the arbiter.
+	arbiterCacheTTL, err := getEnvDuration("NEXUS_ARBITER_CACHE_TTL", 0)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ArbiterCacheTTL = arbiterCacheTTL
 
 	// Judge-guided adaptive routing (issue #47). Defaults keep the
 	// feature dormant unless the judge is enabled and a DB path is

@@ -93,6 +93,9 @@ type counterKey struct {
 // A sixth family (issue #186) records RAG retrieval outcomes:
 //   - nexus_rag_retrieval_total{hit}
 //
+// A seventh family (issue #232) records fusion arbiter cache hits/misses:
+//   - nexus_fusion_arbiter_cache_total{hit}
+//
 // The reason label values are short, bounded strings (method,
 // body_too_large, bad_request, rate_limit, ...) defined as constants
 // in internal/handlers so the chat handler and the rate-limit
@@ -117,6 +120,7 @@ type RouteCounters struct {
 	rRAGHits                 map[string]*uint64
 	rRAGMisses               map[string]*uint64
 	cascadeFallbacks         map[string]*uint64
+	arbiterCache             map[string]*uint64 // "hit" | "miss"
 }
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
@@ -133,6 +137,7 @@ func NewRouteCounters() *RouteCounters {
 		rRAGHits:                 make(map[string]*uint64),
 		rRAGMisses:               make(map[string]*uint64),
 		cascadeFallbacks:         make(map[string]*uint64),
+		arbiterCache:             make(map[string]*uint64),
 	}
 }
 
@@ -319,6 +324,30 @@ func (rc *RouteCounters) ObserveCascadeFallback(reason string) {
 	atomic.AddUint64(rc.cascadeFallbackSlot(reason), 1)
 }
 
+// ObserveArbiterCacheHit records an arbiter cache lookup result
+// (issue #232). hit=true means the synthesis was served from cache;
+// hit=false means the cache missed and the arbiter was invoked.
+// The method is safe for concurrent use and never blocks; nil
+// receivers are a no-op.
+func (rc *RouteCounters) ObserveArbiterCacheHit(hit bool) {
+	if rc == nil {
+		return
+	}
+	label := "false"
+	if hit {
+		label = "true"
+	}
+	rc.mu.Lock()
+	p, ok := rc.arbiterCache[label]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.arbiterCache[label] = p
+	}
+	rc.mu.Unlock()
+	atomic.AddUint64(p, 1)
+}
+
 // reasonSlot returns the *uint64 for reason, creating it if absent.
 // Same lock-then-atomic pattern as slot: the mutex guards the map
 // mutation only, the increment happens lock-free.
@@ -433,6 +462,13 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	if n, err := writeRejectionSeries(w, "nexus_cascade_fallback_total",
 		"Cascade fallback events partitioned by reason (timeout, transport_error, malformed_toolcall).",
 		rc.cascadeFallbacks); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeRejectionSeries(w, "nexus_fusion_arbiter_cache_total",
+		"Fusion arbiter synthesis cache hits and misses (issue #232).",
+		rc.arbiterCache); err != nil {
 		return total, err
 	} else {
 		total += n

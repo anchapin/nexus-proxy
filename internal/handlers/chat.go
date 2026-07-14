@@ -598,6 +598,22 @@ type Deps struct {
 	// RouteCounters.ObserveCascadeFallback.
 	CascadeFallbackObserver CascadeFallbackObserver
 
+	// ArbiterCacheObserver is invoked when the fusion arbiter
+	// synthesis is served from cache (hit=true) or fetched from the
+	// arbiter (hit=false) (issue #232). Implementations must be safe
+	// for concurrent use and must not block. Nil is treated as "no
+	// observer"; the hot path is unaffected. The handler does not
+	// import the observability package — main.go wires a closure that
+	// adapts the event to the in-process arbiter cache counter.
+	ArbiterCacheObserver func(cacheHit bool)
+
+	// ArbiterCache is the optional in-memory cache for fusion arbiter
+	// synthesis responses (issue #232). When non-nil and
+	// Config.ArbiterCacheTTL > 0, identical panel-member content
+	// returns a cached synthesis instead of calling the arbiter.
+	// Nil means caching is disabled (the default for backwards
+	// compatibility).
+	ArbiterCache *upstream.ArbiterCache
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
 	// copy used for sampling is bounded. Zero uses DefaultObservedCap.
@@ -1131,9 +1147,14 @@ func Chat(d Deps) http.Handler {
 					skipLocal,
 					d.Config.FusionAgreementThreshold,
 					reqID,
+					d.ArbiterCache,
+					d.Config.ArbiterCacheTTL,
 				)
 				fusionArbiterSkipped = outcome.ArbiterSkipped
 				fusionJaccardSimilarity = outcome.Similarity
+				if d.ArbiterCacheObserver != nil {
+					d.ArbiterCacheObserver(outcome.ArbiterCacheHit)
+				}
 				if outcome.ArbiterSkipped {
 					slog.Info("fusion arbiter skipped",
 						slog.String("source", outcome.Source),
@@ -1148,7 +1169,8 @@ func Chat(d Deps) http.Handler {
 					})
 				}
 			} else {
-				upErr = upstream.Panel(
+				var cacheHit bool
+				cacheHit, upErr = upstream.Panel(
 					obs, d.Client,
 					d.Config.OllamaURL, d.Config.LocalModel,
 					d.Config.FrontierURL, d.Config.FrontierModel,
@@ -1156,7 +1178,12 @@ func Chat(d Deps) http.Handler {
 					body, latestPrompt, d.Config.FusionTimeout,
 					d.Config.ArbiterTimeout,
 					skipLocal,
+					d.ArbiterCache,
+					d.Config.ArbiterCacheTTL,
 				)
+				if d.ArbiterCacheObserver != nil {
+					d.ArbiterCacheObserver(cacheHit)
+				}
 			}
 			if upErr != nil {
 				slog.Error("fusion error",
