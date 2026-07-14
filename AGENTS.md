@@ -53,11 +53,15 @@ make build && ./bin/nexus   # build & run
 make test                   # unit tests
 make test-race              # race detector
 make lint                   # golangci-lint
-make ci                     # vet + build + test + lint (what CI runs)
+make fmt                    # gofmt -w (auto-formats in place)
+make ci                     # vet + build + test + lint + bench-short
 ```
 
 `go run ./cmd/nexus` works too; the `Makefile` is convenience, not a
 runtime dependency.
+
+**`nexus check` / `nexus doctor`** — runs boot-time diagnostics and exits
+(issue #32). Useful to validate config without starting the server.
 
 The binary listens on `:8000` (env: `NEXUS_ADDR`) and exposes:
 - `POST /v1/chat/completions` — the proxy
@@ -124,6 +128,22 @@ Route constants are `router.RouteLocal`, `router.RouteFrontier`,
 | Otherwise                                                     | SLM decides |
 | SLM confidence < `NEXUS_SLM_CONFIDENCE_THRESHOLD` AND route is local/fusion | `frontier` (escalation, #44) |
 | SLM call fails, times out, or returns invalid JSON            | `frontier` (safe default) |
+
+## SLM decision cache (issue #162, #206)
+
+`NEXUS_SLMCACHE_TTL > 0` enables an in-process cache for SLM routing
+decisions. Deduplicate identical prompts within the TTL window without
+calling the SLM. Optional semantic dedup via `NEXUS_SLMCACHE_SEMANTIC_THRESHOLD`
+uses the embedder to find near-duplicates; cache hits are surfaced in
+metrics as `nexus_slmcache_total{hit="true"|"false"}`.
+
+## Adaptive routing confidence store (issue #47)
+
+When the judge is enabled and `NEXUS_ROUTING_CONFIDENCE_DB` is set,
+historical judge scores are aggregated by task category and fed back to
+the SLM router as a confidence signal. Poor-performing categories bias
+new prompts toward frontier. Dormant when judge is off — routing is
+byte-for-byte identical to the non-adaptive path.
 
 ## Fusion progressive delivery (issue #48)
 
@@ -250,7 +270,10 @@ Gotchas to remember when extending:
   mid-stream. `IdleTimeout` (`NEXUS_SERVER_IDLE_TIMEOUT`, default 120s)
   closes idle keep-alive connections. `MaxHeaderBytes`
   (`NEXUS_SERVER_MAX_HEADER_BYTES`, default 1 MiB) caps request
-  headers. Per-call upstream timeouts are `NEXUS_SLM_TIMEOUT` (8s
+  headers. `ShutdownTimeout` (`NEXUS_SHUTDOWN_TIMEOUT`, default 30s)
+  is the SIGTERM drain window — must be ≥ ReadTimeout or in-flight
+  uploads may be truncated mid-read (boot warns if shorter).
+  Per-call upstream timeouts are `NEXUS_SLM_TIMEOUT` (8s
   default), `NEXUS_FUSION_TIMEOUT` (120s default), and
   `NEXUS_CASCADE_TIMEOUT` (per-cascade-attempt, #14).
 - HTTP client is a single shared pooled `*http.Client` configured via
@@ -367,6 +390,12 @@ tokens, cost) to `NEXUS_METRICS_DB`. The judge's `JudgeScore` record
 (request id, score 1–5, raw response, prompt/output token estimates,
 USD cost) is designed to persist through the same Storage interface
 without changing the wire shape.
+
+## Branch conventions
+
+- **`develop`** is the default branch — use it as the base for all feature and fix branches.
+- **`main`** is only used as the base for PRs from `develop` when preparing a new release.
+- Branch naming: `fix/issue-<number>` or `feat/<short-description>`.
 
 ## Where to extend
 

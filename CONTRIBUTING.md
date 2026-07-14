@@ -11,7 +11,7 @@ We use GitHub Issues to track bugs and requested features. Please use the provid
 - **Feature Requests**: Describe the problem you're solving, what success looks like, and any alternatives you've considered.
 
 ### Development Workflow
-1. **Branching**: Create a feature or fix branch from `main` (e.g., `fix/issue-123` or `feat/new-router-rule`).
+1. **Branching**: Create a feature or fix branch from `develop` (e.g., `fix/issue-123` or `feat/new-router-rule`). The `develop` branch is the default base for all PRs. The `main` branch is only used as the base for PRs from `develop` when preparing a new release.
 2. **Commits**: Use [Conventional Commits](https://www.conventionalcommits.org/) (e.g., `feat: ...`, `fix: ...`, `docs: ...`).
 3. **Testing**: Every change must be accompanied by tests. Use `make test` to run the suite.
 4. **CI**: Ensure `make ci` passes locally before submitting a Pull Request.

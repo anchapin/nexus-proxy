@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, develop]
   pull_request:
+    # develop is the default base; main is only used for release PRs from develop
     branches: [main, develop]
 
 permissions:
