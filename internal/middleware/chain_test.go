@@ -19,8 +19,8 @@ func (m *mockStore) Retrieve(ctx context.Context, query string) (*rag.FewShotExa
 	return nil, 0, nil
 }
 func (m *mockStore) Add(filename, content string, embedding []float64) {}
-func (m *mockStore) Size() int                                   { return 0 }
-func (m *mockStore) Threshold() float64                           { return 0.5 }
+func (m *mockStore) Size() int                                         { return 0 }
+func (m *mockStore) Threshold() float64                                { return 0.5 }
 
 // --- MiddlewareFunc tests ---
 

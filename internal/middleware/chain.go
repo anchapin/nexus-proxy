@@ -62,7 +62,7 @@ func NewMiddleware(name string, fn func([]interface{}) ([]interface{}, error)) M
 
 // ragMiddleware implements ContextMiddleware for RAG retrieval.
 type ragMiddleware struct {
-	rag    rag.RAGStore
+	rag       rag.RAGStore
 	threshold float64
 }
 
