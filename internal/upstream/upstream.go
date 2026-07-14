@@ -516,10 +516,13 @@ func PanelStreaming(
 	// member that returned structured tool calls should be the
 	// speculative winner even if it arrived second.
 	winner := first
+	winnerFromSecond := false
 	if first.Err != nil {
 		winner = second
+		winnerFromSecond = true
 	} else if len(second.ToolCalls) > 0 && len(first.ToolCalls) == 0 {
 		winner = second
+		winnerFromSecond = true
 	}
 	outcome.Source = winner.Source
 
@@ -542,15 +545,20 @@ func PanelStreaming(
 			slog.String("source", outcome.Source),
 			slog.Int("tool_calls", len(winner.ToolCalls)),
 		)
-		// Cancel the slow member's goroutine so it doesn't waste
-		// resources after the response has already been delivered.
-		if winner.Source == "local" && cancelFrontier != nil {
-			cancelFrontier()
-		} else if winner.Source == "frontier" && cancelLocal != nil {
-			cancelLocal()
+		// Cancel the slow member's goroutine to stop in-flight work.
+		// The slow member's result was already consumed in the main
+		// flow (second := <-results), so no drain is needed.
+		if winnerFromSecond {
+			// winner is second; first (local) is slow
+			if cancelLocal != nil {
+				cancelLocal()
+			}
+		} else {
+			// winner is first; second (frontier) is slow
+			if cancelFrontier != nil {
+				cancelFrontier()
+			}
 		}
-		// Drain the slow member's result to unblock its goroutine.
-		_ = <-results
 		if err := writeSSEDone(w); err != nil {
 			return outcome, err
 		}
@@ -559,17 +567,21 @@ func PanelStreaming(
 
 	// One-member case (the other errored, or skipLocal ran frontier
 	// alone). The speculative answer IS the answer; no arbiter.
+	// The slow member's result was already consumed in the main flow.
 	if first.Err != nil || second.Err != nil {
 		outcome.ArbiterSkipped = true
-		// Cancel the slow member's goroutine so it doesn't waste
-		// resources after the response has already been delivered.
-		if winner.Source == "local" && cancelFrontier != nil {
-			cancelFrontier()
-		} else if winner.Source == "frontier" && cancelLocal != nil {
-			cancelLocal()
+		// Cancel the slow member's goroutine to stop in-flight work.
+		if winnerFromSecond {
+			// winner is second; first (local) is slow
+			if cancelLocal != nil {
+				cancelLocal()
+			}
+		} else {
+			// winner is first; second (frontier) is slow
+			if cancelFrontier != nil {
+				cancelFrontier()
+			}
 		}
-		// Drain the slow member's result to unblock its goroutine.
-		_ = <-results
 		if err := writeSSEDone(w); err != nil {
 			return outcome, err
 		}
