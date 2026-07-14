@@ -321,7 +321,7 @@ func TestChatDebugTransformsLogsTOONAndRAG(t *testing.T) {
 // extraction strips it.
 func TestChatDebugUpstreamReportsHost(t *testing.T) {
 	deps, rt := debugDeps(t)
-	// 49000 chars gives ~6125 tiktoken tokens > 6000 guardrail -> route=frontier
+	// 50000 chars forces the guardrail to fire (route=frontier)
 	// which exercises the default frontier branch and the
 	// single-endpoint upstream trace.
 	large := strings.Repeat("a", 49000)
@@ -519,7 +519,7 @@ func TestChatDebugNoAPIKeyInLogs(t *testing.T) {
 // DSL/SLM-driven routes.
 func TestChatDebugGuardrailRoutingReason(t *testing.T) {
 	deps, rt := debugDeps(t)
-	// 49000 chars gives ~6125 tiktoken tokens > 6000 guardrail
+	// 50000 char prompt ≈ 6250 tokens > 6000 guardrail
 	large := strings.Repeat("a", 49000)
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

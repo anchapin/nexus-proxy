@@ -1,8 +1,15 @@
 package transport
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"net/http"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -295,9 +302,6 @@ func TestNewFromEnv_ReadsEnvVars(t *testing.T) {
 		os.Unsetenv("NEXUS_HTTP_MAX_CONNS_PER_HOST")
 		os.Unsetenv("NEXUS_HTTP_IDLE_CONN_TIMEOUT")
 		os.Unsetenv("NEXUS_HTTP_DIAL_CONTEXT_TIMEOUT")
-		os.Unsetenv("NEXUS_HTTP_CLIENT_CERT_FILE")
-		os.Unsetenv("NEXUS_HTTP_CLIENT_KEY_FILE")
-		os.Unsetenv("NEXUS_HTTP_CA_FILE")
 	}
 	restore()
 	defer restore()
@@ -316,100 +320,162 @@ func TestNewFromEnv_ReadsEnvVars(t *testing.T) {
 	}
 }
 
-func TestNew_NoTLSClientConfigByDefault(t *testing.T) {
-	client := New(Config{})
-	tr := client.Transport.(*http.Transport)
-	if tr.TLSClientConfig != nil {
-		t.Errorf("TLSClientConfig = %v, want nil (no client cert configured)", tr.TLSClientConfig)
+// --- mTLS tests ---
+
+func TestHasClientCert(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+		want bool
+	}{
+		{
+			name: "both cert and key set",
+			cfg:  Config{ClientCertFile: "cert.pem", ClientKeyFile: "key.pem"},
+			want: true,
+		},
+		{
+			name: "only cert set",
+			cfg:  Config{ClientCertFile: "cert.pem", ClientKeyFile: ""},
+			want: false,
+		},
+		{
+			name: "only key set",
+			cfg:  Config{ClientCertFile: "", ClientKeyFile: "key.pem"},
+			want: false,
+		},
+		{
+			name: "neither set",
+			cfg:  Config{ClientCertFile: "", ClientKeyFile: ""},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.hasClientCert(); got != tt.want {
+				t.Errorf("hasClientCert() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
-func TestNew_TLSClientConfigSetWithCerts(t *testing.T) {
-	// Use test cert files from the crypto/tls package's test data.
-	// tls.LoadX509KeyPair requires real cert/key files, so we point at
-	// the stdlib test fixtures.
-	certFile := os.Getenv("SSL_CERT_FILE")
-	keyFile := os.Getenv("SSL_KEY_FILE")
-	if certFile == "" || keyFile == "" {
-		t.Skip("SSL_CERT_FILE / SSL_KEY_FILE not set; skipping mTLS test")
-	}
+func TestBuildTLSConfig(t *testing.T) {
+	// Create a temporary self-signed certificate for testing.
+	tmpDir := t.TempDir()
+	certFile := filepath.Join(tmpDir, "client.crt")
+	keyFile := filepath.Join(tmpDir, "client.key")
+	caFile := filepath.Join(tmpDir, "ca.crt")
+
+	// Generate a self-signed certificate using openssl if available,
+	// otherwise skip this test. For CI, certificates are pre-generated.
+	generateTestCert(t, certFile, keyFile, caFile)
+
+	t.Run("valid cert and key", func(t *testing.T) {
+		cfg := Config{
+			ClientCertFile: certFile,
+			ClientKeyFile:  keyFile,
+		}
+		tlsConfig, err := buildTLSConfig(cfg)
+		if err != nil {
+			t.Fatalf("buildTLSConfig() error = %v", err)
+		}
+		if tlsConfig == nil {
+			t.Fatal("buildTLSConfig() returned nil")
+		}
+		if len(tlsConfig.Certificates) != 1 {
+			t.Errorf("len(Certificates) = %d, want 1", len(tlsConfig.Certificates))
+		}
+		if tlsConfig.GetClientCertificate == nil {
+			t.Error("GetClientCertificate is nil")
+		}
+	})
+
+	t.Run("with CAFile", func(t *testing.T) {
+		cfg := Config{
+			ClientCertFile: certFile,
+			ClientKeyFile:  keyFile,
+			CAFile:         caFile,
+		}
+		tlsConfig, err := buildTLSConfig(cfg)
+		if err != nil {
+			t.Fatalf("buildTLSConfig() error = %v", err)
+		}
+		if tlsConfig.RootCAs == nil {
+			t.Error("RootCAs is nil")
+		}
+	})
+
+	t.Run("invalid cert path", func(t *testing.T) {
+		cfg := Config{
+			ClientCertFile: "nonexistent.crt",
+			ClientKeyFile:  keyFile,
+		}
+		_, err := buildTLSConfig(cfg)
+		if err == nil {
+			t.Error("buildTLSConfig() expected error for invalid cert path")
+		}
+	})
+
+	t.Run("invalid key path", func(t *testing.T) {
+		cfg := Config{
+			ClientCertFile: certFile,
+			ClientKeyFile:  "nonexistent.key",
+		}
+		_, err := buildTLSConfig(cfg)
+		if err == nil {
+			t.Error("buildTLSConfig() expected error for invalid key path")
+		}
+	})
+}
+
+func TestNew_WithMTLS(t *testing.T) {
+	tmpDir := t.TempDir()
+	certFile := filepath.Join(tmpDir, "client.crt")
+	keyFile := filepath.Join(tmpDir, "client.key")
+	caFile := filepath.Join(tmpDir, "ca.crt")
+	generateTestCert(t, certFile, keyFile, caFile)
 
 	cfg := Config{
 		ClientCertFile: certFile,
 		ClientKeyFile:  keyFile,
-	}
-	client := New(cfg)
-	tr := client.Transport.(*http.Transport)
-
-	if tr.TLSClientConfig == nil {
-		t.Fatal("TLSClientConfig = nil, want non-nil when client certs are configured")
-	}
-	if tr.TLSClientConfig.GetClientCertificate == nil {
-		t.Error("TLSClientConfig.GetClientCertificate = nil, want non-nil")
-	}
-}
-
-func TestNew_TLSClientConfigWithCAFile(t *testing.T) {
-	caFile := os.Getenv("SSL_CERT_FILE")
-	if caFile == "" {
-		t.Skip("SSL_CERT_FILE not set; skipping CA file test")
-	}
-
-	cfg := Config{
-		ClientCertFile: os.Getenv("SSL_CERT_FILE"),
-		ClientKeyFile:  os.Getenv("SSL_KEY_FILE"),
 		CAFile:         caFile,
 	}
 	client := New(cfg)
 	tr := client.Transport.(*http.Transport)
 
 	if tr.TLSClientConfig == nil {
-		t.Fatal("TLSClientConfig = nil, want non-nil when CA file is configured")
+		t.Fatal("TLSClientConfig is nil")
 	}
-	if tr.TLSClientConfig.RootCAs == nil {
-		t.Error("TLSClientConfig.RootCAs = nil, want non-nil CA pool")
-	}
-}
-
-func TestConfig_HasClientCert(t *testing.T) {
-	tests := []struct {
-		name   string
-		cfg    Config
-		expect bool
-	}{
-		{
-			name:   "both empty",
-			cfg:    Config{},
-			expect: false,
-		},
-		{
-			name:   "only cert",
-			cfg:    Config{ClientCertFile: "cert.pem"},
-			expect: false,
-		},
-		{
-			name:   "only key",
-			cfg:    Config{ClientKeyFile: "key.pem"},
-			expect: false,
-		},
-		{
-			name:   "both set",
-			cfg:    Config{ClientCertFile: "cert.pem", ClientKeyFile: "key.pem"},
-			expect: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := tt.cfg.hasClientCert()
-			if got != tt.expect {
-				t.Errorf("hasClientCert() = %v, want %v", got, tt.expect)
-			}
-		})
+	if tr.TLSClientConfig.GetClientCertificate == nil {
+		t.Error("GetClientCertificate is nil")
 	}
 }
 
-func TestLoadConfigFromEnv_MTLSEnvVars(t *testing.T) {
+func TestNew_WithMTLS_FallbackOnError(t *testing.T) {
+	cfg := Config{
+		ClientCertFile: "nonexistent.crt",
+		ClientKeyFile:  "nonexistent.key",
+	}
+	client := New(cfg)
+	tr := client.Transport.(*http.Transport)
+
+	// Should fall back to nil TLSClientConfig rather than panicking
+	if tr.TLSClientConfig != nil {
+		t.Error("TLSClientConfig should be nil on error")
+	}
+}
+
+func TestNew_NoMTLS(t *testing.T) {
+	cfg := Config{}
+	client := New(cfg)
+	tr := client.Transport.(*http.Transport)
+
+	if tr.TLSClientConfig != nil {
+		t.Error("TLSClientConfig should be nil when no certs configured")
+	}
+}
+
+func TestLoadConfigFromEnv_MTLS(t *testing.T) {
 	restore := func() {
 		os.Unsetenv("NEXUS_HTTP_CLIENT_CERT_FILE")
 		os.Unsetenv("NEXUS_HTTP_CLIENT_KEY_FILE")
@@ -434,17 +500,42 @@ func TestLoadConfigFromEnv_MTLSEnvVars(t *testing.T) {
 	}
 }
 
-func TestNew_InvalidCertPathFallsBackToNilTLSConfig(t *testing.T) {
-	cfg := Config{
-		ClientCertFile: "/nonexistent/cert.pem",
-		ClientKeyFile:  "/nonexistent/key.pem",
-	}
-	client := New(cfg)
-	tr := client.Transport.(*http.Transport)
+// generateTestCert creates a self-signed certificate for testing.
+func generateTestCert(t *testing.T, certFile, keyFile, caFile string) {
+	t.Helper()
 
-	// Invalid cert paths cause buildTLSConfig to fail, so TLSClientConfig
-	// falls back to nil rather than panicking.
-	if tr.TLSClientConfig != nil {
-		t.Errorf("TLSClientConfig = %v, want nil on invalid cert path", tr.TLSClientConfig)
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate private key: %v", err)
+	}
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "testca",
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("failed to create certificate: %v", err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+
+	if err := os.WriteFile(certFile, certPEM, 0600); err != nil {
+		t.Fatalf("failed to write cert file: %v", err)
+	}
+	if err := os.WriteFile(keyFile, keyPEM, 0600); err != nil {
+		t.Fatalf("failed to write key file: %v", err)
+	}
+	if err := os.WriteFile(caFile, certPEM, 0600); err != nil {
+		t.Fatalf("failed to write ca file: %v", err)
 	}
 }

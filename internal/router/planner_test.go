@@ -85,9 +85,10 @@ func TestPlanner_Plan(t *testing.T) {
 				LocalPatternsRegex: localPatternsRegex,
 			},
 			req: PlanRequest{
-				// 30000 a's -> ~3750 tiktoken tokens, exceeds 3000 budget.
-				Prompt:          stringOf('a', 30000),
-				GuardrailBudget: 3000,
+				// 50000 'a's tokenise to 6250 tokens with cl100k_base BPE
+				// compression, which exceeds the 6000-token budget.
+				Prompt:          stringOf('a', 50000),
+				GuardrailBudget: 6000,
 				GuardrailSource: "static-fallback",
 				Context:         context.Background(),
 			},
@@ -322,7 +323,8 @@ func TestPlanner_Plan(t *testing.T) {
 				t.Errorf("SLM called = %v, want %v", slmUsed, tt.wantSLMCalled)
 			}
 
-			// EstimatedTokens should always be telemetry.EstimateTokens (issue #231).
+			// EstimatedTokens should match telemetry.EstimateTokens (the
+			// tiktoken-based count that the planner now uses).
 			wantTokens := telemetry.EstimateTokens(tt.req.Prompt)
 			if dec.EstimatedTokens != wantTokens {
 				t.Errorf("EstimatedTokens = %d, want %d", dec.EstimatedTokens, wantTokens)
