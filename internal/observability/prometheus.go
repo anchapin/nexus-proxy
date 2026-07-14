@@ -171,7 +171,7 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	// Cumulative frontier cost (float-valued counter).
 	writeMeta(w, "nexus_estimated_cost_usd_total",
 		"Cumulative estimated frontier cost in USD across all proxied requests.", "counter")
-	//nolint:errcheck ResponseWriter error cannot be handled after headers committed.
+	//nolint:errcheck // ResponseWriter error cannot be handled after headers committed.
 	fmt.Fprintf(w, "nexus_estimated_cost_usd_total %s\n", formatFloat(c.EstimatedCostUSD()))
 
 	// --- Middleware instrumentation (issue #70) --------------------------
@@ -214,6 +214,7 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	// nexus_budget_exceeded_total counts WouldExceed == true events.
 	writeMeta(w, "nexus_budget_recorded_usd_total",
 		"Cumulative USD recorded by the rolling daily frontier budget tracker.", "counter")
+	//nolint:errcheck // cannot check error after headers committed
 	fmt.Fprintf(w, "nexus_budget_recorded_usd_total %s\n", formatFloat(c.BudgetRecordedUSD()))
 
 	writeCounter(w, "nexus_budget_exceeded_total",
@@ -237,6 +238,7 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	// rate() function gives authentications-per-second).
 	writeMeta(w, "nexus_auth_authenticated_clients",
 		"Cumulative accepted authentications (issue #70).", "gauge")
+	//nolint:errcheck // cannot check error after headers committed
 	fmt.Fprintf(w, "nexus_auth_authenticated_clients %d\n", c.AuthAuthenticatedClients())
 
 	// --- Histograms -----------------------------------------------------
@@ -270,6 +272,7 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 			writeMeta(w, g.Name, meta.help, meta.typ)
 			seen[g.Name] = true
 		}
+		//nolint:errcheck // cannot check error after headers committed
 		fmt.Fprintf(w, "%s %s\n", g.Name, formatFloat(g.Value))
 	}
 }
@@ -284,12 +287,16 @@ type labelSample struct {
 
 // writeMeta emits the # HELP and # TYPE header lines for one metric
 // family. Called once per family before its sample lines.
+//
+//nolint:errcheck
 func writeMeta(w io.Writer, name, help, typ string) {
 	fmt.Fprintf(w, "# HELP %s %s\n", name, help)
 	fmt.Fprintf(w, "# TYPE %s %s\n", name, typ)
 }
 
 // writeCounter emits a single-sample unlabelled counter family.
+//
+//nolint:errcheck
 func writeCounter(w io.Writer, name, help string, v uint64) {
 	writeMeta(w, name, help, "counter")
 	fmt.Fprintf(w, "%s %d\n", name, v)
@@ -298,6 +305,8 @@ func writeCounter(w io.Writer, name, help string, v uint64) {
 // writeCounterLabeled emits a counter family with one label dimension.
 // Each labelSample becomes its own sample line. The label values are
 // emitted in the order given (callers pass them sorted by relevance).
+//
+//nolint:errcheck
 func writeCounterLabeled(w io.Writer, name, help, label string, samples []labelSample) {
 	writeMeta(w, name, help, "counter")
 	for _, s := range samples {
@@ -309,6 +318,8 @@ func writeCounterLabeled(w io.Writer, name, help, label string, samples []labelS
 // Each route gets its own bucket lines, _sum, and _count.
 // Routes are emitted in a fixed order (local, frontier, fusion) for
 // deterministic output.
+//
+//nolint:errcheck
 func writeHistogramLabeled(w io.Writer, name, help, label string, histograms map[string]*Histogram) {
 	writeMeta(w, name, help, "histogram")
 	// Fixed route order for deterministic output.
@@ -330,6 +341,8 @@ func writeHistogramLabeled(w io.Writer, name, help, label string, histograms map
 // writeHistogram emits a histogram family: one bucket line per finite
 // upper bound plus the +Inf bucket, then _sum and _count.
 // Kept for backward compatibility with tests and single-route use cases.
+//
+//nolint:errcheck
 func writeHistogram(w io.Writer, name, help string, h *Histogram) {
 	if h == nil {
 		return

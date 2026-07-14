@@ -1,21 +1,8 @@
 package providers
 
 import (
-	"context"
 	"testing"
-	"time"
-
-	"github.com/anchapin/nexus-proxy/internal/router"
 )
-
-// fixedStatsSource is a test double for router.ProviderStatsSource.
-type fixedStatsSource struct {
-	stats []router.ProviderStats
-}
-
-func (s *fixedStatsSource) ProviderStats(_ context.Context, _ time.Time) ([]router.ProviderStats, error) {
-	return s.stats, nil
-}
 
 func TestFrontierProvider_Fields(t *testing.T) {
 	p := NewFrontierProvider("https://api.openai.com/v1/chat/completions", "gpt-4o", "sk-test", 0.005)
