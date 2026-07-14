@@ -214,6 +214,7 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	// nexus_budget_exceeded_total counts WouldExceed == true events.
 	writeMeta(w, "nexus_budget_recorded_usd_total",
 		"Cumulative USD recorded by the rolling daily frontier budget tracker.", "counter")
+	//nolint:errcheck // cannot check error after headers committed
 	fmt.Fprintf(w, "nexus_budget_recorded_usd_total %s\n", formatFloat(c.BudgetRecordedUSD()))
 
 	writeCounter(w, "nexus_budget_exceeded_total",
@@ -237,6 +238,7 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	// rate() function gives authentications-per-second).
 	writeMeta(w, "nexus_auth_authenticated_clients",
 		"Cumulative accepted authentications (issue #70).", "gauge")
+	//nolint:errcheck // cannot check error after headers committed
 	fmt.Fprintf(w, "nexus_auth_authenticated_clients %d\n", c.AuthAuthenticatedClients())
 
 	// --- Histograms -----------------------------------------------------
@@ -270,6 +272,7 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 			writeMeta(w, g.Name, meta.help, meta.typ)
 			seen[g.Name] = true
 		}
+		//nolint:errcheck // cannot check error after headers committed
 		fmt.Fprintf(w, "%s %s\n", g.Name, formatFloat(g.Value))
 	}
 }
