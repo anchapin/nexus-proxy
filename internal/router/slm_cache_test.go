@@ -355,10 +355,10 @@ func TestSLMCache_SemanticTTLExpiry(t *testing.T) {
 
 func TestCosineSimilarity(t *testing.T) {
 	tests := []struct {
-		name    string
-		a, b    []float64
-		want    float64
-		absTol  float64
+		name   string
+		a, b   []float64
+		want   float64
+		absTol float64
 	}{
 		{"identical", []float64{1, 0, 0}, []float64{1, 0, 0}, 1.0, 0.001},
 		{"orthogonal", []float64{1, 0, 0}, []float64{0, 1, 0}, 0.0, 0.001},
