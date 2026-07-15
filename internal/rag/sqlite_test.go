@@ -420,6 +420,10 @@ func (c *countingErrEmbedder) Embed(_ context.Context, _ string) ([]float64, err
 	return nil, err
 }
 
+func (c *countingErrEmbedder) IsHealthy(_ context.Context) bool {
+	return c.err == nil
+}
+
 // Calls returns the number of Embed invocations observed by this
 // embedder. Safe for concurrent use.
 func (c *countingErrEmbedder) Calls() int {
@@ -451,6 +455,10 @@ func (v *vectorEmbedder) Embed(_ context.Context, text string) ([]float64, error
 	return []float64{0, 0, 0}, nil
 }
 
+func (v *vectorEmbedder) IsHealthy(_ context.Context) bool {
+	return v.err == nil
+}
+
 // indexedCallCounter counts every Embed call so tests can
 // distinguish the disk-cache fast path (1 call — only the
 // prompt) from a regression where the cache was bypassed
@@ -471,6 +479,10 @@ func (c *indexedCallCounter) Embed(_ context.Context, text string) ([]float64, e
 		return out, nil
 	}
 	return []float64{0, 0, 0}, nil
+}
+
+func (c *indexedCallCounter) IsHealthy(_ context.Context) bool {
+	return true
 }
 
 func (c *indexedCallCounter) totalCalls() int {

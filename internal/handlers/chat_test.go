@@ -34,6 +34,10 @@ func (s stubEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
 	return s.vec, nil
 }
 
+func (s stubEmbedder) IsHealthy(_ context.Context) bool {
+	return true
+}
+
 func baseDeps(t *testing.T) (Deps, *upstream.RecordingTransport) {
 	t.Helper()
 	cfg := config.Config{

@@ -202,7 +202,7 @@ func (r *recordingMetricsObserver) snapshot() []MetricsEvent {
 
 // TestChatMetricsEventCarriesRouteDecisionFields verifies the
 // MetricsEvent observer hook receives the issue #74 fields populated
-// from the planner Decision (guardrail path is deterministic — no
+// from the planner Decision (DSL path is deterministic — no
 // SLM stub needed).
 func TestChatMetricsEventCarriesRouteDecisionFields(t *testing.T) {
 	deps, rt := baseDeps(t)

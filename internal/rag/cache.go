@@ -90,3 +90,8 @@ func (c *CachedEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 	}
 	return vec, nil
 }
+
+// IsHealthy delegates to the inner embedder.
+func (c *CachedEmbedder) IsHealthy(ctx context.Context) bool {
+	return c.inner.IsHealthy(ctx)
+}

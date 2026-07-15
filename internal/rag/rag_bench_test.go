@@ -36,6 +36,10 @@ func (e constEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
 	return e.vec, nil
 }
 
+func (e constEmbedder) IsHealthy(_ context.Context) bool {
+	return true
+}
+
 // BenchmarkCosineSimilarity measures the raw dot-product + norm
 // computation at the default 768-dimension embedding width. This is
 // the inner loop of Retrieve — called once per indexed example.

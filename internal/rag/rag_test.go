@@ -53,6 +53,10 @@ func (s *stubEmbedder) Embed(_ context.Context, text string) ([]float64, error) 
 	return []float64{0, 0, 0}, nil
 }
 
+func (s *stubEmbedder) IsHealthy(_ context.Context) bool {
+	return true
+}
+
 func TestRetrieveThreshold(t *testing.T) {
 	emb := &stubEmbedder{vecs: map[string][]float64{
 		"prompt":     {1, 0, 0},

@@ -28,6 +28,10 @@ func (c *countingEmbedder) Embed(_ context.Context, text string) ([]float64, err
 	return []float64{float64(len(text)), 0, 0}, nil
 }
 
+func (c *countingEmbedder) IsHealthy(_ context.Context) bool {
+	return true
+}
+
 func (c *countingEmbedder) callCount(text string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
