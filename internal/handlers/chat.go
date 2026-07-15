@@ -189,6 +189,9 @@ const (
 	RejectionJudgeQueue = "judge_queue"
 	// RejectionQualityQueue marks a rejection due to quality queue overflow.
 	RejectionQualityQueue = "quality_queue"
+	// RejectionBudget marks a 429 Too Many Requests response emitted
+	// when the rolling 24h frontier budget is exhausted (issue #220).
+	RejectionBudget = "budget"
 )
 
 // RejectionEvent carries the minimal context a rejection observer
@@ -537,6 +540,17 @@ type Deps struct {
 	// handler behaves identically to before issue #6 when no
 	// probe is wired.
 	BudgetObserver BudgetObserver
+
+	// SpendGuard is the rolling 24h USD spend guard for frontier
+	// API calls (issue #220). When non-nil, the handler calls
+	// Guard.Check(cost) before every route=frontier or route=fusion
+	// dispatch and returns 429 when exhausted; after a successful
+	// frontier API call it calls Guard.Record(cost, "frontier").
+	// Nil means budget enforcement is disabled (pre-#220 behaviour).
+	SpendGuard interface {
+		Check(cost float64) bool
+		Record(cost float64, source string)
+	}
 
 	// LocalLimiter bounds concurrent local-route requests (issue
 	// #81). When non-nil the handler Acquires a slot before issuing
@@ -1124,6 +1138,16 @@ func Chat(d Deps) http.Handler {
 		// + metrics so the dashboard can report how many tool calls
 		// were preserved. Zero on all other paths.
 		var toolCallCount int
+		// frontierCost estimates the USD cost of the frontier leg of this
+		// request (issue #220). It is computed here so both the
+		// route=frontier and route=fusion cases can call Check/Record
+		// without re-estimating. It is only non-zero when SpendGuard
+		// is wired and the route touches frontier.
+		var frontierCost float64
+		if d.SpendGuard != nil && (route == router.RouteFrontier || route == router.RouteFusion) {
+			inputTokens := telemetry.EstimateTokens(latestPrompt)
+			frontierCost = float64(inputTokens) * d.Config.FrontierCostPer1K / 1000.0
+		}
 		// capw is the response-body captureWriter installed for the
 		// local cascade branch when judge/quality observers OR
 		// debug tracing are configured (issue #33). Hoisted out of
@@ -1158,6 +1182,16 @@ func Chat(d Deps) http.Handler {
 			trace.Upstream.Streaming = streaming
 			trace.Upstream.Model = d.Config.FrontierModel
 			trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
+			// Budget guard: check before fusion frontier dispatch (issue #220).
+			if d.SpendGuard != nil && frontierCost > 0 && d.SpendGuard.Check(frontierCost) {
+				slog.Warn("budget exhausted, rejecting fusion request",
+					slog.String("request_id", reqID),
+					slog.Float64("cost_estimate", frontierCost),
+				)
+				recordRejection(RejectionBudget)
+				http.Error(w, "Budget exhausted", http.StatusTooManyRequests)
+				break
+			}
 			if streaming && d.Config.FusionProgressiveDelivery {
 				var outcome upstream.PanelOutcome
 				outcome, upErr = upstream.PanelStreaming(
@@ -1214,6 +1248,9 @@ func Chat(d Deps) http.Handler {
 					slog.String("request_id", reqID),
 				)
 				http.Error(w, "Upstream error", http.StatusBadGateway)
+			} else if d.SpendGuard != nil && frontierCost > 0 {
+				// Budget guard: record after successful fusion frontier leg (issue #220).
+				d.SpendGuard.Record(frontierCost, "frontier")
 			}
 			model = d.Config.FrontierModel
 
@@ -1461,6 +1498,16 @@ func Chat(d Deps) http.Handler {
 
 		default:
 			model = d.Config.FrontierModel
+			// Budget guard: check before frontier dispatch (issue #220).
+			if d.SpendGuard != nil && frontierCost > 0 && d.SpendGuard.Check(frontierCost) {
+				slog.Warn("budget exhausted, rejecting frontier request",
+					slog.String("request_id", reqID),
+					slog.Float64("cost_estimate", frontierCost),
+				)
+				recordRejection(RejectionBudget)
+				http.Error(w, "Budget exhausted", http.StatusTooManyRequests)
+				break
+			}
 			// Honor the harness's stream flag (issue #10). Stream
 			// preserves SSE framing for chunked deliveries;
 			// BufferedFetch collects the full body and returns a
@@ -1492,8 +1539,11 @@ func Chat(d Deps) http.Handler {
 						slog.Any("err", upErr),
 						slog.String("request_id", reqID),
 					)
-					http.Error(w, "Upstream error", http.StatusBadGateway)
-				}
+				http.Error(w, "Upstream error", http.StatusBadGateway)
+			}
+			} else if d.SpendGuard != nil && frontierCost > 0 {
+				// Budget guard: record after successful frontier call (issue #220).
+				d.SpendGuard.Record(frontierCost, "frontier")
 			}
 			// Debug trace (issue #33): route=frontier is a single
 			// endpoint with no cascade — populate the trace with
