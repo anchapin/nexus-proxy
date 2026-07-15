@@ -14,14 +14,14 @@ import (
 func TestStatusHandler(t *testing.T) {
 	// Setup a status handler with all deps wired.
 	handler := Status(StatusDeps{
-		JudgeEnabled:   func() bool { return true },
-		JudgeDepth:     func() int { return 3 },
-		JudgeCapacity:  func() int { return 64 },
-		JudgeWorkers:   func() int { return 2 },
+		JudgeEnabled:    func() bool { return true },
+		JudgeDepth:      func() int { return 3 },
+		JudgeCapacity:   func() int { return 64 },
+		JudgeWorkers:    func() int { return 2 },
 		QualityEnabled:  func() bool { return true },
-		QualityDepth:   func() int { return 0 },
+		QualityDepth:    func() int { return 0 },
 		QualityCapacity: func() int { return 64 },
-		QualityWorkers: func() int { return 2 },
+		QualityWorkers:  func() int { return 2 },
 		RAGHealthy: func(ctx context.Context) bool {
 			return true
 		},
@@ -47,11 +47,11 @@ func TestStatusHandler(t *testing.T) {
 	}
 
 	var resp struct {
-		Judge   JudgeStatus    `json:"judge"`
-		Quality QualityStatus  `json:"quality"`
-		RAG     RAGStatus     `json:"rag"`
+		Judge   JudgeStatus     `json:"judge"`
+		Quality QualityStatus   `json:"quality"`
+		RAG     RAGStatus       `json:"rag"`
 		Routing RoutingSnapshot `json:"routing"`
-		Uptime  int64         `json:"uptime_ms"`
+		Uptime  int64           `json:"uptime_ms"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("json.Unmarshal: %v", err)
@@ -113,14 +113,14 @@ func TestStatusHandler(t *testing.T) {
 func TestStatusHandlerDisabledSubsystems(t *testing.T) {
 	// All subsystems disabled.
 	handler := Status(StatusDeps{
-		JudgeEnabled:   func() bool { return false },
-		JudgeDepth:     func() int { return 0 },
-		JudgeCapacity:  func() int { return 0 },
-		JudgeWorkers:   func() int { return 0 },
+		JudgeEnabled:    func() bool { return false },
+		JudgeDepth:      func() int { return 0 },
+		JudgeCapacity:   func() int { return 0 },
+		JudgeWorkers:    func() int { return 0 },
 		QualityEnabled:  func() bool { return false },
-		QualityDepth:   func() int { return 0 },
+		QualityDepth:    func() int { return 0 },
 		QualityCapacity: func() int { return 0 },
-		QualityWorkers: func() int { return 0 },
+		QualityWorkers:  func() int { return 0 },
 		RAGHealthy: func(ctx context.Context) bool {
 			return false
 		},
@@ -140,8 +140,8 @@ func TestStatusHandlerDisabledSubsystems(t *testing.T) {
 	}
 
 	var resp struct {
-		Judge   JudgeStatus    `json:"judge"`
-		Quality QualityStatus  `json:"quality"`
+		Judge   JudgeStatus   `json:"judge"`
+		Quality QualityStatus `json:"quality"`
 		RAG     RAGStatus     `json:"rag"`
 		Uptime  int64         `json:"uptime_ms"`
 	}
@@ -168,18 +168,18 @@ func TestStatusHandlerDisabledSubsystems(t *testing.T) {
 
 func TestStatusHandlerContentType(t *testing.T) {
 	handler := Status(StatusDeps{
-		JudgeEnabled:   func() bool { return false },
-		JudgeDepth:     func() int { return 0 },
-		JudgeCapacity:  func() int { return 0 },
-		JudgeWorkers:   func() int { return 0 },
-		QualityEnabled:  func() bool { return false },
-		QualityDepth:   func() int { return 0 },
-		QualityCapacity: func() int { return 0 },
-		QualityWorkers: func() int { return 0 },
-		RAGHealthy:     func(ctx context.Context) bool { return false },
+		JudgeEnabled:       func() bool { return false },
+		JudgeDepth:         func() int { return 0 },
+		JudgeCapacity:      func() int { return 0 },
+		JudgeWorkers:       func() int { return 0 },
+		QualityEnabled:     func() bool { return false },
+		QualityDepth:       func() int { return 0 },
+		QualityCapacity:    func() int { return 0 },
+		QualityWorkers:     func() int { return 0 },
+		RAGHealthy:         func(ctx context.Context) bool { return false },
 		RAGIndexedExamples: func() int { return 0 },
-		RoutingSnapshot: func() RoutingSnapshot { return RoutingSnapshot{} },
-		Uptime:         func() time.Duration { return 0 },
+		RoutingSnapshot:    func() RoutingSnapshot { return RoutingSnapshot{} },
+		Uptime:             func() time.Duration { return 0 },
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/status", nil)
@@ -195,18 +195,18 @@ func TestStatusHandlerContentType(t *testing.T) {
 func TestStatusHandlerNilFunctions(t *testing.T) {
 	// Verify that nil function fields don't panic.
 	handler := Status(StatusDeps{
-		JudgeEnabled:   nil,
-		JudgeDepth:     nil,
-		JudgeCapacity:  nil,
-		JudgeWorkers:   nil,
-		QualityEnabled:  nil,
-		QualityDepth:   nil,
-		QualityCapacity: nil,
-		QualityWorkers: nil,
-		RAGHealthy:     nil,
+		JudgeEnabled:       nil,
+		JudgeDepth:         nil,
+		JudgeCapacity:      nil,
+		JudgeWorkers:       nil,
+		QualityEnabled:     nil,
+		QualityDepth:       nil,
+		QualityCapacity:    nil,
+		QualityWorkers:     nil,
+		RAGHealthy:         nil,
 		RAGIndexedExamples: nil,
-		RoutingSnapshot: nil,
-		Uptime:         nil,
+		RoutingSnapshot:    nil,
+		Uptime:             nil,
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/status", nil)
@@ -221,8 +221,8 @@ func TestStatusHandlerNilFunctions(t *testing.T) {
 
 	// Verify all zero values.
 	var resp struct {
-		Judge   JudgeStatus    `json:"judge"`
-		Quality QualityStatus  `json:"quality"`
+		Judge   JudgeStatus   `json:"judge"`
+		Quality QualityStatus `json:"quality"`
 		RAG     RAGStatus     `json:"rag"`
 		Uptime  int64         `json:"uptime_ms"`
 	}
