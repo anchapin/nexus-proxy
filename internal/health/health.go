@@ -71,6 +71,12 @@ type Health struct {
 	// the last success. Reset to 0 on every successful probe.
 	failureCount atomic.Int32
 
+	// mu serializes recordSuccess to ensure that Swap(true) and
+	// Store(0) are observable together — without this mutex a
+	// goroutine could see healthy==true but a stale failureCount
+	// due to CPU cache ordering between the two atomics.
+	mu sync.Mutex
+
 	closeOnce sync.Once
 	closed    chan struct{}
 	wg        sync.WaitGroup
@@ -123,6 +129,8 @@ func (h *Health) IsLocalHealthy() bool {
 	if h == nil {
 		return true
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	return h.healthy.Load()
 }
 
@@ -133,6 +141,8 @@ func (h *Health) FailureCount() int {
 	if h == nil {
 		return 0
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	return int(h.failureCount.Load())
 }
 
@@ -152,7 +162,7 @@ func (h *Health) Run(ctx context.Context) {
 	_ = h.probe(probeCtx)
 	cancel()
 
-	if !h.healthy.Load() {
+	if !h.IsLocalHealthy() {
 		slog.Warn("ollama unreachable at boot; local model marked unhealthy",
 			slog.String("ollama_url", h.ollamaURL),
 			slog.Int("threshold", int(h.breakerThreshold)),
@@ -292,6 +302,8 @@ func (h *Health) probe(ctx context.Context) error {
 // flaky for a single probe — but are still logged at debug for
 // observability.
 func (h *Health) recordFailure(err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	count := h.failureCount.Add(1)
 	wasHealthy := h.healthy.Load()
 	if count >= h.breakerThreshold {
@@ -319,6 +331,8 @@ func (h *Health) recordFailure(err error) {
 // unhealthy → healthy transition so the operator sees the recovery
 // without the noise of every subsequent successful probe.
 func (h *Health) recordSuccess() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if !h.healthy.Swap(true) {
 		slog.Info("ollama health: recovered",
 			slog.String("ollama_url", h.ollamaURL),

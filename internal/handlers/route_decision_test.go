@@ -98,7 +98,9 @@ func TestChatSetsRouteDecisionHeadersForGuardrail(t *testing.T) {
 	deps, rt := baseDeps(t)
 	deps.RouteDecisionObserver = &routeDecisionRecorder{}
 
-	largeUser := strings.Repeat("a", 49000)
+	// 48500 char prompt ≈ 6062 tokens > 6000 guardrail. Reduced from
+	// 49000 to speed tiktoken encoding in race mode on shared CI runners.
+	largeUser := strings.Repeat("a", 48500)
 	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "frontier stream")
