@@ -122,6 +122,8 @@ type RouteCounters struct {
 	cascadeFallbacks         map[string]*uint64
 	arbiterCache             map[string]*uint64 // "hit" | "miss"
 
+	judgeQueueOverflow   uint64 // atomic; use atomic.AddUint64/atomic.LoadUint64
+	qualityQueueOverflow uint64 // atomic; use atomic.AddUint64/atomic.LoadUint64
 }
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
@@ -349,6 +351,26 @@ func (rc *RouteCounters) ObserveArbiterCacheHit(hit bool) {
 	atomic.AddUint64(p, 1)
 }
 
+// ObserveJudgeQueueOverflow records one judge queue overflow event
+// (issue #226). The judge evaluator calls this when its internal
+// Enqueue returns false due to a full queue.
+func (rc *RouteCounters) ObserveJudgeQueueOverflow() {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(&rc.judgeQueueOverflow, 1)
+}
+
+// ObserveQualityQueueOverflow records one quality verifier queue overflow
+// event (issue #226). The quality verifier calls this when its
+// internal Submit returns false due to a full queue.
+func (rc *RouteCounters) ObserveQualityQueueOverflow() {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(&rc.qualityQueueOverflow, 1)
+}
+
 // reasonSlot returns the *uint64 for reason, creating it if absent.
 // Same lock-then-atomic pattern as slot: the mutex guards the map
 // mutation only, the increment happens lock-free.
@@ -471,6 +493,20 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	if n, err := writeRejectionSeries(w, "nexus_fusion_arbiter_cache_total",
 		"Fusion arbiter synthesis cache hits and misses (issue #232).",
 		rc.arbiterCache); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeOverflowSeries(w, "nexus_judge_queue_overflow_total",
+		"Judge evaluator queue overflow events — sample was dropped because the queue was full.",
+		&rc.judgeQueueOverflow); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeOverflowSeries(w, "nexus_quality_queue_overflow_total",
+		"Quality verifier queue overflow events — event was dropped because the queue was full.",
+		&rc.qualityQueueOverflow); err != nil {
 		return total, err
 	} else {
 		total += n
@@ -670,6 +706,23 @@ func writeSLMCacheSeries(w io.Writer, hits, misses *uint64) (int64, error) {
 	total += int64(n)
 
 	return total, nil
+}
+
+// writeOverflowSeries emits a simple unlabeled counter for queue
+// overflow events (issue #226). Unlike the map-based counters, the
+// overflow counters are plain uint64 fields so we can use atomic
+// operations without mutex contention on the hot path.
+func writeOverflowSeries(w io.Writer, name, help string, counter *uint64) (int64, error) {
+	n, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", name, help, name)
+	if err != nil {
+		return int64(n), err
+	}
+	v := atomic.LoadUint64(counter)
+	n, err = fmt.Fprintf(w, "%s %d\n", name, v)
+	if err != nil {
+		return int64(n), err
+	}
+	return int64(n), nil
 }
 
 // keyLess reports whether k1 < k2 considering only the fields named
