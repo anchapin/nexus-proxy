@@ -711,6 +711,7 @@ func main() {
 		Recorder:                recorder,
 		Health:                  hpoller,
 		BudgetObserver:          budgetObserver(probeMgr),
+		SpendGuard:              budgetGuard, // nil when budget disabled (issue #220)
 		LocalLimiter:            localLimiter,
 		LocalCooldown:           localCooldown,
 		RouteDecisionObserver:   routeDecisionObs,
