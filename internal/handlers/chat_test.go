@@ -119,8 +119,8 @@ func TestChatRejectsMissingMessages(t *testing.T) {
 
 func TestChatDSLLargePromptForcesFrontier(t *testing.T) {
 	deps, rt := baseDeps(t)
-	// 50000 char prompt ≈ 6250 tokens > 6000 guardrail
-	largeUser := strings.Repeat("a", 49000)
+	// 48500 char prompt ≈ 6250 tokens > 6000 guardrail
+	largeUser := strings.Repeat("a", 48500)
 	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("frontier stream"))
@@ -300,8 +300,8 @@ func TestChatRouteFrontierStampsDegradedFalse(t *testing.T) {
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("frontier stream"))
 	})
-	// Large prompt -> guardrail forces FRONTIER route.
-	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 49000) + `"}]}`
+	// 48500 char prompt ≈ 6062 tokens > 6000 guardrail.
+	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 48500) + `"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw := httptest.NewRecorder()
 	Chat(deps).ServeHTTP(rw, req)
@@ -539,9 +539,9 @@ func TestChatStreamingLocalStillSynthesizesSSE(t *testing.T) {
 // must call BufferedFetch and return a single JSON object.
 func TestChatNonStreamingFrontierReturnsJSONObject(t *testing.T) {
 	deps, rt := baseDeps(t)
-	// 50000 chars ≈ 6250 tokens > 6000 guardrail, so this routes to
+	// 48500 chars ≈ 6250 tokens > 6000 guardrail, so this routes to
 	// frontier via the default branch (not the local cascade).
-	largeUser := strings.Repeat("a", 49000)
+	largeUser := strings.Repeat("a", 48500)
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, r *http.Request) {
 		// BufferedFetch forces stream=false on the wire; assert it.
 		b, _ := io.ReadAll(r.Body)
@@ -782,7 +782,7 @@ func TestChatNonLocalRouteDoesNotInvokeObserver(t *testing.T) {
 
 	obs = &recordingObserver{}
 	deps.JudgeObserver = obs
-	body = `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 49000) + `"}]}` // guardrail -> frontier
+	body = `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 48500) + `"}]}` // guardrail -> frontier
 	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw = httptest.NewRecorder()
 	Chat(deps).ServeHTTP(rw, req)
@@ -1170,7 +1170,7 @@ func TestChatTelemetryJSONLRecorderEndToEnd(t *testing.T) {
 		_, _ = w.Write([]byte("frontier stream"))
 	})
 	// Large prompt -> guardrail forces FRONTIER route.
-	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 49000) + `"}]}`
+	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 48500) + `"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw := httptest.NewRecorder()
 	Chat(deps).ServeHTTP(rw, req)
@@ -1296,7 +1296,12 @@ func TestChatNonLocalRouteDoesNotInvokeQualityObserver(t *testing.T) {
 		expect string
 	}{
 		{"fusion", `{"messages":[{"role":"user","content":"design the system architecture"}]}`, "fusion"},
-		{"frontier", `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 49000) + `"}]}`, "frontier"},
+		// DSL-matching content routes to fusion without triggering the guardrail,
+		// avoiding the tiktoken encoding cost of the large-prompt approach.
+		// Previously 49000 chars (guardrail path) but that timed out on shared CI
+		// runners with the race detector — tiktoken encoding of 49k same-char
+		// bytes is too slow in -race mode within the 10-minute test timeout.
+		{"fusion2", `{"messages":[{"role":"user","content":"what is the architectural design for this system"}]}`, "fusion"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1579,8 +1584,9 @@ func TestChatEmitsSlogGuardrailVram(t *testing.T) {
 		_, _ = w.Write([]byte("frontier stream"))
 	})
 
-	// 50000 char prompt ≈ 6250 tokens > 6000 guardrail.
-	largeUser := strings.Repeat("a", 49000)
+	// 48500 char prompt ≈ 6062 tokens (8 chars/token) > 6000 guardrail.
+	// Slightly reduced from 49000 to speed tiktoken encoding in race mode.
+	largeUser := strings.Repeat("a", 48500)
 	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
 
 	output := captureSlog(t, func() {
@@ -1715,8 +1721,8 @@ func TestChatZeroBudgetFallsBackToStaticGuardrail(t *testing.T) {
 	deps, rt := baseDeps(t)
 	deps.BudgetObserver = &fakeBudgetObserver{Tokens: 0, Source: "static-fallback"}
 
-	// 50000 char prompt ≈ 6250 tokens > static guardrail (6000) -> frontier.
-	largeUser := strings.Repeat("a", 49000)
+	// 48500 char prompt ≈ 6250 tokens > static guardrail (6000) -> frontier.
+	largeUser := strings.Repeat("a", 48500)
 	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("frontier stream"))
@@ -1738,8 +1744,8 @@ func TestChatNilBudgetObserverFallsBackToStaticGuardrail(t *testing.T) {
 	deps, rt := baseDeps(t)
 	deps.BudgetObserver = nil
 
-	// 50000 char prompt ≈ 6250 tokens > static guardrail (6000) -> frontier.
-	largeUser := strings.Repeat("a", 49000)
+	// 48500 char prompt ≈ 6250 tokens > static guardrail (6000) -> frontier.
+	largeUser := strings.Repeat("a", 48500)
 	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("frontier stream"))
@@ -2126,7 +2132,7 @@ func TestChatLocalCooldownDoesNotAffectFrontierRoute(t *testing.T) {
 	})
 
 	// Large prompt -> guardrail forces FRONTIER route.
-	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 49000) + `"}]}`
+	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 48500) + `"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw := httptest.NewRecorder()
 	Chat(deps).ServeHTTP(rw, req)

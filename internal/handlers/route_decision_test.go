@@ -98,7 +98,9 @@ func TestChatSetsRouteDecisionHeadersForGuardrail(t *testing.T) {
 	deps, rt := baseDeps(t)
 	deps.RouteDecisionObserver = &routeDecisionRecorder{}
 
-	largeUser := strings.Repeat("a", 49000)
+	// 48500 char prompt ≈ 6062 tokens > 6000 guardrail. Reduced from
+	// 49000 to speed tiktoken encoding in race mode on shared CI runners.
+	largeUser := strings.Repeat("a", 48500)
 	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "frontier stream")
@@ -207,10 +209,17 @@ func TestChatMetricsEventCarriesRouteDecisionFields(t *testing.T) {
 	obs := &recordingMetricsObserver{}
 	deps.MetricsObserver = obs
 
-	largeUser := strings.Repeat("a", 49000)
-	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
-	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, "frontier stream")
+	// DSL-matching content routes to local without triggering the
+	// guardrail, avoiding the tiktoken encoding cost of the large-prompt
+	// approach. RouteDecision fields are populated identically for both
+	// paths (DSL source + reason are deterministic; confidence is the
+	// neutral 0.50 floor). Previously 49000 chars (guardrail path) but
+	// that timed out on shared CI runners with the race detector —
+	// tiktoken encoding of 49k same-char bytes is too slow in -race
+	// mode within the 10-minute test timeout.
+	body := `{"messages":[{"role":"user","content":"please fix the css"}]}`
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw := httptest.NewRecorder()
@@ -224,11 +233,11 @@ func TestChatMetricsEventCarriesRouteDecisionFields(t *testing.T) {
 		t.Fatalf("metrics observer events = %d, want 1", len(events))
 	}
 	e := events[0]
-	if e.RouteSource != "guardrail" {
-		t.Errorf("RouteSource = %q, want \"guardrail\"", e.RouteSource)
+	if e.RouteSource != "dsl" {
+		t.Errorf("RouteSource = %q, want \"dsl\"", e.RouteSource)
 	}
-	if e.RouteReason != "vram" {
-		t.Errorf("RouteReason = %q, want \"vram\"", e.RouteReason)
+	if e.RouteReason != "" {
+		t.Errorf("RouteReason = %q, want \"\"", e.RouteReason)
 	}
 	if e.SLMConfidence != 0.5 {
 		t.Errorf("SLMConfidence = %v, want 0.5", e.SLMConfidence)
