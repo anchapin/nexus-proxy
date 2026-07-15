@@ -23,7 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
+
 	"time"
 )
 
@@ -555,6 +555,20 @@ func NewOllamaEmbedder(baseURL, model string, client *http.Client, cb BreakerCon
 	}
 	e.breakerThreshold.Store(int32(cb.Threshold))
 	return e
+}
+
+// IsHealthy checks whether the Ollama embedder is reachable by issuing a
+// short embed request with the given timeout. It returns true if the request
+// succeeds within the timeout, false otherwise. A nil context uses the default
+// background timeout of 2 seconds.
+func (o *OllamaEmbedder) IsHealthy(ctx context.Context) bool {
+	if ctx == nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+	}
+	_, err := o.Embed(ctx, "health check")
+	return err == nil
 }
 
 // Embed fetches the embedding vector for text. If the circuit breaker is

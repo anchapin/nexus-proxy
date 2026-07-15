@@ -426,6 +426,40 @@ func (rc *RouteCounters) Handler() http.Handler {
 	})
 }
 
+// Snapshot returns a point-in-time copy of the routing decision counters
+// as a sorted slice. Used by the /status JSON endpoint to provide a
+// routing distribution snapshot without exposing the internal counter map.
+func (rc *RouteCounters) Snapshot() []RouteCounterEntry {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	var entries []RouteCounterEntry
+	for k, v := range rc.routeDecisions {
+		entries = append(entries, RouteCounterEntry{
+			Route:  k.route,
+			Source: k.source,
+			Count:  atomic.LoadUint64(v),
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Route != entries[j].Route {
+			return entries[i].Route < entries[j].Route
+		}
+		return entries[i].Source < entries[j].Source
+	})
+	return entries
+}
+
+// RouteCounterEntry is one route/source bucket from the routing snapshot.
+type RouteCounterEntry struct {
+	Route  string `json:"route"`
+	Source string `json:"source"`
+	Count  uint64 `json:"count"`
+}
+
 // WriteTo writes the full Prometheus text exposition to w. The output
 // is deterministic: series are sorted by label key so successive
 // scrapes diff cleanly. Returns the number of bytes written and any
