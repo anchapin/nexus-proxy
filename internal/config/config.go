@@ -17,6 +17,7 @@ import (
 
 	"github.com/anchapin/nexus-proxy/internal/middleware"
 	ragpkg "github.com/anchapin/nexus-proxy/internal/rag"
+	"github.com/anchapin/nexus-proxy/internal/providers"
 )
 
 // Config holds all runtime knobs for the proxy. A zero value is invalid;
@@ -76,6 +77,13 @@ type Config struct {
 	// reconnaissance-grade and should be gated by default.
 	ProxyAPIKey  string // NEXUS_PROXY_API_KEY; empty disables auth
 	StatusPublic bool   // NEXUS_STATUS_PUBLIC; exposes /status without auth
+
+	// Multi-frontier provider registry (issue #223). When NEXUS_FRONTIERS is
+	// set, its value is parsed into a providers.Registry at boot and
+	// main.go wires it to the chat handler. When empty the proxy falls
+	// back to the legacy frontier+z.ai Config.FrontierProviders() path so
+	// a stock deployment is byte-for-byte identical to the pre-#223 behaviour.
+	FrontierProvidersRaw string
 
 	// RAG
 	ExamplesDir  string  // "./few_shot_examples"
@@ -432,6 +440,7 @@ func DefaultJudgeDBPath() string {
 // value is malformed; missing optional values fall back to defaults.
 func Load() (Config, error) {
 	cfg := Config{
+<<<<<<< HEAD
 		Addr:            getEnv("NEXUS_ADDR", ":8000"),
 		OllamaURL:       strings.TrimRight(getEnv("NEXUS_OLLAMA_URL", "http://localhost:11434"), "/"),
 		RouterModel:     getEnv("NEXUS_ROUTER_MODEL", "qwen3-coder:4b"),
@@ -452,6 +461,25 @@ func Load() (Config, error) {
 		MiddlewareChain: getEnv("NEXUS_MIDDLEWARE_CHAIN", ""),
 		TelemetryPath:   getEnvAllowEmpty("NEXUS_TELEMETRY_PATH", "./nexus-telemetry.jsonl"),
 		MetricsDBPath:   getEnvAllowEmpty("NEXUS_METRICS_DB", DefaultMetricsDBPath()),
+=======
+		Addr:           getEnv("NEXUS_ADDR", ":8000"),
+		OllamaURL:      strings.TrimRight(getEnv("NEXUS_OLLAMA_URL", "http://localhost:11434"), "/"),
+		RouterModel:    getEnv("NEXUS_ROUTER_MODEL", "qwen3-coder:4b"),
+		LocalModel:     getEnv("NEXUS_LOCAL_MODEL", "qwen3-coder:8b"),
+		EmbeddingModel: getEnv("NEXUS_EMBEDDING_MODEL", "nomic-embed-text"),
+		FrontierURL:    getEnv("NEXUS_FRONTIER_URL", "https://api.openai.com/v1/chat/completions"),
+		FrontierModel:  getEnv("NEXUS_FRONTIER_MODEL", "gpt-4o"),
+		FrontierKey:    getEnv("NEXUS_FRONTIER_API_KEY", ""),
+		ZAIURL:         getEnv("NEXUS_ZAI_URL", "https://api.z.ai/v1/chat/completions"),
+		ZAIModel:       getEnv("NEXUS_ZAI_MODEL", "glm-4.6"),
+		ZAIKey:         getEnv("NEXUS_ZAI_API_KEY", ""),
+		FrontierProvidersRaw: os.Getenv("NEXUS_FRONTIERS"),
+		ExamplesDir:    getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
+		MetaPrompt:     defaultMetaPrompt,
+		TOONNotice:     defaultTOONNotice,
+		TelemetryPath:  getEnvAllowEmpty("NEXUS_TELEMETRY_PATH", "./nexus-telemetry.jsonl"),
+		MetricsDBPath:  getEnvAllowEmpty("NEXUS_METRICS_DB", DefaultMetricsDBPath()),
+>>>>>>> 4d65e7e (feat: resolve #223 — config-driven provider registry wiring)
 	}
 
 	threshold, err := getEnvFloat("NEXUS_RAG_THRESHOLD", 0.55)
@@ -1115,7 +1143,47 @@ func (c Config) FrontierProviders() []FrontierProvider {
 	return out
 }
 
-// DefaultServerReadTimeout is the default inbound request read deadline
+// FrontierProvidersFromEnv returns the providers registered via NEXUS_FRONTIERS
+// as a Registry. When NEXUS_FRONTIERS is empty it falls back to the legacy
+// frontier+z.ai providers from FrontierProviders() so a stock deployment is
+// byte-for-byte identical to the pre-#223 behaviour.
+func (c Config) FrontierProvidersFromEnv() (*providers.Registry, error) {
+	if c.FrontierProvidersRaw != "" {
+		return providers.ParseProviders(c.FrontierProvidersRaw)
+	}
+	// Fall back to the legacy Config.FrontierProviders path.
+	reg := providers.NewRegistry()
+	for _, fp := range c.FrontierProviders() {
+		reg.Register(newFrontierProviderAdapter(fp))
+	}
+	return reg, nil
+}
+
+// frontierProviderAdapter wraps a config.FrontierProvider to satisfy
+// providers.Provider without a name collision on the APIKey field/method.
+type frontierProviderAdapter struct {
+	name      string
+	baseURL   string
+	model     string
+	apiKey    string
+	costPer1K float64
+}
+
+func newFrontierProviderAdapter(fp FrontierProvider) *frontierProviderAdapter {
+	return &frontierProviderAdapter{
+		name:      fp.Name,
+		baseURL:   fp.URL,
+		model:     fp.Model,
+		apiKey:    fp.APIKey,
+		costPer1K: fp.CostPer1KUSD,
+	}
+}
+
+func (a *frontierProviderAdapter) Name() string      { return a.name }
+func (a *frontierProviderAdapter) BaseURL() string  { return a.baseURL }
+func (a *frontierProviderAdapter) Model() string      { return a.model }
+func (a *frontierProviderAdapter) APIKey() string    { return a.apiKey }
+func (a *frontierProviderAdapter) CostPer1K() float64 { return a.costPer1K }
 // (issue #77). 30s is generous for chat-completion payloads while still
 // disconnecting slow-header/slow-body abuse well before the connection
 // ties up a goroutine for minutes.

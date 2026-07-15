@@ -36,8 +36,6 @@ import (
 // judge needs to score a response. The handler never imports judge —
 // the observer plugs in from cmd/nexus/main.go.
 type LocalCompletion struct {
-	TraceParent string
-	TraceState  string
 	RequestID   string
 	Instruction string
 	Output      string
@@ -51,50 +49,15 @@ type LocalCompletion struct {
 // long. The handler also enforces a body-size cap before invoking
 // the hook so a runaway model cannot blow the observer's memory.
 type JudgeObserver interface {
-	Submit(LocalCompletion) bool
+	Submit(LocalCompletion)
 }
 
 // JudgeObserverFunc adapts a plain function to the JudgeObserver
 // interface so wiring from main.go stays a one-liner.
-type JudgeObserverFunc func(LocalCompletion) bool
+type JudgeObserverFunc func(LocalCompletion)
 
 // Submit implements JudgeObserver.
-func (f JudgeObserverFunc) Submit(c LocalCompletion) bool { f(c); return true }
-
-// LatencyEvent is emitted to the LatencyObserver hook after every
-// upstream response with timing metadata.
-type LatencyEvent struct {
-	Route          string
-	LatencySeconds float64
-	TTFTSeconds    float64
-	IsError        bool
-}
-
-// LatencyObserver is called after each request completes with timing
-// information for dashboards and alerting.
-type LatencyObserver interface {
-	ObserveLatency(LatencyEvent)
-}
-
-// LatencyObserverFunc adapts a plain function to the LatencyObserver
-// interface so wiring from main.go stays a one-liner.
-type LatencyObserverFunc func(LatencyEvent)
-
-// ObserveLatency implements LatencyObserver.
-func (f LatencyObserverFunc) ObserveLatency(e LatencyEvent) { f(e) }
-
-// StreamTruncationEvent is emitted when a streaming response is
-// truncated mid-stream by the cascade timeout.
-type StreamTruncationEvent struct {
-	Route     string
-	Truncated bool
-}
-
-// StreamTruncationObserver is called when a streaming response is
-// truncated mid-stream.
-type StreamTruncationObserver interface {
-	ObserveStreamTruncation(StreamTruncationEvent)
-}
+func (f JudgeObserverFunc) Submit(c LocalCompletion) { f(c) }
 
 // QualityEvent is emitted to the QualityObserver hook each time the
 // handler detects a tool call in an upstream response that looks like
@@ -103,11 +66,9 @@ type StreamTruncationObserver interface {
 // that package so the dependency direction stays one-way (cmd/nexus
 // adapts between the two shapes).
 type QualityEvent struct {
-	TraceParent string
-	TraceState  string
-	RequestID   string // correlates to the chat handler's request id
-	Path        string // path of the edited file
-	ToolName    string // write_file, edit_file, apply_patch, ...
+	RequestID string // correlates to the chat handler's request id
+	Path      string // path of the edited file
+	ToolName  string // write_file, edit_file, apply_patch, ...
 }
 
 // QualityObserver is the hook the chat handler invokes with detected
@@ -141,10 +102,6 @@ type RouteDecisionEvent struct {
 	Reason     string
 	Confidence float64
 	TaskType   string
-	// CacheHit is true when the decision came from the SLM cache
-	// (issue #206) — a duplicate prompt was served from cache without
-	// calling the SLM.
-	CacheHit bool
 }
 
 // RouteDecisionObserver is the hook invoked once per proxied request
@@ -185,13 +142,6 @@ const (
 	// emitted by the rate-limit middleware. The reason is recorded
 	// by the middleware hook wired in main.go.
 	RejectionRateLimit = "rate_limit"
-	// RejectionJudgeQueue marks a rejection due to judge queue overflow.
-	RejectionJudgeQueue = "judge_queue"
-	// RejectionQualityQueue marks a rejection due to quality queue overflow.
-	RejectionQualityQueue = "quality_queue"
-	// RejectionBudget marks a 429 Too Many Requests response emitted
-	// when the rolling 24h frontier budget is exhausted (issue #220).
-	RejectionBudget = "budget"
 )
 
 // RejectionEvent carries the minimal context a rejection observer
@@ -221,84 +171,8 @@ type RejectionObserverFunc func(RejectionEvent)
 // ObserveRejection implements RejectionObserver.
 func (f RejectionObserverFunc) ObserveRejection(e RejectionEvent) { f(e) }
 
-// FusionOutcomeEvent carries the outcome of a fusion panel after
-// PanelStreaming returns (issue #187). It lets operators compute the
-// fusion agreement rate: skipped/(skipped+invoked).
-type FusionOutcomeEvent struct {
-	RequestID      string
-	ArbiterSkipped bool
-}
-
-// FusionOutcomeObserver is the hook invoked once per fusion request
-// with the PanelStreaming outcome (issue #187). Safe for concurrent
-// use, must not block, nil means "no observer". The handler does not
-// import the observability package; main.go wires a closure that
-// forwards to RouteCounters.ObserveFusionOutcome.
-type FusionOutcomeObserver interface {
-	ObserveFusionOutcome(FusionOutcomeEvent)
-}
-
-// FusionOutcomeObserverFunc adapts a plain function to the
-// FusionOutcomeObserver interface.
-type FusionOutcomeObserverFunc func(FusionOutcomeEvent)
-
-// ObserveFusionOutcome implements FusionOutcomeObserver.
-func (f FusionOutcomeObserverFunc) ObserveFusionOutcome(e FusionOutcomeEvent) { f(e) }
-
-// RAGEvent carries the outcome of a single RAG retrieval attempt
-// (issue #186). Hit is true when Retrieve returned a non-nil example;
-// Filename is the matched snippet (meaningful only when Hit is true).
-// MissReason is the miss cause when Hit is false: "empty_store" when
-// the store has no indexed examples, "threshold" when the best match
-// fell below the similarity floor, or "embed_error" when the embedding
-// call failed.
-type RAGEvent struct {
-	Hit        bool
-	Filename   string
-	MissReason string
-}
-
-// RAGObserver is the hook invoked once per RAG retrieval attempt,
-// allowing the observability layer to record hit/miss rates (issue #186).
-// Safe for concurrent use; must not block. Nil is a valid no-op.
-type RAGObserver interface {
-	ObserveRAG(RAGEvent)
-}
-
-// RAGObserverFunc adapts a plain function to the RAGObserver interface.
-type RAGObserverFunc func(RAGEvent)
-
-// ObserveRAG implements RAGObserver.
-func (f RAGObserverFunc) ObserveRAG(e RAGEvent) { f(e) }
-
-// CascadeFallbackEvent carries the reason for a cascade fallback (issue #205).
-// The handler dispatches one when a retryable step failure causes the cascade
-// to fall back to the next step. The reason is one of "timeout",
-// "transport_error", or "malformed_toolcall".
-type CascadeFallbackEvent struct {
-	RequestID string
-	Reason    string // "timeout", "transport_error", or "malformed_toolcall"
-}
-
-// CascadeFallbackObserver is the hook invoked when the cascade falls back
-// to a later step due to a retryable error (issue #205). Implementations
-// must be safe for concurrent use and must not block. Nil means "no
-// observer" — the hot path is unaffected. The handler does not import
-// the observability package; main.go wires a closure that forwards to
-// RouteCounters.ObserveCascadeFallback.
-type CascadeFallbackObserver interface {
-	ObserveCascadeFallback(CascadeFallbackEvent)
-}
-
-// CascadeFallbackObserverFunc adapts a plain function to the
-// CascadeFallbackObserver interface.
-type CascadeFallbackObserverFunc func(CascadeFallbackEvent)
-
-// ObserveCascadeFallback implements CascadeFallbackObserver.
-func (f CascadeFallbackObserverFunc) ObserveCascadeFallback(e CascadeFallbackEvent) { f(e) }
-
 // MetricsEvent carries the per-request data needed by the savings
-// dashboard (issue #4). Fields track the full round-trip metrics:
+// dashboard (issue #4). Fields track the full Round-trip metrics:
 // route/model/input-tokens are routing dimensions; TOON/RAG/cost are
 // the savings dimensions the dashboard renders. The handler builds
 // one of these after every proxied request (success, failure, or
@@ -323,18 +197,15 @@ func (f CascadeFallbackObserverFunc) ObserveCascadeFallback(e CascadeFallbackEve
 // dashboard joins these to answer "what fraction of frontier traffic
 // came from a low-confidence SLM escalation?".
 type MetricsEvent struct {
-	Timestamp             time.Time
-	RequestID             string
-	Route                 string
-	Model                 string
-	InputTokens           int
-	TOONSavingsTokens     int
-	TOONCompressionMethod string // issue #247: "fenced", "nested", or "" (no compression)
-
-	RAGInjected      bool
-	RAGFilename      string
-	RAGCacheHit      bool // true when the RAG embedding was served from the embed cache (issue #227)
-	EstimatedCostUSD float64
+	Timestamp         time.Time
+	RequestID         string
+	Route             string
+	Model             string
+	InputTokens       int
+	TOONSavingsTokens int
+	RAGInjected       bool
+	RAGFilename       string
+	EstimatedCostUSD  float64
 
 	// BaselineCostUSD is what the request would have cost at the
 	// configured frontier baseline rate (issue #73). SavingsUSD is
@@ -342,16 +213,12 @@ type MetricsEvent struct {
 	BaselineCostUSD float64
 	SavingsUSD      float64
 
-	OutputTokens            int
-	TTFTMs                  int64
-	TotalLatencyMs          float64
-	TPS                     float64
-	Streaming               bool
-	FusionArbiterSkipped    bool
-	FusionJaccardSimilarity float64
-	// FusionArbiterCostUSD (issue #239): estimated cost of the arbiter
-	// call when it ran. 0 when the arbiter was skipped or for non-fusion routes.
-	FusionArbiterCostUSD float64
+	OutputTokens         int
+	TTFTMs               int64
+	TotalLatencyMs       float64
+	TPS                  float64
+	Streaming            bool
+	FusionArbiterSkipped bool
 	ToolCallCount        int
 	Error                string
 
@@ -445,24 +312,19 @@ type LocalLimiter interface {
 // Deps bundles the collaborators the chat handler needs. Wiring them
 // explicitly makes the handler trivial to unit-test with stubs.
 type Deps struct {
-	Config          config.Config
-	Client          upstream.Client // http.Client satisfies this interface
+	Config             config.Config
+	Client             upstream.Client // http.Client satisfies this interface
+
+	// FrontierProviders is the multi-frontier provider registry (issue #223).
+	// When non-nil the chat handler looks up providers by name from this
+	// registry when dispatching route=frontier and route=fusion requests,
+	// replacing the prior hardcoded frontier+z.ai-only path. When nil the
+	// handler falls back to reading frontier/z.ai config values directly so
+	// the pre-#223 behaviour is preserved for stock deployments.
+	FrontierProviders *providers.Registry
 	RAG             rag.RAGStore
 	SLM             *router.SLMClient
 	FormattingRegex *regexp.Regexp
-
-	// MiddlewareChain is the ordered list of registered middleware names
-	// to apply to each request's messages slice (issue #224). The handler
-	// iterates the chain and calls each middleware's Transform method.
-	// Nil or empty defaults to the built-in chain.
-	MiddlewareChain []middleware.Middleware
-
-	// ContextAwareRAG is the optional ContextAwareRAG middleware that needs
-	// the request context to perform RAG retrieval. When non-nil and the
-	// chain contains "rag", the handler calls TransformContext instead of
-	// Transform for the RAG step. This keeps the generic Middleware
-	// interface clean (no context) while allowing RAG to receive ctx.
-	ContextAwareRAG middleware.ContextMiddleware
 
 	// Confidence is the optional judge-guided adaptive routing store
 	// (issue #47). When non-nil the handler categorizes the prompt,
@@ -475,14 +337,6 @@ type Deps struct {
 	// judge; main.go bridges JudgeScore -> RecordOutcome.
 	Confidence router.ConfidenceStore
 
-	// SLMCache is the optional time-bounded prompt→route cache
-	// (issue #206). When non-nil the planner checks the cache before
-	// calling the SLM; a cache hit returns the cached route without
-	// calling the SLM. When nil the SLM is always called
-	// (pre-cache behaviour). The cache TTL is configured at cache
-	// construction time via NewSLMCache.
-	SLMCache *router.SLMCache
-
 	// JudgeObserver is optional. When nil, the handler does not
 	// buffer the streamed response for judge sampling — every
 	// request takes the fast path with zero added overhead.
@@ -490,9 +344,7 @@ type Deps struct {
 	// The handler never imports the judge package; main.go wires
 	// a closure that adapts LocalCompletion to the judge's
 	// Sample/Enqueue entry points.
-	LatencyObserver          LatencyObserver
-	StreamTruncationObserver StreamTruncationObserver
-	JudgeObserver            JudgeObserver
+	JudgeObserver JudgeObserver
 
 	// QualityObserver is optional. When non-nil, the handler scans
 	// the captured upstream body for tool-call patterns that look
@@ -541,17 +393,6 @@ type Deps struct {
 	// probe is wired.
 	BudgetObserver BudgetObserver
 
-	// SpendGuard is the rolling 24h USD spend guard for frontier
-	// API calls (issue #220). When non-nil, the handler calls
-	// Guard.Check(cost) before every route=frontier or route=fusion
-	// dispatch and returns 429 when exhausted; after a successful
-	// frontier API call it calls Guard.Record(cost, "frontier").
-	// Nil means budget enforcement is disabled (pre-#220 behaviour).
-	SpendGuard interface {
-		Check(cost float64) bool
-		Record(cost float64, source string)
-	}
-
 	// LocalLimiter bounds concurrent local-route requests (issue
 	// #81). When non-nil the handler Acquires a slot before issuing
 	// the local upstream dispatch and Releases it once the dispatch
@@ -597,61 +438,6 @@ type Deps struct {
 	// observability package — main.go wires a closure that adapts
 	// the event to the in-process rejection counter.
 	RejectionObserver RejectionObserver
-
-	// FusionOutcomeObserver is invoked once per fusion request after
-	// PanelStreaming returns, with the arbiter outcome (issue #187).
-	// Safe for concurrent use, must not block, nil is "no observer".
-	// The handler does not import observability; main.go wires a
-	// closure that forwards to RouteCounters.ObserveFusionOutcome.
-	FusionOutcomeObserver FusionOutcomeObserver
-
-	// RAGObserver is invoked once per RAG retrieval attempt (issue #186)
-	// with the hit/miss outcome so the observability layer can record
-	// RAG effectiveness metrics. Implementations must be safe for
-	// concurrent use and must not block. Nil is treated as "no
-	// observer"; the hot path is unaffected. The handler does not
-	// import the observability package — main.go wires a closure
-	// that adapts the event to the in-process RAG counter.
-	RAGObserver RAGObserver
-
-	// CascadeFallbackObserver is invoked when the cascade falls back to a
-	// later step due to a retryable error (issue #205). The handler
-	// dispatches exactly one event per request when FallbackReason is
-	// non-empty (i.e., the cascade fell back at least once). The
-	// reason is one of "timeout", "transport_error", or
-	// "malformed_toolcall". Implementations must be safe for concurrent
-	// use and must not block. Nil means "no observer"; the hot path is
-	// unaffected. The handler does not import the observability package —
-	// main.go wires a closure that forwards to
-	// RouteCounters.ObserveCascadeFallback.
-	CascadeFallbackObserver CascadeFallbackObserver
-
-	// ArbiterCacheObserver is invoked when the fusion arbiter
-	// synthesis is served from cache (hit=true) or fetched from the
-	// arbiter (hit=false) (issue #232). Implementations must be safe
-	// for concurrent use and must not block. Nil is treated as "no
-	// observer"; the hot path is unaffected. The handler does not
-	// import the observability package — main.go wires a closure that
-	// adapts the event to the in-process arbiter cache counter.
-	ArbiterCacheObserver func(cacheHit bool)
-
-	// ArbiterCache is the optional in-memory cache for fusion arbiter
-	// synthesis responses (issue #232). When non-nil and
-	// Config.ArbiterCacheTTL > 0, identical panel-member content
-	// returns a cached synthesis instead of calling the arbiter.
-	// Nil means caching is disabled (the default for backwards
-	// compatibility).
-	ArbiterCache *upstream.ArbiterCache
-
-	// Providers is the optional registry of frontier providers (issue #223).
-	// When non-nil the handler uses it to build the cascade for
-	// route=frontier and route=local requests. When nil the handler
-	// falls back to the legacy config-based cascade built by
-	// BuildLocalCascade. The registry is nil-safe: a nil registry
-	// means "use legacy path" so unit tests and deployments that do
-	// not set NEXUS_FRONTIER_PROVIDERS are byte-for-byte identical
-	// to the pre-issue-#223 behaviour.
-	Providers *providers.ProviderRegistry
 
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
@@ -746,9 +532,7 @@ func Chat(d Deps) http.Handler {
 					Error:          reason,
 					TotalLatencyMs: totalMs,
 				})
-			}
-			// Both observers receive the record when both are wired (issue #164).
-			if d.Recorder != nil {
+			} else {
 				d.Recorder.Record(telemetry.Record{
 					Timestamp:      ts,
 					RequestID:      reqID,
@@ -847,16 +631,18 @@ func Chat(d Deps) http.Handler {
 			}
 		}
 
-		messages := rawMessages
-
-		// Apply prompt engineering.
+		// Apply prompt engineering. In off mode (default) the legacy
+		// append path is used — byte-for-byte backward compatible.
+		// In warn/strict modes the isolated variant inserts a dedicated
+		// leading system message wrapped in proxy-policy delimiters so
+		// trusted text always precedes user-supplied system content.
+		var messages []interface{}
 		if d.Config.PromptInjectionIsolated() {
-			messages = middleware.ApplyPromptEngineeringIsolated(messages, d.Config.MetaPrompt)
+			messages = middleware.ApplyPromptEngineeringIsolated(rawMessages, d.Config.MetaPrompt)
 		} else {
-			messages = middleware.ApplyPromptEngineering(messages, d.Config.MetaPrompt)
+			messages = middleware.ApplyPromptEngineering(rawMessages, d.Config.MetaPrompt)
 		}
 		latestPrompt := middleware.ExtractLatestUserPrompt(messages)
-
 		// Record whether the meta-prompt actually appended to a
 		// system slot — "applied" only when there is now a system
 		// message containing the operator-configured enhancement.
@@ -866,49 +652,19 @@ func Chat(d Deps) http.Handler {
 		var ragInjected bool
 		var ragFilename string
 		var ragScore float64
-		ragEx, ragScore, ragErr := d.RAG.Retrieve(r.Context(), latestPrompt)
-		switch {
-		case ragErr != nil:
-			slog.Info("rag miss",
-				slog.String("reason", "embed_error"),
-				slog.String("request_id", reqID),
-			)
-			if d.RAGObserver != nil {
-				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "embed_error"})
-			}
-		case ragEx != nil:
-			messages = middleware.InjectRAG(messages, rag.FormatInjection(ragEx))
+		if ex, score, err := d.RAG.Retrieve(r.Context(), latestPrompt); err == nil && ex != nil {
+			messages = middleware.InjectRAG(messages, rag.FormatInjection(ex))
 			slog.Info("rag hit",
-				slog.String("filename", ragEx.Filename),
-				slog.Float64("score", ragScore),
+				slog.String("filename", ex.Filename),
+				slog.Float64("score", score),
 				slog.String("request_id", reqID),
 			)
 			ragInjected = true
-			ragFilename = ragEx.Filename
-			if d.RAGObserver != nil {
-				d.RAGObserver.ObserveRAG(RAGEvent{Hit: true, Filename: ragEx.Filename})
-			}
-		case d.RAG.Size() == 0:
-			slog.Info("rag miss",
-				slog.String("reason", "empty_store"),
-				slog.String("request_id", reqID),
-			)
-			if d.RAGObserver != nil {
-				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "empty_store"})
-			}
-		default:
-			slog.Info("rag miss",
-				slog.String("reason", "threshold"),
-				slog.Float64("score", ragScore),
-				slog.String("request_id", reqID),
-			)
-			if d.RAGObserver != nil {
-				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "threshold"})
-			}
+			ragFilename = ex.Filename
+			ragScore = score
 		}
 		trace.Transforms.RAGInjected = ragInjected
 		trace.Transforms.RAGFilename = ragFilename
-		trace.Transforms.RAGCacheHit = false // issue #227: EmbedCache tracking not active with CachedEmbedder (issue #115)
 		trace.Transforms.RAGScore = ragScore
 		// Snapshot the JSON size BEFORE TOON compression so the
 		// metrics observer can attribute tokens saved by the
@@ -917,16 +673,13 @@ func Chat(d Deps) http.Handler {
 		// (see internal/telemetry.EstimateTokens).
 		preCompressionChars := totalMessageChars(messages)
 		trace.Transforms.TOONBytesBefore = preCompressionChars
-		toonCompressionMethod := middleware.CompressJSONBlocks(messages)
-		if toonCompressionMethod != "" {
+		if middleware.CompressJSONBlocks(messages) {
 			if d.Config.PromptInjectionIsolated() {
 				messages = middleware.AppendSystemNoteIsolated(messages, d.Config.TOONNotice)
 			} else {
 				messages = middleware.AppendSystemNote(messages, d.Config.TOONNotice)
 			}
-			slog.Info("toon compressed messages",
-				slog.String("request_id", reqID),
-				slog.String("method", string(toonCompressionMethod)))
+			slog.Info("toon compressed messages", slog.String("request_id", reqID))
 		}
 		postCompressionChars := totalMessageChars(messages)
 		trace.Transforms.TOONApplied = postCompressionChars != preCompressionChars
@@ -971,7 +724,6 @@ func Chat(d Deps) http.Handler {
 			SLM:             d.SLM,
 			Confidence:      d.Confidence,
 			FormattingRegex: d.FormattingRegex,
-			SLMCache:        d.SLMCache,
 		}
 		decision := planner.Plan(router.PlanRequest{
 			Prompt:          latestPrompt,
@@ -999,7 +751,6 @@ func Chat(d Deps) http.Handler {
 			Reason:     decision.Reason,
 			Confidence: decision.Confidence,
 			TaskType:   decision.TaskType,
-			CacheHit:   decision.CacheHit,
 		}
 		w.Header().Set("X-Nexus-Route", SanitizeHeaderValue(routeEvent.Route))
 		w.Header().Set("X-Nexus-Route-Source", SanitizeHeaderValue(routeEvent.Source))
@@ -1132,22 +883,11 @@ func Chat(d Deps) http.Handler {
 		var model string
 		var upErr error
 		var fusionArbiterSkipped bool
-		var fusionJaccardSimilarity float64
 		// toolCallCount is populated from the cascade result on the
 		// local streaming route (issue #72) and forwarded to telemetry
 		// + metrics so the dashboard can report how many tool calls
 		// were preserved. Zero on all other paths.
 		var toolCallCount int
-		// frontierCost estimates the USD cost of the frontier leg of this
-		// request (issue #220). It is computed here so both the
-		// route=frontier and route=fusion cases can call Check/Record
-		// without re-estimating. It is only non-zero when SpendGuard
-		// is wired and the route touches frontier.
-		var frontierCost float64
-		if d.SpendGuard != nil && (route == router.RouteFrontier || route == router.RouteFusion) {
-			inputTokens := telemetry.EstimateTokens(latestPrompt)
-			frontierCost = float64(inputTokens) * d.Config.FrontierCostPer1K / 1000.0
-		}
 		// capw is the response-body captureWriter installed for the
 		// local cascade branch when judge/quality observers OR
 		// debug tracing are configured (issue #33). Hoisted out of
@@ -1178,40 +918,34 @@ func Chat(d Deps) http.Handler {
 			// host as the "primary" target and notes both
 			// panel members via the cascade-free routing — fusion
 			// has no cascade, both panel members run in parallel.
+			//
+			// Issue #223: when FrontierProviders is wired, look up the frontier
+			// provider from the registry; otherwise fall back to legacy config.
+			fusionFrontierURL := d.Config.FrontierURL
+			fusionFrontierModel := d.Config.FrontierModel
+			fusionFrontierKey := d.Config.FrontierKey
+			if fp := d.frontierProvider("frontier"); fp != nil {
+				fusionFrontierURL = fp.BaseURL()
+				fusionFrontierModel = fp.Model()
+				fusionFrontierKey = fp.APIKey()
+			}
 			trace.Upstream.Route = string(route)
 			trace.Upstream.Streaming = streaming
-			trace.Upstream.Model = d.Config.FrontierModel
-			trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
-			// Budget guard: check before fusion frontier dispatch (issue #220).
-			if d.SpendGuard != nil && frontierCost > 0 && d.SpendGuard.Check(frontierCost) {
-				slog.Warn("budget exhausted, rejecting fusion request",
-					slog.String("request_id", reqID),
-					slog.Float64("cost_estimate", frontierCost),
-				)
-				recordRejection(RejectionBudget)
-				http.Error(w, "Budget exhausted", http.StatusTooManyRequests)
-				break
-			}
+			trace.Upstream.Model = fusionFrontierModel
+			trace.Upstream.TargetHost = HostOfURL(fusionFrontierURL)
 			if streaming && d.Config.FusionProgressiveDelivery {
 				var outcome upstream.PanelOutcome
 				outcome, upErr = upstream.PanelStreaming(
 					obs, d.Client,
 					d.Config.OllamaURL, d.Config.LocalModel,
-					d.Config.FrontierURL, d.Config.FrontierModel,
-					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
+					fusionFrontierURL, fusionFrontierModel,
+					fusionFrontierURL, fusionFrontierKey, fusionFrontierModel,
 					body, latestPrompt, d.Config.FusionTimeout,
 					d.Config.ArbiterTimeout,
 					skipLocal,
 					d.Config.FusionAgreementThreshold,
-					reqID,
-					d.ArbiterCache,
-					d.Config.ArbiterCacheTTL,
 				)
 				fusionArbiterSkipped = outcome.ArbiterSkipped
-				fusionJaccardSimilarity = outcome.Similarity
-				if d.ArbiterCacheObserver != nil {
-					d.ArbiterCacheObserver(outcome.ArbiterCacheHit)
-				}
 				if outcome.ArbiterSkipped {
 					slog.Info("fusion arbiter skipped",
 						slog.String("source", outcome.Source),
@@ -1219,28 +953,16 @@ func Chat(d Deps) http.Handler {
 						slog.String("request_id", reqID),
 					)
 				}
-				if d.FusionOutcomeObserver != nil {
-					d.FusionOutcomeObserver.ObserveFusionOutcome(FusionOutcomeEvent{
-						RequestID:      reqID,
-						ArbiterSkipped: outcome.ArbiterSkipped,
-					})
-				}
 			} else {
-				var cacheHit bool
-				cacheHit, upErr = upstream.Panel(
+				upErr = upstream.Panel(
 					obs, d.Client,
 					d.Config.OllamaURL, d.Config.LocalModel,
-					d.Config.FrontierURL, d.Config.FrontierModel,
-					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
+					fusionFrontierURL, fusionFrontierModel,
+					fusionFrontierURL, fusionFrontierKey, fusionFrontierModel,
 					body, latestPrompt, d.Config.FusionTimeout,
 					d.Config.ArbiterTimeout,
 					skipLocal,
-					d.ArbiterCache,
-					d.Config.ArbiterCacheTTL,
 				)
-				if d.ArbiterCacheObserver != nil {
-					d.ArbiterCacheObserver(cacheHit)
-				}
 			}
 			if upErr != nil {
 				slog.Error("fusion error",
@@ -1248,11 +970,8 @@ func Chat(d Deps) http.Handler {
 					slog.String("request_id", reqID),
 				)
 				http.Error(w, "Upstream error", http.StatusBadGateway)
-			} else if d.SpendGuard != nil && frontierCost > 0 {
-				// Budget guard: record after successful fusion frontier leg (issue #220).
-				d.SpendGuard.Record(frontierCost, "frontier")
 			}
-			model = d.Config.FrontierModel
+			model = fusionFrontierModel
 
 		case router.RouteLocal:
 			// VRAM-aware concurrency ceiling (issue #81). Bound the
@@ -1296,48 +1015,36 @@ func Chat(d Deps) http.Handler {
 			// stream flag (issue #10) so both branches share a single
 			// configured cascade; see below for the non-streaming
 			// degraded override.
-			//
-			// When d.Providers is set (issue #223), the cascade is built
-			// from the registry instead of the legacy config-based steps.
-			// This allows operators to register providers via
-			// NEXUS_FRONTIER_PROVIDERS without recompiling.
-			var cas *upstream.Cascade
-			if d.Providers != nil && d.Providers.Len() > 0 {
-				// Use providers from the registry (issue #223).
-				// Prepend the local step when not skipped.
-				steps := []upstream.CascadeStep{}
-				if !skipLocal {
-					steps = append(steps, upstream.CascadeStep{
-						Name:   "local",
-						URL:    strings.TrimRight(d.Config.OllamaURL, "/") + "/v1/chat/completions",
-						Model:  d.Config.LocalModel,
-						APIKey: "",
-					})
-				}
-				for _, p := range d.Providers.All() {
-					steps = append(steps, upstream.CascadeStep{
-						Name:   p.Name(),
-						URL:    strings.TrimRight(p.BaseURL(), "/") + "/v1/chat/completions",
-						Model:  p.Model(),
-						APIKey: p.APIKey(),
-					})
-				}
-				cas = &upstream.Cascade{Steps: steps, Timeout: d.Config.CascadeTimeout}
-			} else {
-				// Legacy path: build cascade from config (frontier + z.ai).
-				cas = upstream.BuildLocalCascade(upstream.CascadeConfig{
-					LocalURL:      d.Config.OllamaURL,
-					LocalModel:    d.Config.LocalModel,
-					FrontierURL:   d.Config.FrontierURL,
-					FrontierModel: d.Config.FrontierModel,
-					FrontierKey:   d.Config.FrontierKey,
-					ZAIURL:        d.Config.ZAIURL,
-					ZAIModel:      d.Config.ZAIModel,
-					ZAIKey:        d.Config.ZAIKey,
-					Timeout:       d.Config.CascadeTimeout,
-					SkipLocal:     skipLocal,
-				})
+			// Issue #223: when FrontierProviders is wired, look up frontier/z.ai
+			// from the registry; otherwise fall back to the legacy config values.
+			frontierURL := d.Config.FrontierURL
+			frontierModel := d.Config.FrontierModel
+			frontierKey := d.Config.FrontierKey
+			if fp := d.frontierProvider("frontier"); fp != nil {
+				frontierURL = fp.BaseURL()
+				frontierModel = fp.Model()
+				frontierKey = fp.APIKey()
 			}
+			zaiURL := d.Config.ZAIURL
+			zaiModel := d.Config.ZAIModel
+			zaiKey := d.Config.ZAIKey
+			if zp := d.frontierProvider("zai"); zp != nil {
+				zaiURL = zp.BaseURL()
+				zaiModel = zp.Model()
+				zaiKey = zp.APIKey()
+			}
+			cas := upstream.BuildLocalCascade(upstream.CascadeConfig{
+				LocalURL:      d.Config.OllamaURL,
+				LocalModel:    d.Config.LocalModel,
+				FrontierURL:   frontierURL,
+				FrontierModel: frontierModel,
+				FrontierKey:   frontierKey,
+				ZAIURL:        zaiURL,
+				ZAIModel:      zaiModel,
+				ZAIKey:        zaiKey,
+				Timeout:       d.Config.CascadeTimeout,
+				SkipLocal:     skipLocal,
+			})
 
 			// Writer chain (outermost first):
 			//   upstream.Write -> captureWriter (judge + quality tee OR debug) ->
@@ -1361,16 +1068,6 @@ func Chat(d Deps) http.Handler {
 				// entirely and starts at frontier.
 				res, err := cas.Run(rw, d.Client, body)
 				logCascadeTelemetry(res, err, reqID)
-				// Issue #205: record cascade fallback metric when a retryable
-				// step failure caused the cascade to fall back to the next
-				// step. The observer is nil-safe; nil means no observability
-				// wiring so the hot path is unaffected.
-				if res.FallbackReason != "" && d.CascadeFallbackObserver != nil {
-					d.CascadeFallbackObserver.ObserveCascadeFallback(CascadeFallbackEvent{
-						RequestID: reqID,
-						Reason:    res.FallbackReason,
-					})
-				}
 				// Issue #80: arm the local-route cooldown when the
 				// cascade reports the local step failed before a
 				// fallback served the request. Subsequent requests
@@ -1408,7 +1105,7 @@ func Chat(d Deps) http.Handler {
 							})
 						}
 						if d.QualityObserver != nil {
-							emitDetectedEdits(capw.Buffer(), reqID, "", "", d.QualityObserver)
+							emitDetectedEdits(capw.Buffer(), reqID, d.QualityObserver)
 						}
 					}
 				}
@@ -1422,7 +1119,7 @@ func Chat(d Deps) http.Handler {
 				trace.Upstream.Route = string(route)
 				trace.Upstream.Streaming = streaming
 				trace.Upstream.Model = model
-				trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
+				trace.Upstream.TargetHost = HostOfURL(frontierURL)
 				if res.RouteAttempted != "" {
 					trace.Upstream.CascadeSteps = strings.Split(res.RouteAttempted, "->")
 				} else {
@@ -1448,8 +1145,8 @@ func Chat(d Deps) http.Handler {
 				targetURL := strings.TrimRight(d.Config.OllamaURL, "/") + "/v1/chat/completions"
 				apiKey := ""
 				if skipLocal {
-					targetURL = d.Config.FrontierURL
-					apiKey = d.Config.FrontierKey
+					targetURL = frontierURL
+					apiKey = frontierKey
 				}
 				if err := upstream.BufferedFetch(rw, d.Client, targetURL, apiKey, body); err != nil {
 					slog.Error("upstream error",
@@ -1467,7 +1164,7 @@ func Chat(d Deps) http.Handler {
 				} else {
 					model = d.Config.LocalModel
 					if skipLocal {
-						model = d.Config.FrontierModel
+						model = frontierModel
 					}
 					if capw != nil {
 						if d.JudgeObserver != nil {
@@ -1479,7 +1176,7 @@ func Chat(d Deps) http.Handler {
 							})
 						}
 						if d.QualityObserver != nil {
-							emitDetectedEdits(capw.Buffer(), reqID, "", "", d.QualityObserver)
+							emitDetectedEdits(capw.Buffer(), reqID, d.QualityObserver)
 						}
 					}
 				}
@@ -1497,53 +1194,35 @@ func Chat(d Deps) http.Handler {
 			}
 
 		default:
-			model = d.Config.FrontierModel
-			// Budget guard: check before frontier dispatch (issue #220).
-			if d.SpendGuard != nil && frontierCost > 0 && d.SpendGuard.Check(frontierCost) {
-				slog.Warn("budget exhausted, rejecting frontier request",
-					slog.String("request_id", reqID),
-					slog.Float64("cost_estimate", frontierCost),
-				)
-				recordRejection(RejectionBudget)
-				http.Error(w, "Budget exhausted", http.StatusTooManyRequests)
-				break
+			// Issue #223: route=frontier (and any unrecognised route)
+			// uses the "frontier" provider from the registry when wired,
+			// falling back to the legacy config values.
+			frontierURL := d.Config.FrontierURL
+			frontierModel := d.Config.FrontierModel
+			frontierKey := d.Config.FrontierKey
+			if fp := d.frontierProvider("frontier"); fp != nil {
+				frontierURL = fp.BaseURL()
+				frontierModel = fp.Model()
+				frontierKey = fp.APIKey()
 			}
+			model = frontierModel
 			// Honor the harness's stream flag (issue #10). Stream
 			// preserves SSE framing for chunked deliveries;
 			// BufferedFetch collects the full body and returns a
 			// single chatCompletionResponse JSON object.
 			if streaming {
 				upErr = upstream.Stream(obs, d.Client,
-					d.Config.FrontierURL, d.Config.FrontierKey, body)
+					frontierURL, frontierKey, body)
 			} else {
 				upErr = upstream.BufferedFetch(obs, d.Client,
-					d.Config.FrontierURL, d.Config.FrontierKey, body)
+					frontierURL, frontierKey, body)
 			}
 			if upErr != nil {
-				if errors.Is(upErr, upstream.ErrUpstreamTruncated) {
-					// Upstream already wrote a partial body + truncation
-					// event; self-heal by setting X-Nexus-Truncated and
-					// dispatching the observer (issue #118). Do NOT call
-					// http.Error — the SSE headers are already committed
-					// and a 502 would corrupt the truncated body already
-					// written to the wire.
-					w.Header().Set("X-Nexus-Truncated", "true")
-					if d.StreamTruncationObserver != nil {
-						d.StreamTruncationObserver.ObserveStreamTruncation(StreamTruncationEvent{
-							Route:     string(route),
-							Truncated: true,
-						})
-					}
-				} else {
-					slog.Error("upstream error",
-						slog.Any("err", upErr),
-						slog.String("request_id", reqID),
-					)
-					http.Error(w, "Upstream error", http.StatusBadGateway)
-				}
-			} else if d.SpendGuard != nil && frontierCost > 0 {
-				// Budget guard: record after successful frontier call (issue #220).
-				d.SpendGuard.Record(frontierCost, "frontier")
+				slog.Error("upstream error",
+					slog.Any("err", upErr),
+					slog.String("request_id", reqID),
+				)
+				http.Error(w, "Upstream error", http.StatusBadGateway)
 			}
 			// Debug trace (issue #33): route=frontier is a single
 			// endpoint with no cascade — populate the trace with
@@ -1551,7 +1230,7 @@ func Chat(d Deps) http.Handler {
 			trace.Upstream.Route = string(route)
 			trace.Upstream.Streaming = streaming
 			trace.Upstream.Model = model
-			trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
+			trace.Upstream.TargetHost = HostOfURL(frontierURL)
 		}
 
 		// Per-request recording. The metrics observer (issue #4)
@@ -1575,82 +1254,45 @@ func Chat(d Deps) http.Handler {
 			}
 		}
 		outputTokens := int(obs.BytesOut() / 4)
-		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr, fusionArbiterSkipped, fusionJaccardSimilarity, toolCallCount, decision)
+		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr, fusionArbiterSkipped, toolCallCount, decision)
 		if d.MetricsObserver != nil {
 			postCompressionChars := totalMessageChars(messages)
 			savings := totalTokenSavings(preCompressionChars, postCompressionChars)
 			inputTokens := telemetry.EstimateTokens(latestPrompt)
-			cost := frontierCostEstimate(string(route), model, inputTokens, d.Config.FrontierCostPer1K)
+			cost := frontierCostEstimate(string(route), model, inputTokens, d.Config.JudgeCostPer1KUSD)
 			baselineCost := baselineCostEstimate(inputTokens+outputTokens, d.Config.CostBaselineRatePer1K)
 			savingsCost := baselineCost - cost
 			if savingsCost < 0 {
 				savingsCost = 0
 			}
-			// FusionArbiterCostUSD (issue #239): when the arbiter ran
-			// (fusion route with disagreement), estimate its cost using
-			// FrontierCostPer1K. The arbiter prompt is approximately
-			// the latestPrompt plus the two panel responses; we use
-			// inputTokens as a conservative proxy since the streamed
-			// responses are not retained after serving.
-			var fusionArbiterCostUSD float64
-			if route == router.RouteFusion && !fusionArbiterSkipped {
-				fusionArbiterCostUSD = frontierCostEstimate(
-					string(router.RouteFrontier), model, inputTokens, d.Config.FrontierCostPer1K)
-			}
 			tps := telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 			d.MetricsObserver.Submit(MetricsEvent{
-				Timestamp:               rec.Timestamp,
-				RequestID:               reqID,
-				Route:                   string(route),
-				Model:                   model,
-				InputTokens:             rec.InputTokens,
-				TOONSavingsTokens:       savings,
-				TOONCompressionMethod:   string(toonCompressionMethod),
-				RAGInjected:             ragInjected,
-				RAGFilename:             ragFilename,
-				RAGCacheHit:             false, // issue #227: EmbedCache tracking not active with CachedEmbedder (issue #115)
-				EstimatedCostUSD:        cost,
-				BaselineCostUSD:         baselineCost,
-				SavingsUSD:              savingsCost,
-				OutputTokens:            outputTokens,
-				TTFTMs:                  ttftMs,
-				TotalLatencyMs:          totalMs,
-				TPS:                     tps,
-				Streaming:               streaming,
-				FusionArbiterSkipped:    fusionArbiterSkipped,
-				FusionJaccardSimilarity: fusionJaccardSimilarity,
-				FusionArbiterCostUSD:    fusionArbiterCostUSD,
-				ToolCallCount:           toolCallCount,
-				Error:                   rec.Error,
-				RouteSource:             string(decision.Source),
-				RouteReason:             decision.Reason,
-				SLMConfidence:           decision.Confidence,
-				SLMTaskType:             decision.TaskType,
+				Timestamp:            rec.Timestamp,
+				RequestID:            reqID,
+				Route:                string(route),
+				Model:                model,
+				InputTokens:          rec.InputTokens,
+				TOONSavingsTokens:    savings,
+				RAGInjected:          ragInjected,
+				RAGFilename:          ragFilename,
+				EstimatedCostUSD:     cost,
+				BaselineCostUSD:      baselineCost,
+				SavingsUSD:           savingsCost,
+				OutputTokens:         outputTokens,
+				TTFTMs:               ttftMs,
+				TotalLatencyMs:       totalMs,
+				TPS:                  tps,
+				Streaming:            streaming,
+				FusionArbiterSkipped: fusionArbiterSkipped,
+				ToolCallCount:        toolCallCount,
+				Error:                rec.Error,
+				RouteSource:          string(decision.Source),
+				RouteReason:          decision.Reason,
+				SLMConfidence:        decision.Confidence,
+				SLMTaskType:          decision.TaskType,
 			})
-		}
-		// Both observers receive the record when both are wired (issue #164).
-		if d.Recorder != nil {
+		} else {
 			d.Recorder.Record(rec)
-		}
-
-		// LatencyObserver (issue #165): fired after the upstream response
-		// completes so callers can record end-to-end latency histograms.
-		// ttftMs is already computed above; convert to float64 seconds.
-		if d.LatencyObserver != nil {
-			var ttftSecs float64
-			if ttftMs > 0 {
-				ttftSecs = float64(ttftMs) / 1000.0
-			}
-			var isErr bool
-			if upErr != nil || obs.StatusCode() >= 400 {
-				isErr = true
-			}
-			d.LatencyObserver.ObserveLatency(LatencyEvent{
-				Route:          string(route),
-				LatencySeconds: totalMs / 1000.0,
-				TTFTSeconds:    ttftSecs,
-				IsError:        isErr,
-			})
 		}
 
 		// Debug trace emission (issue #33). When Debug is on we
@@ -1718,17 +1360,9 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 // requestID extracts (or generates) a correlation id for the judge
 // hook. The handler honours an inbound X-Request-Id so a caller can
 // thread its own id through; otherwise we mint a short hex token.
-//
-// The inbound value is sanitised (issue #39): characters outside
-// [a-zA-Z0-9._:-] are stripped so a crafted header cannot inject log
-// entries or break downstream JSON consumers, and the length is capped
-// at 128 bytes. When the value is empty after sanitization the
-// handler falls through to a generated hex id.
 func requestID(r *http.Request) string {
 	if v := r.Header.Get("X-Request-Id"); v != "" {
-		if clean := sanitizeRequestID(v); clean != "" {
-			return clean
-		}
+		return v
 	}
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -1843,6 +1477,17 @@ func stepNames(steps []upstream.CascadeStep) []string {
 	return out
 }
 
+// frontierProvider returns the registered provider with the given name, or nil
+// if not registered. Used by the cascade and fusion builders to look up
+// frontier/z.ai provider details from the registry (issue #223) while
+// preserving the legacy config fallback when the registry is not wired.
+func (d *Deps) frontierProvider(name string) providers.Provider {
+	if d.FrontierProviders == nil {
+		return nil
+	}
+	return d.FrontierProviders.Get(name)
+}
+
 // qualityEditNames is the set of tool names the handler treats as
 // "this might have written a file". Mirrors internal/quality so the
 // two stay in sync; the handler intentionally does not import the
@@ -1890,7 +1535,7 @@ const qualityPathWindowBytes = 4 * 1024
 // The function is O(len(body)) and best-effort: malformed JSON,
 // missing fields, or windows that don't contain a path field are
 // silently skipped. Deduplication is per-call, by path.
-func emitDetectedEdits(body, reqID, traceParent, traceState string, obs QualityObserver) {
+func emitDetectedEdits(body, reqID string, obs QualityObserver) {
 	if obs == nil || body == "" {
 		return
 	}
@@ -1978,7 +1623,6 @@ func buildRecord(
 	model, latestPrompt string,
 	upErr error,
 	fusionArbiterSkipped bool,
-	fusionJaccardSimilarity float64,
 	toolCallCount int,
 	decision router.Decision,
 ) telemetry.Record {
@@ -1992,22 +1636,21 @@ func buildRecord(
 	}
 	outputTokens := int(bytesOut / 4)
 	rec := telemetry.Record{
-		Timestamp:               time.Now().UTC(),
-		RequestID:               requestID,
-		Model:                   model,
-		Route:                   string(route),
-		InputTokens:             telemetry.EstimateTokens(latestPrompt),
-		OutputTokens:            outputTokens,
-		TTFTMs:                  ttftMs,
-		TotalLatencyMs:          totalMs,
-		Streaming:               streaming,
-		FusionArbiterSkipped:    fusionArbiterSkipped,
-		FusionJaccardSimilarity: fusionJaccardSimilarity,
-		ToolCallCount:           toolCallCount,
-		RouteSource:             string(decision.Source),
-		RouteReason:             decision.Reason,
-		SLMConfidence:           decision.Confidence,
-		SLMTaskType:             decision.TaskType,
+		Timestamp:            time.Now().UTC(),
+		RequestID:            requestID,
+		Model:                model,
+		Route:                string(route),
+		InputTokens:          telemetry.EstimateTokens(latestPrompt),
+		OutputTokens:         outputTokens,
+		TTFTMs:               ttftMs,
+		TotalLatencyMs:       totalMs,
+		Streaming:            streaming,
+		FusionArbiterSkipped: fusionArbiterSkipped,
+		ToolCallCount:        toolCallCount,
+		RouteSource:          string(decision.Source),
+		RouteReason:          decision.Reason,
+		SLMConfidence:        decision.Confidence,
+		SLMTaskType:          decision.TaskType,
 	}
 	rec.TPS = telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 	if upErr != nil {
@@ -2043,9 +1686,12 @@ func totalTokenSavings(preChars, postChars int) int {
 
 // frontierCostEstimate multiplies input tokens by the configured
 // cost-per-1k. Returns zero for non-frontier routes so local +
-// fusion-trail rows count as zero cost in the dashboard.
+// fusion-trail rows count as zero cost in the dashboard. The
+// JudgeCostPer1KUSD knob is reused here for lack of a separate
+// frontier-rate env; the PRD says one is enough at this stage.
 func frontierCostEstimate(route, model string, inputTokens int, costPer1KUSD float64) float64 {
-	// model is reserved for future per-model pricing tables.
+	// model is reserved for future per-model pricing tables —
+	// the bundle stays cheap by sharing JudgeCostPer1KUSD for now.
 	_ = model
 	if route != string(router.RouteFrontier) {
 		return 0

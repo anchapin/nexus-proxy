@@ -677,3 +677,85 @@ func TestIsLoopbackBind(t *testing.T) {
 		})
 	}
 }
+
+func TestFrontierProvidersFromEnv(t *testing.T) {
+	t.Run("empty raw falls back to legacy config", func(t *testing.T) {
+		cfg := Config{
+			FrontierKey:    "sk-frontier",
+			FrontierURL:    "https://api.openai.com/v1/chat/completions",
+			FrontierModel:  "gpt-4o",
+			FrontierCostPer1K: 0.005,
+			ZAIKey:    "sk-zai",
+			ZAIURL:    "https://api.z.ai/v1/chat/completions",
+			ZAIModel:  "glm-4.6",
+			ZAICostPer1K: 0.002,
+		}
+		reg, err := cfg.FrontierProvidersFromEnv()
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		ps := reg.All()
+		if len(ps) != 2 {
+			t.Fatalf("expected 2 providers, got %d", len(ps))
+		}
+		if ps[0].Name() != "frontier" {
+			t.Errorf("expected first provider frontier, got %q", ps[0].Name())
+		}
+		if ps[0].BaseURL() != "https://api.openai.com/v1/chat/completions" {
+			t.Errorf("expected frontier URL, got %q", ps[0].BaseURL())
+		}
+		if ps[1].Name() != "zai" {
+			t.Errorf("expected second provider zai, got %q", ps[1].Name())
+		}
+	})
+
+	t.Run("NEXUS_FRONTIERS takes precedence", func(t *testing.T) {
+		cfg := Config{
+			FrontierProvidersRaw: "custom|https://custom.example.com/v1|gpt-5|sk-custom|0.010",
+			// Legacy values should be ignored when NEXUS_FRONTIERS is set
+			FrontierKey:    "sk-frontier",
+			FrontierURL:    "https://api.openai.com/v1/chat/completions",
+			FrontierModel:  "gpt-4o",
+		}
+		reg, err := cfg.FrontierProvidersFromEnv()
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		ps := reg.All()
+		if len(ps) != 1 {
+			t.Fatalf("expected 1 provider, got %d", len(ps))
+		}
+		if ps[0].Name() != "custom" {
+			t.Errorf("expected provider custom, got %q", ps[0].Name())
+		}
+		if ps[0].BaseURL() != "https://custom.example.com/v1" {
+			t.Errorf("expected custom URL, got %q", ps[0].BaseURL())
+		}
+		if ps[0].APIKey() != "sk-custom" {
+			t.Errorf("expected apiKey sk-custom, got %q", ps[0].APIKey())
+		}
+		if ps[0].CostPer1K() != 0.010 {
+			t.Errorf("expected cost 0.010, got %f", ps[0].CostPer1K())
+		}
+	})
+
+	t.Run("invalid cost in NEXUS_FRONTIERS", func(t *testing.T) {
+		cfg := Config{
+			FrontierProvidersRaw: "bad|https://bad.example.com/v1|gpt-5|sk-bad|not-a-number",
+		}
+		_, err := cfg.FrontierProvidersFromEnv()
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
+
+	t.Run("missing fields in NEXUS_FRONTIERS", func(t *testing.T) {
+		cfg := Config{
+			FrontierProvidersRaw: "onlyname|https://example.com",
+		}
+		_, err := cfg.FrontierProvidersFromEnv()
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
+}
