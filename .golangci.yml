@@ -46,6 +46,14 @@ linters:
           - errcheck
         text: fmt\.F(print|printf|println)
 
+      # internal/observability/prometheus.go writes to http.ResponseWriter.
+      # Write errors cannot be handled after headers are committed, so
+      # ignoring errcheck is the intentional design (issue #276).
+      - path: internal/observability/
+        linters:
+          - errcheck
+        text: fmt\.F(print|printf|println)
+
       # resp.Body.Close and rows.Close ignored in non-critical paths
       # (matches v1 behaviour which excluded these via less-granular rules).
       - path: (.+)\.go$
