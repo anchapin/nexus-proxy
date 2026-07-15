@@ -56,8 +56,8 @@ func TestChatConfidenceLowBiasesSLMPromptToFrontier(t *testing.T) {
 		_, _ = w.Write([]byte("frontier stream"))
 	})
 
-	// "debug ... failing" is not a DSL/guardrail hit, so it reaches the SLM.
-	body := `{"messages":[{"role":"user","content":"debug why this test keeps failing with an exception"}]}`
+	// "analyze this exception" is not a DSL/guardrail hit, so it reaches the SLM.
+	body := `{"messages":[{"role":"user","content":"analyze this exception that keeps happening"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw := httptest.NewRecorder()
 	Chat(deps).ServeHTTP(rw, req)

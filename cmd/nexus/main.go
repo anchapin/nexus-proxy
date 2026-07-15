@@ -43,7 +43,7 @@ import (
 )
 
 const (
-	formattingRegexPattern = `(?i)\b(css|format|docstring|lint|typo|boilerplate)\b`
+	formattingRegexPattern = `(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`
 	bootRAGTimeout         = 30 * time.Second
 )
 
