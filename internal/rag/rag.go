@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"time"
 )
@@ -51,6 +52,7 @@ type FewShotExample struct {
 // concurrent use; the store calls them concurrently during indexing.
 type Embedder interface {
 	Embed(ctx context.Context, text string) ([]float64, error)
+	IsHealthy(ctx context.Context) bool
 }
 
 // embedCacheEntry pairs a prompt embedding with its expiry time so TTL-based
@@ -221,6 +223,10 @@ func (c *EmbedCache) CacheStats() (hits, misses int64) {
 // per-request cache hits without being disturbed by concurrent requests.
 func (c *EmbedCache) HitCount() int64 {
 	return atomic.LoadInt64(&c.hitCount)
+}
+
+func (c *EmbedCache) IsHealthy(ctx context.Context) bool {
+	return c.inner.IsHealthy(ctx)
 }
 
 // RAGStore is the read+seed API the chat handler depends on. PersistentStore
@@ -676,6 +682,11 @@ func (o *OpenAIEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 	return raw.Data[0].Embedding, nil
 }
 
+func (o *OpenAIEmbedder) IsHealthy(ctx context.Context) bool {
+	_, err := o.Embed(ctx, "health")
+	return err == nil
+}
+
 // CohereEmbedder calls the Cohere /v1/embed endpoint. It is safe for
 // concurrent use via a shared http.Client.
 type CohereEmbedder struct {
@@ -729,6 +740,11 @@ func (c *CohereEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 		return nil, fmt.Errorf("cohere embed: empty embedding for model %s", c.Model)
 	}
 	return raw.Embeddings[0], nil
+}
+
+func (c *CohereEmbedder) IsHealthy(ctx context.Context) bool {
+	_, err := c.Embed(ctx, "health")
+	return err == nil
 }
 
 // EmbedderType is the discriminator for the embedder factory.
