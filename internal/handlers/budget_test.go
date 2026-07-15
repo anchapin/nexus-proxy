@@ -53,22 +53,25 @@ func (s *stubSpendGuard) Record(cost float64, source string) {
 
 // chatHandlerForBudget returns a chat handler configured for budget guard testing.
 // The handler is set up so DSL/SLM won't match "hello world" -> will go to frontier.
-func chatHandlerForBudget(t *testing.T, sg interface{ Check(float64) bool; Record(float64, string) }) Deps {
+func chatHandlerForBudget(t *testing.T, sg interface {
+	Check(float64) bool
+	Record(float64, string)
+}) Deps {
 	t.Helper()
 	cfg := config.Config{
-		Addr:           ":0",
-		OllamaURL:      "http://ollama.local",
-		RouterModel:    "qwen3-coder:4b",
-		LocalModel:     "qwen3-coder:8b",
-		EmbeddingModel: "nomic-embed-text",
-		FrontierURL:    "http://frontier.local",
-		FrontierModel:  "gpt-4o",
-		FrontierKey:    "sk-test",
+		Addr:              ":0",
+		OllamaURL:         "http://ollama.local",
+		RouterModel:       "qwen3-coder:4b",
+		LocalModel:        "qwen3-coder:8b",
+		EmbeddingModel:    "nomic-embed-text",
+		FrontierURL:       "http://frontier.local",
+		FrontierModel:     "gpt-4o",
+		FrontierKey:       "sk-test",
 		FrontierCostPer1K: 0.005,
-		RAGThreshold:   0.55,
-		TokenGuardrail: 6000,
-		MetaPrompt:     " BOOST",
-		TOONNotice:     "[PROXY SYSTEM NOTE]: TOON compression applied",
+		RAGThreshold:      0.55,
+		TokenGuardrail:    6000,
+		MetaPrompt:        " BOOST",
+		TOONNotice:        "[PROXY SYSTEM NOTE]: TOON compression applied",
 	}
 	store := rag.NewStore(stubEmbedder{vec: []float64{0, 0, 0}}, 0.55)
 	rt := upstream.NewRecordingTransport()
@@ -176,7 +179,7 @@ func TestBudgetGuardNoRecordOnCheckFailure(t *testing.T) {
 // mockSpendGuard records calls for verification.
 type mockSpendGuard struct {
 	mu          sync.Mutex
-	checkCalls  []float64   // cost passed to each Check call
+	checkCalls  []float64 // cost passed to each Check call
 	recordCalls []recordCall
 	shouldBlock bool
 }

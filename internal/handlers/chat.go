@@ -1539,8 +1539,8 @@ func Chat(d Deps) http.Handler {
 						slog.Any("err", upErr),
 						slog.String("request_id", reqID),
 					)
-				http.Error(w, "Upstream error", http.StatusBadGateway)
-			}
+					http.Error(w, "Upstream error", http.StatusBadGateway)
+				}
 			} else if d.SpendGuard != nil && frontierCost > 0 {
 				// Budget guard: record after successful frontier call (issue #220).
 				d.SpendGuard.Record(frontierCost, "frontier")
