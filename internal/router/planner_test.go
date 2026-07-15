@@ -63,7 +63,7 @@ func (s *stubConf) LocalConfidence(category string) float64 {
 }
 
 // formattingRegex matches the handler's NEXUS_FORMATTING_REGEX default.
-var formattingRegex = regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate)\b`)
+var formattingRegex = regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`)
 
 // localPatternsRegex matches common coding task keywords (issue #202).
 var localPatternsRegex = regexp.MustCompile(`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis)\b`)
@@ -363,10 +363,10 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 			FormattingRegex:    formattingRegex,
 			LocalPatternsRegex: localPatternsRegex,
 		}
-		// "debug ... failing" categorizes as CategoryDebugging and
+		// "analyze this exception" categorizes as CategoryDebugging and
 		// does not match any DSL keyword, so it reaches the SLM.
 		req := PlanRequest{
-			Prompt:          "debug why this test keeps failing with an exception",
+			Prompt:          "analyze this exception that keeps happening",
 			GuardrailBudget: 6000,
 			GuardrailSource: "static-fallback",
 			Context:         context.Background(),
@@ -406,7 +406,7 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 			LocalPatternsRegex: localPatternsRegex,
 		}
 		req := PlanRequest{
-			Prompt:          "debug why this test keeps failing",
+			Prompt:          "analyze why this code keeps crashing",
 			GuardrailBudget: 6000,
 			GuardrailSource: "static-fallback",
 			Context:         context.Background(),
@@ -433,7 +433,7 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 			LocalPatternsRegex: localPatternsRegex,
 		}
 		req := PlanRequest{
-			Prompt:          "debug why this test keeps failing",
+			Prompt:          "analyze why this code keeps crashing",
 			GuardrailBudget: 6000,
 			GuardrailSource: "static-fallback",
 			Context:         context.Background(),
@@ -464,7 +464,7 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 			LocalPatternsRegex: localPatternsRegex,
 		}
 		req := PlanRequest{
-			Prompt:          "debug this stack trace",
+			Prompt:          "analyze this stack trace",
 			GuardrailBudget: 6000,
 			GuardrailSource: "static-fallback",
 			Context:         context.Background(),

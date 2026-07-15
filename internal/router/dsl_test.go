@@ -34,8 +34,10 @@ func TestGuardrail(t *testing.T) {
 }
 
 func TestDSL(t *testing.T) {
-	formattingRegex := regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate)\b`)
-	localPatternsRegex := regexp.MustCompile(`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis)\b`)
+	// Formatting patterns (simple, non-logic tasks)
+	formattingRegex := regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|regex|api endpoint)\b`)
+	// Local patterns (common coding tasks — issue #230 additions merged with prior #202 entries)
+	localPatternsRegex := regexp.MustCompile(`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis|debug|fix bug|git commit|sql query|parse json|validate input|test|optimize|readme)\b`)
 	cases := []struct {
 		name    string
 		prompt  string
@@ -59,6 +61,18 @@ func TestDSL(t *testing.T) {
 			"refactoring is needed", "", false},
 		{"unrelated", "explain goroutines", "", false},
 		{"empty", "", "", false},
+		// New patterns from issue #230
+		{"debug hit", "debug this memory leak", RouteLocal, true},
+		{"fix bug hit", "fix bug in the authentication", RouteLocal, true},
+		{"git commit hit", "git commit with a descriptive message", RouteLocal, true},
+		{"sql query hit", "write a sql query to find duplicates", RouteLocal, true},
+		{"parse json hit", "parse json response", RouteLocal, true},
+		{"validate input hit", "validate input fields", RouteLocal, true},
+		{"regex hit", "regex to match email addresses", RouteLocal, true},
+		{"api endpoint hit", "create an api endpoint", RouteLocal, true},
+		{"test hit", "write a test for this function", RouteLocal, true},
+		{"optimize hit", "optimize the database queries", RouteLocal, true},
+		{"readme hit", "update the readme file", RouteLocal, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

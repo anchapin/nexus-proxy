@@ -69,7 +69,7 @@ func baseDeps(t *testing.T) (Deps, *upstream.RecordingTransport) {
 		Client:          client,
 		RAG:             store,
 		SLM:             router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, 1, client),
-		FormattingRegex: regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate)\b`),
+		FormattingRegex: regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`),
 		Recorder:        telemetry.Noop{},
 	}
 	return deps, rt
