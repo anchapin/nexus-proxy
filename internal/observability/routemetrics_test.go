@@ -494,3 +494,101 @@ func TestObserveCascadeFallbackDeterministicOrder(t *testing.T) {
 		t.Errorf("cascade fallback output not deterministic between scrapes")
 	}
 }
+
+// TestQueueOverflowCounters exercises the issue #226 overflow counters
+// and verifies they appear in the Prometheus exposition with the correct
+// HELP/TYPE lines and zero-value output when not incremented.
+func TestQueueOverflowCounters(t *testing.T) {
+	rc := NewRouteCounters()
+
+	// Verify zero-state has HELP/TYPE but zero value.
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_judge_queue_overflow_total", "judge metric family header"},
+		{"# TYPE nexus_judge_queue_overflow_total counter", "judge TYPE line"},
+		{"nexus_quality_queue_overflow_total", "quality metric family header"},
+		{"# TYPE nexus_quality_queue_overflow_total counter", "quality TYPE line"},
+		{"nexus_judge_queue_overflow_total 0\n", "judge zero value"},
+		{"nexus_quality_queue_overflow_total 0\n", "quality zero value"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+
+	// Increment both counters and verify non-zero output.
+	rc.ObserveJudgeQueueOverflow()
+	rc.ObserveJudgeQueueOverflow()
+	rc.ObserveQualityQueueOverflow()
+
+	sb.Reset()
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo after increments: %v", err)
+	}
+	out = sb.String()
+
+	overflowChecks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_judge_queue_overflow_total 2\n", "judge incremented twice"},
+		{"nexus_quality_queue_overflow_total 1\n", "quality incremented once"},
+	}
+	for _, c := range overflowChecks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+}
+
+// TestQueueOverflowCountersConcurrentSafe exercises the overflow
+// counters from many goroutines; the race detector is the primary assertion.
+func TestQueueOverflowCountersConcurrentSafe(t *testing.T) {
+	rc := NewRouteCounters()
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			if n%2 == 0 {
+				rc.ObserveJudgeQueueOverflow()
+			} else {
+				rc.ObserveQualityQueueOverflow()
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+	if !strings.Contains(out, "nexus_judge_queue_overflow_total") {
+		t.Errorf("expected judge overflow metric in output")
+	}
+	if !strings.Contains(out, "nexus_quality_queue_overflow_total") {
+		t.Errorf("expected quality overflow metric in output")
+	}
+}
+
+// TestQueueOverflowCountersNilSafe verifies that nil receivers are safe.
+func TestQueueOverflowCountersNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveJudgeQueueOverflow()
+	rc.ObserveQualityQueueOverflow()
+	// Must not panic; WriteTo is already tested nil-safe above.
+	n, err := rc.WriteTo(&strings.Builder{})
+	if err != nil || n != 0 {
+		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
+	}
+}

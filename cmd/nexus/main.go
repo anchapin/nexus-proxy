@@ -325,6 +325,10 @@ func main() {
 		}
 	}
 
+	// Route-decision counters (issue #74, #226). Declared early so the
+	// judge and quality observers can reference it; mux.Handle and the
+	// Handler() call stay in the late-setup block below.
+	routeCounters := observability.NewRouteCounters()
 	if cfg.JudgeEnabled && cfg.JudgeAPIKey != "" {
 		evalCfg := judge.Config{
 			URL:         cfg.JudgeURL,
@@ -412,6 +416,7 @@ func main() {
 				if bridge != nil {
 					bridge.forget(c.RequestID)
 				}
+				routeCounters.ObserveJudgeQueueOverflow()
 				slog.Warn("judge queue full, dropped request", slog.String("request_id", c.RequestID))
 				return false
 			}
@@ -552,6 +557,7 @@ func main() {
 				TraceParent: e.TraceParent,
 				TraceState:  e.TraceState,
 			}) {
+				routeCounters.ObserveQualityQueueOverflow()
 				slog.Warn("quality queue full, dropped request",
 					slog.String("request_id", e.RequestID),
 					slog.String("path", e.Path),
@@ -608,8 +614,6 @@ func main() {
 	// signature. /metrics is served by the handler returned by
 	// RouteCounters.Handler() so a scrape is always an atomic
 	// snapshot.
-	routeCounters := observability.NewRouteCounters()
-
 	routeDecisionObs := handlers.RouteDecisionObserverFunc(func(e handlers.RouteDecisionEvent) {
 		routeCounters.Observe(e.Route, e.Source, e.Confidence, e.TaskType, "")
 		// Issue #206: record SLM cache hit/miss.

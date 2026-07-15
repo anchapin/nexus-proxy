@@ -192,6 +192,9 @@ func (e *Evaluator) Enabled() bool {
 // judge queue was full. The counter is monotonically increasing and
 // safe to read from any goroutine.
 func (e *Evaluator) Dropped() uint64 {
+	if e == nil {
+		return 0
+	}
 	return e.dropped.Load()
 }
 
