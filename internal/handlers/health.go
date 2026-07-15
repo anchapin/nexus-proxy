@@ -332,10 +332,10 @@ type readyzResponse struct {
 	Degraded bool   `json:"degraded"`
 }
 
-// StatusDeps bundles the collaborators the /status handler reads
+// HealthStatusDeps bundles the collaborators the /status handler reads
 // when serialising the detailed JSON view. Splitting it from
 // ReadyzDeps keeps each handler's signature small and self-evident.
-type StatusDeps struct {
+type HealthStatusDeps struct {
 	Health        *health.Health
 	Probe         ProbeStats
 	Judge         JudgeStats
@@ -351,7 +351,7 @@ type StatusDeps struct {
 // non-blocking (atomic loads on the hot path, method calls that
 // read the latest buffered-channel state in microseconds) so a
 // probe storm does not contend with the chat path.
-func StatusHandler(deps StatusDeps) http.HandlerFunc {
+func StatusHandler(deps HealthStatusDeps) http.HandlerFunc {
 	start := deps.StartTime
 	if start.IsZero() {
 		// Defensive: a wiring mistake that forgets StartTime would

@@ -37,6 +37,8 @@ func (benchEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
 	return []float64{1.0}, nil
 }
 
+func (benchEmbedder) IsHealthy(context.Context) bool { return true }
+
 // jsonStringLit wraps a string in a JSON string literal via fmt %q.
 func jsonStringLit(s string) string {
 	return fmt.Sprintf("%q", s)

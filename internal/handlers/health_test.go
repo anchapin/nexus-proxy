@@ -230,7 +230,7 @@ func TestStatusShape(t *testing.T) {
 	cfg := config.Config{FrontierKey: "sk-test"}
 	start := time.Now().Add(-42 * time.Second)
 
-	h := StatusHandler(StatusDeps{
+	h := StatusHandler(HealthStatusDeps{
 		Health:        stubHealth(t, true),
 		Probe:         probe,
 		Judge:         judge,
@@ -359,7 +359,7 @@ func TestStatusShape(t *testing.T) {
 // return 200 with sensible zero values, never panic on a nil
 // adapter function.
 func TestStatusZeroAdapters(t *testing.T) {
-	h := StatusHandler(StatusDeps{
+	h := StatusHandler(HealthStatusDeps{
 		Health:        nil,
 		Probe:         ProbeStatsFunc{},
 		Judge:         JudgeStatsFunc{},
