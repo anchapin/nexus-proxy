@@ -2147,3 +2147,59 @@ func TestChatLocalCooldownDoesNotAffectFrontierRoute(t *testing.T) {
 		t.Errorf("X-Nexus-Local-Cooldown = %q, want absent on route=frontier", got)
 	}
 }
+
+// TestChatFrontierCostUsesFrontierCostPer1K verifies issue #221: the
+// EstimatedCostUSD field is calculated using d.Config.FrontierCostPer1K
+// (not d.Config.JudgeCostPer1KUSD). The guardrail forces a frontier
+// route deterministically without needing an SLM stub.
+func TestChatFrontierCostUsesFrontierCostPer1K(t *testing.T) {
+	deps, rt := baseDeps(t)
+	// Set two distinct cost rates so we can distinguish which one
+	// the handler actually uses.
+	deps.Config.FrontierCostPer1K = 0.010 // 10x the judge default
+	deps.Config.JudgeCostPer1KUSD = 0.002
+
+	obs := &recordingMetricsObserver{}
+	deps.MetricsObserver = obs
+
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("frontier stream"))
+	})
+
+	// 30000 chars / 4 = 7500 tokens > 6000 guardrail -> frontier
+	largeUser := strings.Repeat("a", 30000)
+	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%q", rw.Code, rw.Body.String())
+	}
+
+	events := obs.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("metrics observer events = %d, want 1", len(events))
+	}
+
+	e := events[0]
+	if e.Route != string(router.RouteFrontier) {
+		t.Errorf("Route = %q, want %q", e.Route, router.RouteFrontier)
+	}
+
+	// Verify the cost uses FrontierCostPer1K (0.010) not JudgeCostPer1KUSD (0.002).
+	// The cost ratio should be exactly 5x (0.010/0.002).
+	// We verify this by checking that EstimatedCostUSD / FrontierCostPer1K ==
+	// EstimatedCostUSD if using JudgeCostPer1KUSD * 5 (within floating point tolerance).
+	if e.EstimatedCostUSD <= 0 {
+		t.Fatalf("EstimatedCostUSD = %v, want > 0", e.EstimatedCostUSD)
+	}
+	// Cost with FrontierCostPer1K should be 5x cost with JudgeCostPer1KUSD.
+	// If the code incorrectly used JudgeCostPer1KUSD, the ratio would be 1.0.
+	// If it correctly uses FrontierCostPer1K, the ratio is 5.0.
+	ratio := e.EstimatedCostUSD / (float64(e.InputTokens) * deps.Config.JudgeCostPer1KUSD / 1000.0)
+	if ratio < 4.9 || ratio > 5.1 {
+		t.Errorf("Cost ratio = %v, want ~5.0 (FrontierCostPer1K=0.010 / JudgeCostPer1KUSD=0.002); got ratio %.2f which indicates %s",
+			ratio, ratio,
+			map[bool]string{true: "CORRECT use of FrontierCostPer1K", false: "INCORRECT use of JudgeCostPer1KUSD"}[ratio > 4.5])
+	}
+}

@@ -1580,7 +1580,7 @@ func Chat(d Deps) http.Handler {
 			postCompressionChars := totalMessageChars(messages)
 			savings := totalTokenSavings(preCompressionChars, postCompressionChars)
 			inputTokens := telemetry.EstimateTokens(latestPrompt)
-			cost := frontierCostEstimate(string(route), model, inputTokens, d.Config.JudgeCostPer1KUSD)
+			cost := frontierCostEstimate(string(route), model, inputTokens, d.Config.FrontierCostPer1K)
 			baselineCost := baselineCostEstimate(inputTokens+outputTokens, d.Config.CostBaselineRatePer1K)
 			savingsCost := baselineCost - cost
 			if savingsCost < 0 {
@@ -2043,12 +2043,9 @@ func totalTokenSavings(preChars, postChars int) int {
 
 // frontierCostEstimate multiplies input tokens by the configured
 // cost-per-1k. Returns zero for non-frontier routes so local +
-// fusion-trail rows count as zero cost in the dashboard. The
-// JudgeCostPer1KUSD knob is reused here for lack of a separate
-// frontier-rate env; the PRD says one is enough at this stage.
+// fusion-trail rows count as zero cost in the dashboard.
 func frontierCostEstimate(route, model string, inputTokens int, costPer1KUSD float64) float64 {
-	// model is reserved for future per-model pricing tables —
-	// the bundle stays cheap by sharing JudgeCostPer1KUSD for now.
+	// model is reserved for future per-model pricing tables.
 	_ = model
 	if route != string(router.RouteFrontier) {
 		return 0
