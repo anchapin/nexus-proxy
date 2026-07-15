@@ -54,6 +54,8 @@ const (
 var version = "dev"
 
 func main() {
+	startTime := time.Now()
+
 	// Subcommand dispatch (issue #32). The default invocation
 	// (no args) starts the proxy; `nexus check` (alias `nexus
 	// doctor`) runs the boot-time diagnostic suite and exits.
@@ -756,17 +758,46 @@ func main() {
 		slog.String("ollama_url", cfg.OllamaURL),
 	)
 
-	// /status endpoint (issue #109). Exposes operator-facing
-	// diagnostics: frontier configured (boolean only — no URL or
-	// model name), judge enabled, VRAM budget, and uptime. Behind
-	// auth by default; set NEXUS_STATUS_PUBLIC=true for a public
-	// status page (e.g. behind a reverse-proxy ACL).
-	mux.HandleFunc("/status", statusHandler(hpoller, probeMgr, cfg, judgeEval != nil, time.Now()))
-	if cfg.StatusPublic {
-		slog.Info("status endpoint is PUBLIC (NEXUS_STATUS_PUBLIC=true)")
-	} else {
-		slog.Info("status endpoint is gated behind auth (set NEXUS_STATUS_PUBLIC=true to expose)")
-	}
+	// /status serves a JSON diagnostic snapshot of all async subsystems
+	// (issue #225): judge queue depth/capacity, quality queue depth/capacity,
+	// RAG embedding health, and a routing distribution snapshot. Primary
+	// interface for Kubernetes readiness probes and on-call engineers.
+	mux.Handle("/status", handlers.Status(handlers.StatusDeps{
+		JudgeEnabled:   func() bool { return judgeEval != nil && judgeEval.Enabled() },
+		JudgeDepth:     func() int { return judgeEval.QueueDepth() },
+		JudgeCapacity:  func() int { return cfg.JudgeQueueDepth },
+		JudgeWorkers:   func() int {
+			if judgeEval == nil {
+				return 0
+			}
+			return judgeEval.Concurrency()
+		},
+		QualityEnabled:  func() bool { return verifier != nil && verifier.Enabled() },
+		QualityDepth:   func() int {
+			if verifier == nil {
+				return 0
+			}
+			return verifier.QueueDepth()
+		},
+		QualityCapacity: func() int { return cfg.QualityQueueDepth },
+		QualityWorkers: func() int {
+			if verifier == nil {
+				return 0
+			}
+			return verifier.Concurrency()
+		},
+		RAGHealthy: func(ctx context.Context) bool {
+			// emb is the OllamaEmbedder; use its IsHealthy method with a short timeout.
+			return emb.IsHealthy(ctx)
+		},
+		RAGIndexedExamples: func() int { return store.Size() },
+		RoutingSnapshot: func() handlers.RoutingSnapshot {
+			snap := routeCounters.Snapshot()
+			return handlers.RoutingSnapshot{Decisions: snap}
+		},
+		Uptime: func() time.Duration { return time.Since(startTime) },
+	}))
+	slog.Info("status endpoint serves async subsystem diagnostics")
 
 	// OpenAI-compatible model discovery (issue #78). GET /v1/models
 	// returns the configured local/router/frontier models (and any
