@@ -763,17 +763,17 @@ func main() {
 	// RAG embedding health, and a routing distribution snapshot. Primary
 	// interface for Kubernetes readiness probes and on-call engineers.
 	mux.Handle("/status", handlers.Status(handlers.StatusDeps{
-		JudgeEnabled:   func() bool { return judgeEval != nil && judgeEval.Enabled() },
-		JudgeDepth:     func() int { return judgeEval.QueueDepth() },
-		JudgeCapacity:  func() int { return cfg.JudgeQueueDepth },
-		JudgeWorkers:   func() int {
+		JudgeEnabled:  func() bool { return judgeEval != nil && judgeEval.Enabled() },
+		JudgeDepth:    func() int { return judgeEval.QueueDepth() },
+		JudgeCapacity: func() int { return cfg.JudgeQueueDepth },
+		JudgeWorkers: func() int {
 			if judgeEval == nil {
 				return 0
 			}
 			return judgeEval.Concurrency()
 		},
-		QualityEnabled:  func() bool { return verifier != nil && verifier.Enabled() },
-		QualityDepth:   func() int {
+		QualityEnabled: func() bool { return verifier != nil && verifier.Enabled() },
+		QualityDepth: func() int {
 			if verifier == nil {
 				return 0
 			}
@@ -1202,50 +1202,5 @@ func publicPathExempt(cfg config.Config) func(*http.Request) bool {
 		default:
 			return false
 		}
-	}
-}
-
-// statusHandler returns the /status handler (issue #109). Unlike
-// /healthz (which is designed for liveness probes), /status exposes
-// operator-facing diagnostics: whether the frontier API is
-// configured, whether the judge evaluator is enabled, the current
-// VRAM budget, and uptime. The frontier field is a boolean (not the
-// URL or model name) so the response is safe to expose publicly if
-// the operator opts in via NEXUS_STATUS_PUBLIC=true.
-func statusHandler(hpoller *health.Health, mgr *probe.Manager, cfg config.Config, judgeEnabled bool, startTime time.Time) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-
-		budget := probe.Budget{Source: probe.SourceStatic}
-		if mgr != nil {
-			budget = mgr.Get()
-		}
-		displayTokens := budget.Tokens
-		if displayTokens <= 0 {
-			displayTokens = cfg.TokenGuardrail
-		}
-
-		resp := struct {
-			Status             string `json:"status"`
-			FrontierConfigured bool   `json:"frontier_configured"`
-			OllamaHealthy      bool   `json:"ollama_healthy"`
-			JudgeEnabled       bool   `json:"judge_enabled"`
-			BudgetTokens       int    `json:"budget_tokens"`
-			BudgetSource       string `json:"budget_source"`
-			FreeVRAMBytes      int64  `json:"free_vram_bytes,omitempty"`
-			ModelContext       int    `json:"model_context,omitempty"`
-			UptimeSeconds      int64  `json:"uptime_seconds"`
-		}{
-			Status:             "ok",
-			FrontierConfigured: cfg.FrontierKey != "",
-			OllamaHealthy:      hpoller == nil || hpoller.IsLocalHealthy(),
-			JudgeEnabled:       judgeEnabled,
-			BudgetTokens:       displayTokens,
-			BudgetSource:       string(budget.Source),
-			FreeVRAMBytes:      budget.FreeVRAMBytes,
-			ModelContext:       budget.ModelContext,
-			UptimeSeconds:      int64(time.Since(startTime).Seconds()),
-		}
-		_ = json.NewEncoder(w).Encode(resp)
 	}
 }
