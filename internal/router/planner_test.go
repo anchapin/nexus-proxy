@@ -62,8 +62,8 @@ func (s *stubConf) LocalConfidence(category string) float64 {
 	return s.value
 }
 
-	// formattingRegex matches the handler's NEXUS_FORMATTING_REGEX default.
-	var formattingRegex = regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`)
+// formattingRegex matches the handler's NEXUS_FORMATTING_REGEX default.
+var formattingRegex = regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`)
 
 // localPatternsRegex matches common coding task keywords (issue #202).
 var localPatternsRegex = regexp.MustCompile(`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis)\b`)
