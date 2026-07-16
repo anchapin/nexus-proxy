@@ -992,7 +992,7 @@ func main() {
 				slog.Duration("window", cfg.AuthRateLimitWindow),
 			)
 		}
-		authMw := auth.NewMiddleware(cfg.ProxyAPIKey, publicPathExempt(cfg), authLimiter)
+		authMw := auth.NewMiddleware(cfg.ProxyAPIKey, publicPathExempt(cfg), authLimiter, circuitCollector)
 		rootHandler = authMw.Wrap(mux)
 		slog.Info("inbound auth enabled",
 			slog.Bool("status_public", cfg.StatusPublic),
