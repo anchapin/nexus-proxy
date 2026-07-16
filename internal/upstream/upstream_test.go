@@ -610,8 +610,9 @@ func TestBufferedFetchForcesStreamFalseOnWire(t *testing.T) {
 		b, _ := io.ReadAll(r.Body)
 		seenBody = string(b)
 		return &http.Response{
-			StatusCode: 200,
-			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"ok"}}]}`)),
+			StatusCode:    200,
+			Header:        http.Header{"Content-Type": {"application/json"}},
+			Body:          io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"ok"}}]}`)),
 		}, nil
 	})}
 	payload := map[string]interface{}{
@@ -631,8 +632,9 @@ func TestBufferedFetchSetsBearerWhenKeySet(t *testing.T) {
 	client := &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
 		seenAuth = r.Header.Get("Authorization")
 		return &http.Response{
-			StatusCode: 200,
-			Body:       io.NopCloser(strings.NewReader(`{}`)),
+			StatusCode:    200,
+			Header:        http.Header{"Content-Type": {"application/json"}},
+			Body:          io.NopCloser(strings.NewReader(`{}`)),
 		}, nil
 	})}
 	if err := BufferedFetch(newJSONRW(), client, "http://x", "sk-test", nil); err != nil {

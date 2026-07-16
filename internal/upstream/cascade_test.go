@@ -304,6 +304,27 @@ func TestCascadeFallsBackOnMalformedJSON(t *testing.T) {
 	}
 }
 
+// TestCascadeFallsBackOnHTMLContentType verifies that a 200 OK response
+// with Content-Type: text/html is treated as an error and triggers fallback
+// (issue #314). HTML error pages from a misbehaving upstream would
+// otherwise pass JSON validation and get forwarded as a valid response.
+func TestCascadeFallsBackOnHTMLContentType(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `<html><body>Internal Server Error</body></html>`)
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+	res, err := twoStepCascade().Run(newSSERW(), &http.Client{Transport: ft}, nil)
+	if err != nil || res.ServedBy != "frontier" {
+		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
+	}
+}
+
 func TestCascadeFallsBackOnEmptyChoices(t *testing.T) {
 	ft := newFakeTransport()
 	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {

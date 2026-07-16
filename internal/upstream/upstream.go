@@ -96,6 +96,13 @@ func (b *bufferResponseWriter) Write(d []byte) (int, error) {
 func (b *bufferResponseWriter) WriteHeader(int) {}
 func (b *bufferResponseWriter) Flush()          {}
 
+// ErrUpstreamContentTypeMismatch is returned by BufferedFetchWithContext
+// when the upstream responds with 200 OK but the Content-Type header is
+// not application/json or text/event-stream. HTML error pages from a
+// misbehaving upstream would otherwise pass JSON validation and get
+// forwarded as a valid response (issue #314).
+var ErrUpstreamContentTypeMismatch = errors.New("upstream: response Content-Type mismatch")
+
 // Stream POSTs payload to targetURL and flushes every newline-terminated
 // chunk from the upstream response body straight to w. This preserves the
 // harness's expected SSE framing — each `data: {…}\n\n` arrives intact.
@@ -298,6 +305,27 @@ func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
+
+	// Validate Content-Type before attempting JSON parsing (issue #314).
+	// A misbehaving upstream returning 200 OK with text/html would otherwise
+	// pass JSON validation and get forwarded as a valid response.
+	// Only check Content-Type for 200 OK; non-200 responses are forwarded
+	// as-is (their bodies may be plain-text error messages).
+	if resp.StatusCode == http.StatusOK {
+		contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+		// Strip charset suffix (e.g. "application/json; charset=utf-8").
+		if idx := strings.Index(contentType, ";"); idx >= 0 {
+			contentType = strings.TrimSpace(contentType[:idx])
+		}
+		if contentType != "application/json" && contentType != "text/event-stream" {
+			slog.Warn("upstream: response Content-Type mismatch",
+				"status", resp.StatusCode,
+				"content_type", contentType,
+				"target_url", targetURL,
+			)
+			return fmt.Errorf("%w: got %q (status %d)", ErrUpstreamContentTypeMismatch, contentType, resp.StatusCode)
+		}
+	}
 
 	// Validate the upstream body is a single JSON object. A misbehaving
 	// upstream returning HTML or plain text would otherwise propagate
