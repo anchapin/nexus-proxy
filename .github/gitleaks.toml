@@ -8,9 +8,28 @@
 [extend]
 useDefault = true
 
-[allowlist]
+[[allowlists]]
 description = "Example env file and provider constructors — no real secrets"
 paths = [
   ".env.example",
   "internal/providers/",
+]
+
+# False positive: generic-api-key rule triggers on float64 type declarations
+# in function signatures and on NEXUS_FRONTIER_API_KEY in test code.
+# These are not real secrets. (issue #313)
+[[allowlists]]
+description = "False positive files for generic-api-key rule"
+paths = [
+  "internal/handlers/chat.go",
+  "internal/config/file_integration_test.go",
+  "internal/config/file_test.go",
+]
+
+# Historical commits with false positives - skip entire commits
+[[allowlists]]
+description = "Historical commits with placeholder test values"
+commits = [
+  "da7477ee88eab8eea00d50d6d02fb2850ec41cb0",
+  "5c7b020a82951aea0402d8e5a5b54474f02a2cb0",
 ]
