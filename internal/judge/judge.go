@@ -40,6 +40,7 @@ import (
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/budget"
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
 // Sample is the input that triggers one judge attempt: the original
@@ -272,7 +273,25 @@ func (e *Evaluator) Concurrency() int { return e.cfg.Concurrency }
 func (e *Evaluator) worker() {
 	defer e.wg.Done()
 	for s := range e.queue {
+		// Create a child span for this judge evaluation when trace context
+		// is available (issue #372).
+		var span *tracing.Span
+		if s.TraceParent != "" {
+			traceID, spanID, ok := tracing.ParseTraceparent(s.TraceParent)
+			if ok {
+				parentCtx := tracing.Context{TraceID: traceID, SpanID: spanID}
+				_, span = tracing.StartSpan(parentCtx, "judge.evaluate")
+				span.SetAttr("request_id", s.RequestID)
+				span.SetAttr("model", e.cfg.Model)
+			}
+		}
+
 		score := e.evaluate(s)
+
+		if span != nil {
+			span.SetAttr("score", score.Score)
+		}
+
 		if err := e.storage.Record(score); err != nil {
 			slog.Error("judge storage record",
 				slog.String("request_id", s.RequestID),
@@ -282,6 +301,10 @@ func (e *Evaluator) worker() {
 		// Wire judge cost into the budget guard (issue #240).
 		if e.cfg.BudgetGuard != nil && score.Cost > 0 {
 			e.cfg.BudgetGuard.Record(context.Background(), score.Cost, "judge")
+		}
+
+		if span != nil {
+			span.End()
 		}
 	}
 }

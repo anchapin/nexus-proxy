@@ -27,6 +27,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
 
@@ -790,6 +791,14 @@ func Chat(d Deps) http.Handler {
 		reqID := requestID(r)
 		started := time.Now()
 
+		// W3C trace context for async worker propagation (issue #372).
+		// Captured from the inbound request context so judge and quality
+		// workers can create child spans linked to the originating request.
+		var traceParent, traceState string
+		if tc, ok := tracing.SpanContextFromContext(r.Context()); ok {
+			traceParent = tracing.FormatTraceparent(tc.TraceID, tc.SpanID)
+		}
+
 		// Per-stage timing breakdown (issue #300). Captured using
 		// time.Since(started) after each pipeline stage so the
 		// observer can populate histograms.
@@ -1541,6 +1550,8 @@ func Chat(d Deps) http.Handler {
 					if res.Succeeded && capw != nil {
 						if d.JudgeObserver != nil {
 							d.JudgeObserver.Submit(LocalCompletion{
+								TraceParent: traceParent,
+								TraceState:  traceState,
 								RequestID:   reqID,
 								Instruction: latestPrompt,
 								Output:      capw.Buffer(),
@@ -1548,7 +1559,7 @@ func Chat(d Deps) http.Handler {
 							})
 						}
 						if d.QualityObserver != nil {
-							emitDetectedEdits(capw.Buffer(), reqID, "", "", d.QualityObserver)
+							emitDetectedEdits(capw.Buffer(), reqID, traceParent, traceState, d.QualityObserver)
 						}
 					}
 				}
@@ -1615,6 +1626,8 @@ func Chat(d Deps) http.Handler {
 					if capw != nil {
 						if d.JudgeObserver != nil {
 							d.JudgeObserver.Submit(LocalCompletion{
+								TraceParent: traceParent,
+								TraceState:  traceState,
 								RequestID:   reqID,
 								Instruction: latestPrompt,
 								Output:      capw.Buffer(),
@@ -1622,7 +1635,7 @@ func Chat(d Deps) http.Handler {
 							})
 						}
 						if d.QualityObserver != nil {
-							emitDetectedEdits(capw.Buffer(), reqID, "", "", d.QualityObserver)
+							emitDetectedEdits(capw.Buffer(), reqID, traceParent, traceState, d.QualityObserver)
 						}
 					}
 				}

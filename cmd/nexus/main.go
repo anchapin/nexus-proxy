@@ -37,6 +37,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/ratelimit"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 	"github.com/anchapin/nexus-proxy/internal/transport"
 	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
@@ -342,6 +343,19 @@ func main() {
 	// judge and quality observers can reference it; mux.Handle and the
 	// Handler() call stay in the late-setup block below.
 	routeCounters := observability.NewRouteCounters()
+
+	// Distributed tracing (issue #372). Wire up the OTLP/JSON exporter
+	// if NEXUS_TRACING_ENDPOINT is set; otherwise the tracing package
+	// stays in no-op mode so operators pay zero overhead.
+	if cfg.TracingEndpoint != "" {
+		exporter := tracing.NewExporter(tracing.ExporterConfig{
+			Endpoint: cfg.TracingEndpoint,
+			Timeout:  cfg.TracingTimeout,
+		})
+		if exporter != nil {
+			tracing.RegisterExporter(exporter)
+		}
+	}
 
 	// Circuit breaker metrics collector (issue #304). Created early so it
 	// is available for wiring into the chat handler Deps.
