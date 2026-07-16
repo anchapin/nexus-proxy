@@ -659,6 +659,14 @@ type Deps struct {
 	// that adapts the event to the in-process RAG counter.
 	RAGObserver RAGObserver
 
+	// RAGCacheObserver is invoked once per RAG retrieval attempt with
+	// the embedding cache hit/miss outcome (issue #303). Implementations
+	// must be safe for concurrent use and must not block. Nil is
+	// treated as "no observer"; the hot path is unaffected. The handler
+	// does not import the observability package — main.go wires a closure
+	// that adapts the event to RouteCounters.ObserveRAGCacheHit/Miss.
+	RAGCacheObserver func(hit bool)
+
 	// CascadeFallbackObserver is invoked when the cascade falls back to a
 	// later step due to a retryable error (issue #205). The handler
 	// dispatches exactly one event per request when FallbackReason is
@@ -935,6 +943,14 @@ func Chat(d Deps) http.Handler {
 		var ragInjected bool
 		var ragFilename string
 		var ragScore float64
+
+		// Snapshot the embedding cache hit count before Retrieve so we can
+		// determine whether the prompt embedding was served from cache (issue #303).
+		var cacheHitCountBefore int64
+		if statsProvider, ok := d.RAG.(rag.RAGCacheStatsProvider); ok {
+			cacheHitCountBefore = statsProvider.EmbedHitCount()
+		}
+
 		ragEx, ragScore, ragErr := d.RAG.Retrieve(r.Context(), latestPrompt)
 		switch {
 		case ragErr != nil:
@@ -990,11 +1006,20 @@ func Chat(d Deps) http.Handler {
 				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "threshold"})
 			}
 		}
+		// Determine embedding cache hit by diffing the hit counter before/after
+		// Retrieve. Only meaningful when the embedder is an EmbedCache (issue #303).
+		var cacheHit bool
+		if statsProvider, ok := d.RAG.(rag.RAGCacheStatsProvider); ok {
+			cacheHit = statsProvider.EmbedHitCount() > cacheHitCountBefore
+		}
 		ragRetrievalMs = time.Since(started).Milliseconds() - promptEngineeringMs
 		trace.Transforms.RAGInjected = ragInjected
 		trace.Transforms.RAGFilename = ragFilename
-		trace.Transforms.RAGCacheHit = false // issue #227: EmbedCache tracking not active with CachedEmbedder (issue #115)
+		trace.Transforms.RAGCacheHit = cacheHit
 		trace.Transforms.RAGScore = ragScore
+		if d.RAGCacheObserver != nil {
+			d.RAGCacheObserver(cacheHit)
+		}
 		// Snapshot the JSON size BEFORE TOON compression so the
 		// metrics observer can attribute tokens saved by the
 		// round-trip pass. Uses the cheap "4 chars per token"

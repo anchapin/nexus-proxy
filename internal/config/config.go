@@ -102,10 +102,10 @@ type Config struct {
 
 	// RAG embedding cache (issue #115). Prompt embeddings are
 	// deterministic for a given model+text pair, so they are memoized
-	// in a bounded LRU. A value of 0 disables the cache (every
-	// Retrieve re-embeds); the default keeps memory flat while
-	// skipping the Ollama round-trip for repeat prompts.
-	RAGEmbedCacheSize int // max LRU entries (256)
+	// in a bounded LRU with TTL. RAGEmbedCacheSize=0 disables the cache;
+	// RAGEmbedCacheTTL=0 disables caching (pass-through) even when size>0.
+	RAGEmbedCacheSize int           // max LRU entries (256)
+	RAGEmbedCacheTTL  time.Duration // per-entry TTL (24h default); 0 = pass-through
 
 	// RAG circuit breaker (issue #222). After RAGCircuitBreakerThreshold
 	// consecutive Ollama /api/embeddings failures the breaker trips and
@@ -504,6 +504,16 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.RAGEmbedCacheSize = embedCacheSize
+
+	// RAG embed cache TTL (issue #303). A TTL is required for EmbedCache
+	// to be active; a value of 0 makes it a pass-through. Default 24h
+	// keeps entries alive across a typical working day while still
+	// eventually evicting stale entries.
+	ragCacheTTL, err := getEnvDuration("NEXUS_RAG_EMBED_CACHE_TTL", 24*time.Hour)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RAGEmbedCacheTTL = ragCacheTTL
 
 	// RAG embedder plugin interface (issue #238). The type selects
 	// which backend the RAG store uses for vector embeddings.
