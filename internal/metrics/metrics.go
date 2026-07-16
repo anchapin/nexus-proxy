@@ -77,6 +77,12 @@ const recordRequestErrorTimeout = 5 * time.Second
 // other case (legacy Panel path always invokes the arbiter; non-fusion
 // routes are always false).
 //
+// FusionJaccardSimilarity (issue #200) mirrors telemetry.Record: the
+// actual Jaccard ratio between the two panel members' contents when
+// both returned content. 0 when fewer than two members returned content.
+// Enables operators to tune NEXUS_FUSION_AGREEMENT_THRESHOLD based on
+// actual distribution data.
+//
 // Route-source metadata (issue #74) mirrors telemetry.Record so the
 // SQLite store and the JSONL recorder carry identical routing metadata
 // for every request.
@@ -87,9 +93,15 @@ type Request struct {
 	Model             string
 	InputTokens       int
 	TOONSavingsTokens int
-	RAGInjected       bool
-	RAGFilename       string
-	EstimatedCostUSD  float64
+	// TOONCompressionMethod records which TOON compression pattern was
+	// applied to this request's messages (issue #247): "fenced" for
+	// ```json [...] ``` blocks, "nested" for {"files": [...]} arrays,
+	// or "" when no compression was applied.
+	TOONCompressionMethod string
+	RAGInjected           bool
+	RAGFilename           string
+	RAGCacheHit           bool // true when the RAG embedding was served from the embed cache (issue #227)
+	EstimatedCostUSD      float64
 
 	// BaselineCostUSD is what this request would have cost if sent
 	// to the configured baseline (frontier) provider at the baseline
@@ -98,12 +110,17 @@ type Request struct {
 	BaselineCostUSD float64
 	SavingsUSD      float64
 
-	OutputTokens         int
-	TTFTMs               int64
-	TotalLatencyMs       float64
-	TPS                  float64
-	Streaming            bool
-	FusionArbiterSkipped bool
+	OutputTokens            int
+	TTFTMs                  int64
+	TotalLatencyMs          float64
+	TPS                     float64
+	Streaming               bool
+	FusionArbiterSkipped    bool
+	FusionJaccardSimilarity float64
+	// FusionArbiterCostUSD (issue #239) mirrors telemetry.Record:
+	// estimated cost of the arbiter call when it ran. 0 when the
+	// arbiter was skipped or for non-fusion routes.
+	FusionArbiterCostUSD float64
 	Error                string
 
 	// Route-source metadata (issue #74).
@@ -127,6 +144,7 @@ type Summary struct {
 	TotalInputTokens   int
 	TOONSavingsTokens  int
 	RAGInjectedCount   int
+	RAGCacheHitCount   int // number of requests whose RAG embedding was served from the embed cache (issue #227)
 	EstimatedCostTotal float64
 
 	// BaselineCostTotal and SavingsTotal roll up the per-request
@@ -183,12 +201,22 @@ func OpenWithLogger(path string, lg Logger) (Store, error) {
 	}
 	if path != ":memory:" {
 		if dir := filepath.Dir(path); dir != "" && dir != "." {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
 				return nil, fmt.Errorf("metrics: mkdir %q: %w", dir, err)
 			}
 		}
 	}
-	return newSQLiteStore(path, lg)
+	s, err := newSQLiteStore(path, lg)
+	if err != nil {
+		return nil, err
+	}
+	// Tighten permissions on the SQLite DB file so an upgrade from a
+	// pre-fix binary locks it down (issue #108). The driver creates the
+	// file; we chmod it after the first successful open.
+	if path != ":memory:" {
+		chmodIfWider(path, 0o600)
+	}
+	return s, nil
 }
 
 // DroppedCounter is implemented by Stores that can shed load under
@@ -221,3 +249,32 @@ type atomicDropped struct{ n atomic.Uint64 }
 
 func (a *atomicDropped) add()        { a.n.Add(1) }
 func (a *atomicDropped) get() uint64 { return a.n.Load() }
+
+// chmodIfWider checks the current mode of path and, if any
+// group/other bits are set, tightens the file to the requested mode.
+// Errors are logged — chmod failures are non-fatal.
+func chmodIfWider(path string, mode os.FileMode) {
+	info, err := os.Stat(path)
+	if err != nil {
+		slog.Warn("metrics: stat for chmod",
+			slog.String("path", path),
+			slog.Any("err", err),
+		)
+		return
+	}
+	perm := info.Mode().Perm()
+	if perm&0o077 == 0 {
+		return
+	}
+	slog.Warn("metrics: tightening file permissions",
+		slog.String("path", path),
+		slog.Int("was", int(perm)),
+		slog.Int("now", int(mode)),
+	)
+	if err := os.Chmod(path, mode); err != nil {
+		slog.Warn("metrics: chmod failed",
+			slog.String("path", path),
+			slog.Any("err", err),
+		)
+	}
+}

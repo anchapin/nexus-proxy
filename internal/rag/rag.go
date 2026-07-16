@@ -11,22 +11,40 @@ package rag
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/anchapin/nexus-proxy/internal/ioutils"
+	"io"
 	"log/slog"
 	"math"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 
-	"github.com/anchapin/nexus-proxy/internal/observability"
+	"time"
 )
 
 // defaultMaxResponseBytes is the default cap on upstream response bodies.
 // It is used by ReadAllLimited to prevent memory exhaustion (issue #365).
 const defaultMaxResponseBytes = 64 << 20 // 64 MiB
+
+// ErrCircuitOpen is returned by OllamaEmbedder.Embed when the circuit
+// breaker has tripped and the cooldown window has not yet elapsed.
+// Callers should treat this as a transient failure and retry after the
+// cooldown expires.
+var ErrCircuitOpen = fmt.Errorf("rag: ollama embedder circuit breaker open")
+
+// BreakerConfig configures the circuit breaker on OllamaEmbedder.
+// A zero Threshold disables the breaker.
+type BreakerConfig struct {
+	Threshold int           // consecutive failures that trip the breaker; 0 = disabled
+	Cooldown  time.Duration // how long the breaker stays open after tripping
+}
 
 // FewShotExample is one indexed code snippet with its embedding.
 type FewShotExample struct {
@@ -39,6 +57,207 @@ type FewShotExample struct {
 // concurrent use; the store calls them concurrently during indexing.
 type Embedder interface {
 	Embed(ctx context.Context, text string) ([]float64, error)
+	IsHealthy(ctx context.Context) bool
+	// IsBreakerOpen is implemented by OllamaEmbedder to expose circuit
+	// breaker state. It returns false for embedders that do not have a
+	// circuit breaker (issue #304).
+	IsBreakerOpen() bool
+	// RecordBreakerSuccess resets the OllamaEmbedder failure counter on a
+	// successful embedding. No-op for embedders without a breaker.
+	RecordBreakerSuccess()
+}
+
+// embedCacheEntry pairs a prompt embedding with its expiry time so TTL-based
+// eviction works alongside the LRU order.
+type embedCacheEntry struct {
+	key    string    // stored so we can evict by key when the list evicts
+	vec    []float64 // embedding vector
+	expire time.Time // TTL boundary
+}
+
+// EmbedCache is a并发-safe LRU cache for prompt embeddings keyed on the
+// exact prompt string. It wraps an Embedder and eliminates redundant
+// /api/embeddings round-trips for duplicate prompts within a configurable
+// TTL window (issue #227).
+type EmbedCache struct {
+	inner  Embedder
+	max    int           // max entries; 0 disables the cache
+	ttl    time.Duration // per-entry TTL; 0 means no expiry
+	mu     sync.Mutex
+	lru    *list.List               // front = most-recently-used
+	index  map[string]*list.Element // prompt → linked-list node
+	hits   int64
+	misses int64
+	// hitCount is an atomic counter incremented on every cache hit.
+	// Handlers snapshot it before and after Retrieve to estimate
+	// per-request cache hits without being disturbed by concurrent requests.
+	hitCount int64
+	// loading tracks in-flight inner.Embed calls so concurrent goroutines
+	// for the same key share a single upstream request.
+	loading map[string]chan loadResult
+}
+
+// loadResult is the result of an inner.Embed call, shared across waiters.
+type loadResult struct {
+	vec []float64
+	err error
+}
+
+// NewEmbedCache returns a cache that wraps inner. max is the LRU capacity
+// (entries are evicted oldest-first when full); ttl is the per-entry time-to-live
+// (zero = no expiry). Both max and ttl must be > 0 for caching to be active;
+// when either is zero the cache is a no-op pass-through to inner.
+func NewEmbedCache(inner Embedder, max int, ttl time.Duration) *EmbedCache {
+	return &EmbedCache{
+		inner:   inner,
+		max:     max,
+		ttl:     ttl,
+		lru:     list.New(),
+		index:   make(map[string]*list.Element),
+		loading: make(map[string]chan loadResult),
+	}
+}
+
+// Embed returns the cached embedding for text if present and not expired,
+// otherwise calls inner.Embed and caches the result. Thread-safe.
+func (c *EmbedCache) Embed(ctx context.Context, text string) ([]float64, error) {
+	if c.max <= 0 || c.ttl <= 0 {
+		return c.inner.Embed(ctx, text)
+	}
+
+	key := text
+
+	// Fast path: check for a live cache entry under the write lock.
+	c.mu.Lock()
+	if el, ok := c.index[key]; ok {
+		ent := el.Value.(embedCacheEntry)
+		if time.Now().Before(ent.expire) {
+			c.lru.MoveToFront(el)
+			c.hits++
+			atomic.AddInt64(&c.hitCount, 1)
+			vec := ent.vec
+			c.mu.Unlock()
+			out := make([]float64, len(vec))
+			copy(out, vec)
+			return out, nil
+		}
+		// Expired — remove from both structures.
+		c.lru.Remove(el)
+		delete(c.index, key)
+	}
+
+	// Check if another goroutine is already loading this key.
+	// If so, release the lock and wait for that goroutine's result.
+	if waitCh, ok := c.loading[key]; ok {
+		c.mu.Unlock()
+		result := <-waitCh
+		if result.err != nil {
+			return nil, result.err
+		}
+		// We waited for a concurrent load and got a hit.
+		atomic.AddInt64(&c.hits, 1)
+		atomic.AddInt64(&c.hitCount, 1)
+		out := make([]float64, len(result.vec))
+		copy(out, result.vec)
+		return out, nil
+	}
+
+	// Mark this key as being loaded. Use a buffered channel so we can
+	// signal completion without blocking the broadcasting goroutine.
+	loadCh := make(chan loadResult, 1)
+	c.loading[key] = loadCh
+	c.mu.Unlock()
+
+	// Call the underlying embedder while not holding the lock.
+	vec, err := c.inner.Embed(ctx, text)
+
+	// Broadcast result to any waiting goroutines and mark load complete.
+	c.mu.Lock()
+	delete(c.loading, key)
+	if err != nil {
+		c.misses++
+		c.mu.Unlock()
+		loadCh <- loadResult{err: err}
+		close(loadCh)
+		return nil, err
+	}
+
+	// Double-check: another goroutine may have inserted a fresh entry
+	// while we were loading.
+	if el, ok := c.index[key]; ok {
+		ent := el.Value.(embedCacheEntry)
+		if time.Now().Before(ent.expire) {
+			c.lru.MoveToFront(el)
+			c.hits++
+		} else {
+			c.lru.Remove(el)
+			delete(c.index, key)
+		}
+	}
+
+	// Insert unless a concurrent goroutine inserted while we loaded.
+	if _, exists := c.index[key]; !exists {
+		ent := embedCacheEntry{
+			key:    key,
+			vec:    vec,
+			expire: time.Now().Add(c.ttl),
+		}
+		el := c.lru.PushFront(ent)
+		c.index[key] = el
+		c.misses++
+		if c.lru.Len() > c.max {
+			oldest := c.lru.Back()
+			evictKey := oldest.Value.(embedCacheEntry).key
+			delete(c.index, evictKey)
+			c.lru.Remove(oldest)
+		}
+	}
+	c.mu.Unlock()
+
+	loadCh <- loadResult{vec: vec, err: nil}
+	close(loadCh)
+
+	out := make([]float64, len(vec))
+	copy(out, vec)
+	return out, nil
+}
+
+// CacheStats returns the cumulative hit and miss counts since the cache was
+// created. Used for observability; not thread-safe with concurrent access.
+func (c *EmbedCache) CacheStats() (hits, misses int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.hits, c.misses
+}
+
+// HitCount returns the current total hit count atomically. Used by the
+// chat handler to snapshot before/after a Retrieve call to estimate
+// per-request cache hits without being disturbed by concurrent requests.
+func (c *EmbedCache) HitCount() int64 {
+	return atomic.LoadInt64(&c.hitCount)
+}
+
+func (c *EmbedCache) IsHealthy(ctx context.Context) bool {
+	return c.inner.IsHealthy(ctx)
+}
+
+// IsBreakerOpen delegates to the wrapped embedder's circuit breaker state
+// (issue #304). Returns false when the inner embedder does not implement
+// the method.
+func (c *EmbedCache) IsBreakerOpen() bool {
+	if e, ok := c.inner.(interface{ IsBreakerOpen() bool }); ok {
+		return e.IsBreakerOpen()
+	}
+	return false
+}
+
+// RecordBreakerSuccess delegates to the wrapped embedder's circuit breaker
+// success handler (issue #304). No-op when the inner embedder does not
+// implement the method.
+func (c *EmbedCache) RecordBreakerSuccess() {
+	if e, ok := c.inner.(interface{ RecordBreakerSuccess() }); ok {
+		e.RecordBreakerSuccess()
+	}
 }
 
 // RAGStore is the read+seed API the chat handler depends on. PersistentStore
@@ -49,6 +268,28 @@ type RAGStore interface {
 	Add(filename, content string, embedding []float64)
 	Size() int
 	Threshold() float64
+	// IsBreakerOpen returns true when the RAG embedder's circuit breaker
+	// has tripped and is blocking requests (issue #304).
+	IsBreakerOpen() bool
+	// RecordBreakerSuccess notifies the embedder's circuit breaker of a
+	// successful retrieval so the failure counter is reset (issue #304).
+	RecordBreakerSuccess()
+}
+
+// EmbedCacheStats is the observability surface for the prompt embedding cache.
+// It is implemented by *EmbedCache and is also exposed by *Store (where it
+// delegates to the wrapped embedder when it is an *EmbedCache).
+type EmbedCacheStats interface {
+	// CacheStats returns the cumulative hit and miss counts.
+	CacheStats() (hits, misses int64)
+}
+
+// RAGCacheStatsProvider is implemented by RAGStore when the store wraps a
+// caching embedder. The chat handler type-asserts d.RAG to this interface
+// to snapshot the embed cache hit count before/after Retrieve and report
+// per-request cache hits via MetricsEvent (issue #227).
+type RAGCacheStatsProvider interface {
+	EmbedHitCount() int64
 }
 
 // Store holds the indexed few-shot examples.
@@ -82,10 +323,59 @@ func (s *Store) Size() int {
 // construction and never mutated.
 func (s *Store) Threshold() float64 { return s.threshold }
 
+// isSymlink reports whether a DirEntry represents a symbolic link.
+// os.ReadDir uses Lstat under the hood, so the ModeSymlink bit is
+// set on the entry itself — we never follow the link.
+func isSymlink(f os.DirEntry) bool {
+	return f.Type()&os.ModeSymlink != 0
+}
+
+// resolveDir resolves symlinks in dir once so that every file-path
+// check later can compare against a canonical prefix. This also
+// prevents the parent-symlink variant (e.g. "examples/sub/../../etc/passwd").
+func resolveDir(dir string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", fmt.Errorf("rag: resolve examples dir %q: %w", dir, err)
+	}
+	return resolved, nil
+}
+
+// verifyInsideDir checks that resolvedPath is rooted inside baseDir.
+// This catches path-traversal attempts where a symlinked subdirectory
+// escapes the intended examples directory.
+func verifyInsideDir(baseDir, resolvedPath string) bool {
+	return strings.HasPrefix(resolvedPath, baseDir+string(filepath.Separator)) || resolvedPath == baseDir
+}
+
+// CacheStats returns the cache hit/miss counts from the wrapped embedder
+// when it is an *EmbedCache. Returns zeros when caching is disabled
+// or the embedder is not a cache.
+func (s *Store) CacheStats() (hits, misses int64) {
+	if ec, ok := s.embedder.(*EmbedCache); ok {
+		return ec.CacheStats()
+	}
+	return 0, 0
+}
+
+// EmbedHitCount returns the current hit count from the wrapped *EmbedCache,
+// or 0 if the embedder is not a caching embedder. Safe to call concurrently.
+func (s *Store) EmbedHitCount() int64 {
+	if ec, ok := s.embedder.(*EmbedCache); ok {
+		return ec.HitCount()
+	}
+	return 0
+}
+
 // IndexDir walks dir, embedding every regular file's contents. It is
 // permissive: a missing directory is created (and indexing returns empty),
 // per-file read or embed errors are logged and skipped. This matches the
 // prototype's behaviour but the errors are now observable instead of silent.
+//
+// Security: symlinks are skipped (issue #107) to prevent confidentiality
+// leaks via injected few-shot examples. The directory path is resolved
+// once to canonicalize it, and every file's resolved path is verified
+// to remain inside the resolved directory.
 func (s *Store) IndexDir(ctx context.Context, dir string) error {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
@@ -98,6 +388,11 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 		return nil
 	}
 
+	safeDir, err := resolveDir(dir)
+	if err != nil {
+		return err
+	}
+
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("rag: read examples dir %q: %w", dir, err)
@@ -107,7 +402,30 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 		if f.IsDir() {
 			continue
 		}
+		if isSymlink(f) {
+			slog.Warn("rag: skipping symlink in examples dir (issue #107)",
+				slog.String("filename", f.Name()),
+				slog.String("dir", dir),
+			)
+			continue
+		}
 		path := filepath.Join(dir, f.Name())
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			slog.Error("rag: cannot resolve path, skipping",
+				slog.String("filename", f.Name()),
+				slog.Any("err", err),
+			)
+			continue
+		}
+		if !verifyInsideDir(safeDir, resolved) {
+			slog.Warn("rag: skipping file that escapes examples dir (issue #107)",
+				slog.String("filename", f.Name()),
+				slog.String("resolved", resolved),
+				slog.String("base", safeDir),
+			)
+			continue
+		}
 		content, err := os.ReadFile(path)
 		if err != nil {
 			slog.Error("rag read file", slog.String("filename", f.Name()), slog.Any("err", err))
@@ -204,6 +522,25 @@ func (s *Store) Add(filename, content string, embedding []float64) {
 	})
 }
 
+// IsBreakerOpen delegates to the underlying embedder's circuit breaker
+// state (issue #304). Returns false when the embedder does not implement
+// the method.
+func (s *Store) IsBreakerOpen() bool {
+	if e, ok := s.embedder.(interface{ IsBreakerOpen() bool }); ok {
+		return e.IsBreakerOpen()
+	}
+	return false
+}
+
+// RecordBreakerSuccess delegates to the underlying embedder's circuit
+// breaker success handler (issue #304). No-op when the embedder does not
+// implement the method.
+func (s *Store) RecordBreakerSuccess() {
+	if e, ok := s.embedder.(interface{ RecordBreakerSuccess() }); ok {
+		e.RecordBreakerSuccess()
+	}
+}
+
 // replace swaps the entire examples slice atomically. Used by
 // PersistentStore.Load to populate from SQLite on boot and by the
 // watcher after a deletion; the caller passes the new slice, this
@@ -257,21 +594,51 @@ func (s *Store) snapshot() []FewShotExample {
 // OllamaEmbedder calls the Ollama /api/embeddings endpoint. It is safe for
 // concurrent use via a shared http.Client.
 type OllamaEmbedder struct {
-	BaseURL string // e.g. "http://localhost:11434"
-	Model   string // e.g. "nomic-embed-text"
-	Client  *http.Client
+	BaseURL          string // e.g. "http://localhost:11434"
+	Model            string // e.g. "nomic-embed-text"
+	Client           *http.Client
+	BreakerConfig    // optional; zero-value means breaker disabled
+	breakerThreshold atomic.Int32
+	cooldownUntil    atomic.Int64 // nanoseconds since Unix epoch; 0 = never tripped
+	failureCount     atomic.Int32
 }
 
 // NewOllamaEmbedder returns an embedder wired to the given Ollama instance.
-func NewOllamaEmbedder(baseURL, model string, client *http.Client) *OllamaEmbedder {
+// Passing a zero BreakerConfig (Threshold==0) disables the circuit breaker.
+func NewOllamaEmbedder(baseURL, model string, client *http.Client, cb BreakerConfig) *OllamaEmbedder {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &OllamaEmbedder{BaseURL: baseURL, Model: model, Client: client}
+	e := &OllamaEmbedder{
+		BaseURL:       baseURL,
+		Model:         model,
+		Client:        client,
+		BreakerConfig: cb,
+	}
+	e.breakerThreshold.Store(int32(cb.Threshold))
+	return e
 }
 
-// Embed fetches the embedding vector for text.
+// IsHealthy checks whether the Ollama embedder is reachable by issuing a
+// short embed request with the given timeout. It returns true if the request
+// succeeds within the timeout, false otherwise. A nil context uses the default
+// background timeout of 2 seconds.
+func (o *OllamaEmbedder) IsHealthy(ctx context.Context) bool {
+	if ctx == nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+	}
+	_, err := o.Embed(ctx, "health check")
+	return err == nil
+}
+
+// Embed fetches the embedding vector for text. If the circuit breaker is
+// open it returns ErrCircuitOpen without calling Ollama.
 func (o *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float64, error) {
+	if o.isOpen() {
+		return nil, ErrCircuitOpen
+	}
 	payload, _ := json.Marshal(map[string]string{"model": o.Model, "prompt": text})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		o.BaseURL+"/api/embeddings", bytes.NewReader(payload))
@@ -281,25 +648,268 @@ func (o *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := o.Client.Do(req)
 	if err != nil {
+		o.recordFailure()
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	body, err := observability.ReadAllLimited(nil, resp.Body, defaultMaxResponseBytes)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		o.recordFailure()
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
+		o.recordFailure()
 		return nil, fmt.Errorf("ollama embed %s: status %d: %s", o.Model, resp.StatusCode, body)
 	}
 	var raw struct {
 		Embedding []float64 `json:"embedding"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
+		o.recordFailure()
 		return nil, fmt.Errorf("ollama embed: decode: %w", err)
 	}
 	if len(raw.Embedding) == 0 {
+		o.recordFailure()
 		return nil, fmt.Errorf("ollama embed: empty embedding for model %s", o.Model)
 	}
+	o.recordSuccess()
 	return raw.Embedding, nil
+}
+
+// OpenAIEmbedder calls the OpenAI /v1/embeddings endpoint. It is safe for
+// concurrent use via a shared http.Client.
+type OpenAIEmbedder struct {
+	BaseURL  string // e.g. "https://api.openai.com/v1"
+	Model    string // e.g. "text-embedding-3-small"
+	APIKey   string
+	Client   *http.Client
+	Audience string // optional OAuth audience for cURL-compatible header
+}
+
+// NewOpenAIEmbedder returns an embedder wired to the OpenAI embeddings endpoint.
+func NewOpenAIEmbedder(baseURL, model, apiKey string, client *http.Client) *OpenAIEmbedder {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	return &OpenAIEmbedder{BaseURL: baseURL, Model: model, APIKey: apiKey, Client: client}
+}
+
+// Embed fetches the embedding vector for text via the OpenAI /v1/embeddings API.
+func (o *OpenAIEmbedder) Embed(ctx context.Context, text string) ([]float64, error) {
+	payload, _ := json.Marshal(map[string]any{
+		"model": o.Model,
+		"input": text,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		o.BaseURL+"/embeddings", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+o.APIKey)
+	if o.Audience != "" {
+		req.Header.Set("ocp-apim-subscription-key", o.Audience)
+	}
+	resp, err := o.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutils.ReadAllLimited(resp.Body, defaultMaxResponseBytes)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("openai embed %s: status %d: %s", o.Model, resp.StatusCode, body)
+	}
+	var raw struct {
+		Data []struct {
+			Embedding []float64 `json:"embedding"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("openai embed: decode: %w", err)
+	}
+	if len(raw.Data) == 0 || len(raw.Data[0].Embedding) == 0 {
+		return nil, fmt.Errorf("openai embed: empty embedding for model %s", o.Model)
+	}
+	return raw.Data[0].Embedding, nil
+}
+
+func (o *OpenAIEmbedder) IsHealthy(ctx context.Context) bool {
+	_, err := o.Embed(ctx, "health")
+	return err == nil
+}
+
+// IsBreakerOpen returns false for OpenAIEmbedder (no circuit breaker, issue #304).
+func (o *OpenAIEmbedder) IsBreakerOpen() bool { return false }
+
+// RecordBreakerSuccess is a no-op for OpenAIEmbedder (issue #304).
+func (o *OpenAIEmbedder) RecordBreakerSuccess() {}
+
+// CohereEmbedder calls the Cohere /v1/embed endpoint. It is safe for
+// concurrent use via a shared http.Client.
+type CohereEmbedder struct {
+	BaseURL string // e.g. "https://api.cohere.ai/v1"
+	Model   string // e.g. "embed-english-v3.0"
+	APIKey  string
+	Client  *http.Client
+}
+
+// NewCohereEmbedder returns an embedder wired to the Cohere embeddings endpoint.
+func NewCohereEmbedder(baseURL, model, apiKey string, client *http.Client) *CohereEmbedder {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	return &CohereEmbedder{BaseURL: baseURL, Model: model, APIKey: apiKey, Client: client}
+}
+
+// Embed fetches the embedding vector for text via the Cohere /v1/embed API.
+func (c *CohereEmbedder) Embed(ctx context.Context, text string) ([]float64, error) {
+	payload, _ := json.Marshal(map[string]any{
+		"model": c.Model,
+		"texts": []string{text},
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.BaseURL+"/embed", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	resp, err := c.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("cohere embed %s: status %d: %s", c.Model, resp.StatusCode, body)
+	}
+	var raw struct {
+		Embeddings [][]float64 `json:"embeddings"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("cohere embed: decode: %w", err)
+	}
+	if len(raw.Embeddings) == 0 || len(raw.Embeddings[0]) == 0 {
+		return nil, fmt.Errorf("cohere embed: empty embedding for model %s", c.Model)
+	}
+	return raw.Embeddings[0], nil
+}
+
+func (c *CohereEmbedder) IsHealthy(ctx context.Context) bool {
+	_, err := c.Embed(ctx, "health")
+	return err == nil
+}
+
+// IsBreakerOpen returns false for CohereEmbedder (no circuit breaker, issue #304).
+func (c *CohereEmbedder) IsBreakerOpen() bool { return false }
+
+// RecordBreakerSuccess is a no-op for CohereEmbedder (issue #304).
+func (c *CohereEmbedder) RecordBreakerSuccess() {}
+
+// EmbedderType is the discriminator for the embedder factory.
+type EmbedderType string
+
+const (
+	EmbedderTypeOllama EmbedderType = "ollama"
+	EmbedderTypeOpenAI EmbedderType = "openai"
+	EmbedderTypeCohere EmbedderType = "cohere"
+)
+
+// NewEmbedder constructs an Embedder from the given config fields.
+// The returned Embedder must be wrapped with NewCachedEmbedder by the
+// caller when the cache is desired (as in main.go).
+// The breakerConfig is only used for the Ollama embedder.
+func NewEmbedder(embedderType EmbedderType, baseURL, model, apiKey string, client *http.Client, breakerConfig BreakerConfig) (Embedder, error) {
+	switch embedderType {
+	case EmbedderTypeOpenAI:
+		if apiKey == "" {
+			return nil, fmt.Errorf("rag: NEXUS_EMBEDDER_TYPE=openai requires NEXUS_FRONTIER_API_KEY to be set")
+		}
+		return NewOpenAIEmbedder(baseURL, model, apiKey, client), nil
+	case EmbedderTypeCohere:
+		if apiKey == "" {
+			return nil, fmt.Errorf("rag: NEXUS_EMBEDDER_TYPE=cohere requires NEXUS_COHERE_API_KEY to be set")
+		}
+		return NewCohereEmbedder(baseURL, model, apiKey, client), nil
+	case EmbedderTypeOllama:
+		fallthrough
+	default:
+		return NewOllamaEmbedder(baseURL, model, client, breakerConfig), nil
+	}
+}
+
+// isOpen reports whether the circuit breaker is currently in the open
+// (cooldown) state. A zero cooldownUntil means the breaker has never
+// tripped or has recovered.
+//
+// When the cooldown deadline has passed, both the failure counter and the
+// deadline are reset so that the next request starts fresh — if it fails it
+// will re-trip the breaker, creating a new cooldown window.
+func (o *OllamaEmbedder) isOpen() bool {
+	deadline := o.cooldownUntil.Load()
+	if deadline == 0 {
+		return false
+	}
+	if time.Now().UnixNano() >= deadline {
+		// Cooldown has expired; give the next request a clean slate.
+		o.failureCount.Store(0)
+		o.cooldownUntil.Store(0)
+		return false
+	}
+	return true
+}
+
+// recordFailure increments the consecutive-failure counter and trips the
+// breaker when the threshold is reached. The cooldown window is set to
+// BreakerCooldown from the current time.
+func (o *OllamaEmbedder) recordFailure() {
+	if o.breakerThreshold.Load() == 0 {
+		return // breaker disabled
+	}
+	count := o.failureCount.Add(1)
+	if count >= o.breakerThreshold.Load() {
+		// Trip: set the cooldown deadline. We add one nanosecond so that
+		// the comparison in isOpen is strict (deadline > now, not >=).
+		o.cooldownUntil.Store(time.Now().Add(o.BreakerConfig.Cooldown).UnixNano() + 1)
+		slog.Warn("rag: ollama embedder circuit breaker tripped",
+			slog.Int("failures", int(count)),
+			slog.Int("threshold", int(o.breakerThreshold.Load())),
+			slog.Duration("cooldown", o.BreakerConfig.Cooldown),
+		)
+	}
+}
+
+// recordSuccess resets the consecutive-failure counter and clears the
+// cooldown deadline. No-op when the breaker is already closed.
+func (o *OllamaEmbedder) recordSuccess() {
+	o.failureCount.Store(0)
+	o.cooldownUntil.Store(0)
+}
+
+// FailureCount returns the current consecutive-failure counter. Exported
+// for the Prometheus gauge provider in main.go.
+func (o *OllamaEmbedder) FailureCount() int {
+	return int(o.failureCount.Load())
+}
+
+// RecordBreakerSuccess resets the circuit breaker failure counter. Called
+// by the chat handler when a RAG retrieval succeeds so the breaker does
+// not remain open after transient failures (issue #304).
+func (o *OllamaEmbedder) RecordBreakerSuccess() {
+	o.recordSuccess()
+}
+
+// IsBreakerOpen reports whether the circuit is currently in the open
+// (cooldown) state. Exported for tests and operational dashboards.
+func (o *OllamaEmbedder) IsBreakerOpen() bool {
+	return o.isOpen()
 }

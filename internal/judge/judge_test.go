@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/budget"
 )
 
 // rtFunc is a tiny test double that satisfies both http.RoundTripper
@@ -626,5 +628,158 @@ func TestEvaluatorCloseDrains(t *testing.T) {
 	}
 }
 
+// TestBudgetGuardIntegration verifies that a configured BudgetGuard receives
+// Record calls with source="judge" after each successful evaluation (issue #240).
+func TestBudgetGuardIntegration(t *testing.T) {
+	var (
+		mu           sync.Mutex
+		recordedCost float64
+		recordedSrc  string
+	)
+	fn := rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"3"}}]}`)),
+		}, nil
+	})
+
+	bg := newBudgetGuardForTest(t)
+	bg.SetAlerter(budgetAlerterFunc(func(_ context.Context, _ interface{}, cost float64, src string) {
+		mu.Lock()
+		defer mu.Unlock()
+		recordedCost = cost
+		recordedSrc = src
+	}))
+
+	e, store := newTestEvaluator(t, Config{
+		BudgetGuard: bg,
+	}, fn)
+	defer e.Close()
+
+	if !e.Enqueue(Sample{RequestID: "r-bg", Instruction: "x", Output: "y"}) {
+		t.Fatal("Enqueue should accept")
+	}
+	waitForScores(t, store, 1, 2*time.Second)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if recordedCost <= 0 {
+		t.Errorf("BudgetGuard cost = %v, want > 0", recordedCost)
+	}
+	if recordedSrc != "judge" {
+		t.Errorf("BudgetGuard source = %q, want judge", recordedSrc)
+	}
+}
+
+// budgetAlerterFunc is a thin adapter so tests can use a plain function
+// as a budget.Alerter without defining an interface implementation.
+type budgetAlerterFunc func(context.Context, interface{}, float64, string)
+
+func (f budgetAlerterFunc) OnExceed(ctx context.Context, state budget.State) {}
+func (f budgetAlerterFunc) OnSpend(ctx context.Context, state budget.State, cost float64, src string) {
+	f(ctx, state, cost, src)
+}
+func (f budgetAlerterFunc) OnApproaching(ctx context.Context, state budget.State) {}
+
+func newBudgetGuardForTest(t *testing.T) *budget.Guard {
+	t.Helper()
+	return budget.NewGuard(1000.0)
+}
+
 // Compile-time guard: judge.HTTPClient must accept *http.Client.
 var _ HTTPClient = (*http.Client)(nil)
+
+// TestEvaluatorDroppedCounter verifies the dropped atomic counter increments
+// when the queue is full and Enqueue returns false (issue #226).
+func TestEvaluatorDroppedCounter(t *testing.T) {
+	release := make(chan struct{})
+	fn := rtFunc(func(_ *http.Request) (*http.Response, error) {
+		<-release
+		return &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"3"}}]}`)),
+		}, nil
+	})
+	e, _ := newTestEvaluator(t, Config{
+		Concurrency: 1,
+		QueueDepth:  1,
+	}, fn)
+	defer e.Close()
+	defer close(release)
+
+	if e.Dropped() != 0 {
+		t.Errorf("Dropped = %d, want 0 initially", e.Dropped())
+	}
+
+	// First enqueue occupies the worker.
+	if !e.Enqueue(Sample{Instruction: "x", Output: "y"}) {
+		t.Fatal("first Enqueue should succeed")
+	}
+	// Wait for the worker to pick it up so the queue slot is freed.
+	waitFor(t, func() bool { return len(e.queue) == 0 }, time.Second)
+	// Second enqueue fills the queue (worker still blocked in stub).
+	if !e.Enqueue(Sample{Instruction: "x", Output: "y"}) {
+		t.Fatal("second Enqueue should fill the queue")
+	}
+	// Third enqueue must drop.
+	done := make(chan bool, 1)
+	go func() { done <- e.Enqueue(Sample{Instruction: "x", Output: "y"}) }()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Error("third Enqueue should drop")
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Enqueue blocked when queue was full")
+	}
+	if got := e.Dropped(); got != 1 {
+		t.Errorf("Dropped = %d, want 1", got)
+	}
+}
+
+// TestEvaluatorDroppedCounterConcurrent exercises the dropped counter from
+// many goroutines; the race detector is the primary assertion.
+func TestEvaluatorDroppedCounterConcurrent(t *testing.T) {
+	// Slow stub so the queue stays full.
+	blocked := make(chan struct{})
+	fn := rtFunc(func(_ *http.Request) (*http.Response, error) {
+		<-blocked
+		return &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"3"}}]}`)),
+		}, nil
+	})
+	e, _ := newTestEvaluator(t, Config{
+		Concurrency: 1,
+		QueueDepth:  1,
+	}, fn)
+	defer close(blocked) // release blocked worker
+
+	// Fill the queue first.
+	if !e.Enqueue(Sample{Instruction: "x", Output: "y"}) {
+		t.Fatal("first Enqueue should succeed")
+	}
+	waitFor(t, func() bool { return len(e.queue) == 0 }, time.Second)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			e.Enqueue(Sample{Instruction: "x", Output: "y"})
+		}()
+	}
+	wg.Wait()
+
+	if got := e.Dropped(); got == 0 {
+		t.Errorf("Dropped = 0 after 50 overflow enqueues, want > 0")
+	}
+}
+
+// TestEvaluatorDroppedNilSafe confirms nil evaluator returns 0 from Dropped.
+func TestEvaluatorDroppedNilSafe(t *testing.T) {
+	var e *Evaluator
+	if got := e.Dropped(); got != 0 {
+		t.Errorf("nil Dropped = %d, want 0", got)
+	}
+}

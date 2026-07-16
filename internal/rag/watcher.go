@@ -87,7 +87,8 @@ func (w *Watcher) run(parent context.Context) {
 	defer close(w.doneCh)
 
 	if err := w.scanOnce(parent); err != nil && !errors.Is(err, context.Canceled) {
-		slog.Warn("[RAG INDEXER] initial scan failed",
+		slog.Warn("rag: initial scan failed",
+			slog.String("component", "rag"),
 			slog.String("dir", w.dir),
 			slog.Any("err", err),
 		)
@@ -104,7 +105,8 @@ func (w *Watcher) run(parent context.Context) {
 			return
 		case <-t.C:
 			if err := w.scanOnce(parent); err != nil && !errors.Is(err, context.Canceled) {
-				slog.Warn("[RAG INDEXER] scan failed",
+				slog.Warn("rag: scan failed",
+					slog.String("component", "rag"),
 					slog.String("dir", w.dir),
 					slog.Any("err", err),
 				)
@@ -115,6 +117,9 @@ func (w *Watcher) run(parent context.Context) {
 
 // scanOnce reads the directory once, diffs against `known`, and
 // applies the delta. Safe to call directly from tests.
+//
+// Security: symlinks are skipped (issue #107) to prevent confidentiality
+// leaks via injected few-shot examples.
 func (w *Watcher) scanOnce(ctx context.Context) error {
 	files, err := os.ReadDir(w.dir)
 	if err != nil {
@@ -135,6 +140,14 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 		if f.IsDir() {
 			continue
 		}
+		if isSymlink(f) {
+			slog.Warn("rag: skipping symlink in examples dir (issue #107)",
+				slog.String("component", "rag"),
+				slog.String("filename", f.Name()),
+				slog.String("dir", w.dir),
+			)
+			continue
+		}
 		info, err := f.Info()
 		if err != nil {
 			continue
@@ -149,13 +162,14 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 		}
 
 		if err := w.indexFile(ctx, name); err != nil {
-			slog.Warn("[RAG INDEXER] index failed",
+			slog.Warn("rag: index failed",
+				slog.String("component", "rag"),
 				slog.String("filename", name),
 				slog.Any("err", err),
 			)
-			continue
+			continue // known still holds old snapshot → next poll retries
 		}
-		w.known[name] = snap
+		w.known[name] = snap // only update on success
 	}
 
 	// Detect deletions: anything in `known` that wasn't in `seen`
@@ -165,14 +179,16 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 			continue
 		}
 		if err := w.store.Remove(ctx, name); err != nil {
-			slog.Warn("[RAG INDEXER] remove failed",
+			slog.Warn("rag: remove failed",
+				slog.String("component", "rag"),
 				slog.String("filename", name),
 				slog.Any("err", err),
 			)
 			continue
 		}
 		delete(w.known, name)
-		slog.Info("[RAG INDEXER] removed",
+		slog.Info("rag: removed",
+			slog.String("component", "rag"),
 			slog.String("filename", name),
 		)
 	}

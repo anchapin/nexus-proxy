@@ -1,5 +1,7 @@
 package metrics
 
+// SQLite metrics store (issue #4). Uses modernc.org/sqlite — the only
+// allowed third-party runtime dependency. See AGENTS.md and README.md.
 import (
 	"context"
 	"database/sql"
@@ -32,7 +34,7 @@ import (
 //
 // The route_source / route_reason / slm_confidence / slm_task_type
 // columns (issue #74) are added here for fresh databases. Existing
-// databases are migrated via migrateRouteSourceColumns at Open time
+// databases are migrated via runAdditiveMigrations at Open time
 // so additive ALTER TABLE statements bring them up to the same shape
 // without data loss.
 const requestsSchema = `
@@ -55,6 +57,8 @@ CREATE TABLE IF NOT EXISTS requests (
     tps REAL NOT NULL DEFAULT 0,
     streaming INTEGER NOT NULL DEFAULT 1,
     fusion_arbiter_skipped INTEGER NOT NULL DEFAULT 0,
+    fusion_jaccard_similarity REAL NOT NULL DEFAULT 0,
+    fusion_arbiter_cost_usd REAL NOT NULL DEFAULT 0,
     error TEXT NOT NULL DEFAULT '',
     route_source TEXT NOT NULL DEFAULT '',
     route_reason TEXT NOT NULL DEFAULT '',
@@ -63,28 +67,39 @@ CREATE TABLE IF NOT EXISTS requests (
 );
 CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
 CREATE INDEX IF NOT EXISTS idx_requests_request_id ON requests(request_id);
+CREATE INDEX IF NOT EXISTS idx_requests_route_timestamp ON requests(route, timestamp);
+CREATE INDEX IF NOT EXISTS idx_requests_model_timestamp ON requests(model, timestamp);
 `
 
-// routeSourceMigrations is the set of additive ALTER TABLE statements
-// that bring an existing requests table up to the issue #74 schema.
+// additiveMigrations is the set of additive ALTER TABLE statements
+// that bring an existing requests table up to the current schema.
 // Each is idempotent: SQLite errors on duplicate-column are swallowed
-// by the caller (migrateRouteSourceColumns) so re-running against an
+// by the caller (runAdditiveMigrations) so re-running against an
 // already-migrated database is a no-op.
-var routeSourceMigrations = []string{
+var additiveMigrations = []string{
+	// Issue #74: route-source columns
 	`ALTER TABLE requests ADD COLUMN route_source TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN route_reason TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN slm_confidence REAL NOT NULL DEFAULT 0`,
 	`ALTER TABLE requests ADD COLUMN slm_task_type TEXT NOT NULL DEFAULT ''`,
+	// Issue #200: Jaccard similarity
+	`ALTER TABLE requests ADD COLUMN fusion_jaccard_similarity REAL NOT NULL DEFAULT 0`,
+	// Issue #247: TOON compression method
+	`ALTER TABLE requests ADD COLUMN toon_compression_method TEXT NOT NULL DEFAULT ''`,
+	// Issue #239: arbiter cost tracking
+	`ALTER TABLE requests ADD COLUMN fusion_arbiter_cost_usd REAL NOT NULL DEFAULT 0`,
+	// Issue #227: rag cache hit tracking
+	`ALTER TABLE requests ADD COLUMN rag_cache_hit INTEGER NOT NULL DEFAULT 0`,
 }
 
-// migrateRouteSourceColumns runs the additive ALTER TABLE migrations
-// for issue #74. Each statement is attempted individually; "duplicate
-// column" errors mean the column already exists (the database was
-// created or migrated by a newer build) and are silently ignored.
-// Any other error aborts Open so the operator sees the problem at
-// boot rather than on the first failed INSERT.
-func migrateRouteSourceColumns(ctx context.Context, db *sql.DB) error {
-	for _, stmt := range routeSourceMigrations {
+// runAdditiveMigrations executes the additive ALTER TABLE migrations.
+// Each statement is attempted individually; "duplicate column" errors
+// mean the column already exists (the database was created or migrated
+// by a newer build) and are silently ignored. Any other error aborts
+// Open so the operator sees the problem at boot rather than on the
+// first failed INSERT.
+func runAdditiveMigrations(ctx context.Context, db *sql.DB) error {
+	for _, stmt := range additiveMigrations {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			// modernc.org/sqlite returns the error string
 			// containing "duplicate column name" for the
@@ -118,12 +133,13 @@ var schemaMigrations = []string{
 // statement caching.
 const insertSQL = `INSERT INTO requests
     (timestamp, request_id, route, model,
-     input_tokens, output_tokens, toon_savings_tokens,
-     rag_injected, rag_filename, estimated_cost_usd,
+     input_tokens, output_tokens, toon_savings_tokens, toon_compression_method,
+     rag_injected, rag_filename, rag_cache_hit, estimated_cost_usd,
      baseline_cost_usd, savings_usd,
-     ttft_ms, total_latency_ms, tps, streaming, fusion_arbiter_skipped, error,
+     ttft_ms, total_latency_ms, tps, streaming,
+     fusion_arbiter_skipped, fusion_jaccard_similarity, fusion_arbiter_cost_usd, error,
      route_source, route_reason, slm_confidence, slm_task_type)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // SQLiteStore is the production Store implementation (issue #4).
 // Writes are funnelled through a buffered channel and a single
@@ -183,7 +199,7 @@ func newSQLiteStore(path string, lg Logger) (*SQLiteStore, error) {
 	// requestsSchema above), so every ALTER will no-op on the
 	// "duplicate column name" error and the migration completes in
 	// microseconds.
-	if err := migrateRouteSourceColumns(context.Background(), db); err != nil {
+	if err := runAdditiveMigrations(context.Background(), db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("metrics: migrate route-source: %w", err)
 	}
@@ -324,11 +340,11 @@ func (s *SQLiteStore) writeOne(req Request) {
 	}
 	_, err := s.db.ExecContext(ctx, insertSQL,
 		ts.UTC(), req.RequestID, route, model,
-		req.InputTokens, req.OutputTokens, req.TOONSavingsTokens,
-		ragInjected, req.RAGFilename, req.EstimatedCostUSD,
+		req.InputTokens, req.OutputTokens, req.TOONSavingsTokens, req.TOONCompressionMethod,
+		ragInjected, req.RAGFilename, req.RAGCacheHit, req.EstimatedCostUSD,
 		req.BaselineCostUSD, req.SavingsUSD,
 		req.TTFTMs, req.TotalLatencyMs, req.TPS, streaming,
-		fusionArbiterSkipped, req.Error,
+		fusionArbiterSkipped, req.FusionJaccardSimilarity, req.FusionArbiterCostUSD, req.Error,
 		req.RouteSource, req.RouteReason, req.SLMConfidence, req.SLMTaskType,
 	)
 	if err != nil {
@@ -468,6 +484,7 @@ func (s *SQLiteStore) ProviderStats(since time.Time) ([]router.ProviderStats, er
 	if err != nil {
 		return nil, fmt.Errorf("metrics: provider stats aggregate: %w", err)
 	}
+	defer rows.Close()
 	type aggRow struct {
 		name        string
 		sampleCount int
@@ -478,12 +495,10 @@ func (s *SQLiteStore) ProviderStats(since time.Time) ([]router.ProviderStats, er
 	for rows.Next() {
 		var r aggRow
 		if err := rows.Scan(&r.name, &r.sampleCount, &r.avgCost, &r.errorCount); err != nil {
-			rows.Close()
 			return nil, fmt.Errorf("metrics: scan aggregate: %w", err)
 		}
 		aggs = append(aggs, r)
 	}
-	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("metrics: aggregate rows: %w", err)
 	}
@@ -569,6 +584,16 @@ func (s *SQLiteStore) Close() error {
 	})
 }
 
+// Writable checks whether the database is currently reachable by attempting
+// a Ping. Returns false when the database is closed or inaccessible.
+func (s *SQLiteStore) Writable() bool {
+	if s == nil || s.db == nil {
+		return false
+	}
+	return s.db.Ping() == nil
+}
+
+// Path returns the configured database path ("" for ":memory:").
 // --- telemetry.Recorder compatibility ------------------------------------
 //
 // The chat handler still uses the Recorder interface defined in

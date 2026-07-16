@@ -21,7 +21,9 @@
 package health
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -53,6 +55,7 @@ var ErrDisabled = errors.New("health: not configured")
 // atomic load; the poller mutates state via atomic.Store.
 type Health struct {
 	ollamaURL        string
+	localModel       string
 	pollInterval     time.Duration
 	breakerThreshold int32
 	probeTimeout     time.Duration
@@ -68,6 +71,21 @@ type Health struct {
 	// the last success. Reset to 0 on every successful probe.
 	failureCount atomic.Int32
 
+	// currentInterval is the active polling interval in nanoseconds.
+	// It starts as pollInterval and increases via exponential backoff
+	// after consecutive failures (capped at 15x pollInterval).
+	currentInterval atomic.Int64
+
+	// lastTier tracks the backoff tier that was last logged so we
+	// only log on tier transitions, not every failed probe.
+	lastTier atomic.Int32
+
+	// mu serializes recordSuccess to ensure that Swap(true) and
+	// Store(0) are observable together — without this mutex a
+	// goroutine could see healthy==true but a stale failureCount
+	// due to CPU cache ordering between the two atomics.
+	mu sync.Mutex
+
 	closeOnce sync.Once
 	closed    chan struct{}
 	wg        sync.WaitGroup
@@ -76,11 +94,13 @@ type Health struct {
 // New constructs a Health. Zero-valued knobs are filled with safe
 // defaults (30s poll, 3-failure breaker threshold, 5s probe timeout)
 // so a partial config is enough. A nil client falls back to
-// http.DefaultClient.
+// http.DefaultClient. localModel is the model name used for the
+// model-availability probe; it is stored verbatim and passed to
+// the chat completions endpoint.
 //
 // The returned Health has not yet probed; call Run to perform the
 // initial probe and start the background poller.
-func New(ollamaURL string, pollInterval time.Duration, breakerThreshold int, probeTimeout time.Duration, client *http.Client) *Health {
+func New(ollamaURL string, localModel string, pollInterval time.Duration, breakerThreshold int, probeTimeout time.Duration, client *http.Client) *Health {
 	if pollInterval <= 0 {
 		pollInterval = DefaultPollInterval
 	}
@@ -95,6 +115,7 @@ func New(ollamaURL string, pollInterval time.Duration, breakerThreshold int, pro
 	}
 	h := &Health{
 		ollamaURL:        ollamaURL,
+		localModel:       localModel,
 		pollInterval:     pollInterval,
 		breakerThreshold: int32(breakerThreshold),
 		probeTimeout:     probeTimeout,
@@ -105,6 +126,7 @@ func New(ollamaURL string, pollInterval time.Duration, breakerThreshold int, pro
 	// corrects this — a unit test or operator who never starts the
 	// poller still gets "healthy" until something trips the breaker.
 	h.healthy.Store(true)
+	h.currentInterval.Store(int64(pollInterval))
 	return h
 }
 
@@ -117,6 +139,8 @@ func (h *Health) IsLocalHealthy() bool {
 	if h == nil {
 		return true
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	return h.healthy.Load()
 }
 
@@ -127,7 +151,18 @@ func (h *Health) FailureCount() int {
 	if h == nil {
 		return 0
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	return int(h.failureCount.Load())
+}
+
+// PollingInterval returns the current polling interval.
+// Exported for tests to verify backoff behavior.
+func (h *Health) PollingInterval() time.Duration {
+	if h == nil {
+		return 0
+	}
+	return time.Duration(h.currentInterval.Load())
 }
 
 // Run performs an initial synchronous probe and then starts the
@@ -146,7 +181,7 @@ func (h *Health) Run(ctx context.Context) {
 	_ = h.probe(probeCtx)
 	cancel()
 
-	if !h.healthy.Load() {
+	if !h.IsLocalHealthy() {
 		slog.Warn("ollama unreachable at boot; local model marked unhealthy",
 			slog.String("ollama_url", h.ollamaURL),
 			slog.Int("threshold", int(h.breakerThreshold)),
@@ -162,9 +197,30 @@ func (h *Health) Run(ctx context.Context) {
 	go h.loop(ctx)
 }
 
+// maxBackoffMultiplier caps the backoff at 15x the poll interval.
+const maxBackoffMultiplier = 15
+
+// calcBackoffInterval computes the backoff interval based on consecutive
+// failure count. Tier 0 (failures 1-2): 1x, Tier 1 (failures 3-4): 2x,
+// Tier 2 (failures 5-6): 4x, Tier 3 (failures 7-8): 8x, Tier 4+: 15x.
+func (h *Health) calcBackoffInterval(count int) time.Duration {
+	// tier 0: count 1-2, tier 1: count 3-4, tier 2: count 5-6, ...
+	tier := (count - 1) >> 1
+	if tier < 0 {
+		tier = 0
+	}
+	multiplier := int64(1 << tier)
+	if multiplier > maxBackoffMultiplier {
+		multiplier = maxBackoffMultiplier
+	}
+	return h.pollInterval * time.Duration(multiplier)
+}
+
 // loop runs probes on a ticker until ctx is canceled or Close is
 // called. The probe itself uses a per-call timeout derived from
 // probeTimeout so a slow Ollama cannot pin the goroutine.
+// After the breaker trips, the ticker interval is increased via
+// exponential backoff to reduce log noise during extended outages.
 func (h *Health) loop(ctx context.Context) {
 	defer h.wg.Done()
 	t := time.NewTicker(h.pollInterval)
@@ -183,6 +239,36 @@ func (h *Health) loop(ctx context.Context) {
 			// log line emitted by the next iteration's audit trail.
 			_ = h.probe(probeCtx)
 			cancel()
+
+			// After the probe, check if we need to adjust the
+			// backoff interval (only when breaker is open).
+			if !h.healthy.Load() {
+				h.mu.Lock()
+				count := int(h.failureCount.Load())
+				// failureCount < breakerThreshold shouldn't happen
+				// (breaker is only open when count >= threshold),
+				// but handle it gracefully.
+				if count >= int(h.breakerThreshold) {
+					newInterval := h.calcBackoffInterval(count)
+					curr := time.Duration(h.currentInterval.Load())
+					if newInterval != curr {
+						// Drain any pending ticks from the old ticker
+						// before stopping it, to prevent stale ticks
+						// from firing at the wrong interval.
+						oldTicker := t
+						select {
+						case <-oldTicker.C:
+						default:
+						}
+						oldTicker.Stop()
+						t = time.NewTicker(newInterval)
+						slog.Info("ollama health: entering backoff mode",
+							slog.Float64("interval_seconds", newInterval.Seconds()),
+						)
+					}
+				}
+				h.mu.Unlock()
+			}
 		}
 	}
 }
@@ -202,14 +288,17 @@ func (h *Health) Probe(ctx context.Context) error {
 	return h.probe(ctx)
 }
 
-// probe performs one HTTP GET to /api/tags and updates the internal
-// health state. See Probe for the public, error-returning variant.
+// probe performs one HTTP GET to /api/tags to check server reachability
+// and one HTTP POST to /api/chat with a trivial request to verify the
+// model is loaded and functional. See Probe for the public, error-returning
+// variant.
 //
-// Status >= 500 is treated as failure (the daemon is reachable but
-// sick). 4xx is treated as success: the daemon answered, even if
-// some authentication layer rejected the request — Ollama itself
-// is up and the operator can investigate the auth layer separately.
+// Status >= 500 on either call is treated as failure (the daemon is
+// reachable but sick). 4xx on the tags check is treated as success: the
+// daemon answered, even if some authentication layer rejected the request.
+// For the model check, 4xx means the model is not available.
 func (h *Health) probe(ctx context.Context) error {
+	// First check server reachability via /api/tags.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.ollamaURL+"/api/tags", nil)
 	if err != nil {
 		h.recordFailure(err)
@@ -220,9 +309,56 @@ func (h *Health) probe(ctx context.Context) error {
 		h.recordFailure(err)
 		return err
 	}
+	resp.Body.Close()
+	if resp.StatusCode >= 500 {
+		err := fmt.Errorf("tags status %d", resp.StatusCode)
+		h.recordFailure(err)
+		return err
+	}
+
+	// Server is up; now verify the model is actually loaded by making
+	// a trivial chat request. This catches the case where Ollama is running
+	// but the model failed to load (e.g. VRAM exhaustion).
+	chatReq := struct {
+		Model    string `json:"model"`
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}{
+		Model: h.localModel,
+		Messages: []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}{
+			{Role: "user", Content: "hi"},
+		},
+	}
+	payload, err := json.Marshal(chatReq)
+	if err != nil {
+		h.recordFailure(err)
+		return err
+	}
+	req, err = http.NewRequestWithContext(ctx, http.MethodPost, h.ollamaURL+"/api/chat", bytes.NewReader(payload))
+	if err != nil {
+		h.recordFailure(err)
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = h.client.Do(req)
+	if err != nil {
+		h.recordFailure(err)
+		return err
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 500 {
-		err := fmt.Errorf("status %d", resp.StatusCode)
+		err := fmt.Errorf("chat status %d", resp.StatusCode)
+		h.recordFailure(err)
+		return err
+	}
+	// 4xx on the chat endpoint means the model is not available.
+	if resp.StatusCode >= 400 {
+		err := fmt.Errorf("model %s unavailable: status %d", h.localModel, resp.StatusCode)
 		h.recordFailure(err)
 		return err
 	}
@@ -236,6 +372,8 @@ func (h *Health) probe(ctx context.Context) error {
 // flaky for a single probe — but are still logged at debug for
 // observability.
 func (h *Health) recordFailure(err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	count := h.failureCount.Add(1)
 	wasHealthy := h.healthy.Load()
 	if count >= h.breakerThreshold {
@@ -247,6 +385,18 @@ func (h *Health) recordFailure(err error) {
 			)
 		}
 		h.healthy.Store(false)
+		// Update currentInterval based on failure count tier.
+		// Tier 0 (count 1-2): 1x, Tier 1 (count 3-4): 2x,
+		// Tier 2 (count 5-6): 4x, Tier 3 (count 7-8): 8x, Tier 4+: 15x.
+		tier := (int(count) - 1) >> 1
+		if tier < 0 {
+			tier = 0
+		}
+		multiplier := int64(1 << tier)
+		if multiplier > maxBackoffMultiplier {
+			multiplier = maxBackoffMultiplier
+		}
+		h.currentInterval.Store(int64(h.pollInterval * time.Duration(multiplier)))
 		return
 	}
 	if wasHealthy {
@@ -263,12 +413,16 @@ func (h *Health) recordFailure(err error) {
 // unhealthy → healthy transition so the operator sees the recovery
 // without the noise of every subsequent successful probe.
 func (h *Health) recordSuccess() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if !h.healthy.Swap(true) {
 		slog.Info("ollama health: recovered",
 			slog.String("ollama_url", h.ollamaURL),
 		)
 	}
 	h.failureCount.Store(0)
+	h.currentInterval.Store(int64(h.pollInterval))
+	h.lastTier.Store(0)
 }
 
 // Close stops the background poller and waits for the loop goroutine

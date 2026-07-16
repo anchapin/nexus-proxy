@@ -21,16 +21,17 @@ func TestNoopRecorderSafe(t *testing.T) {
 }
 
 func TestEstimateTokens(t *testing.T) {
-	cases := map[string]int{
-		"":         0,
-		"a":        0, // 1 / 4 == 0
-		"abcd":     1,
-		"abcdefgh": 2,
-		"long text this is a sentence with many many words here please": 15, // 61 / 4 = 15
+	cases := map[string]struct{ min, max int }{
+		"":         {0, 0},
+		"a":        {1, 1}, // tiktoken: 1 token
+		"abcd":     {1, 1}, // tiktoken: 1 token (short strings compress to 1 in cl100k_base)
+		"abcdefgh": {1, 1}, // tiktoken: 1 token (same)
+		"long text this is a sentence with many many words here please": {11, 13}, // tiktoken: 12 tokens
 	}
-	for in, want := range cases {
-		if got := EstimateTokens(in); got != want {
-			t.Errorf("EstimateTokens(%q) = %d, want %d", in, got, want)
+	for in, tc := range cases {
+		got := EstimateTokens(in)
+		if got < tc.min || got > tc.max {
+			t.Errorf("EstimateTokens(%q) = %d, want [%d, %d]", in, got, tc.min, tc.max)
 		}
 	}
 }
@@ -83,6 +84,62 @@ func TestNewJSONLRecorderCreatesFile(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Errorf("file not created: %v", err)
+	}
+}
+
+func TestJSONLRecorderFilePerms0600(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tel.jsonl")
+	r, err := NewJSONLRecorder(path)
+	if err != nil {
+		t.Fatalf("NewJSONLRecorder: %v", err)
+	}
+	defer r.Close()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("file perm = %o, want 0600", got)
+	}
+}
+
+func TestJSONLRecorderTightensExistingFilePerms(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tel.jsonl")
+	// Create a file with permissive mode (simulating a pre-fix file).
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewJSONLRecorder(path)
+	if err != nil {
+		t.Fatalf("NewJSONLRecorder: %v", err)
+	}
+	defer r.Close()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("existing file perm = %o, want 0600", got)
+	}
+}
+
+func TestJSONLRecorderParentDirPerms0700(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sub", "tel.jsonl")
+	r, err := NewJSONLRecorder(path)
+	if err != nil {
+		t.Fatalf("NewJSONLRecorder: %v", err)
+	}
+	defer r.Close()
+	parent := filepath.Dir(path)
+	info, err := os.Stat(parent)
+	if err != nil {
+		t.Fatalf("Stat parent: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Errorf("parent dir perm = %o, want 0700", got)
 	}
 }
 

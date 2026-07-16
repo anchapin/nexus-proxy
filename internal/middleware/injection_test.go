@@ -12,14 +12,14 @@ func TestParseInjectionMode(t *testing.T) {
 		input string
 		want  InjectionMode
 	}{
-		{"", InjectionModeOff},
+		{"", InjectionModeWarn},
 		{"off", InjectionModeOff},
 		{"OFF", InjectionModeOff},
 		{"  warn  ", InjectionModeWarn},
 		{"Warn", InjectionModeWarn},
 		{"strict", InjectionModeStrict},
 		{"STRICT", InjectionModeStrict},
-		{"garbage", InjectionModeOff},
+		{"garbage", InjectionModeWarn},
 	}
 	for _, tt := range tests {
 		if got := ParseInjectionMode(tt.input); got != tt.want {

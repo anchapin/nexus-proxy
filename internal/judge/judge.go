@@ -35,9 +35,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/anchapin/nexus-proxy/internal/observability"
+	"github.com/anchapin/nexus-proxy/internal/budget"
+	"github.com/anchapin/nexus-proxy/internal/ioutils"
 )
 
 // defaultMaxResponseBytes is the default cap on upstream response bodies.
@@ -53,6 +55,11 @@ type Sample struct {
 	Instruction string // latest user prompt (verbatim)
 	Output      string // full streamed local-model response
 	LocalModel  string // which local model produced Output
+
+	// TraceParent and TraceState carry the W3C trace context from the
+	// inbound request so the async worker can create a child span (issue #233).
+	TraceParent string
+	TraceState  string
 }
 
 // JudgeScore is the structured record produced by one judge attempt.
@@ -96,6 +103,7 @@ type Config struct {
 	QueueDepth  int           // buffered channel size (default 64)
 	Timeout     time.Duration // per-call judge timeout (default 30s)
 	CostPer1K   float64       // USD per 1k tokens (input+output); default 0.002
+	BudgetGuard *budget.Guard // optional budget guard to record judge costs
 }
 
 // applyDefaults fills zero fields with sane values. It mutates cfg.
@@ -128,6 +136,17 @@ type Evaluator struct {
 	rng       *rand.Rand
 	closed    chan struct{}
 	closeOnce sync.Once
+
+	// dropped counts samples that were rejected because the queue was
+	// full. Exposed via Dropped() so callers can surface the counter
+	// across observability surfaces (issue #111).
+	dropped atomic.Uint64
+
+	// onDrop is an optional callback invoked atomically once per
+	// dropped sample. The callback receives the running total of
+	// drops so callers can feed a Prometheus counter without
+	// polling.
+	onDrop func(uint64)
 }
 
 // NewEvaluator wires the evaluator and starts its worker pool. The
@@ -173,6 +192,24 @@ func (e *Evaluator) Enabled() bool {
 	return e.cfg.SampleRate > 0
 }
 
+// Dropped returns the total number of samples rejected because the
+// judge queue was full. The counter is monotonically increasing and
+// safe to read from any goroutine.
+func (e *Evaluator) Dropped() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.dropped.Load()
+}
+
+// SetDropCallback registers an optional callback that fires once per
+// dropped sample with the running total. The callback is invoked
+// synchronously under the send path — keep it cheap (e.g. an atomic
+// increment). Pass nil to clear.
+func (e *Evaluator) SetDropCallback(fn func(uint64)) {
+	e.onDrop = fn
+}
+
 // Sample returns true if a fresh request should be enqueued for judge
 // evaluation, given the configured sample rate. It is the canonical
 // "Sample" entry point listed in the issue's acceptance criteria.
@@ -207,6 +244,11 @@ func (e *Evaluator) Enqueue(s Sample) bool {
 	case e.queue <- s:
 		return true
 	default:
+		e.dropped.Add(1)
+		total := e.dropped.Load()
+		if e.onDrop != nil {
+			e.onDrop(total)
+		}
 		slog.Warn("judge queue full, dropped request", slog.String("request_id", s.RequestID))
 		return false
 	}
@@ -240,6 +282,10 @@ func (e *Evaluator) worker() {
 				slog.String("request_id", s.RequestID),
 				slog.Any("err", err),
 			)
+		}
+		// Wire judge cost into the budget guard (issue #240).
+		if e.cfg.BudgetGuard != nil && score.Cost > 0 {
+			e.cfg.BudgetGuard.Record(context.Background(), score.Cost, "judge")
 		}
 	}
 }
@@ -288,6 +334,13 @@ func (e *Evaluator) evaluateCtx(ctx context.Context, s Sample) JudgeScore {
 	if e.cfg.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+e.cfg.APIKey)
 	}
+	// Propagate W3C trace context for child-span creation (issue #233).
+	if s.TraceParent != "" {
+		req.Header.Set("traceparent", s.TraceParent)
+	}
+	if s.TraceState != "" {
+		req.Header.Set("tracestate", s.TraceState)
+	}
 
 	resp, err := e.client.Do(req)
 	if err != nil {
@@ -295,7 +348,7 @@ func (e *Evaluator) evaluateCtx(ctx context.Context, s Sample) JudgeScore {
 		return score
 	}
 	defer resp.Body.Close()
-	body, err := observability.ReadAllLimited(nil, resp.Body, defaultMaxResponseBytes)
+	body, err := ioutils.ReadAllLimited(resp.Body, defaultMaxResponseBytes)
 	if err != nil {
 		score.Err = fmt.Errorf("judge: read body: %w", err)
 		return score

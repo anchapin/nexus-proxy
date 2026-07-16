@@ -24,6 +24,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/tokenizer"
 )
 
 // bufferedChannelSize caps the in-flight queue per recorder. Each record
@@ -55,29 +57,43 @@ const writeBufferSize = 16 << 10
 // the arbiter is always invoked. The dashboard joins on this flag
 // to report "fraction of fusion traffic that achieved agreement".
 //
+// FusionJaccardSimilarity (issue #200) is the actual Jaccard ratio
+// between the two panel members' contents when both returned content.
+// 0 when fewer than two members returned content. Enables operators
+// to tune NEXUS_FUSION_AGREEMENT_THRESHOLD based on actual distribution.
+//
 // Route-source fields (issue #74) carry the planner's Decision
 // metadata so downstream consumers (JSONL log, SQLite metrics,
 // dashboard) can attribute each request to the stage that produced
 // the route. RouteSource is one of guardrail / dsl / slm / slm-error
 // / escalation; RouteReason is a short machine-readable detail
-// (e.g. "vram" for the guardrail path, the error string for the
+// (e.g. "vram" for the guardrail path, the error String for the
 // SLM-error path); SLMConfidence is the [0,1] confidence value (0.5
 // neutral, 0 for non-SLM sources); SLMTaskType is the Categorize()
 // bucket (empty for non-SLM sources).
+//
+// Per-stage timing fields (issue #300) track wall-clock milliseconds
+// spent in each pipeline stage. Omitempty keeps legacy JSONL rows
+// byte-for-byte compatible when these fields are zero-valued.
 type Record struct {
-	Timestamp            time.Time `json:"timestamp"`
-	RequestID            string    `json:"request_id"`
-	Model                string    `json:"model"`
-	Route                string    `json:"route"`
-	InputTokens          int       `json:"input_tokens"`
-	OutputTokens         int       `json:"output_tokens"`
-	TTFTMs               int64     `json:"ttft_ms"`
-	TotalLatencyMs       float64   `json:"total_latency_ms"`
-	TPS                  float64   `json:"tps"`
-	Streaming            bool      `json:"streaming"`
-	FusionArbiterSkipped bool      `json:"fusion_arbiter_skipped,omitempty"`
-	ToolCallCount        int       `json:"tool_call_count,omitempty"`
-	Error                string    `json:"error,omitempty"`
+	Timestamp               time.Time `json:"timestamp"`
+	RequestID               string    `json:"request_id"`
+	Model                   string    `json:"model"`
+	Route                   string    `json:"route"`
+	InputTokens             int       `json:"input_tokens"`
+	OutputTokens            int       `json:"output_tokens"`
+	TTFTMs                  int64     `json:"ttft_ms"`
+	TotalLatencyMs          float64   `json:"total_latency_ms"`
+	TPS                     float64   `json:"tps"`
+	Streaming               bool      `json:"streaming"`
+	FusionArbiterSkipped    bool      `json:"fusion_arbiter_skipped,omitempty"`
+	FusionJaccardSimilarity float64   `json:"fusion_jaccard_similarity,omitempty"`
+	// FusionArbiterCostUSD (issue #239) is the estimated cost of the
+	// arbiter call when it ran (route=fusion and agreement threshold
+	// not met). 0 when the arbiter was skipped or for non-fusion routes.
+	FusionArbiterCostUSD float64 `json:"fusion_arbiter_cost_usd,omitempty"`
+	ToolCallCount        int     `json:"tool_call_count,omitempty"`
+	Error                string  `json:"error,omitempty"`
 
 	// Route-source metadata (issue #74). Omitempty keeps legacy
 	// JSONL rows byte-for-byte compatible when these fields are
@@ -86,16 +102,22 @@ type Record struct {
 	RouteReason   string  `json:"route_reason,omitempty"`
 	SLMConfidence float64 `json:"slm_confidence,omitempty"`
 	SLMTaskType   string  `json:"slm_task_type,omitempty"`
+
+	// Per-stage latency breakdown (issue #300). All fields are
+	// integer milliseconds; 0 when the stage was skipped or
+	// not applicable.
+	RAGRetrievalMs      int64 `json:"rag_retrieval_ms,omitempty"`
+	PromptEngineeringMs int64 `json:"prompt_engineering_ms,omitempty"`
+	TOONCompressionMs   int64 `json:"toon_compression_ms,omitempty"`
+	SLMRoutingMs        int64 `json:"slm_routing_ms,omitempty"`
+	UpstreamFirstByteMs int64 `json:"upstream_first_byte_ms,omitempty"`
 }
 
 // EstimateTokens returns the cheap "4 chars per token" heuristic used
 // across the proxy (router VRAM guardrail, telemetry input). Centralising
 // the rule here keeps the two call sites consistent.
 func EstimateTokens(s string) int {
-	if len(s) <= 0 {
-		return 0
-	}
-	return len(s) / 4
+	return tokenizer.CountTokens(s)
 }
 
 // ComputeTPS derives tokens-per-second from output tokens and the generation
@@ -162,14 +184,17 @@ func NewJSONLRecorder(path string) (*JSONLRecorder, error) {
 		return nil, fmt.Errorf("telemetry: empty path")
 	}
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("telemetry: mkdir %q: %w", dir, err)
 		}
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("telemetry: open %q: %w", path, err)
 	}
+	// Tighten permissions on an existing file so an upgrade from a
+	// pre-fix binary locks down the log (issue #108).
+	chmodIfWider(path, 0o600)
 	r := &JSONLRecorder{
 		ch:   make(chan Record, bufferedChannelSize),
 		path: path,
@@ -244,6 +269,36 @@ func (r *JSONLRecorder) Close() error {
 	close(r.ch)
 	r.wg.Wait()
 	return nil
+}
+
+// chmodIfWider checks the current mode of path and, if any
+// group/other bits are set, tightens the file to the requested mode.
+// Errors are logged — chmod failures are non-fatal (the file was
+// already created with the restrictive mode by OpenFile).
+func chmodIfWider(path string, mode os.FileMode) {
+	info, err := os.Stat(path)
+	if err != nil {
+		slog.Warn("telemetry: stat for chmod",
+			slog.String("path", path),
+			slog.Any("err", err),
+		)
+		return
+	}
+	perm := info.Mode().Perm()
+	if perm&0o077 == 0 {
+		return // already owner-only
+	}
+	slog.Warn("telemetry: tightening file permissions",
+		slog.String("path", path),
+		slog.Int("was", int(perm)),
+		slog.Int("now", int(mode)),
+	)
+	if err := os.Chmod(path, mode); err != nil {
+		slog.Warn("telemetry: chmod failed",
+			slog.String("path", path),
+			slog.Any("err", err),
+		)
+	}
 }
 
 func writeJSONLine(w *bufio.Writer, rec Record) error {

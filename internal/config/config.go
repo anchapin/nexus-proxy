@@ -11,11 +11,13 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/middleware"
+	ragpkg "github.com/anchapin/nexus-proxy/internal/rag"
 )
 
 // Config holds all runtime knobs for the proxy. A zero value is invalid;
@@ -66,9 +68,28 @@ type Config struct {
 	ZAIModel string // "glm-4.6"
 	ZAIKey   string // empty == skipped from cascade
 
+	// Inbound auth (issue #109). When ProxyAPIKey is non-empty, every
+	// non-exempt endpoint requires a matching Bearer token in the
+	// Authorization header. /healthz and /metrics stay exempt for K8s
+	// probes and Prometheus scrapers. /status is exempt only when
+	// StatusPublic is true (default false) — the diagnostics surface
+	// (frontier configured, judge enabled, VRAM state) is
+	// reconnaissance-grade and should be gated by default.
+	ProxyAPIKey  string // NEXUS_PROXY_API_KEY; empty disables auth
+	StatusPublic bool   // NEXUS_STATUS_PUBLIC; exposes /status without auth
+
 	// RAG
 	ExamplesDir  string  // "./few_shot_examples"
 	RAGThreshold float64 // cosine similarity cutoff for retrieval (0.55)
+
+	// RAG embedder plugin interface (issue #238). EmbedderType selects
+	// the backend: "ollama" (default), "openai", or "cohere". When
+	// "openai" or "cohere" is selected the corresponding API key must
+	// also be configured. The base URL for the remote backends defaults
+	// to the standard public endpoints; override via NEXUS_EMBEDDER_BASE_URL.
+	EmbedderType    ragpkg.EmbedderType // "ollama" | "openai" | "cohere"
+	EmbedderBaseURL string              // base URL for openai/cohere embedder
+	CohereAPIKey    string              // NEXUS_COHERE_API_KEY
 
 	// RAG persistence (issue #46). When RAGDBPath is set, the few-shot
 	// embeddings are cached on disk and reloaded on boot without
@@ -79,12 +100,39 @@ type Config struct {
 	RAGDBPath       string        // on-disk SQLite database for the RAG store
 	RAGPollInterval time.Duration // watcher cadence; 0 disables the watcher
 
+	// RAG embedding cache (issue #115). Prompt embeddings are
+	// deterministic for a given model+text pair, so they are memoized
+	// in a bounded LRU with TTL. RAGEmbedCacheSize=0 disables the cache;
+	// RAGEmbedCacheTTL=0 disables caching (pass-through) even when size>0.
+	RAGEmbedCacheSize int           // max LRU entries (256)
+	RAGEmbedCacheTTL  time.Duration // per-entry TTL (24h default); 0 = pass-through
+
+	// RAG circuit breaker (issue #222). After RAGCircuitBreakerThreshold
+	// consecutive Ollama /api/embeddings failures the breaker trips and
+	// enters a cooldown window during which Embed returns ErrCircuitOpen.
+	RAGCircuitBreakerThreshold int           // consecutive failures to trip; 0 = disabled
+	RAGCircuitBreakerCooldown  time.Duration // cooldown duration after trip
+
 	// Routing
-	TokenGuardrail int           // estimated tokens above this force frontier (6000)
-	SLMTimeout     time.Duration // Qwen3-Coder routing timeout (8s)
-	FusionTimeout  time.Duration // per-panel-member fetch timeout (120s)
-	CascadeTimeout time.Duration // per-attempt timeout for cascade fallback (30s)
-	ArbiterTimeout time.Duration // per-call timeout for the fusion arbiter stream (60s)
+	TokenGuardrail            int           // estimated tokens above this force frontier (6000)
+	SLMTimeout                time.Duration // Qwen3-Coder routing timeout (8s)
+	SLMCacheMaxEntries        int           // max entries in SLM routing decision cache (512)
+	SLMCacheSemanticThreshold float64       // cosine similarity floor for semantic cache hits (0.0..1.0, issue #245)
+	SLMConfidenceThreshold    float64       // hard escalation threshold: local/fusion decisions below this force frontier (default 0.3, issue #301)
+	FusionTimeout             time.Duration // per-panel-member fetch timeout (120s)
+	CascadeTimeout            time.Duration // per-attempt timeout for cascade fallback (30s)
+	ArbiterTimeout            time.Duration // per-call timeout for the fusion arbiter stream (60s)
+
+	// DSL fast-pass patterns (issue #305). DSLFormattingPatterns
+	// matches simple formatting keywords (css, format, docstring, ...).
+	// DSLFusionPatterns matches architecture keywords that warrant
+	// running both local and frontier (fusion). DSLLocalPatterns
+	// matches common coding task keywords (refactor, security scan,
+	// ...). All three default to the prior hardcoded behaviour when
+	// the corresponding env var is unset.
+	DSLFormattingPatterns []*regexp.Regexp // NEXUS_DSL_FORMATTING_PATTERNS
+	DSLFusionPatterns     []*regexp.Regexp // NEXUS_DSL_FUSION_PATTERNS
+	DSLLocalPatterns      []*regexp.Regexp // NEXUS_DSL_LOCAL_PATTERNS
 
 	// Frontier provider selector (issue #45). When more than one
 	// frontier provider is configured (frontier + z.ai), the chat
@@ -135,6 +183,14 @@ type Config struct {
 	FusionProgressiveDelivery bool    // true iff NEXUS_FUSION_PROGRESSIVE is unset or "true" (default true)
 	FusionAgreementThreshold  float64 // Jaccard ratio [0,1] above which arbiter is skipped (default 0.85)
 
+	// Fusion arbiter synthesis cache (issue #232). When ArbiterCacheTTL > 0,
+	// arbiter synthesis responses are cached keyed by a hash of
+	// (first.Content, second.Content). Subsequent requests with identical
+	// panel-member content return the cached synthesis text instead of
+	// invoking the expensive frontier arbiter call. Set to 0 to disable
+	// the cache (all arbiter calls are made, no caching).
+	ArbiterCacheTTL time.Duration // NEXUS_ARBITER_CACHE_TTL; 0 disables
+
 	// Judge-guided adaptive routing (issue #47). Historical judge
 	// scores are aggregated by task category in a SQLite table and fed
 	// back to the SLM router as a confidence signal. All of this is
@@ -151,6 +207,11 @@ type Config struct {
 	RoutingConfidenceCeiling    float64
 	RoutingConfidenceMinSamples int
 	RoutingConfidenceWindow     time.Duration
+
+	// SLM decision cache (issue #206). Deduplicates identical prompts
+	// within a TTL window so repeated requests don't trigger an SLM call.
+	// NEXUS_SLM_CACHE_TTL <= 0 disables the cache.
+	SLMCacheTTL time.Duration
 
 	// Health (issue #8). The chat handler consults
 	// internal/health.Health before issuing local-bound requests;
@@ -195,6 +256,22 @@ type Config struct {
 	// catching up. Zero disables the circuit (pre-#80 behaviour).
 	LocalCooldown time.Duration // default 10s; 0 disables
 
+	// Rolling 24h frontier spend guard (issue #183, #201). The guard
+	// tracks USD costs over a sliding 24-hour window and rejects new
+	// frontier/fusion requests with HTTP 429 when the daily limit is
+	// exhausted. BudgetEnabled is true when BudgetDailyLimit > 0.
+	//
+	// Alerting (issue #201): When BudgetAlertEnabled is true, the guard
+	// invokes the alerter callbacks when spend is recorded, when the
+	// budget is exceeded, and when spend crosses the approaching
+	// threshold (BudgetAlertThreshold fraction of the limit, default 80%).
+	// The alerter updates Prometheus counters and logs at warn/error
+	// level. Set BudgetAlertWebhookURL to enable webhook alerting.
+	BudgetDailyLimit      float64 // USD; NEXUS_BUDGET_DAILY_LIMIT
+	BudgetAlertEnabled    bool    // true iff NEXUS_BUDGET_ALERT_ENABLED is "true"
+	BudgetAlertThreshold  float64 // fraction of limit that triggers "approaching" alert [0,1]; default 0.8
+	BudgetAlertWebhookURL string  // optional webhook URL for JSON alert payloads
+
 	// HTTP request body cap (issue #11). The chat handler applies this
 	// with http.MaxBytesReader before reading the request body, so an
 	// oversized POST cannot exhaust proxy memory before the guardrail
@@ -213,8 +290,7 @@ type Config struct {
 	JudgeQueueDepth   int           // buffered channel size (default 64)
 	JudgeTimeout      time.Duration // per-call judge timeout (default 30s)
 	JudgeCostPer1KUSD float64       // rough USD/1k-token rate for cost estimates
-
-	// Quality (async AST/compiler verifier, issue #13). Detected
+	JudgeDBPath       string        // on-disk SQLite database for judge scores; empty disables Detected
 	// edits enqueue a background `cargo check` / `npx tsc` and the
 	// verdict (1 = clean, 0 = fail/timeout) is reported via a
 	// callback to cmd/nexus/main.go. QualityEnabled is true iff
@@ -228,8 +304,14 @@ type Config struct {
 	QualityStderrCap   int           // stderr bytes retained per verdict (default 2 KiB)
 
 	// Middleware prompts
-	MetaPrompt string // appended to system prompt by prompt_engine
-	TOONNotice string // appended when TOON compression is applied
+	MetaPrompt   string // appended to system prompt by prompt_engine
+	TOONNotice   string // appended when TOON compression is applied
+	TOONUnfenced bool   // issue #123: compress bare (unfenced) JSON arrays; default true
+
+	// Middleware chain (issue #224). Comma-separated ordered list of
+	// registered middleware names to apply per request. Empty uses the
+	// built-in default: "promptEngineering,rag,compressJSONBlocks,appendSystemNote".
+	MiddlewareChain string
 
 	// Prompt-injection hardening (issue #76). Controls whether the
 	// proxy isolates its policy text from user-supplied system content
@@ -312,6 +394,25 @@ type Config struct {
 	// gigabytes could otherwise cause uncontrolled memory growth.
 	// Zero or negative falls back to DefaultMaxResponseBytes.
 	MaxResponseBytes int
+
+	// Auth brute-force protection (issue #296). Tracks per-client-IP
+	// auth failures and blocks the client after AuthRateLimitBurst
+	// consecutive failures within a sliding AuthRateLimitWindow
+	// window. AuthRateLimitRPM controls the steady-state refill rate.
+	// When AuthRateLimitRPM <= 0 the limiter is disabled (transparent
+	// passthrough) so a stock deployment without the env vars set is
+	// unchanged from pre-#296 behaviour.
+	AuthRateLimitRPM    int
+	AuthRateLimitBurst  int
+	AuthRateLimitWindow time.Duration // window for auth failure tracking (default 5 min)
+
+	// Readiness mode for /readyz (issue #302). Controls whether the
+	// readiness probe returns 503 when Ollama is down (strict) or
+	// always returns 200 while surfacing the degraded flag (degraded,
+	// the default). Unknown values fail validation at boot rather
+	// than silently falling back, so a typo in NEXUS_READINESS_MODE
+	// is caught immediately instead of producing an indeterminate state.
+	ReadinessMode string
 }
 
 // DefaultMetricsDBPath returns the canonical metrics DB location:
@@ -352,27 +453,43 @@ func DefaultRAGDBPath() string {
 	return filepath.Join(base, "nexus-proxy", "rag.db")
 }
 
+// DefaultJudgeDBPath returns the canonical location for the judge
+// SQLite store (issue #198): $XDG_CACHE_HOME/nexus-proxy/judge.db.
+// Operators override with NEXUS_JUDGE_DB (empty disables persistence,
+// falling back to the in-memory MemoryStorage).
+func DefaultJudgeDBPath() string {
+	base, err := os.UserCacheDir()
+	if err != nil || base == "" {
+		base = "./.cache"
+	}
+	return filepath.Join(base, "nexus-proxy", "judge.db")
+}
+
 // Load reads configuration from environment variables, applying defaults
 // suitable for local development. It returns an error only when a required
 // value is malformed; missing optional values fall back to defaults.
 func Load() (Config, error) {
 	cfg := Config{
-		Addr:           getEnv("NEXUS_ADDR", ":8000"),
-		OllamaURL:      strings.TrimRight(getEnv("NEXUS_OLLAMA_URL", "http://localhost:11434"), "/"),
-		RouterModel:    getEnv("NEXUS_ROUTER_MODEL", "qwen3-coder:4b"),
-		LocalModel:     getEnv("NEXUS_LOCAL_MODEL", "qwen3-coder:8b"),
-		EmbeddingModel: getEnv("NEXUS_EMBEDDING_MODEL", "nomic-embed-text"),
-		FrontierURL:    getEnv("NEXUS_FRONTIER_URL", "https://api.openai.com/v1/chat/completions"),
-		FrontierModel:  getEnv("NEXUS_FRONTIER_MODEL", "gpt-4o"),
-		FrontierKey:    getEnv("NEXUS_FRONTIER_API_KEY", ""),
-		ZAIURL:         getEnv("NEXUS_ZAI_URL", "https://api.z.ai/v1/chat/completions"),
-		ZAIModel:       getEnv("NEXUS_ZAI_MODEL", "glm-4.6"),
-		ZAIKey:         getEnv("NEXUS_ZAI_API_KEY", ""),
-		ExamplesDir:    getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
-		MetaPrompt:     defaultMetaPrompt,
-		TOONNotice:     defaultTOONNotice,
-		TelemetryPath:  getEnvAllowEmpty("NEXUS_TELEMETRY_PATH", "./nexus-telemetry.jsonl"),
-		MetricsDBPath:  getEnvAllowEmpty("NEXUS_METRICS_DB", DefaultMetricsDBPath()),
+		Addr:            getEnv("NEXUS_ADDR", ":8000"),
+		OllamaURL:       strings.TrimRight(getEnv("NEXUS_OLLAMA_URL", "http://localhost:11434"), "/"),
+		RouterModel:     getEnv("NEXUS_ROUTER_MODEL", "qwen3-coder:4b"),
+		LocalModel:      getEnv("NEXUS_LOCAL_MODEL", "qwen3-coder:8b"),
+		EmbeddingModel:  getEnv("NEXUS_EMBEDDING_MODEL", "nomic-embed-text"),
+		FrontierURL:     getEnv("NEXUS_FRONTIER_URL", "https://api.openai.com/v1/chat/completions"),
+		FrontierModel:   getEnv("NEXUS_FRONTIER_MODEL", "gpt-4o"),
+		FrontierKey:     getEnv("NEXUS_FRONTIER_API_KEY", ""),
+		ZAIURL:          getEnv("NEXUS_ZAI_URL", "https://api.z.ai/v1/chat/completions"),
+		ZAIModel:        getEnv("NEXUS_ZAI_MODEL", "glm-4.6"),
+		ZAIKey:          getEnv("NEXUS_ZAI_API_KEY", ""),
+		ProxyAPIKey:     getEnv("NEXUS_PROXY_API_KEY", ""),
+		StatusPublic:    getEnvBool("NEXUS_STATUS_PUBLIC", false),
+		ExamplesDir:     getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
+		MetaPrompt:      defaultMetaPrompt,
+		TOONNotice:      defaultTOONNotice,
+		TOONUnfenced:    getEnvBool("NEXUS_TOON_UNFENCED", true),
+		MiddlewareChain: getEnv("NEXUS_MIDDLEWARE_CHAIN", ""),
+		TelemetryPath:   getEnvAllowEmpty("NEXUS_TELEMETRY_PATH", "./nexus-telemetry.jsonl"),
+		MetricsDBPath:   getEnvAllowEmpty("NEXUS_METRICS_DB", DefaultMetricsDBPath()),
 	}
 
 	threshold, err := getEnvFloat("NEXUS_RAG_THRESHOLD", 0.55)
@@ -396,6 +513,57 @@ func Load() (Config, error) {
 	}
 	cfg.RAGPollInterval = pollInterval
 
+	// RAG embedding cache size (issue #115). Default 256 keeps the
+	// cache useful for repetitive coding prompts while bounding
+	// memory. Set to 0 to disable.
+	embedCacheSize, err := getEnvInt("NEXUS_RAG_EMBED_CACHE_SIZE", 256)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RAGEmbedCacheSize = embedCacheSize
+
+	// RAG embed cache TTL (issue #303). A TTL is required for EmbedCache
+	// to be active; a value of 0 makes it a pass-through. Default 24h
+	// keeps entries alive across a typical working day while still
+	// eventually evicting stale entries.
+	ragCacheTTL, err := getEnvDuration("NEXUS_RAG_EMBED_CACHE_TTL", 24*time.Hour)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RAGEmbedCacheTTL = ragCacheTTL
+
+	// RAG embedder plugin interface (issue #238). The type selects
+	// which backend the RAG store uses for vector embeddings.
+	// Defaults to "ollama" so a stock deployment is unchanged.
+	cfg.EmbedderType = ragpkg.EmbedderType(strings.ToLower(strings.TrimSpace(
+		getEnv("NEXUS_EMBEDDER_TYPE", "ollama"))))
+	// Base URL for remote embedder backends (openai/cohere). The
+	// default matches each provider's public endpoint, so operators
+	// only need to set the API key.
+	switch cfg.EmbedderType {
+	case ragpkg.EmbedderTypeOpenAI:
+		cfg.EmbedderBaseURL = getEnv("NEXUS_EMBEDDER_BASE_URL", "https://api.openai.com/v1")
+	case ragpkg.EmbedderTypeCohere:
+		cfg.EmbedderBaseURL = getEnv("NEXUS_EMBEDDER_BASE_URL", "https://api.cohere.ai/v1")
+	default:
+		// Ollama: base URL is already in OllamaURL; reuse it.
+		cfg.EmbedderBaseURL = cfg.OllamaURL
+	}
+	cfg.CohereAPIKey = getEnv("NEXUS_COHERE_API_KEY", "")
+
+	// RAG circuit breaker (issue #222).
+	cbThreshold, err := getEnvInt("NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD", 3)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RAGCircuitBreakerThreshold = cbThreshold
+
+	cbCooldown, err := getEnvDuration("NEXUS_RAG_CIRCUIT_BREAKER_COOLDOWN", 30*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RAGCircuitBreakerCooldown = cbCooldown
+
 	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
 	if err != nil {
 		return cfg, err
@@ -407,6 +575,32 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.SLMTimeout = slmTimeout
+
+	// SLM routing decision cache (issue #162). Max
+	// entries caps memory at ~512 entries with simple LRU eviction.
+	slmCacheMax, err := getEnvInt("NEXUS_SLM_CACHE_MAX_ENTRIES", 512)
+	if err != nil {
+		return cfg, err
+	}
+	if slmCacheMax < 0 {
+		slmCacheMax = 0
+	}
+	cfg.SLMCacheMaxEntries = slmCacheMax
+
+	// SLM confidence hard-escalation threshold (issue #301). When the
+	// SLM returns local/fusion with confidence below this value, the
+	// planner overrides to frontier. The default (0.3) is deliberately
+	// conservative: it only fires when the SLM is quite uncertain,
+	// preserving the cost savings of local routing for clear-cut cases.
+	// Set to 0 to disable the hard override (soft bias via
+	// DecideWithConfidence still applies when a ConfidenceStore is
+	// wired). The threshold is not validated — a value outside [0,1]
+	// simply never triggers in practice.
+	slmConfThreshold, err := getEnvFloat("NEXUS_SLM_CONFIDENCE_THRESHOLD", 0.3)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.SLMConfidenceThreshold = slmConfThreshold
 
 	fusionTimeout, err := getEnvDuration("NEXUS_FUSION_TIMEOUT", 120*time.Second)
 	if err != nil {
@@ -428,6 +622,28 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.ArbiterTimeout = arbiterTimeout
+
+	// DSL fast-pass patterns (issue #305). Defaults match the prior
+	// hardcoded behaviour so operators who upgrade see identical routing.
+	dslFormatting, err := getEnvRegexps("NEXUS_DSL_FORMATTING_PATTERNS",
+		`(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.DSLFormattingPatterns = dslFormatting
+
+	dslFusion, err := getEnvRegexps("NEXUS_DSL_FUSION_PATTERNS", `(?i)\b(architectural design|system architecture)\b`)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.DSLFusionPatterns = dslFusion
+
+	dslLocal, err := getEnvRegexps("NEXUS_DSL_LOCAL_PATTERNS",
+		`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis)\b`)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.DSLLocalPatterns = dslLocal
 
 	// Frontier provider selector (issue #45). Look-back window,
 	// observation floor, and cache cadence. Defaults match the
@@ -512,6 +728,17 @@ func Load() (Config, error) {
 	}
 	cfg.FusionAgreementThreshold = agreementThreshold
 
+	// Fusion arbiter synthesis cache (issue #232). NEXUS_ARBITER_CACHE_TTL=0
+	// (the default) disables the cache entirely — every disagreement
+	// calls the arbiter. When set to a positive duration, identical
+	// panel-member content within the TTL window returns the cached
+	// synthesis text without calling the arbiter.
+	arbiterCacheTTL, err := getEnvDuration("NEXUS_ARBITER_CACHE_TTL", 0)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ArbiterCacheTTL = arbiterCacheTTL
+
 	// Judge-guided adaptive routing (issue #47). Defaults keep the
 	// feature dormant unless the judge is enabled and a DB path is
 	// configured. The DB defaults to a sibling of the metrics DB so a
@@ -541,6 +768,31 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.RoutingConfidenceWindow = confWindow
+
+	// SLM decision cache TTL (issue #206). Set
+	// NEXUS_SLM_CACHE_TTL to "0" to disable the cache entirely;
+	// the planner then always calls the SLM (pre-cache behaviour).
+	slmCacheTTL, err := getEnvDuration("NEXUS_SLM_CACHE_TTL", 30*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.SLMCacheTTL = slmCacheTTL
+
+	// Semantic similarity threshold for SLM cache (issue #245).
+	// 0.0 disables semantic deduplication; >0 uses cosine-similarity
+	// fallback in the SLMCache so prompts with the same intent but
+	// different wording share the same cached route decision.
+	slmCacheSemThreshold, err := getEnvFloat("NEXUS_SLMCACHE_SIMILARITY_THRESHOLD", 0.0)
+	if err != nil {
+		return cfg, err
+	}
+	if slmCacheSemThreshold < 0 {
+		slmCacheSemThreshold = 0
+	}
+	if slmCacheSemThreshold > 1.0 {
+		slmCacheSemThreshold = 1.0
+	}
+	cfg.SLMCacheSemanticThreshold = slmCacheSemThreshold
 
 	// Ollama health poller (issue #8). Defaults: 30s poll cadence,
 	// 3-failure breaker, 5s per-probe HTTP timeout. Set
@@ -749,6 +1001,11 @@ func Load() (Config, error) {
 	}
 	cfg.JudgeCostPer1KUSD = costRate
 
+	// Judge SQLite persistence (issue #198). When set, scores are
+	// written to an on-disk SQLite store that survives restarts.
+	// Empty (the default) uses the in-memory MemoryStorage.
+	cfg.JudgeDBPath = getEnvAllowEmpty("NEXUS_JUDGE_DB", DefaultJudgeDBPath())
+
 	// The judge is "enabled" iff the operator actually configured
 	// sampling above zero. Zero/negative rate keeps the worker pool
 	// dormant even if the env vars are partially populated (a common
@@ -815,11 +1072,10 @@ func Load() (Config, error) {
 	}
 	cfg.ModelsCacheTTL = modelsCacheTTL
 
-	// Prompt-injection hardening (issue #76). Defaults to off so a
-	// stock deployment boots with byte-for-byte legacy behaviour.
-	// Operators opt into warn (log only) or strict (reject 400) by
-	// setting NEXUS_PROMPT_INJECTION_MODE. Unknown values fall back
-	// to off rather than failing boot.
+	// Prompt-injection hardening (issue #76). Defaults to warn so a
+	// stock deployment logs injection attempts out of the box.
+	// Operators can set NEXUS_PROMPT_INJECTION_MODE=off to disable,
+	// or strict to reject 400. Unknown values fall back to warn.
 	cfg.PromptInjectionMode = middleware.ParseInjectionMode(
 		os.Getenv("NEXUS_PROMPT_INJECTION_MODE"),
 	)
@@ -842,6 +1098,34 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.TrustedProxies = parsed
+
+	// Rolling 24h frontier spend guard (issue #183, #201). When
+	// BudgetDailyLimit > 0 the guard is active. Alerting is
+	// separately enabled via BudgetAlertEnabled.
+	budgetDailyLimit, err := getEnvFloat("NEXUS_BUDGET_DAILY_LIMIT", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if budgetDailyLimit < 0 {
+		budgetDailyLimit = 0
+	}
+	cfg.BudgetDailyLimit = budgetDailyLimit
+
+	cfg.BudgetAlertEnabled = parseBoolEnv("NEXUS_BUDGET_ALERT_ENABLED", false)
+
+	budgetAlertThreshold, err := getEnvFloat("NEXUS_BUDGET_ALERT_THRESHOLD", 0.8)
+	if err != nil {
+		return cfg, err
+	}
+	if budgetAlertThreshold < 0 {
+		budgetAlertThreshold = 0
+	}
+	if budgetAlertThreshold > 1 {
+		budgetAlertThreshold = 1
+	}
+	cfg.BudgetAlertThreshold = budgetAlertThreshold
+
+	cfg.BudgetAlertWebhookURL = getEnv("NEXUS_BUDGET_ALERT_WEBHOOK_URL", "")
 
 	// Per-client rate ceiling (requests/minute). Zero or negative
 	// disables the limiter entirely so a stock deployment is
@@ -875,7 +1159,62 @@ func Load() (Config, error) {
 	}
 	cfg.MaxResponseBytes = maxRespBytes
 
+	// Auth brute-force protection (issue #296). Defaults: RPM 5, burst 3,
+	// window 5 min. When RPM <= 0 the limiter is disabled so a stock
+	// deployment with no NEXUS_AUTH_RATE_LIMIT_RPM is byte-for-byte
+	// identical to the pre-#296 behaviour.
+	authRateRPM, err := getEnvInt("NEXUS_AUTH_RATE_LIMIT_RPM", 5)
+	if err != nil {
+		return cfg, err
+	}
+	if authRateRPM < 0 {
+		authRateRPM = 0
+	}
+	cfg.AuthRateLimitRPM = authRateRPM
+
+	authRateBurst, err := getEnvInt("NEXUS_AUTH_RATE_LIMIT_BURST", 3)
+	if err != nil {
+		return cfg, err
+	}
+	if authRateBurst < 0 {
+		authRateBurst = 0
+	}
+	cfg.AuthRateLimitBurst = authRateBurst
+
+	authRateWindow, err := getEnvDuration("NEXUS_AUTH_RATE_LIMIT_WINDOW", 5*time.Minute)
+	if err != nil {
+		return cfg, err
+	}
+	if authRateWindow < 0 {
+		authRateWindow = 0
+	}
+	cfg.AuthRateLimitWindow = authRateWindow
+
+	// Readiness mode for /readyz (issue #302). Controls whether the
+	// readiness probe returns 503 when Ollama is down (strict) or
+	// always returns 200 while surfacing the degraded flag (degraded,
+	// the default). Unrecognised values fail boot rather than silently
+	// falling back.
+	cfg.ReadinessMode = getEnv("NEXUS_READINESS_MODE", "degraded")
+
+	if err := cfg.Validate(); err != nil {
+		return cfg, err
+	}
 	return cfg, nil
+}
+
+// Validate checks that the loaded configuration is internally consistent
+// and that all enum-like fields contain recognised values. It is called
+// automatically at the end of Load(); unit tests that construct a Config
+// directly should call it before use.
+func (c Config) Validate() error {
+	switch c.ReadinessMode {
+	case "strict", "degraded":
+		// Recognised values.
+	default:
+		return fmt.Errorf("config: NEXUS_READINESS_MODE value %q is not recognised; want \"strict\" or \"degraded\"", c.ReadinessMode)
+	}
+	return nil
 }
 
 // FrontierEnabled reports whether a frontier API key is configured. The proxy
@@ -1031,10 +1370,20 @@ func (c Config) PromptInjectionIsolated() bool {
 // opened. Disabled when MetricsDBPath is empty.
 func (c Config) MetricsEnabled() bool { return c.MetricsDBPath != "" }
 
+// BudgetEnabled reports whether the rolling 24h frontier spend guard is
+// active (issue #183). Disabled when BudgetDailyLimit <= 0.
+func (c Config) BudgetEnabled() bool { return c.BudgetDailyLimit > 0 }
+
 // RateLimitEnabled reports whether the per-client rate limiter is
 // active (issue #75). Disabled when RateLimitRPM <= 0 so a stock
 // deployment is byte-for-byte identical to the pre-#75 path.
 func (c Config) RateLimitEnabled() bool { return c.RateLimitRPM > 0 }
+
+// AuthRateLimitEnabled reports whether the auth brute-force limiter is
+// active (issue #296). Disabled when AuthRateLimitRPM <= 0 so a stock
+// deployment with no NEXUS_AUTH_RATE_LIMIT_RPM is byte-for-byte identical
+// to the pre-#296 path.
+func (c Config) AuthRateLimitEnabled() bool { return c.AuthRateLimitRPM > 0 }
 
 // TrustedProxiesConfigured reports whether any trusted-proxy CIDRs are
 // set. Used by the boot-time warning to detect the "rate limit on +
@@ -1125,6 +1474,18 @@ func (c Config) RoutingConfidenceEnabled() bool {
 	return c.RoutingConfidenceDB != "" && c.JudgeEnabled
 }
 
+// AuthEnabled reports whether the inbound API-key gate (issue #109)
+// is active. When false, all endpoints are open — the binary behaves
+// identically to the pre-auth proxy.
+func (c Config) AuthEnabled() bool { return c.ProxyAPIKey != "" }
+
+// SLMCacheEnabled reports whether the SLM decision cache (issue #206)
+// should be active. Disabled when SLMCacheTTL <= 0, which preserves
+// the pre-cache behaviour of always calling the SLM.
+func (c Config) SLMCacheEnabled() bool {
+	return c.SLMCacheTTL > 0
+}
+
 // RAGPersistentEnabled reports whether the SQLite-backed RAG store
 // (issue #46) should be opened. Disabled when RAGDBPath is empty,
 // which preserves the legacy in-memory-only behaviour for operators
@@ -1137,6 +1498,11 @@ func (c Config) RAGPersistentEnabled() bool { return c.RAGDBPath != "" }
 func (c Config) RAGWatcherEnabled() bool {
 	return c.RAGPersistentEnabled() && c.RAGPollInterval > 0
 }
+
+// JudgeDBEnabled reports whether the SQLite-backed judge store
+// (issue #198) should be opened. Disabled when JudgeDBPath is empty,
+// which preserves the legacy in-memory-only behaviour.
+func (c Config) JudgeDBEnabled() bool { return c.JudgeDBPath != "" }
 
 // NewLogger returns a *slog.Logger configured per LogLevel / LogFormat,
 // always writing to stderr. Centralising the construction in config
@@ -1152,6 +1518,56 @@ func (c Config) NewLogger() *slog.Logger {
 		h = slog.NewJSONHandler(os.Stderr, opts)
 	}
 	return slog.New(h)
+}
+
+// HotReloadResult captures the outcome of a SIGHUP config reload (issue #306).
+type HotReloadResult struct {
+	// NeedsRestart is the list of env vars that were changed but require
+	// a full proxy restart to take effect.
+	NeedsRestart []string
+}
+
+// ReloadHotReloadable re-reads environment variables for settings that are
+// safe to change at runtime (NEXUS_RATE_LIMIT_RPM, NEXUS_RATE_LIMIT_BURST,
+// NEXUS_LOG_LEVEL, NEXUS_LOG_FORMAT, NEXUS_DEBUG) and returns a new Config
+// with those fields updated. Settings that require a restart
+// (NEXUS_OLLAMA_URL, NEXUS_FRONTIER_API_KEY, NEXUS_METRICS_DB) are checked
+// and reported via NeedsRestart if they have changed since the last load.
+// The caller should apply in-place changes (rate limiter RPM/Burst, logger
+// level/format, debug flag) and log NeedsRestart with a restart hint.
+func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
+	result := HotReloadResult{}
+	next := prev // start from previous so non-reloadable fields are preserved
+
+	// Check which restart-required settings have changed.
+	if v := os.Getenv("NEXUS_OLLAMA_URL"); v != "" && v != prev.OllamaURL {
+		result.NeedsRestart = append(result.NeedsRestart, "NEXUS_OLLAMA_URL")
+	}
+	if v := os.Getenv("NEXUS_FRONTIER_API_KEY"); v != "" && v != prev.FrontierKey {
+		result.NeedsRestart = append(result.NeedsRestart, "NEXUS_FRONTIER_API_KEY")
+	}
+	if v := os.Getenv("NEXUS_METRICS_DB"); v != "" && v != prev.MetricsDBPath {
+		result.NeedsRestart = append(result.NeedsRestart, "NEXUS_METRICS_DB")
+	}
+
+	// Hot-reloadable settings.
+	rateRPM, _ := getEnvInt("NEXUS_RATE_LIMIT_RPM", prev.RateLimitRPM)
+	if rateRPM < 0 {
+		rateRPM = 0
+	}
+	next.RateLimitRPM = rateRPM
+
+	rateBurst, _ := getEnvInt("NEXUS_RATE_LIMIT_BURST", prev.RateLimitBurst)
+	if rateBurst < 0 {
+		rateBurst = 0
+	}
+	next.RateLimitBurst = rateBurst
+
+	next.LogLevel = parseLogLevel(os.Getenv("NEXUS_LOG_LEVEL"))
+	next.LogFormat = parseLogFormat(os.Getenv("NEXUS_LOG_FORMAT"))
+	next.Debug = parseBoolEnv("NEXUS_DEBUG", prev.Debug)
+
+	return next, result
 }
 
 func getEnv(key, def string) string {
@@ -1183,6 +1599,22 @@ func getEnvInt(key string, def int) (int, error) {
 	return n, nil
 }
 
+// getEnvBool reads a boolean environment variable. Accepts
+// "true"/"1"/"yes" (case-insensitive) as true; anything else is
+// false. Returns def when the variable is unset or empty.
+func getEnvBool(key string, def bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def
+	}
+	switch strings.ToLower(v) {
+	case "true", "1", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
 func getEnvFloat(key string, def float64) (float64, error) {
 	v, ok := os.LookupEnv(key)
 	if !ok || v == "" {
@@ -1205,6 +1637,35 @@ func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("config: %s must be a duration (e.g. 8s, 2m): %w", key, err)
 	}
 	return d, nil
+}
+
+// getEnvRegexps parses a comma-separated list of regex patterns and
+// compiles each one. The default is returned when the env var is unset
+// or empty. An invalid pattern causes a fatal error at boot time.
+func getEnvRegexps(key string, defaultPattern string) ([]*regexp.Regexp, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		v = defaultPattern
+	}
+	// Special case: if the env var was explicitly set to empty string,
+	// return empty slice (operator wants to disable this DSL branch).
+	if ok && v == "" {
+		return []*regexp.Regexp{}, nil
+	}
+	patterns := strings.Split(v, ",")
+	result := make([]*regexp.Regexp, 0, len(patterns))
+	for _, p := range patterns {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return nil, fmt.Errorf("config: %s pattern %q is not a valid regex: %w", key, p, err)
+		}
+		result = append(result, re)
+	}
+	return result, nil
 }
 
 // parseBoolEnv maps a string env value to a bool with the supplied

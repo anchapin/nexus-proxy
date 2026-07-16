@@ -1,387 +1,219 @@
-# Nexus Proxy
+# Nexus Proxy — Agent Guide
 
 Hardware-aware AI routing gateway in Go. Intercepts OpenAI-compatible
-`/v1/chat/completions` requests from coding agents (OpenCode, Aider, etc.),
-optimizes the prompt (TOON compression, RAG few-shot, meta-prompting), and
-routes to local Ollama or a frontier API based on complexity.
+`/v1/chat/completions`, optimizes prompts (TOON compression, RAG,
+meta-prompting), and routes to local Ollama or a frontier API based
+on complexity.
 
-See `Nexus Proxy PRD and Architecture.md` for the full PRD and roadmap,
-and `README.md` for the user-facing quickstart.
+See `Nexus Proxy PRD and Architecture.md` for full design intent and
+`README.md` for user-facing quickstart.
 
-## Repo state
-
-Phases 1–5 are substantially shipped. The single-file prototype is gone;
-the codebase follows standard Go layout. Structured logging (#3),
-telemetry (#16), Prometheus metrics (#40), distributed tracing (#41),
-Kubernetes health endpoints (#42), inbound auth (#37), rate limiting
-(#38), TLS termination (#39), SQLite metrics store (#4), the
-multi-frontier provider registry (#43), and VRAM-aware concurrency
-gating (#35) have all landed.
-
-```
-cmd/nexus/                 # main: wires config + middleware + handlers + starts HTTP
-internal/
-  auth/                    # inbound API-key gateway middleware (#37)
-  budget/                  # rolling 24h frontier spend guard (#38)
-  concurrencylimit/        # VRAM-aware local-route semaphore (#35)
-  config/                  # env loading, defaults, validation
-  handlers/                # chat.go + health.go (HTTP entry points)
-  health/                  # Ollama health poller + circuit breaker (#8)
-  judge/                   # async LLM-as-a-judge evaluator (#15)
-  metrics/                 # SQLite metrics store for savings dashboard (#4)
-  middleware/              # toon.go, prompt_engine.go (prompt transforms)
-  observability/           # Prometheus collector + /metrics (#40)
-  probe/                   # VRAM probe for concurrency gating
-  providers/               # multi-frontier provider registry (#43)
-  quality/                 # AST/compiler verifier (#13)
-  rag/                     # SQLite-backed store + Ollama embedder + file watcher (#46)
-  ratelimit/               # clientip.go, middleware.go (trusted-proxy + per-client limiter, #75)
-  router/                  # dsl.go, slm.go, guardrails
-  telemetry/               # Recorder interface + JSONLRecorder + ObservingWriter
-  tracing/                 # W3C trace context + OTLP/JSON export (#41)
-  transport/               # shared pooled HTTP client (#34)
-  upstream/                # stream.go, cascade.go, fusion.go (panel + arbiter)
-few_shot_examples/         # (gitignored) user-curated snippets
-.env.example               # all env vars with safe defaults
-Makefile                   # build / test / lint / ci
-```
-
-## Build / run / test
+## Build / test / lint
 
 ```bash
-make build && ./bin/nexus   # build & run
-make test                   # unit tests
-make test-race              # race detector
-make lint                   # golangci-lint
-make ci                     # vet + build + test + lint (what CI runs)
+make build          # → ./bin/nexus
+make test           # unit tests
+make test-race      # race detector (required to merge)
+make lint           # golangci-lint
+make fmt            # gofmt -w (in place)
+make ci             # vet + build + test + test-race + lint + bench-short  ← CI gate
 ```
 
-`go run ./cmd/nexus` works too; the `Makefile` is convenience, not a
-runtime dependency.
+`go run ./cmd/nexus` also works. `nexus check` / `nexus doctor` run
+boot-time diagnostics without starting the server (issue #32).
 
-The binary listens on `:8000` (env: `NEXUS_ADDR`) and exposes:
-- `POST /v1/chat/completions` — the proxy
-- `GET  /healthz` — liveness probe (legacy alias)
-- `GET  /livez` — liveness probe (#42)
-- `GET  /readyz` — readiness probe; honours `NEXUS_READINESS_MODE` (#42)
-- `GET  /status` — detailed subsystem state (frontier, judge, VRAM)
-- `GET  /metrics` — Prometheus-format metrics (#40; path via `NEXUS_METRICS_ENDPOINT`)
+**CI coverage floor is 70%** — `make ci` will fail if total coverage
+drops below 70%. Per-package numbers print for visibility; only the
+total gates.
 
-`/healthz`, `/livez`, `/readyz`, `/status`, and `/metrics` are exempt
-from inbound auth and rate limiting. `/v1/chat/completions` requires
-auth when `NEXUS_PROXY_API_KEY` is set (#37).
+**Go version:** CI uses Go 1.26 (see `.github/workflows/ci.yml`).
 
-Telemetry is opt-out: by default the proxy appends one JSON object per
-proxied request to `./nexus-telemetry.jsonl` (env: `NEXUS_TELEMETRY_PATH`,
-empty disables). Records are pushed onto a buffered channel consumed by a
-background goroutine — the request path never blocks on persistence.
+**Runtime dependency only:** `modernc.org/sqlite` (metrics store).
+Everything else is stdlib.
 
-**SQLite metrics store (#4).** When `NEXUS_METRICS_DB` is set, the proxy
-also writes a structured row per request to a SQLite database (route,
-model, tokens, TOON savings, RAG injection, estimated frontier cost).
-This powers the savings dashboard. Parent directories are created on
-demand; leave empty to disable.
+## Package layout
 
-**Prometheus metrics (#40).** `/metrics` exposes counters, gauges, and
-histograms for auth, rate-limit, budget, TLS middleware, and per-route
-latency. See `internal/observability`.
+```
+cmd/nexus/              # main: wires config → middleware → handlers → HTTP server
+internal/
+  auth/                 # inbound API-key middleware
+  budget/               # 24h rolling frontier spend cap
+  concurrencylimit/     # VRAM-aware local-route semaphore
+  config/               # Load() parses all NEXUS_* env vars (no central map)
+  handlers/              # chat.go + health.go (only package that touches net/http)
+  health/               # Ollama circuit breaker
+  judge/                # async LLM-as-a-judge (sampled local completions)
+  metrics/              # SQLite metrics store → savings dashboard
+  middleware/           # prompt transforms only (toon, prompt_engine)
+  observability/        # Prometheus collector + /metrics endpoint
+  probe/                # nvidia-smi / AMD sysfs VRAM probe
+  providers/             # multi-frontier registry + cost-latency selector
+  quality/              # background cargo check / tsc verifier
+  rag/                  # PersistentStore (SQLite) + Store + Watcher
+  ratelimit/            # ClientIPResolver + HTTP middleware (NOT in middleware/)
+  router/               # Guardrail → DSL → SLM.Decide routing pipeline
+  telemetry/            # Recorder interface + JSONLRecorder
+  tracing/              # W3C trace context + OTLP/JSON exporter
+  transport/            # shared pooled http.Client (NEXUS_HTTP_* tuning)
+  upstream/             # upstream.go, cascade.go (Panel + PanelStreaming)
+```
 
-**Known gotcha (#112).** When the SQLite metrics store is enabled, the
-JSONL telemetry log is currently silenced. Tracked as bug #112 — both
-sinks should coexist.
+**Critical: `internal/ratelimit` ≠ `internal/middleware`.** Rate limiting
+lives in `internal/ratelimit` because it imports `net/http`. The
+`internal/middleware` package has no `net/http` dependency — keep it that
+way for unit-testability.
 
-## Prerequisites
+**Dependency rule:** `internal/handlers` and `internal/upstream` must
+**never** import `internal/judge`. The judge hooks in via
+`JudgeObserver` on `handlers.Deps` — a function-typed field wired in
+`cmd/nexus/main.go`. This keeps the hot path testable without spinning
+up a worker pool.
 
-1. **Ollama running locally** on `http://localhost:11434` (env:
-   `NEXUS_OLLAMA_URL`).
-2. **Models pulled:**
-   - `qwen3-coder:4b` — routing SLM (`NEXUS_ROUTER_MODEL`)
-   - `qwen3-coder:8b` — local execution model (`NEXUS_LOCAL_MODEL`)
-   - `nomic-embed-text` — embeddings for RAG (`NEXUS_EMBEDDING_MODEL`)
-   RAG silently skips files whose embedding call fails, so missing the
-   embedding model degrades gracefully (no RAG injection).
-3. **Frontier API key** in `NEXUS_FRONTIER_API_KEY`. Without it, frontier
-   routing returns 401.
+## Routing pipeline
 
-Copy `.env.example` to `.env` and edit.
+`internal/router`: Guardrail → DSL → SLM.Decide. Every failure defaults
+to **frontier** (safe choice).
 
-## Routing logic — quick reference
+| Trigger | Route |
+| ------- | ----- |
+| `len(prompt)/4 > NEXUS_TOKEN_GUARDRAIL` | `frontier` (VRAM guardrail) |
+| Prompt matches `NEXUS_DSL_FUSION_PATTERNS` (default: `architectural design\|system architecture`) | `fusion` |
+| Prompt matches `NEXUS_DSL_FORMATTING_PATTERNS` (default: `css\|format\|docstring\|lint\|typo\|boilerplate\|debug\|fix bug\|git commit\|sql query\|parse json\|validate input\|regex\|api endpoint\|test\|optimize\|readme`) | `local` |
+| Prompt matches `NEXUS_DSL_LOCAL_PATTERNS` (default: `refactor\|security scan\|generate tests\|explain this code\|performance analysis`) | `local` |
+| Otherwise | SLM decides (qwen3-coder:4b JSON decision) |
+| SLM confidence < threshold OR SLM fails | `frontier` (escalation) |
 
-Decided in `internal/router`:
-- `Guardrail` first (token-budget heuristic, force frontier above budget)
-- `DSL` second (regex fast-pass: architecture → fusion, formatting → local)
-- `SLMClient.Decide` last (Qwen3-Coder JSON-decision)
-- Every failure defaults to **frontier** (the safe choice)
+DSL patterns are **comma-separated regexes** (set via env var, not a map).
+`NEXUS_DSL_FUSION_PATTERNS` and `NEXUS_DSL_LOCAL_PATTERNS` accept Go
+regex syntax.
 
-Route constants are `router.RouteLocal`, `router.RouteFrontier`,
-`router.RouteFusion`.
+**SLM decision cache:** `NEXUS_SLM_CACHE_MAX_ENTRIES` + `NEXUS_SLM_CACHE_TTL`
+(default 512 entries / 30s). Semantic dedup via
+`NEXUS_SLMCACHE_SEMANTIC_THRESHOLD` uses the embedder.
 
-| Trigger                                                       | Route     |
-| ------------------------------------------------------------- | --------- |
-| `len(prompt)/4 > NEXUS_TOKEN_GUARDRAIL`                       | `frontier` (VRAM guardrail) |
-| Prompt contains "architectural design" or "system architecture" | `fusion` |
-| Prompt matches `\b(css\|format\|docstring\|lint\|typo\|boilerplate)\b` | `local` |
-| Otherwise                                                     | SLM decides |
-| SLM confidence < `NEXUS_SLM_CONFIDENCE_THRESHOLD` AND route is local/fusion | `frontier` (escalation, #44) |
-| SLM call fails, times out, or returns invalid JSON            | `frontier` (safe default) |
+**Fusion progressive delivery** (`NEXUS_FUSION_PROGRESSIVE=true`, default):
+panels race local + frontier, stream the faster as speculative SSE, and
+only invoke the arbiter when Jaccard similarity < `NEXUS_FUSION_AGREEMENT_THRESHOLD`
+(default 0.85). Set `NEXUS_FUSION_PROGRESSIVE=false` for legacy blocking
+Panel behavior.
 
-## Fusion progressive delivery (issue #48)
+## Middleware order (do not reorder)
 
-`route=fusion` no longer blocks until both panel members complete.
-`upstream.PanelStreaming` (in `internal/upstream/upstream.go`) races
-the local + frontier fetches, streams the first to complete as a
-speculative OpenAI-compatible SSE chunk tagged with `X-Nexus-Fusion-
-Progressive: true`, then either:
+**Inbound HTTP chain** (`cmd/nexus/main.go`, outermost → innermost):
+1. Security headers (`X-Request-Id` sanitize, `X-Content-Type-Options`, etc.)
+2. Rate limiting (per-client-IP; exempts `/healthz /livez /readyz /status /metrics`)
+3. Inbound auth (bearer token; same exemptions; no-op when `NEXUS_PROXY_API_KEY` unset)
+4. Handler dispatch
 
-- emits `data: [DONE]\n\n` when both members' Jaccard similarity is
-  `>= NEXUS_FUSION_AGREEMENT_THRESHOLD` (default 0.85) — arbiter
-  is **not** invoked; the user has already received the answer;
-- streams the arbiter's synthesis as additional SSE chunks after
-  the speculative one when the two members diverge (the "append"
-  disagreement mode).
+Rate limiter fires **before** any prompt-pipeline work — a 429 terminates
+at the HTTP layer.
 
-The legacy blocking `Panel` path remains for `stream=false`
-harness requests and for operators who opt out via
-`NEXUS_FUSION_PROGRESSIVE=false`. Both paths share the same
-arbiter timeout (`NEXUS_ARBITER_TIMEOUT`) and the same per-fetch
-timeout (`NEXUS_FUSION_TIMEOUT`); the only difference is whether
-the user sees bytes before the arbiter runs.
+**Prompt pipeline** (`internal/handlers/chat.go`):
+1. `ApplyPromptEngineering` — role/CoT/constraints into system prompt
+2. `RAG.Retrieve` + `InjectRAG` — embed + cosine match (threshold `NEXUS_RAG_THRESHOLD`)
+3. `CompressJSONBlocks` + `AppendSystemNote` — TOON compression + system note
+4. Guardrail → DSL → SLM routing
+5. Dispatch: local → Cascade/BufferedFetch; frontier → Stream/BufferedFetch; fusion → Panel
 
-`fusion_arbiter_skipped` is exposed on the telemetry record (and
-the SQLite metrics row) so the dashboard can report the fraction
-of fusion traffic that achieved agreement.
+## Ollama degradation (issue #8)
 
-## TOON compression gotchas
+If Ollama goes down after boot, the health poller trips the circuit
+breaker after `NEXUS_HEALTH_BREAKER_THRESHOLD` (default 3) failed probes:
+- `RouteLocal` → transparently rerouted to frontier
+- `RouteFusion` → local panel skipped, arbiter synthesizes from frontier alone
+- Response carries `X-Nexus-Degraded: true`
+- Circuit recloses on next successful probe
 
-`middleware.SerializeToTOON` rewrites JSON arrays into a CSV-like TOON
-shape. Two non-obvious behaviours to remember when re-parsing downstream:
-
-- **Commas in values are replaced with full-width `，` (U+FF0C)** to
-  protect the CSV structure.
-- **Newlines in values are replaced with spaces** — multi-line strings
-  round-trip lossy.
-- The regex `JSONArrayBlock` only fires on ` ```json\n[ ... ]\n``` `
-  fenced blocks inside `user`/`assistant` messages.
-
-## Middleware order (do not reorder casually)
-
-### Inbound chain (wired in `cmd/nexus/main.go`, outermost → innermost)
-
-1. **Security headers** (#39) — sanitizes `X-Request-Id`, sets
-   `X-Content-Type-Options`, `X-Frame-Options`, etc. Outermost so
-   every response including 401/429 gets headers.
-2. **Rate limiting** (#38/#75) — per-client-IP + optional global
-   token-bucket. Exempts `/healthz`, `/livez`, `/readyz`, `/status`,
-   `/metrics`.
-3. **Inbound auth** (#37) — bearer-token gate. Exempts the same health
-   endpoints. No-op pass-through when `NEXUS_PROXY_API_KEY` is unset.
-4. **Handler** — `handlers.Chat` dispatch.
-
-The HTTP-layer rate limiter (`internal/ratelimit`) wraps the chat
-handler **before** any prompt-pipeline step runs — a throttled request
-is rejected with 429 before prompt engineering / RAG / routing do any
-work. It is disabled (passthrough) when `NEXUS_RATE_LIMIT_RPM <= 0`.
-
-### Prompt pipeline (inside `internal/handlers/chat.go`)
-
-1. `ApplyPromptEngineering` — inject role/CoT/constraints into system prompt
-2. `RAG.Retrieve` + `InjectRAG` — embed latest user prompt, inject best
-   cosine match (threshold from `NEXUS_RAG_THRESHOLD`)
-3. `CompressJSONBlocks` + `AppendSystemNote` — TOON compress JSON arrays,
-   append TOON instructions to system
-4. Then routing: `Guardrail` → `DSL` → `SLM` (with confidence escalation, #44)
-5. Then dispatch:
-   - `local` → `Cascade` (streaming, with fallback) or `BufferedFetch` (non-streaming)
-   - `frontier` → `Stream` (streaming) or `BufferedFetch` (non-streaming)
-   - `fusion` → `Panel` (local + frontier + arbiter)
+Set `NEXUS_HEALTH_POLL_INTERVAL=0` to disable the poller (assumes
+Ollama always healthy, pays per-request timeout on failure).
 
 ## Trusted-proxy client-IP resolution (issue #75)
 
-`internal/ratelimit.ClientIPResolver` is the single source of truth for
-"who is the client?". It honours `X-Forwarded-For` / `X-Real-IP` **only**
-when the direct TCP peer (`r.RemoteAddr`) is in the
-`NEXUS_TRUSTED_PROXIES` CIDR allowlist; otherwise it uses the peer IP
-and ignores the headers (spoofing defence). A multi-hop XFF chain is
-walked right-to-left, skipping trusted hops, to find the first
-untrusted client IP (same algorithm as nginx `real_ip_recursive`).
+`internal/ratelimit.ClientIPResolver` is the single source of truth.
+`X-Forwarded-For` / `X-Real-IP` are honoured **only** when the direct
+TCP peer is in `NEXUS_TRUSTED_PROXIES` CIDR allowlist. Empty =
+trust nobody (safe default). Invalid CIDR **fails boot** (not silent).
 
-Gotchas to remember when extending:
+Boot warning fires when: rate limiting on + non-loopback bind + no
+trusted proxies configured.
 
-- **Empty config = trust nobody** (the safe default). The zero-value /
-  nil resolver always returns the direct peer IP.
-- **Invalid CIDR fails boot** — `config.parseTrustedProxies` returns an
-  error rather than silently falling back, so a typo doesn't quietly
-  disable XFF honouiring.
-- `config.IsLoopbackBind` classifies `:8000` as loopback-safe (dev
-  default) but `0.0.0.0:8000` as non-loopback; the boot warning fires
-  only for the latter + rate-limit-on + no-trusted-proxies.
-- The `ClientIPResolver` and `Middleware` live in `internal/ratelimit`
-  (NOT `internal/middleware`, which is prompt transforms only) so they
-  can import `net/http` without polluting the prompt pipeline.
+## TOON compression (issue #123)
 
-## Style / workflow notes
+`middleware.SerializeToTOON` rewrites JSON arrays into CSV-like shape.
+Two non-obvious round-trip rules:
+- **Commas in values → full-width `，` (U+FF0C)**
+- **Newlines in values → spaces** (multi-line strings lose newlines)
 
-- Go 1.21+. **Near-stdlib**: the only runtime dependency is
-  `modernc.org/sqlite` (pure-Go SQLite driver for the metrics store,
-  #4). The dev-time toolchain (golangci-lint, Make) is documented but
-  optional for contributors who just want to run the binary.
-- Logging uses `log/slog` (structured logging, #3). Format and level
-  are configurable via `NEXUS_LOG_FORMAT` (json|text) and
-  `NEXUS_LOG_LEVEL` (debug|info|warn|error). The old bracketed
-  `log.Println` prefixes (`[ROUTER]`, `[RAG INDEXER]`) are gone — use
-  `slog.Info(...)` with `slog.String("component", ...)` attributes.
-- HTTP timeouts: `http.Server.ReadHeaderTimeout` is 10s.
-  `ReadTimeout`/`WriteTimeout`/`IdleTimeout` are still 0 — tracked in
-  #106. Per-call timeouts are `NEXUS_SLM_TIMEOUT` (8s default),
-  `NEXUS_FUSION_TIMEOUT` (120s default), and
-  `NEXUS_CASCADE_TIMEOUT` (per-cascade-attempt, #14).
-- HTTP client is a single shared pooled `*http.Client` configured via
-  `internal/transport.New` (#34) — env vars `NEXUS_HTTP_*` tune
-  `MaxIdleConnsPerHost`, `MaxConnsPerHost`, `IdleConnTimeout`, etc.
-  The old `http.DefaultClient` references are gone.
-- The `few_shot_examples/` directory is auto-created at first run if
-  missing (`Store.IndexDir`). It's gitignored.
-- Tests use `httptest` + a `RecordingTransport` helper in
-  `internal/upstream/recording.go` to record and replay HTTP calls.
-  All tests run in <2s with `-race`.
+The `JSONArrayBlock` regex only fires on fenced ` ```json\n[...]\n``` ` blocks.
+A second pass (`CompressUnfencedJSONArrays`) handles bare and prose-
+embedded arrays of ≥2 objects — single-row arrays are skipped. Set
+`NEXUS_TOON_UNFENCED=false` to restrict to fenced-only.
 
-## Persistent RAG vector store (issue #46)
+## Persistent RAG (issue #46)
 
-`internal/rag` now ships a SQLite-backed `PersistentStore` and a
-background `Watcher` so the few-shot embeddings survive restarts and
-new snippets can be indexed without restarting the proxy.
+`internal/rag`: `PersistentStore` (SQLite-backed) embeds an in-memory
+`Store`. Both satisfy the `RAGStore` interface. The chat handler is
+unaware which is wired.
 
-```
-internal/rag/
-  rag.go          # FewShotExample, Embedder, RAGStore interface, Store (in-memory)
-  sqlite.go       # PersistentStore: SQLite-backed cache + Load/IndexDir/Upsert/Remove
-  watcher.go      # Watcher: mtime+size polling goroutine, file -> PersistentStore
-```
+Boot: `OpenPersistentStore` → `LoadOrIndex` (loads from SQLite, falls
+back to full embed if DB is empty). `Watcher` reconciles on mtime+size
+changes. Embeddings use `encoding/gob`. Set `NEXUS_RAG_DB=` to disable
+persistence (legacy in-memory path).
 
-The chat handler still calls `d.RAG.Retrieve` against a `rag.RAGStore`
-interface — both `*Store` and `*PersistentStore` satisfy it, so the
-handler is unaware of which implementation is wired.
+**RAG embedder is pluggable** (`NEXUS_EMBEDDER_TYPE`): `ollama` (default),
+`openai`, or `cohere`. Set the matching API key env var.
 
-| Env var                       | Default                                  | Purpose                                  |
-| ----------------------------- | ---------------------------------------- | ---------------------------------------- |
-| `NEXUS_RAG_DB`                | `~/.cache/nexus-proxy/rag.db`            | On-disk SQLite cache; empty disables persistence |
-| `NEXUS_RAG_POLL_INTERVAL`     | `30s`                                    | Watcher cadence; `0` disables the watcher but keeps the cache |
+## Judge (issue #15)
 
-Boot path (when persistence is enabled):
-1. `OpenPersistentStore` opens (or creates) the DB and the in-memory
-   `*Store` it embeds.
-2. `LoadOrIndex` calls `Load` first (O(rows) — no Ollama) and only
-   falls back to `IndexDir` (which embeds + persists) if the DB is
-   empty.
-3. The watcher (when enabled) polls the examples dir every
-   `NEXUS_RAG_POLL_INTERVAL` and reconciles via Upsert/Remove using
-   (mtime, size) as the freshness signal — a re-write triggers
-   re-embed, a deletion drops the row.
+Async LLM-as-a-judge samples ~10% of `RouteLocal` completions and scores
+them 1–5 via a frontier endpoint. Disabled when `NEXUS_JUDGE_SAMPLE_RATE <= 0`.
 
-Embeddings are serialised with `encoding/gob` (stdlib, no extra
-dependency). The store is concurrency-safe via an internal
-`sync.RWMutex`; the watcher writes through `Upsert`/`Remove` and
-chat handlers read through `Retrieve` without coordination beyond
-the lock.
+Judge output (`JudgeScore`) is stored via a `Storage` interface (today:
+in-memory `MemoryStorage`). The SQLite metrics store (`internal/metrics`)
+persists per-request rows independently.
 
-## Debug request/response tracing (issue #33)
+**Judge-guided adaptive routing** (`NEXUS_ROUTING_CONFIDENCE_DB`):
+historical scores aggregated by task category feed back to the SLM as a
+confidence signal. Dormant when judge is off — routing is byte-for-byte
+identical to non-adaptive path.
 
-`NEXUS_DEBUG=true` switches the chat handler into a structured
-tracing mode that emits five `[DEBUG] <section>` slog lines per
-proxied request: `request`, `transforms`, `routing`, `upstream`,
-`response`. Each line carries a structured sub-group so operators
-can grep a single request id and see the full lifecycle:
+## Debug tracing (issue #33)
 
-| Section       | Fields                                                                  |
-| ------------- | ----------------------------------------------------------------------- |
-| `request`     | message count, estimated tokens, model, stream flag, body bytes        |
-| `transforms`  | prompt engineering applied, RAG injection (filename/score), TOON delta  |
-| `routing`     | route, reason (guardrail / dsl / slm), budget source, estimated tokens |
-| `upstream`    | target host, model, streaming, cascade steps + served-by (when applicable) |
-| `response`    | status code, TTFT ms, total bytes, output tokens, truncated body preview |
+`NEXUS_DEBUG=true` emits five structured slog groups per request:
+`request`, `transforms`, `routing`, `upstream`, `response`. Zero
+overhead when off. API keys redacted; body preview capped at
+`NEXUS_DEBUG_BODY_BYTES` (default 512).
 
-Production has zero overhead when the flag is off: the handler
-skips trace construction entirely and the existing fast path is
-byte-for-byte identical. When on, the handler installs a
-`captureWriter` even without judge/quality observers so the
-response trace can include a body preview.
+## Adding new env vars
 
-API keys are always redacted (`sk-...XYZ1` for a real
-`sk-proj-...XYZ1`); `Authorization` headers are stripped from any
-structured payload. The body preview is capped at
-`NEXUS_DEBUG_BODY_BYTES` (default 512) so a runaway upstream cannot
-flood the log. Traces are emitted **after** the response completes
-so they never interleave with the SSE stream the harness is
-consuming.
+Update `internal/config/config.go` — add the field to `Config` struct,
+then parse it inline in `Load()` using a helper:
+- `getEnv("NEXUS_VAR", "default")` — string
+- `getEnvBool("NEXUS_VAR", false)` — bool
+- `getEnvInt("NEXUS_VAR", 0)` — int
+- `getEnvFloat("NEXUS_VAR", 0.0)` — float64
+- `getEnvDuration("NEXUS_VAR", 30*time.Second)` — duration
+- `getEnvAllowEmpty("NEXUS_VAR", "default")` — string (including empty)
 
-## Async LLM-as-a-Judge (issue #15)
+Also add the variable to `.env.example`. No central registry needed.
 
-`internal/judge` is the async quality evaluator. It samples ~10% of
-completed `RouteLocal` requests and asks a frontier endpoint for a
-1–5 score on the model's output. Tunables (all env vars):
+## Branch conventions
 
-| Variable                    | Default                       | Purpose                                  |
-| --------------------------- | ----------------------------- | ---------------------------------------- |
-| `NEXUS_JUDGE_URL`           | z.ai, falls back to frontier  | Judge endpoint                           |
-| `NEXUS_JUDGE_MODEL`         | `NEXUS_FRONTIER_MODEL`        | Judge model name                         |
-| `NEXUS_JUDGE_API_KEY`       | `NEXUS_FRONTIER_API_KEY`      | Bearer token (may be empty in dev)       |
-| `NEXUS_JUDGE_SAMPLE_RATE`   | `0.1`                         | Fraction of completed local requests     |
-| `NEXUS_JUDGE_CONCURRENCY`   | `2`                           | Max simultaneous judge calls             |
-| `NEXUS_JUDGE_QUEUE`         | `64`                          | Buffered channel size; overflow drops    |
-| `NEXUS_JUDGE_TIMEOUT`       | `30s`                         | Per-call timeout                         |
-| `NEXUS_JUDGE_COST_PER_1K`   | `0.002`                       | USD per 1k tokens for cost estimates     |
+- **`develop`** is the default branch — base for all feature/fix branches
+- **`main`** — only as PR target from `develop` for releases
+- Naming: `fix/issue-<number>` or `feat/<short-description>`
 
-The judge is **always disabled when `NEXUS_JUDGE_SAMPLE_RATE <= 0`**,
-so a stock `.env.example` boots with the evaluator dormant. The chat
-hot path is unaffected when the judge is dormant.
+## Logging
 
-**Dependency rule.** `internal/handlers` and `internal/upstream` must
-never import `internal/judge`. The handler exposes a
-`JudgeObserver` hook (function-typed) on `handlers.Deps`, and
-`cmd/nexus/main.go` plugs in a closure that adapts to the judge's
-`Sample`/`Enqueue` entry points. This keeps the hot path lean and
-unit-testable without spinning up a worker pool.
+`log/slog` structured logging only. Use `slog.Info(...)` with
+`slog.String("component", ...)` attributes. Never `fmt.Println` in
+production paths.
 
-**Persistence.** `internal/judge` exposes a tiny `Storage` interface;
-today it is backed by an in-memory `MemoryStorage`. The SQLite metrics
-store (#4, `internal/metrics`) persists per-request data (route, model,
-tokens, cost) to `NEXUS_METRICS_DB`. The judge's `JudgeScore` record
-(request id, score 1–5, raw response, prompt/output token estimates,
-USD cost) is designed to persist through the same Storage interface
-without changing the wire shape.
+## Testing
 
-## Where to extend
+Tests use `httptest` + `RecordingTransport` in `internal/upstream/recording.go`
+to record/replay HTTP calls. All tests run in <2s with `-race`.
 
-For new behaviour, add tests first and follow the existing layout:
-
-| New behaviour                           | Package                          |
-| --------------------------------------- | -------------------------------- |
-| New env var                             | `internal/config`                |
-| New prompt transform                    | `internal/middleware`            |
-| New routing rule                        | `internal/router`                |
-| Different upstream protocol / cascade   | `internal/upstream`              |
-| New HTTP endpoint                       | `internal/handlers`              |
-| Trusted-proxy / client-IP / rate limit  | `internal/ratelimit`             |
-| Inbound auth / API key validation       | `internal/auth`                  |
-| Spend guard / budget enforcement        | `internal/budget`                |
-| TLS / security headers                  | `internal/handlers` (header mw)  |
-| Prometheus metric / collector           | `internal/observability`         |
-| Distributed tracing / span              | `internal/tracing`               |
-| SQLite metrics store / savings query    | `internal/metrics`               |
-| VRAM probe / concurrency gate           | `internal/probe`, `internal/concurrencylimit` |
-| Health poller / circuit breaker         | `internal/health`                |
-| Multi-frontier provider registry        | `internal/providers`             |
-| AST/compiler quality check              | `internal/quality`               |
-| Shared HTTP client tuning               | `internal/transport`             |
-| Judge scoring / sampling logic          | `internal/judge`                 |
-| Judge persistence (SQLite, etc.)        | `internal/judge` (Storage impl)  |
-| New telemetry field or storage backend  | `internal/telemetry`             |
-| RAG embedding cache / indexer           | `internal/rag`                   |
-
-Existing functions map 1:1 to those packages. The handler is the only
-public entry point — keep middleware and router free of `net/http`
-concerns so they stay unit-testable. Telemetry's `Recorder` interface
-(`internal/telemetry`) is the JSONL seam; the SQLite metrics store
-(`internal/metrics`) is a separate sink with its own schema. Both are
-wired via `handlers.Deps` so neither touches the hot-path handler
-logic directly.
+`make test-race` is required to pass before merging — race conditions in
+transport, metrics, budget tracker, and VRAM limiter are easy to miss
+in manual testing.

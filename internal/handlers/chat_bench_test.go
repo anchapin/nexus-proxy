@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -37,6 +36,10 @@ func (benchEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
 	return []float64{1.0}, nil
 }
 
+func (benchEmbedder) IsHealthy(context.Context) bool { return true }
+func (benchEmbedder) IsBreakerOpen() bool            { return false }
+func (benchEmbedder) RecordBreakerSuccess()          {}
+
 // jsonStringLit wraps a string in a JSON string literal via fmt %q.
 func jsonStringLit(s string) string {
 	return fmt.Sprintf("%q", s)
@@ -63,12 +66,11 @@ func benchDeps(b *testing.B, localSrv, frontierSrv *httptest.Server) Deps {
 	client := localSrv.Client()
 	store := rag.NewStore(benchEmbedder{}, 0.55)
 	return Deps{
-		Config:          cfg,
-		Client:          client,
-		RAG:             store,
-		SLM:             router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, 1, client),
-		FormattingRegex: regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate)\b`),
-		Recorder:        telemetry.Noop{},
+		Config:   cfg,
+		Client:   client,
+		RAG:      store,
+		SLM:      router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, 1, client),
+		Recorder: telemetry.Noop{},
 	}
 }
 
@@ -106,7 +108,7 @@ func BenchmarkChatRouteFrontierStream(b *testing.B) {
 
 	deps := benchDeps(b, localSrv, frontierSrv)
 	handler := Chat(deps)
-	largePrompt := strings.Repeat("a", 30000) // 7500 est tokens > 6000 guardrail
+	largePrompt := strings.Repeat("a", 49000) // ≈ 6125 tokens > 6000 guardrail
 	body := `{"messages":[{"role":"user","content":"` + largePrompt + `"}]}`
 
 	b.ReportAllocs()
@@ -163,7 +165,7 @@ func BenchmarkChatRouteFrontierStreamParallel(b *testing.B) {
 
 	deps := benchDeps(b, localSrv, frontierSrv)
 	handler := Chat(deps)
-	largePrompt := strings.Repeat("a", 30000)
+	largePrompt := strings.Repeat("a", 49000)
 	body := `{"messages":[{"role":"user","content":"` + largePrompt + `"}]}`
 
 	b.ReportAllocs()
@@ -218,13 +220,13 @@ func BenchmarkChatEndToEndProxy(b *testing.B) {
 	b.Cleanup(proxySrv.Close)
 
 	client := proxySrv.Client()
-	largePrompt := strings.Repeat("a", 30000)
+	largePrompt := strings.Repeat("a", 49000)
 	body := `{"messages":[{"role":"user","content":"` + largePrompt + `"}]}`
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		req, _ := http.NewRequest(http.MethodPost, proxySrv.URL+"/v1/chat/completions",
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, proxySrv.URL+"/v1/chat/completions",
 			strings.NewReader(body))
 		resp, err := client.Do(req)
 		if err != nil {
@@ -252,7 +254,7 @@ func BenchmarkChatEndToEndProxyConcurrent(b *testing.B) {
 	b.Cleanup(proxySrv.Close)
 
 	client := proxySrv.Client()
-	largePrompt := strings.Repeat("a", 30000)
+	largePrompt := strings.Repeat("a", 49000)
 	body := `{"messages":[{"role":"user","content":"` + largePrompt + `"}]}`
 
 	for _, c := range []int{1, 4, 8} {
@@ -270,7 +272,7 @@ func BenchmarkChatEndToEndProxyConcurrent(b *testing.B) {
 				go func() {
 					defer wg.Done()
 					for r := 0; r < perWorker; r++ {
-						req, _ := http.NewRequest(http.MethodPost,
+						req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost,
 							proxySrv.URL+"/v1/chat/completions",
 							strings.NewReader(body))
 						resp, err := client.Do(req)

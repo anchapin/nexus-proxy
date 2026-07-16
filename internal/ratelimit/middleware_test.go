@@ -264,3 +264,163 @@ func TestMiddleware_SetRejectionHookRemoves(t *testing.T) {
 		t.Errorf("hook fired %d after nil removal, want 0", fired)
 	}
 }
+
+// TestMiddleware_BucketRaceConcurrencyFix verifies issue #248: many
+// concurrent goroutines requesting the same previously-unseen IP must
+// result in exactly one bucket, not one per goroutine.
+func TestMiddleware_BucketRaceConcurrencyFix(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 1000, resolver) // big burst to avoid 429 noise
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	const goroutines = 50
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodPost, "/", nil)
+			req.RemoteAddr = "192.168.99.99:9999" // same IP for all goroutines
+			h.ServeHTTP(httptest.NewRecorder(), req)
+		}()
+	}
+	wg.Wait()
+
+	// Issue #248: only ONE bucket should exist for that IP. A race window
+	// during bucket creation would have let each goroutine allocate its own
+	// bucket before inserting, orphaning all but the last.
+	if count := m.BucketCount(); count != 1 {
+		t.Errorf("expected exactly 1 bucket for concurrent same-IP requests, got %d (race window not fixed)", count)
+	}
+}
+
+// TestMiddleware_SetRPM verifies SetRPM updates the steady-state rate.
+// A newly created bucket should use the updated rpm for refill calculations.
+func TestMiddleware_SetRPM(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(60, 2, resolver) // 60/min = 1/s, burst 2
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+
+	// Exhaust burst.
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	// Should be throttled.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 429 {
+		t.Errorf("expected 429 after burst exhausted, got %d", rec.Code)
+	}
+
+	// Increase RPM — refill should be faster but burst is still exhausted.
+	// With 60 RPM (1/s), 1 second should add 1 token, making 1 request succeed.
+	m.SetRPM(60)
+	time.Sleep(1100 * time.Millisecond)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Errorf("expected 200 after refill with 60 RPM, got %d", rec.Code)
+	}
+}
+
+// TestMiddleware_SetBurst verifies SetBurst updates the bucket capacity.
+func TestMiddleware_SetBurst(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 2, resolver) // burst 2
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+
+	// Exhaust original burst of 2.
+	for i := 0; i < 2; i++ {
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	{
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != 429 {
+			t.Errorf("expected 429 after burst 2 exhausted, got %d", rec.Code)
+		}
+	}
+
+	// Increase burst to 5 — but existing bucket is still throttled.
+	// SetBurst affects NEW buckets, not existing ones.
+	m.SetBurst(5)
+
+	// A NEW client IP gets the new burst capacity of 5.
+	newReq := httptest.NewRequest(http.MethodPost, "/", nil)
+	newReq.RemoteAddr = "10.0.0.2:1000" // different IP = new bucket
+	{
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, newReq)
+		if rec.Code != 200 {
+			t.Errorf("expected 200 for new client with burst 5, got %d", rec.Code)
+		}
+	}
+
+	// Verify the original client is still throttled (existing bucket unchanged).
+	{
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != 429 {
+			t.Errorf("expected 429 for original client (existing bucket), got %d", rec.Code)
+		}
+	}
+
+	// Exhaust new client's burst of 5.
+	for i := 0; i < 5; i++ {
+		h.ServeHTTP(httptest.NewRecorder(), newReq)
+	}
+	{
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, newReq)
+		if rec.Code != 429 {
+			t.Errorf("expected 429 after new client's burst 5 exhausted, got %d", rec.Code)
+		}
+	}
+}
+
+// TestMiddleware_SetBurstZeroDoesNotChange verifies that SetBurst(0) is a no-op.
+func TestMiddleware_SetBurstZeroDoesNotChange(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 2, resolver) // burst 2
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+
+	// Exhaust burst.
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	// SetBurst(0) should be a no-op.
+	m.SetBurst(0)
+	{
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != 429 {
+			t.Errorf("expected 429 after SetBurst(0), got %d", rec.Code)
+		}
+	}
+}
+
+// TestMiddleware_NilSafeSetRPM verifies SetRPM on a nil middleware does not panic.
+func TestMiddleware_NilSafeSetRPM(t *testing.T) {
+	var m *Middleware
+	m.SetRPM(100) // must not panic
+}
+
+// TestMiddleware_NilSafeSetBurst verifies SetBurst on a nil middleware does not panic.
+func TestMiddleware_NilSafeSetBurst(t *testing.T) {
+	var m *Middleware
+	m.SetBurst(10) // must not panic
+}

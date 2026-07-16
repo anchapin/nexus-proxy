@@ -21,6 +21,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/anchapin/nexus-proxy/internal/ioutils"
 )
 
 // Confidence buckets. The SLM emits a float64 in [0,1]; we collapse
@@ -81,11 +83,10 @@ func BucketConfidence(c float64) string {
 // allocation on the hot path — the caller passes already-owned
 // strings from the Decision.
 type counterKey struct {
-	route         string
-	source        string
-	confBucket    string
-	taskType      string
-	escalatedFrom string
+	route      string
+	source     string
+	confBucket string
+	taskType   string
 }
 
 // RouteCounters is a concurrency-safe collection of route-decision
@@ -95,36 +96,91 @@ type counterKey struct {
 // lookup (guarded by a mutex) followed by an atomic increment, so
 // contention is minimal.
 //
-// Three metric families are exposed:
+// Four metric families are exposed:
 //   - nexus_route_decisions_total{route,source}
 //   - nexus_slm_decisions_total{route,confidence_bucket,task_type}
 //   - nexus_slm_low_confidence_escalations_total{task_type}
+//   - nexus_slm_cache_hits_total{kind}
+//   - nexus_slm_cache_misses_total
 //
-// A fourth family (issue #119) records requests the proxy rejected
+// A fifth family (issue #119) records requests the proxy rejected
 // before they reached an upstream:
 //   - nexus_requests_rejected_total{reason}
+//
+// A fifth family (issue #187) records fusion arbiter outcomes:
+//   - nexus_fusion_arbiter_total{outcome}
+//     where outcome is "skipped" (agreement reached, arbiter not invoked)
+//     or "invoked" (disagreement, arbiter was called).
+//
+// A sixth family (issue #186) records RAG retrieval outcomes:
+//   - nexus_rag_retrieval_total{hit}
+//
+// A seventh family (issue #232) records fusion arbiter cache hits/misses:
+//   - nexus_fusion_arbiter_cache_total{hit}
 //
 // The reason label values are short, bounded strings (method,
 // body_too_large, bad_request, rate_limit, ...) defined as constants
 // in internal/handlers so the chat handler and the rate-limit
 // middleware agree on the vocabulary without importing this package.
+//
+// A fifth family (issue #205) records cascade fallback events:
+//
+// 腔   - nexus_cascade_fallback_total{reason}
+//
+// The reason label values are "timeout", "transport_error", or
+// "malformed_toolcall".
 type RouteCounters struct {
 	mu sync.Mutex
 
 	routeDecisions           map[counterKey]*uint64
 	slmDecisions             map[counterKey]*uint64
 	lowConfidenceEscalations map[counterKey]*uint64
+	slmCacheHits             map[string]*uint64 // "exact" | "semantic" (issue #352)
+	slmCacheMisses           *uint64
 	rejections               map[string]*uint64
 	responseTruncated        uint64 // nexus_upstream_response_truncated_total
+	fusionArbiter            map[string]*uint64
+	rRAGHits                 map[string]*uint64
+	rRAGMisses               map[string]*uint64
+	cascadeFallbacks         map[string]*uint64
+	arbiterCache             map[string]*uint64 // "hit" | "miss"
+	slmEscalations           map[string]*uint64 // reason label for issue #301
+
+	judgeQueueOverflow   uint64 // atomic; use atomic.AddUint64/atomic.LoadUint64
+	qualityQueueOverflow uint64 // atomic; use atomic.AddUint64/atomic.LoadUint64
+
+	// RAG embedding cache counters (issue #303).
+	ragCacheHits   *uint64
+	ragCacheMisses *uint64
+
+	// Panel panic counter (issue #309). Bumped when a panel goroutine
+	// recovers from a panic and returns a panic error.
+	panelPanics uint64 // atomic
+
+	// collector is an optional Collector whose CircuitBreakerGauges()
+	// are merged into the /metrics output when non-nil.
+	collector *Collector
 }
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
 func NewRouteCounters() *RouteCounters {
+	misses := uint64(0)
+	cHits, cMisses := uint64(0), uint64(0)
 	return &RouteCounters{
 		routeDecisions:           make(map[counterKey]*uint64),
 		slmDecisions:             make(map[counterKey]*uint64),
 		lowConfidenceEscalations: make(map[counterKey]*uint64),
+		slmCacheHits:             make(map[string]*uint64),
+		slmCacheMisses:           &misses,
 		rejections:               make(map[string]*uint64),
+		fusionArbiter:            make(map[string]*uint64),
+		rRAGHits:                 make(map[string]*uint64),
+		rRAGMisses:               make(map[string]*uint64),
+		cascadeFallbacks:         make(map[string]*uint64),
+		arbiterCache:             make(map[string]*uint64),
+		slmEscalations:           make(map[string]*uint64),
+		ragCacheHits:             &cHits,
+		ragCacheMisses:           &cMisses,
 	}
 }
 
@@ -145,10 +201,7 @@ func (rc *RouteCounters) SetGlobalTruncationCounter() {
 //   - source: the decision source ("guardrail", "dsl", "slm", "slm-error", "escalation")
 //   - confidence: the SLM confidence in [0,1] (0.5 neutral; pass 0 for non-SLM)
 //   - taskType: the SLM category bucket (empty for non-SLM sources)
-//   - escalatedFrom: when source=="escalation", the prior route that
-//     was overridden (e.g. "local" when a low-confidence local decision
-//     was bumped to frontier); empty otherwise.
-func (rc *RouteCounters) Observe(route, source string, confidence float64, taskType, escalatedFrom string) {
+func (rc *RouteCounters) Observe(route, source string, confidence float64, taskType, model string) {
 	if rc == nil {
 		return
 	}
@@ -184,12 +237,22 @@ func (rc *RouteCounters) Observe(route, source string, confidence float64, taskT
 		}
 	}
 
-	// Source==escalation is the planner's defensive nil-SLM path.
-	// Record it under low-confidence escalations too so the counter
-	// captures every frontier-bound override.
-	if source == "escalation" && escalatedFrom != "" {
-		ek := counterKey{taskType: taskType, escalatedFrom: escalatedFrom}
+	// Source==escalation is the planner's defensive nil-SLM path
+	// (the SLM timed out or was nil, so the planner fell back to
+	// frontier). Record it under low-confidence escalations so the
+	// counter captures every frontier-bound override, not just the
+	// SLM-confidence ones above.
+	if source == "escalation" {
+		ek := counterKey{taskType: taskType}
 		atomic.AddUint64(rc.slot(rc.lowConfidenceEscalations, ek), 1)
+	}
+
+	// Source==slm-escalation is the planner's hard override for
+	// low-confidence SLM decisions (issue #301). Record it under
+	// slm-escalations with reason label so the metric is
+	// nexus_slm_escalations_total{reason="low_confidence"}.
+	if source == "slm-escalation" {
+		atomic.AddUint64(rc.escalationSlot("low_confidence"), 1)
 	}
 }
 
@@ -215,6 +278,196 @@ func (rc *RouteCounters) ObserveResponseTruncated() {
 		return
 	}
 	atomic.AddUint64(&rc.responseTruncated, 1)
+}
+
+// ObserveFusionOutcome records the outcome of a fusion panel after
+// PanelStreaming returns (issue #187). arbiterSkipped is true when
+// the two panel members agreed (SimilarityRatio >= agreementThreshold)
+// and the arbiter was not invoked; false when disagreement triggered
+// arbiter synthesis. This gives operators the data to compute the
+// fusion agreement rate: skipped/(skipped+invoked).
+func (rc *RouteCounters) ObserveFusionOutcome(arbiterSkipped bool) {
+	if rc == nil {
+		return
+	}
+	outcome := "invoked"
+	if arbiterSkipped {
+		outcome = "skipped"
+	}
+	atomic.AddUint64(rc.fusionSlot(outcome), 1)
+}
+
+// fusionSlot returns the *uint64 for the fusion outcome label, creating
+// it if absent. Same lock-then-atomic pattern as slot.
+func (rc *RouteCounters) fusionSlot(outcome string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.fusionArbiter[outcome]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.fusionArbiter[outcome] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
+// ObserveRAGHit records a RAG retrieval hit (issue #186). filename
+// is the source file of the matched example and is attached as a
+// label so operators can see which snippets are being retrieved.
+func (rc *RouteCounters) ObserveRAGHit(filename string) {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(rc.ragHitSlot(filename), 1)
+}
+
+// ObserveRAGMiss records a RAG retrieval miss (issue #186). reason
+// is the miss cause: "empty_store" when the RAG store has no indexed
+// examples, "threshold" when the best match scored below the similarity
+// floor, or "embed_error" when the embedding call failed.
+func (rc *RouteCounters) ObserveRAGMiss(reason string) {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(rc.ragMissSlot(reason), 1)
+}
+
+// ObserveRAGCacheHit records a RAG prompt embedding cache hit (issue #303).
+func (rc *RouteCounters) ObserveRAGCacheHit() {
+	if rc == nil || rc.ragCacheHits == nil {
+		return
+	}
+	atomic.AddUint64(rc.ragCacheHits, 1)
+}
+
+// ObserveRAGCacheMiss records a RAG prompt embedding cache miss (issue #303).
+func (rc *RouteCounters) ObserveRAGCacheMiss() {
+	if rc == nil || rc.ragCacheMisses == nil {
+		return
+	}
+	atomic.AddUint64(rc.ragCacheMisses, 1)
+}
+
+// ragHitSlot returns the *uint64 for a hit filename, creating it if absent.
+func (rc *RouteCounters) ragHitSlot(filename string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.rRAGHits[filename]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.rRAGHits[filename] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
+// ragMissSlot returns the *uint64 for a miss reason, creating it if absent.
+func (rc *RouteCounters) ragMissSlot(reason string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.rRAGMisses[reason]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.rRAGMisses[reason] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
+// ObserveSLMCacheHit records one SLM decision cache hit (issue #206).
+// kind is "exact" for an exact string match or "semantic" for a cosine-
+// similarity match (issue #245, #352). The cache deduplicates identical
+// prompts within a TTL window; a hit means the same prompt was seen
+// recently and the cached decision was returned instead of calling the
+// SLM. Safe for concurrent use; nil receivers are a no-op.
+func (rc *RouteCounters) ObserveSLMCacheHit(kind string) {
+	if rc == nil || rc.slmCacheHits == nil {
+		return
+	}
+	rc.mu.Lock()
+	p, ok := rc.slmCacheHits[kind]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.slmCacheHits[kind] = p
+	}
+	rc.mu.Unlock()
+	atomic.AddUint64(p, 1)
+}
+
+// ObserveSLMCacheMiss records one SLM decision cache miss (issue #206).
+// A miss means the prompt was not in the cache (or was expired), so
+// the SLM was called to produce a decision. Safe for concurrent use;
+// nil receivers are a no-op.
+func (rc *RouteCounters) ObserveSLMCacheMiss() {
+	if rc == nil || rc.slmCacheMisses == nil {
+		return
+	}
+	atomic.AddUint64(rc.slmCacheMisses, 1)
+}
+
+// ObserveCascadeFallback records a single cascade fallback event,
+// partitioned by reason (issue #205). Call this after Cascade.Run
+// returns when FallbackReason is non-empty. The method is safe for
+// concurrent use and never blocks; nil receivers are a no-op.
+// reason is one of "timeout", "transport_error", or "malformed_toolcall".
+func (rc *RouteCounters) ObserveCascadeFallback(reason string) {
+	if rc == nil || reason == "" {
+		return
+	}
+	atomic.AddUint64(rc.cascadeFallbackSlot(reason), 1)
+}
+
+// ObserveArbiterCacheHit records an arbiter cache lookup result
+// (issue #232). hit=true means the synthesis was served from cache;
+// hit=false means the cache missed and the arbiter was invoked.
+// The method is safe for concurrent use and never blocks; nil
+// receivers are a no-op.
+func (rc *RouteCounters) ObserveArbiterCacheHit(hit bool) {
+	if rc == nil {
+		return
+	}
+	label := "false"
+	if hit {
+		label = "true"
+	}
+	rc.mu.Lock()
+	p, ok := rc.arbiterCache[label]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.arbiterCache[label] = p
+	}
+	rc.mu.Unlock()
+	atomic.AddUint64(p, 1)
+}
+
+// ObserveJudgeQueueOverflow records one judge queue overflow event
+// (issue #226). The judge evaluator calls this when its internal
+// Enqueue returns false due to a full queue.
+func (rc *RouteCounters) ObserveJudgeQueueOverflow() {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(&rc.judgeQueueOverflow, 1)
+}
+
+// ObserveQualityQueueOverflow records one quality verifier queue overflow
+// event (issue #226). The quality verifier calls this when its
+// internal Submit returns false due to a full queue.
+func (rc *RouteCounters) ObserveQualityQueueOverflow() {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(&rc.qualityQueueOverflow, 1)
+}
+
+// ObservePanelPanic records one panel goroutine panic recovery (issue #309).
+func (rc *RouteCounters) ObservePanelPanic() {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(&rc.panelPanics, 1)
 }
 
 // reasonSlot returns the *uint64 for reason, creating it if absent.
@@ -255,6 +508,34 @@ func ReadAllLimited(rc *RouteCounters, r io.Reader, maxBytes int) ([]byte, error
 	return body, err
 }
 
+// cascadeFallbackSlot returns the *uint64 for cascade fallback reason,
+// creating it if absent. Same lock-then-atomic pattern as slot.
+func (rc *RouteCounters) cascadeFallbackSlot(reason string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.cascadeFallbacks[reason]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.cascadeFallbacks[reason] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
+// escalationSlot returns the *uint64 for an SLM escalation with the
+// given reason label, creating it if absent.
+func (rc *RouteCounters) escalationSlot(reason string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.slmEscalations[reason]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.slmEscalations[reason] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
 // slot returns the *uint64 for key, creating it if absent. The
 // pointer is returned so the caller can atomic.AddUint64 without
 // holding the lock during the increment.
@@ -273,12 +554,56 @@ func (rc *RouteCounters) slot(m map[counterKey]*uint64, key counterKey) *uint64 
 // Handler returns an http.Handler that writes the Prometheus text
 // exposition. The handler sets Content-Type to the Prometheus text
 // format and never errors — a scrape always returns 200 with the
-// current counter snapshot.
+// current counter snapshot. When a Collector is set (via SetCollector),
+// circuit breaker gauges from the collector are also included.
 func (rc *RouteCounters) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		_, _ = rc.WriteTo(w)
+		if rc.collector != nil {
+			RenderPrometheus(w, rc.collector)
+		}
 	})
+}
+
+// SetCollector attaches a Collector whose circuit breaker gauges are
+// included in the /metrics output. Nil clears the collector.
+func (rc *RouteCounters) SetCollector(c *Collector) {
+	rc.collector = c
+}
+
+// Snapshot returns a point-in-time copy of the routing decision counters
+// as a sorted slice. Used by the /status JSON endpoint to provide a
+// routing distribution snapshot without exposing the internal counter map.
+func (rc *RouteCounters) Snapshot() []RouteCounterEntry {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	var entries []RouteCounterEntry
+	for k, v := range rc.routeDecisions {
+		entries = append(entries, RouteCounterEntry{
+			Route:  k.route,
+			Source: k.source,
+			Count:  atomic.LoadUint64(v),
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Route != entries[j].Route {
+			return entries[i].Route < entries[j].Route
+		}
+		return entries[i].Source < entries[j].Source
+	})
+	return entries
+}
+
+// RouteCounterEntry is one route/source bucket from the routing snapshot.
+type RouteCounterEntry struct {
+	Route  string `json:"route"`
+	Source string `json:"source"`
+	Count  uint64 `json:"count"`
 }
 
 // WriteTo writes the full Prometheus text exposition to w. The output
@@ -311,6 +636,18 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += n
 	}
+	if n, err := writeRejectionSeries(w, "nexus_slm_escalations_total",
+		"Hard escalations to frontier due to low SLM confidence (issue #301).",
+		rc.slmEscalations); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeSLMCacheSeries(w, rc.slmCacheHits, rc.slmCacheMisses); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
 	if n, err := writeRejectionSeries(w, "nexus_requests_rejected_total",
 		"Requests the proxy rejected before they reached an upstream.",
 		rc.rejections); err != nil {
@@ -319,14 +656,9 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 		total += n
 	}
 	// nexus_upstream_response_truncated_total (issue #365)
-	// Use the package-level counter if set; otherwise fall back to the
-	// RouteCounters instance counter (for backwards compatibility in tests).
-	var truncated uint64 = 0
-	if responseTruncated != nil {
-		truncated = atomic.LoadUint64(responseTruncated)
-	} else {
-		truncated = atomic.LoadUint64(&rc.responseTruncated)
-	}
+	// Read from the ioutils package-level counter which is incremented
+	// by ReadAllLimited calls in upstream, cascade, router, judge, and rag.
+	truncated := ioutils.ReadAllTruncatedCounter()
 	n, err := fmt.Fprintf(w, "# HELP nexus_upstream_response_truncated_total %s\n# TYPE nexus_upstream_response_truncated_total counter\nnexus_upstream_response_truncated_total %d\n",
 		"Upstream responses truncated because they exceeded MaxResponseBytes.",
 		truncated)
@@ -335,6 +667,70 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	}
 	total += int64(n)
 
+	if n, err := writeFusionSeries(w, "nexus_fusion_arbiter_total",
+		"Fusion panel outcomes: arbiter skipped (agreement) or invoked (disagreement).",
+		rc.fusionArbiter); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeRAGSeries(w, "nexus_rag_retrieval_total",
+		"RAG retrieval outcomes partitioned by hit/miss and reason or filename.",
+		rc.rRAGHits, rc.rRAGMisses); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+
+	// RAG embedding cache counters (issue #303).
+	hitsVal := atomic.LoadUint64(rc.ragCacheHits)
+	missesVal := atomic.LoadUint64(rc.ragCacheMisses)
+	if n, err := fmt.Fprintf(w, "# HELP nexus_rag_cache_hits_total RAG prompt embedding cache hits.\n# TYPE nexus_rag_cache_hits_total counter\nnexus_rag_cache_hits_total %d\n", hitsVal); err != nil {
+		return total, err
+	} else {
+		total += int64(n)
+	}
+	if n, err := fmt.Fprintf(w, "# HELP nexus_rag_cache_misses_total RAG prompt embedding cache misses.\n# TYPE nexus_rag_cache_misses_total counter\nnexus_rag_cache_misses_total %d\n", missesVal); err != nil {
+		return total, err
+	} else {
+		total += int64(n)
+	}
+
+	if n, err := writeRejectionSeries(w, "nexus_cascade_fallback_total",
+		"Cascade fallback events partitioned by reason (timeout, transport_error, malformed_toolcall).",
+		rc.cascadeFallbacks); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeRejectionSeries(w, "nexus_fusion_arbiter_cache_total",
+		"Fusion arbiter synthesis cache hits and misses (issue #232).",
+		rc.arbiterCache); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeOverflowSeries(w, "nexus_judge_queue_overflow_total",
+		"Judge evaluator queue overflow events — sample was dropped because the queue was full.",
+		&rc.judgeQueueOverflow); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeOverflowSeries(w, "nexus_quality_queue_overflow_total",
+		"Quality verifier queue overflow events — event was dropped because the queue was full.",
+		&rc.qualityQueueOverflow); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeOverflowSeries(w, "nexus_panel_panics_total",
+		"Panel goroutine panic recoveries (issue #309).",
+		&rc.panelPanics); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
 	return total, nil
 }
 
@@ -374,7 +770,7 @@ func writeSeries(w io.Writer, name, help string, m map[counterKey]*uint64, label
 }
 
 // writeRejectionSeries emits the nexus_requests_rejected_total
-// family. It is a string-keyed variant of writeSeries so the
+// family. It is a String-keyed variant of writeSeries so the
 // rejection counters (keyed only by reason) do not need to reuse the
 // multi-field counterKey struct. Output is sorted by reason for
 // deterministic scrape diffs.
@@ -395,13 +791,167 @@ func writeRejectionSeries(w io.Writer, name, help string, m map[string]*uint64) 
 	sort.Strings(keys)
 	for _, k := range keys {
 		v := atomic.LoadUint64(m[k])
-		n, err := fmt.Fprintf(w, "%s{reason=%q} %d\n", name, sanitizeLabel(k), v)
+		n, err := fmt.Fprintf(w, "%s{reason=\"%s\"} %d\n", name, sanitizeLabel(k), v)
 		if err != nil {
 			return total + int64(n), err
 		}
 		total += int64(n)
 	}
 	return total, nil
+}
+
+// writeFusionSeries emits the nexus_fusion_arbiter_total family (issue #187).
+// outcome="skipped" when the two panel members agreed and the arbiter was not invoked;
+// outcome="invoked" when disagreement triggered arbiter synthesis.
+// Output is sorted by outcome label for deterministic scrape diffs.
+func writeFusionSeries(w io.Writer, name, help string, m map[string]*uint64) (int64, error) {
+	var total int64
+	n, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", name, help, name)
+	if err != nil {
+		return total + int64(n), err
+	}
+	total += int64(n)
+	if len(m) == 0 {
+		return total, nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := atomic.LoadUint64(m[k])
+		n, err := fmt.Fprintf(w, "%s{outcome=%q} %d\n", name, sanitizeLabel(k), v)
+		if err != nil {
+			return total + int64(n), err
+		}
+		total += int64(n)
+	}
+	return total, nil
+}
+
+// writeRAGSeries emits the nexus_rag_retrieval_total family.
+// hits and misses share the same metric name but are distinguished by
+// the "hit" label (true/false). filename is attached to hits so
+// operators can see which snippets fire most often; reason is attached
+// to misses so they can diagnose why retrieval fails. Output is sorted
+// by hit then by key for deterministic scrape diffs.
+func writeRAGSeries(w io.Writer, name, help string, hits, misses map[string]*uint64) (int64, error) {
+	var total int64
+	n, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", name, help, name)
+	if err != nil {
+		return total, err
+	}
+	total += int64(n)
+
+	writeHitPairs := func(m map[string]*uint64) (int64, error) {
+		var subTotal int64
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			v := atomic.LoadUint64(m[k])
+			n, err := fmt.Fprintf(w, "%s{hit=%q,filename=%q} %d\n", name, "true", sanitizeLabel(k), v)
+			if err != nil {
+				return subTotal + int64(n), err
+			}
+			subTotal += int64(n)
+		}
+		return subTotal, nil
+	}
+
+	writeMissPairs := func(m map[string]*uint64) (int64, error) {
+		var subTotal int64
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			v := atomic.LoadUint64(m[k])
+			n, err := fmt.Fprintf(w, "%s{hit=%q,reason=%q} %d\n", name, "false", sanitizeLabel(k), v)
+			if err != nil {
+				return subTotal + int64(n), err
+			}
+			subTotal += int64(n)
+		}
+		return subTotal, nil
+	}
+
+	if n, err := writeHitPairs(hits); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeMissPairs(misses); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	return total, nil
+}
+
+// writeSLMCacheSeries emits the nexus_slm_cache_hits_total and
+// nexus_slm_cache_misses_total counters (issue #206, #352). These track
+// the SLM decision cache hit rate so operators can tune the cache
+// TTL and diagnose cache ineffectiveness. The hits map may be nil or
+// empty; nil is treated as zero. Misses is a single pointer (no labels).
+func writeSLMCacheSeries(w io.Writer, hits map[string]*uint64, misses *uint64) (int64, error) {
+	var total int64
+
+	n, err := fmt.Fprintf(w, "# HELP nexus_slm_cache_hits_total SLM decision cache hits partitioned by kind (issue #352).\n# TYPE nexus_slm_cache_hits_total counter\n")
+	if err != nil {
+		return total, err
+	}
+	total += int64(n)
+
+	// Emit one line per kind label, sorted for determinism.
+	keys := make([]string, 0, len(hits))
+	for k := range hits {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := atomic.LoadUint64(hits[k])
+		n, err := fmt.Fprintf(w, "nexus_slm_cache_hits_total{kind=%q} %d\n", k, v)
+		if err != nil {
+			return total, err
+		}
+		total += int64(n)
+	}
+
+	missesVal := atomic.LoadUint64(misses)
+	n, err = fmt.Fprintf(w, "# HELP nexus_slm_cache_misses_total SLM decision cache misses.\n# TYPE nexus_slm_cache_misses_total counter\n")
+	if err != nil {
+		return total, err
+	}
+	total += int64(n)
+	n, err = fmt.Fprintf(w, "nexus_slm_cache_misses_total %d\n", missesVal)
+	if err != nil {
+		return total, err
+	}
+	total += int64(n)
+
+	return total, nil
+}
+
+// writeOverflowSeries emits a simple unlabeled counter for queue
+// overflow events (issue #226). Unlike the map-based counters, the
+// overflow counters are plain uint64 fields so we can use atomic
+// operations without mutex contention on the hot path.
+func writeOverflowSeries(w io.Writer, name, help string, counter *uint64) (int64, error) {
+	n, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", name, help, name)
+	if err != nil {
+		return int64(n), err
+	}
+	v := atomic.LoadUint64(counter)
+	n, err = fmt.Fprintf(w, "%s %d\n", name, v)
+	if err != nil {
+		return int64(n), err
+	}
+	return int64(n), nil
 }
 
 // keyLess reports whether k1 < k2 considering only the fields named
@@ -448,8 +998,6 @@ func labelValue(k counterKey, label string) string {
 		return k.confBucket
 	case "task_type":
 		return k.taskType
-	case "escalated_from":
-		return k.escalatedFrom
 	default:
 		return ""
 	}
