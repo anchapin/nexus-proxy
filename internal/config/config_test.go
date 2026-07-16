@@ -964,3 +964,29 @@ func TestReadinessModeValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestShutdownTimeoutZeroRemapsToDefault(t *testing.T) {
+	t.Setenv("NEXUS_SHUTDOWN_TIMEOUT", "0")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.ShutdownTimeout != DefaultShutdownTimeout {
+		t.Errorf("ShutdownTimeout = %v, want %v (DefaultShutdownTimeout)", cfg.ShutdownTimeout, DefaultShutdownTimeout)
+	}
+}
+
+func TestCheckUnknownEnvVarsNoPanic(t *testing.T) {
+	// checkUnknownEnvVars should not panic regardless of env var content.
+	// It logs warnings for unknown vars but never fails.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("checkUnknownEnvVars panicked: %v", r)
+		}
+	}()
+	// Set a definitely-unknown var and call the checker.
+	t.Setenv("NEXUS_COMPLETELY_UNKNOWN_VAR_FOR_TESTING", "true")
+	checkUnknownEnvVars()
+	// Also test with empty env — should not panic.
+	checkUnknownEnvVars()
+}
