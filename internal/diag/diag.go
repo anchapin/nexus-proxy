@@ -801,8 +801,7 @@ func checkMiddlewareChainFn(cfg config.Config) Check {
 		Status: StatusPass,
 		Detail: fmt.Sprintf("chain valid (%s)", chain),
 	}
-
-
+}
 
 // --- Models endpoint -------------------------------------------------------
 
@@ -885,7 +884,7 @@ func checkModelsEndpointFn(ctx context.Context, cfg config.Config, opts Options)
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(body, \&listResp); err != nil {
+	if err := json.Unmarshal(body, &listResp); err != nil {
 		return Check{
 			Name:   checkModelsEndpoint,
 			Status: StatusFail,
@@ -902,7 +901,7 @@ func checkModelsEndpointFn(ctx context.Context, cfg config.Config, opts Options)
 	// Verify configured models appear in the discovery list.
 	var missing []string
 	for _, model := range []string{cfg.RouterModel, cfg.LocalModel} {
-		if model != "" \&\& !seen[model] {
+		if model != "" && !seen[model] {
 			missing = append(missing, model)
 		}
 	}
@@ -919,6 +918,4 @@ func checkModelsEndpointFn(ctx context.Context, cfg config.Config, opts Options)
 		Status: StatusPass,
 		Detail: fmt.Sprintf("/v1/models accessible at %s", nexusURL),
 	}
-}
-
 }
