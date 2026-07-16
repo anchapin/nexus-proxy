@@ -638,7 +638,7 @@ func main() {
 		routeCounters.Observe(e.Route, e.Source, e.Confidence, e.TaskType, "")
 		// Issue #206: record SLM cache hit/miss.
 		if e.CacheHit {
-			routeCounters.ObserveSLMCacheHit()
+			routeCounters.ObserveSLMCacheHit(e.CacheHitKind)
 		} else {
 			routeCounters.ObserveSLMCacheMiss()
 		}

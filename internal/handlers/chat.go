@@ -173,6 +173,11 @@ type RouteDecisionEvent struct {
 	// (issue #206) — a duplicate prompt was served from cache without
 	// calling the SLM.
 	CacheHit bool
+
+	// CacheHitKind describes how the cache hit was produced (issue #352).
+	// Valid values are "exact" (exact string match) and "semantic"
+	// (cosine similarity match, issue #245). Empty when CacheHit is false.
+	CacheHitKind string
 }
 
 // RouteDecisionObserver is the hook invoked once per proxied request
@@ -1116,13 +1121,14 @@ func Chat(d Deps) http.Handler {
 		// — the source/escalation story the issue calls out is only
 		// complete when both ship together.
 		routeEvent := RouteDecisionEvent{
-			RequestID:  reqID,
-			Route:      string(decision.Route),
-			Source:     string(decision.Source),
-			Reason:     decision.Reason,
-			Confidence: decision.Confidence,
-			TaskType:   decision.TaskType,
-			CacheHit:   decision.CacheHit,
+			RequestID:    reqID,
+			Route:        string(decision.Route),
+			Source:       string(decision.Source),
+			Reason:       decision.Reason,
+			Confidence:   decision.Confidence,
+			TaskType:     decision.TaskType,
+			CacheHit:     decision.CacheHit,
+			CacheHitKind: string(decision.CacheHitKind),
 		}
 		w.Header().Set("X-Nexus-Route", SanitizeHeaderValue(routeEvent.Route))
 		w.Header().Set("X-Nexus-Route-Source", SanitizeHeaderValue(routeEvent.Source))

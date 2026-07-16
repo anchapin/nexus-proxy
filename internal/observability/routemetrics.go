@@ -78,7 +78,7 @@ type counterKey struct {
 //   - nexus_route_decisions_total{route,source}
 //   - nexus_slm_decisions_total{route,confidence_bucket,task_type}
 //   - nexus_slm_low_confidence_escalations_total{task_type}
-//   - nexus_slm_cache_hits_total
+//   - nexus_slm_cache_hits_total{kind}
 //   - nexus_slm_cache_misses_total
 //
 // A fifth family (issue #119) records requests the proxy rejected
@@ -113,7 +113,7 @@ type RouteCounters struct {
 	routeDecisions           map[counterKey]*uint64
 	slmDecisions             map[counterKey]*uint64
 	lowConfidenceEscalations map[counterKey]*uint64
-	slmCacheHits             *uint64
+	slmCacheHits             map[string]*uint64 // "exact" | "semantic" (issue #352)
 	slmCacheMisses           *uint64
 	rejections               map[string]*uint64
 	fusionArbiter            map[string]*uint64
@@ -141,13 +141,13 @@ type RouteCounters struct {
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
 func NewRouteCounters() *RouteCounters {
-	hits, misses := uint64(0), uint64(0)
+	misses := uint64(0)
 	cHits, cMisses := uint64(0), uint64(0)
 	return &RouteCounters{
 		routeDecisions:           make(map[counterKey]*uint64),
 		slmDecisions:             make(map[counterKey]*uint64),
 		lowConfidenceEscalations: make(map[counterKey]*uint64),
-		slmCacheHits:             &hits,
+		slmCacheHits:             make(map[string]*uint64),
 		slmCacheMisses:           &misses,
 		rejections:               make(map[string]*uint64),
 		fusionArbiter:            make(map[string]*uint64),
@@ -334,15 +334,24 @@ func (rc *RouteCounters) ragMissSlot(reason string) *uint64 {
 }
 
 // ObserveSLMCacheHit records one SLM decision cache hit (issue #206).
-// The cache deduplicates identical prompts within a TTL window; a hit
-// means the same prompt was seen recently and the cached decision was
-// returned instead of calling the SLM. Safe for concurrent use; nil
-// receivers are a no-op.
-func (rc *RouteCounters) ObserveSLMCacheHit() {
+// kind is "exact" for an exact string match or "semantic" for a cosine-
+// similarity match (issue #245, #352). The cache deduplicates identical
+// prompts within a TTL window; a hit means the same prompt was seen
+// recently and the cached decision was returned instead of calling the
+// SLM. Safe for concurrent use; nil receivers are a no-op.
+func (rc *RouteCounters) ObserveSLMCacheHit(kind string) {
 	if rc == nil || rc.slmCacheHits == nil {
 		return
 	}
-	atomic.AddUint64(rc.slmCacheHits, 1)
+	rc.mu.Lock()
+	p, ok := rc.slmCacheHits[kind]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.slmCacheHits[kind] = p
+	}
+	rc.mu.Unlock()
+	atomic.AddUint64(p, 1)
 }
 
 // ObserveSLMCacheMiss records one SLM decision cache miss (issue #206).
@@ -810,26 +819,35 @@ func writeRAGSeries(w io.Writer, name, help string, hits, misses map[string]*uin
 }
 
 // writeSLMCacheSeries emits the nexus_slm_cache_hits_total and
-// nexus_slm_cache_misses_total counters (issue #206). These track
+// nexus_slm_cache_misses_total counters (issue #206, #352). These track
 // the SLM decision cache hit rate so operators can tune the cache
-// TTL and diagnose cache ineffectiveness. The hits and misses pointers
-// may be nil; nil is treated as zero.
-func writeSLMCacheSeries(w io.Writer, hits, misses *uint64) (int64, error) {
+// TTL and diagnose cache ineffectiveness. The hits map may be nil or
+// empty; nil is treated as zero. Misses is a single pointer (no labels).
+func writeSLMCacheSeries(w io.Writer, hits map[string]*uint64, misses *uint64) (int64, error) {
 	var total int64
-	hitsVal := atomic.LoadUint64(hits)
+
+	n, err := fmt.Fprintf(w, "# HELP nexus_slm_cache_hits_total SLM decision cache hits partitioned by kind (issue #352).\n# TYPE nexus_slm_cache_hits_total counter\n")
+	if err != nil {
+		return total, err
+	}
+	total += int64(n)
+
+	// Emit one line per kind label, sorted for determinism.
+	keys := make([]string, 0, len(hits))
+	for k := range hits {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := atomic.LoadUint64(hits[k])
+		n, err := fmt.Fprintf(w, "nexus_slm_cache_hits_total{kind=%q} %d\n", k, v)
+		if err != nil {
+			return total, err
+		}
+		total += int64(n)
+	}
+
 	missesVal := atomic.LoadUint64(misses)
-
-	n, err := fmt.Fprintf(w, "# HELP nexus_slm_cache_hits_total SLM decision cache hits.\n# TYPE nexus_slm_cache_hits_total counter\n")
-	if err != nil {
-		return total, err
-	}
-	total += int64(n)
-	n, err = fmt.Fprintf(w, "nexus_slm_cache_hits_total %d\n", hitsVal)
-	if err != nil {
-		return total, err
-	}
-	total += int64(n)
-
 	n, err = fmt.Fprintf(w, "# HELP nexus_slm_cache_misses_total SLM decision cache misses.\n# TYPE nexus_slm_cache_misses_total counter\n")
 	if err != nil {
 		return total, err

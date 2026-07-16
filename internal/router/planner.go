@@ -127,6 +127,12 @@ type Decision struct {
 	// came from the SLM (or from guardrail/DSL which never hit the
 	// cache).
 	CacheHit bool
+
+	// CacheHitKind describes how the cache hit was produced when CacheHit
+	// is true (issue #352). It is "" (empty) when CacheHit is false.
+	// Valid values are "exact" (exact string match) and "semantic"
+	// (cosine similarity match, issue #245).
+	CacheHitKind CacheHitKind
 }
 
 // SLMDecider is the minimal interface the planner needs from the SLM
@@ -290,7 +296,7 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 
 	// Check cache first if enabled.
 	if p.SLMCache != nil {
-		if cached, hit := p.SLMCache.Get(req.Context, req.Prompt); hit {
+		if cached, hit, hitKind := p.SLMCache.Get(req.Context, req.Prompt); hit {
 			// We still categorize for observability even on cache hit,
 			// but we use the cached route directly.
 			if p.Confidence != nil {
@@ -310,6 +316,7 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 					BudgetSource:    req.GuardrailSource,
 					BudgetTokens:    req.GuardrailBudget,
 					CacheHit:        true,
+					CacheHitKind:    hitKind,
 				}
 			}
 			return Decision{
@@ -321,6 +328,7 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 				BudgetSource:    req.GuardrailSource,
 				BudgetTokens:    req.GuardrailBudget,
 				CacheHit:        true,
+				CacheHitKind:    hitKind,
 			}
 		}
 	}
