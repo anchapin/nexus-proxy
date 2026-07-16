@@ -185,7 +185,7 @@ func TestGet_NotFound(t *testing.T) {
 
 func TestBuildChain_EmptySpec(t *testing.T) {
 	Init("", "", false)
-	chain, err := BuildChain("")
+	chain, err := BuildChain("", MiddlewareConfig{})
 	if err != nil {
 		t.Fatalf("BuildChain() error = %v", err)
 	}
@@ -196,7 +196,7 @@ func TestBuildChain_EmptySpec(t *testing.T) {
 
 func TestBuildChain_ValidSpec(t *testing.T) {
 	Init("", "", false)
-	chain, err := BuildChain("promptEngineering,compressJSONBlocks")
+	chain, err := BuildChain("promptEngineering,compressJSONBlocks", MiddlewareConfig{})
 	if err != nil {
 		t.Fatalf("BuildChain() error = %v", err)
 	}
@@ -213,7 +213,7 @@ func TestBuildChain_ValidSpec(t *testing.T) {
 
 func TestBuildChain_UnknownName(t *testing.T) {
 	Init("", "", false)
-	_, err := BuildChain("promptEngineering,unknownMiddleware,compressJSONBlocks")
+	_, err := BuildChain("promptEngineering,unknownMiddleware,compressJSONBlocks", MiddlewareConfig{})
 	if err == nil {
 		t.Fatal("BuildChain() expected error for unknown middleware, got nil")
 	}
@@ -221,7 +221,7 @@ func TestBuildChain_UnknownName(t *testing.T) {
 
 func TestBuildChain_EmptyAfterTrim(t *testing.T) {
 	Init("", "", false)
-	_, err := BuildChain("promptEngineering, , compressJSONBlocks")
+	_, err := BuildChain("promptEngineering, , compressJSONBlocks", MiddlewareConfig{})
 	if err != nil {
 		t.Fatalf("BuildChain() should skip empty entries, got error: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestBuildChain_EmptyAfterTrim(t *testing.T) {
 
 func TestBuildChain_AllEmpty(t *testing.T) {
 	Init("", "", false)
-	_, err := BuildChain(" , ")
+	_, err := BuildChain(" , ", MiddlewareConfig{})
 	if err == nil {
 		t.Fatal("BuildChain() expected error for all-empty chain")
 	}
@@ -239,7 +239,7 @@ func TestBuildChain_AllEmpty(t *testing.T) {
 
 func TestDefaultChain_HasFourEntries(t *testing.T) {
 	Init("", "", false)
-	chain := DefaultChain()
+	chain := DefaultChain(MiddlewareConfig{})
 	if len(chain) != 4 {
 		t.Errorf("DefaultChain() len = %d, want 4", len(chain))
 	}
@@ -272,7 +272,7 @@ func TestInit_ReInitializesRegistry(t *testing.T) {
 		t.Error("After re-init, custom middleware should be removed")
 	}
 	// promptEngineering should still be present (built-in)
-	chain, err := BuildChain("promptEngineering")
+	chain, err := BuildChain("promptEngineering", MiddlewareConfig{})
 	if err != nil {
 		t.Fatalf("BuildChain() error = %v", err)
 	}
@@ -288,7 +288,7 @@ func TestInit_ReInitializesRegistry(t *testing.T) {
 func TestBuildChain_CanBuildPartialChain(t *testing.T) {
 	Init("", "", false)
 	// Operator can drop RAG from the chain
-	chain, err := BuildChain("promptEngineering,compressJSONBlocks,appendSystemNote")
+	chain, err := BuildChain("promptEngineering,compressJSONBlocks,appendSystemNote", MiddlewareConfig{})
 	if err != nil {
 		t.Fatalf("BuildChain() error = %v", err)
 	}
