@@ -126,6 +126,10 @@ type RouteCounters struct {
 	judgeQueueOverflow   uint64 // atomic; use atomic.AddUint64/atomic.LoadUint64
 	qualityQueueOverflow uint64 // atomic; use atomic.AddUint64/atomic.LoadUint64
 
+	// RAG embedding cache counters (issue #303).
+	ragCacheHits   *uint64
+	ragCacheMisses *uint64
+
 	// Panel panic counter (issue #309). Bumped when a panel goroutine
 	// recovers from a panic and returns a panic error.
 	panelPanics uint64 // atomic
@@ -138,6 +142,7 @@ type RouteCounters struct {
 // NewRouteCounters returns a ready-to-use RouteCounters.
 func NewRouteCounters() *RouteCounters {
 	hits, misses := uint64(0), uint64(0)
+	cHits, cMisses := uint64(0), uint64(0)
 	return &RouteCounters{
 		routeDecisions:           make(map[counterKey]*uint64),
 		slmDecisions:             make(map[counterKey]*uint64),
@@ -151,6 +156,8 @@ func NewRouteCounters() *RouteCounters {
 		cascadeFallbacks:         make(map[string]*uint64),
 		arbiterCache:             make(map[string]*uint64),
 		slmEscalations:           make(map[string]*uint64),
+		ragCacheHits:             &cHits,
+		ragCacheMisses:           &cMisses,
 	}
 }
 
@@ -282,6 +289,22 @@ func (rc *RouteCounters) ObserveRAGMiss(reason string) {
 		return
 	}
 	atomic.AddUint64(rc.ragMissSlot(reason), 1)
+}
+
+// ObserveRAGCacheHit records a RAG prompt embedding cache hit (issue #303).
+func (rc *RouteCounters) ObserveRAGCacheHit() {
+	if rc == nil || rc.ragCacheHits == nil {
+		return
+	}
+	atomic.AddUint64(rc.ragCacheHits, 1)
+}
+
+// ObserveRAGCacheMiss records a RAG prompt embedding cache miss (issue #303).
+func (rc *RouteCounters) ObserveRAGCacheMiss() {
+	if rc == nil || rc.ragCacheMisses == nil {
+		return
+	}
+	atomic.AddUint64(rc.ragCacheMisses, 1)
 }
 
 // ragHitSlot returns the *uint64 for a hit filename, creating it if absent.
@@ -574,6 +597,21 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += n
 	}
+
+	// RAG embedding cache counters (issue #303).
+	hitsVal := atomic.LoadUint64(rc.ragCacheHits)
+	missesVal := atomic.LoadUint64(rc.ragCacheMisses)
+	if n, err := fmt.Fprintf(w, "# HELP nexus_rag_cache_hits_total RAG prompt embedding cache hits.\n# TYPE nexus_rag_cache_hits_total counter\nnexus_rag_cache_hits_total %d\n", hitsVal); err != nil {
+		return total, err
+	} else {
+		total += int64(n)
+	}
+	if n, err := fmt.Fprintf(w, "# HELP nexus_rag_cache_misses_total RAG prompt embedding cache misses.\n# TYPE nexus_rag_cache_misses_total counter\nnexus_rag_cache_misses_total %d\n", missesVal); err != nil {
+		return total, err
+	} else {
+		total += int64(n)
+	}
+
 	if n, err := writeRejectionSeries(w, "nexus_cascade_fallback_total",
 		"Cascade fallback events partitioned by reason (timeout, transport_error, malformed_toolcall).",
 		rc.cascadeFallbacks); err != nil {

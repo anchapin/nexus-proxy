@@ -120,15 +120,16 @@ func main() {
 	bootCtx, cancel := context.WithTimeout(context.Background(), bootRAGTimeout)
 	defer cancel()
 
-	// RAG embedding cache (issue #115). Wrap the Ollama embedder with
-	// a bounded LRU so repeat prompts skip the /api/embeddings
-	// round-trip. A size of 0 disables the cache (falls back to the
-	// raw embedder).
+	// RAG embedding cache (issue #115, #303). Wrap the Ollama embedder
+	// with a bounded LRU + TTL cache so repeat prompts skip the
+	// /api/embeddings round-trip. A size of 0 or TTL of 0 disables
+	// the cache (falls back to the raw embedder).
 	var ragEmbedder rag.Embedder = emb
-	if cfg.RAGEmbedCacheSize > 0 {
-		ragEmbedder = rag.NewCachedEmbedder(emb, cfg.RAGEmbedCacheSize)
+	if cfg.RAGEmbedCacheSize > 0 && cfg.RAGEmbedCacheTTL > 0 {
+		ragEmbedder = rag.NewEmbedCache(emb, cfg.RAGEmbedCacheSize, cfg.RAGEmbedCacheTTL)
 		slog.Info("rag embedding cache enabled",
 			slog.Int("max_entries", cfg.RAGEmbedCacheSize),
+			slog.Duration("ttl", cfg.RAGEmbedCacheTTL),
 		)
 	}
 
@@ -699,6 +700,15 @@ func main() {
 		}
 	})
 
+	// RAG embedding cache hit/miss observer (issue #303).
+	ragCacheObserver := func(hit bool) {
+		if hit {
+			routeCounters.ObserveRAGCacheHit()
+		} else {
+			routeCounters.ObserveRAGCacheMiss()
+		}
+	}
+
 	// SLM decision cache (issue #206). When NEXUS_SLM_CACHE_TTL > 0,
 	// deduplicate identical prompts within the TTL window so repeated
 	// requests don't trigger an SLM call.
@@ -750,6 +760,7 @@ func main() {
 		RejectionObserver:       rejectionObs,
 		FusionOutcomeObserver:   fusionOutcomeObs,
 		RAGObserver:             ragObserver,
+		RAGCacheObserver:        ragCacheObserver,
 		CascadeFallbackObserver: cascadeFallbackObs,
 		ArbiterCacheObserver:    arbiterCacheObserver,
 		PanelPanicObserver:      panelPanicObs,
@@ -1116,7 +1127,7 @@ func (b *confidenceBridge) Close() error { return b.inner.Close() }
 // NEXUS_RAG_POLL_INTERVAL > 0; an interval of zero leaves
 // persistence on but disables runtime updates (boot-only load).
 func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context) (rag.RAGStore, *rag.PersistentStore, *rag.Watcher) {
-	// emb is already wrapped with CachedEmbedder by the caller (issue #115)
+	// emb is already wrapped with EmbedCache by the caller (issue #115, #303)
 	cachedEmb := emb
 	if !cfg.RAGPersistentEnabled() {
 		slog.Info("rag persistent store disabled (NEXUS_RAG_DB is empty); using in-memory store")
