@@ -1,7 +1,10 @@
-// Command nexus-dashboard renders the per-request metrics written by the
-// proxy into a human-readable daily savings summary. See render.go for
-// the pure rendering layer; this file wires CLI flags to the metrics
-// store and drives the day loop.
+// Subcommand: `nexus dashboard`. Reads the per-request metrics written by
+// the proxy into a human-readable daily savings summary. The dashboard is
+// read-only and safe to run while the proxy is live.
+//
+// This file is the CLI adapter; the rendering logic lives in
+// dashboard_render.go. Keeping the two separate means the rendering is
+// testable without importing flag or io.
 package main
 
 import (
@@ -11,7 +14,6 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
-	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/metrics"
@@ -23,12 +25,12 @@ import (
 // judge agree on a dollar figure for the same token count.
 const defaultCostPer1k = 0.002
 
-// usage is shown on -h / bad flags. Kept compact because the proxy is
-// an operator tool, not an end-user app.
-const usage = `nexus-dashboard — daily savings summary for the Nexus Proxy metrics store.
+// dashboardUsage is shown on -h / bad flags. Kept compact because the
+// proxy is an operator tool, not an end-user app.
+const dashboardUsage = `nexus dashboard — daily savings summary for the Nexus Proxy.
 
 Usage:
-  nexus-dashboard [--json] [--since YYYY-MM-DD] [--days N] [--db PATH] [--cost-per-1k RATE]
+  nexus dashboard [--json] [--since YYYY-MM-DD] [--days N] [--db PATH] [--cost-per-1k RATE]
 
 Flags:
   --json              Emit a JSON array instead of a plain-text table.
@@ -45,20 +47,15 @@ Flags:
 The tool is read-only and safe to run while the proxy is live.
 `
 
-func main() {
-	if err := run(os.Args[1:], os.Stdout); err != nil {
-		fmt.Fprintf(os.Stderr, "nexus-dashboard: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-// run is the testable core: args and output are parameters so a future
-// test can drive the full CLI (flags + store + render) end to end. The
-// day loop calls Store.DailySummary once per queried day; the store is
-// opened read-mostly (the proxy is the sole writer).
-func run(args []string, out io.Writer) error {
-	fs := flag.NewFlagSet("nexus-dashboard", flag.ContinueOnError)
-	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
+// runDashboard is the testable core of the `nexus dashboard` subcommand.
+// args and output are parameters so a future test can drive the full CLI
+// end-to-end. The function returns a process exit code (0 or 1) rather
+// than calling os.Exit so tests can assert against it without spawning
+// a subprocess.
+func runDashboard(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("nexus dashboard", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() { fmt.Fprint(stderr, dashboardUsage) }
 
 	var (
 		asJSON     bool
@@ -74,18 +71,23 @@ func run(args []string, out io.Writer) error {
 	fs.StringVar(&costPer1kF, "cost-per-1k", "", "USD per 1k tokens for TOON savings valuation")
 
 	if err := fs.Parse(args); err != nil {
-		return err
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 1
 	}
 
 	costPer1k, err := resolveCostPer1k(costPer1kF)
 	if err != nil {
-		return err
+		fmt.Fprintf(stderr, "nexus dashboard: %v\n", err)
+		return 1
 	}
 
 	path := resolveDBPath(dbPath)
 	store, err := metrics.Open(path)
 	if err != nil {
-		return fmt.Errorf("open metrics store %q: %w", path, err)
+		fmt.Fprintf(stderr, "nexus dashboard: open metrics store %q: %v\n", path, err)
+		return 1
 	}
 	defer func() {
 		if cerr := store.Close(); cerr != nil {
@@ -95,22 +97,32 @@ func run(args []string, out io.Writer) error {
 
 	start, end, err := resolveRange(sinceRaw, days)
 	if err != nil {
-		return err
+		fmt.Fprintf(stderr, "nexus dashboard: %v\n", err)
+		return 1
 	}
 
 	summs := make([]metrics.Summary, 0, len(daysRange(start, end)))
 	for _, day := range daysRange(start, end) {
 		s, err := store.DailySummary(day)
 		if err != nil {
-			return fmt.Errorf("daily summary for %s: %w", day.Format("2006-01-02"), err)
+			fmt.Fprintf(stderr, "nexus dashboard: daily summary for %s: %v\n", day.Format("2006-01-02"), err)
+			return 1
 		}
 		summs = append(summs, s)
 	}
 
 	if asJSON {
-		return renderJSON(summs, costPer1k, out)
+		if err := renderDashboardJSON(summs, costPer1k, stdout); err != nil {
+			fmt.Fprintf(stderr, "nexus dashboard: %v\n", err)
+			return 1
+		}
+	} else {
+		if err := renderDashboardTable(summs, costPer1k, stdout); err != nil {
+			fmt.Fprintf(stderr, "nexus dashboard: %v\n", err)
+			return 1
+		}
 	}
-	return renderTable(summs, costPer1k, out)
+	return 0
 }
 
 // resolveDBPath picks the SQLite path in priority order: --db flag,
@@ -148,43 +160,4 @@ func resolveCostPer1k(flagVal string) (float64, error) {
 		return f, nil
 	}
 	return defaultCostPer1k, nil
-}
-
-// resolveRange turns the --since / --days flags into an inclusive
-// [start, end] UTC day pair. Resolution rules:
-//   - neither flag        → just today (start == end == today)
-//   - --days N only       → last N days ending today
-//   - --since DATE only   → DATE through today
-//   - --since + --days N  → DATE through DATE+N-1
-//
-// "Today" is fixed once per invocation so a run that straddles
-// midnight UTC stays internally consistent.
-func resolveRange(sinceRaw string, days int) (start, end time.Time, err error) {
-	today := time.Now().UTC().Truncate(24 * time.Hour)
-
-	var since time.Time
-	hasSince := sinceRaw != ""
-	if hasSince {
-		since, err = time.Parse("2006-01-02", sinceRaw)
-		if err != nil {
-			return time.Time{}, time.Time{}, fmt.Errorf("--since: want YYYY-MM-DD, got %q", sinceRaw)
-		}
-		since = since.UTC()
-	}
-
-	switch {
-	case hasSince && days > 0:
-		start = since
-		end = since.Add(time.Duration(days-1) * 24 * time.Hour)
-	case hasSince:
-		start = since
-		end = today
-	case days > 0:
-		start = today.Add(time.Duration(-(days - 1)) * 24 * time.Hour)
-		end = today
-	default:
-		start = today
-		end = today
-	}
-	return start, end, nil
 }

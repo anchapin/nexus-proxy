@@ -74,11 +74,14 @@ func main() {
 		switch os.Args[1] {
 		case "check", "doctor":
 			os.Exit(runCheck(os.Args[2:], os.Stdout, os.Stderr))
+		case "dashboard":
+			os.Exit(runDashboard(os.Args[2:], os.Stdout, os.Stderr))
 		case "-h", "--help", "help":
-			fmt.Fprintln(os.Stderr, "Usage: nexus [check|doctor]")
+			fmt.Fprintln(os.Stderr, "Usage: nexus [check|doctor|dashboard]")
 			fmt.Fprintln(os.Stderr, "")
 			fmt.Fprintln(os.Stderr, "Run with no arguments to start the proxy.")
 			fmt.Fprintln(os.Stderr, "Run `nexus check` to validate boot-time configuration.")
+			fmt.Fprintln(os.Stderr, "Run `nexus dashboard` to view the daily savings summary.")
 			fmt.Fprintln(os.Stderr, "Run `nexus --version` to print the build version.")
 			os.Exit(0)
 		case "-v", "--version", "version":
@@ -86,7 +89,7 @@ func main() {
 			os.Exit(0)
 		default:
 			fmt.Fprintf(os.Stderr, "nexus: unknown subcommand %q\n\n", os.Args[1])
-			fmt.Fprintln(os.Stderr, "Usage: nexus [check|doctor]")
+			fmt.Fprintln(os.Stderr, "Usage: nexus [check|doctor|dashboard]")
 			os.Exit(2)
 		}
 	}
