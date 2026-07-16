@@ -766,6 +766,22 @@ func main() {
 		slog.String("ollama_url", cfg.OllamaURL),
 	)
 
+	// /readyz is the Kubernetes readiness probe (issue #42). In
+	// "degraded" mode (the default) it always returns 200 so a
+	// transient Ollama outage never evicts the pod; the body
+	// surfaces the degraded flag for dashboards to act on. In
+	// "strict" mode it returns 503 when neither Ollama nor a
+	// frontier key is available, so the kubelet stops routing
+	// traffic to the pod until it recovers.
+	mux.HandleFunc("/readyz", handlers.ReadyzHandler(handlers.ReadyzDeps{
+		Health:             hpoller,
+		FrontierConfigured: cfg.FrontierEnabled(),
+		Mode:               cfg.ReadinessMode,
+	}))
+	slog.Info("readyz endpoint registered",
+		slog.String("mode", cfg.ReadinessMode),
+	)
+
 	// /status serves a JSON diagnostic snapshot of all async subsystems
 	// (issue #225): judge queue depth/capacity, quality queue depth/capacity,
 	// RAG embedding health, and a routing distribution snapshot. Primary
@@ -1296,7 +1312,7 @@ func healthzHandler(hpoller *health.Health, mgr *probe.Manager, cfg config.Confi
 func publicPathExempt(cfg config.Config) func(*http.Request) bool {
 	return func(r *http.Request) bool {
 		switch r.URL.Path {
-		case "/healthz", "/metrics":
+		case "/healthz", "/metrics", "/readyz":
 			return true
 		case "/status":
 			return cfg.StatusPublic
