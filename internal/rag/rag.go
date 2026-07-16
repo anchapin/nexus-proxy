@@ -330,6 +330,26 @@ func (s *Store) EmbedHitCount() int64 {
 	return 0
 }
 
+// RecordBreakerSuccess records a successful embedding as circuit recovery.
+// Safe to call on stores backed by non-Ollama embedders (no-op).
+// Exported for the circuit breaker metrics (issue #304).
+func (s *Store) RecordBreakerSuccess() {
+	if oe, ok := s.embedder.(*OllamaEmbedder); ok {
+		oe.RecordBreakerSuccess()
+	}
+}
+
+// IsBreakerOpen reports whether the RAG Ollama embedder circuit is
+// currently open (cooldown). Safe to call on stores backed by
+// non-Ollama embedders (returns false). Exported for the circuit
+// breaker metrics (issue #304).
+func (s *Store) IsBreakerOpen() bool {
+	if oe, ok := s.embedder.(*OllamaEmbedder); ok {
+		return oe.IsBreakerOpen()
+	}
+	return false
+}
+
 // IndexDir walks dir, embedding every regular file's contents. It is
 // permissive: a missing directory is created (and indexing returns empty),
 // per-file read or embed errors are logged and skipped. This matches the
@@ -823,6 +843,14 @@ func (o *OllamaEmbedder) recordFailure() {
 // recordSuccess resets the consecutive-failure counter and clears the
 // cooldown deadline. No-op when the breaker is already closed.
 func (o *OllamaEmbedder) recordSuccess() {
+	o.failureCount.Store(0)
+	o.cooldownUntil.Store(0)
+}
+
+// RecordBreakerSuccess is called by the chat handler after a successful
+// RAG embedding to record circuit recovery. Exported for the circuit
+// breaker metrics (issue #304).
+func (o *OllamaEmbedder) RecordBreakerSuccess() {
 	o.failureCount.Store(0)
 	o.cooldownUntil.Store(0)
 }

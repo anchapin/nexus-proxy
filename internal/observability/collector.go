@@ -13,7 +13,9 @@ package observability
 
 import (
 	"math"
+	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // DefaultBuckets are the histogram bucket upper bounds (in
@@ -128,7 +130,28 @@ type Collector struct {
 	// fires when a connection closes before reaching that state.
 	tlsConnectionsAccepted atomic.Uint64
 	tlsConnectionsRejected atomic.Uint64
+
+	// --- Circuit breaker instrumentation (issue #304) ---------------
+	//
+	// Tracks the state of each named circuit breaker (ollama, rag).
+	// State values: 0=closed, 1=half_open, 2=open.
+	// Protected by cbMu; read via atomic for hot path.
+	cbMu   sync.RWMutex
+	cbState map[string]*circuitBreakerState
 }
+
+// circuitBreakerState holds the atomic state for one named circuit.
+type circuitBreakerState struct {
+	state       atomic.Int32 // 0=closed, 1=half_open, 2=open
+	failures    atomic.Uint64
+	lastFailure  atomic.Int64 // Unix timestamp (seconds) of last failure
+}
+
+const (
+	circuitStateClosed   int32 = 0
+	circuitStateHalfOpen int32 = 1
+	circuitStateOpen     int32 = 2
+)
 
 // NewCollector constructs a Collector with the default latency and TTFT
 // histograms for each route. The returned collector is ready to receive
@@ -337,6 +360,76 @@ func (c *Collector) IncTLSAccepted() { c.tlsConnectionsAccepted.Add(1) }
 // from main.go via http.Server.ConnState for connections that
 // close before reaching http.StateTLSHandshakeComplete.
 func (c *Collector) IncTLSRejected() { c.tlsConnectionsRejected.Add(1) }
+
+// --- Circuit breaker instrumentation (issue #304) --------------------
+//
+// RecordCircuitFailure records a failure for the named circuit and
+// transitions its state to "open". Called from the chat handler when
+// the local cooldown or RAG breaker trips.
+func (c *Collector) RecordCircuitFailure(circuit string) {
+	if circuit == "" {
+		return
+	}
+	cb := c.getOrCreateCircuit(circuit)
+	cb.state.Store(circuitStateOpen)
+	cb.failures.Add(1)
+	cb.lastFailure.Store(time.Now().Unix())
+}
+
+// RecordCircuitRecovery transitions the named circuit back to "closed".
+// Called from the chat handler when the cooldown window expires or a
+// RAG request succeeds after the breaker was open.
+func (c *Collector) RecordCircuitRecovery(circuit string) {
+	if circuit == "" {
+		return
+	}
+	cb := c.getOrCreateCircuit(circuit)
+	cb.state.Store(circuitStateClosed)
+}
+
+// RecordCircuitHalfOpen transitions the named circuit to "half_open".
+// Used when a circuit begins recovery but hasn't fully closed yet.
+func (c *Collector) RecordCircuitHalfOpen(circuit string) {
+	if circuit == "" {
+		return
+	}
+	cb := c.getOrCreateCircuit(circuit)
+	cb.state.Store(circuitStateHalfOpen)
+}
+
+// CircuitBreakerGauges returns the live state of all tracked circuit
+// breakers as gauge samples for the Prometheus renderer. Each circuit
+// emits three samples: state (0=closed, 1=half_open, 2=open),
+// failures_total, and last_failure_seconds.
+func (c *Collector) CircuitBreakerGauges() []GaugeSample {
+	var out []GaugeSample
+	now := time.Now().Unix()
+	c.cbMu.RLock()
+	defer c.cbMu.RUnlock()
+	for name, cb := range c.cbState {
+		lastFail := cb.lastFailure.Load()
+		labels := map[string]string{"circuit": name}
+		out = append(out,
+			GaugeSample{Name: "nexus_circuit_breaker_state", Labels: labels, Value: float64(cb.state.Load())},
+			GaugeSample{Name: "nexus_circuit_breaker_failures_total", Labels: labels, Value: float64(cb.failures.Load())},
+			GaugeSample{Name: "nexus_circuit_breaker_last_failure_seconds", Labels: labels, Value: float64(lastFail)},
+		)
+		_ = now // referenced for future last-success metric
+	}
+	return out
+}
+
+// getOrCreateCircuit returns the state for a named circuit, creating
+// it if first seen. Caller must hold cbMu.
+func (c *Collector) getOrCreateCircuit(name string) *circuitBreakerState {
+	if c.cbState == nil {
+		c.cbState = make(map[string]*circuitBreakerState)
+	}
+	if c.cbState[name] == nil {
+		c.cbState[name] = &circuitBreakerState{}
+	}
+	return c.cbState[name]
+}
 
 // Histogram is a fixed-bucket cumulative histogram. Buckets are
 // pre-allocated at construction; Observe performs a single linear scan

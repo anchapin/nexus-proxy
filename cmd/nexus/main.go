@@ -328,6 +328,11 @@ func main() {
 	// judge and quality observers can reference it; mux.Handle and the
 	// Handler() call stay in the late-setup block below.
 	routeCounters := observability.NewRouteCounters()
+
+	// Circuit breaker metrics collector (issue #304). Attached to
+	// routeCounters so circuit breaker gauges appear in /metrics.
+	circuitCollector := observability.NewCollector()
+	routeCounters.SetCollector(circuitCollector)
 	if cfg.JudgeEnabled && cfg.JudgeAPIKey != "" {
 		evalCfg := judge.Config{
 			URL:         cfg.JudgeURL,
@@ -732,6 +737,7 @@ func main() {
 		PanelPanicObserver:      panelPanicObs,
 		ArbiterCache:            arbiterCache,
 		Providers:               providerRegistry,
+		CircuitBreakerObserver: &circuitBreakerObserverAdapter{collector: circuitCollector},
 	})
 	// Apply the per-client rate limiter (issue #75) as the outermost
 	// wrapper so a flood of requests is rejected before any middleware
@@ -760,6 +766,22 @@ func main() {
 	mux.HandleFunc("/healthz", healthzHandler(hpoller, probeMgr, cfg))
 	slog.Info("healthz endpoint serves dynamic budget JSON",
 		slog.String("ollama_url", cfg.OllamaURL),
+	)
+
+	// /readyz is the Kubernetes readiness probe (issue #42). In
+	// "degraded" mode (the default) it always returns 200 so a
+	// transient Ollama outage never evicts the pod; the body
+	// surfaces the degraded flag for dashboards to act on. In
+	// "strict" mode it returns 503 when neither Ollama nor a
+	// frontier key is available, so the kubelet stops routing
+	// traffic to the pod until it recovers.
+	mux.HandleFunc("/readyz", handlers.ReadyzHandler(handlers.ReadyzDeps{
+		Health:             hpoller,
+		FrontierConfigured: cfg.FrontierEnabled(),
+		Mode:               cfg.ReadinessMode,
+	}))
+	slog.Info("readyz endpoint registered",
+		slog.String("mode", cfg.ReadinessMode),
 	)
 
 	// /status serves a JSON diagnostic snapshot of all async subsystems
@@ -1002,6 +1024,21 @@ func printVersion(w io.Writer) {
 // JudgeScore that carries no task category, so the bridge remembers the
 // category per request id (stashed by the observer at enqueue time) and
 // resolves it when the score lands. It delegates to an inner Storage (the
+// circuitBreakerObserverAdapter bridges the single-method
+// CircuitBreakerObserver interface to the Collector (issue #304).
+// Lives in main.go to avoid circular imports between handlers and observability.
+type circuitBreakerObserverAdapter struct {
+	collector *observability.Collector
+}
+
+func (a *circuitBreakerObserverAdapter) RecordCircuitFailure(circuit string) {
+	a.collector.RecordCircuitFailure(circuit)
+}
+
+func (a *circuitBreakerObserverAdapter) RecordCircuitRecovery(circuit string) {
+	a.collector.RecordCircuitRecovery(circuit)
+}
+
 // in-memory judge log) so existing judge behaviour is preserved.
 //
 // This adapter lives in main.go — not internal/judge or internal/router —
@@ -1288,11 +1325,12 @@ func healthzHandler(hpoller *health.Health, mgr *probe.Manager, cfg config.Confi
 // credentials. /status is exempt only when NEXUS_STATUS_PUBLIC=true
 // (default false) — the diagnostics surface (frontier configured,
 // judge enabled, VRAM state) is reconnaissance-grade and should be
-// gated by default.
+// gated by default. /readyz is always exempt since K8s readiness
+// probes must work without credentials.
 func publicPathExempt(cfg config.Config) func(*http.Request) bool {
 	return func(r *http.Request) bool {
 		switch r.URL.Path {
-		case "/healthz", "/metrics":
+		case "/healthz", "/metrics", "/readyz":
 			return true
 		case "/status":
 			return cfg.StatusPublic
