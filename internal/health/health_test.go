@@ -413,15 +413,15 @@ func TestCalcBackoffInterval(t *testing.T) {
 		count          int
 		wantMultiplier int64
 	}{
-		{1, 1},   // tier 0: 1x
-		{2, 1},   // tier 0: 1x
-		{3, 2},   // tier 1: 2x
-		{4, 2},   // tier 1: 2x
-		{5, 4},   // tier 2: 4x
-		{6, 4},   // tier 2: 4x
-		{7, 8},   // tier 3: 8x
-		{8, 8},   // tier 3: 8x
-		{9, 15},  // tier 4: capped at 15x
+		{1, 1},    // tier 0: 1x
+		{2, 1},    // tier 0: 1x
+		{3, 2},    // tier 1: 2x
+		{4, 2},    // tier 1: 2x
+		{5, 4},    // tier 2: 4x
+		{6, 4},    // tier 2: 4x
+		{7, 8},    // tier 3: 8x
+		{8, 8},    // tier 3: 8x
+		{9, 15},   // tier 4: capped at 15x
 		{100, 15}, // tier 4: capped at 15x
 	}
 
