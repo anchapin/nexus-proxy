@@ -209,6 +209,33 @@ func (m *Middleware) reap(now time.Time) {
 	}
 }
 
+// SetRPM updates the steady-state requests per minute. A value <= 0
+// disables the limiter (transparent passthrough). Safe to call while
+// the server is running; the new value is used on the next Allow call.
+// Exposed for SIGHUP-based config hot reload (issue #306).
+func (m *Middleware) SetRPM(rpm int) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rpm = rpm
+}
+
+// SetBurst updates the bucket capacity. A value <= 0 leaves the burst
+// unchanged. Safe to call while the server is running. Exposed for
+// SIGHUP-based config hot reload (issue #306).
+func (m *Middleware) SetBurst(burst int) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if burst > 0 {
+		m.burst = burst
+	}
+}
+
 // BucketCount returns the number of tracked client buckets. Exposed for
 // /healthz diagnostics and tests.
 func (m *Middleware) BucketCount() int {
