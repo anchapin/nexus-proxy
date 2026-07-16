@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -23,6 +24,17 @@ import (
 // a non-error client-abort condition: log at info level and return early
 // without continuing to the arbiter.
 var ErrClientAbort = errors.New("client abort")
+
+// panelPanicsTotal counts recovered panics in panel goroutines (issue #309).
+// Exposed via PanelPanicsTotal for the /metrics endpoint.
+var panelPanicsTotal atomic.Uint64
+
+// IncPanelPanics increments the panel panic counter. Called from panel
+// goroutines when they catch and recover from a panic.
+func IncPanelPanics() { panelPanicsTotal.Add(1) }
+
+// PanelPanicsTotal returns the cumulative panel panic count.
+func PanelPanicsTotal() uint64 { return panelPanicsTotal.Load() }
 
 // IsClientAbort reports whether err is a client-side connection error
 // (EPIPE, ECONNRESET, broken pipe) that indicates the client disconnected
@@ -465,6 +477,7 @@ func Panel(
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
+					IncPanelPanics()
 					results <- PanelResult{Source: "local", Err: fmt.Errorf("panic: %v", r)}
 				}
 			}()
@@ -478,6 +491,7 @@ func Panel(
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
+				IncPanelPanics()
 				results <- PanelResult{Source: "frontier", Err: fmt.Errorf("panic: %v", r)}
 			}
 		}()
@@ -754,6 +768,7 @@ func PanelStreaming(
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
+					IncPanelPanics()
 					results <- PanelResult{Source: "local", Err: fmt.Errorf("panic: %v", r)}
 				}
 			}()
@@ -768,6 +783,7 @@ func PanelStreaming(
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
+				IncPanelPanics()
 				results <- PanelResult{Source: "frontier", Err: fmt.Errorf("panic: %v", r)}
 			}
 		}()

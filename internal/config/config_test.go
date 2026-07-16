@@ -100,6 +100,16 @@ func TestLoadDefaults(t *testing.T) {
 	if !cfg.TOONUnfenced {
 		t.Error("TOONUnfenced = false, want true (default on)")
 	}
+	// DSL fast-pass patterns (issue #305).
+	if len(cfg.DSLFormattingPatterns) == 0 {
+		t.Error("DSLFormattingPatterns is empty, want default patterns")
+	}
+	if len(cfg.DSLFusionPatterns) == 0 {
+		t.Error("DSLFusionPatterns is empty, want default patterns")
+	}
+	if len(cfg.DSLLocalPatterns) == 0 {
+		t.Error("DSLLocalPatterns is empty, want default patterns")
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -191,6 +201,66 @@ func TestLoadTOONUnfencedFlag(t *testing.T) {
 	})
 }
 
+func TestLoadDSLPatternOverrides(t *testing.T) {
+	// Custom local patterns: operator adds "custom task" to local patterns (issue #305)
+	// Note: comma-separated regex patterns - each is compiled separately
+	t.Setenv("NEXUS_DSL_LOCAL_PATTERNS", `(?i)\b(refactor)\b,(?i)\b(custom task)\b`)
+	// Custom fusion patterns: operator adds "database schema" (issue #305)
+	t.Setenv("NEXUS_DSL_FUSION_PATTERNS", `(?i)\b(architectural design|system architecture)\b,(?i)\b(database schema)\b`)
+	// Custom formatting patterns
+	t.Setenv("NEXUS_DSL_FORMATTING_PATTERNS", `(?i)\b(css)\b,(?i)\b(html)\b`)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	// Verify local patterns include refactor and custom task (2 comma-separated patterns)
+	if len(cfg.DSLLocalPatterns) != 2 {
+		t.Errorf("DSLLocalPatterns count = %d, want 2", len(cfg.DSLLocalPatterns))
+	}
+	foundRefactor := false
+	for _, re := range cfg.DSLLocalPatterns {
+		if re.String() == `(?i)\b(refactor)\b` {
+			foundRefactor = true
+			break
+		}
+	}
+	if !foundRefactor {
+		t.Error("DSLLocalPatterns does not contain refactor pattern")
+	}
+	foundCustom := false
+	for _, re := range cfg.DSLLocalPatterns {
+		if re.String() == `(?i)\b(custom task)\b` {
+			foundCustom = true
+			break
+		}
+	}
+	if !foundCustom {
+		t.Error("DSLLocalPatterns does not contain custom task pattern")
+	}
+
+	// Verify fusion patterns (2 comma-separated patterns)
+	if len(cfg.DSLFusionPatterns) != 2 {
+		t.Errorf("DSLFusionPatterns count = %d, want 2", len(cfg.DSLFusionPatterns))
+	}
+	foundSchema := false
+	for _, re := range cfg.DSLFusionPatterns {
+		if re.String() == `(?i)\b(database schema)\b` {
+			foundSchema = true
+			break
+		}
+	}
+	if !foundSchema {
+		t.Error("DSLFusionPatterns does not contain database schema pattern")
+	}
+
+	// Verify formatting patterns (2 comma-separated patterns)
+	if len(cfg.DSLFormattingPatterns) != 2 {
+		t.Errorf("DSLFormattingPatterns count = %d, want 2", len(cfg.DSLFormattingPatterns))
+	}
+}
+
 func TestLoadTelemetryDisabledByEmptyPath(t *testing.T) {
 	t.Setenv("NEXUS_TELEMETRY_PATH", "")
 	cfg, err := Load()
@@ -257,6 +327,9 @@ func TestLoadInvalidValues(t *testing.T) {
 		{"bad float", "NEXUS_RAG_THRESHOLD", "0.5x"},
 		{"bad duration", "NEXUS_SLM_TIMEOUT", "eight seconds"},
 		{"bad cascade duration", "NEXUS_CASCADE_TIMEOUT", "ten seconds"},
+		{"bad dsl formatting regex", "NEXUS_DSL_FORMATTING_PATTERNS", "[invalid"},
+		{"bad dsl fusion regex", "NEXUS_DSL_FUSION_PATTERNS", "(unbalanced"},
+		{"bad dsl local regex", "NEXUS_DSL_LOCAL_PATTERNS", "**invalid"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

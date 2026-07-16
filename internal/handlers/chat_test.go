@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,12 +66,11 @@ func baseDeps(t *testing.T) (Deps, *upstream.RecordingTransport) {
 	rt := upstream.NewRecordingTransport()
 	client := &http.Client{Transport: rt}
 	deps := Deps{
-		Config:          cfg,
-		Client:          client,
-		RAG:             store,
-		SLM:             router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, 1, client),
-		FormattingRegex: regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`),
-		Recorder:        telemetry.Noop{},
+		Config:   cfg,
+		Client:   client,
+		RAG:      store,
+		SLM:      router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, 1, client),
+		Recorder: telemetry.Noop{},
 	}
 	return deps, rt
 }

@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -120,6 +121,17 @@ type Config struct {
 	FusionTimeout             time.Duration // per-panel-member fetch timeout (120s)
 	CascadeTimeout            time.Duration // per-attempt timeout for cascade fallback (30s)
 	ArbiterTimeout            time.Duration // per-call timeout for the fusion arbiter stream (60s)
+
+	// DSL fast-pass patterns (issue #305). DSLFormattingPatterns
+	// matches simple formatting keywords (css, format, docstring, ...).
+	// DSLFusionPatterns matches architecture keywords that warrant
+	// running both local and frontier (fusion). DSLLocalPatterns
+	// matches common coding task keywords (refactor, security scan,
+	// ...). All three default to the prior hardcoded behaviour when
+	// the corresponding env var is unset.
+	DSLFormattingPatterns []*regexp.Regexp // NEXUS_DSL_FORMATTING_PATTERNS
+	DSLFusionPatterns     []*regexp.Regexp // NEXUS_DSL_FUSION_PATTERNS
+	DSLLocalPatterns      []*regexp.Regexp // NEXUS_DSL_LOCAL_PATTERNS
 
 	// Frontier provider selector (issue #45). When more than one
 	// frontier provider is configured (frontier + z.ai), the chat
@@ -559,6 +571,28 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.ArbiterTimeout = arbiterTimeout
+
+	// DSL fast-pass patterns (issue #305). Defaults match the prior
+	// hardcoded behaviour so operators who upgrade see identical routing.
+	dslFormatting, err := getEnvRegexps("NEXUS_DSL_FORMATTING_PATTERNS",
+		`(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.DSLFormattingPatterns = dslFormatting
+
+	dslFusion, err := getEnvRegexps("NEXUS_DSL_FUSION_PATTERNS", `(?i)\b(architectural design|system architecture)\b`)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.DSLFusionPatterns = dslFusion
+
+	dslLocal, err := getEnvRegexps("NEXUS_DSL_LOCAL_PATTERNS",
+		`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis)\b`)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.DSLLocalPatterns = dslLocal
 
 	// Frontier provider selector (issue #45). Look-back window,
 	// observation floor, and cache cadence. Defaults match the
@@ -1466,6 +1500,35 @@ func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("config: %s must be a duration (e.g. 8s, 2m): %w", key, err)
 	}
 	return d, nil
+}
+
+// getEnvRegexps parses a comma-separated list of regex patterns and
+// compiles each one. The default is returned when the env var is unset
+// or empty. An invalid pattern causes a fatal error at boot time.
+func getEnvRegexps(key string, defaultPattern string) ([]*regexp.Regexp, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		v = defaultPattern
+	}
+	// Special case: if the env var was explicitly set to empty string,
+	// return empty slice (operator wants to disable this DSL branch).
+	if ok && v == "" {
+		return []*regexp.Regexp{}, nil
+	}
+	patterns := strings.Split(v, ",")
+	result := make([]*regexp.Regexp, 0, len(patterns))
+	for _, p := range patterns {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return nil, fmt.Errorf("config: %s pattern %q is not a valid regex: %w", key, p, err)
+		}
+		result = append(result, re)
+	}
+	return result, nil
 }
 
 // parseBoolEnv maps a string env value to a bool with the supplied

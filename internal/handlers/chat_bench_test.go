@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -65,12 +64,11 @@ func benchDeps(b *testing.B, localSrv, frontierSrv *httptest.Server) Deps {
 	client := localSrv.Client()
 	store := rag.NewStore(benchEmbedder{}, 0.55)
 	return Deps{
-		Config:          cfg,
-		Client:          client,
-		RAG:             store,
-		SLM:             router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, 1, client),
-		FormattingRegex: regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`),
-		Recorder:        telemetry.Noop{},
+		Config:   cfg,
+		Client:   client,
+		RAG:      store,
+		SLM:      router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, 1, client),
+		Recorder: telemetry.Noop{},
 	}
 }
 

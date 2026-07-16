@@ -150,17 +150,22 @@ type Planner struct {
 	// identical to the pre-issue-47 behaviour.
 	Confidence ConfidenceStore
 
-	// FormattingRegex is the DSL fast-pass regex for formatting tasks
-	// (css, lint, docstring, ...). May be nil; a nil regex disables the
-	// formatting branch of the DSL (the architecture keywords still
-	// fire).
-	FormattingRegex *regexp.Regexp
+	// FormattingRegex is the DSL fast-pass regex(es) for formatting tasks
+	// (css, lint, docstring, ...). An empty/nil slice disables the
+	// formatting branch of the DSL (the fusion patterns still fire).
+	FormattingRegex []*regexp.Regexp
 
-	// LocalPatternsRegex is the DSL fast-pass regex for common coding
+	// FusionPatterns is the DSL fast-pass regex(es) for architecture
+	// keywords that warrant running both local and frontier (fusion).
+	// An empty/nil slice uses the hardcoded defaults
+	// ("architectural design", "system architecture").
+	FusionPatterns []*regexp.Regexp
+
+	// LocalPatternsRegex is the DSL fast-pass regex(es) for common coding
 	// task keywords (refactor, security scan, generate tests, explain this
-	// code, performance analysis, ...). May be nil; a nil regex disables
-	// the local-patterns branch of the DSL.
-	LocalPatternsRegex *regexp.Regexp
+	// code, performance analysis, ...). An empty/nil slice disables the
+	// local-patterns branch of the DSL.
+	LocalPatternsRegex []*regexp.Regexp
 
 	// SLMCache is the optional time-bounded prompt→route cache
 	// (issue #206). When non-nil the planner checks the cache before
@@ -224,8 +229,20 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 		}
 	}
 
-	// Stage 2: DSL fast-pass.
-	if r, hit := DSL(req.Prompt, p.FormattingRegex, p.LocalPatternsRegex); hit {
+	// Stage 2: DSL fast-pass. Use default patterns when config fields are nil.
+	fusionPatterns := p.FusionPatterns
+	if len(fusionPatterns) == 0 {
+		fusionPatterns = DefaultFusionPatterns
+	}
+	formattingPatterns := p.FormattingRegex
+	if len(formattingPatterns) == 0 {
+		formattingPatterns = DefaultFormattingPatterns
+	}
+	localPatterns := p.LocalPatternsRegex
+	if len(localPatterns) == 0 {
+		localPatterns = DefaultLocalPatterns
+	}
+	if r, hit := DSL(req.Prompt, fusionPatterns, formattingPatterns, localPatterns); hit {
 		return Decision{
 			Route:           r,
 			Source:          SourceDSL,

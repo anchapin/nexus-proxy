@@ -14,6 +14,8 @@ import (
 	"math"
 	"sort"
 	"strconv"
+
+	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
 
 // GaugeSample is one live gauge reading captured at scrape time. Name
@@ -230,6 +232,12 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 			{value: "accepted", n: c.tlsConnectionsAccepted.Load()},
 			{value: "rejected", n: c.tlsConnectionsRejected.Load()},
 		})
+
+	// Panel panic counter (issue #309). Tracks recovered panics in
+	// panel goroutines so operators can observe how often upstream JSON
+	// shape causes a goroutine to die.
+	writeCounter(w, "nexus_panel_panics_total",
+		"Total recovered panics in panel goroutines (issue #309).", upstream.PanelPanicsTotal())
 
 	// Auth gauge: cumulative accepted authentications. The metric name
 	// carries "_clients" per the issue spec; semantically this is a
