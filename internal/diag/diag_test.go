@@ -3,6 +3,7 @@ package diag
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -644,4 +645,205 @@ func checkByName(r Result, name string) Check {
 		}
 	}
 	return Check{Name: name, Status: StatusFail, Detail: "missing"}
+}
+
+// --- New diagnostic checks -------------------------------------------------
+
+func TestRunRAGCircuitBreakerDisabled(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.RAGCircuitBreakerThreshold = 0
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkRAGCircuitBreaker)
+	if got.Status != StatusWarn {
+		t.Errorf("rag_circuit_breaker = %s, want warn", got.Status)
+	}
+	if !strings.Contains(got.Detail, "disabled") {
+		t.Errorf("detail should mention disabled: %q", got.Detail)
+	}
+}
+
+func TestRunRAGCircuitBreakerEnabled(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.RAGCircuitBreakerThreshold = 5
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkRAGCircuitBreaker)
+	if got.Status != StatusPass {
+		t.Errorf("rag_circuit_breaker = %s, want pass", got.Status)
+	}
+	if !strings.Contains(got.Detail, "5") {
+		t.Errorf("detail should mention threshold: %q", got.Detail)
+	}
+}
+
+func TestRunQualityVerifierDisabled(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.QualityConcurrency = 0
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkQualityVerifier)
+	if got.Status != StatusWarn {
+		t.Errorf("quality_verifier = %s, want warn", got.Status)
+	}
+	if !strings.Contains(got.Detail, "dormant") {
+		t.Errorf("detail should mention dormant: %q", got.Detail)
+	}
+}
+
+func TestRunQualityVerifierEnabled(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.QualityConcurrency = 4
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkQualityVerifier)
+	if got.Status != StatusPass {
+		t.Errorf("quality_verifier = %s, want pass", got.Status)
+	}
+	if !strings.Contains(got.Detail, "4") {
+		t.Errorf("detail should mention concurrency: %q", got.Detail)
+	}
+}
+
+func TestRunBudgetGuardDisabled(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.BudgetDailyLimit = 0
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkBudgetGuard)
+	if got.Status != StatusWarn {
+		t.Errorf("budget_guard = %s, want warn", got.Status)
+	}
+	if !strings.Contains(got.Detail, "disabled") {
+		t.Errorf("detail should mention disabled: %q", got.Detail)
+	}
+}
+
+func TestRunBudgetGuardEnabled(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.BudgetDailyLimit = 10.50
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkBudgetGuard)
+	if got.Status != StatusPass {
+		t.Errorf("budget_guard = %s, want pass", got.Status)
+	}
+	if !strings.Contains(got.Detail, "10.50") {
+		t.Errorf("detail should mention limit: %q", got.Detail)
+	}
+}
+
+func TestRunRateLimitProxyConfigRPMZeroIsSkip(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.RateLimitRPM = 0
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkRateLimitProxyConfig)
+	if got.Status != StatusSkip {
+		t.Errorf("rate_limit_proxy_config = %s, want skip", got.Status)
+	}
+}
+
+func TestRunRateLimitProxyConfigRPMPositiveNoTrustedProxiesIsFail(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.RateLimitRPM = 100
+	cfg.TrustedProxies = nil // no trusted proxies
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkRateLimitProxyConfig)
+	if got.Status != StatusFail {
+		t.Errorf("rate_limit_proxy_config = %s, want fail", got.Status)
+	}
+	if !strings.Contains(got.Detail, "spoofing") {
+		t.Errorf("detail should mention spoofing vulnerability: %q", got.Detail)
+	}
+}
+
+func TestRunRateLimitProxyConfigRPMPositiveWithTrustedProxiesIsPass(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.RateLimitRPM = 100
+	// Add a trusted proxy
+	cfg.TrustedProxies = make([]*net.IPNet, 1)
+	_, cfg.TrustedProxies[0], _ = net.ParseCIDR("10.0.0.0/8")
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkRateLimitProxyConfig)
+	if got.Status != StatusPass {
+		t.Errorf("rate_limit_proxy_config = %s (detail=%s), want pass", got.Status, got.Detail)
+	}
+}
+
+func TestRunProviderRegistryMalformedJSON(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	t.Setenv("NEXUS_FRONTIER_PROVIDERS", `{invalid json`)
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkProviderRegistry)
+	if got.Status != StatusFail {
+		t.Errorf("provider_registry = %s, want fail", got.Status)
+	}
+	if !strings.Contains(got.Detail, "malformed") {
+		t.Errorf("detail should mention malformed: %q", got.Detail)
+	}
+}
+
+func TestRunProviderRegistryValidJSON(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	t.Setenv("NEXUS_FRONTIER_PROVIDERS", `[{"name":"test","url":"https://test.com/v1","model":"test-model","costPer1K":0.01}]`)
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkProviderRegistry)
+	if got.Status != StatusPass {
+		t.Errorf("provider_registry = %s, want pass", got.Status)
+	}
+}
+
+func TestRunMiddlewareChainUnknownMiddlewareIsFail(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.MiddlewareChain = "promptEngineering,unknownMiddleware,rag"
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkMiddlewareChain)
+	if got.Status != StatusFail {
+		t.Errorf("middleware_chain = %s, want fail", got.Status)
+	}
+	if !strings.Contains(got.Detail, "unknown") {
+		t.Errorf("detail should mention unknown middleware: %q", got.Detail)
+	}
+}
+
+func TestRunMiddlewareChainValidIsPass(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.MiddlewareChain = "promptEngineering,rag,compressJSONBlocks,appendSystemNote"
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkMiddlewareChain)
+	if got.Status != StatusPass {
+		t.Errorf("middleware_chain = %s (detail=%s), want pass", got.Status, got.Detail)
+	}
+}
+
+func TestRunMiddlewareChainEmptyUsesDefault(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.MiddlewareChain = "" // empty should use default
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkMiddlewareChain)
+	if got.Status != StatusPass {
+		t.Errorf("middleware_chain = %s (detail=%s), want pass", got.Status, got.Detail)
+	}
 }

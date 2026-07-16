@@ -33,7 +33,9 @@ import (
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/config"
+	"github.com/anchapin/nexus-proxy/internal/middleware"
 	"github.com/anchapin/nexus-proxy/internal/probe"
+	"github.com/anchapin/nexus-proxy/internal/providers"
 )
 
 // Status is the outcome of a single diagnostic check. The values
@@ -84,17 +86,23 @@ const DefaultTimeout = 5 * time.Second
 // Check names. Kept as constants so the JSON output and the
 // human-readable table can never drift apart.
 const (
-	checkOllamaReachable = "ollama_reachable"
-	checkRouterModel     = "ollama_router_model"
-	checkLocalModel      = "ollama_local_model"
-	checkEmbeddingModel  = "ollama_embedding_model"
-	checkFrontierKey     = "frontier_api_key"
-	checkZAIKey          = "zai_api_key"
-	checkVRAMProbe       = "vram_probe"
-	checkRAGDirectory    = "rag_directory"
-	checkTelemetryPath   = "telemetry_path_writable"
-	checkMetricsDBPath   = "metrics_db_writable"
-	checkJudgeReadiness  = "judge_readiness"
+	checkOllamaReachable      = "ollama_reachable"
+	checkRouterModel          = "ollama_router_model"
+	checkLocalModel           = "ollama_local_model"
+	checkEmbeddingModel       = "ollama_embedding_model"
+	checkFrontierKey          = "frontier_api_key"
+	checkZAIKey               = "zai_api_key"
+	checkVRAMProbe            = "vram_probe"
+	checkRAGDirectory         = "rag_directory"
+	checkTelemetryPath        = "telemetry_path_writable"
+	checkMetricsDBPath        = "metrics_db_writable"
+	checkJudgeReadiness       = "judge_readiness"
+	checkRAGCircuitBreaker    = "rag_circuit_breaker"
+	checkQualityVerifier      = "quality_verifier"
+	checkBudgetGuard          = "budget_guard"
+	checkRateLimitProxyConfig = "rate_limit_proxy_config"
+	checkProviderRegistry     = "provider_registry"
+	checkMiddlewareChain      = "middleware_chain"
 )
 
 // Run executes every diagnostic check against cfg and returns the
@@ -128,6 +136,12 @@ func Run(ctx context.Context, cfg config.Config, opts Options) Result {
 	r = append(r, checkWritablePathFn(checkTelemetryPath, cfg.TelemetryPath))
 	r = append(r, checkWritablePathFn(checkMetricsDBPath, cfg.MetricsDBPath))
 	r = append(r, checkJudgeReadinessFn(cfg))
+	r = append(r, checkRAGCircuitBreakerFn(cfg))
+	r = append(r, checkQualityVerifierFn(cfg))
+	r = append(r, checkBudgetGuardFn(cfg))
+	r = append(r, checkRateLimitProxyConfigFn(cfg))
+	r = append(r, checkProviderRegistryFn())
+	r = append(r, checkMiddlewareChainFn(cfg))
 	return r
 }
 
@@ -633,5 +647,156 @@ func checkJudgeReadinessFn(cfg config.Config) Check {
 		Name:   checkJudgeReadiness,
 		Status: StatusPass,
 		Detail: fmt.Sprintf("ready (model=%s, sample_rate=%.2f)", cfg.JudgeModel, cfg.JudgeSampleRate),
+	}
+}
+
+// --- RAG circuit breaker ---------------------------------------------------
+
+// checkRAGCircuitBreakerFn inspects the RAG circuit breaker threshold.
+// A threshold of 0 means the breaker is disabled and RAG will retry
+// indefinitely on failures (no backstop). This is a warning because
+// a misbehaving embedding endpoint can exhaust proxy resources silently.
+func checkRAGCircuitBreakerFn(cfg config.Config) Check {
+	if cfg.RAGCircuitBreakerThreshold == 0 {
+		return Check{
+			Name:   checkRAGCircuitBreaker,
+			Status: StatusWarn,
+			Detail: "NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD=0 — breaker disabled; RAG will retry indefinitely on failures",
+		}
+	}
+	return Check{
+		Name:   checkRAGCircuitBreaker,
+		Status: StatusPass,
+		Detail: fmt.Sprintf("threshold=%d consecutive failures", cfg.RAGCircuitBreakerThreshold),
+	}
+}
+
+// --- Quality verifier ------------------------------------------------------
+
+// checkQualityVerifierFn inspects the quality verifier concurrency. A
+// concurrency of 0 means the verifier is dormant (no AST/compiler checks
+// run). This is a warning because the operator may have intended to
+// enable quality enforcement but misconfigured the concurrency.
+func checkQualityVerifierFn(cfg config.Config) Check {
+	if cfg.QualityConcurrency == 0 {
+		return Check{
+			Name:   checkQualityVerifier,
+			Status: StatusWarn,
+			Detail: "NEXUS_QUALITY_CONCURRENCY=0 — quality verifier dormant; no AST/compiler checks will run",
+		}
+	}
+	return Check{
+		Name:   checkQualityVerifier,
+		Status: StatusPass,
+		Detail: fmt.Sprintf("concurrency=%d workers", cfg.QualityConcurrency),
+	}
+}
+
+// --- Budget guard ---------------------------------------------------------
+
+// checkBudgetGuardFn inspects the daily budget limit. A limit of 0 means
+// the spend guard is disabled and there is no cap on frontier/fusion
+// spend. This is a warning for production deployments where accidental
+// runaway API costs are a concern.
+func checkBudgetGuardFn(cfg config.Config) Check {
+	if cfg.BudgetDailyLimit == 0 {
+		return Check{
+			Name:   checkBudgetGuard,
+			Status: StatusWarn,
+			Detail: "NEXUS_BUDGET_DAILY_LIMIT=0 — budget guard disabled; no cap on frontier/fusion spend",
+		}
+	}
+	return Check{
+		Name:   checkBudgetGuard,
+		Status: StatusPass,
+		Detail: fmt.Sprintf("daily limit=$%.2f", cfg.BudgetDailyLimit),
+	}
+}
+
+// --- Rate-limit proxy configuration ---------------------------------------
+
+// checkRateLimitProxyConfigFn checks that when per-client rate limiting
+// is enabled (RPM > 0), at least one trusted proxy CIDR is configured.
+// Without trusted proxies, X-Forwarded-For / X-Real-IP headers are
+// ignored and the direct peer IP is used — this is safe but means a
+// single client cannot be rate-limited across multiple proxies in a
+// deployment. More critically: when RPM > 0 and TrustedProxies is empty,
+// the proxy uses the direct TCP peer for rate limiting, which is
+// correct but the check warns anyway because the operator may have
+// intended to configure trusted proxies for a layered setup.
+func checkRateLimitProxyConfigFn(cfg config.Config) Check {
+	if cfg.RateLimitRPM <= 0 {
+		return Check{
+			Name:   checkRateLimitProxyConfig,
+			Status: StatusSkip,
+			Detail: "rate limiting disabled (NEXUS_RATE_LIMIT_RPM <= 0)",
+		}
+	}
+	if !cfg.TrustedProxiesConfigured() {
+		return Check{
+			Name:   checkRateLimitProxyConfig,
+			Status: StatusFail,
+			Detail: "NEXUS_RATE_LIMIT_RPM > 0 but no NEXUS_TRUSTED_PROXIES configured — spoofing vulnerability: a client behind a NAT gateway shares rate-limit bucket with other clients",
+		}
+	}
+	return Check{
+		Name:   checkRateLimitProxyConfig,
+		Status: StatusPass,
+		Detail: fmt.Sprintf("rate limit=%d RPM, %d trusted proxy CIDR(s)", cfg.RateLimitRPM, len(cfg.TrustedProxies)),
+	}
+}
+
+// --- Provider registry ----------------------------------------------------
+
+// checkProviderRegistryFn validates that NEXUS_FRONTIER_PROVIDERS
+// contains valid JSON. A malformed JSON value causes a hard error at
+// boot time because ParseProvidersFromEnv is called during config
+// loading; this check re-validates the env var in the diag path so
+// operators can audit the configuration without rebooting.
+func checkProviderRegistryFn() Check {
+	// ParseProvidersFromEnv returns (nil, nil) when the env var is
+	// empty — that is a valid configuration (no extra providers).
+	_, err := providers.ParseProvidersFromEnv()
+	if err != nil {
+		return Check{
+			Name:   checkProviderRegistry,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("NEXUS_FRONTIER_PROVIDERS is malformed: %v", err),
+		}
+	}
+	return Check{
+		Name:   checkProviderRegistry,
+		Status: StatusPass,
+		Detail: "JSON valid",
+	}
+}
+
+// --- Middleware chain -----------------------------------------------------
+
+// checkMiddlewareChainFn validates that every middleware name in the
+// configured chain resolves to a registered middleware. Unknown names
+// cause BuildChain to error, which would fail the middleware setup at
+// runtime — catching it at the diagnostic stage gives the operator a
+// clear error instead of a silent fallback to the default chain.
+func checkMiddlewareChainFn(cfg config.Config) Check {
+	// Re-init the middleware registry with the defaults so BuildChain
+	// has the canonical set available. This mirrors what main.go does
+	// before building the chain.
+	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.PromptInjectionIsolated())
+	if _, err := middleware.BuildChain(cfg.MiddlewareChain); err != nil {
+		return Check{
+			Name:   checkMiddlewareChain,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("NEXUS_MIDDLEWARE_CHAIN is invalid: %v", err),
+		}
+	}
+	chain := cfg.MiddlewareChain
+	if chain == "" {
+		chain = "promptEngineering,rag,compressJSONBlocks,appendSystemNote"
+	}
+	return Check{
+		Name:   checkMiddlewareChain,
+		Status: StatusPass,
+		Detail: fmt.Sprintf("chain valid (%s)", chain),
 	}
 }
