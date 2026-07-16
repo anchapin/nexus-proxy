@@ -15,7 +15,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/anchapin/nexus-proxy/internal/ioutils"
 	"io"
 	"log/slog"
 	"math"
@@ -25,6 +24,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/anchapin/nexus-proxy/internal/ioutils"
 
 	"time"
 )
