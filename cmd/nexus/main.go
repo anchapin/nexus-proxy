@@ -658,6 +658,13 @@ func main() {
 			routeCounters.ObserveArbiterCacheHit(cacheHit)
 		}
 	}
+	// Panel panic observer (issue #309). The chat handler detects
+	// "panic:" in error messages from Panel/PanelStreaming and
+	// calls this observer, which forwards to the in-process counter
+	// so it surfaces in /metrics as nexus_panel_panics_total.
+	panelPanicObs := func() {
+		routeCounters.ObservePanelPanic()
+	}
 	// Arbiter synthesis cache (issue #232). Created when TTL > 0;
 	// nil means caching is disabled.
 	var arbiterCache *upstream.ArbiterCache
@@ -726,6 +733,7 @@ func main() {
 		RAGObserver:             ragObserver,
 		CascadeFallbackObserver: cascadeFallbackObs,
 		ArbiterCacheObserver:    arbiterCacheObserver,
+		PanelPanicObserver:       panelPanicObs,
 		ArbiterCache:            arbiterCache,
 		Providers:               providerRegistry,
 	})
