@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -31,7 +32,7 @@ func newStubSpendGuard(limit float64) *stubSpendGuard {
 	return &stubSpendGuard{limit: limit}
 }
 
-func (s *stubSpendGuard) Check(cost float64) bool {
+func (s *stubSpendGuard) Check(ctx context.Context, cost float64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.checkCalls++
@@ -41,7 +42,7 @@ func (s *stubSpendGuard) Check(cost float64) bool {
 	return s.spent+cost > s.limit
 }
 
-func (s *stubSpendGuard) Record(cost float64, source string) {
+func (s *stubSpendGuard) Record(ctx context.Context, cost float64, source string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.recordCalls++
@@ -53,8 +54,8 @@ func (s *stubSpendGuard) Record(cost float64, source string) {
 // chatHandlerForBudget returns a chat handler configured for budget guard testing.
 // The handler is set up so DSL/SLM won't match "hello world" -> will go to frontier.
 func chatHandlerForBudget(t *testing.T, sg interface {
-	Check(float64) bool
-	Record(float64, string)
+	Check(context.Context, float64) bool
+	Record(context.Context, float64, string)
 }) Deps {
 	t.Helper()
 	cfg := config.Config{
@@ -187,14 +188,14 @@ type recordCall struct {
 	source string
 }
 
-func (m *mockSpendGuard) Check(cost float64) bool {
+func (m *mockSpendGuard) Check(ctx context.Context, cost float64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.checkCalls = append(m.checkCalls, cost)
 	return m.shouldBlock
 }
 
-func (m *mockSpendGuard) Record(cost float64, source string) {
+func (m *mockSpendGuard) Record(ctx context.Context, cost float64, source string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.recordCalls = append(m.recordCalls, recordCall{cost: cost, source: source})

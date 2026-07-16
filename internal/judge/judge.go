@@ -281,7 +281,7 @@ func (e *Evaluator) worker() {
 		}
 		// Wire judge cost into the budget guard (issue #240).
 		if e.cfg.BudgetGuard != nil && score.Cost > 0 {
-			e.cfg.BudgetGuard.Record(score.Cost, "judge")
+			e.cfg.BudgetGuard.Record(context.Background(), score.Cost, "judge")
 		}
 	}
 }

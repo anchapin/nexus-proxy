@@ -56,11 +56,11 @@ func NewPrometheusAlerter(logger *slog.Logger) *PrometheusAlerter {
 
 // OnExceed implements Alerter. It increments the exceed counter, logs
 // at error level, and stores the state.
-func (a *PrometheusAlerter) OnExceed(s State) {
+func (a *PrometheusAlerter) OnExceed(ctx context.Context, s State) {
 	a.ExceedCount.Add(1)
 	a.LastState.Store(s)
 	if a.Logger != nil {
-		a.Logger.Log(context.TODO(), slog.LevelError, "budget exceeded",
+		a.Logger.Log(ctx, slog.LevelError, "budget exceeded",
 			slog.Float64("spent_usd", s.Spent),
 			slog.Float64("limit_usd", s.Limit),
 			slog.Float64("remaining_usd", s.Remaining),
@@ -71,12 +71,12 @@ func (a *PrometheusAlerter) OnExceed(s State) {
 // OnSpend implements Alerter. It stores the spend amount, source, and state.
 // The source label (e.g. "frontier" or "judge") is stored and logged so
 // spend can be attributed to its origin.
-func (a *PrometheusAlerter) OnSpend(s State, amount float64, source string) {
+func (a *PrometheusAlerter) OnSpend(ctx context.Context, s State, amount float64, source string) {
 	a.LastSpent.Store(math.Float64bits(amount))
 	a.lastSource.Store(source)
 	a.LastState.Store(s)
 	if a.Logger != nil {
-		a.Logger.Log(context.TODO(), slog.LevelInfo, "budget spend recorded",
+		a.Logger.Log(ctx, slog.LevelInfo, "budget spend recorded",
 			slog.Float64("spent_usd", amount),
 			slog.Float64("total_spent_usd", s.Spent),
 			slog.String("source", source),
@@ -86,11 +86,11 @@ func (a *PrometheusAlerter) OnSpend(s State, amount float64, source string) {
 
 // OnApproaching implements Alerter. It increments the approaching counter,
 // logs at warn level, and stores the state.
-func (a *PrometheusAlerter) OnApproaching(s State) {
+func (a *PrometheusAlerter) OnApproaching(ctx context.Context, s State) {
 	a.ApproachingCount.Add(1)
 	a.LastState.Store(s)
 	if a.Logger != nil {
-		a.Logger.Log(context.TODO(), a.LogLevel, "budget approaching limit",
+		a.Logger.Log(ctx, a.LogLevel, "budget approaching limit",
 			slog.Float64("spent_usd", s.Spent),
 			slog.Float64("limit_usd", s.Limit),
 			slog.Float64("remaining_usd", s.Remaining),
