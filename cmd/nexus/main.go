@@ -895,6 +895,40 @@ func main() {
 		}
 	}()
 
+	// SIGHUP-based config hot reload (issue #306). A separate channel
+	// is used so SIGHUP does not interfere with the graceful shutdown
+	// path. The closure captures rateLimiter and cfg by reference so
+	// in-place updates take effect without a restart.
+	sighupCh := make(chan os.Signal, 1)
+	signal.Notify(sighupCh, syscall.SIGHUP)
+	go func() {
+		for range sighupCh {
+			newCfg, result := config.ReloadHotReloadable(cfg)
+			// Update in-place components.
+			if rateLimiter != nil {
+				rateLimiter.SetRPM(newCfg.RateLimitRPM)
+				rateLimiter.SetBurst(newCfg.RateLimitBurst)
+			}
+			// Update structured logger level and format.
+			newLogger := newCfg.NewLogger()
+			slog.SetDefault(newLogger)
+			cfg = newCfg
+			slog.Info("config reloaded via SIGHUP",
+				slog.Int("rate_limit_rpm", newCfg.RateLimitRPM),
+				slog.Int("rate_limit_burst", newCfg.RateLimitBurst),
+				slog.String("log_level", newCfg.LogLevel.String()),
+				slog.String("log_format", newCfg.LogFormat.String()),
+				slog.Bool("debug", newCfg.Debug),
+			)
+			for _, name := range result.NeedsRestart {
+				slog.Warn("config change requires restart",
+					slog.String("setting", name),
+					slog.String("hint", "send SIGTERM/SIGINT to gracefully restart"),
+				)
+			}
+		}
+	}()
+
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		// Unrecoverable boot/server error — log.Fatalf is kept
 		// here per the issue #3 acceptance criteria.
