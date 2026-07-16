@@ -71,6 +71,15 @@ type Health struct {
 	// the last success. Reset to 0 on every successful probe.
 	failureCount atomic.Int32
 
+	// currentInterval is the active polling interval in nanoseconds.
+	// It starts as pollInterval and increases via exponential backoff
+	// after consecutive failures (capped at 15x pollInterval).
+	currentInterval atomic.Int64
+
+	// lastTier tracks the backoff tier that was last logged so we
+	// only log on tier transitions, not every failed probe.
+	lastTier atomic.Int32
+
 	// mu serializes recordSuccess to ensure that Swap(true) and
 	// Store(0) are observable together — without this mutex a
 	// goroutine could see healthy==true but a stale failureCount
@@ -117,6 +126,7 @@ func New(ollamaURL string, localModel string, pollInterval time.Duration, breake
 	// corrects this — a unit test or operator who never starts the
 	// poller still gets "healthy" until something trips the breaker.
 	h.healthy.Store(true)
+	h.currentInterval.Store(int64(pollInterval))
 	return h
 }
 
@@ -144,6 +154,15 @@ func (h *Health) FailureCount() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return int(h.failureCount.Load())
+}
+
+// PollingInterval returns the current polling interval.
+// Exported for tests to verify backoff behavior.
+func (h *Health) PollingInterval() time.Duration {
+	if h == nil {
+		return 0
+	}
+	return time.Duration(h.currentInterval.Load())
 }
 
 // Run performs an initial synchronous probe and then starts the
@@ -178,9 +197,30 @@ func (h *Health) Run(ctx context.Context) {
 	go h.loop(ctx)
 }
 
+// maxBackoffMultiplier caps the backoff at 15x the poll interval.
+const maxBackoffMultiplier = 15
+
+// calcBackoffInterval computes the backoff interval based on consecutive
+// failure count. Tier 0 (failures 1-2): 1x, Tier 1 (failures 3-4): 2x,
+// Tier 2 (failures 5-6): 4x, Tier 3 (failures 7-8): 8x, Tier 4+: 15x.
+func (h *Health) calcBackoffInterval(count int) time.Duration {
+	// tier 0: count 1-2, tier 1: count 3-4, tier 2: count 5-6, ...
+	tier := (count - 1) >> 1
+	if tier < 0 {
+		tier = 0
+	}
+	multiplier := int64(1 << tier)
+	if multiplier > maxBackoffMultiplier {
+		multiplier = maxBackoffMultiplier
+	}
+	return h.pollInterval * time.Duration(multiplier)
+}
+
 // loop runs probes on a ticker until ctx is canceled or Close is
 // called. The probe itself uses a per-call timeout derived from
 // probeTimeout so a slow Ollama cannot pin the goroutine.
+// After the breaker trips, the ticker interval is increased via
+// exponential backoff to reduce log noise during extended outages.
 func (h *Health) loop(ctx context.Context) {
 	defer h.wg.Done()
 	t := time.NewTicker(h.pollInterval)
@@ -199,6 +239,36 @@ func (h *Health) loop(ctx context.Context) {
 			// log line emitted by the next iteration's audit trail.
 			_ = h.probe(probeCtx)
 			cancel()
+
+			// After the probe, check if we need to adjust the
+			// backoff interval (only when breaker is open).
+			if !h.healthy.Load() {
+				h.mu.Lock()
+				count := int(h.failureCount.Load())
+				// failureCount < breakerThreshold shouldn't happen
+				// (breaker is only open when count >= threshold),
+				// but handle it gracefully.
+				if count >= int(h.breakerThreshold) {
+					newInterval := h.calcBackoffInterval(count)
+					curr := time.Duration(h.currentInterval.Load())
+					if newInterval != curr {
+						// Drain any pending ticks from the old ticker
+						// before stopping it, to prevent stale ticks
+						// from firing at the wrong interval.
+						oldTicker := t
+						select {
+						case <-oldTicker.C:
+						default:
+						}
+						oldTicker.Stop()
+						t = time.NewTicker(newInterval)
+						slog.Info("ollama health: entering backoff mode",
+							slog.Float64("interval_seconds", newInterval.Seconds()),
+						)
+					}
+				}
+				h.mu.Unlock()
+			}
 		}
 	}
 }
@@ -315,6 +385,18 @@ func (h *Health) recordFailure(err error) {
 			)
 		}
 		h.healthy.Store(false)
+		// Update currentInterval based on failure count tier.
+		// Tier 0 (count 1-2): 1x, Tier 1 (count 3-4): 2x,
+		// Tier 2 (count 5-6): 4x, Tier 3 (count 7-8): 8x, Tier 4+: 15x.
+		tier := (int(count) - 1) >> 1
+		if tier < 0 {
+			tier = 0
+		}
+		multiplier := int64(1 << tier)
+		if multiplier > maxBackoffMultiplier {
+			multiplier = maxBackoffMultiplier
+		}
+		h.currentInterval.Store(int64(h.pollInterval * time.Duration(multiplier)))
 		return
 	}
 	if wasHealthy {
@@ -339,6 +421,8 @@ func (h *Health) recordSuccess() {
 		)
 	}
 	h.failureCount.Store(0)
+	h.currentInterval.Store(int64(h.pollInterval))
+	h.lastTier.Store(0)
 }
 
 // Close stops the background poller and waits for the loop goroutine
