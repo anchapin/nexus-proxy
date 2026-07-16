@@ -37,6 +37,8 @@ func (e constEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
 }
 
 func (e constEmbedder) IsHealthy(context.Context) bool { return true }
+func (e constEmbedder) IsBreakerOpen() bool            { return false }
+func (e constEmbedder) RecordBreakerSuccess()          {}
 
 // BenchmarkCosineSimilarity measures the raw dot-product + norm
 // computation at the default 768-dimension embedding width. This is

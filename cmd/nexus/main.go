@@ -51,6 +51,16 @@ const (
 // local `make build` without any special setup.
 var version = "dev"
 
+// circuitBreakerAdapter bridges the chat handler's CircuitBreakerObserver
+// calls into the observability Collector (issue #304).
+type circuitBreakerAdapter struct {
+	recordFailure  func(string)
+	recordRecovery func(string)
+}
+
+func (a circuitBreakerAdapter) RecordCircuitFailure(circuit string)  { a.recordFailure(circuit) }
+func (a circuitBreakerAdapter) RecordCircuitRecovery(circuit string) { a.recordRecovery(circuit) }
+
 func main() {
 	startTime := time.Now()
 
@@ -328,6 +338,11 @@ func main() {
 	// judge and quality observers can reference it; mux.Handle and the
 	// Handler() call stay in the late-setup block below.
 	routeCounters := observability.NewRouteCounters()
+
+	// Circuit breaker metrics collector (issue #304). Created early so it
+	// is available for wiring into the chat handler Deps.
+	circuitCollector := observability.NewCollector()
+
 	if cfg.JudgeEnabled && cfg.JudgeAPIKey != "" {
 		evalCfg := judge.Config{
 			URL:         cfg.JudgeURL,
@@ -705,6 +720,14 @@ func main() {
 		slog.Info("slm decision cache disabled (NEXUS_SLMCACHE_TTL<=0)")
 	}
 
+	// Wire circuit breaker metrics into the /metrics output (issue #304).
+	routeCounters.SetCollector(circuitCollector)
+
+	circuitBreakerObs := circuitBreakerAdapter{
+		recordFailure:  circuitCollector.RecordCircuitFailure,
+		recordRecovery: circuitCollector.RecordCircuitRecovery,
+	}
+
 	chatHandler := handlers.Chat(handlers.Deps{
 		Config:                  cfg,
 		Client:                  httpClient,
@@ -730,6 +753,7 @@ func main() {
 		CascadeFallbackObserver: cascadeFallbackObs,
 		ArbiterCacheObserver:    arbiterCacheObserver,
 		PanelPanicObserver:      panelPanicObs,
+		CircuitBreakerObserver:  circuitBreakerObs,
 		ArbiterCache:            arbiterCache,
 		Providers:               providerRegistry,
 	})

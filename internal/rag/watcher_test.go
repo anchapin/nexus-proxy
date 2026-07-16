@@ -27,6 +27,8 @@ func (r *recordingEmbedder) Embed(_ context.Context, text string) ([]float64, er
 }
 
 func (r *recordingEmbedder) IsHealthy(context.Context) bool { return true }
+func (r *recordingEmbedder) IsBreakerOpen() bool            { return false }
+func (r *recordingEmbedder) RecordBreakerSuccess()          {}
 
 func (r *recordingEmbedder) Called() []string {
 	r.mu.Lock()

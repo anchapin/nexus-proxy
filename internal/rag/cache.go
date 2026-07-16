@@ -94,3 +94,18 @@ func (c *CachedEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 func (c *CachedEmbedder) IsHealthy(ctx context.Context) bool {
 	return c.inner.IsHealthy(ctx)
 }
+
+// IsBreakerOpen delegates to the wrapped embedder (issue #304).
+func (c *CachedEmbedder) IsBreakerOpen() bool {
+	if e, ok := c.inner.(interface{ IsBreakerOpen() bool }); ok {
+		return e.IsBreakerOpen()
+	}
+	return false
+}
+
+// RecordBreakerSuccess delegates to the wrapped embedder (issue #304).
+func (c *CachedEmbedder) RecordBreakerSuccess() {
+	if e, ok := c.inner.(interface{ RecordBreakerSuccess() }); ok {
+		e.RecordBreakerSuccess()
+	}
+}

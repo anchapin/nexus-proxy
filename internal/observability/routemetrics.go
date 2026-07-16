@@ -128,6 +128,10 @@ type RouteCounters struct {
 	// Panel panic counter (issue #309). Bumped when a panel goroutine
 	// recovers from a panic and returns a panic error.
 	panelPanics uint64 // atomic
+
+	// collector is an optional Collector whose CircuitBreakerGauges()
+	// are merged into the /metrics output when non-nil.
+	collector *Collector
 }
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
@@ -430,12 +434,22 @@ func (rc *RouteCounters) slot(m map[counterKey]*uint64, key counterKey) *uint64 
 // Handler returns an http.Handler that writes the Prometheus text
 // exposition. The handler sets Content-Type to the Prometheus text
 // format and never errors — a scrape always returns 200 with the
-// current counter snapshot.
+// current counter snapshot. When a Collector is set (via SetCollector),
+// circuit breaker gauges from the collector are also included.
 func (rc *RouteCounters) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		_, _ = rc.WriteTo(w)
+		if rc.collector != nil {
+			RenderPrometheus(w, rc.collector)
+		}
 	})
+}
+
+// SetCollector attaches a Collector whose circuit breaker gauges are
+// included in the /metrics output. Nil clears the collector.
+func (rc *RouteCounters) SetCollector(c *Collector) {
+	rc.collector = c
 }
 
 // Snapshot returns a point-in-time copy of the routing decision counters

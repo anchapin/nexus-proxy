@@ -297,6 +297,23 @@ type CascadeFallbackObserverFunc func(CascadeFallbackEvent)
 // ObserveCascadeFallback implements CascadeFallbackObserver.
 func (f CascadeFallbackObserverFunc) ObserveCascadeFallback(e CascadeFallbackEvent) { f(e) }
 
+// CircuitBreakerObserver is notified when a circuit breaker's state
+// changes. Used to update circuit breaker Prometheus gauges (issue #304).
+type CircuitBreakerObserver interface {
+	RecordCircuitFailure(circuit string)
+	RecordCircuitRecovery(circuit string)
+}
+
+// CircuitBreakerObserverFunc adapts a plain function to the
+// CircuitBreakerObserver interface.
+type CircuitBreakerObserverFunc func(circuit string)
+
+// RecordCircuitFailure implements CircuitBreakerObserver.
+func (f CircuitBreakerObserverFunc) RecordCircuitFailure(circuit string) { f(circuit) }
+
+// RecordCircuitRecovery implements CircuitBreakerObserver.
+func (f CircuitBreakerObserverFunc) RecordCircuitRecovery(circuit string) { f(circuit) }
+
 // MetricsEvent carries the per-request data needed by the savings
 // dashboard (issue #4). Fields track the full round-trip metrics:
 // route/model/input-tokens are routing dimensions; TOON/RAG/cost are
@@ -659,6 +676,12 @@ type Deps struct {
 	// to the pre-issue-#223 behaviour.
 	Providers *providers.ProviderRegistry
 
+	// CircuitBreakerObserver is notified when the local (Ollama) or
+	// RAG circuit breaker changes state (issue #304). Nil means
+	// circuit breaker metrics are not recorded. The hot path is
+	// unaffected when nil.
+	CircuitBreakerObserver CircuitBreakerObserver
+
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
 	// copy used for sampling is bounded. Zero uses DefaultObservedCap.
@@ -882,6 +905,13 @@ func Chat(d Deps) http.Handler {
 			if d.RAGObserver != nil {
 				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "embed_error"})
 			}
+			// Record circuit failure for rag only when the circuit is open
+			// (transient embed errors are not circuit breaker events).
+			if d.CircuitBreakerObserver != nil {
+				if s, ok := d.RAG.(interface{ IsBreakerOpen() bool }); ok && s.IsBreakerOpen() {
+					d.CircuitBreakerObserver.RecordCircuitFailure("rag")
+				}
+			}
 		case ragEx != nil:
 			messages = middleware.InjectRAG(messages, rag.FormatInjection(ragEx))
 			slog.Info("rag hit",
@@ -893,6 +923,14 @@ func Chat(d Deps) http.Handler {
 			ragFilename = ragEx.Filename
 			if d.RAGObserver != nil {
 				d.RAGObserver.ObserveRAG(RAGEvent{Hit: true, Filename: ragEx.Filename})
+			}
+			if d.CircuitBreakerObserver != nil {
+				d.CircuitBreakerObserver.RecordCircuitRecovery("rag")
+			}
+			// Reset the RAG embedder's circuit breaker failure counter on
+			// a successful retrieval (issue #304).
+			if s, ok := d.RAG.(interface{ RecordBreakerSuccess() }); ok {
+				s.RecordBreakerSuccess()
 			}
 		case d.RAG.Size() == 0:
 			slog.Info("rag miss",
@@ -1393,6 +1431,9 @@ func Chat(d Deps) http.Handler {
 				// local timeouts until the health poller catches up.
 				if res.LocalStepFailed && d.LocalCooldown != nil {
 					d.LocalCooldown.RecordFailure()
+					if d.CircuitBreakerObserver != nil {
+						d.CircuitBreakerObserver.RecordCircuitFailure("ollama")
+					}
 					slog.Warn("local-route cooldown armed after cascade local failure",
 						slog.String("route_attempted", res.RouteAttempted),
 						slog.String("served_by", res.ServedBy),
@@ -1477,6 +1518,9 @@ func Chat(d Deps) http.Handler {
 					// request skips local and goes to the fallback.
 					if !skipLocal && d.LocalCooldown != nil {
 						d.LocalCooldown.RecordFailure()
+						if d.CircuitBreakerObserver != nil {
+							d.CircuitBreakerObserver.RecordCircuitFailure("ollama")
+						}
 					}
 				} else {
 					model = d.Config.LocalModel

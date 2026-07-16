@@ -34,6 +34,8 @@ func (s stubEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
 }
 
 func (s stubEmbedder) IsHealthy(context.Context) bool { return true }
+func (s stubEmbedder) IsBreakerOpen() bool            { return false }
+func (s stubEmbedder) RecordBreakerSuccess()          {}
 
 func baseDeps(t *testing.T) (Deps, *upstream.RecordingTransport) {
 	t.Helper()

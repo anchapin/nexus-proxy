@@ -53,6 +53,13 @@ type FewShotExample struct {
 type Embedder interface {
 	Embed(ctx context.Context, text string) ([]float64, error)
 	IsHealthy(ctx context.Context) bool
+	// IsBreakerOpen is implemented by OllamaEmbedder to expose circuit
+	// breaker state. It returns false for embedders that do not have a
+	// circuit breaker (issue #304).
+	IsBreakerOpen() bool
+	// RecordBreakerSuccess resets the OllamaEmbedder failure counter on a
+	// successful embedding. No-op for embedders without a breaker.
+	RecordBreakerSuccess()
 }
 
 // embedCacheEntry pairs a prompt embedding with its expiry time so TTL-based
@@ -229,6 +236,25 @@ func (c *EmbedCache) IsHealthy(ctx context.Context) bool {
 	return c.inner.IsHealthy(ctx)
 }
 
+// IsBreakerOpen delegates to the wrapped embedder's circuit breaker state
+// (issue #304). Returns false when the inner embedder does not implement
+// the method.
+func (c *EmbedCache) IsBreakerOpen() bool {
+	if e, ok := c.inner.(interface{ IsBreakerOpen() bool }); ok {
+		return e.IsBreakerOpen()
+	}
+	return false
+}
+
+// RecordBreakerSuccess delegates to the wrapped embedder's circuit breaker
+// success handler (issue #304). No-op when the inner embedder does not
+// implement the method.
+func (c *EmbedCache) RecordBreakerSuccess() {
+	if e, ok := c.inner.(interface{ RecordBreakerSuccess() }); ok {
+		e.RecordBreakerSuccess()
+	}
+}
+
 // RAGStore is the read+seed API the chat handler depends on. PersistentStore
 // (issue #46) embeds *Store and implements the same surface; the handler
 // is unaffected because both types satisfy this interface.
@@ -237,6 +263,12 @@ type RAGStore interface {
 	Add(filename, content string, embedding []float64)
 	Size() int
 	Threshold() float64
+	// IsBreakerOpen returns true when the RAG embedder's circuit breaker
+	// has tripped and is blocking requests (issue #304).
+	IsBreakerOpen() bool
+	// RecordBreakerSuccess notifies the embedder's circuit breaker of a
+	// successful retrieval so the failure counter is reset (issue #304).
+	RecordBreakerSuccess()
 }
 
 // EmbedCacheStats is the observability surface for the prompt embedding cache.
@@ -485,6 +517,25 @@ func (s *Store) Add(filename, content string, embedding []float64) {
 	})
 }
 
+// IsBreakerOpen delegates to the underlying embedder's circuit breaker
+// state (issue #304). Returns false when the embedder does not implement
+// the method.
+func (s *Store) IsBreakerOpen() bool {
+	if e, ok := s.embedder.(interface{ IsBreakerOpen() bool }); ok {
+		return e.IsBreakerOpen()
+	}
+	return false
+}
+
+// RecordBreakerSuccess delegates to the underlying embedder's circuit
+// breaker success handler (issue #304). No-op when the embedder does not
+// implement the method.
+func (s *Store) RecordBreakerSuccess() {
+	if e, ok := s.embedder.(interface{ RecordBreakerSuccess() }); ok {
+		e.RecordBreakerSuccess()
+	}
+}
+
 // replace swaps the entire examples slice atomically. Used by
 // PersistentStore.Load to populate from SQLite on boot and by the
 // watcher after a deletion; the caller passes the new slice, this
@@ -687,6 +738,12 @@ func (o *OpenAIEmbedder) IsHealthy(ctx context.Context) bool {
 	return err == nil
 }
 
+// IsBreakerOpen returns false for OpenAIEmbedder (no circuit breaker, issue #304).
+func (o *OpenAIEmbedder) IsBreakerOpen() bool { return false }
+
+// RecordBreakerSuccess is a no-op for OpenAIEmbedder (issue #304).
+func (o *OpenAIEmbedder) RecordBreakerSuccess() {}
+
 // CohereEmbedder calls the Cohere /v1/embed endpoint. It is safe for
 // concurrent use via a shared http.Client.
 type CohereEmbedder struct {
@@ -746,6 +803,12 @@ func (c *CohereEmbedder) IsHealthy(ctx context.Context) bool {
 	_, err := c.Embed(ctx, "health")
 	return err == nil
 }
+
+// IsBreakerOpen returns false for CohereEmbedder (no circuit breaker, issue #304).
+func (c *CohereEmbedder) IsBreakerOpen() bool { return false }
+
+// RecordBreakerSuccess is a no-op for CohereEmbedder (issue #304).
+func (c *CohereEmbedder) RecordBreakerSuccess() {}
 
 // EmbedderType is the discriminator for the embedder factory.
 type EmbedderType string
@@ -831,6 +894,13 @@ func (o *OllamaEmbedder) recordSuccess() {
 // for the Prometheus gauge provider in main.go.
 func (o *OllamaEmbedder) FailureCount() int {
 	return int(o.failureCount.Load())
+}
+
+// RecordBreakerSuccess resets the circuit breaker failure counter. Called
+// by the chat handler when a RAG retrieval succeeds so the breaker does
+// not remain open after transient failures (issue #304).
+func (o *OllamaEmbedder) RecordBreakerSuccess() {
+	o.recordSuccess()
 }
 
 // IsBreakerOpen reports whether the circuit is currently in the open

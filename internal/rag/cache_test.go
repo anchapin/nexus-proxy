@@ -29,6 +29,8 @@ func (c *countingEmbedder) Embed(_ context.Context, text string) ([]float64, err
 }
 
 func (c *countingEmbedder) IsHealthy(context.Context) bool { return true }
+func (c *countingEmbedder) IsBreakerOpen() bool            { return false }
+func (c *countingEmbedder) RecordBreakerSuccess()          {}
 
 func (c *countingEmbedder) callCount(text string) int {
 	c.mu.Lock()
