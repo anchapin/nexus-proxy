@@ -387,6 +387,14 @@ type Config struct {
 	TrustedProxiesRaw string
 	RateLimitRPM      int
 	RateLimitBurst    int
+
+	// Readiness mode for /readyz (issue #302). Controls whether the
+	// readiness probe returns 503 when Ollama is down (strict) or
+	// always returns 200 while surfacing the degraded flag (degraded,
+	// the default). Unknown values fail validation at boot rather
+	// than silently falling back, so a typo in NEXUS_READINESS_MODE
+	// is caught immediately instead of producing an indeterminate state.
+	ReadinessMode string
 }
 
 // DefaultMetricsDBPath returns the canonical metrics DB location:
@@ -1098,7 +1106,31 @@ func Load() (Config, error) {
 	}
 	cfg.RateLimitBurst = rateBurst
 
+	// Readiness mode for /readyz (issue #302). Controls whether the
+	// readiness probe returns 503 when Ollama is down (strict) or
+	// always returns 200 while surfacing the degraded flag (degraded,
+	// the default). Unrecognised values fail boot rather than silently
+	// falling back.
+	cfg.ReadinessMode = getEnv("NEXUS_READINESS_MODE", "degraded")
+
+	if err := cfg.Validate(); err != nil {
+		return cfg, err
+	}
 	return cfg, nil
+}
+
+// Validate checks that the loaded configuration is internally consistent
+// and that all enum-like fields contain recognised values. It is called
+// automatically at the end of Load(); unit tests that construct a Config
+// directly should call it before use.
+func (c Config) Validate() error {
+	switch c.ReadinessMode {
+	case "strict", "degraded":
+		// Recognised values.
+	default:
+		return fmt.Errorf("config: NEXUS_READINESS_MODE value %q is not recognised; want \"strict\" or \"degraded\"", c.ReadinessMode)
+	}
+	return nil
 }
 
 // FrontierEnabled reports whether a frontier API key is configured. The proxy

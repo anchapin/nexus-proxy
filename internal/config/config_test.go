@@ -899,3 +899,68 @@ func TestReloadHotReloadable_PreservesNonReloadable(t *testing.T) {
 	// Reload would be called with a fresh prev in the SIGHUP handler,
 	// so we verify the returned cfg preserves non-reloadable fields.
 }
+
+func TestReadinessModeValidation(t *testing.T) {
+	tests := []struct {
+		name     string
+		envValue string
+		wantErr  bool
+		wantMode string
+	}{
+		{
+			name:     "default degraded",
+			envValue: "",
+			wantErr:  false,
+			wantMode: "degraded",
+		},
+		{
+			name:     "strict",
+			envValue: "strict",
+			wantErr:  false,
+			wantMode: "strict",
+		},
+		{
+			name:     "degraded explicit",
+			envValue: "degraded",
+			wantErr:  false,
+			wantMode: "degraded",
+		},
+		{
+			name:     "unknown value fails validation",
+			envValue: "unknown",
+			wantErr:  true,
+			wantMode: "",
+		},
+		{
+			name:     "strict with whitespace fails",
+			envValue: " strict ",
+			wantErr:  true,
+			wantMode: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.envValue != "" {
+				t.Setenv("NEXUS_READINESS_MODE", tc.envValue)
+			} else {
+				t.Setenv("NEXUS_READINESS_MODE", "")
+			}
+
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("Load() with NEXUS_READINESS_MODE=%q = %+v, want error", tc.envValue, cfg)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("Load() with NEXUS_READINESS_MODE=%q returned error: %v", tc.envValue, err)
+				return
+			}
+			if cfg.ReadinessMode != tc.wantMode {
+				t.Errorf("cfg.ReadinessMode = %q, want %q", cfg.ReadinessMode, tc.wantMode)
+			}
+		})
+	}
+}
