@@ -1,5 +1,7 @@
 package tracing
 
+import "context"
+
 // Propagation helpers for the W3C Trace Context `traceparent`
 // header. The header is the only propagation format this package
 // understands; future support for `tracestate` (vendor-specific
@@ -17,4 +19,22 @@ package tracing
 // correlation".
 func InjectTraceparent(ctx Context) string {
 	return FormatTraceparent(ctx.TraceID, ctx.SpanID)
+}
+
+// TraceparentFromContext extracts the active tracing Context from ctx
+// (via SpanContextFromContext) and returns the W3C traceparent header
+// value formatted via FormatTraceparent. Returns "" when ctx carries
+// no trace id so callers can skip setting the header entirely.
+//
+// This is the outbound-context helper the upstream package uses to
+// propagate trace context to Ollama and frontier endpoints (issue #299).
+func TraceparentFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	tc, ok := SpanContextFromContext(ctx)
+	if !ok {
+		return ""
+	}
+	return InjectTraceparent(tc)
 }

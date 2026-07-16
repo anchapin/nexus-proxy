@@ -83,6 +83,34 @@ type LatencyObserverFunc func(LatencyEvent)
 // ObserveLatency implements LatencyObserver.
 func (f LatencyObserverFunc) ObserveLatency(e LatencyEvent) { f(e) }
 
+// PipelineStageEvent carries per-stage timing breakdown for a single
+// request (issue #300). Each field is integer milliseconds spent in
+// that pipeline stage; 0 when the stage was skipped or not applicable.
+type PipelineStageEvent struct {
+	RAGRetrievalMs      int64
+	PromptEngineeringMs int64
+	TOONCompressionMs   int64
+	SLMRoutingMs        int64
+	UpstreamFirstByteMs int64 // TTFT minus all proxy overhead stages
+}
+
+// PipelineStageObserver is called after each request completes with
+// per-stage timing breakdown (issue #300). Implementations use the
+// timings to populate histograms for the /metrics endpoint. Safe
+// for concurrent use; the handler invokes Observe on the same
+// request goroutine so observers should not block for long.
+type PipelineStageObserver interface {
+	ObservePipelineStage(PipelineStageEvent)
+}
+
+// PipelineStageObserverFunc adapts a plain function to the
+// PipelineStageObserver interface so wiring from main.go stays a
+// one-liner.
+type PipelineStageObserverFunc func(PipelineStageEvent)
+
+// ObservePipelineStage implements PipelineStageObserver.
+func (f PipelineStageObserverFunc) ObservePipelineStage(e PipelineStageEvent) { f(e) }
+
 // StreamTruncationEvent is emitted when a streaming response is
 // truncated mid-stream by the cascade timeout.
 type StreamTruncationEvent struct {
@@ -515,6 +543,7 @@ type Deps struct {
 	// a closure that adapts LocalCompletion to the judge's
 	// Sample/Enqueue entry points.
 	LatencyObserver          LatencyObserver
+	PipelineStageObserver    PipelineStageObserver
 	StreamTruncationObserver StreamTruncationObserver
 	JudgeObserver            JudgeObserver
 
@@ -756,6 +785,16 @@ func Chat(d Deps) http.Handler {
 		reqID := requestID(r)
 		started := time.Now()
 
+		// Per-stage timing breakdown (issue #300). Captured using
+		// time.Since(started) after each pipeline stage so the
+		// observer can populate histograms.
+		var (
+			promptEngineeringMs int64
+			ragRetrievalMs      int64
+			toonCompressionMs   int64
+			slmRoutingMs        int64
+		)
+
 		// Debug trace scaffolding (issue #33). Allocated up front so
 		// each lifecycle step can populate its sub-trace; emitted as
 		// a single batch at the very end. The trace variable is a
@@ -900,6 +939,7 @@ func Chat(d Deps) http.Handler {
 		} else {
 			messages = middleware.ApplyPromptEngineering(messages, d.Config.MetaPrompt)
 		}
+		promptEngineeringMs = time.Since(started).Milliseconds()
 		latestPrompt := middleware.ExtractLatestUserPrompt(messages)
 
 		// Record whether the meta-prompt actually appended to a
@@ -980,6 +1020,7 @@ func Chat(d Deps) http.Handler {
 		if statsProvider, ok := d.RAG.(rag.RAGCacheStatsProvider); ok {
 			cacheHit = statsProvider.EmbedHitCount() > cacheHitCountBefore
 		}
+		ragRetrievalMs = time.Since(started).Milliseconds() - promptEngineeringMs
 		trace.Transforms.RAGInjected = ragInjected
 		trace.Transforms.RAGFilename = ragFilename
 		trace.Transforms.RAGCacheHit = cacheHit
@@ -1017,6 +1058,7 @@ func Chat(d Deps) http.Handler {
 		// TransformTrace; the post-middleware count lives on the
 		// RequestTrace because it is what every later stage sees.
 		trace.Request.EstimatedTokens = len(latestPrompt) / 4
+		toonCompressionMs = time.Since(started).Milliseconds() - promptEngineeringMs - ragRetrievalMs
 
 		// --- routing decision (issue #82) ---------------------------------
 		//
@@ -1059,6 +1101,7 @@ func Chat(d Deps) http.Handler {
 			GuardrailSource: guardrailSource,
 			Context:         r.Context(),
 		})
+		slmRoutingMs = time.Since(started).Milliseconds() - promptEngineeringMs - ragRetrievalMs - toonCompressionMs
 		route := decision.Route
 
 		// Surface route-decision metadata on the response and via the
@@ -1742,6 +1785,20 @@ func Chat(d Deps) http.Handler {
 				LatencySeconds: totalMs / 1000.0,
 				TTFTSeconds:    ttftSecs,
 				IsError:        isErr,
+			})
+		}
+
+		// PipelineStageObserver (issue #300): fire after all stages complete
+		// so the collector can populate per-stage latency histograms.
+		// upstreamFirstByteMs = ttftMs covers "time to first byte from upstream"
+		// which is the last pipeline stage after all proxy overhead.
+		if d.PipelineStageObserver != nil {
+			d.PipelineStageObserver.ObservePipelineStage(PipelineStageEvent{
+				RAGRetrievalMs:      ragRetrievalMs,
+				PromptEngineeringMs: promptEngineeringMs,
+				TOONCompressionMs:   toonCompressionMs,
+				SLMRoutingMs:        slmRoutingMs,
+				UpstreamFirstByteMs: ttftMs,
 			})
 		}
 

@@ -13,6 +13,7 @@ package observability
 
 import (
 	"math"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,6 +58,15 @@ type ObservabilityEvent struct {
 	// Latency dimensions. TTFTMs is 0 for non-streaming responses.
 	TotalLatencyMs int64
 	TTFTMs         int64
+
+	// Per-stage latency breakdown (issue #300). Each field is the
+	// wall-clock milliseconds spent in that pipeline stage. 0 when
+	// the stage was skipped or not applicable.
+	RAGRetrievalMs      int64 // RAG embedding + retrieval
+	PromptEngineeringMs int64 // meta-prompt injection
+	TOONCompressionMs   int64 // JSON array compression
+	SLMRoutingMs        int64 // SLM routing decision (including DSL fast-pass)
+	UpstreamFirstByteMs int64 // upstream call to first byte (TTFT minus proxy overhead)
 }
 
 // Collector is the in-process metrics surface. It is safe for
@@ -97,6 +107,14 @@ type Collector struct {
 	ttftLocal       *Histogram
 	ttftFrontier    *Histogram
 	ttftFusion      *Histogram
+
+	// Per-stage pipeline latency histograms (issue #300).
+	// Labelled by stage: rag, prompt_eng, toon, slm, upstream.
+	stageRAG       *Histogram
+	stagePromptEng *Histogram
+	stageTOON      *Histogram
+	stageSLM       *Histogram
+	stageUpstream  *Histogram
 
 	// --- Middleware instrumentation (issue #70) ---------------------------
 	//
@@ -154,8 +172,9 @@ const (
 )
 
 // NewCollector constructs a Collector with the default latency and TTFT
-// histograms for each route. The returned collector is ready to receive
-// Submit calls and RenderPrometheus scrapes from any goroutine.
+// histograms for each route and per-stage pipeline histograms (issue #300).
+// The returned collector is ready to receive Submit calls and
+// RenderPrometheus scrapes from any goroutine.
 func NewCollector() *Collector {
 	return &Collector{
 		latencyLocal:    NewHistogram(DefaultBuckets),
@@ -164,6 +183,11 @@ func NewCollector() *Collector {
 		ttftLocal:       NewHistogram(DefaultBuckets),
 		ttftFrontier:    NewHistogram(DefaultBuckets),
 		ttftFusion:      NewHistogram(DefaultBuckets),
+		stageRAG:        NewHistogram(DefaultBuckets),
+		stagePromptEng:  NewHistogram(DefaultBuckets),
+		stageTOON:       NewHistogram(DefaultBuckets),
+		stageSLM:        NewHistogram(DefaultBuckets),
+		stageUpstream:   NewHistogram(DefaultBuckets),
 	}
 }
 
@@ -225,6 +249,22 @@ func (c *Collector) Submit(e ObservabilityEvent) {
 	}
 	if e.TTFTMs > 0 && ttftHist != nil {
 		ttftHist.Observe(float64(e.TTFTMs))
+	}
+	// Per-stage pipeline latency histograms (issue #300).
+	if e.RAGRetrievalMs > 0 {
+		c.stageRAG.Observe(float64(e.RAGRetrievalMs))
+	}
+	if e.PromptEngineeringMs > 0 {
+		c.stagePromptEng.Observe(float64(e.PromptEngineeringMs))
+	}
+	if e.TOONCompressionMs > 0 {
+		c.stageTOON.Observe(float64(e.TOONCompressionMs))
+	}
+	if e.SLMRoutingMs > 0 {
+		c.stageSLM.Observe(float64(e.SLMRoutingMs))
+	}
+	if e.UpstreamFirstByteMs > 0 {
+		c.stageUpstream.Observe(float64(e.UpstreamFirstByteMs))
 	}
 }
 
@@ -428,6 +468,51 @@ func (c *Collector) getOrCreateCircuit(name string) *circuitBreakerState {
 	}
 	return c.cbState[name]
 }
+
+// --- Pipeline stage latency breakdown (issue #300) -------------------
+//
+// ObservePipelineStage records per-stage timing breakdown from the chat
+// handler (issue #300). Each field is milliseconds spent in that stage;
+// 0 when the stage was skipped. Safe for concurrent use.
+func (c *Collector) ObservePipelineStage(e PipelineStageEvent) {
+	if e.RAGRetrievalMs > 0 {
+		c.stageRAG.Observe(float64(e.RAGRetrievalMs))
+	}
+	if e.PromptEngineeringMs > 0 {
+		c.stagePromptEng.Observe(float64(e.PromptEngineeringMs))
+	}
+	if e.TOONCompressionMs > 0 {
+		c.stageTOON.Observe(float64(e.TOONCompressionMs))
+	}
+	if e.SLMRoutingMs > 0 {
+		c.stageSLM.Observe(float64(e.SLMRoutingMs))
+	}
+	if e.UpstreamFirstByteMs > 0 {
+		c.stageUpstream.Observe(float64(e.UpstreamFirstByteMs))
+	}
+}
+
+// PipelineStageEvent mirrors handlers.PipelineStageEvent so the
+// collector stays independent of the handlers package.
+type PipelineStageEvent struct {
+	RAGRetrievalMs      int64
+	PromptEngineeringMs int64
+	TOONCompressionMs   int64
+	SLMRoutingMs        int64
+	UpstreamFirstByteMs int64
+}
+
+// Handler returns an http.Handler that renders stage latency histograms
+// in Prometheus text format. Used by the /metrics endpoint to expose
+// nexus_pipeline_stage_latency_ms (issue #300).
+func (c *Collector) Handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		RenderPrometheus(w, c)
+	})
+}
+
+// Histogram}
 
 // Histogram is a fixed-bucket cumulative histogram. Buckets are
 // pre-allocated at construction; Observe performs a single linear scan
