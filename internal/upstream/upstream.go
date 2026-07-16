@@ -14,7 +14,14 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/observability"
 )
+
+// defaultMaxResponseBytes is the default cap on upstream response bodies.
+// It is used by ReadAllLimited to prevent memory exhaustion (issue #365).
+// The chat handler's Config.MaxResponseBytes takes precedence when set.
+const defaultMaxResponseBytes = 64 << 20 // 64 MiB
 
 // Client is the minimal interface used by the stream and fusion helpers. The
 // default http.Client satisfies it; tests can pass a stub.
@@ -138,7 +145,7 @@ func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client
 		return fmt.Errorf("upstream: do: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, _ := observability.ReadAllLimited(nil, resp.Body, defaultMaxResponseBytes)
 
 	// Validate the upstream body is a single JSON object. A misbehaving
 	// upstream returning HTML or plain text would otherwise propagate
@@ -197,7 +204,7 @@ func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName
 		return AssistantMessage{}, fmt.Errorf("fusion: do: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, _ := observability.ReadAllLimited(nil, resp.Body, defaultMaxResponseBytes)
 	if resp.StatusCode != http.StatusOK {
 		return AssistantMessage{}, fmt.Errorf("fusion: %s status %d: %s", modelName, resp.StatusCode, respBody)
 	}

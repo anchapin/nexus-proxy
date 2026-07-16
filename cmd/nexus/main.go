@@ -489,6 +489,7 @@ func main() {
 	// RouteCounters.Handler() so a scrape is always an atomic
 	// snapshot.
 	routeCounters := observability.NewRouteCounters()
+	routeCounters.SetGlobalTruncationCounter() // issue #365
 	routeDecisionObs := handlers.RouteDecisionObserverFunc(func(e handlers.RouteDecisionEvent) {
 		routeCounters.Observe(e.Route, e.Source, e.Confidence, e.TaskType, "")
 	})

@@ -14,14 +14,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/anchapin/nexus-proxy/internal/observability"
 )
+
+// defaultMaxResponseBytes is the default cap on upstream response bodies.
+// It is used by ReadAllLimited to prevent memory exhaustion (issue #365).
+const defaultMaxResponseBytes = 64 << 20 // 64 MiB
 
 // FewShotExample is one indexed code snippet with its embedding.
 type FewShotExample struct {
@@ -280,7 +285,7 @@ func (o *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := observability.ReadAllLimited(nil, resp.Body, defaultMaxResponseBytes)
 	if err != nil {
 		return nil, err
 	}

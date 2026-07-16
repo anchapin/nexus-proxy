@@ -38,6 +38,26 @@ const (
 	bucketNone   = "none" // guardrail / DSL / non-SLM sources
 )
 
+// responseTruncated is a package-level counter for truncated upstream
+// responses (issue #365). It is set by SetTruncationCounter and
+// incremented by IncrementTruncationCounter. When nil, increments are
+// no-ops.
+var responseTruncated *uint64
+
+// SetTruncationCounter configures the package-level truncation counter.
+// Called once at startup from main.go.
+func SetTruncationCounter(p *uint64) {
+	responseTruncated = p
+}
+
+// IncrementTruncationCounter atomically increments the truncation counter.
+// Safe for concurrent use. Nil counter is a no-op.
+func IncrementTruncationCounter() {
+	if responseTruncated != nil {
+		atomic.AddUint64(responseTruncated, 1)
+	}
+}
+
 // BucketConfidence collapses a raw SLM confidence into a short,
 // bounded-cardinality label. Non-SLM sources (guardrail, DSL) carry
 // no meaningful confidence, so callers should pass bucketNone by
@@ -95,6 +115,7 @@ type RouteCounters struct {
 	slmDecisions             map[counterKey]*uint64
 	lowConfidenceEscalations map[counterKey]*uint64
 	rejections               map[string]*uint64
+	responseTruncated        uint64 // nexus_upstream_response_truncated_total
 }
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
@@ -105,6 +126,14 @@ func NewRouteCounters() *RouteCounters {
 		lowConfidenceEscalations: make(map[counterKey]*uint64),
 		rejections:               make(map[string]*uint64),
 	}
+}
+
+// SetGlobalTruncationCounter sets the package-level truncation counter
+// to point at the RouteCounters' internal truncation counter. Called
+// once at startup so ReadAllLimited can increment the counter without
+// needing a *RouteCounters reference.
+func (rc *RouteCounters) SetGlobalTruncationCounter() {
+	SetTruncationCounter(&rc.responseTruncated)
 }
 
 // Observe records a single routing decision. Call this from the chat
@@ -178,6 +207,16 @@ func (rc *RouteCounters) ObserveRejection(reason string) {
 	atomic.AddUint64(rc.reasonSlot(reason), 1)
 }
 
+// ObserveResponseTruncated increments the counter for upstream responses
+// that were truncated because they exceeded MaxResponseBytes (issue #365).
+// Safe for concurrent use; nil receivers are a no-op.
+func (rc *RouteCounters) ObserveResponseTruncated() {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(&rc.responseTruncated, 1)
+}
+
 // reasonSlot returns the *uint64 for reason, creating it if absent.
 // Same lock-then-atomic pattern as slot: the mutex guards the map
 // mutation only, the increment happens lock-free.
@@ -191,6 +230,29 @@ func (rc *RouteCounters) reasonSlot(reason string) *uint64 {
 	}
 	rc.mu.Unlock()
 	return p
+}
+
+// ReadAllLimited reads from r with a byte limit of maxBytes. If the
+// response body is larger than maxBytes, the body is truncated and
+// ObserveResponseTruncated is called on rc (if non-nil) or the
+// package-level counter is incremented (issue #365). This prevents
+// memory exhaustion from a malicious upstream returning gigabytes.
+// The returned error is any read error encountered before hitting the
+// limit; a truncation itself is not treated as an error.
+func ReadAllLimited(rc *RouteCounters, r io.Reader, maxBytes int) ([]byte, error) {
+	lr := io.LimitReader(r, int64(maxBytes))
+	body, err := io.ReadAll(lr)
+	// If we read exactly maxBytes, the response was likely truncated.
+	// The edge case of a response that is exactly maxBytes is
+	// astronomically unlikely at 64 MiB.
+	if len(body) >= maxBytes {
+		if rc != nil {
+			rc.ObserveResponseTruncated()
+		} else {
+			IncrementTruncationCounter()
+		}
+	}
+	return body, err
 }
 
 // slot returns the *uint64 for key, creating it if absent. The
@@ -256,6 +318,23 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += n
 	}
+	// nexus_upstream_response_truncated_total (issue #365)
+	// Use the package-level counter if set; otherwise fall back to the
+	// RouteCounters instance counter (for backwards compatibility in tests).
+	var truncated uint64 = 0
+	if responseTruncated != nil {
+		truncated = atomic.LoadUint64(responseTruncated)
+	} else {
+		truncated = atomic.LoadUint64(&rc.responseTruncated)
+	}
+	n, err := fmt.Fprintf(w, "# HELP nexus_upstream_response_truncated_total %s\n# TYPE nexus_upstream_response_truncated_total counter\nnexus_upstream_response_truncated_total %d\n",
+		"Upstream responses truncated because they exceeded MaxResponseBytes.",
+		truncated)
+	if err != nil {
+		return total, err
+	}
+	total += int64(n)
+
 	return total, nil
 }
 

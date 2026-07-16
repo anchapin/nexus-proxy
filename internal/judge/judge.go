@@ -29,7 +29,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math/rand"
 	"net/http"
@@ -37,7 +36,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/observability"
 )
+
+// defaultMaxResponseBytes is the default cap on upstream response bodies.
+// It is used by ReadAllLimited to prevent memory exhaustion (issue #365).
+const defaultMaxResponseBytes = 64 << 20 // 64 MiB
 
 // Sample is the input that triggers one judge attempt: the original
 // user instruction and the model output we want scored. It is the
@@ -290,7 +295,7 @@ func (e *Evaluator) evaluateCtx(ctx context.Context, s Sample) JudgeScore {
 		return score
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := observability.ReadAllLimited(nil, resp.Body, defaultMaxResponseBytes)
 	if err != nil {
 		score.Err = fmt.Errorf("judge: read body: %w", err)
 		return score

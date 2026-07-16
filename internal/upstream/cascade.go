@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/observability"
 )
 
 // CascadeStep is one member of a Cascade: a single model endpoint the
@@ -216,7 +218,7 @@ func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payl
 		return AssistantMessage{}, "", newCascadeErr(true, "transport: %v", dErr)
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, _ := observability.ReadAllLimited(nil, resp.Body, defaultMaxResponseBytes)
 
 	if ShouldRetry(resp.StatusCode, nil) {
 		return AssistantMessage{}, "", newCascadeErr(true, "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
