@@ -1697,7 +1697,7 @@ func TestConfigureTimeouts(t *testing.T) {
 		t.Errorf("withDefaultArbiterTimeout(0) = %v, want 90s", got)
 	}
 	// Positive values are returned as-is.
-	if got := withDefaultArbiterTimeout(30*time.Second); got != 30*time.Second {
+	if got := withDefaultArbiterTimeout(30 * time.Second); got != 30*time.Second {
 		t.Errorf("withDefaultArbiterTimeout(30s) = %v, want 30s", got)
 	}
 
@@ -1706,7 +1706,7 @@ func TestConfigureTimeouts(t *testing.T) {
 		t.Errorf("withDefault(0) = %v, want 45s", got)
 	}
 	// Positive values are returned as-is.
-	if got := withDefault(10*time.Second); got != 10*time.Second {
+	if got := withDefault(10 * time.Second); got != 10*time.Second {
 		t.Errorf("withDefault(10s) = %v, want 10s", got)
 	}
 }
