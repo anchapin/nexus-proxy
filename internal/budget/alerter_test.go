@@ -1,6 +1,7 @@
 package budget
 
 import (
+	"context"
 	"log/slog"
 	"strings"
 	"testing"
@@ -13,7 +14,7 @@ func TestPrometheusAlerterOnExceed(t *testing.T) {
 	a := NewPrometheusAlerter(logger)
 
 	state := State{Spent: 95, Limit: 100, Remaining: 5, Exhausted: true}
-	a.OnExceed(state)
+	a.OnExceed(context.Background(), state)
 
 	if a.ExceedTotal() != 1 {
 		t.Errorf("ExceedTotal = %d, want 1", a.ExceedTotal())
@@ -30,7 +31,7 @@ func TestPrometheusAlerterOnApproaching(t *testing.T) {
 	a := NewPrometheusAlerter(logger)
 
 	state := State{Spent: 82, Limit: 100, Remaining: 18, Exhausted: false}
-	a.OnApproaching(state)
+	a.OnApproaching(context.Background(), state)
 
 	if a.ApproachingTotal() != 1 {
 		t.Errorf("ApproachingTotal = %d, want 1", a.ApproachingTotal())
@@ -45,7 +46,7 @@ func TestPrometheusAlerterOnSpend(t *testing.T) {
 	a := NewPrometheusAlerter(nil) // no logger
 
 	state := State{Spent: 10, Limit: 100, Remaining: 90, Exhausted: false}
-	a.OnSpend(state, 10.0, "frontier")
+	a.OnSpend(context.Background(), state, 10.0, "frontier")
 
 	if a.LastSpentAmount() != 10.0 {
 		t.Errorf("LastSpentAmount = %.2f, want 10.0", a.LastSpentAmount())
@@ -64,9 +65,9 @@ func TestPrometheusAlerterMultipleExceed(t *testing.T) {
 	a := NewPrometheusAlerter(nil)
 	state := State{Spent: 100, Limit: 100, Remaining: 0, Exhausted: true}
 
-	a.OnExceed(state)
-	a.OnExceed(state)
-	a.OnExceed(state)
+	a.OnExceed(context.Background(), state)
+	a.OnExceed(context.Background(), state)
+	a.OnExceed(context.Background(), state)
 
 	if a.ExceedTotal() != 3 {
 		t.Errorf("ExceedTotal = %d, want 3", a.ExceedTotal())
@@ -84,9 +85,9 @@ func TestPrometheusAlerterNilLoggerNoPanic(t *testing.T) {
 				t.Errorf("panic with nil logger: %v", r)
 			}
 		}()
-		a.OnExceed(state)
-		a.OnApproaching(state)
-		a.OnSpend(state, 5.0, "frontier")
+		a.OnExceed(context.Background(), state)
+		a.OnApproaching(context.Background(), state)
+		a.OnSpend(context.Background(), state, 5.0, "frontier")
 	}()
 }
 
@@ -95,10 +96,10 @@ func TestPrometheusAlerterStateAccess(t *testing.T) {
 	a := NewPrometheusAlerter(nil)
 
 	initial := State{Spent: 0, Limit: 100, Remaining: 100, Exhausted: false}
-	a.OnSpend(initial, 0, "frontier")
+	a.OnSpend(context.Background(), initial, 0, "frontier")
 
 	afterSpend := State{Spent: 25, Limit: 100, Remaining: 75, Exhausted: false}
-	a.OnSpend(afterSpend, 25.0, "frontier")
+	a.OnSpend(context.Background(), afterSpend, 25.0, "frontier")
 
 	got := a.State()
 	if got.Spent != 25.0 {

@@ -14,7 +14,7 @@ import (
 // update, when set via -update-golden, regenerates every testdata/
 // golden file from the current renderer output. Run:
 //
-//	go test ./cmd/nexus-dashboard -run TestGolden -update-golden
+//	go test ./cmd/nexus -run TestGolden -update-golden
 //
 // then review the diff before committing.
 var update = flag.Bool("update-golden", false, "regenerate testdata/ golden files")
@@ -99,15 +99,15 @@ func checkGolden(t *testing.T, name, got string) {
 }
 
 // TestGoldenSeededTable runs the full read path (seed → DailySummary →
-// renderTable) and golden-files the rendered table. A regression in
+// renderDashboardTable) and golden-files the rendered table. A regression in
 // the schema scan order, the renderer, or the cost formula all surface
 // here as a diff.
 func TestGoldenSeededTable(t *testing.T) {
 	path := seedStore(t)
 	sum := readDay(t, path, goldenDay)
 	var b strings.Builder
-	if err := renderTable([]metrics.Summary{sum}, 0.002, &b); err != nil {
-		t.Fatalf("renderTable: %v", err)
+	if err := renderDashboardTable([]metrics.Summary{sum}, 0.002, &b); err != nil {
+		t.Fatalf("renderDashboardTable: %v", err)
 	}
 	checkGolden(t, "seeded.golden", b.String())
 }
@@ -130,8 +130,8 @@ func TestGoldenEmptyTable(t *testing.T) {
 	}
 	sum := readDay(t, path, goldenDay)
 	var b strings.Builder
-	if err := renderTable([]metrics.Summary{sum}, 0.002, &b); err != nil {
-		t.Fatalf("renderTable: %v", err)
+	if err := renderDashboardTable([]metrics.Summary{sum}, 0.002, &b); err != nil {
+		t.Fatalf("renderDashboardTable: %v", err)
 	}
 	checkGolden(t, "empty.golden", b.String())
 }
@@ -143,8 +143,8 @@ func TestGoldenSeededJSON(t *testing.T) {
 	path := seedStore(t)
 	sum := readDay(t, path, goldenDay)
 	var b strings.Builder
-	if err := renderJSON([]metrics.Summary{sum}, 0.002, &b); err != nil {
-		t.Fatalf("renderJSON: %v", err)
+	if err := renderDashboardJSON([]metrics.Summary{sum}, 0.002, &b); err != nil {
+		t.Fatalf("renderDashboardJSON: %v", err)
 	}
 	checkGolden(t, "seeded.json", b.String())
 }

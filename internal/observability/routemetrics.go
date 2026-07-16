@@ -21,6 +21,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/anchapin/nexus-proxy/internal/ioutils"
 )
 
 // Confidence buckets. The SLM emits a float64 in [0,1]; we collapse
@@ -37,6 +39,26 @@ const (
 	bucketHigh   = "high"
 	bucketNone   = "none" // guardrail / DSL / non-SLM sources
 )
+
+// responseTruncated is a package-level counter for truncated upstream
+// responses (issue #365). It is set by SetTruncationCounter and
+// incremented by IncrementTruncationCounter. When nil, increments are
+// no-ops.
+var responseTruncated *uint64
+
+// SetTruncationCounter configures the package-level truncation counter.
+// Called once at startup from main.go.
+func SetTruncationCounter(p *uint64) {
+	responseTruncated = p
+}
+
+// IncrementTruncationCounter atomically increments the truncation counter.
+// Safe for concurrent use. Nil counter is a no-op.
+func IncrementTruncationCounter() {
+	if responseTruncated != nil {
+		atomic.AddUint64(responseTruncated, 1)
+	}
+}
 
 // BucketConfidence collapses a raw SLM confidence into a short,
 // bounded-cardinality label. Non-SLM sources (guardrail, DSL) carry
@@ -78,7 +100,7 @@ type counterKey struct {
 //   - nexus_route_decisions_total{route,source}
 //   - nexus_slm_decisions_total{route,confidence_bucket,task_type}
 //   - nexus_slm_low_confidence_escalations_total{task_type}
-//   - nexus_slm_cache_hits_total
+//   - nexus_slm_cache_hits_total{kind}
 //   - nexus_slm_cache_misses_total
 //
 // A fifth family (issue #119) records requests the proxy rejected
@@ -113,9 +135,10 @@ type RouteCounters struct {
 	routeDecisions           map[counterKey]*uint64
 	slmDecisions             map[counterKey]*uint64
 	lowConfidenceEscalations map[counterKey]*uint64
-	slmCacheHits             *uint64
+	slmCacheHits             map[string]*uint64 // "exact" | "semantic" (issue #352)
 	slmCacheMisses           *uint64
 	rejections               map[string]*uint64
+	responseTruncated        uint64 // nexus_upstream_response_truncated_total
 	fusionArbiter            map[string]*uint64
 	rRAGHits                 map[string]*uint64
 	rRAGMisses               map[string]*uint64
@@ -141,13 +164,13 @@ type RouteCounters struct {
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
 func NewRouteCounters() *RouteCounters {
-	hits, misses := uint64(0), uint64(0)
+	misses := uint64(0)
 	cHits, cMisses := uint64(0), uint64(0)
 	return &RouteCounters{
 		routeDecisions:           make(map[counterKey]*uint64),
 		slmDecisions:             make(map[counterKey]*uint64),
 		lowConfidenceEscalations: make(map[counterKey]*uint64),
-		slmCacheHits:             &hits,
+		slmCacheHits:             make(map[string]*uint64),
 		slmCacheMisses:           &misses,
 		rejections:               make(map[string]*uint64),
 		fusionArbiter:            make(map[string]*uint64),
@@ -159,6 +182,14 @@ func NewRouteCounters() *RouteCounters {
 		ragCacheHits:             &cHits,
 		ragCacheMisses:           &cMisses,
 	}
+}
+
+// SetGlobalTruncationCounter sets the package-level truncation counter
+// to point at the RouteCounters' internal truncation counter. Called
+// once at startup so ReadAllLimited can increment the counter without
+// needing a *RouteCounters reference.
+func (rc *RouteCounters) SetGlobalTruncationCounter() {
+	SetTruncationCounter(&rc.responseTruncated)
 }
 
 // Observe records a single routing decision. Call this from the chat
@@ -237,6 +268,16 @@ func (rc *RouteCounters) ObserveRejection(reason string) {
 		return
 	}
 	atomic.AddUint64(rc.reasonSlot(reason), 1)
+}
+
+// ObserveResponseTruncated increments the counter for upstream responses
+// that were truncated because they exceeded MaxResponseBytes (issue #365).
+// Safe for concurrent use; nil receivers are a no-op.
+func (rc *RouteCounters) ObserveResponseTruncated() {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(&rc.responseTruncated, 1)
 }
 
 // ObserveFusionOutcome records the outcome of a fusion panel after
@@ -334,15 +375,24 @@ func (rc *RouteCounters) ragMissSlot(reason string) *uint64 {
 }
 
 // ObserveSLMCacheHit records one SLM decision cache hit (issue #206).
-// The cache deduplicates identical prompts within a TTL window; a hit
-// means the same prompt was seen recently and the cached decision was
-// returned instead of calling the SLM. Safe for concurrent use; nil
-// receivers are a no-op.
-func (rc *RouteCounters) ObserveSLMCacheHit() {
+// kind is "exact" for an exact string match or "semantic" for a cosine-
+// similarity match (issue #245, #352). The cache deduplicates identical
+// prompts within a TTL window; a hit means the same prompt was seen
+// recently and the cached decision was returned instead of calling the
+// SLM. Safe for concurrent use; nil receivers are a no-op.
+func (rc *RouteCounters) ObserveSLMCacheHit(kind string) {
 	if rc == nil || rc.slmCacheHits == nil {
 		return
 	}
-	atomic.AddUint64(rc.slmCacheHits, 1)
+	rc.mu.Lock()
+	p, ok := rc.slmCacheHits[kind]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.slmCacheHits[kind] = p
+	}
+	rc.mu.Unlock()
+	atomic.AddUint64(p, 1)
 }
 
 // ObserveSLMCacheMiss records one SLM decision cache miss (issue #206).
@@ -433,6 +483,29 @@ func (rc *RouteCounters) reasonSlot(reason string) *uint64 {
 	}
 	rc.mu.Unlock()
 	return p
+}
+
+// ReadAllLimited reads from r with a byte limit of maxBytes. If the
+// response body is larger than maxBytes, the body is truncated and
+// ObserveResponseTruncated is called on rc (if non-nil) or the
+// package-level counter is incremented (issue #365). This prevents
+// memory exhaustion from a malicious upstream returning gigabytes.
+// The returned error is any read error encountered before hitting the
+// limit; a truncation itself is not treated as an error.
+func ReadAllLimited(rc *RouteCounters, r io.Reader, maxBytes int) ([]byte, error) {
+	lr := io.LimitReader(r, int64(maxBytes))
+	body, err := io.ReadAll(lr)
+	// If we read exactly maxBytes, the response was likely truncated.
+	// The edge case of a response that is exactly maxBytes is
+	// astronomically unlikely at 64 MiB.
+	if len(body) >= maxBytes {
+		if rc != nil {
+			rc.ObserveResponseTruncated()
+		} else {
+			IncrementTruncationCounter()
+		}
+	}
+	return body, err
 }
 
 // cascadeFallbackSlot returns the *uint64 for cascade fallback reason,
@@ -582,6 +655,17 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += n
 	}
+	// nexus_upstream_response_truncated_total (issue #365)
+	// Read from the ioutils package-level counter which is incremented
+	// by ReadAllLimited calls in upstream, cascade, router, judge, and rag.
+	truncated := ioutils.ReadAllTruncatedCounter()
+	n, err := fmt.Fprintf(w, "# HELP nexus_upstream_response_truncated_total %s\n# TYPE nexus_upstream_response_truncated_total counter\nnexus_upstream_response_truncated_total %d\n",
+		"Upstream responses truncated because they exceeded MaxResponseBytes.",
+		truncated)
+	if err != nil {
+		return total, err
+	}
+	total += int64(n)
 
 	if n, err := writeFusionSeries(w, "nexus_fusion_arbiter_total",
 		"Fusion panel outcomes: arbiter skipped (agreement) or invoked (disagreement).",
@@ -810,26 +894,35 @@ func writeRAGSeries(w io.Writer, name, help string, hits, misses map[string]*uin
 }
 
 // writeSLMCacheSeries emits the nexus_slm_cache_hits_total and
-// nexus_slm_cache_misses_total counters (issue #206). These track
+// nexus_slm_cache_misses_total counters (issue #206, #352). These track
 // the SLM decision cache hit rate so operators can tune the cache
-// TTL and diagnose cache ineffectiveness. The hits and misses pointers
-// may be nil; nil is treated as zero.
-func writeSLMCacheSeries(w io.Writer, hits, misses *uint64) (int64, error) {
+// TTL and diagnose cache ineffectiveness. The hits map may be nil or
+// empty; nil is treated as zero. Misses is a single pointer (no labels).
+func writeSLMCacheSeries(w io.Writer, hits map[string]*uint64, misses *uint64) (int64, error) {
 	var total int64
-	hitsVal := atomic.LoadUint64(hits)
+
+	n, err := fmt.Fprintf(w, "# HELP nexus_slm_cache_hits_total SLM decision cache hits partitioned by kind (issue #352).\n# TYPE nexus_slm_cache_hits_total counter\n")
+	if err != nil {
+		return total, err
+	}
+	total += int64(n)
+
+	// Emit one line per kind label, sorted for determinism.
+	keys := make([]string, 0, len(hits))
+	for k := range hits {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := atomic.LoadUint64(hits[k])
+		n, err := fmt.Fprintf(w, "nexus_slm_cache_hits_total{kind=%q} %d\n", k, v)
+		if err != nil {
+			return total, err
+		}
+		total += int64(n)
+	}
+
 	missesVal := atomic.LoadUint64(misses)
-
-	n, err := fmt.Fprintf(w, "# HELP nexus_slm_cache_hits_total SLM decision cache hits.\n# TYPE nexus_slm_cache_hits_total counter\n")
-	if err != nil {
-		return total, err
-	}
-	total += int64(n)
-	n, err = fmt.Fprintf(w, "nexus_slm_cache_hits_total %d\n", hitsVal)
-	if err != nil {
-		return total, err
-	}
-	total += int64(n)
-
 	n, err = fmt.Fprintf(w, "# HELP nexus_slm_cache_misses_total SLM decision cache misses.\n# TYPE nexus_slm_cache_misses_total counter\n")
 	if err != nil {
 		return total, err

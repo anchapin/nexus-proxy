@@ -644,7 +644,7 @@ func TestBudgetGuardIntegration(t *testing.T) {
 	})
 
 	bg := newBudgetGuardForTest(t)
-	bg.SetAlerter(budgetAlerterFunc(func(_ interface{}, cost float64, src string) {
+	bg.SetAlerter(budgetAlerterFunc(func(_ context.Context, _ interface{}, cost float64, src string) {
 		mu.Lock()
 		defer mu.Unlock()
 		recordedCost = cost
@@ -673,13 +673,13 @@ func TestBudgetGuardIntegration(t *testing.T) {
 
 // budgetAlerterFunc is a thin adapter so tests can use a plain function
 // as a budget.Alerter without defining an interface implementation.
-type budgetAlerterFunc func(interface{}, float64, string)
+type budgetAlerterFunc func(context.Context, interface{}, float64, string)
 
-func (f budgetAlerterFunc) OnExceed(budget.State) {}
-func (f budgetAlerterFunc) OnSpend(state budget.State, cost float64, src string) {
-	f(state, cost, src)
+func (f budgetAlerterFunc) OnExceed(ctx context.Context, state budget.State) {}
+func (f budgetAlerterFunc) OnSpend(ctx context.Context, state budget.State, cost float64, src string) {
+	f(ctx, state, cost, src)
 }
-func (f budgetAlerterFunc) OnApproaching(budget.State) {}
+func (f budgetAlerterFunc) OnApproaching(ctx context.Context, state budget.State) {}
 
 func newBudgetGuardForTest(t *testing.T) *budget.Guard {
 	t.Helper()

@@ -106,6 +106,38 @@ func newFrontierFixture(t *testing.T, status int) *frontierFixture {
 	return f
 }
 
+// nexusFixture mocks the Nexus /v1/models endpoint for diagnostic
+// testing. The zero value serves a minimal valid response with no
+// models; set modelsBody to override.
+type nexusFixture struct {
+	*httptest.Server
+	modelsBody atomic.Value // string — JSON for /v1/models
+	status     int          // HTTP status; defaults to 200
+	calls      atomic.Int32
+}
+
+func newNexusFixture(t *testing.T) *nexusFixture {
+	t.Helper()
+	f := &nexusFixture{status: http.StatusOK}
+	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.calls.Add(1)
+		if r.URL.Path != "/v1/models" && r.URL.Path != "/v1/models/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(f.status)
+		body, _ := f.modelsBody.Load().(string)
+		if body == "" {
+			// Minimal valid response with no models.
+			body = `{"object":"list","data":[]}`
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(f.Close)
+	return f
+}
+
 // fixtureConfig returns a config.Config pointed at the supplied
 // test servers. Defaults are picked so a happy-path test passes with
 // zero overrides.
@@ -845,5 +877,104 @@ func TestRunMiddlewareChainEmptyUsesDefault(t *testing.T) {
 	got := checkByName(res, checkMiddlewareChain)
 	if got.Status != StatusPass {
 		t.Errorf("middleware_chain = %s (detail=%s), want pass", got.Status, got.Detail)
+	}
+}
+
+// --- models_endpoint tests -------------------------------------------------
+
+func TestRunModelsEndpointDisabledIsSkip(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.ModelsEndpointEnabled = false
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkModelsEndpoint)
+	if got.Status != StatusSkip {
+		t.Errorf("models_endpoint = %s, want skip", got.Status)
+	}
+}
+
+func TestRunModelsEndpointServerNotRunningIsSkip(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.ModelsEndpointEnabled = true
+	// Use a server that is not running (connection refused).
+	// The addr format ":1" with no scheme will fail immediately.
+	res := Run(context.Background(), cfg, Options{
+		OllamaURL:  ollama.URL,
+		HTTPClient: &http.Client{Timeout: 200 * time.Millisecond},
+		Timeout:    200 * time.Millisecond,
+	})
+	got := checkByName(res, checkModelsEndpoint)
+	if got.Status != StatusSkip {
+		t.Errorf("models_endpoint = %s (detail=%s), want skip when server not running", got.Status, got.Detail)
+	}
+}
+
+func TestRunModelsEndpointReturnsErrorIsFail(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	nexus := newNexusFixture(t)
+	nexus.status = http.StatusInternalServerError
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.ModelsEndpointEnabled = true
+	cfg.Addr = strings.TrimPrefix(nexus.URL, "http://")
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkModelsEndpoint)
+	if got.Status != StatusFail {
+		t.Errorf("models_endpoint = %s (detail=%s), want fail when server returns error", got.Status, got.Detail)
+	}
+}
+
+func TestRunModelsEndpointReturnsInvalidJSONIsFail(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	nexus := newNexusFixture(t)
+	nexus.modelsBody.Store("not json")
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.ModelsEndpointEnabled = true
+	cfg.Addr = strings.TrimPrefix(nexus.URL, "http://")
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkModelsEndpoint)
+	if got.Status != StatusFail {
+		t.Errorf("models_endpoint = %s (detail=%s), want fail on invalid JSON", got.Status, got.Detail)
+	}
+}
+
+func TestRunModelsEndpointMissingModelsIsFail(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	nexus := newNexusFixture(t)
+	nexus.modelsBody.Store(`{"object":"list","data":[
+		{"id": "some-other-model", "object":"model","created":0,"owned_by":"ollama"}
+	]}`)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.ModelsEndpointEnabled = true
+	cfg.Addr = strings.TrimPrefix(nexus.URL, "http://")
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkModelsEndpoint)
+	if got.Status != StatusFail {
+		t.Errorf("models_endpoint = %s (detail=%s), want fail when models missing", got.Status, got.Detail)
+	}
+	if !strings.Contains(got.Detail, "qwen3-coder") {
+		t.Errorf("detail should mention missing model: %s", got.Detail)
+	}
+}
+
+func TestRunModelsEndpointAllModelsPresentIsPass(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	nexus := newNexusFixture(t)
+	nexus.modelsBody.Store(`{"object":"list","data":[
+		{"id":"qwen3-coder:4b","object":"model","created":0,"owned_by":"ollama"},
+		{"id":"qwen3-coder:8b","object":"model","created":0,"owned_by":"ollama"}
+	]}`)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.ModelsEndpointEnabled = true
+	cfg.Addr = strings.TrimPrefix(nexus.URL, "http://")
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkModelsEndpoint)
+	if got.Status != StatusPass {
+		t.Errorf("models_endpoint = %s (detail=%s), want pass", got.Status, got.Detail)
 	}
 }

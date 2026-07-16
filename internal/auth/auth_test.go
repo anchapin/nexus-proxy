@@ -15,7 +15,7 @@ func okHandler() http.Handler {
 }
 
 func TestDisabledWhenNoKey(t *testing.T) {
-	m := NewMiddleware("", nil, nil)
+	m := NewMiddleware("", nil, nil, nil)
 	if m.Enabled() {
 		t.Error("Enabled() = true for empty key, want false")
 	}
@@ -30,7 +30,7 @@ func TestDisabledWhenNoKey(t *testing.T) {
 }
 
 func TestRejectsWithoutToken(t *testing.T) {
-	m := NewMiddleware("secret-key", nil, nil) // no exempt paths
+	m := NewMiddleware("secret-key", nil, nil, nil) // no exempt paths
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
@@ -45,7 +45,7 @@ func TestRejectsWithoutToken(t *testing.T) {
 }
 
 func TestRejectsWrongToken(t *testing.T) {
-	m := NewMiddleware("secret-key", nil, nil)
+	m := NewMiddleware("secret-key", nil, nil, nil)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
@@ -58,7 +58,7 @@ func TestRejectsWrongToken(t *testing.T) {
 }
 
 func TestAcceptsCorrectToken(t *testing.T) {
-	m := NewMiddleware("secret-key", nil, nil)
+	m := NewMiddleware("secret-key", nil, nil, nil)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
@@ -77,7 +77,7 @@ func TestExemptPathsBypassAuth(t *testing.T) {
 	exempt := func(r *http.Request) bool {
 		return r.URL.Path == "/healthz" || r.URL.Path == "/metrics"
 	}
-	m := NewMiddleware("secret-key", exempt, nil)
+	m := NewMiddleware("secret-key", exempt, nil, nil)
 
 	for _, path := range []string{"/healthz", "/metrics"} {
 		rr := httptest.NewRecorder()
@@ -102,7 +102,7 @@ func TestStatusGatedByDefault(t *testing.T) {
 	exempt := func(r *http.Request) bool {
 		return r.URL.Path == "/healthz" || r.URL.Path == "/metrics"
 	}
-	m := NewMiddleware("secret-key", exempt, nil)
+	m := NewMiddleware("secret-key", exempt, nil, nil)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/status", nil)
@@ -118,7 +118,7 @@ func TestStatusPublicWhenExempt(t *testing.T) {
 	exempt := func(r *http.Request) bool {
 		return r.URL.Path == "/healthz" || r.URL.Path == "/metrics" || r.URL.Path == "/status"
 	}
-	m := NewMiddleware("secret-key", exempt, nil)
+	m := NewMiddleware("secret-key", exempt, nil, nil)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/status", nil)
@@ -186,7 +186,7 @@ func TestConstantTimeComparisonRegression(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := NewMiddleware(correctKey, nil, nil)
+			m := NewMiddleware(correctKey, nil, nil, nil)
 			rr := httptest.NewRecorder()
 			req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 			if tc.token != "" {
@@ -198,5 +198,79 @@ func TestConstantTimeComparisonRegression(t *testing.T) {
 				t.Errorf("token %q: status = %d, want %d", tc.token, rr.Code, tc.wantStatus)
 			}
 		})
+	}
+}
+
+// mockObserver implements AuthObserver for testing (issue #295).
+type mockObserver struct {
+	rejectedInvalid int
+	rejectedMissing int
+}
+
+func (m *mockObserver) IncAuthRejectedInvalid() { m.rejectedInvalid++ }
+func (m *mockObserver) IncAuthRejectedMissing() { m.rejectedMissing++ }
+
+// TestAuthObserverMissingToken verifies that IncAuthRejectedMissing is called
+// when a request arrives without a token (issue #295).
+func TestAuthObserverMissingToken(t *testing.T) {
+	obs := &mockObserver{}
+	m := NewMiddleware("secret-key", nil, nil, obs)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rr.Code)
+	}
+	if obs.rejectedMissing != 1 {
+		t.Errorf("IncAuthRejectedMissing call count = %d, want 1", obs.rejectedMissing)
+	}
+	if obs.rejectedInvalid != 0 {
+		t.Errorf("IncAuthRejectedInvalid call count = %d, want 0", obs.rejectedInvalid)
+	}
+}
+
+// TestAuthObserverInvalidToken verifies that IncAuthRejectedInvalid is called
+// when a request arrives with an invalid token (issue #295).
+func TestAuthObserverInvalidToken(t *testing.T) {
+	obs := &mockObserver{}
+	m := NewMiddleware("secret-key", nil, nil, obs)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer wrong-key")
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rr.Code)
+	}
+	if obs.rejectedInvalid != 1 {
+		t.Errorf("IncAuthRejectedInvalid call count = %d, want 1", obs.rejectedInvalid)
+	}
+	if obs.rejectedMissing != 0 {
+		t.Errorf("IncAuthRejectedMissing call count = %d, want 0", obs.rejectedMissing)
+	}
+}
+
+// TestAuthObserverNoCallbackOnSuccess verifies that neither observer method is
+// called when auth succeeds (issue #295).
+func TestAuthObserverNoCallbackOnSuccess(t *testing.T) {
+	obs := &mockObserver{}
+	m := NewMiddleware("secret-key", nil, nil, obs)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer secret-key")
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if obs.rejectedInvalid != 0 {
+		t.Errorf("IncAuthRejectedInvalid call count = %d, want 0", obs.rejectedInvalid)
+	}
+	if obs.rejectedMissing != 0 {
+		t.Errorf("IncAuthRejectedMissing call count = %d, want 0", obs.rejectedMissing)
 	}
 }

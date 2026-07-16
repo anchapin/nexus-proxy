@@ -25,8 +25,14 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/anchapin/nexus-proxy/internal/ioutils"
+
 	"time"
 )
+
+// defaultMaxResponseBytes is the default cap on upstream response bodies.
+// It is used by ReadAllLimited to prevent memory exhaustion (issue #365).
+const defaultMaxResponseBytes = 64 << 20 // 64 MiB
 
 // ErrCircuitOpen is returned by OllamaEmbedder.Embed when the circuit
 // breaker has tripped and the cooldown window has not yet elapsed.
@@ -712,7 +718,7 @@ func (o *OpenAIEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := ioutils.ReadAllLimited(resp.Body, defaultMaxResponseBytes)
 	if err != nil {
 		return nil, err
 	}

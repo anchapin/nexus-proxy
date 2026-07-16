@@ -371,7 +371,7 @@ func TestPanelArbiterTimeoutBoundsHangingCall(t *testing.T) {
 	const arbiterTO = 100 * time.Millisecond
 	start := time.Now()
 	_, err := Panel(
-		newSSERW(), http.DefaultClient,
+		context.Background(), newSSERW(), http.DefaultClient,
 		localSrv.URL, "local-m",
 		frontierSrv.URL, "frontier-m",
 		arbiterSrv.URL+"/v1/chat/completions", "", "arbiter-m",
@@ -426,7 +426,7 @@ func TestPanelArbiterHappyPathNoRegression(t *testing.T) {
 
 	rw := newSSERW()
 	if _, err := Panel(
-		rw, client,
+		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		"http://frontier.local", "frontier-m",
 		arbiterURL, "", "arbiter-m",
@@ -482,9 +482,9 @@ func TestPanelSkipLocalOmitsLocalFetch(t *testing.T) {
 
 	rw := newSSERW()
 	if _, err := Panel(
-		rw, client,
+		context.Background(), rw, client,
 		"http://local.local", "local-m",
-		frontierURL, "frontier-m",
+		"http://frontier.local", "frontier-m",
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
@@ -533,7 +533,7 @@ func TestPanelSkipLocalArbiterPromptHasDegradedMarker(t *testing.T) {
 	client := &http.Client{Transport: ft}
 
 	if _, err := Panel(
-		newSSERW(), client,
+		context.Background(), newSSERW(), client,
 		localURL, "local-m",
 		frontierURL, "frontier-m",
 		arbiterURL, "", "arbiter-m",
@@ -723,7 +723,7 @@ func TestPanelArbiterHonorsStreamFlagFalse(t *testing.T) {
 
 	rw := newJSONRW()
 	if _, err := Panel(
-		rw, client,
+		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		"http://frontier.local", "frontier-m",
 		arbiterURL, "", "arbiter-m",
@@ -785,7 +785,7 @@ func TestPanelArbiterHonorsStreamFlagTrueRegression(t *testing.T) {
 	// Explicit stream=true to mirror the OpenAI default.
 	rw := newSSERW()
 	if _, err := Panel(
-		rw, client,
+		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		"http://frontier.local", "frontier-m",
 		arbiterURL, "", "arbiter-m",
@@ -839,7 +839,7 @@ func TestPanelStreamingAgreementSkipsArbiter(t *testing.T) {
 
 	rw := newSSERW()
 	outcome, err := PanelStreaming(
-		rw, client,
+		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		frontierURL, "frontier-m",
 		arbiterURL, "", "arbiter-m",
@@ -930,7 +930,7 @@ func TestPanelStreamingAgreementCancelsSlowMember(t *testing.T) {
 
 	rw := newSSERW()
 	outcome, err := PanelStreaming(
-		rw, client,
+		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		frontierURL, "frontier-m",
 		arbiterURL, "", "arbiter-m",
@@ -1001,7 +1001,7 @@ func TestPanelStreamingDisagreementRunsArbiter(t *testing.T) {
 
 	rw := newSSERW()
 	outcome, err := PanelStreaming(
-		rw, client,
+		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		frontierURL, "frontier-m",
 		arbiterURL, "", "arbiter-m",
@@ -1073,7 +1073,7 @@ func TestPanelStreamingDegradedSkipLocal(t *testing.T) {
 
 	rw := newSSERW()
 	outcome, err := PanelStreaming(
-		rw, client,
+		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		frontierURL, "frontier-m",
 		arbiterURL, "", "arbiter-m",
@@ -1137,7 +1137,7 @@ func TestPanelStreamingOneMemberFailedSkipsArbiter(t *testing.T) {
 
 	rw := newSSERW()
 	outcome, err := PanelStreaming(
-		rw, client,
+		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		frontierURL, "frontier-m",
 		arbiterURL, "", "arbiter-m",
@@ -1188,7 +1188,7 @@ func TestPanelStreamingBothMembersFailedSurfacesError(t *testing.T) {
 
 	rw := newSSERW()
 	_, err := PanelStreaming(
-		rw, client,
+		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		frontierURL, "frontier-m",
 		arbiterURL, "", "arbiter-m",
@@ -1240,7 +1240,7 @@ func TestPanelStreamingHonorsStreamFalseFallsBackToPanel(t *testing.T) {
 
 	rw := newJSONRW()
 	outcome, err := PanelStreaming(
-		rw, client,
+		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		frontierURL, "frontier-m",
 		arbiterURL, "", "arbiter-m",
@@ -1307,7 +1307,7 @@ func TestPanelStreamingThresholdClamping(t *testing.T) {
 		client := &http.Client{Transport: ft}
 		rw := newSSERW()
 		outcome, err := PanelStreaming(
-			rw, client,
+			context.Background(), rw, client,
 			"http://local.local", "local-m",
 			frontierURL, "frontier-m",
 			arbiterURL, "", "arbiter-m",
@@ -1352,7 +1352,7 @@ func TestPanelStreamingThresholdClamping(t *testing.T) {
 		client := &http.Client{Transport: ft}
 		rw := newSSERW()
 		outcome, err := PanelStreaming(
-			rw, client,
+			context.Background(), rw, client,
 			"http://local.local", "local-m",
 			frontierURL, "frontier-m",
 			arbiterURL, "", "arbiter-m",
@@ -1402,7 +1402,7 @@ func TestPanelStreamingSpeculativeSourceIdentified(t *testing.T) {
 
 	rw := newSSERW()
 	outcome, err := PanelStreaming(
-		rw, client,
+		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		frontierURL, "frontier-m",
 		arbiterURL, "", "arbiter-m",
@@ -1451,7 +1451,7 @@ func TestPanelStreamingSetsProgressiveHeader(t *testing.T) {
 
 	rw := newSSERW()
 	if _, err := PanelStreaming(
-		rw, client,
+		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		frontierURL, "frontier-m",
 		arbiterURL, "", "arbiter-m",
@@ -1502,7 +1502,7 @@ func TestPanelStreamingToolCallWinnerSkipsArbiter(t *testing.T) {
 
 	rw := newSSERW()
 	outcome, err := PanelStreaming(
-		rw, client,
+		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		frontierURL, "frontier-m",
 		arbiterURL, "", "arbiter-m",
@@ -1623,7 +1623,7 @@ func TestPanelStreamingClientAbortSkipsArbiter(t *testing.T) {
 
 	rw := newBrokenPipeRW()
 	outcome, err := PanelStreaming(
-		rw, client,
+		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		frontierURL, "frontier-m",
 		arbiterURL, "", "arbiter-m",

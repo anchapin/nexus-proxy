@@ -8,12 +8,17 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/ioutils"
 )
+
+// defaultMaxResponseBytes is the default cap on upstream response bodies.
+// It is used by ReadAllLimited to prevent memory exhaustion (issue #365).
+const defaultMaxResponseBytes = 64 << 20 // 64 MiB
 
 // SLMClient talks to a local Ollama /api/chat endpoint and asks the small
 // model to produce a routing decision. The HTTP layer is abstracted so
@@ -262,7 +267,7 @@ func (c *SLMClient) decide(ctx context.Context, prompt, systemPrompt string) (Ro
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := ioutils.ReadAllLimited(resp.Body, defaultMaxResponseBytes)
 	if err != nil {
 		return RouteFrontier, err
 	}

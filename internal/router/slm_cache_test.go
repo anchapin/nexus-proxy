@@ -11,19 +11,19 @@ import (
 func TestSLMCache_GetSet(t *testing.T) {
 	c := NewSLMCache(100 * time.Millisecond)
 	ctx := context.Background()
-	if got, ok := c.Get(ctx, "hello"); ok || got != "" {
-		t.Errorf("empty cache: got (%v, %v), want (\"\", false)", got, ok)
+	if got, ok, _ := c.Get(ctx, "hello"); ok || got != "" {
+		t.Errorf("empty cache: got (%v, %v, _), want (\"\", false, _)", got, ok)
 	}
 
 	c.Set(ctx, "hello", RouteLocal)
-	got, ok := c.Get(ctx, "hello")
-	if !ok || got != RouteLocal {
-		t.Errorf("after Set: got (%v, %v), want (RouteLocal, true)", got, ok)
+	got, ok, kind := c.Get(ctx, "hello")
+	if !ok || got != RouteLocal || kind != CacheHitExact {
+		t.Errorf("after Set: got (%v, %v, %v), want (RouteLocal, true, CacheHitExact)", got, ok, kind)
 	}
 
 	// Different key is still empty.
-	if got, ok := c.Get(ctx, "other"); ok || got != "" {
-		t.Errorf("different key: got (%v, %v), want (\"\", false)", got, ok)
+	if got, ok, _ := c.Get(ctx, "other"); ok || got != "" {
+		t.Errorf("different key: got (%v, %v, _), want (\"\", false, _)", got, ok)
 	}
 }
 
@@ -33,7 +33,7 @@ func TestSLMCache_TTLExpiry(t *testing.T) {
 	c.Set(ctx, "key", RouteFrontier)
 
 	// Should be present immediately.
-	if _, ok := c.Get(ctx, "key"); !ok {
+	if _, ok, _ := c.Get(ctx, "key"); !ok {
 		t.Fatal("key missing immediately after Set")
 	}
 
@@ -41,8 +41,8 @@ func TestSLMCache_TTLExpiry(t *testing.T) {
 	time.Sleep(120 * time.Millisecond)
 
 	// Should be expired now.
-	if got, ok := c.Get(ctx, "key"); ok || got != "" {
-		t.Errorf("after TTL: got (%v, %v), want (\"\", false)", got, ok)
+	if got, ok, _ := c.Get(ctx, "key"); ok || got != "" {
+		t.Errorf("after TTL: got (%v, %v, _), want (\"\", false, _)", got, ok)
 	}
 }
 
@@ -52,9 +52,9 @@ func TestSLMCache_Overwrite(t *testing.T) {
 	c.Set(ctx, "key", RouteLocal)
 	c.Set(ctx, "key", RouteFrontier)
 
-	got, ok := c.Get(ctx, "key")
-	if !ok || got != RouteFrontier {
-		t.Errorf("after overwrite: got (%v, %v), want (RouteFrontier, true)", got, ok)
+	got, ok, kind := c.Get(ctx, "key")
+	if !ok || got != RouteFrontier || kind != CacheHitExact {
+		t.Errorf("after overwrite: got (%v, %v, %v), want (RouteFrontier, true, CacheHitExact)", got, ok, kind)
 	}
 }
 
@@ -98,8 +98,8 @@ func TestNewSLMCache_ZeroTTL(t *testing.T) {
 	ctx := context.Background()
 	// Should use default TTL (30s).
 	c.Set(ctx, "k", RouteFrontier)
-	if got, ok := c.Get(ctx, "k"); !ok || got != RouteFrontier {
-		t.Errorf("with default TTL: got (%v, %v), want (RouteFrontier, true)", got, ok)
+	if got, ok, kind := c.Get(ctx, "k"); !ok || got != RouteFrontier || kind != CacheHitExact {
+		t.Errorf("with default TTL: got (%v, %v, %v), want (RouteFrontier, true, CacheHitExact)", got, ok, kind)
 	}
 }
 
@@ -120,8 +120,8 @@ func TestSLMCache_Stats(t *testing.T) {
 	// Wait for TTL to pass — entries become expired but are not evicted.
 	time.Sleep(120 * time.Millisecond)
 	stats = c.Stats()
-	if got, ok := c.Get(ctx, "a"); ok || got != "" {
-		t.Errorf("a expired: got (%v, %v), want (\"\", false)", got, ok)
+	if got, ok, _ := c.Get(ctx, "a"); ok || got != "" {
+		t.Errorf("a expired: got (%v, %v, _), want (\"\", false, _)", got, ok)
 	}
 	// Entries count still includes expired (not evicted until next write).
 	if stats.Expired != 2 {
@@ -185,9 +185,9 @@ func TestSLMCache_SemanticExactMatch(t *testing.T) {
 	c.Set(ctx, "write a fibonacci function", RouteLocal)
 
 	// Exact String match — should hit even though semantic could also match.
-	got, ok := c.Get(ctx, "write a fibonacci function")
-	if !ok || got != RouteLocal {
-		t.Errorf("exact match: got (%v, %v), want (RouteLocal, true)", got, ok)
+	got, ok, kind := c.Get(ctx, "write a fibonacci function")
+	if !ok || got != RouteLocal || kind != CacheHitExact {
+		t.Errorf("exact match: got (%v, %v, %v), want (RouteLocal, true, CacheHitExact)", got, ok, kind)
 	}
 }
 
@@ -207,9 +207,9 @@ func TestSLMCache_SemanticMatch(t *testing.T) {
 	c.Set(ctx, "write a fibonacci function", RouteLocal)
 
 	// Now Get with a semantically similar prompt — should hit via semantic match.
-	got, ok := c.Get(ctx, "implement fibonacci recursively")
-	if !ok || got != RouteLocal {
-		t.Errorf("semantic match: got (%v, %v), want (RouteLocal, true)", got, ok)
+	got, ok, kind := c.Get(ctx, "implement fibonacci recursively")
+	if !ok || got != RouteLocal || kind != CacheHitSemantic {
+		t.Errorf("semantic match: got (%v, %v, %v), want (RouteLocal, true, CacheHitSemantic)", got, ok, kind)
 	}
 }
 
@@ -225,9 +225,9 @@ func TestSLMCache_SemanticNoMatch(t *testing.T) {
 
 	c.Set(ctx, "write a fibonacci function", RouteLocal)
 
-	got, ok := c.Get(ctx, "explain quantum entanglement")
-	if ok || got != "" {
-		t.Errorf("semantic mismatch: got (%v, %v), want (\"\", false)", got, ok)
+	got, ok, kind := c.Get(ctx, "explain quantum entanglement")
+	if ok || got != "" || kind != "" {
+		t.Errorf("semantic mismatch: got (%v, %v, %v), want (\"\", false, \"\")", got, ok, kind)
 	}
 }
 
@@ -243,9 +243,9 @@ func TestSLMCache_SemanticBelowThreshold(t *testing.T) {
 
 	c.Set(ctx, "write a fibonacci function", RouteLocal)
 
-	got, ok := c.Get(ctx, "implement fibonacci recursively")
-	if ok || got != "" {
-		t.Errorf("below threshold: got (%v, %v), want (\"\", false)", got, ok)
+	got, ok, kind := c.Get(ctx, "implement fibonacci recursively")
+	if ok || got != "" || kind != "" {
+		t.Errorf("below threshold: got (%v, %v, %v), want (\"\", false, \"\")", got, ok, kind)
 	}
 }
 
@@ -261,9 +261,9 @@ func TestSLMCache_SemanticAboveThreshold(t *testing.T) {
 
 	c.Set(ctx, "write a fibonacci function", RouteLocal)
 
-	got, ok := c.Get(ctx, "implement fibonacci recursively")
-	if !ok || got != RouteLocal {
-		t.Errorf("above threshold: got (%v, %v), want (RouteLocal, true)", got, ok)
+	got, ok, kind := c.Get(ctx, "implement fibonacci recursively")
+	if !ok || got != RouteLocal || kind != CacheHitSemantic {
+		t.Errorf("above threshold: got (%v, %v, %v), want (RouteLocal, true, CacheHitSemantic)", got, ok, kind)
 	}
 }
 
@@ -275,16 +275,16 @@ func TestSLMCache_SemanticEmbedError(t *testing.T) {
 
 	c.Set(ctx, "write a fibonacci function", RouteLocal)
 
-	got, ok := c.Get(ctx, "write a fibonacci function")
+	got, ok, kind := c.Get(ctx, "write a fibonacci function")
 	// Exact match should still work.
-	if !ok || got != RouteLocal {
-		t.Errorf("exact match failed: got (%v, %v), want (RouteLocal, true)", got, ok)
+	if !ok || got != RouteLocal || kind != CacheHitExact {
+		t.Errorf("exact match failed: got (%v, %v, %v), want (RouteLocal, true, CacheHitExact)", got, ok, kind)
 	}
 
 	// Semantic lookup should fail gracefully (no panic) when embedder errors.
-	_, ok = c.Get(ctx, "different prompt")
-	if ok {
-		t.Errorf("semantic with embed error: expected miss, got hit")
+	_, ok, kind = c.Get(ctx, "different prompt")
+	if ok || kind != "" {
+		t.Errorf("semantic with embed error: got (%v, %v, %v), want (\"\", false, \"\")", got, ok, kind)
 	}
 }
 
@@ -296,15 +296,15 @@ func TestSLMCache_SemanticDisabled(t *testing.T) {
 	c.Set(ctx, "write a fibonacci function", RouteLocal)
 
 	// Exact match works.
-	got, ok := c.Get(ctx, "write a fibonacci function")
-	if !ok || got != RouteLocal {
-		t.Errorf("exact match: got (%v, %v), want (RouteLocal, true)", got, ok)
+	got, ok, kind := c.Get(ctx, "write a fibonacci function")
+	if !ok || got != RouteLocal || kind != CacheHitExact {
+		t.Errorf("exact match: got (%v, %v, %v), want (RouteLocal, true, CacheHitExact)", got, ok, kind)
 	}
 
-	// Semantic should not apply — different String is a miss.
-	got, ok = c.Get(ctx, "implement fibonacci recursively")
-	if ok || got != "" {
-		t.Errorf("semantic not enabled: got (%v, %v), want (\"\", false)", got, ok)
+	// Semantic should not apply — different string is a miss.
+	got, ok, kind = c.Get(ctx, "implement fibonacci recursively")
+	if ok || got != "" || kind != "" {
+		t.Errorf("semantic not enabled: got (%v, %v, %v), want (\"\", false, \"\")", got, ok, kind)
 	}
 }
 
@@ -316,9 +316,9 @@ func TestSLMCache_SetEmbedding(t *testing.T) {
 	emb := []float64{1.0, 0.5, 0.0, 0.0}
 	c.SetEmbedding("write a fibonacci function", RouteLocal, emb)
 
-	got, ok := c.Get(ctx, "write a fibonacci function")
-	if !ok || got != RouteLocal {
-		t.Errorf("SetEmbedding exact match: got (%v, %v), want (RouteLocal, true)", got, ok)
+	got, ok, kind := c.Get(ctx, "write a fibonacci function")
+	if !ok || got != RouteLocal || kind != CacheHitExact {
+		t.Errorf("SetEmbedding exact match: got (%v, %v, %v), want (RouteLocal, true, CacheHitExact)", got, ok, kind)
 	}
 }
 
@@ -333,23 +333,23 @@ func TestSLMCache_SemanticTTLExpiry(t *testing.T) {
 	c.Set(ctx, "write a fibonacci function", RouteLocal)
 
 	// Immediate semantic hit.
-	got, ok := c.Get(ctx, "implement fibonacci recursively")
-	if !ok || got != RouteLocal {
-		t.Errorf("immediate semantic hit: got (%v, %v), want (RouteLocal, true)", got, ok)
+	got, ok, kind := c.Get(ctx, "implement fibonacci recursively")
+	if !ok || got != RouteLocal || kind != CacheHitSemantic {
+		t.Errorf("immediate semantic hit: got (%v, %v, %v), want (RouteLocal, true, CacheHitSemantic)", got, ok, kind)
 	}
 
 	// Wait for TTL to pass.
 	time.Sleep(120 * time.Millisecond)
 
 	// Both exact and semantic should be expired.
-	got, ok = c.Get(ctx, "write a fibonacci function")
-	if ok || got != "" {
-		t.Errorf("exact expired: got (%v, %v), want (\"\", false)", got, ok)
+	got, ok, kind = c.Get(ctx, "write a fibonacci function")
+	if ok || got != "" || kind != "" {
+		t.Errorf("exact expired: got (%v, %v, %v), want (\"\", false, \"\")", got, ok, kind)
 	}
 
-	got, ok = c.Get(ctx, "implement fibonacci recursively")
-	if ok || got != "" {
-		t.Errorf("semantic expired: got (%v, %v), want (\"\", false)", got, ok)
+	got, ok, kind = c.Get(ctx, "implement fibonacci recursively")
+	if ok || got != "" || kind != "" {
+		t.Errorf("semantic expired: got (%v, %v, %v), want (\"\", false, \"\")", got, ok, kind)
 	}
 }
 
@@ -396,7 +396,7 @@ func TestNewSLMCacheWithEmbedder_Defaults(t *testing.T) {
 
 	ctx := context.Background()
 	c.Set(ctx, "k", RouteFrontier)
-	if got, ok := c.Get(ctx, "k"); !ok || got != RouteFrontier {
-		t.Errorf("basic operation: got (%v, %v), want (RouteFrontier, true)", got, ok)
+	if got, ok, kind := c.Get(ctx, "k"); !ok || got != RouteFrontier || kind != CacheHitExact {
+		t.Errorf("basic operation: got (%v, %v, %v), want (RouteFrontier, true, CacheHitExact)", got, ok, kind)
 	}
 }

@@ -389,6 +389,12 @@ type Config struct {
 	RateLimitRPM      int
 	RateLimitBurst    int
 
+	// MaxResponseBytes caps upstream response bodies read into memory
+	// (issue #365). A malicious or misbehaving upstream returning
+	// gigabytes could otherwise cause uncontrolled memory growth.
+	// Zero or negative falls back to DefaultMaxResponseBytes.
+	MaxResponseBytes int
+
 	// Auth brute-force protection (issue #296). Tracks per-client-IP
 	// auth failures and blocks the client after AuthRateLimitBurst
 	// consecutive failures within a sliding AuthRateLimitWindow
@@ -1143,6 +1149,16 @@ func Load() (Config, error) {
 	}
 	cfg.RateLimitBurst = rateBurst
 
+	// MaxResponseBytes caps upstream response bodies (issue #365). Default
+	// 64 MiB accommodates large frontier completions; operators who proxy
+	// very long responses can raise it. Zero or negative falls back to
+	// DefaultMaxResponseBytes.
+	maxRespBytes, err := getEnvInt("NEXUS_MAX_RESPONSE_BYTES", DefaultMaxResponseBytes)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.MaxResponseBytes = maxRespBytes
+
 	// Auth brute-force protection (issue #296). Defaults: RPM 5, burst 3,
 	// window 5 min. When RPM <= 0 the limiter is disabled so a stock
 	// deployment with no NEXUS_AUTH_RATE_LIMIT_RPM is byte-for-byte
@@ -1279,6 +1295,11 @@ const DefaultShutdownTimeout = 30 * time.Second
 // need more room can raise it via NEXUS_MAX_BODY_BYTES.
 const DefaultMaxBodyBytes = 1 << 20 // 1 MiB
 
+// DefaultMaxResponseBytes is the default cap on upstream response bodies
+// (issue #365). 64 MiB accommodates large frontier completions while
+// preventing memory exhaustion from a malicious upstream.
+const DefaultMaxResponseBytes = 64 << 20 // 64 MiB
+
 // EffectiveMaxBodyBytes returns the request-body cap the chat handler should
 // enforce. Zero or negative values fall back to DefaultMaxBodyBytes so a
 // zero-value Config (e.g. inside unit tests) still gets a sane cap.
@@ -1287,6 +1308,16 @@ func (c Config) EffectiveMaxBodyBytes() int {
 		return c.MaxBodyBytes
 	}
 	return DefaultMaxBodyBytes
+}
+
+// EffectiveMaxResponseBytes returns the upstream response-body cap.
+// Zero or negative values fall back to DefaultMaxResponseBytes so a
+// zero-value Config (e.g. inside unit tests) still gets a sane cap.
+func (c Config) EffectiveMaxResponseBytes() int {
+	if c.MaxResponseBytes > 0 {
+		return c.MaxResponseBytes
+	}
+	return DefaultMaxResponseBytes
 }
 
 // DefaultDebugBodyBytes is the upper bound on the response-body preview
