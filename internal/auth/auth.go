@@ -6,12 +6,18 @@
 // liveness probes and Prometheus scrapers continue to work without
 // credentials. The /status endpoint is exempt only when
 // NEXUS_STATUS_PUBLIC=true (default false).
+//
+// Auth brute-force protection (issue #296): when an auth limiter is wired
+// in, failed auth attempts are tracked per client IP and the client is
+// temporarily blocked after too many failures.
 package auth
 
 import (
 	"crypto/subtle"
 	"net/http"
 	"strings"
+
+	"github.com/anchapin/nexus-proxy/internal/ratelimit"
 )
 
 // Middleware gates HTTP requests behind a bearer token. When key is
@@ -19,15 +25,19 @@ import (
 // development proxy with no NEXUS_PROXY_API_KEY behaves identically
 // to the pre-auth binary.
 type Middleware struct {
-	key    string
-	exempt func(*http.Request) bool
+	key         string
+	exempt      func(*http.Request) bool
+	authLimiter *ratelimit.AuthLimiter
 }
 
 // NewMiddleware returns a middleware that rejects requests without a
 // matching Bearer token, unless exempt(r) returns true. A empty key
 // disables auth entirely (Wrap returns the handler unchanged).
-func NewMiddleware(key string, exempt func(*http.Request) bool) *Middleware {
-	return &Middleware{key: key, exempt: exempt}
+// When authLimiter is non-nil, brute-force protection is enabled:
+// the client IP is checked against the limiter before auth, and failures
+// are reported to the limiter.
+func NewMiddleware(key string, exempt func(*http.Request) bool, authLimiter *ratelimit.AuthLimiter) *Middleware {
+	return &Middleware{key: key, exempt: exempt, authLimiter: authLimiter}
 }
 
 // Enabled reports whether the middleware actually enforces auth.

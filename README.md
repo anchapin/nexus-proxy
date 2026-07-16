@@ -375,6 +375,9 @@ defaults. The most useful ones:
 | `NEXUS_TRUSTED_PROXIES`   | *(empty = trust nobody)*      | CIDR allowlist for X-Forwarded-For (issue #75) |
 | `NEXUS_RATE_LIMIT_RPM`    | `0` (disabled)                | Per-client requests/min ceiling (issue #75) |
 | `NEXUS_RATE_LIMIT_BURST`  | `0` (= RPM)                  | Token-bucket burst capacity (issue #75) |
+| `NEXUS_AUTH_RATE_LIMIT_RPM` | `5`                           | Auth brute-force: failures/min before block (issue #296) |
+| `NEXUS_AUTH_RATE_LIMIT_BURST` | `3`                         | Auth brute-force: failures before 429 (issue #296) |
+| `NEXUS_AUTH_RATE_LIMIT_WINDOW` | `5m`                         | Auth brute-force: sliding window for tracking (issue #296) |
 | `NEXUS_COST_BASELINE_PROVIDER` | `frontier`               | Provider name for the cost-avoidance baseline |
 | `NEXUS_COST_BASELINE_MODEL`   | `NEXUS_FRONTIER_MODEL`    | Model name for the cost-avoidance baseline |
 | `NEXUS_COST_BASELINE_RATE_PER_1K` | `NEXUS_FRONTIER_COST_PER_1K` | USD per 1k tokens for baseline valuation |

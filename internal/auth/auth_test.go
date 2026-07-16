@@ -15,7 +15,7 @@ func okHandler() http.Handler {
 }
 
 func TestDisabledWhenNoKey(t *testing.T) {
-	m := NewMiddleware("", nil)
+	m := NewMiddleware("", nil, nil)
 	if m.Enabled() {
 		t.Error("Enabled() = true for empty key, want false")
 	}
@@ -30,7 +30,7 @@ func TestDisabledWhenNoKey(t *testing.T) {
 }
 
 func TestRejectsWithoutToken(t *testing.T) {
-	m := NewMiddleware("secret-key", nil) // no exempt paths
+	m := NewMiddleware("secret-key", nil, nil) // no exempt paths
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
@@ -45,7 +45,7 @@ func TestRejectsWithoutToken(t *testing.T) {
 }
 
 func TestRejectsWrongToken(t *testing.T) {
-	m := NewMiddleware("secret-key", nil)
+	m := NewMiddleware("secret-key", nil, nil)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
@@ -58,7 +58,7 @@ func TestRejectsWrongToken(t *testing.T) {
 }
 
 func TestAcceptsCorrectToken(t *testing.T) {
-	m := NewMiddleware("secret-key", nil)
+	m := NewMiddleware("secret-key", nil, nil)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
@@ -77,7 +77,7 @@ func TestExemptPathsBypassAuth(t *testing.T) {
 	exempt := func(r *http.Request) bool {
 		return r.URL.Path == "/healthz" || r.URL.Path == "/metrics"
 	}
-	m := NewMiddleware("secret-key", exempt)
+	m := NewMiddleware("secret-key", exempt, nil)
 
 	for _, path := range []string{"/healthz", "/metrics"} {
 		rr := httptest.NewRecorder()
@@ -102,7 +102,7 @@ func TestStatusGatedByDefault(t *testing.T) {
 	exempt := func(r *http.Request) bool {
 		return r.URL.Path == "/healthz" || r.URL.Path == "/metrics"
 	}
-	m := NewMiddleware("secret-key", exempt)
+	m := NewMiddleware("secret-key", exempt, nil)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/status", nil)
@@ -118,7 +118,7 @@ func TestStatusPublicWhenExempt(t *testing.T) {
 	exempt := func(r *http.Request) bool {
 		return r.URL.Path == "/healthz" || r.URL.Path == "/metrics" || r.URL.Path == "/status"
 	}
-	m := NewMiddleware("secret-key", exempt)
+	m := NewMiddleware("secret-key", exempt, nil)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/status", nil)
@@ -186,7 +186,7 @@ func TestConstantTimeComparisonRegression(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := NewMiddleware(correctKey, nil)
+			m := NewMiddleware(correctKey, nil, nil)
 			rr := httptest.NewRecorder()
 			req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 			if tc.token != "" {
