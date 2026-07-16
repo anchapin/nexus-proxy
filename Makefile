@@ -28,7 +28,7 @@ help:
 	@echo "  fmt         - gofmt -w (writes in place)"
 	@echo "  lint        - golangci-lint run"
 	@echo "  tidy        - go mod tidy"
-	@echo "  ci          - vet + build + test + lint (what CI runs)"
+	@echo "  ci          - vet + build + test + test-race + lint (what CI runs)"
 	@echo "  clean       - remove ./bin/ and coverage files"
 
 build:
@@ -72,7 +72,10 @@ lint:
 tidy:
 	$(GO) mod tidy
 
-ci: vet build test lint bench-short
+# `test-race` is included here because race conditions in concurrent code
+# (transport, metrics, budget tracker, VRAM limiter) are easy to miss in
+# manual testing and can hide in CI for weeks before surfacing in prod.
+ci: vet build test test-race lint bench-short
 
 clean:
 	rm -rf bin/ coverage.txt coverage.html
