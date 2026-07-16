@@ -337,6 +337,11 @@ type Config struct {
 	TelemetryPath string
 	MetricsDBPath string
 
+	// Tracing (issue #372). Endpoint is the full OTLP/JSON HTTP URL.
+	// Empty disables distributed tracing (zero overhead).
+	TracingEndpoint string
+	TracingTimeout  time.Duration
+
 	// Structured logging (issue #3). LogLevel maps NEXUS_LOG_LEVEL
 	// ("debug" | "info" | "warn" | "error") to a slog.Level. LogFormat
 	// maps NEXUS_LOG_FORMAT ("json" | "text") to a slog.Handler; json
@@ -484,7 +489,14 @@ func Load() (Config, error) {
 		MiddlewareChain: getEnv("NEXUS_MIDDLEWARE_CHAIN", ""),
 		TelemetryPath:   getEnvAllowEmpty("NEXUS_TELEMETRY_PATH", "./nexus-telemetry.jsonl"),
 		MetricsDBPath:   getEnvAllowEmpty("NEXUS_METRICS_DB", DefaultMetricsDBPath()),
+		TracingEndpoint: getEnvAllowEmpty("NEXUS_TRACING_ENDPOINT", ""),
 	}
+
+	tracingTimeout, err := getEnvDuration("NEXUS_TRACING_TIMEOUT", 10*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.TracingTimeout = tracingTimeout
 
 	threshold, err := getEnvFloat("NEXUS_RAG_THRESHOLD", 0.55)
 	if err != nil {

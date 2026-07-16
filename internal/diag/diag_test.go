@@ -977,3 +977,4 @@ func TestRunModelsEndpointAllModelsPresentIsPass(t *testing.T) {
 	if got.Status != StatusPass {
 		t.Errorf("models_endpoint = %s (detail=%s), want pass", got.Status, got.Detail)
 	}
+}

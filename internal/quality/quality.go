@@ -37,6 +37,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
 // Kind identifies which project marker was found during project
@@ -302,7 +304,32 @@ func (v *ShellVerifier) Close() error {
 func (v *ShellVerifier) worker() {
 	defer v.wg.Done()
 	for e := range v.queue {
-		v.cfg.Observer.Submit(v.Verify(e))
+		// Create a child span for this verification when trace context
+		// is available (issue #372).
+		var span *tracing.Span
+		if e.TraceParent != "" {
+			traceID, spanID, ok := tracing.ParseTraceparent(e.TraceParent)
+			if ok {
+				parentCtx := tracing.Context{TraceID: traceID, SpanID: spanID}
+				_, span = tracing.StartSpan(parentCtx, "quality.verify")
+				span.SetAttr("request_id", e.RequestID)
+				span.SetAttr("path", e.Path)
+				span.SetAttr("tool", e.ToolName)
+			}
+		}
+
+		verdict := v.Verify(e)
+
+		if span != nil {
+			span.SetAttr("pass", verdict.Pass)
+			span.SetAttr("exit_code", verdict.ExitCode)
+		}
+
+		v.cfg.Observer.Submit(verdict)
+
+		if span != nil {
+			span.End()
+		}
 	}
 }
 
