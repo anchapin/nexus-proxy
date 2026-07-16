@@ -56,6 +56,10 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.CascadeTimeout != 30*time.Second {
 		t.Errorf("CascadeTimeout = %v, want 30s", cfg.CascadeTimeout)
 	}
+	// Issue #385: FusionPerFetchTimeout default
+	if cfg.FusionPerFetchTimeout != 120*time.Second {
+		t.Errorf("FusionPerFetchTimeout = %v, want 120s", cfg.FusionPerFetchTimeout)
+	}
 	if cfg.ZAIURL != "https://api.z.ai/v1/chat/completions" {
 		t.Errorf("ZAIURL = %q", cfg.ZAIURL)
 	}
@@ -119,6 +123,7 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("NEXUS_RAG_THRESHOLD", "0.7")
 	t.Setenv("NEXUS_SLM_TIMEOUT", "3s")
 	t.Setenv("NEXUS_CASCADE_TIMEOUT", "15s")
+	t.Setenv("NEXUS_FUSION_PER_FETCH_TIMEOUT", "45s")
 	t.Setenv("NEXUS_ZAI_API_KEY", "zai-test")
 	t.Setenv("NEXUS_ZAI_MODEL", "glm-4.5")
 	t.Setenv("NEXUS_TELEMETRY_PATH", "")
@@ -147,6 +152,10 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if cfg.CascadeTimeout != 15*time.Second {
 		t.Errorf("CascadeTimeout = %v, want 15s", cfg.CascadeTimeout)
+	}
+	// Issue #385: FusionPerFetchTimeout override
+	if cfg.FusionPerFetchTimeout != 45*time.Second {
+		t.Errorf("FusionPerFetchTimeout = %v, want 45s", cfg.FusionPerFetchTimeout)
 	}
 	if cfg.ZAIKey != "zai-test" {
 		t.Errorf("ZAIKey = %q", cfg.ZAIKey)

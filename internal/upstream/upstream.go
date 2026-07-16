@@ -621,8 +621,20 @@ func Panel(
 
 // arbiterDefaultTimeout is the per-call arbiter timeout used when
 // Panel's arbiterTimeout argument is <= 0. Mirrors the issue default
-// ("configurable, default 60s").
-const arbiterDefaultTimeout = 60 * time.Second
+// ("configurable, default 60s"). Configured via ConfigureTimeouts.
+var arbiterDefaultTimeout = 60 * time.Second
+
+// perFetchDefaultTimeout is the per-fetch timeout used when Panel's
+// perFetchTimeout argument is <= 0. Configured via ConfigureTimeouts.
+var perFetchDefaultTimeout = 120 * time.Second
+
+// ConfigureTimeouts sets the upstream package-level timeout defaults from
+// config values. Called once at startup from cmd/nexus/main.go after
+// loading config. Issue #385.
+func ConfigureTimeouts(arbiterTimeout, perFetchTimeout time.Duration) {
+	arbiterDefaultTimeout = arbiterTimeout
+	perFetchDefaultTimeout = perFetchTimeout
+}
 
 func withDefaultArbiterTimeout(d time.Duration) time.Duration {
 	if d <= 0 {
@@ -654,7 +666,7 @@ func formatCandidate(r PanelResult) string {
 
 func withDefault(d time.Duration) time.Duration {
 	if d <= 0 {
-		return 120 * time.Second
+		return perFetchDefaultTimeout
 	}
 	return d
 }

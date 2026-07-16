@@ -83,7 +83,14 @@ type CascadeResult struct {
 
 // cascadeDefaultTimeout is the per-attempt timeout used when Cascade.Timeout
 // is <= 0. Mirrors the issue default ("configurable, default 30s").
-const cascadeDefaultTimeout = 30 * time.Second
+// Configured via ConfigureCascadeTimeout.
+var cascadeDefaultTimeout = 30 * time.Second
+
+// ConfigureCascadeTimeout sets the cascade default timeout. Called once at
+// startup from cmd/nexus/main.go after loading config. Issue #385.
+func ConfigureCascadeTimeout(t time.Duration) {
+	cascadeDefaultTimeout = t
+}
 
 // ErrSSEPartialWrite is returned by writeSSEResponse when an SSE body write
 // fails after HTTP headers have already been committed (WriteHeader called).

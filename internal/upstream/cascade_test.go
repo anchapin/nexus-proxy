@@ -870,3 +870,16 @@ func TestExtractAssistantMessageToolCalls(t *testing.T) {
 		t.Errorf("Name = %q", msg.ToolCalls[0].Function.Name)
 	}
 }
+
+// TestConfigureCascadeTimeout verifies ConfigureCascadeTimeout sets the
+// cascadeDefaultTimeout package-level variable. Issue #385.
+func TestConfigureCascadeTimeout(t *testing.T) {
+	orig := cascadeDefaultTimeout
+	defer func() { cascadeDefaultTimeout = orig }()
+
+	ConfigureCascadeTimeout(45 * time.Second)
+
+	if cascadeDefaultTimeout != 45*time.Second {
+		t.Errorf("cascadeDefaultTimeout = %v, want 45s", cascadeDefaultTimeout)
+	}
+}
