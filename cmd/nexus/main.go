@@ -1056,6 +1056,13 @@ func main() {
 	sighupCh := make(chan os.Signal, 1)
 	signal.Notify(sighupCh, syscall.SIGHUP)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("sighup handler recovered from panic",
+					slog.Any("panic", r),
+					slog.String("component", "hot-reload"))
+			}
+		}()
 		for range sighupCh {
 			newCfg, result := config.ReloadHotReloadable(cfg)
 			// Update in-place components.
