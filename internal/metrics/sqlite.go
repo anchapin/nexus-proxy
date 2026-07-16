@@ -582,6 +582,16 @@ func (s *SQLiteStore) Close() error {
 	})
 }
 
+// Writable checks whether the database is currently reachable by attempting
+// a Ping. Returns false when the database is closed or inaccessible.
+func (s *SQLiteStore) Writable() bool {
+	if s == nil || s.db == nil {
+		return false
+	}
+	return s.db.Ping() == nil
+}
+
+// Path returns the configured database path ("" for ":memory:").
 // --- telemetry.Recorder compatibility ------------------------------------
 //
 // The chat handler still uses the Recorder interface defined in
