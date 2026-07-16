@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
 // CascadeStep is one member of a Cascade: a single model endpoint the
@@ -260,6 +262,10 @@ func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payl
 	req.Header.Set("Content-Type", "application/json")
 	if step.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+step.APIKey)
+	}
+	// Propagate W3C trace context for distributed correlation (issue #299).
+	if tp := tracing.TraceparentFromContext(ctx); tp != "" {
+		req.Header.Set("traceparent", tp)
 	}
 
 	resp, dErr := client.Do(req)

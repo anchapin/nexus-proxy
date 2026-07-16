@@ -1,6 +1,9 @@
 package tracing
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 // TestPropagationRoundTrip is the canonical W3C interop test:
 // every traceparent produced by FormatTraceparent must parse via
@@ -44,5 +47,34 @@ func TestPropagationEmpty(t *testing.T) {
 		if got := InjectTraceparent(c); got != "" {
 			t.Errorf("case %d: InjectTraceparent = %q, want empty", i, got)
 		}
+	}
+}
+
+// TestTraceparentFromContext tests the outbound-context helper used by
+// the upstream package to propagate trace context (issue #299).
+func TestTraceparentFromContext(t *testing.T) {
+	// No tracing context at all — returns "".
+	if got := TraceparentFromContext(context.Background()); got != "" {
+		t.Errorf("no context: got %q, want empty", got)
+	}
+
+	// Context with valid tracing Context — returns formatted header.
+	tc := Context{
+		TraceID: "0af7651916cd43dd8448eb211c80319c",
+		SpanID:  "b7ad6b7169203331",
+	}
+	ctx := WithSpanContext(context.Background(), tc)
+	got := TraceparentFromContext(ctx)
+	if got == "" {
+		t.Fatal("expected non-empty traceparent")
+	}
+	// Verify it round-trips.
+	traceID, spanID, ok := ParseTraceparent(got)
+	if !ok {
+		t.Fatalf("TraceparentFromContext returned unparseable header: %q", got)
+	}
+	if traceID != tc.TraceID || spanID != tc.SpanID {
+		t.Errorf("round trip mismatch: got %q/%q, want %q/%q",
+			traceID, spanID, tc.TraceID, tc.SpanID)
 	}
 }

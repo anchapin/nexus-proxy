@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
 // ErrClientAbort is returned by streamPanelResultAsSSE when the client
@@ -156,6 +158,10 @@ func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	// Propagate W3C trace context for distributed correlation (issue #299).
+	if tp := tracing.TraceparentFromContext(ctx); tp != "" {
+		req.Header.Set("traceparent", tp)
 	}
 
 	resp, err := client.Do(req)
@@ -303,6 +309,10 @@ func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
+	// Propagate W3C trace context for distributed correlation (issue #299).
+	if tp := tracing.TraceparentFromContext(ctx); tp != "" {
+		req.Header.Set("traceparent", tp)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -354,6 +364,10 @@ func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	// Propagate W3C trace context for distributed correlation (issue #299).
+	if tp := tracing.TraceparentFromContext(ctx); tp != "" {
+		req.Header.Set("traceparent", tp)
 	}
 
 	resp, err := client.Do(req)
