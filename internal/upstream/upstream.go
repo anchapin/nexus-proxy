@@ -466,7 +466,13 @@ type PanelResult struct {
 // without calling the arbiter. When nil or TTL=0 the cache is bypassed
 // and the arbiter is called on every disagreement. Returns true if the
 // response was served from cache (so the caller can record metrics).
+//
+// The ctx parameter is the request context (typically r.Context() from the
+// HTTP handler). When the client disconnects, ctx is cancelled and the
+// in-flight upstream calls are cancelled within 1 second rather than
+// waiting for their individual timeouts (issue #297).
 func Panel(
+	ctx context.Context,
 	w http.ResponseWriter,
 	client Client,
 	localBaseURL, localModel, frontierURL, frontierModel string,
@@ -495,7 +501,7 @@ func Panel(
 					results <- PanelResult{Source: "local", Err: fmt.Errorf("panic: %v", r)}
 				}
 			}()
-			ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
+			ctx, cancel := context.WithTimeout(ctx, withDefault(perFetchTimeout))
 			defer cancel()
 			msg, err := FetchPanel(ctx, client,
 				localBaseURL+"/v1/chat/completions", "", localModel, body)
@@ -509,7 +515,7 @@ func Panel(
 				results <- PanelResult{Source: "frontier", Err: fmt.Errorf("panic: %v", r)}
 			}
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
+		ctx, cancel := context.WithTimeout(ctx, withDefault(perFetchTimeout))
 		defer cancel()
 		msg, err := FetchPanel(ctx, client,
 			frontierURL, "", frontierModel, body)
@@ -531,7 +537,7 @@ func Panel(
 	// above already enforce perFetchTimeout via FetchPanel's context,
 	// so we leave them alone and only the arbiter stream picks up the
 	// new arbiterTimeout knob.
-	arbiterCtx, cancelArbiter := context.WithTimeout(context.Background(), withDefaultArbiterTimeout(arbiterTimeout))
+	arbiterCtx, cancelArbiter := context.WithTimeout(ctx, withDefaultArbiterTimeout(arbiterTimeout))
 	defer cancelArbiter()
 	// Honor the harness's stream flag (issue #10). Panel members
 	// already force stream=false on the wire (FetchPanel needs the
