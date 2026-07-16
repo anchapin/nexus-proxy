@@ -139,6 +139,23 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Unix timestamp of the last failure recorded for this circuit breaker (issue #304).",
 		typ:  "gauge",
 	},
+	// RAG watcher gauges (issue #367)
+	"nexus_rag_watcher_files_indexed": {
+		help: "Number of files processed (indexed or removed) in the last watcher scan.",
+		typ:  "gauge",
+	},
+	"nexus_rag_watcher_last_scan_time": {
+		help: "Unix timestamp of the last watcher scan completion.",
+		typ:  "gauge",
+	},
+	"nexus_rag_watcher_scan_duration_ms": {
+		help: "Wall-clock duration of the last watcher scan in milliseconds.",
+		typ:  "gauge",
+	},
+	"nexus_rag_watcher_indexing_errors": {
+		help: "Cumulative count of file indexing errors in the RAG watcher.",
+		typ:  "counter",
+	},
 }
 
 // RenderPrometheus writes the full /metrics body in Prometheus
@@ -295,6 +312,8 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	// --- Gauges (live readings from providers) --------------------------
 
 	gauges := collectGauges(providers)
+	// RAG watcher gauges (issue #367)
+	gauges = append(gauges, c.RAGWatcherGauges()...)
 
 	// Group samples by metric name so HELP/TYPE is emitted once per family.
 	type sampleEntry struct {

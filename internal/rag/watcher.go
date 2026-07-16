@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
 // fileSnapshot is the per-file state the watcher remembers between
@@ -44,7 +46,26 @@ type Watcher struct {
 	stopCh chan struct{}
 	doneCh chan struct{}
 	once   sync.Once
+
+	// metrics is an optional hook called after each scan with the
+	// scan outcome (files indexed, duration, errors). main.go wires
+	// this to observability.Collector so the metrics appear in /metrics.
+	metrics WatcherMetrics
 }
+
+// WatcherMetrics collects scan outcome data from the watcher. The
+// interface is defined here so the rag package has no dependency on
+// the observability package.
+type WatcherMetrics interface {
+	// OnScanComplete is called at the end of each scan with the
+	// number of files processed (indexed or removed), the wall-clock
+	// duration in milliseconds, and the count of indexing errors.
+	OnScanComplete(filesIndexed int, durationMs int64, indexingErrors int)
+}
+
+// SetMetrics configures the watcher metrics hook. Safe to call before
+// or after Start; a nil metrics clears the hook.
+func (w *Watcher) SetMetrics(m WatcherMetrics) { w.metrics = m }
 
 // NewWatcher constructs a Watcher; call Start to spawn the polling
 // goroutine. The directory must already exist (the persistent
@@ -121,6 +142,10 @@ func (w *Watcher) run(parent context.Context) {
 // Security: symlinks are skipped (issue #107) to prevent confidentiality
 // leaks via injected few-shot examples.
 func (w *Watcher) scanOnce(ctx context.Context) error {
+	scanStart := time.Now()
+	filesIndexed := 0
+	indexingErrors := 0
+
 	files, err := os.ReadDir(w.dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -167,8 +192,10 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 				slog.String("filename", name),
 				slog.Any("err", err),
 			)
+			indexingErrors++
 			continue // known still holds old snapshot → next poll retries
 		}
+		filesIndexed++
 		w.known[name] = snap // only update on success
 	}
 
@@ -187,10 +214,15 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 			continue
 		}
 		delete(w.known, name)
+		filesIndexed++
 		slog.Info("rag: removed",
 			slog.String("component", "rag"),
 			slog.String("filename", name),
 		)
+	}
+
+	if w.metrics != nil {
+		w.metrics.OnScanComplete(filesIndexed, time.Since(scanStart).Milliseconds(), indexingErrors)
 	}
 	return nil
 }
@@ -199,6 +231,11 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 // into the persistent store. Pulled out so tests can exercise it
 // without the goroutine.
 func (w *Watcher) indexFile(ctx context.Context, name string) error {
+	ctx, span := tracing.StartSpanFromContext(ctx, "rag.watcher.indexFile")
+	if span != nil {
+		span.SetAttr("file", name)
+		defer span.End()
+	}
 	content, err := os.ReadFile(filepath.Join(w.dir, name))
 	if err != nil {
 		return err
