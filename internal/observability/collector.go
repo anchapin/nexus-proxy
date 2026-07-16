@@ -136,7 +136,7 @@ type Collector struct {
 	// Tracks the state of each named circuit breaker (ollama, rag).
 	// State values: 0=closed, 1=half_open, 2=open.
 	// Protected by cbMu; read via atomic for hot path.
-	cbMu   sync.RWMutex
+	cbMu    sync.RWMutex
 	cbState map[string]*circuitBreakerState
 }
 
@@ -144,7 +144,7 @@ type Collector struct {
 type circuitBreakerState struct {
 	state       atomic.Int32 // 0=closed, 1=half_open, 2=open
 	failures    atomic.Uint64
-	lastFailure  atomic.Int64 // Unix timestamp (seconds) of last failure
+	lastFailure atomic.Int64 // Unix timestamp (seconds) of last failure
 }
 
 const (

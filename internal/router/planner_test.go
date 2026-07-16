@@ -84,9 +84,9 @@ func TestPlanner_Plan(t *testing.T) {
 			name: "guardrail forces frontier on oversized prompt",
 			planner: &Planner{
 				SLM:                &stubSLM{route: RouteLocal},
-				FusionPatterns:      fusionPatterns,
+				FusionPatterns:     fusionPatterns,
 				FormattingRegex:    formattingPatterns,
-				LocalPatternsRegex:   localPatterns,
+				LocalPatternsRegex: localPatterns,
 			},
 			req: PlanRequest{
 				// 50000 'a's tokenise to 6250 tokens with cl100k_base BPE
@@ -104,9 +104,9 @@ func TestPlanner_Plan(t *testing.T) {
 			name: "guardrail disabled when budget <= 0 falls through to DSL",
 			planner: &Planner{
 				SLM:                &stubSLM{route: RouteFrontier},
-				FusionPatterns:      fusionPatterns,
+				FusionPatterns:     fusionPatterns,
 				FormattingRegex:    formattingPatterns,
-				LocalPatternsRegex:   localPatterns,
+				LocalPatternsRegex: localPatterns,
 			},
 			req: PlanRequest{
 				Prompt:          "fix the css",
@@ -122,9 +122,9 @@ func TestPlanner_Plan(t *testing.T) {
 			name: "dsl local match for formatting keyword",
 			planner: &Planner{
 				SLM:                &stubSLM{route: RouteFrontier},
-				FusionPatterns:      fusionPatterns,
+				FusionPatterns:     fusionPatterns,
 				FormattingRegex:    formattingPatterns,
-				LocalPatternsRegex:   localPatterns,
+				LocalPatternsRegex: localPatterns,
 			},
 			req: PlanRequest{
 				Prompt:          "please fix the css",
@@ -140,9 +140,9 @@ func TestPlanner_Plan(t *testing.T) {
 			name: "dsl fusion match for architecture keyword",
 			planner: &Planner{
 				SLM:                &stubSLM{route: RouteLocal},
-				FusionPatterns:      fusionPatterns,
+				FusionPatterns:     fusionPatterns,
 				FormattingRegex:    formattingPatterns,
-				LocalPatternsRegex:   localPatterns,
+				LocalPatternsRegex: localPatterns,
 			},
 			req: PlanRequest{
 				Prompt:          "review the system architecture",
@@ -158,9 +158,9 @@ func TestPlanner_Plan(t *testing.T) {
 			name: "dsl local match for refactor keyword (issue #202)",
 			planner: &Planner{
 				SLM:                &stubSLM{route: RouteFrontier},
-				FusionPatterns:      fusionPatterns,
+				FusionPatterns:     fusionPatterns,
 				FormattingRegex:    formattingPatterns,
-				LocalPatternsRegex:   localPatterns,
+				LocalPatternsRegex: localPatterns,
 			},
 			req: PlanRequest{
 				Prompt:          "refactor this module to use better error handling",
@@ -176,9 +176,9 @@ func TestPlanner_Plan(t *testing.T) {
 			name: "dsl local match for security scan keyword (issue #202)",
 			planner: &Planner{
 				SLM:                &stubSLM{route: RouteFrontier},
-				FusionPatterns:      fusionPatterns,
+				FusionPatterns:     fusionPatterns,
 				FormattingRegex:    formattingPatterns,
-				LocalPatternsRegex:   localPatterns,
+				LocalPatternsRegex: localPatterns,
 			},
 			req: PlanRequest{
 				Prompt:          "run a security scan on this code",
@@ -194,9 +194,9 @@ func TestPlanner_Plan(t *testing.T) {
 			name: "dsl local match for generate tests keyword (issue #202)",
 			planner: &Planner{
 				SLM:                &stubSLM{route: RouteFrontier},
-				FusionPatterns:      fusionPatterns,
+				FusionPatterns:     fusionPatterns,
 				FormattingRegex:    formattingPatterns,
-				LocalPatternsRegex:   localPatterns,
+				LocalPatternsRegex: localPatterns,
 			},
 			req: PlanRequest{
 				Prompt:          "generate tests for the auth middleware",
@@ -212,9 +212,9 @@ func TestPlanner_Plan(t *testing.T) {
 			name: "dsl local match for explain this code keyword (issue #202)",
 			planner: &Planner{
 				SLM:                &stubSLM{route: RouteFrontier},
-				FusionPatterns:      fusionPatterns,
+				FusionPatterns:     fusionPatterns,
 				FormattingRegex:    formattingPatterns,
-				LocalPatternsRegex:   localPatterns,
+				LocalPatternsRegex: localPatterns,
 			},
 			req: PlanRequest{
 				Prompt:          "explain this code section",
@@ -230,9 +230,9 @@ func TestPlanner_Plan(t *testing.T) {
 			name: "dsl local match for performance analysis keyword (issue #202)",
 			planner: &Planner{
 				SLM:                &stubSLM{route: RouteFrontier},
-				FusionPatterns:      fusionPatterns,
+				FusionPatterns:     fusionPatterns,
 				FormattingRegex:    formattingPatterns,
-				LocalPatternsRegex:   localPatterns,
+				LocalPatternsRegex: localPatterns,
 			},
 			req: PlanRequest{
 				Prompt:          "run a performance analysis on this function",
@@ -248,9 +248,9 @@ func TestPlanner_Plan(t *testing.T) {
 			name: "slm decision local",
 			planner: &Planner{
 				SLM:                &stubSLM{route: RouteLocal},
-				FusionPatterns:      fusionPatterns,
+				FusionPatterns:     fusionPatterns,
 				FormattingRegex:    formattingPatterns,
-				LocalPatternsRegex:   localPatterns,
+				LocalPatternsRegex: localPatterns,
 			},
 			req: PlanRequest{
 				Prompt:          "write a small helper function",
@@ -266,9 +266,9 @@ func TestPlanner_Plan(t *testing.T) {
 			name: "slm decision frontier",
 			planner: &Planner{
 				SLM:                &stubSLM{route: RouteFrontier},
-				FusionPatterns:      fusionPatterns,
+				FusionPatterns:     fusionPatterns,
 				FormattingRegex:    formattingPatterns,
-				LocalPatternsRegex:   localPatterns,
+				LocalPatternsRegex: localPatterns,
 			},
 			req: PlanRequest{
 				Prompt:          "implement a new distributed caching strategy for this microservices architecture",
@@ -284,9 +284,9 @@ func TestPlanner_Plan(t *testing.T) {
 			name: "slm error falls back to frontier",
 			planner: &Planner{
 				SLM:                &stubSLM{err: errors.New("ollama: connection refused")},
-				FusionPatterns:      fusionPatterns,
+				FusionPatterns:     fusionPatterns,
 				FormattingRegex:    formattingPatterns,
-				LocalPatternsRegex:   localPatterns,
+				LocalPatternsRegex: localPatterns,
 			},
 			req: PlanRequest{
 				Prompt:          "build a complex distributed caching layer with redis and memcache",
@@ -302,9 +302,9 @@ func TestPlanner_Plan(t *testing.T) {
 			name: "dsl bypassed when no keyword matches, slm consulted",
 			planner: &Planner{
 				SLM:                &stubSLM{route: RouteFusion},
-				FusionPatterns:      fusionPatterns,
+				FusionPatterns:     fusionPatterns,
 				FormattingRegex:    formattingPatterns,
-				LocalPatternsRegex:   localPatterns,
+				LocalPatternsRegex: localPatterns,
 			},
 			req: PlanRequest{
 				Prompt:          "design a new caching layer with redis",
@@ -376,9 +376,9 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 		p := &Planner{
 			SLM:                slm,
 			Confidence:         conf,
-			FusionPatterns:      fusionPatterns,
-				FormattingRegex:    formattingPatterns,
-			LocalPatternsRegex:   localPatterns,
+			FusionPatterns:     fusionPatterns,
+			FormattingRegex:    formattingPatterns,
+			LocalPatternsRegex: localPatterns,
 		}
 		// "analyze this exception" categorizes as CategoryDebugging and
 		// does not match any DSL keyword, so it reaches the SLM.
@@ -419,9 +419,9 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 		p := &Planner{
 			SLM:                slm,
 			Confidence:         conf,
-			FusionPatterns:      fusionPatterns,
-				FormattingRegex:    formattingPatterns,
-			LocalPatternsRegex:   localPatterns,
+			FusionPatterns:     fusionPatterns,
+			FormattingRegex:    formattingPatterns,
+			LocalPatternsRegex: localPatterns,
 		}
 		req := PlanRequest{
 			Prompt:          "analyze why this code keeps crashing",
@@ -447,9 +447,9 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 		p := &Planner{
 			SLM:                slm,
 			Confidence:         nil,
-			FusionPatterns:      fusionPatterns,
-				FormattingRegex:    formattingPatterns,
-			LocalPatternsRegex:   localPatterns,
+			FusionPatterns:     fusionPatterns,
+			FormattingRegex:    formattingPatterns,
+			LocalPatternsRegex: localPatterns,
 		}
 		req := PlanRequest{
 			Prompt:          "analyze why this code keeps crashing",
@@ -479,9 +479,9 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 		p := &Planner{
 			SLM:                slm,
 			Confidence:         conf,
-			FusionPatterns:      fusionPatterns,
-				FormattingRegex:    formattingPatterns,
-			LocalPatternsRegex:   localPatterns,
+			FusionPatterns:     fusionPatterns,
+			FormattingRegex:    formattingPatterns,
+			LocalPatternsRegex: localPatterns,
 		}
 		req := PlanRequest{
 			Prompt:          "analyze this stack trace",
@@ -517,9 +517,9 @@ func TestPlanner_NilSLM(t *testing.T) {
 	// with a nil SLM:
 	p := &Planner{
 		SLM:                nil,
-		FusionPatterns:      fusionPatterns,
-				FormattingRegex:    formattingPatterns,
-		LocalPatternsRegex:   localPatterns,
+		FusionPatterns:     fusionPatterns,
+		FormattingRegex:    formattingPatterns,
+		LocalPatternsRegex: localPatterns,
 	}
 	req := PlanRequest{
 		Prompt:          "fix the css",
