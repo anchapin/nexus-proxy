@@ -463,6 +463,19 @@ type Deps struct {
 	// interface clean (no context) while allowing RAG to receive ctx.
 	ContextAwareRAG middleware.ContextMiddleware
 
+	// MiddlewareChain is the ordered list of registered middleware names
+	// to apply to each request's messages slice (issue #224). The handler
+	// iterates the chain and calls each middleware's Transform method.
+	// Nil or empty defaults to the built-in chain.
+	MiddlewareChain []middleware.Middleware
+
+	// ContextAwareRAG is the optional ContextAwareRAG middleware that needs
+	// the request context to perform RAG retrieval. When non-nil and the
+	// chain contains "rag", the handler calls TransformContext instead of
+	// Transform for the RAG step. This keeps the generic Middleware
+	// interface clean (no context) while allowing RAG to receive ctx.
+	ContextAwareRAG middleware.ContextMiddleware
+
 	// Confidence is the optional judge-guided adaptive routing store
 	// (issue #47). When non-nil the handler categorizes the prompt,
 	// looks up the local model's historical confidence for that

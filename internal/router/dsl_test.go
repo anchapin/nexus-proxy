@@ -34,18 +34,10 @@ func TestGuardrail(t *testing.T) {
 }
 
 func TestDSL(t *testing.T) {
-	// Fusion patterns (architecture keywords — issue #305)
-	fusionPatterns := []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\b(architectural design|system architecture)\b`),
-	}
 	// Formatting patterns (simple, non-logic tasks)
-	formattingPatterns := []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|regex|api endpoint)\b`),
-	}
+	formattingRegex := regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|regex|api endpoint)\b`)
 	// Local patterns (common coding tasks — issue #230 additions merged with prior #202 entries)
-	localPatterns := []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis|debug|fix bug|git commit|sql query|parse json|validate input|test|optimize|readme)\b`),
-	}
+	localPatternsRegex := regexp.MustCompile(`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis|debug|fix bug|git commit|sql query|parse json|validate input|test|optimize|readme)\b`)
 	cases := []struct {
 		name    string
 		prompt  string
@@ -84,7 +76,7 @@ func TestDSL(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, hit := DSL(tc.prompt, fusionPatterns, formattingPatterns, localPatterns)
+			got, hit := DSL(tc.prompt, formattingRegex, localPatternsRegex)
 			if got != tc.want || hit != tc.wantHit {
 				t.Errorf("DSL(%q) = (%q,%v), want (%q,%v)",
 					tc.prompt, got, hit, tc.want, tc.wantHit)
