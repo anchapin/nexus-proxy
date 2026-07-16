@@ -103,6 +103,7 @@ const (
 	checkRateLimitProxyConfig = "rate_limit_proxy_config"
 	checkProviderRegistry     = "provider_registry"
 	checkMiddlewareChain      = "middleware_chain"
+	checkModelsEndpoint       = "models_endpoint"
 )
 
 // Run executes every diagnostic check against cfg and returns the
@@ -142,6 +143,7 @@ func Run(ctx context.Context, cfg config.Config, opts Options) Result {
 	r = append(r, checkRateLimitProxyConfigFn(cfg))
 	r = append(r, checkProviderRegistryFn())
 	r = append(r, checkMiddlewareChainFn(cfg))
+	r = append(r, checkModelsEndpointFn(ctx, cfg, opts))
 	return r
 }
 
@@ -798,5 +800,122 @@ func checkMiddlewareChainFn(cfg config.Config) Check {
 		Name:   checkMiddlewareChain,
 		Status: StatusPass,
 		Detail: fmt.Sprintf("chain valid (%s)", chain),
+	}
+}
+
+// --- Models endpoint -------------------------------------------------------
+
+// checkModelsEndpointFn verifies the Nexus /v1/models endpoint is
+// accessible and returns the configured local and router models in
+// the response. This addresses issue #351: an operator can run
+// `nexus check` successfully but still have GET /v1/models return
+// 500 at runtime if the endpoint is misconfigured.
+//
+// A connection failure (server not running) is reported as skip so
+// `nexus check` does not falsely fail when the server is down. Any
+// other error (non-200 response, parse failure, missing models) is
+// reported as fail.
+func checkModelsEndpointFn(ctx context.Context, cfg config.Config, opts Options) Check {
+	if !cfg.ModelsEndpointEnabled {
+		return Check{
+			Name:   checkModelsEndpoint,
+			Status: StatusSkip,
+			Detail: "models endpoint disabled (NEXUS_MODELS_ENDPOINT=false)",
+		}
+	}
+
+	// Construct the Nexus URL from cfg.Addr. The addr format is
+	// ":8000" (colon-prefixed port) or "localhost:8000". We prepend
+	// "http://" unconditionally because TLS config is a separate
+	// concern not relevant for a local diagnostic probe.
+	addr := cfg.Addr
+	if addr == "" {
+		addr = ":8000"
+	}
+	// addr like ":8000" -> host "localhost:8000"
+	if strings.HasPrefix(addr, ":") {
+		addr = "localhost" + addr
+	}
+	nexusURL := "http://" + addr + "/v1/models"
+
+	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nexusURL, nil)
+	if err != nil {
+		return Check{
+			Name:   checkModelsEndpoint,
+			Status: StatusFail,
+			Detail: err.Error(),
+		}
+	}
+
+	resp, err := opts.HTTPClient.Do(req)
+	if err != nil {
+		// Connection refused: server not running — skip rather than fail
+		// so `nexus check` can validate config even when the server is down.
+		return Check{
+			Name:   checkModelsEndpoint,
+			Status: StatusSkip,
+			Detail: fmt.Sprintf("cannot reach %s (is the Nexus server running?)", nexusURL),
+		}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return Check{
+			Name:   checkModelsEndpoint,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("/v1/models returned status %d", resp.StatusCode),
+		}
+	}
+
+	// Read and parse the response body.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB cap
+	if err != nil {
+		return Check{
+			Name:   checkModelsEndpoint,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("failed to read /v1/models response: %v", err),
+		}
+	}
+
+	var listResp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &listResp); err != nil {
+		return Check{
+			Name:   checkModelsEndpoint,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("/v1/models returned invalid JSON: %v", err),
+		}
+	}
+
+	// Build a set of model IDs from the response.
+	seen := make(map[string]bool)
+	for _, m := range listResp.Data {
+		seen[m.ID] = true
+	}
+
+	// Verify configured models appear in the discovery list.
+	var missing []string
+	for _, model := range []string{cfg.RouterModel, cfg.LocalModel} {
+		if model != "" && !seen[model] {
+			missing = append(missing, model)
+		}
+	}
+	if len(missing) > 0 {
+		return Check{
+			Name:   checkModelsEndpoint,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("configured model(s) not in /v1/models response: %v", missing),
+		}
+	}
+
+	return Check{
+		Name:   checkModelsEndpoint,
+		Status: StatusPass,
+		Detail: fmt.Sprintf("/v1/models accessible at %s", nexusURL),
 	}
 }
