@@ -637,3 +637,126 @@ func TestRouteCountersSLMEscalationsNilSafe(t *testing.T) {
 		t.Errorf("nil + Observe slm-escalation: expected (0, nil), got (%d, %v)", n, err)
 	}
 }
+
+// TestFusionArbiterSkipCounters tests the fusion arbiter skip counters (issue #384).
+func TestFusionArbiterSkipCounters(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveFusionArbiterSkip("agreement")
+	rc.ObserveFusionArbiterSkip("agreement")
+	rc.ObserveFusionArbiterSkip("tool_calls")
+	rc.ObserveFusionArbiterSkip("one_member")
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_fusion_arbiter_skipped_total", "metric family header"},
+		{`reason="agreement"} 2`, "agreement counted twice"},
+		{`reason="tool_calls"} 1`, "tool_calls counted once"},
+		{`reason="one_member"} 1`, "one_member counted once"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+}
+
+// TestFusionSimilarityRatioHistogram tests the fusion similarity ratio histogram (issue #384).
+func TestFusionSimilarityRatioHistogram(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveFusionSimilarityRatio(0.85)
+	rc.ObserveFusionSimilarityRatio(0.92)
+	rc.ObserveFusionSimilarityRatio(0.75)
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_fusion_similarity_ratio_bucket", "metric family header"},
+		{"nexus_fusion_similarity_ratio_bucket_bucket{le=", "histogram buckets present"},
+		{"_sum", "sum field present"},
+		{"_count", "count field present"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+}
+
+// TestFusionSpeculativeWinnerCounters tests the fusion speculative winner counters (issue #384).
+func TestFusionSpeculativeWinnerCounters(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveFusionSpeculativeWinner("local")
+	rc.ObserveFusionSpeculativeWinner("local")
+	rc.ObserveFusionSpeculativeWinner("frontier")
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_fusion_speculative_winner_total", "metric family header"},
+		{`reason="local"} 2`, "local counted twice"},
+		{`reason="frontier"} 1`, "frontier counted once"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+}
+
+// TestFusionArbiterSkipCountersNilSafe verifies that nil receivers are safe
+// when ObserveFusionArbiterSkip is called.
+func TestFusionArbiterSkipCountersNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveFusionArbiterSkip("agreement")
+	// Must not panic; WriteTo should return (0, nil).
+	n, err := rc.WriteTo(&strings.Builder{})
+	if err != nil || n != 0 {
+		t.Errorf("nil + ObserveFusionArbiterSkip: expected (0, nil), got (%d, %v)", n, err)
+	}
+}
+
+// TestFusionSimilarityRatioHistogramNilSafe verifies that nil receivers are safe
+// when ObserveFusionSimilarityRatio is called.
+func TestFusionSimilarityRatioHistogramNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveFusionSimilarityRatio(0.85)
+	// Must not panic; WriteTo should return (0, nil).
+	n, err := rc.WriteTo(&strings.Builder{})
+	if err != nil || n != 0 {
+		t.Errorf("nil + ObserveFusionSimilarityRatio: expected (0, nil), got (%d, %v)", n, err)
+	}
+}
+
+// TestFusionSpeculativeWinnerCountersNilSafe verifies that nil receivers are safe
+// when ObserveFusionSpeculativeWinner is called.
+func TestFusionSpeculativeWinnerCountersNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveFusionSpeculativeWinner("local")
+	// Must not panic; WriteTo should return (0, nil).
+	n, err := rc.WriteTo(&strings.Builder{})
+	if err != nil || n != 0 {
+		t.Errorf("nil + ObserveFusionSpeculativeWinner: expected (0, nil), got (%d, %v)", n, err)
+	}
+}

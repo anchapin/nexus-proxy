@@ -714,6 +714,12 @@ type PanelOutcome struct {
 	// When false and the arbiter was invoked, the synthesis was
 	// fetched from the arbiter and cached for future requests.
 	ArbiterCacheHit bool
+	// SkipReason describes why the arbiter was skipped (issue #384):
+	// "agreement" when Similarity >= agreementThreshold,
+	// "tool_calls" when the speculative winner carried tool calls,
+	// or "one_member" when only one panel member returned content.
+	// Empty when ArbiterSkipped is false.
+	SkipReason string
 }
 
 // PanelStreaming runs the fusion panel with progressive delivery
@@ -906,6 +912,7 @@ func PanelStreaming(
 	// change may add tool-call-aware arbitration.
 	if len(winner.ToolCalls) > 0 {
 		outcome.ArbiterSkipped = true
+		outcome.SkipReason = "tool_calls"
 		slog.Info("fusion tool-call winner, arbiter skipped",
 			slog.String("request_id", requestID),
 			slog.String("source", outcome.Source),
@@ -936,6 +943,7 @@ func PanelStreaming(
 	// The slow member's result was already consumed in the main flow.
 	if first.Err != nil || second.Err != nil {
 		outcome.ArbiterSkipped = true
+		outcome.SkipReason = "one_member"
 		// Cancel the slow member's goroutine to stop in-flight work.
 		if winnerFromSecond {
 			// winner is second; first (local) is slow
@@ -958,6 +966,7 @@ func PanelStreaming(
 	outcome.Similarity = SimilarityRatio(first.Content, second.Content)
 	if outcome.Similarity >= agreementThreshold {
 		outcome.ArbiterSkipped = true
+		outcome.SkipReason = "agreement"
 		slog.Info("fusion agreement, arbiter skipped",
 			slog.String("request_id", requestID),
 			slog.String("source", outcome.Source),

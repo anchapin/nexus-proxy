@@ -134,6 +134,19 @@ type RouteCounters struct {
 	// recovers from a panic and returns a panic error.
 	panelPanics uint64 // atomic
 
+	// Fusion arbiter skip counters (issue #384). reason is one of
+	// "agreement", "tool_calls", or "one_member".
+	fusionArbiterSkips map[string]*uint64
+
+	// Fusion similarity ratio histogram (issue #384). Records the Jaccard
+	// similarity ratio when the two panel members disagreed (arbiter was
+	// invoked). Bucket boundaries are in (0, 1].
+	fusionSimilarityRatio *Histogram
+
+	// Fusion speculative winner counters (issue #384). source is "local"
+	// or "frontier" indicating which panel member streamed first.
+	fusionSpeculativeWinner map[string]*uint64
+
 	// collector is an optional Collector whose CircuitBreakerGauges()
 	// are merged into the /metrics output when non-nil.
 	collector *Collector
@@ -158,6 +171,9 @@ func NewRouteCounters() *RouteCounters {
 		slmEscalations:           make(map[string]*uint64),
 		ragCacheHits:             &cHits,
 		ragCacheMisses:           &cMisses,
+		fusionArbiterSkips:       make(map[string]*uint64),
+		fusionSimilarityRatio:    NewHistogram([]float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0}),
+		fusionSpeculativeWinner:  make(map[string]*uint64),
 	}
 }
 
@@ -429,6 +445,67 @@ func (rc *RouteCounters) ObservePanelPanic() {
 	atomic.AddUint64(&rc.panelPanics, 1)
 }
 
+// ObserveFusionArbiterSkip records a fusion arbiter skip event (issue #384).
+// reason is one of "agreement" (SimilarityRatio >= threshold), "tool_calls"
+// (speculative winner carried tool calls), or "one_member" (one panel member
+// errored or skipLocal was true). Safe for concurrent use; nil receivers
+// are a no-op.
+func (rc *RouteCounters) ObserveFusionArbiterSkip(reason string) {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(rc.fusionArbiterSkipSlot(reason), 1)
+}
+
+// fusionArbiterSkipSlot returns the *uint64 for the skip reason, creating
+// it if absent. Same lock-then-atomic pattern as slot.
+func (rc *RouteCounters) fusionArbiterSkipSlot(reason string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.fusionArbiterSkips[reason]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.fusionArbiterSkips[reason] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
+// ObserveFusionSimilarityRatio records the Jaccard similarity ratio between
+// the two panel members when they disagreed and the arbiter was invoked
+// (issue #384). ratio is in [0, 1]. Safe for concurrent use; nil
+// receivers are a no-op.
+func (rc *RouteCounters) ObserveFusionSimilarityRatio(ratio float64) {
+	if rc == nil || rc.fusionSimilarityRatio == nil {
+		return
+	}
+	rc.fusionSimilarityRatio.Observe(ratio)
+}
+
+// ObserveFusionSpeculativeWinner records which panel member streamed first
+// as the speculative answer (issue #384). source is "local" or "frontier".
+// Safe for concurrent use; nil receivers are a no-op.
+func (rc *RouteCounters) ObserveFusionSpeculativeWinner(source string) {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(rc.fusionSpeculativeWinnerSlot(source), 1)
+}
+
+// fusionSpeculativeWinnerSlot returns the *uint64 for the speculative winner
+// source, creating it if absent. Same lock-then-atomic pattern as slot.
+func (rc *RouteCounters) fusionSpeculativeWinnerSlot(source string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.fusionSpeculativeWinner[source]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.fusionSpeculativeWinner[source] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
 // reasonSlot returns the *uint64 for reason, creating it if absent.
 // Same lock-then-atomic pattern as slot: the mutex guards the map
 // mutation only, the increment happens lock-free.
@@ -656,6 +733,33 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += n
 	}
+
+	// Fusion arbiter skip counters (issue #384).
+	if n, err := writeRejectionSeries(w, "nexus_fusion_arbiter_skipped_total",
+		"Fusion arbiter skips partitioned by reason (agreement, tool_calls, one_member) — issue #384.",
+		rc.fusionArbiterSkips); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+
+	// Fusion similarity ratio histogram (issue #384). Records Jaccard similarity
+	// when panel members disagreed and the arbiter was invoked.
+	if rc.fusionSimilarityRatio != nil {
+		writeHistogram(w, "nexus_fusion_similarity_ratio_bucket",
+			"Jaccard similarity ratio between panel members when arbiter was invoked (issue #384).",
+			rc.fusionSimilarityRatio)
+	}
+
+	// Fusion speculative winner counters (issue #384).
+	if n, err := writeRejectionSeries(w, "nexus_fusion_speculative_winner_total",
+		"Speculative winner source distribution in fusion panel (issue #384).",
+		rc.fusionSpeculativeWinner); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+
 	return total, nil
 }
 
