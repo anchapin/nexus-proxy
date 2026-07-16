@@ -2,6 +2,7 @@ package observability
 
 import (
 	"math"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -424,5 +425,153 @@ func TestCollectorCountersConcurrent(t *testing.T) {
 	wantBudgetUSD := 0.001 * float64(wantAuth)
 	if got := c.BudgetRecordedUSD(); math.Abs(got-wantBudgetUSD) > 1e-9 {
 		t.Errorf("BudgetRecordedUSD = %v, want %v", got, wantBudgetUSD)
+	}
+}
+
+// TestObservePipelineStage verifies each stage histogram accepts observations
+// and the buckets are populated correctly (issue #300).
+func TestObservePipelineStage(t *testing.T) {
+	c := NewCollector()
+
+	// Emit one observation per stage.
+	c.ObservePipelineStage(PipelineStageEvent{
+		RAGRetrievalMs:      15,
+		PromptEngineeringMs: 3,
+		TOONCompressionMs:   2,
+		SLMRoutingMs:        8,
+		UpstreamFirstByteMs: 250,
+	})
+
+	// Verify each stage histogram received exactly one observation.
+	for _, tc := range []struct {
+		name      string
+		hist      *Histogram
+		wantCount uint64
+	}{
+		{"stageRAG", c.stageRAG, 1},
+		{"stagePromptEng", c.stagePromptEng, 1},
+		{"stageTOON", c.stageTOON, 1},
+		{"stageSLM", c.stageSLM, 1},
+		{"stageUpstream", c.stageUpstream, 1},
+	} {
+		if got := tc.hist.count.Load(); got != tc.wantCount {
+			t.Errorf("%s count = %d, want %d", tc.name, got, tc.wantCount)
+		}
+	}
+}
+
+// TestObservePipelineStageZeroValues verifies zero-valued fields do not
+// produce observations (the handler skips zero values to keep metrics clean).
+func TestObservePipelineStageZeroValues(t *testing.T) {
+	c := NewCollector()
+
+	// Only upstream has a non-zero value.
+	c.ObservePipelineStage(PipelineStageEvent{
+		RAGRetrievalMs:      0,
+		PromptEngineeringMs: 0,
+		TOONCompressionMs:   0,
+		SLMRoutingMs:        0,
+		UpstreamFirstByteMs: 50,
+	})
+
+	if got := c.stageUpstream.count.Load(); got != 1 {
+		t.Errorf("stageUpstream count = %d, want 1", got)
+	}
+	// All other histograms should be at zero.
+	for _, tc := range []struct {
+		name string
+		hist *Histogram
+	}{
+		{"stageRAG", c.stageRAG},
+		{"stagePromptEng", c.stagePromptEng},
+		{"stageTOON", c.stageTOON},
+		{"stageSLM", c.stageSLM},
+	} {
+		if got := tc.hist.count.Load(); got != 0 {
+			t.Errorf("%s count = %d, want 0", tc.name, got)
+		}
+	}
+}
+
+// TestPipelineStageHandlerContentType verifies the Handler returns the
+// correct Prometheus Content-Type header.
+func TestPipelineStageHandlerContentType(t *testing.T) {
+	c := NewCollector()
+	c.ObservePipelineStage(PipelineStageEvent{UpstreamFirstByteMs: 100})
+
+	req := httptest.NewRequest("GET", "/metrics/stages", nil)
+	rec := httptest.NewRecorder()
+	c.Handler().ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("Content-Type"); got == "" {
+		t.Errorf("Content-Type header is empty, want text/plain")
+	}
+}
+
+// TestPipelineStageHandlerReturnsPrometheusFormat verifies the handler
+// output contains the expected stage metric name.
+func TestPipelineStageHandlerReturnsPrometheusFormat(t *testing.T) {
+	c := NewCollector()
+	c.ObservePipelineStage(PipelineStageEvent{
+		RAGRetrievalMs:      10,
+		PromptEngineeringMs: 5,
+		TOONCompressionMs:   2,
+		SLMRoutingMs:        7,
+		UpstreamFirstByteMs: 150,
+	})
+
+	req := httptest.NewRequest("GET", "/metrics/stages", nil)
+	rec := httptest.NewRecorder()
+	c.Handler().ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	metricName := "nexus_pipeline_stage_latency_ms"
+	if !strings.Contains(body, metricName) {
+		t.Errorf("handler output does not contain %q, got:\n%s", metricName, body)
+	}
+}
+
+// TestObservePipelineStageConcurrent verifies ObservePipelineStage is safe
+// for concurrent calls under the race detector.
+func TestObservePipelineStageConcurrent(t *testing.T) {
+	c := NewCollector()
+	const goroutines = 16
+	const iters = 100
+
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				// Add 1 to each modulo to ensure all values are > 0
+				// so the handler records every observation.
+				c.ObservePipelineStage(PipelineStageEvent{
+					RAGRetrievalMs:      int64(i%20) + 1,
+					PromptEngineeringMs: int64(i%10) + 1,
+					TOONCompressionMs:   int64(i%5) + 1,
+					SLMRoutingMs:        int64(i%15) + 1,
+					UpstreamFirstByteMs: int64(i%50) + 100,
+				})
+			}
+		}()
+	}
+	wg.Wait()
+
+	// All histograms should have received exactly goroutines * iters observations.
+	wantCount := uint64(goroutines * iters)
+	for _, tc := range []struct {
+		name string
+		hist *Histogram
+	}{
+		{"stageRAG", c.stageRAG},
+		{"stagePromptEng", c.stagePromptEng},
+		{"stageTOON", c.stageTOON},
+		{"stageSLM", c.stageSLM},
+		{"stageUpstream", c.stageUpstream},
+	} {
+		if got := tc.hist.count.Load(); got != wantCount {
+			t.Errorf("%s count = %d, want %d", tc.name, got, wantCount)
+		}
 	}
 }

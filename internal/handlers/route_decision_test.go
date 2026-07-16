@@ -530,3 +530,67 @@ func TestChatLatencyObserverCalledForLocalRoute(t *testing.T) {
 		t.Errorf("IsError = true, want false for successful request")
 	}
 }
+
+// TestPipelineStageObserverFuncAdapter verifies PipelineStageObserverFunc
+// correctly forwards PipelineStageEvent to the wrapped function (issue #300).
+func TestPipelineStageObserverFuncAdapter(t *testing.T) {
+	var captured PipelineStageEvent
+	PipelineStageObserverFunc(func(e PipelineStageEvent) { captured = e }).ObservePipelineStage(PipelineStageEvent{
+		RAGRetrievalMs:      12,
+		PromptEngineeringMs: 4,
+		TOONCompressionMs:   1,
+		SLMRoutingMs:        9,
+		UpstreamFirstByteMs: 180,
+	})
+	if captured.RAGRetrievalMs != 12 || captured.PromptEngineeringMs != 4 ||
+		captured.TOONCompressionMs != 1 || captured.SLMRoutingMs != 9 ||
+		captured.UpstreamFirstByteMs != 180 {
+		t.Errorf("adapter dropped or mangled event: %+v", captured)
+	}
+}
+
+// TestPipelineStageObserverInterface covers the full interface contract:
+// zero values are accepted and forwarded, and concurrent calls are safe.
+func TestPipelineStageObserverInterface(t *testing.T) {
+	const goroutines = 8
+	const iters = 50
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var totalRAG, totalPE, totalTOON, totalSLM, totalUpstream int64
+
+	obs := PipelineStageObserverFunc(func(e PipelineStageEvent) {
+		mu.Lock()
+		totalRAG += e.RAGRetrievalMs
+		totalPE += e.PromptEngineeringMs
+		totalTOON += e.TOONCompressionMs
+		totalSLM += e.SLMRoutingMs
+		totalUpstream += e.UpstreamFirstByteMs
+		mu.Unlock()
+	})
+
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				obs.ObservePipelineStage(PipelineStageEvent{
+					RAGRetrievalMs:      int64(id*iters + i + 1),
+					PromptEngineeringMs: int64(id + 1),
+					TOONCompressionMs:   int64((id + 1) * 2),
+					SLMRoutingMs:        int64(id + 1),
+					UpstreamFirstByteMs: int64((id*iters + i + 1) * 10),
+				})
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	// Verify non-zero accumulation.
+	wantRAG := int64(goroutines * iters * (goroutines*iters + 1) / 2)
+	if totalRAG == 0 || totalRAG != wantRAG {
+		t.Errorf("totalRAG = %d, want %d", totalRAG, wantRAG)
+	}
+	if totalUpstream == 0 {
+		t.Error("totalUpstream = 0, want non-zero")
+	}
+}
