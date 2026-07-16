@@ -316,3 +316,120 @@ func TestModelNotLoadedVerifiesModel(t *testing.T) {
 		t.Fatalf("failureCount=%d, want >=3", h.FailureCount())
 	}
 }
+
+// TestBackoffIntervalIncrease verifies that the polling interval increases
+// via exponential backoff after consecutive failures. This is the core
+// fix for issue #311.
+func TestBackoffIntervalIncrease(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+	// Fail enough probes to trigger breaker and then exercise backoff tiers.
+	srv.failNextN(10000)
+	// Use a short poll interval so we can observe backoff quickly.
+	pollInterval := 50 * time.Millisecond
+	h := New(srv.URL, "qwen3-coder:8b", pollInterval, 3, time.Second, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.Run(ctx)
+	defer h.Close()
+
+	// Wait for breaker to trip and verify state.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !h.IsLocalHealthy() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if h.IsLocalHealthy() {
+		t.Fatal("expected breaker to trip")
+	}
+	if h.FailureCount() < 3 {
+		t.Fatalf("expected failureCount >= 3, got %d", h.FailureCount())
+	}
+
+	// After the breaker trips, the interval should be backoff (2x = 100ms).
+	// Verify via PollingInterval().
+	interval := h.PollingInterval()
+	if interval < 80*time.Millisecond {
+		t.Fatalf("expected backoff interval >= 80ms, got %v", interval)
+	}
+}
+
+// TestBackoffResetsOnRecovery verifies that the polling interval resets
+// to normal after a successful probe.
+func TestBackoffResetsOnRecovery(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+	// Fail 3 times (breaker trips), then succeed.
+	srv.failNextN(3)
+	pollInterval := 50 * time.Millisecond
+	h := New(srv.URL, "qwen3-coder:8b", pollInterval, 3, time.Second, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.Run(ctx)
+	defer h.Close()
+
+	// Wait for breaker to trip.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !h.IsLocalHealthy() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if h.IsLocalHealthy() {
+		t.Fatal("expected breaker to trip")
+	}
+
+	// Now the server will succeed on next probe.
+	// Wait for recovery.
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.IsLocalHealthy() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !h.IsLocalHealthy() {
+		t.Fatal("expected recovery after success")
+	}
+
+	// After recovery, the interval should be back to normal.
+	interval := h.PollingInterval()
+	if interval != pollInterval {
+		t.Fatalf("expected normal interval %v after recovery, got %v", pollInterval, interval)
+	}
+}
+
+// TestCalcBackoffInterval verifies the tier calculation.
+func TestCalcBackoffInterval(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+	pollInterval := 100 * time.Millisecond
+	h := New(srv.URL, "qwen3-coder:8b", pollInterval, 3, time.Second, nil)
+
+	tests := []struct {
+		count          int
+		wantMultiplier int64
+	}{
+		{1, 1},   // tier 0: 1x
+		{2, 1},   // tier 0: 1x
+		{3, 2},   // tier 1: 2x
+		{4, 2},   // tier 1: 2x
+		{5, 4},   // tier 2: 4x
+		{6, 4},   // tier 2: 4x
+		{7, 8},   // tier 3: 8x
+		{8, 8},   // tier 3: 8x
+		{9, 15},  // tier 4: capped at 15x
+		{100, 15}, // tier 4: capped at 15x
+	}
+
+	for _, tc := range tests {
+		got := h.calcBackoffInterval(tc.count)
+		want := pollInterval * time.Duration(tc.wantMultiplier)
+		if got != want {
+			t.Errorf("calcBackoffInterval(%d) = %v, want %v", tc.count, got, want)
+		}
+	}
+}
