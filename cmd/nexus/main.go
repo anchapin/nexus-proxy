@@ -767,6 +767,7 @@ func main() {
 		CircuitBreakerObserver:  circuitBreakerObs,
 		ArbiterCache:            arbiterCache,
 		Providers:               providerRegistry,
+		LocalPatternsRegex:      cfg.DSLLocalPatterns, // issue #298
 	})
 	// Apply the per-client rate limiter (issue #75) as the outermost
 	// wrapper so a flood of requests is rejected before any middleware
