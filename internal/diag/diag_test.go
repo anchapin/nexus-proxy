@@ -70,6 +70,39 @@ func newOllamaFixture(t *testing.T) *ollamaFixture {
 	return f
 }
 
+// nexusFixture mocks the Nexus /v1/models endpoint for diagnostic
+// testing. The zero value serves a minimal valid response with no
+// models; set modelsBody to override.
+type nexusFixture struct {
+	*httptest.Server
+	modelsBody atomic.Value // string — JSON for /v1/models
+	status     int          // HTTP status; defaults to 200
+	calls      atomic.Int32
+}
+
+func newNexusFixture(t *testing.T) *nexusFixture {
+	t.Helper()
+	f := &nexusFixture{status: http.StatusOK}
+	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.calls.Add(1)
+		if r.URL.Path != "/v1/models" && r.URL.Path != "/v1/models/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(f.status)
+		body, _ := f.modelsBody.Load().(string)
+		if body == "" {
+			// Minimal valid response with no models.
+			body = `{"object":"list","data":[]}`
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(f.Close)
+	return f
+}
+
+
 // frontierFixture records the Authorization header so tests can
 // assert the Bearer token is forwarded without logging it. Returns a
 // /v1/models endpoint that mirrors OpenAI's shape; tests override
@@ -978,3 +1011,4 @@ func TestRunModelsEndpointAllModelsPresentIsPass(t *testing.T) {
 		t.Errorf("models_endpoint = %s (detail=%s), want pass", got.Status, got.Detail)
 	}
 }
+
