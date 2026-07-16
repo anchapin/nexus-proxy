@@ -1349,6 +1349,56 @@ func (c Config) NewLogger() *slog.Logger {
 	return slog.New(h)
 }
 
+// HotReloadResult captures the outcome of a SIGHUP config reload (issue #306).
+type HotReloadResult struct {
+	// NeedsRestart is the list of env vars that were changed but require
+	// a full proxy restart to take effect.
+	NeedsRestart []string
+}
+
+// ReloadHotReloadable re-reads environment variables for settings that are
+// safe to change at runtime (NEXUS_RATE_LIMIT_RPM, NEXUS_RATE_LIMIT_BURST,
+// NEXUS_LOG_LEVEL, NEXUS_LOG_FORMAT, NEXUS_DEBUG) and returns a new Config
+// with those fields updated. Settings that require a restart
+// (NEXUS_OLLAMA_URL, NEXUS_FRONTIER_API_KEY, NEXUS_METRICS_DB) are checked
+// and reported via NeedsRestart if they have changed since the last load.
+// The caller should apply in-place changes (rate limiter RPM/Burst, logger
+// level/format, debug flag) and log NeedsRestart with a restart hint.
+func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
+	result := HotReloadResult{}
+	next := prev // start from previous so non-reloadable fields are preserved
+
+	// Check which restart-required settings have changed.
+	if v := os.Getenv("NEXUS_OLLAMA_URL"); v != "" && v != prev.OllamaURL {
+		result.NeedsRestart = append(result.NeedsRestart, "NEXUS_OLLAMA_URL")
+	}
+	if v := os.Getenv("NEXUS_FRONTIER_API_KEY"); v != "" && v != prev.FrontierKey {
+		result.NeedsRestart = append(result.NeedsRestart, "NEXUS_FRONTIER_API_KEY")
+	}
+	if v := os.Getenv("NEXUS_METRICS_DB"); v != "" && v != prev.MetricsDBPath {
+		result.NeedsRestart = append(result.NeedsRestart, "NEXUS_METRICS_DB")
+	}
+
+	// Hot-reloadable settings.
+	rateRPM, _ := getEnvInt("NEXUS_RATE_LIMIT_RPM", prev.RateLimitRPM)
+	if rateRPM < 0 {
+		rateRPM = 0
+	}
+	next.RateLimitRPM = rateRPM
+
+	rateBurst, _ := getEnvInt("NEXUS_RATE_LIMIT_BURST", prev.RateLimitBurst)
+	if rateBurst < 0 {
+		rateBurst = 0
+	}
+	next.RateLimitBurst = rateBurst
+
+	next.LogLevel = parseLogLevel(os.Getenv("NEXUS_LOG_LEVEL"))
+	next.LogFormat = parseLogFormat(os.Getenv("NEXUS_LOG_FORMAT"))
+	next.Debug = parseBoolEnv("NEXUS_DEBUG", prev.Debug)
+
+	return next, result
+}
+
 func getEnv(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		return v
