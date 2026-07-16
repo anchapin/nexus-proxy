@@ -527,6 +527,14 @@ type Deps struct {
 	// construction time via NewSLMCache.
 	SLMCache *router.SLMCache
 
+	// LocalPatternsRegex is the DSL fast-pass regex(es) for common coding
+	// task keywords (issue #298). When non-nil the handler uses these
+	// patterns for DSL routing instead of Config.DSLLocalPatterns. This
+	// allows tests to inject specific patterns without constructing a
+	// full Config. Nil means use Config.DSLLocalPatterns (the production
+	// path via config.Load).
+	LocalPatternsRegex []*regexp.Regexp
+
 	// JudgeObserver is optional. When nil, the handler does not
 	// buffer the streamed response for judge sampling — every
 	// request takes the fast path with zero added overhead.
@@ -1083,7 +1091,7 @@ func Chat(d Deps) http.Handler {
 			Confidence:          d.Confidence,
 			FusionPatterns:      d.Config.DSLFusionPatterns,
 			FormattingRegex:     d.Config.DSLFormattingPatterns,
-			LocalPatternsRegex:  d.Config.DSLLocalPatterns,
+			LocalPatternsRegex:  d.LocalPatternsRegex,
 			SLMCache:            d.SLMCache,
 			ConfidenceThreshold: d.Config.SLMConfidenceThreshold,
 		}

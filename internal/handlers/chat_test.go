@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1573,6 +1574,81 @@ func TestChatEmitsSlogRouteLocal(t *testing.T) {
 	}
 	if !foundDSL {
 		t.Fatalf("no dsl match log line with route=local in: %s", output)
+	}
+}
+
+// TestChatDSLCacheLocalPatternsRouting verifies that a prompt matching
+// only the localPatternsRegex (not formattingRegex) routes to local via
+// the DSL fast-pass (issue #298).
+func TestChatDSLCacheLocalPatternsRouting(t *testing.T) {
+	// Construct deps with explicit LocalPatternsRegex so the DSL routing
+	// uses our pattern and not DefaultLocalPatterns.
+	deps := Deps{
+		Config: config.Config{
+			Addr:           ":0",
+			OllamaURL:      "http://ollama.local",
+			RouterModel:    "qwen3-coder:4b",
+			LocalModel:     "qwen3-coder:8b",
+			EmbeddingModel: "nomic-embed-text",
+			FrontierURL:    "http://frontier.local",
+			FrontierModel:  "gpt-4o",
+			FrontierKey:    "sk-test",
+			TokenGuardrail: 6000,
+			MetaPrompt:     " BOOST",
+			TOONNotice:     "[PROXY SYSTEM NOTE]: TOON compression applied",
+		},
+		// Override DSL patterns: only "explain this code" is a local pattern.
+		// No formatting patterns so we can verify localPatterns routing.
+		LocalPatternsRegex: []*regexp.Regexp{
+			regexp.MustCompile(`(?i)\b(explain this code)\b`),
+		},
+		Recorder: telemetry.Noop{},
+	}
+	// Also set DSLFusionPatterns and DSLFormattingPatterns to empty so
+	// only LocalPatternsRegex determines routing.
+	deps.Config.DSLFusionPatterns = nil
+	deps.Config.DSLFormattingPatterns = nil
+
+	rt := upstream.NewRecordingTransport()
+	client := &http.Client{Transport: rt}
+	slm := router.NewSLMClient(deps.Config.OllamaURL, deps.Config.RouterModel, 1, client)
+	store := rag.NewStore(stubEmbedder{vec: []float64{0, 0, 0}}, 0.55)
+	store.Add("no-match.go", "x", []float64{0, 1, 0})
+	deps.SLM = slm
+	deps.RAG = store
+	deps.Client = client
+
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"local stream"},"finish_reason":"stop"}]}`)
+	})
+
+	// Prompt matches localPatterns ("explain this code") but NOT formattingPatterns.
+	body := `{"messages":[{"role":"user","content":"explain this code section"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rw.Code)
+	}
+
+	// Verify the request went to local (Ollama), not frontier.
+	var sawOllama, sawFrontier bool
+	for _, c := range rt.Calls() {
+		if strings.Contains(c.URL, "ollama") {
+			sawOllama = true
+		}
+		if strings.Contains(c.URL, "frontier") {
+			sawFrontier = true
+		}
+	}
+	if sawFrontier {
+		t.Errorf("request went to frontier; want local route via DSL localPatterns")
+	}
+	if !sawOllama {
+		t.Errorf("request did not go to local Ollama; DSL localPatterns routing may have failed")
 	}
 }
 
