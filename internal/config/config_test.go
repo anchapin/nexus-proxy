@@ -764,8 +764,8 @@ func TestReloadHotReloadable_Debug(t *testing.T) {
 // restart-required settings are detected and reported.
 func TestReloadHotReloadable_RestartRequired(t *testing.T) {
 	prev := Config{
-		OllamaURL:   "http://localhost:11434",
-		FrontierKey: "sk-old",
+		OllamaURL:     "http://localhost:11434",
+		FrontierKey:   "sk-old",
 		MetricsDBPath: "/tmp/old.db",
 	}
 	// Simulate operator changing restart-required settings.

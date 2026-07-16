@@ -733,7 +733,7 @@ func main() {
 		RAGObserver:             ragObserver,
 		CascadeFallbackObserver: cascadeFallbackObs,
 		ArbiterCacheObserver:    arbiterCacheObserver,
-		PanelPanicObserver:       panelPanicObs,
+		PanelPanicObserver:      panelPanicObs,
 		ArbiterCache:            arbiterCache,
 		Providers:               providerRegistry,
 	})
