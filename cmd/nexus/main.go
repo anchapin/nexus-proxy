@@ -361,6 +361,11 @@ func main() {
 	// is available for wiring into the chat handler Deps.
 	circuitCollector := observability.NewCollector()
 
+	// Wire RAG watcher metrics into the /metrics output (issue #367).
+	if ragWatcher != nil {
+		ragWatcher.SetMetrics(circuitCollector)
+	}
+
 	// Stage latency collector (issue #300). Separate from routeCounters
 	// so the per-stage histograms (RAGRetrievalMs, PromptEngineeringMs,
 	// TOONCompressionMs, SLMRoutingMs, UpstreamFirstByteMs) are collected

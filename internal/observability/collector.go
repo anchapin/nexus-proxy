@@ -153,6 +153,15 @@ type Collector struct {
 	tlsConnectionsAccepted atomic.Uint64
 	tlsConnectionsRejected atomic.Uint64
 
+	// --- RAG watcher instrumentation (issue #367) ------------------
+	//
+	// RAG watcher scan outcome metrics. Updated after each scan by
+	// rag.Watcher calling OnScanComplete.
+	ragWatcherFilesIndexed   atomic.Uint64 // files processed in last scan
+	ragWatcherLastScanTime   atomic.Int64  // Unix timestamp (seconds) of last scan
+	ragWatcherScanDurationMs atomic.Uint64 // last scan duration in milliseconds
+	ragWatcherIndexingErrors atomic.Uint64 // cumulative indexing errors
+
 	// --- Circuit breaker instrumentation (issue #304) ---------------
 	//
 	// Tracks the state of each named circuit breaker (ollama, rag).
@@ -408,6 +417,31 @@ func (c *Collector) IncTLSAccepted() { c.tlsConnectionsAccepted.Add(1) }
 // from main.go via http.Server.ConnState for connections that
 // close before reaching http.StateTLSHandshakeComplete.
 func (c *Collector) IncTLSRejected() { c.tlsConnectionsRejected.Add(1) }
+
+// --- RAG watcher instrumentation (issue #367) ----------------------
+//
+// OnScanComplete records the outcome of one watcher scan. Called by
+// rag.Watcher after each scanOnce; implements rag.WatcherMetrics so
+// main.go can wire it with watcher.SetMetrics(c).
+func (c *Collector) OnScanComplete(filesIndexed int, durationMs int64, indexingErrors int) {
+	c.ragWatcherFilesIndexed.Store(uint64(filesIndexed))
+	c.ragWatcherLastScanTime.Store(time.Now().Unix())
+	c.ragWatcherScanDurationMs.Store(uint64(durationMs))
+	if indexingErrors > 0 {
+		c.ragWatcherIndexingErrors.Add(uint64(indexingErrors))
+	}
+}
+
+// RAGWatcherGauges returns the live RAG watcher readings as gauge samples
+// for the Prometheus renderer.
+func (c *Collector) RAGWatcherGauges() []GaugeSample {
+	return []GaugeSample{
+		{Name: "nexus_rag_watcher_files_indexed", Value: float64(c.ragWatcherFilesIndexed.Load())},
+		{Name: "nexus_rag_watcher_last_scan_time", Value: float64(c.ragWatcherLastScanTime.Load())},
+		{Name: "nexus_rag_watcher_scan_duration_ms", Value: float64(c.ragWatcherScanDurationMs.Load())},
+		{Name: "nexus_rag_watcher_indexing_errors", Value: float64(c.ragWatcherIndexingErrors.Load())},
+	}
+}
 
 // --- Circuit breaker instrumentation (issue #304) --------------------
 //
