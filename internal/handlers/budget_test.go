@@ -76,11 +76,11 @@ func chatHandlerForBudget(t *testing.T, sg interface {
 	rt := upstream.NewRecordingTransport()
 	client := &http.Client{Transport: rt}
 	deps := Deps{
-		Config:   cfg,
-		Client:   client,
-		RAG:      store,
-		SLM:      router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, 1, client),
-		Recorder: telemetry.Noop{},
+		Config:     cfg,
+		Client:     client,
+		RAG:        store,
+		SLM:        router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, 1, client),
+		Recorder:   telemetry.Noop{},
 		SpendGuard: sg,
 	}
 	return deps

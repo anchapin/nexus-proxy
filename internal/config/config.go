@@ -130,7 +130,7 @@ type Config struct {
 	// ...). All three default to the prior hardcoded behaviour when
 	// the corresponding env var is unset.
 	DSLFormattingPatterns []*regexp.Regexp // NEXUS_DSL_FORMATTING_PATTERNS
-	DSLFusionPatterns    []*regexp.Regexp // NEXUS_DSL_FUSION_PATTERNS
+	DSLFusionPatterns     []*regexp.Regexp // NEXUS_DSL_FUSION_PATTERNS
 	DSLLocalPatterns      []*regexp.Regexp // NEXUS_DSL_LOCAL_PATTERNS
 
 	// Frontier provider selector (issue #45). When more than one
