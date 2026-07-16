@@ -145,13 +145,13 @@ func TestChatRejectionMissingMessages(t *testing.T) {
 
 // TestChatRejectionUsesMetricsObserver confirms that when a
 // MetricsObserver is wired, the rejection is dispatched to it (with
-// route="rejected") instead of the legacy Recorder. This matches the
-// same preference the successful-request path uses (issue #4).
+// route="rejected"). With the fix for issue #164 both the
+// MetricsObserver and the Recorder receive events when both are wired.
 func TestChatRejectionUsesMetricsObserver(t *testing.T) {
 	deps, _ := baseDeps(t)
 	mo := &recordingMetricsObserver{}
 	deps.MetricsObserver = mo
-	deps.Recorder = &recordingRecorder{} // should NOT receive a record
+	deps.Recorder = &recordingRecorder{}
 	rr := &rejectionRecorder{}
 	deps.RejectionObserver = rr
 
@@ -168,6 +168,17 @@ func TestChatRejectionUsesMetricsObserver(t *testing.T) {
 	}
 	if events[0].Error != RejectionMethod {
 		t.Errorf("metrics error = %q, want %q", events[0].Error, RejectionMethod)
+	}
+	// Recorder also receives the rejection (issue #164 fix).
+	rows := deps.Recorder.(*recordingRecorder).snapshot()
+	if len(rows) != 1 {
+		t.Fatalf("recorder rows = %d, want 1", len(rows))
+	}
+	if rows[0].Route != "rejected" {
+		t.Errorf("record route = %q, want \"rejected\"", rows[0].Route)
+	}
+	if rows[0].Error != RejectionMethod {
+		t.Errorf("record error = %q, want %q", rows[0].Error, RejectionMethod)
 	}
 }
 
@@ -194,5 +205,29 @@ func TestRejectionObserverFuncAdapter(t *testing.T) {
 	f.ObserveRejection(RejectionEvent{RequestID: "req-1", Reason: RejectionMethod})
 	if got.RequestID != "req-1" || got.Reason != RejectionMethod {
 		t.Errorf("adapter captured %+v", got)
+	}
+}
+
+// TestRejectionQueueConstants verifies the queue overflow rejection
+// constants have the expected string values (issue #168).
+func TestRejectionQueueConstants(t *testing.T) {
+	if RejectionJudgeQueue != "judge_queue" {
+		t.Errorf("RejectionJudgeQueue = %q, want %q", RejectionJudgeQueue, "judge_queue")
+	}
+	if RejectionQualityQueue != "quality_queue" {
+		t.Errorf("RejectionQualityQueue = %q, want %q", RejectionQualityQueue, "quality_queue")
+	}
+}
+
+// TestRejectionObserverFuncQueueOverflow exercises the RejectionObserverFunc
+// adapter with the queue overflow reasons so the wiring in main.go is covered.
+func TestRejectionObserverFuncQueueOverflow(t *testing.T) {
+	for _, reason := range []string{RejectionJudgeQueue, RejectionQualityQueue} {
+		var got RejectionEvent
+		f := RejectionObserverFunc(func(e RejectionEvent) { got = e })
+		f.ObserveRejection(RejectionEvent{RequestID: "req-queue", Reason: reason})
+		if got.RequestID != "req-queue" || got.Reason != reason {
+			t.Errorf("adapter captured %+v for reason %q", got, reason)
+		}
 	}
 }

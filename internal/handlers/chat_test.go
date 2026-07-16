@@ -21,6 +21,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/health"
+	"github.com/anchapin/nexus-proxy/internal/middleware"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
@@ -32,6 +33,8 @@ type stubEmbedder struct{ vec []float64 }
 func (s stubEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
 	return s.vec, nil
 }
+
+func (s stubEmbedder) IsHealthy(context.Context) bool { return true }
 
 func baseDeps(t *testing.T) (Deps, *upstream.RecordingTransport) {
 	t.Helper()
@@ -56,6 +59,9 @@ func baseDeps(t *testing.T) (Deps, *upstream.RecordingTransport) {
 		FusionProgressiveDelivery: true,
 		FusionAgreementThreshold:  0.85,
 	}
+	// Re-initialize the middleware chain so closures capture cfg values
+	// instead of the empty defaults from the package init (issue #224).
+	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.PromptInjectionIsolated())
 	store := rag.NewStore(stubEmbedder{vec: []float64{0, 0, 0}}, 0.55)
 	store.Add("no-match.go", "x", []float64{0, 1, 0})
 	rt := upstream.NewRecordingTransport()
@@ -65,7 +71,7 @@ func baseDeps(t *testing.T) (Deps, *upstream.RecordingTransport) {
 		Client:          client,
 		RAG:             store,
 		SLM:             router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, 1, client),
-		FormattingRegex: regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate)\b`),
+		FormattingRegex: regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`),
 		Recorder:        telemetry.Noop{},
 	}
 	return deps, rt
@@ -115,8 +121,8 @@ func TestChatRejectsMissingMessages(t *testing.T) {
 
 func TestChatDSLLargePromptForcesFrontier(t *testing.T) {
 	deps, rt := baseDeps(t)
-	// 50000 char prompt ≈ 6250 tokens > 6000 guardrail
-	largeUser := strings.Repeat("a", 49000)
+	// 48500 char prompt ≈ 6250 tokens > 6000 guardrail
+	largeUser := strings.Repeat("a", 48500)
 	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("frontier stream"))
@@ -296,8 +302,8 @@ func TestChatRouteFrontierStampsDegradedFalse(t *testing.T) {
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("frontier stream"))
 	})
-	// Large prompt -> guardrail forces FRONTIER route.
-	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 49000) + `"}]}`
+	// 48500 char prompt ≈ 6062 tokens > 6000 guardrail.
+	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 48500) + `"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw := httptest.NewRecorder()
 	Chat(deps).ServeHTTP(rw, req)
@@ -535,9 +541,9 @@ func TestChatStreamingLocalStillSynthesizesSSE(t *testing.T) {
 // must call BufferedFetch and return a single JSON object.
 func TestChatNonStreamingFrontierReturnsJSONObject(t *testing.T) {
 	deps, rt := baseDeps(t)
-	// 50000 chars ≈ 6250 tokens > 6000 guardrail, so this routes to
+	// 48500 chars ≈ 6250 tokens > 6000 guardrail, so this routes to
 	// frontier via the default branch (not the local cascade).
-	largeUser := strings.Repeat("a", 49000)
+	largeUser := strings.Repeat("a", 48500)
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, r *http.Request) {
 		// BufferedFetch forces stream=false on the wire; assert it.
 		b, _ := io.ReadAll(r.Body)
@@ -687,10 +693,11 @@ type recordingObserver struct {
 	seen []LocalCompletion
 }
 
-func (r *recordingObserver) Submit(c LocalCompletion) {
+func (r *recordingObserver) Submit(c LocalCompletion) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.seen = append(r.seen, c)
+	return true
 }
 
 func (r *recordingObserver) Snapshot() []LocalCompletion {
@@ -777,7 +784,7 @@ func TestChatNonLocalRouteDoesNotInvokeObserver(t *testing.T) {
 
 	obs = &recordingObserver{}
 	deps.JudgeObserver = obs
-	body = `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 49000) + `"}]}` // guardrail -> frontier
+	body = `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 48500) + `"}]}` // guardrail -> frontier
 	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw = httptest.NewRecorder()
 	Chat(deps).ServeHTTP(rw, req)
@@ -1025,6 +1032,127 @@ func (errTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return nil, errors.New("simulated network down")
 }
 
+// frontierTruncTransport serves a frontier response that yields one
+// complete SSE chunk and then drops the connection mid-stream
+// (io.ErrUnexpectedEOF), reproducing issue #118 at the handler level.
+// RecordingTransport cannot simulate this — its RoundTrip always
+// returns a fully-buffered body that ends in a clean io.EOF.
+type frontierTruncTransport struct{}
+
+func (frontierTruncTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	chunk := "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(&truncBodyReader{data: []byte(chunk)}),
+	}, nil
+}
+
+// truncBodyReader yields data then returns io.ErrUnexpectedEOF,
+// mimicking an HTTP chunked body whose connection closed before the
+// terminating 0-length chunk.
+type truncBodyReader struct {
+	data []byte
+	pos  int
+}
+
+func (r *truncBodyReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.ErrUnexpectedEOF
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	return n, nil
+}
+
+// truncationObserverRecorder captures StreamTruncationEvent
+// dispatches so handler tests can assert the hook fired with the
+// expected route. Mirrors the rejectionRecorder pattern.
+type truncationObserverRecorder struct {
+	mu     sync.Mutex
+	events []StreamTruncationEvent
+}
+
+func (r *truncationObserverRecorder) ObserveStreamTruncation(e StreamTruncationEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, e)
+}
+
+func (r *truncationObserverRecorder) snapshot() []StreamTruncationEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]StreamTruncationEvent, len(r.events))
+	copy(out, r.events)
+	return out
+}
+
+// TestChatFrontierStreamTruncationHandled exercises issue #118 at the
+// handler level: a guardrail-forced frontier stream that drops
+// mid-stream is self-healed inside upstream.StreamWithContext
+// (truncation event + [DONE]). The handler must keep the 200 status
+// (NOT write a 502 into the already-committed SSE stream), stamp
+// X-Nexus-Truncated, and dispatch the StreamTruncationObserver so
+// /metrics records the truncation.
+func TestChatFrontierStreamTruncationHandled(t *testing.T) {
+	deps, _ := baseDeps(t)
+	deps.Client = &http.Client{Transport: frontierTruncTransport{}}
+	obs := &truncationObserverRecorder{}
+	deps.StreamTruncationObserver = obs
+
+	// Large prompt forces the token guardrail -> route=frontier.
+	body := `{"stream":true,"messages":[{"role":"user","content":"` + strings.Repeat("a", 30000) + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (proxy self-healed); body=%q", rw.Code, rw.Body.String())
+	}
+	out := rw.Body.String()
+	if !strings.Contains(out, `"type":"upstream_truncated"`) {
+		t.Errorf("body missing truncation event: %q", out)
+	}
+	if !strings.HasSuffix(out, "data: [DONE]\n\n") {
+		t.Errorf("body must end with [DONE] sentinel, got %q", out)
+	}
+	if got := rw.Header().Get("X-Nexus-Truncated"); got != "true" {
+		t.Errorf("X-Nexus-Truncated = %q, want \"true\"", got)
+	}
+	events := obs.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("StreamTruncationObserver events = %d, want 1", len(events))
+	}
+	if events[0].Route != string(router.RouteFrontier) {
+		t.Errorf("truncation route = %q, want %q", events[0].Route, router.RouteFrontier)
+	}
+}
+
+// TestChatFrontierStreamTruncationObserverNilSafe confirms a nil
+// StreamTruncationObserver does not break the truncation path — the
+// proxy still self-heals with [DONE] and X-Nexus-Truncated (issue
+// #118 wiring: the hook is optional, like the other observers).
+func TestChatFrontierStreamTruncationObserverNilSafe(t *testing.T) {
+	deps, _ := baseDeps(t)
+	deps.Client = &http.Client{Transport: frontierTruncTransport{}}
+	// deps.StreamTruncationObserver deliberately left nil.
+
+	body := `{"stream":true,"messages":[{"role":"user","content":"` + strings.Repeat("a", 30000) + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rw.Code, rw.Body.String())
+	}
+	if got := rw.Header().Get("X-Nexus-Truncated"); got != "true" {
+		t.Errorf("X-Nexus-Truncated = %q, want \"true\"", got)
+	}
+	if !strings.HasSuffix(rw.Body.String(), "data: [DONE]\n\n") {
+		t.Errorf("body must end with [DONE] sentinel, got %q", rw.Body.String())
+	}
+}
+
 // TestChatTelemetryJSONLRecorderEndToEnd wires the production
 // JSONLRecorder through the full handler and asserts the on-disk row
 // matches what we expect. This is the cross-package integration test the
@@ -1044,7 +1172,7 @@ func TestChatTelemetryJSONLRecorderEndToEnd(t *testing.T) {
 		_, _ = w.Write([]byte("frontier stream"))
 	})
 	// Large prompt -> guardrail forces FRONTIER route.
-	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 49000) + `"}]}`
+	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 48500) + `"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw := httptest.NewRecorder()
 	Chat(deps).ServeHTTP(rw, req)
@@ -1170,7 +1298,12 @@ func TestChatNonLocalRouteDoesNotInvokeQualityObserver(t *testing.T) {
 		expect string
 	}{
 		{"fusion", `{"messages":[{"role":"user","content":"design the system architecture"}]}`, "fusion"},
-		{"frontier", `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 49000) + `"}]}`, "frontier"},
+		// DSL-matching content routes to fusion without triggering the guardrail,
+		// avoiding the tiktoken encoding cost of the large-prompt approach.
+		// Previously 49000 chars (guardrail path) but that timed out on shared CI
+		// runners with the race detector — tiktoken encoding of 49k same-char
+		// bytes is too slow in -race mode within the 10-minute test timeout.
+		{"fusion2", `{"messages":[{"role":"user","content":"what is the architectural design for this system"}]}`, "fusion"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1453,8 +1586,9 @@ func TestChatEmitsSlogGuardrailVram(t *testing.T) {
 		_, _ = w.Write([]byte("frontier stream"))
 	})
 
-	// 50000 char prompt ≈ 6250 tokens > 6000 guardrail.
-	largeUser := strings.Repeat("a", 49000)
+	// 48500 char prompt ≈ 6062 tokens (8 chars/token) > 6000 guardrail.
+	// Slightly reduced from 49000 to speed tiktoken encoding in race mode.
+	largeUser := strings.Repeat("a", 48500)
 	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
 
 	output := captureSlog(t, func() {
@@ -1589,8 +1723,8 @@ func TestChatZeroBudgetFallsBackToStaticGuardrail(t *testing.T) {
 	deps, rt := baseDeps(t)
 	deps.BudgetObserver = &fakeBudgetObserver{Tokens: 0, Source: "static-fallback"}
 
-	// 50000 char prompt ≈ 6250 tokens > static guardrail (6000) -> frontier.
-	largeUser := strings.Repeat("a", 49000)
+	// 48500 char prompt ≈ 6250 tokens > static guardrail (6000) -> frontier.
+	largeUser := strings.Repeat("a", 48500)
 	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("frontier stream"))
@@ -1612,8 +1746,8 @@ func TestChatNilBudgetObserverFallsBackToStaticGuardrail(t *testing.T) {
 	deps, rt := baseDeps(t)
 	deps.BudgetObserver = nil
 
-	// 50000 char prompt ≈ 6250 tokens > static guardrail (6000) -> frontier.
-	largeUser := strings.Repeat("a", 49000)
+	// 48500 char prompt ≈ 6250 tokens > static guardrail (6000) -> frontier.
+	largeUser := strings.Repeat("a", 48500)
 	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("frontier stream"))
@@ -2000,7 +2134,7 @@ func TestChatLocalCooldownDoesNotAffectFrontierRoute(t *testing.T) {
 	})
 
 	// Large prompt -> guardrail forces FRONTIER route.
-	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 49000) + `"}]}`
+	body := `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 48500) + `"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw := httptest.NewRecorder()
 	Chat(deps).ServeHTTP(rw, req)
@@ -2011,5 +2145,61 @@ func TestChatLocalCooldownDoesNotAffectFrontierRoute(t *testing.T) {
 	// cooldown only protects route=local / route=fusion.
 	if got := rw.Header().Get("X-Nexus-Local-Cooldown"); got != "" {
 		t.Errorf("X-Nexus-Local-Cooldown = %q, want absent on route=frontier", got)
+	}
+}
+
+// TestChatFrontierCostUsesFrontierCostPer1K verifies issue #221: the
+// EstimatedCostUSD field is calculated using d.Config.FrontierCostPer1K
+// (not d.Config.JudgeCostPer1KUSD). The guardrail forces a frontier
+// route deterministically without needing an SLM stub.
+func TestChatFrontierCostUsesFrontierCostPer1K(t *testing.T) {
+	deps, rt := baseDeps(t)
+	// Set two distinct cost rates so we can distinguish which one
+	// the handler actually uses.
+	deps.Config.FrontierCostPer1K = 0.010 // 10x the judge default
+	deps.Config.JudgeCostPer1KUSD = 0.002
+
+	obs := &recordingMetricsObserver{}
+	deps.MetricsObserver = obs
+
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("frontier stream"))
+	})
+
+	// 30000 chars / 4 = 7500 tokens > 6000 guardrail -> frontier
+	largeUser := strings.Repeat("a", 30000)
+	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%q", rw.Code, rw.Body.String())
+	}
+
+	events := obs.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("metrics observer events = %d, want 1", len(events))
+	}
+
+	e := events[0]
+	if e.Route != string(router.RouteFrontier) {
+		t.Errorf("Route = %q, want %q", e.Route, router.RouteFrontier)
+	}
+
+	// Verify the cost uses FrontierCostPer1K (0.010) not JudgeCostPer1KUSD (0.002).
+	// The cost ratio should be exactly 5x (0.010/0.002).
+	// We verify this by checking that EstimatedCostUSD / FrontierCostPer1K ==
+	// EstimatedCostUSD if using JudgeCostPer1KUSD * 5 (within floating point tolerance).
+	if e.EstimatedCostUSD <= 0 {
+		t.Fatalf("EstimatedCostUSD = %v, want > 0", e.EstimatedCostUSD)
+	}
+	// Cost with FrontierCostPer1K should be 5x cost with JudgeCostPer1KUSD.
+	// If the code incorrectly used JudgeCostPer1KUSD, the ratio would be 1.0.
+	// If it correctly uses FrontierCostPer1K, the ratio is 5.0.
+	ratio := e.EstimatedCostUSD / (float64(e.InputTokens) * deps.Config.JudgeCostPer1KUSD / 1000.0)
+	if ratio < 4.9 || ratio > 5.1 {
+		t.Errorf("Cost ratio = %v, want ~5.0 (FrontierCostPer1K=0.010 / JudgeCostPer1KUSD=0.002); got ratio %.2f which indicates %s",
+			ratio, ratio,
+			map[bool]string{true: "CORRECT use of FrontierCostPer1K", false: "INCORRECT use of JudgeCostPer1KUSD"}[ratio > 4.5])
 	}
 }

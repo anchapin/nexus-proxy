@@ -391,27 +391,41 @@ func TestTelemetryRecorderBackwardsCompat(t *testing.T) {
 // correct struct field in both directions. A regression here is
 // silent — DailySummary looks fine but the dashboard lies — so we
 // assert every field explicitly.
+//
+// This test also serves as a regression guard for the INSERT placeholder
+// count contract: every column in the schema must have a corresponding ?
+// placeholder in the VALUES clause. If the counts mismatch, RecordRequest
+// returns a SQL error and this test fails (issue #219).
 func TestRequestFieldsRoundtrip(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Date(2026, 7, 10, 12, 34, 56, 789000000, time.UTC)
 	in := Request{
-		Timestamp:         now,
-		RequestID:         "roundtrip-1",
-		Route:             "fusion",
-		Model:             "glm-4.6",
-		InputTokens:       1234,
-		OutputTokens:      5678,
-		TOONSavingsTokens: 99,
-		RAGInjected:       true,
-		RAGFilename:       "examples/anything.go",
-		EstimatedCostUSD:  0.0123,
-		BaselineCostUSD:   0.0345,
-		SavingsUSD:        0.0222,
-		TTFTMs:            250,
-		TotalLatencyMs:    5000.0,
-		TPS:               1234.5,
-		Streaming:         true,
-		Error:             "",
+		Timestamp:               now,
+		RequestID:               "roundtrip-1",
+		Route:                   "fusion",
+		Model:                   "glm-4.6",
+		InputTokens:             1234,
+		OutputTokens:            5678,
+		TOONSavingsTokens:       99,
+		TOONCompressionMethod:   "fenced",
+		RAGInjected:             true,
+		RAGFilename:             "examples/anything.go",
+		RAGCacheHit:             true,
+		EstimatedCostUSD:        0.0123,
+		BaselineCostUSD:         0.0345,
+		SavingsUSD:              0.0222,
+		TTFTMs:                  250,
+		TotalLatencyMs:          5000.0,
+		TPS:                     1234.5,
+		Streaming:               true,
+		FusionArbiterSkipped:    true,
+		FusionJaccardSimilarity: 0.85,
+		FusionArbiterCostUSD:    0.001,
+		Error:                   "",
+		RouteSource:             "dsl",
+		RouteReason:             "architecture pattern",
+		SLMConfidence:           0.92,
+		SLMTaskType:             "refactor",
 	}
 	if err := s.RecordRequest(in); err != nil {
 		t.Fatalf("RecordRequest: %v", err)
@@ -428,13 +442,19 @@ func TestRequestFieldsRoundtrip(t *testing.T) {
 	// Read back via a fresh SQL query rather than DailySummary so
 	// all columns can be verified (issue #48 added
 	// fusion_arbiter_skipped; issue #73 added baseline_cost_usd /
-	// savings_usd).
+	// savings_usd; issue #200 added fusion_jaccard_similarity;
+	// issue #227 added rag_cache_hit; issue #239 added
+	// fusion_arbiter_cost_usd; issue #247 added
+	// toon_compression_method; issue #74 added route_source,
+	// route_reason, slm_confidence, slm_task_type).
 	row := ss2.db.QueryRow(`
 SELECT timestamp, request_id, route, model,
-       input_tokens, output_tokens, toon_savings_tokens,
-       rag_injected, rag_filename, estimated_cost_usd,
+       input_tokens, output_tokens, toon_savings_tokens, toon_compression_method,
+       rag_injected, rag_filename, rag_cache_hit, estimated_cost_usd,
        baseline_cost_usd, savings_usd,
-       ttft_ms, total_latency_ms, tps, streaming, fusion_arbiter_skipped, error
+       ttft_ms, total_latency_ms, tps, streaming,
+       fusion_arbiter_skipped, fusion_jaccard_similarity, fusion_arbiter_cost_usd, error,
+       route_source, route_reason, slm_confidence, slm_task_type
 FROM requests WHERE request_id = ?`, in.RequestID)
 	var (
 		gotTS                   time.Time
@@ -444,8 +464,10 @@ FROM requests WHERE request_id = ?`, in.RequestID)
 		gotInput                int
 		gotOutput               int
 		gotSavings              int
+		gotTOONMethod           string
 		gotRAGInj               int
 		gotRAGFile              string
+		gotRAGCacheHit          int
 		gotCost                 float64
 		gotBaseline             float64
 		gotSavingsUSD           float64
@@ -454,9 +476,15 @@ FROM requests WHERE request_id = ?`, in.RequestID)
 		gotTPS                  float64
 		gotStreaming            int
 		gotFusionArbiterSkipped int
+		gotFusionJaccard        float64
+		gotFusionArbiterCost    float64
 		gotErr                  string
+		gotRouteSource          string
+		gotRouteReason          string
+		gotSLMConfidence        float64
+		gotSLMTaskType          string
 	)
-	if err := row.Scan(&gotTS, &gotReqID, &gotRoute, &gotModel, &gotInput, &gotOutput, &gotSavings, &gotRAGInj, &gotRAGFile, &gotCost, &gotBaseline, &gotSavingsUSD, &gotTTFT, &gotLatency, &gotTPS, &gotStreaming, &gotFusionArbiterSkipped, &gotErr); err != nil {
+	if err := row.Scan(&gotTS, &gotReqID, &gotRoute, &gotModel, &gotInput, &gotOutput, &gotSavings, &gotTOONMethod, &gotRAGInj, &gotRAGFile, &gotRAGCacheHit, &gotCost, &gotBaseline, &gotSavingsUSD, &gotTTFT, &gotLatency, &gotTPS, &gotStreaming, &gotFusionArbiterSkipped, &gotFusionJaccard, &gotFusionArbiterCost, &gotErr, &gotRouteSource, &gotRouteReason, &gotSLMConfidence, &gotSLMTaskType); err != nil {
 		t.Fatalf("scan: %v", err)
 	}
 	if gotReqID != in.RequestID {
@@ -477,11 +505,17 @@ FROM requests WHERE request_id = ?`, in.RequestID)
 	if gotSavings != in.TOONSavingsTokens {
 		t.Errorf("toon_savings_tokens = %d, want %d", gotSavings, in.TOONSavingsTokens)
 	}
+	if gotTOONMethod != in.TOONCompressionMethod {
+		t.Errorf("toon_compression_method = %q, want %q", gotTOONMethod, in.TOONCompressionMethod)
+	}
 	if gotRAGInj != 1 {
 		t.Errorf("rag_injected = %d, want 1", gotRAGInj)
 	}
 	if gotRAGFile != in.RAGFilename {
 		t.Errorf("rag_filename = %q, want %q", gotRAGFile, in.RAGFilename)
+	}
+	if gotRAGCacheHit != 1 {
+		t.Errorf("rag_cache_hit = %d, want 1", gotRAGCacheHit)
 	}
 	if gotCost != in.EstimatedCostUSD {
 		t.Errorf("estimated_cost_usd = %f, want %f", gotCost, in.EstimatedCostUSD)
@@ -504,8 +538,29 @@ FROM requests WHERE request_id = ?`, in.RequestID)
 	if gotStreaming != 1 {
 		t.Errorf("streaming = %d, want 1", gotStreaming)
 	}
+	if gotFusionArbiterSkipped != 1 {
+		t.Errorf("fusion_arbiter_skipped = %d, want 1", gotFusionArbiterSkipped)
+	}
+	if gotFusionJaccard != in.FusionJaccardSimilarity {
+		t.Errorf("fusion_jaccard_similarity = %f, want %f", gotFusionJaccard, in.FusionJaccardSimilarity)
+	}
+	if gotFusionArbiterCost != in.FusionArbiterCostUSD {
+		t.Errorf("fusion_arbiter_cost_usd = %f, want %f", gotFusionArbiterCost, in.FusionArbiterCostUSD)
+	}
 	if gotErr != in.Error {
 		t.Errorf("error = %q, want %q", gotErr, in.Error)
+	}
+	if gotRouteSource != in.RouteSource {
+		t.Errorf("route_source = %q, want %q", gotRouteSource, in.RouteSource)
+	}
+	if gotRouteReason != in.RouteReason {
+		t.Errorf("route_reason = %q, want %q", gotRouteReason, in.RouteReason)
+	}
+	if gotSLMConfidence != in.SLMConfidence {
+		t.Errorf("slm_confidence = %f, want %f", gotSLMConfidence, in.SLMConfidence)
+	}
+	if gotSLMTaskType != in.SLMTaskType {
+		t.Errorf("slm_task_type = %q, want %q", gotSLMTaskType, in.SLMTaskType)
 	}
 	// Timestamp stored as RFC3339-ish text — comparison should be
 	// exact since we asked modernc to use its default text format.
@@ -778,6 +833,59 @@ CREATE INDEX IF NOT EXISTS idx_requests_request_id ON requests(request_id);`
 	}
 	if !floatEq(sum.SavingsTotal, 0.001) {
 		t.Errorf("SavingsTotal = %f, want ~0.001", sum.SavingsTotal)
+	}
+}
+
+// TestInsertSQLPlaceholdersMatchColumns verifies that the number of
+// columns in the INSERT column list exactly matches the number of ?
+// placeholders in the VALUES clause. A mismatch causes SQLite to return
+// "N values for M columns" at runtime, which would surface as silent
+// failures in RecordRequest (the error is logged but not returned).
+//
+// This test explicitly decouples the column list from the placeholder
+// list so a future developer can see at a glance whether the counts
+// agree. The canonical guard is TestRequestFieldsRoundtrip — if INSERT
+// placeholders mismatch columns, that test will fail because the write
+// returns a SQL error (issue #219).
+func TestInsertSQLPlaceholdersMatchColumns(t *testing.T) {
+	const (
+		colsSQL = `INSERT INTO requests
+    (timestamp, request_id, route, model,
+     input_tokens, output_tokens, toon_savings_tokens, toon_compression_method,
+     rag_injected, rag_filename, rag_cache_hit, estimated_cost_usd,
+     baseline_cost_usd, savings_usd,
+     ttft_ms, total_latency_ms, tps, streaming,
+     fusion_arbiter_skipped, fusion_jaccard_similarity, fusion_arbiter_cost_usd, error,
+     route_source, route_reason, slm_confidence, slm_task_type)`
+		valsSQL = `VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	)
+
+	colCount := 0
+	inParens := false
+	for _, r := range colsSQL {
+		if r == '(' {
+			inParens = true
+			continue
+		}
+		if r == ')' {
+			inParens = false
+			continue
+		}
+		if inParens && r == ',' {
+			colCount++
+		}
+	}
+	colCount++ // last column before )
+
+	placeholderCount := 0
+	for _, r := range valsSQL {
+		if r == '?' {
+			placeholderCount++
+		}
+	}
+
+	if colCount != placeholderCount {
+		t.Fatalf("INSERT column count (%d) != VALUES placeholder count (%d)", colCount, placeholderCount)
 	}
 }
 

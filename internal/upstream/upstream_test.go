@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -100,6 +101,115 @@ func TestStreamTransportError(t *testing.T) {
 	})}
 	if err := Stream(newRW(), client, "http://x", "", nil); err == nil {
 		t.Error("expected error")
+	}
+}
+
+// truncatingReader yields data then returns terminalErr instead of a
+// clean io.EOF. It lets streaming tests reproduce a mid-stream TCP
+// drop (io.ErrUnexpectedEOF — what the HTTP chunked reader surfaces
+// when the connection closes before the terminating 0-length chunk)
+// and a post-[DONE] connection reset, without spinning up an
+// httptest.Server. terminalErr must be non-nil.
+type truncatingReader struct {
+	data        []byte
+	pos         int
+	terminalErr error
+}
+
+func (r *truncatingReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, r.terminalErr
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	return n, nil
+}
+
+// TestStreamEmitsDoneOnUpstreamTruncation reproduces issue #118: the
+// upstream yields one complete SSE chunk then drops the connection
+// mid-stream (io.ErrUnexpectedEOF instead of a clean io.EOF). The
+// proxy must forward the partial chunk, emit a truncation event, emit
+// the terminating data: [DONE] sentinel so the harness does not hang,
+// stamp X-Nexus-Truncated, and return ErrUpstreamTruncated.
+func TestStreamEmitsDoneOnUpstreamTruncation(t *testing.T) {
+	chunk := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(&truncatingReader{data: []byte(chunk), terminalErr: io.ErrUnexpectedEOF}),
+		}, nil
+	})}
+	rw := newRW()
+	err := StreamWithContext(context.Background(), rw, client, "http://x", "", map[string]interface{}{"model": "m"})
+	if !errors.Is(err, ErrUpstreamTruncated) {
+		t.Fatalf("StreamWithContext error = %v, want ErrUpstreamTruncated", err)
+	}
+	if got := rw.header.Get("X-Nexus-Truncated"); got != "true" {
+		t.Errorf("X-Nexus-Truncated = %q, want \"true\"", got)
+	}
+	out := rw.body.String()
+	if !strings.Contains(out, chunk) {
+		t.Errorf("forwarded chunk missing from body: %q", out)
+	}
+	if !strings.Contains(out, `"type":"upstream_truncated"`) {
+		t.Errorf("body missing truncation event: %q", out)
+	}
+	if !strings.HasSuffix(out, "data: [DONE]\n\n") {
+		t.Errorf("body must end with [DONE] sentinel, got %q", out)
+	}
+}
+
+// TestStreamHappyPathDoneTerminatedUnchanged locks the happy path: a
+// complete upstream that emits its own data: [DONE] and then a clean
+// io.EOF must pass through byte-for-byte unchanged, return nil, and
+// NOT stamp X-Nexus-Truncated (issue #118 acceptance: successful
+// streams must not gain a synthetic terminator).
+func TestStreamHappyPathDoneTerminatedUnchanged(t *testing.T) {
+	body := "data: {\"choices\":[]}\n\ndata: [DONE]\n\n"
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})}
+	rw := newRW()
+	if err := Stream(rw, client, "http://x", "", map[string]interface{}{"model": "m"}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if rw.body.String() != body {
+		t.Errorf("body changed on happy path:\ngot:  %q\nwant: %q", rw.body.String(), body)
+	}
+	if got := rw.header.Get("X-Nexus-Truncated"); got != "" {
+		t.Errorf("X-Nexus-Truncated should be unset on happy path, got %q", got)
+	}
+}
+
+// TestStreamNoTruncationWhenDoneAlreadySeen pins the graceful/abrupt
+// distinction: once the upstream's own data: [DONE] has flowed
+// through, the SSE stream is complete even if the connection then
+// drops (io.ErrUnexpectedEOF). No synthetic truncation event must be
+// appended and Stream returns nil — the harness already saw its
+// terminator.
+func TestStreamNoTruncationWhenDoneAlreadySeen(t *testing.T) {
+	body := "data: {\"choices\":[]}\n\ndata: [DONE]\n\n"
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(&truncatingReader{data: []byte(body), terminalErr: io.ErrUnexpectedEOF}),
+		}, nil
+	})}
+	rw := newRW()
+	if err := Stream(rw, client, "http://x", "", map[string]interface{}{"model": "m"}); err != nil {
+		t.Fatalf("Stream: %v (want nil — [DONE] already seen)", err)
+	}
+	if rw.body.String() != body {
+		t.Errorf("body changed after [DONE] was seen:\ngot:  %q\nwant: %q", rw.body.String(), body)
+	}
+	if got := rw.header.Get("X-Nexus-Truncated"); got != "" {
+		t.Errorf("X-Nexus-Truncated should be unset when [DONE] already seen, got %q", got)
 	}
 }
 
@@ -260,7 +370,7 @@ func TestPanelArbiterTimeoutBoundsHangingCall(t *testing.T) {
 
 	const arbiterTO = 100 * time.Millisecond
 	start := time.Now()
-	err := Panel(
+	_, err := Panel(
 		newSSERW(), http.DefaultClient,
 		localSrv.URL, "local-m",
 		frontierSrv.URL, "frontier-m",
@@ -270,6 +380,7 @@ func TestPanelArbiterTimeoutBoundsHangingCall(t *testing.T) {
 		5*time.Second, // perFetchTimeout (panel members)
 		arbiterTO,     // arbiterTimeout
 		false,         // skipLocal
+		nil, 0*time.Second,
 	)
 	elapsed := time.Since(start)
 
@@ -314,7 +425,7 @@ func TestPanelArbiterHappyPathNoRegression(t *testing.T) {
 	client := &http.Client{Transport: ft}
 
 	rw := newSSERW()
-	if err := Panel(
+	if _, err := Panel(
 		rw, client,
 		"http://local.local", "local-m",
 		"http://frontier.local", "frontier-m",
@@ -324,6 +435,7 @@ func TestPanelArbiterHappyPathNoRegression(t *testing.T) {
 		5*time.Second, // perFetchTimeout
 		5*time.Second, // arbiterTimeout
 		false,         // skipLocal
+		nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -369,7 +481,7 @@ func TestPanelSkipLocalOmitsLocalFetch(t *testing.T) {
 	client := &http.Client{Transport: ft}
 
 	rw := newSSERW()
-	if err := Panel(
+	if _, err := Panel(
 		rw, client,
 		"http://local.local", "local-m",
 		frontierURL, "frontier-m",
@@ -379,6 +491,7 @@ func TestPanelSkipLocalOmitsLocalFetch(t *testing.T) {
 		5*time.Second, // perFetchTimeout
 		5*time.Second, // arbiterTimeout
 		true,          // skipLocal
+		nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -419,7 +532,7 @@ func TestPanelSkipLocalArbiterPromptHasDegradedMarker(t *testing.T) {
 	})
 	client := &http.Client{Transport: ft}
 
-	if err := Panel(
+	if _, err := Panel(
 		newSSERW(), client,
 		localURL, "local-m",
 		frontierURL, "frontier-m",
@@ -428,6 +541,7 @@ func TestPanelSkipLocalArbiterPromptHasDegradedMarker(t *testing.T) {
 		"the user prompt",
 		5*time.Second, 5*time.Second,
 		true, // skipLocal
+		nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -608,7 +722,7 @@ func TestPanelArbiterHonorsStreamFlagFalse(t *testing.T) {
 	client := &http.Client{Transport: ft}
 
 	rw := newJSONRW()
-	if err := Panel(
+	if _, err := Panel(
 		rw, client,
 		"http://local.local", "local-m",
 		"http://frontier.local", "frontier-m",
@@ -618,6 +732,7 @@ func TestPanelArbiterHonorsStreamFlagFalse(t *testing.T) {
 		5*time.Second,
 		5*time.Second,
 		false, // skipLocal (issue #8)
+		nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -669,7 +784,7 @@ func TestPanelArbiterHonorsStreamFlagTrueRegression(t *testing.T) {
 
 	// Explicit stream=true to mirror the OpenAI default.
 	rw := newSSERW()
-	if err := Panel(
+	if _, err := Panel(
 		rw, client,
 		"http://local.local", "local-m",
 		"http://frontier.local", "frontier-m",
@@ -679,6 +794,7 @@ func TestPanelArbiterHonorsStreamFlagTrueRegression(t *testing.T) {
 		5*time.Second,
 		5*time.Second,
 		false, // skipLocal (issue #8)
+		nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -734,6 +850,7 @@ func TestPanelStreamingAgreementSkipsArbiter(t *testing.T) {
 		false,         // skipLocal
 		0.85,          // agreementThreshold
 		"test-request-id",
+		nil, 0*time.Second,
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -824,6 +941,7 @@ func TestPanelStreamingAgreementCancelsSlowMember(t *testing.T) {
 		false,         // skipLocal
 		0.85,          // agreementThreshold
 		"test-request-id",
+		nil, 0*time.Second,
 	)
 
 	if err != nil {
@@ -894,6 +1012,7 @@ func TestPanelStreamingDisagreementRunsArbiter(t *testing.T) {
 		false,
 		0.85,
 		"test-request-id",
+		nil, 0*time.Second,
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -964,6 +1083,7 @@ func TestPanelStreamingDegradedSkipLocal(t *testing.T) {
 		true, // skipLocal
 		0.85,
 		"test-request-id",
+		nil, 0*time.Second,
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1026,6 +1146,7 @@ func TestPanelStreamingOneMemberFailedSkipsArbiter(t *testing.T) {
 		5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
+		nil, 0*time.Second,
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1076,6 +1197,7 @@ func TestPanelStreamingBothMembersFailedSurfacesError(t *testing.T) {
 		5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
+		nil, 0*time.Second,
 	)
 	if err == nil {
 		t.Fatal("expected error when both members fail")
@@ -1127,6 +1249,7 @@ func TestPanelStreamingHonorsStreamFalseFallsBackToPanel(t *testing.T) {
 		5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
+		nil, 0*time.Second,
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1194,6 +1317,7 @@ func TestPanelStreamingThresholdClamping(t *testing.T) {
 			false,
 			-1.0, // negative: clamped to 0 → "always skip when both succeed"
 			"test-request-id",
+			nil, 0*time.Second,
 		)
 		if err != nil {
 			t.Fatalf("PanelStreaming: %v", err)
@@ -1238,6 +1362,7 @@ func TestPanelStreamingThresholdClamping(t *testing.T) {
 			false,
 			2.0, // >1: clamps to 1 → only identical content skips
 			"test-request-id",
+			nil, 0*time.Second,
 		)
 		if err != nil {
 			t.Fatalf("PanelStreaming: %v", err)
@@ -1286,6 +1411,7 @@ func TestPanelStreamingSpeculativeSourceIdentified(t *testing.T) {
 		5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
+		nil, 0*time.Second,
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1334,6 +1460,7 @@ func TestPanelStreamingSetsProgressiveHeader(t *testing.T) {
 		5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
+		nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
 	}
@@ -1384,6 +1511,7 @@ func TestPanelStreamingToolCallWinnerSkipsArbiter(t *testing.T) {
 		5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
+		nil, 0*time.Second,
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1429,5 +1557,123 @@ func TestFetchPanelPreservesToolCalls(t *testing.T) {
 	}
 	if got.ToolCalls[0].Function.Name != "exec" {
 		t.Errorf("name = %q", got.ToolCalls[0].Function.Name)
+	}
+}
+
+// --- Issue #167: client abort during speculative SSE write tests ----------
+
+// brokenPipeRW is a ResponseWriter that fails on the first Write with EPIPE,
+// simulating a client that disconnected mid-stream.
+type brokenPipeRW struct {
+	header http.Header
+	status int
+	writes int // number of Write calls attempted
+}
+
+func newBrokenPipeRW() *brokenPipeRW {
+	return &brokenPipeRW{header: http.Header{}}
+}
+
+func (b *brokenPipeRW) Header() http.Header { return b.header }
+func (b *brokenPipeRW) WriteHeader(s int)   { b.status = s }
+func (b *brokenPipeRW) Flush()              {}
+func (b *brokenPipeRW) Write(p []byte) (int, error) {
+	b.writes++
+	// Simulate EPIPE: the client disconnected.
+	return len(p), &writeErr{errno: syscall.EPIPE}
+}
+
+// writeErr wraps syscall.Errno so errors.Is works correctly.
+type writeErr struct {
+	errno syscall.Errno
+}
+
+func (e *writeErr) Error() string { return e.errno.Error() }
+func (e *writeErr) Unwrap() error { return e.errno }
+
+// TestPanelStreamingClientAbortSkipsArbiter verifies that when the client
+// disconnects during the speculative SSE write (EPIPE), PanelStreaming
+// returns nil (not an error) and does NOT invoke the arbiter. This is the
+// fix for issue #167: client abort should be logged at info level and
+// return early, not treated as an upstream error.
+func TestPanelStreamingClientAbortSkipsArbiter(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local answer"}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier answer"}}]}`)
+	})
+	// The arbiter handler sets a flag so we can assert it was never called.
+	var arbiterCalled int
+	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		arbiterCalled++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "data: {\"synth\":\"arbiter-out\"}\n\n")
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newBrokenPipeRW()
+	outcome, err := PanelStreaming(
+		rw, client,
+		"http://local.local", "local-m",
+		frontierURL, "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		5*time.Second, 5*time.Second,
+		false, 0.85, "test-request",
+		nil, 0*time.Second,
+	)
+	// Issue #167: client abort is NOT returned as an error — we return nil
+	// so the handler does not render a 502 error page to a disconnected client.
+	if err != nil {
+		t.Fatalf("PanelStreaming: got error %v, want nil (client abort)", err)
+	}
+	// The arbiter must NOT have been invoked — the client is gone, there
+	// is nobody to receive the arbiter synthesis.
+	if arbiterCalled != 0 {
+		t.Errorf("arbiter called %d times, want 0 (client aborted)", arbiterCalled)
+	}
+	// The speculative write was attempted at least once (the broken pipe fired).
+	if rw.writes == 0 {
+		t.Errorf("rw.writes = 0, want >= 1 (write should have been attempted)")
+	}
+	// outcome.Source should still be set from the winner selection.
+	if outcome.Source != "local" && outcome.Source != "frontier" {
+		t.Errorf("outcome.Source = %q, want local or frontier", outcome.Source)
+	}
+	_ = outcome // outcome.Similarity is 0 since we never reached agreement check
+}
+
+// TestIsClientAbort verifies the IsClientAbort helper correctly identifies
+// EPIPE, ECONNRESET, and ErrClientAbort.
+func TestIsClientAbort(t *testing.T) {
+	epipeErr := &writeErr{errno: syscall.EPIPE}
+	connresetErr := &writeErr{errno: syscall.ECONNRESET}
+	otherErr := errors.New("some other error")
+
+	if !IsClientAbort(epipeErr) {
+		t.Error("IsClientAbort(EPIPE) = false, want true")
+	}
+	if !IsClientAbort(connresetErr) {
+		t.Error("IsClientAbort(ECONNRESET) = false, want true")
+	}
+	if !IsClientAbort(ErrClientAbort) {
+		t.Error("IsClientAbort(ErrClientAbort) = false, want true")
+	}
+	if IsClientAbort(otherErr) {
+		t.Error("IsClientAbort(other error) = true, want false")
+	}
+	if IsClientAbort(nil) {
+		t.Error("IsClientAbort(nil) = true, want false")
 	}
 }

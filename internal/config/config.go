@@ -106,6 +106,12 @@ type Config struct {
 	// skipping the Ollama round-trip for repeat prompts.
 	RAGEmbedCacheSize int // max LRU entries (256)
 
+	// RAG circuit breaker (issue #222). After RAGCircuitBreakerThreshold
+	// consecutive Ollama /api/embeddings failures the breaker trips and
+	// enters a cooldown window during which Embed returns ErrCircuitOpen.
+	RAGCircuitBreakerThreshold int           // consecutive failures to trip; 0 = disabled
+	RAGCircuitBreakerCooldown  time.Duration // cooldown duration after trip
+
 	// Routing
 	TokenGuardrail            int           // estimated tokens above this force frontier (6000)
 	SLMTimeout                time.Duration // Qwen3-Coder routing timeout (8s)
@@ -163,6 +169,14 @@ type Config struct {
 	// entirely (negative) or always skip it (>1).
 	FusionProgressiveDelivery bool    // true iff NEXUS_FUSION_PROGRESSIVE is unset or "true" (default true)
 	FusionAgreementThreshold  float64 // Jaccard ratio [0,1] above which arbiter is skipped (default 0.85)
+
+	// Fusion arbiter synthesis cache (issue #232). When ArbiterCacheTTL > 0,
+	// arbiter synthesis responses are cached keyed by a hash of
+	// (first.Content, second.Content). Subsequent requests with identical
+	// panel-member content return the cached synthesis text instead of
+	// invoking the expensive frontier arbiter call. Set to 0 to disable
+	// the cache (all arbiter calls are made, no caching).
+	ArbiterCacheTTL time.Duration // NEXUS_ARBITER_CACHE_TTL; 0 disables
 
 	// Judge-guided adaptive routing (issue #47). Historical judge
 	// scores are aggregated by task category in a SQLite table and fed
@@ -277,8 +291,14 @@ type Config struct {
 	QualityStderrCap   int           // stderr bytes retained per verdict (default 2 KiB)
 
 	// Middleware prompts
-	MetaPrompt string // appended to system prompt by prompt_engine
-	TOONNotice string // appended when TOON compression is applied
+	MetaPrompt   string // appended to system prompt by prompt_engine
+	TOONNotice   string // appended when TOON compression is applied
+	TOONUnfenced bool   // issue #123: compress bare (unfenced) JSON arrays; default true
+
+	// Middleware chain (issue #224). Comma-separated ordered list of
+	// registered middleware names to apply per request. Empty uses the
+	// built-in default: "promptEngineering,rag,compressJSONBlocks,appendSystemNote".
+	MiddlewareChain string
 
 	// Prompt-injection hardening (issue #76). Controls whether the
 	// proxy isolates its policy text from user-supplied system content
@@ -412,24 +432,26 @@ func DefaultJudgeDBPath() string {
 // value is malformed; missing optional values fall back to defaults.
 func Load() (Config, error) {
 	cfg := Config{
-		Addr:           getEnv("NEXUS_ADDR", ":8000"),
-		OllamaURL:      strings.TrimRight(getEnv("NEXUS_OLLAMA_URL", "http://localhost:11434"), "/"),
-		RouterModel:    getEnv("NEXUS_ROUTER_MODEL", "qwen3-coder:4b"),
-		LocalModel:     getEnv("NEXUS_LOCAL_MODEL", "qwen3-coder:8b"),
-		EmbeddingModel: getEnv("NEXUS_EMBEDDING_MODEL", "nomic-embed-text"),
-		FrontierURL:    getEnv("NEXUS_FRONTIER_URL", "https://api.openai.com/v1/chat/completions"),
-		FrontierModel:  getEnv("NEXUS_FRONTIER_MODEL", "gpt-4o"),
-		FrontierKey:    getEnv("NEXUS_FRONTIER_API_KEY", ""),
-		ZAIURL:         getEnv("NEXUS_ZAI_URL", "https://api.z.ai/v1/chat/completions"),
-		ZAIModel:       getEnv("NEXUS_ZAI_MODEL", "glm-4.6"),
-		ZAIKey:         getEnv("NEXUS_ZAI_API_KEY", ""),
-		ProxyAPIKey:    getEnv("NEXUS_PROXY_API_KEY", ""),
-		StatusPublic:   getEnvBool("NEXUS_STATUS_PUBLIC", false),
-		ExamplesDir:    getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
-		MetaPrompt:     defaultMetaPrompt,
-		TOONNotice:     defaultTOONNotice,
-		TelemetryPath:  getEnvAllowEmpty("NEXUS_TELEMETRY_PATH", "./nexus-telemetry.jsonl"),
-		MetricsDBPath:  getEnvAllowEmpty("NEXUS_METRICS_DB", DefaultMetricsDBPath()),
+		Addr:            getEnv("NEXUS_ADDR", ":8000"),
+		OllamaURL:       strings.TrimRight(getEnv("NEXUS_OLLAMA_URL", "http://localhost:11434"), "/"),
+		RouterModel:     getEnv("NEXUS_ROUTER_MODEL", "qwen3-coder:4b"),
+		LocalModel:      getEnv("NEXUS_LOCAL_MODEL", "qwen3-coder:8b"),
+		EmbeddingModel:  getEnv("NEXUS_EMBEDDING_MODEL", "nomic-embed-text"),
+		FrontierURL:     getEnv("NEXUS_FRONTIER_URL", "https://api.openai.com/v1/chat/completions"),
+		FrontierModel:   getEnv("NEXUS_FRONTIER_MODEL", "gpt-4o"),
+		FrontierKey:     getEnv("NEXUS_FRONTIER_API_KEY", ""),
+		ZAIURL:          getEnv("NEXUS_ZAI_URL", "https://api.z.ai/v1/chat/completions"),
+		ZAIModel:        getEnv("NEXUS_ZAI_MODEL", "glm-4.6"),
+		ZAIKey:          getEnv("NEXUS_ZAI_API_KEY", ""),
+		ProxyAPIKey:     getEnv("NEXUS_PROXY_API_KEY", ""),
+		StatusPublic:    getEnvBool("NEXUS_STATUS_PUBLIC", false),
+		ExamplesDir:     getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
+		MetaPrompt:      defaultMetaPrompt,
+		TOONNotice:      defaultTOONNotice,
+		TOONUnfenced:    getEnvBool("NEXUS_TOON_UNFENCED", true),
+		MiddlewareChain: getEnv("NEXUS_MIDDLEWARE_CHAIN", ""),
+		TelemetryPath:   getEnvAllowEmpty("NEXUS_TELEMETRY_PATH", "./nexus-telemetry.jsonl"),
+		MetricsDBPath:   getEnvAllowEmpty("NEXUS_METRICS_DB", DefaultMetricsDBPath()),
 	}
 
 	threshold, err := getEnvFloat("NEXUS_RAG_THRESHOLD", 0.55)
@@ -480,6 +502,19 @@ func Load() (Config, error) {
 		cfg.EmbedderBaseURL = cfg.OllamaURL
 	}
 	cfg.CohereAPIKey = getEnv("NEXUS_COHERE_API_KEY", "")
+
+	// RAG circuit breaker (issue #222).
+	cbThreshold, err := getEnvInt("NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD", 3)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RAGCircuitBreakerThreshold = cbThreshold
+
+	cbCooldown, err := getEnvDuration("NEXUS_RAG_CIRCUIT_BREAKER_COOLDOWN", 30*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RAGCircuitBreakerCooldown = cbCooldown
 
 	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
 	if err != nil {
@@ -607,6 +642,17 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.FusionAgreementThreshold = agreementThreshold
+
+	// Fusion arbiter synthesis cache (issue #232). NEXUS_ARBITER_CACHE_TTL=0
+	// (the default) disables the cache entirely — every disagreement
+	// calls the arbiter. When set to a positive duration, identical
+	// panel-member content within the TTL window returns the cached
+	// synthesis text without calling the arbiter.
+	arbiterCacheTTL, err := getEnvDuration("NEXUS_ARBITER_CACHE_TTL", 0)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ArbiterCacheTTL = arbiterCacheTTL
 
 	// Judge-guided adaptive routing (issue #47). Defaults keep the
 	// feature dormant unless the judge is enabled and a DB path is

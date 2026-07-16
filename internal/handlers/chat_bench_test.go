@@ -37,6 +37,8 @@ func (benchEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
 	return []float64{1.0}, nil
 }
 
+func (benchEmbedder) IsHealthy(context.Context) bool { return true }
+
 // jsonStringLit wraps a string in a JSON string literal via fmt %q.
 func jsonStringLit(s string) string {
 	return fmt.Sprintf("%q", s)
@@ -67,7 +69,7 @@ func benchDeps(b *testing.B, localSrv, frontierSrv *httptest.Server) Deps {
 		Client:          client,
 		RAG:             store,
 		SLM:             router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, 1, client),
-		FormattingRegex: regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate)\b`),
+		FormattingRegex: regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`),
 		Recorder:        telemetry.Noop{},
 	}
 }
@@ -224,7 +226,7 @@ func BenchmarkChatEndToEndProxy(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		req, _ := http.NewRequest(http.MethodPost, proxySrv.URL+"/v1/chat/completions",
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, proxySrv.URL+"/v1/chat/completions",
 			strings.NewReader(body))
 		resp, err := client.Do(req)
 		if err != nil {
@@ -270,7 +272,7 @@ func BenchmarkChatEndToEndProxyConcurrent(b *testing.B) {
 				go func() {
 					defer wg.Done()
 					for r := 0; r < perWorker; r++ {
-						req, _ := http.NewRequest(http.MethodPost,
+						req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost,
 							proxySrv.URL+"/v1/chat/completions",
 							strings.NewReader(body))
 						resp, err := client.Do(req)

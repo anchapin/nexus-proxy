@@ -119,7 +119,7 @@ func TestBuildRAGStore(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	emb := rag.NewOllamaEmbedder("http://localhost:11434", "nomic-embed-text", nil)
+	emb := rag.NewOllamaEmbedder("http://localhost:11434", "nomic-embed-text", nil, rag.BreakerConfig{})
 	ctx := context.Background()
 
 	cfg := config.Config{

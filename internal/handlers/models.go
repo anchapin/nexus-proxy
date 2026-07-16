@@ -13,6 +13,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -98,7 +99,7 @@ func Models(deps ModelsDeps) http.HandlerFunc {
 		id := strings.TrimPrefix(r.URL.Path, "/v1/models")
 		id = strings.TrimPrefix(id, "/")
 
-		all := buildModelsList(deps, cache)
+		all := buildModelsList(r.Context(), deps, cache)
 
 		if id == "" {
 			writeModelsJSON(w, http.StatusOK, ModelsListResponse{
@@ -123,7 +124,7 @@ func Models(deps ModelsDeps) http.HandlerFunc {
 // always present, optionally supplemented by cached Ollama /api/tags.
 // IDs are deduplicated so a model that is both configured and pulled
 // in Ollama appears only once.
-func buildModelsList(deps ModelsDeps, cache *tagsCache) []Model {
+func buildModelsList(ctx context.Context, deps ModelsDeps, cache *tagsCache) []Model {
 	now := deps.Now().Unix()
 	seen := make(map[string]bool)
 	out := make([]Model, 0, 4)
@@ -153,7 +154,7 @@ func buildModelsList(deps ModelsDeps, cache *tagsCache) []Model {
 
 	// Optional Ollama /api/tags supplement (cached per ModelsCacheTTL).
 	if deps.Config.ModelsCacheEnabled() {
-		for _, m := range cache.get(deps) {
+		for _, m := range cache.get(ctx, deps) {
 			add(m.ID, m.OwnedBy, m.Created)
 		}
 	}
@@ -166,7 +167,7 @@ func buildModelsList(deps ModelsDeps, cache *tagsCache) []Model {
 // cache is returned (if any) so a transient Ollama outage does not
 // degrade the list. The mutex serialises refreshes; concurrent callers
 // that arrive during a refresh simply wait and get the fresh result.
-func (c *tagsCache) get(deps ModelsDeps) []Model {
+func (c *tagsCache) get(ctx context.Context, deps ModelsDeps) []Model {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -175,7 +176,7 @@ func (c *tagsCache) get(deps ModelsDeps) []Model {
 		return c.models
 	}
 
-	fetched, err := fetchOllamaTags(deps)
+	fetched, err := fetchOllamaTags(ctx, deps)
 	if err != nil {
 		// Ollama is unreachable or returned an error. Serve the stale
 		// cache if we have one; otherwise return nil so the caller
@@ -194,9 +195,9 @@ func (c *tagsCache) get(deps ModelsDeps) []Model {
 // fetchOllamaTags issues a GET to {OllamaURL}/api/tags and decodes the
 // model list into Model objects. The response body is capped at 4 MiB
 // to prevent a runaway Ollama instance from exhausting proxy memory.
-func fetchOllamaTags(deps ModelsDeps) ([]Model, error) {
+func fetchOllamaTags(ctx context.Context, deps ModelsDeps) ([]Model, error) {
 	url := strings.TrimRight(deps.Config.OllamaURL, "/") + "/api/tags"
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}

@@ -36,6 +36,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/budget"
@@ -131,6 +132,17 @@ type Evaluator struct {
 	rng       *rand.Rand
 	closed    chan struct{}
 	closeOnce sync.Once
+
+	// dropped counts samples that were rejected because the queue was
+	// full. Exposed via Dropped() so callers can surface the counter
+	// across observability surfaces (issue #111).
+	dropped atomic.Uint64
+
+	// onDrop is an optional callback invoked atomically once per
+	// dropped sample. The callback receives the running total of
+	// drops so callers can feed a Prometheus counter without
+	// polling.
+	onDrop func(uint64)
 }
 
 // NewEvaluator wires the evaluator and starts its worker pool. The
@@ -176,6 +188,24 @@ func (e *Evaluator) Enabled() bool {
 	return e.cfg.SampleRate > 0
 }
 
+// Dropped returns the total number of samples rejected because the
+// judge queue was full. The counter is monotonically increasing and
+// safe to read from any goroutine.
+func (e *Evaluator) Dropped() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.dropped.Load()
+}
+
+// SetDropCallback registers an optional callback that fires once per
+// dropped sample with the running total. The callback is invoked
+// synchronously under the send path — keep it cheap (e.g. an atomic
+// increment). Pass nil to clear.
+func (e *Evaluator) SetDropCallback(fn func(uint64)) {
+	e.onDrop = fn
+}
+
 // Sample returns true if a fresh request should be enqueued for judge
 // evaluation, given the configured sample rate. It is the canonical
 // "Sample" entry point listed in the issue's acceptance criteria.
@@ -210,6 +240,11 @@ func (e *Evaluator) Enqueue(s Sample) bool {
 	case e.queue <- s:
 		return true
 	default:
+		e.dropped.Add(1)
+		total := e.dropped.Load()
+		if e.onDrop != nil {
+			e.onDrop(total)
+		}
 		slog.Warn("judge queue full, dropped request", slog.String("request_id", s.RequestID))
 		return false
 	}

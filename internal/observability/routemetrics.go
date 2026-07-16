@@ -93,6 +93,9 @@ type counterKey struct {
 // A sixth family (issue #186) records RAG retrieval outcomes:
 //   - nexus_rag_retrieval_total{hit}
 //
+// A seventh family (issue #232) records fusion arbiter cache hits/misses:
+//   - nexus_fusion_arbiter_cache_total{hit}
+//
 // The reason label values are short, bounded strings (method,
 // body_too_large, bad_request, rate_limit, ...) defined as constants
 // in internal/handlers so the chat handler and the rate-limit
@@ -117,6 +120,10 @@ type RouteCounters struct {
 	rRAGHits                 map[string]*uint64
 	rRAGMisses               map[string]*uint64
 	cascadeFallbacks         map[string]*uint64
+	arbiterCache             map[string]*uint64 // "hit" | "miss"
+
+	judgeQueueOverflow   uint64 // atomic; use atomic.AddUint64/atomic.LoadUint64
+	qualityQueueOverflow uint64 // atomic; use atomic.AddUint64/atomic.LoadUint64
 }
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
@@ -133,6 +140,7 @@ func NewRouteCounters() *RouteCounters {
 		rRAGHits:                 make(map[string]*uint64),
 		rRAGMisses:               make(map[string]*uint64),
 		cascadeFallbacks:         make(map[string]*uint64),
+		arbiterCache:             make(map[string]*uint64),
 	}
 }
 
@@ -319,6 +327,50 @@ func (rc *RouteCounters) ObserveCascadeFallback(reason string) {
 	atomic.AddUint64(rc.cascadeFallbackSlot(reason), 1)
 }
 
+// ObserveArbiterCacheHit records an arbiter cache lookup result
+// (issue #232). hit=true means the synthesis was served from cache;
+// hit=false means the cache missed and the arbiter was invoked.
+// The method is safe for concurrent use and never blocks; nil
+// receivers are a no-op.
+func (rc *RouteCounters) ObserveArbiterCacheHit(hit bool) {
+	if rc == nil {
+		return
+	}
+	label := "false"
+	if hit {
+		label = "true"
+	}
+	rc.mu.Lock()
+	p, ok := rc.arbiterCache[label]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.arbiterCache[label] = p
+	}
+	rc.mu.Unlock()
+	atomic.AddUint64(p, 1)
+}
+
+// ObserveJudgeQueueOverflow records one judge queue overflow event
+// (issue #226). The judge evaluator calls this when its internal
+// Enqueue returns false due to a full queue.
+func (rc *RouteCounters) ObserveJudgeQueueOverflow() {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(&rc.judgeQueueOverflow, 1)
+}
+
+// ObserveQualityQueueOverflow records one quality verifier queue overflow
+// event (issue #226). The quality verifier calls this when its
+// internal Submit returns false due to a full queue.
+func (rc *RouteCounters) ObserveQualityQueueOverflow() {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(&rc.qualityQueueOverflow, 1)
+}
+
 // reasonSlot returns the *uint64 for reason, creating it if absent.
 // Same lock-then-atomic pattern as slot: the mutex guards the map
 // mutation only, the increment happens lock-free.
@@ -374,6 +426,40 @@ func (rc *RouteCounters) Handler() http.Handler {
 	})
 }
 
+// Snapshot returns a point-in-time copy of the routing decision counters
+// as a sorted slice. Used by the /status JSON endpoint to provide a
+// routing distribution snapshot without exposing the internal counter map.
+func (rc *RouteCounters) Snapshot() []RouteCounterEntry {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	var entries []RouteCounterEntry
+	for k, v := range rc.routeDecisions {
+		entries = append(entries, RouteCounterEntry{
+			Route:  k.route,
+			Source: k.source,
+			Count:  atomic.LoadUint64(v),
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Route != entries[j].Route {
+			return entries[i].Route < entries[j].Route
+		}
+		return entries[i].Source < entries[j].Source
+	})
+	return entries
+}
+
+// RouteCounterEntry is one route/source bucket from the routing snapshot.
+type RouteCounterEntry struct {
+	Route  string `json:"route"`
+	Source string `json:"source"`
+	Count  uint64 `json:"count"`
+}
+
 // WriteTo writes the full Prometheus text exposition to w. The output
 // is deterministic: series are sorted by label key so successive
 // scrapes diff cleanly. Returns the number of bytes written and any
@@ -416,6 +502,7 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += n
 	}
+
 	if n, err := writeFusionSeries(w, "nexus_fusion_arbiter_total",
 		"Fusion panel outcomes: arbiter skipped (agreement) or invoked (disagreement).",
 		rc.fusionArbiter); err != nil {
@@ -433,6 +520,27 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	if n, err := writeRejectionSeries(w, "nexus_cascade_fallback_total",
 		"Cascade fallback events partitioned by reason (timeout, transport_error, malformed_toolcall).",
 		rc.cascadeFallbacks); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeRejectionSeries(w, "nexus_fusion_arbiter_cache_total",
+		"Fusion arbiter synthesis cache hits and misses (issue #232).",
+		rc.arbiterCache); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeOverflowSeries(w, "nexus_judge_queue_overflow_total",
+		"Judge evaluator queue overflow events — sample was dropped because the queue was full.",
+		&rc.judgeQueueOverflow); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeOverflowSeries(w, "nexus_quality_queue_overflow_total",
+		"Quality verifier queue overflow events — event was dropped because the queue was full.",
+		&rc.qualityQueueOverflow); err != nil {
 		return total, err
 	} else {
 		total += n
@@ -632,6 +740,23 @@ func writeSLMCacheSeries(w io.Writer, hits, misses *uint64) (int64, error) {
 	total += int64(n)
 
 	return total, nil
+}
+
+// writeOverflowSeries emits a simple unlabeled counter for queue
+// overflow events (issue #226). Unlike the map-based counters, the
+// overflow counters are plain uint64 fields so we can use atomic
+// operations without mutex contention on the hot path.
+func writeOverflowSeries(w io.Writer, name, help string, counter *uint64) (int64, error) {
+	n, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", name, help, name)
+	if err != nil {
+		return int64(n), err
+	}
+	v := atomic.LoadUint64(counter)
+	n, err = fmt.Fprintf(w, "%s %d\n", name, v)
+	if err != nil {
+		return int64(n), err
+	}
+	return int64(n), nil
 }
 
 // keyLess reports whether k1 < k2 considering only the fields named

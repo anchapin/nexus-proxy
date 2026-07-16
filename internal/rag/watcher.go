@@ -167,9 +167,9 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 				slog.String("filename", name),
 				slog.Any("err", err),
 			)
-			continue
+			continue // known still holds old snapshot → next poll retries
 		}
-		w.known[name] = snap
+		w.known[name] = snap // only update on success
 	}
 
 	// Detect deletions: anything in `known` that wasn't in `seen`

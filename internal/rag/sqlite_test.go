@@ -15,7 +15,7 @@ import (
 // underlying DB.
 func newTestPersistentStore(t *testing.T) *PersistentStore {
 	t.Helper()
-	ps, err := OpenPersistentStore(":memory:", stubEmbedder{}, 0.55)
+	ps, err := OpenPersistentStore(":memory:", &stubEmbedder{}, 0.55)
 	if err != nil {
 		t.Fatalf("OpenPersistentStore: %v", err)
 	}
@@ -24,7 +24,7 @@ func newTestPersistentStore(t *testing.T) *PersistentStore {
 }
 
 func TestOpenPersistentStoreRejectsEmptyPath(t *testing.T) {
-	if _, err := OpenPersistentStore("", stubEmbedder{}, 0.55); err == nil {
+	if _, err := OpenPersistentStore("", &stubEmbedder{}, 0.55); err == nil {
 		t.Fatal("expected error for empty path")
 	}
 }
@@ -53,7 +53,7 @@ func TestPersistentStoreUpsertAndLoad(t *testing.T) {
 
 	// Persist to an on-disk DB and reopen it to verify the round-trip.
 	onDisk := filepath.Join(t.TempDir(), "rag.db")
-	disk, err := OpenPersistentStore(onDisk, stubEmbedder{}, 0.55)
+	disk, err := OpenPersistentStore(onDisk, &stubEmbedder{}, 0.55)
 	if err != nil {
 		t.Fatalf("OpenPersistentStore(disk): %v", err)
 	}
@@ -75,7 +75,7 @@ func TestPersistentStoreUpsertAndLoad(t *testing.T) {
 		t.Fatalf("disk Close: %v", err)
 	}
 
-	disk2, err := OpenPersistentStore(onDisk, stubEmbedder{}, 0.55)
+	disk2, err := OpenPersistentStore(onDisk, &stubEmbedder{}, 0.55)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestPersistentStoreLoadOrIndexFreshDB(t *testing.T) {
 	}
 
 	dbPath := filepath.Join(t.TempDir(), "rag.db")
-	ps, err := OpenPersistentStore(dbPath, stubEmbedder{}, 0.55)
+	ps, err := OpenPersistentStore(dbPath, &stubEmbedder{}, 0.55)
 	if err != nil {
 		t.Fatalf("OpenPersistentStore: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestPersistentStoreLoadOrIndexSkipsEmbedWhenDBHasRows(t *testing.T) {
 	}
 
 	dbPath := filepath.Join(t.TempDir(), "rag.db")
-	ps, err := OpenPersistentStore(dbPath, stubEmbedder{}, 0.55)
+	ps, err := OpenPersistentStore(dbPath, &stubEmbedder{}, 0.55)
 	if err != nil {
 		t.Fatalf("OpenPersistentStore: %v", err)
 	}
@@ -366,7 +366,7 @@ func TestPersistentStoreCloseIsIdempotent(t *testing.T) {
 // does not abort the Load.
 func TestPersistentStoreCorruptEmbeddingIsSkipped(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "rag.db")
-	ps, err := OpenPersistentStore(dbPath, stubEmbedder{}, 0.55)
+	ps, err := OpenPersistentStore(dbPath, &stubEmbedder{}, 0.55)
 	if err != nil {
 		t.Fatalf("OpenPersistentStore: %v", err)
 	}
@@ -420,6 +420,8 @@ func (c *countingErrEmbedder) Embed(_ context.Context, _ string) ([]float64, err
 	return nil, err
 }
 
+func (c *countingErrEmbedder) IsHealthy(context.Context) bool { return true }
+
 // Calls returns the number of Embed invocations observed by this
 // embedder. Safe for concurrent use.
 func (c *countingErrEmbedder) Calls() int {
@@ -451,6 +453,8 @@ func (v *vectorEmbedder) Embed(_ context.Context, text string) ([]float64, error
 	return []float64{0, 0, 0}, nil
 }
 
+func (v *vectorEmbedder) IsHealthy(context.Context) bool { return true }
+
 // indexedCallCounter counts every Embed call so tests can
 // distinguish the disk-cache fast path (1 call — only the
 // prompt) from a regression where the cache was bypassed
@@ -472,6 +476,8 @@ func (c *indexedCallCounter) Embed(_ context.Context, text string) ([]float64, e
 	}
 	return []float64{0, 0, 0}, nil
 }
+
+func (c *indexedCallCounter) IsHealthy(context.Context) bool { return true }
 
 func (c *indexedCallCounter) totalCalls() int {
 	c.mu.Lock()
