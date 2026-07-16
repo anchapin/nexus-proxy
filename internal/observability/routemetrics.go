@@ -124,6 +124,10 @@ type RouteCounters struct {
 
 	judgeQueueOverflow   uint64 // atomic; use atomic.AddUint64/atomic.LoadUint64
 	qualityQueueOverflow uint64 // atomic; use atomic.AddUint64/atomic.LoadUint64
+
+	// Panel panic counter (issue #309). Bumped when a panel goroutine
+	// recovers from a panic and returns a panic error.
+	panelPanics uint64 // atomic
 }
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
@@ -371,6 +375,14 @@ func (rc *RouteCounters) ObserveQualityQueueOverflow() {
 	atomic.AddUint64(&rc.qualityQueueOverflow, 1)
 }
 
+// ObservePanelPanic records one panel goroutine panic recovery (issue #309).
+func (rc *RouteCounters) ObservePanelPanic() {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(&rc.panelPanics, 1)
+}
+
 // reasonSlot returns the *uint64 for reason, creating it if absent.
 // Same lock-then-atomic pattern as slot: the mutex guards the map
 // mutation only, the increment happens lock-free.
@@ -541,6 +553,13 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	if n, err := writeOverflowSeries(w, "nexus_quality_queue_overflow_total",
 		"Quality verifier queue overflow events — event was dropped because the queue was full.",
 		&rc.qualityQueueOverflow); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeOverflowSeries(w, "nexus_panel_panics_total",
+		"Panel goroutine panic recoveries (issue #309).",
+		&rc.panelPanics); err != nil {
 		return total, err
 	} else {
 		total += n
