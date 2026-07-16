@@ -131,6 +131,10 @@ type Collector struct {
 	tlsConnectionsAccepted atomic.Uint64
 	tlsConnectionsRejected atomic.Uint64
 
+	// Auth rate limit counter (issue #296). Bumped when the auth
+	// brute-force limiter rejects a client with 429.
+	authRateLimitRejected atomic.Uint64
+
 	// --- Circuit breaker instrumentation (issue #304) ---------------
 	//
 	// Tracks the state of each named circuit breaker (ollama, rag).
@@ -328,6 +332,10 @@ func (c *Collector) IncRateLimit(scope string, allowed bool) {
 // SpendGate rejects a frontier request (issue #70 AC: "How often is
 // the daily frontier budget hit?").
 func (c *Collector) IncBudgetExceeded() { c.budgetExceededTotal.Add(1) }
+
+// IncAuthRateLimitRejected bumps the auth-rate-limit counter when
+// the auth brute-force limiter rejects a client (issue #296).
+func (c *Collector) IncAuthRateLimitRejected() { c.authRateLimitRejected.Add(1) }
 
 // AddBudgetRecorded adds amount to the cumulative recorded-spend
 // counter. The collector mirrors the SpendTracker.Record behaviour:

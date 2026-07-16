@@ -242,6 +242,11 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 		"Number of frontier requests rejected by the daily budget gate.",
 		c.budgetExceededTotal.Load())
 
+	// Auth rate limit counter (issue #296).
+	writeCounter(w, "nexus_requests_rejected_total",
+		"Total requests rejected by auth brute-force protection (issue #296).",
+		c.authRateLimitRejected.Load())
+
 	// TLS handshake counters. Optional: only non-zero when the operator
 	// configured TLS (NEXUS_TLS_CERT + NEXUS_TLS_KEY); otherwise both
 	// samples stay at 0.
