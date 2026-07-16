@@ -16,7 +16,7 @@ make test           # unit tests
 make test-race      # race detector (required to merge)
 make lint           # golangci-lint
 make fmt            # gofmt -w (in place)
-make ci             # vet + build + test + test-race + lint + bench-short  ← CI gate
+make ci             # vet + build + test + test-race + lint (bench-short runs but does not block)
 ```
 
 `go run ./cmd/nexus` also works. `nexus check` / `nexus doctor` run
@@ -26,10 +26,21 @@ boot-time diagnostics without starting the server (issue #32).
 drops below 70%. Per-package numbers print for visibility; only the
 total gates.
 
-**Go version:** CI uses Go 1.26 (see `.github/workflows/ci.yml`).
+**Go version:** `go.mod` declares `1.25.0`; CI builds with Go 1.26 (see `.github/workflows/ci.yml`). Local dev needs at least 1.25.
 
 **Runtime dependency only:** `modernc.org/sqlite` (metrics store).
 Everything else is stdlib.
+
+## Running tests
+
+```bash
+make test           # all packages
+go test ./internal/handlers/...   # single package
+go test -run TestChatHandler ./...  # single test
+make test-race     # race detector (required before merge)
+```
+
+Benchmarks are **non-blocking** in CI — the `bench` job has `continue-on-error: true`. `make ci` does not gate on them.
 
 ## Package layout
 
@@ -213,7 +224,3 @@ production paths.
 
 Tests use `httptest` + `RecordingTransport` in `internal/upstream/recording.go`
 to record/replay HTTP calls. All tests run in <2s with `-race`.
-
-`make test-race` is required to pass before merging — race conditions in
-transport, metrics, budget tracker, and VRAM limiter are easy to miss
-in manual testing.
