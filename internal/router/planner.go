@@ -49,6 +49,13 @@ const (
 	// handler always wires an SLM, but the planner guards against nil
 	// so a misconfiguration degrades gracefully rather than panicking.
 	SourceEscalation DecisionSource = "escalation"
+
+	// SourceSLMEscalation (issue #301) means the planner overrode the
+	// SLM's local/fusion decision to frontier because the SLM's own
+	// confidence fell below the configured SLMConfidenceThreshold.
+	// This is a hard override — the SLM made a decision but the low
+	// confidence signal triggered an automatic escalation.
+	SourceSLMEscalation DecisionSource = "slm-escalation"
 )
 
 // TraceReason maps a DecisionSource to the short string the handler
@@ -173,6 +180,16 @@ type Planner struct {
 	// the SLM. A miss calls the SLM and stores the result. When nil the
 	// SLM is always called (pre-cache behaviour).
 	SLMCache *SLMCache
+
+	// ConfidenceThreshold is the hard-escalation floor for SLM decisions
+	// (issue #301). When the SLM returns RouteLocal or RouteFusion with
+	// confidence below this threshold, the planner overrides to
+	// RouteFrontier and sets Source to SourceSLMEscalation. A zero or
+	// negative value disables the hard override (the soft bias via
+	// DecideWithConfidence still applies when Confidence is wired). The
+	// planner uses >, not >=, so a threshold of 0.3 fires when
+	// confidence is 0.29.
+	ConfidenceThreshold float64
 }
 
 // PlanRequest carries the per-request inputs the planner needs. The
@@ -280,6 +297,21 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 				category = Categorize(req.Prompt)
 				confidence = p.Confidence.LocalConfidence(category)
 			}
+			// Hard override: same check as the miss path — a cached
+			// local/fusion decision with low confidence still escalates.
+			if p.ConfidenceThreshold > 0 && (cached == RouteLocal || cached == RouteFusion) && confidence < p.ConfidenceThreshold {
+				return Decision{
+					Route:           RouteFrontier,
+					Source:          SourceSLMEscalation,
+					Reason:          "low_confidence",
+					Confidence:      confidence,
+					TaskType:        category,
+					EstimatedTokens: estimatedTokens,
+					BudgetSource:    req.GuardrailSource,
+					BudgetTokens:    req.GuardrailBudget,
+					CacheHit:        true,
+				}
+			}
 			return Decision{
 				Route:           cached,
 				Source:          SourceSLM,
@@ -314,6 +346,26 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 			CacheHit:        false,
 		}
 	}
+
+	// Hard override: if the SLM returned local/fusion but confidence
+	// is below the threshold, escalate to frontier (issue #301).
+	// The check uses > so threshold 0.3 fires on 0.29. A zero or
+	// negative threshold disables the override.
+	if p.ConfidenceThreshold > 0 && (dec == RouteLocal || dec == RouteFusion) && confidence < p.ConfidenceThreshold {
+		category = Categorize(req.Prompt)
+		return Decision{
+			Route:           RouteFrontier,
+			Source:          SourceSLMEscalation,
+			Reason:          "low_confidence",
+			Confidence:      confidence,
+			TaskType:        category,
+			EstimatedTokens: estimatedTokens,
+			BudgetSource:    req.GuardrailSource,
+			BudgetTokens:    req.GuardrailBudget,
+			CacheHit:        false,
+		}
+	}
+
 	// Cache the successful decision for future identical prompts.
 	if p.SLMCache != nil {
 		p.SLMCache.Set(req.Context, req.Prompt, dec)

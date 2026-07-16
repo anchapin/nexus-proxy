@@ -121,6 +121,7 @@ type RouteCounters struct {
 	rRAGMisses               map[string]*uint64
 	cascadeFallbacks         map[string]*uint64
 	arbiterCache             map[string]*uint64 // "hit" | "miss"
+	slmEscalations           map[string]*uint64 // reason label for issue #301
 
 	judgeQueueOverflow   uint64 // atomic; use atomic.AddUint64/atomic.LoadUint64
 	qualityQueueOverflow uint64 // atomic; use atomic.AddUint64/atomic.LoadUint64
@@ -149,6 +150,7 @@ func NewRouteCounters() *RouteCounters {
 		rRAGMisses:               make(map[string]*uint64),
 		cascadeFallbacks:         make(map[string]*uint64),
 		arbiterCache:             make(map[string]*uint64),
+		slmEscalations:           make(map[string]*uint64),
 	}
 }
 
@@ -205,6 +207,14 @@ func (rc *RouteCounters) Observe(route, source string, confidence float64, taskT
 	if source == "escalation" {
 		ek := counterKey{taskType: taskType}
 		atomic.AddUint64(rc.slot(rc.lowConfidenceEscalations, ek), 1)
+	}
+
+	// Source==slm-escalation is the planner's hard override for
+	// low-confidence SLM decisions (issue #301). Record it under
+	// slm-escalations with reason label so the metric is
+	// nexus_slm_escalations_total{reason="low_confidence"}.
+	if source == "slm-escalation" {
+		atomic.AddUint64(rc.escalationSlot("low_confidence"), 1)
 	}
 }
 
@@ -416,6 +426,20 @@ func (rc *RouteCounters) cascadeFallbackSlot(reason string) *uint64 {
 	return p
 }
 
+// escalationSlot returns the *uint64 for an SLM escalation with the
+// given reason label, creating it if absent.
+func (rc *RouteCounters) escalationSlot(reason string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.slmEscalations[reason]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.slmEscalations[reason] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
 // slot returns the *uint64 for key, creating it if absent. The
 // pointer is returned so the caller can atomic.AddUint64 without
 // holding the lock during the increment.
@@ -512,6 +536,13 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	if n, err := writeSeries(w, "nexus_slm_low_confidence_escalations_total",
 		"Requests escalated to frontier because the SLM confidence was below the low threshold.",
 		rc.lowConfidenceEscalations, []string{"task_type"}); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeRejectionSeries(w, "nexus_slm_escalations_total",
+		"Hard escalations to frontier due to low SLM confidence (issue #301).",
+		rc.slmEscalations); err != nil {
 		return total, err
 	} else {
 		total += n

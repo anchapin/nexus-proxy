@@ -536,7 +536,158 @@ func TestPlanner_NilSLM(t *testing.T) {
 	}
 }
 
-// stringOf returns a string of n copies of byte b. A test helper for
+// TestPlanner_ConfidenceThresholdHardOverride verifies the hard escalation
+// path (issue #301): when ConfidenceThreshold is set and the SLM returns
+// local/fusion with confidence below the threshold, the planner overrides
+// to frontier with SourceSLMEscalation.
+func TestPlanner_ConfidenceThresholdHardOverride(t *testing.T) {
+	t.Run("low confidence local decision escalates to frontier", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		conf := &stubConf{value: 0.2} // below threshold
+		p := &Planner{
+			SLM:                 slm,
+			Confidence:          conf,
+			FusionPatterns:      fusionPatterns,
+			FormattingRegex:     formattingPatterns,
+			LocalPatternsRegex:  localPatterns,
+			ConfidenceThreshold: 0.3,
+		}
+		// Prompt doesn't match any DSL keyword, reaches SLM.
+		req := PlanRequest{
+			Prompt:          "analyze this exception that keeps happening",
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		// The SLM decided local, but confidence (0.2) < threshold (0.3),
+		// so it should be overridden to frontier.
+		if dec.Route != RouteFrontier {
+			t.Errorf("Route = %q, want frontier (low confidence override)", dec.Route)
+		}
+		if dec.Source != SourceSLMEscalation {
+			t.Errorf("Source = %q, want %q", dec.Source, SourceSLMEscalation)
+		}
+		if dec.Reason != "low_confidence" {
+			t.Errorf("Reason = %q, want %q", dec.Reason, "low_confidence")
+		}
+	})
+
+	t.Run("low confidence fusion decision escalates to frontier", func(t *testing.T) {
+		slm := &stubSLM{route: RouteFusion}
+		conf := &stubConf{value: 0.15} // below threshold
+		p := &Planner{
+			SLM:                 slm,
+			Confidence:          conf,
+			FusionPatterns:      fusionPatterns,
+			FormattingRegex:     formattingPatterns,
+			LocalPatternsRegex:  localPatterns,
+			ConfidenceThreshold: 0.3,
+		}
+		req := PlanRequest{
+			Prompt:          "implement a complex distributed caching strategy", // no DSL match
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		if dec.Route != RouteFrontier {
+			t.Errorf("Route = %q, want frontier (low confidence override)", dec.Route)
+		}
+		if dec.Source != SourceSLMEscalation {
+			t.Errorf("Source = %q, want %q", dec.Source, SourceSLMEscalation)
+		}
+	})
+
+	t.Run("high confidence local decision is not overridden", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		conf := &stubConf{value: 0.8} // above threshold
+		p := &Planner{
+			SLM:                 slm,
+			Confidence:          conf,
+			FusionPatterns:      fusionPatterns,
+			FormattingRegex:     formattingPatterns,
+			LocalPatternsRegex:  localPatterns,
+			ConfidenceThreshold: 0.3,
+		}
+		req := PlanRequest{
+			Prompt:          "refactor this module to improve readability", // "refactor" is DSL local
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		// "refactor" matches DSL local pattern, so it returns local with SourceDSL.
+		if dec.Route != RouteLocal {
+			t.Errorf("Route = %q, want local (DSL match)", dec.Route)
+		}
+		if dec.Source != SourceDSL {
+			t.Errorf("Source = %q, want %q (DSL bypasses SLM)", dec.Source, SourceDSL)
+		}
+	})
+
+	t.Run("zero threshold disables hard override", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		conf := &stubConf{value: 0.1} // very low confidence
+		p := &Planner{
+			SLM:                 slm,
+			Confidence:          conf,
+			FusionPatterns:      fusionPatterns,
+			FormattingRegex:     formattingPatterns,
+			LocalPatternsRegex:  localPatterns,
+			ConfidenceThreshold: 0, // disabled
+		}
+		req := PlanRequest{
+			Prompt:          "analyze this exception that keeps happening",
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		// With threshold=0, the hard override is disabled; the low
+		// confidence SLM still decides local.
+		if dec.Route != RouteLocal {
+			t.Errorf("Route = %q, want local (threshold disabled)", dec.Route)
+		}
+		if dec.Source != SourceSLM {
+			t.Errorf("Source = %q, want %q", dec.Source, SourceSLM)
+		}
+	})
+
+	t.Run("threshold boundary fires on 0.29 with threshold 0.3", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		conf := &stubConf{value: 0.29} // just below threshold
+		p := &Planner{
+			SLM:                 slm,
+			Confidence:          conf,
+			FusionPatterns:      fusionPatterns,
+			FormattingRegex:     formattingPatterns,
+			LocalPatternsRegex:  localPatterns,
+			ConfidenceThreshold: 0.3,
+		}
+		req := PlanRequest{
+			Prompt:          "review this pull request for potential issues", // no DSL match
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		// 0.29 < 0.3, so it should escalate.
+		if dec.Route != RouteFrontier {
+			t.Errorf("Route = %q, want frontier (0.29 < 0.3 threshold)", dec.Route)
+		}
+		if dec.Source != SourceSLMEscalation {
+			t.Errorf("Source = %q, want %q", dec.Source, SourceSLMEscalation)
+		}
+	})
+}
+
+// stringOf returns a String of n copies of byte b. A test helper for
 // generating oversized prompts without a strings.Builder import.
 func stringOf(b byte, n int) string {
 	buf := make([]byte, n)

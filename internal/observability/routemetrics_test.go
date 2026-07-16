@@ -592,3 +592,48 @@ func TestQueueOverflowCountersNilSafe(t *testing.T) {
 		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
 	}
 }
+
+// TestRouteCountersSLMEscalations verifies the issue #301 SLM escalation
+// counter: Observe with source="slm-escalation" increments the
+// nexus_slm_escalations_total{reason="low_confidence"} counter.
+func TestRouteCountersSLMEscalations(t *testing.T) {
+	rc := NewRouteCounters()
+	// Simulate low-confidence escalation: SLM returned local but confidence
+	// was below threshold. The handler calls Observe with source="slm-escalation".
+	rc.Observe("frontier", "slm-escalation", 0.2, "debugging", "")
+	rc.Observe("frontier", "slm-escalation", 0.15, "refactor", "")
+	rc.Observe("frontier", "slm-escalation", 0.29, "coding", "")
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	// Check the metric family is present.
+	if !strings.Contains(out, "nexus_slm_escalations_total") {
+		t.Errorf("missing nexus_slm_escalations_total metric family")
+	}
+	if !strings.Contains(out, `# TYPE nexus_slm_escalations_total counter`) {
+		t.Errorf("missing counter type line")
+	}
+	if !strings.Contains(out, `reason="low_confidence"`) {
+		t.Errorf("missing low_confidence reason label")
+	}
+	// All three escalations should be counted.
+	if !strings.Contains(out, `nexus_slm_escalations_total{reason="low_confidence"} 3`) {
+		t.Errorf("expected 3 escalations in output, got:\n%s", out)
+	}
+}
+
+// TestRouteCountersSLMEscalationsNilSafe verifies that nil receivers are safe
+// when Observe is called with the slm-escalation source.
+func TestRouteCountersSLMEscalationsNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.Observe("frontier", "slm-escalation", 0.2, "debugging", "")
+	// Must not panic; WriteTo should return (0, nil).
+	n, err := rc.WriteTo(&strings.Builder{})
+	if err != nil || n != 0 {
+		t.Errorf("nil + Observe slm-escalation: expected (0, nil), got (%d, %v)", n, err)
+	}
+}
