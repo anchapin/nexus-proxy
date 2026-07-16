@@ -335,6 +335,57 @@ func TestSLMCacheHitMiss(t *testing.T) {
 	}
 }
 
+// TestSLMCacheBudgetMiss verifies that the same prompt with a different
+// guardrail budget produces a cache miss (issue #369). This prevents
+// a cached "local" decision made under a high VRAM budget from being
+// incorrectly served when the next request has a much lower budget.
+func TestSLMCacheBudgetMiss(t *testing.T) {
+	callCount := 0
+	client := newClient(func(_ *http.Request) (*http.Response, error) {
+		callCount++
+		return okBody(`{"message":{"content":"{\"route\":\"local\"}"}}`)
+	})
+	c := NewSLMClient("http://x", "m", time.Second, client).WithCache(10, 5*time.Minute)
+
+	prompt := "fix the off-by-one error in the parser"
+
+	// First call with budget 6000: cache miss, hits Ollama
+	r1, err := c.DecideWithBudget(context.Background(), prompt, NeutralConfidence, 6000)
+	if err != nil {
+		t.Fatalf("first DecideWithBudget: %v", err)
+	}
+	if r1 != RouteLocal {
+		t.Errorf("first route = %q, want local", r1)
+	}
+	if callCount != 1 {
+		t.Errorf("first callCount = %d, want 1", callCount)
+	}
+
+	// Same prompt, same budget: cache hit, NO Ollama call
+	r2, err := c.DecideWithBudget(context.Background(), prompt, NeutralConfidence, 6000)
+	if err != nil {
+		t.Fatalf("second DecideWithBudget (same budget): %v", err)
+	}
+	if r2 != RouteLocal {
+		t.Errorf("second route = %q, want local", r2)
+	}
+	if callCount != 1 {
+		t.Errorf("second callCount = %d, want 1 (cache hit)", callCount)
+	}
+
+	// Same prompt, different budget (3000 vs 6000): cache MISS, hits Ollama
+	r3, err := c.DecideWithBudget(context.Background(), prompt, NeutralConfidence, 3000)
+	if err != nil {
+		t.Fatalf("third DecideWithBudget (different budget): %v", err)
+	}
+	if r3 != RouteLocal {
+		t.Errorf("third route = %q, want local", r3)
+	}
+	if callCount != 2 {
+		t.Errorf("third callCount = %d, want 2 (budget change = cache miss)", callCount)
+	}
+}
+
 // TestSLMCacheTTLExpiry verifies that entries expire after TTL and
 // trigger a fresh Ollama call.
 func TestSLMCacheTTLExpiry(t *testing.T) {

@@ -92,12 +92,49 @@ func (c *SLMClient) WithCache(maxEntries int, ttl time.Duration) *SLMClient {
 // slmSystemPrompt is the static instruction we send to the routing SLM.
 // Keeping it as a package var (not a config field) makes it trivial to grep
 // and to snapshot in tests.
-const slmSystemPrompt = `You are an intelligent routing assistant for a coding agent proxy. 
-    Analyze the user's prompt. 
-    - If it is a simple task (boilerplate, styling, small isolated functions), output {"route": "local"}. 
-    - If it is a complex task (deep debugging, multi-file refactoring), output {"route": "frontier"}. 
-    - If it requires extreme architectural deliberation and planning, output {"route": "fusion"}.
-	Respond ONLY in valid JSON. No explanations.`
+//
+// Decision criteria (issue #369):
+//   - "local": Simple, isolated tasks — single-file changes, formatting,
+//     boilerplate, code generation for small snippets, CSS/styling, single
+//     function refactors, straightforward bug fixes with clear symptoms
+//   - "frontier": Complex tasks — multi-file changes, poorly-specified bugs
+//     (no stack trace), tasks requiring broad codebase understanding,
+//     performance optimization needing profiling, security issues requiring audit
+//   - "fusion": Architecture-level decisions — system design, API architecture,
+//     database schema design, significant refactoring across many modules
+//
+// Available data: prompt length (token count), DSL fast-pass result, VRAM
+// budget in tokens. High token counts + no DSL match = strong frontier signal.
+const slmSystemPrompt = `You are an intelligent routing assistant for a coding agent proxy. Analyze the user's prompt and decide whether to route it to a local model (fast, cheap) or a frontier model (capable, expensive).
+
+Decision rules — apply in order:
+1. STRONGLY prefer "local" when the prompt is trivially simple:
+   - Single-file changes, formatting, boilerplate, small code snippets
+   - CSS/styling, single function refactors
+   - Bug fixes with clear symptoms and a specific file/function named
+   - "explain this code", "generate tests for this function"
+   - DSL fast-pass already fired (prompt matches formatting/refactor patterns)
+
+2. STRONGLY prefer "frontier" when the task is complex:
+   - Vague problem descriptions ("help with my code", "it's not working")
+   - Multi-component systems, no specific file/function mentioned
+   - Performance issues without profiling data
+   - Security audits, architecture reviews
+   - Multi-file refactoring or large-scale changes
+   - Poorly-specified bugs (no stack trace provided)
+
+3. Prefer "fusion" for architecture-level decisions:
+   - System design, API architecture, database schema design
+   - Significant refactoring across many modules
+   - "architectural design" or "system architecture" in the prompt
+
+Key signals that favor "frontier" over "local":
+- High token count (>1500 tokens) + no DSL match = complex
+- Vague descriptions, no specific files mentioned
+- Multi-component or multi-file scope
+- No clear, isolated problem statement
+
+Respond ONLY in valid JSON. No explanations.`
 
 // negativeBiasNote is appended to slmSystemPrompt when empirical local
 // confidence for the task category is below the floor. It nudges the SLM
@@ -131,7 +168,15 @@ func (c *SLMClient) Decide(ctx context.Context, prompt string) (Route, error) {
 // system prompt gains a frontier bias; above the ceiling a local bias;
 // inside the neutral band the request is unchanged from Decide.
 func (c *SLMClient) DecideWithConfidence(ctx context.Context, prompt string, confidence float64) (Route, error) {
-	return c.decide(ctx, prompt, c.systemPromptFor(confidence))
+	return c.decide(ctx, prompt, c.systemPromptFor(confidence), 0)
+}
+
+// DecideWithBudget is DecideWithConfidence augmented with the VRAM guardrail
+// budget. The budget is folded into the cache key so a budget change produces
+// a cache miss (issue #369). When budget is 0 the cache key is the same as
+// DecideWithConfidence for backwards compatibility.
+func (c *SLMClient) DecideWithBudget(ctx context.Context, prompt string, confidence float64, guardrailBudget int) (Route, error) {
+	return c.decide(ctx, prompt, c.systemPromptFor(confidence), guardrailBudget)
 }
 
 // systemPromptFor returns the SLM system prompt for the given confidence,
@@ -157,12 +202,13 @@ func (c *SLMClient) systemPromptFor(confidence float64) string {
 }
 
 // cacheKey returns the FNV-1a hash key for a (prompt, systemPrompt) pair.
-// The same logical prompt always produces the same key regardless of
-// SLMClient pointer equality, so callers can use this for pre-check.
-func cacheKey(prompt, systemPrompt string) string {
+// The guardrailBudget is included so the same prompt with a different VRAM
+// budget produces different cache entries (issue #369).
+func cacheKey(prompt, systemPrompt string, guardrailBudget int) string {
 	h := fnv.New64a()
 	h.Write([]byte(prompt))
 	h.Write([]byte(systemPrompt))
+	_, _ = fmt.Fprintf(h, "%d", guardrailBudget)
 	return fmt.Sprintf("%x", h.Sum64())
 }
 
@@ -211,11 +257,13 @@ func (c *SLMClient) evictStale() {
 }
 
 // decide performs the HTTP round-trip with the supplied system prompt.
-func (c *SLMClient) decide(ctx context.Context, prompt, systemPrompt string) (Route, error) {
+// guardrailBudget is included in the cache key so budget changes produce
+// cache misses (issue #369).
+func (c *SLMClient) decide(ctx context.Context, prompt, systemPrompt string, guardrailBudget int) (Route, error) {
 	var key string
 	caching := c.CacheMaxEntries > 0
 	if caching {
-		key = cacheKey(prompt, systemPrompt)
+		key = cacheKey(prompt, systemPrompt, guardrailBudget)
 		// Fast path: check cache before HTTP call (issue #162).
 		c.cacheMu.RLock()
 		elem, ok := c.cacheMap[key]
