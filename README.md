@@ -197,6 +197,43 @@ The proxy container talks to the `ollama` service by name over the
 compose network — leave `NEXUS_OLLAMA_URL` unset and the default in
 `docker-compose.yml` will kick in.
 
+### Production deployment (resource limits)
+
+For production, set Docker-level resource limits **and** the
+VRAM-aware concurrency ceiling so the proxy cannot exhaust GPU VRAM even
+under bursty load:
+
+```bash
+docker run --rm -p 8000:8000 \
+  --gpus all \
+  --memory 4g \
+  --memory-reservation 2g \
+  --cpus 2 \
+  -e NEXUS_FRONTIER_API_KEY=sk-... \
+  -e NEXUS_OLLAMA_URL=http://host.docker.internal:11434 \
+  -e NEXUS_LOCAL_MAX_CONCURRENT=2 \
+  ghcr.io/anchapin/nexus-proxy:latest
+```
+
+| Flag | Value | Why |
+| ---- | ----- | --- |
+| `--gpus all` | GPU passthrough | Ollama needs the GPU for inference; without this the container runs CPU-only |
+| `--memory` | `4g` | RAG embedding batches and SQLite metric writes need headroom; too low causes OOM kills |
+| `--memory-reservation` | `2g` | Soft guarantee — Docker tries to keep at least this much available; the hard `--memory` cap is the safety net |
+| `--cpus` | `2` | The proxy is I/O-bound but the judge worker pool and RAG embedder run concurrent goroutines; two cores keeps those pipelines from starving the HTTP handlers |
+| `NEXUS_LOCAL_MAX_CONCURRENT` | `2` | **Primary GPU OOM prevention.** The VRAM probe (`NEXUS_PROBE_INTERVAL`, default 60 s) continuously samples free VRAM and sets the effective concurrency to `min(NEXUS_LOCAL_MAX_CONCURRENT, freeVRAM / NEXUS_LOCAL_VRAM_BYTES_PER_SLOT)`. When the probe is unavailable the hard ceiling holds. Set to `0` (default) to disable the limiter entirely |
+
+On a multi-GPU host use `NVIDIA_VISIBLE_DEVICES` instead of `--gpus all`
+to pin the container to specific GPUs:
+
+```bash
+docker run --rm -p 8000:8000 \
+  --memory 4g --memory-reservation 2g --cpus 2 \
+  -e NVIDIA_VISIBLE_DEVICES=0 \
+  -e NEXUS_FRONTIER_API_KEY=sk-... \
+  ghcr.io/anchapin/nexus-proxy:latest
+```
+
 ### Health check
 
 The proxy serves `GET /healthz` returning `ok`. The Dockerfile uses
