@@ -14,3 +14,18 @@ paths = [
   ".env.example",
   "internal/providers/",
 ]
+
+# False positive: float64 parameter types in function signatures flagged as generic-api-key.
+# These are not secrets — just type declarations. (issue #313)
+[[allowlists]]
+description = "float64 parameter types falsely flagged as generic-api-key"
+paths = [
+  '''internal/handlers/chat\.go$''',
+]
+
+# False positive: test files that set environment variables with fake/redacted values.
+[[allowlists]]
+description = "Test files setting fake env var values — not real secrets"
+paths = [
+  '''internal/config/file_integration_test\.go$''',
+]
