@@ -2044,6 +2044,7 @@ func totalTokenSavings(preChars, postChars int) int {
 // frontierCostEstimate multiplies input tokens by the configured
 // cost-per-1k. Returns zero for non-frontier routes so local +
 // fusion-trail rows count as zero cost in the dashboard.
+//
 //gitleaks:ignore
 func frontierCostEstimate(route, model string, inputTokens int, costPer1KUSD float64) float64 {
 	// model is reserved for future per-model pricing tables.
