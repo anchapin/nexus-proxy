@@ -1,13 +1,10 @@
-// Command nexus-dashboard renders the per-request metrics written by the
-// proxy into a human-readable daily savings summary. It reads the same
-// SQLite store the proxy writes to (issue #4) and never writes to it, so
-// it is safe to run concurrently with a live proxy.
+// dashboard_render.go contains the pure rendering functions for the `nexus
+// dashboard` subcommand. It is kept separate from dashboard.go so the
+// rendering logic is testable without importing flag or io.
 //
-// The binary is self-contained: it depends only on internal/metrics and
-// the standard library. Rendering is split into pure functions (this
-// file, render.go) so tests can golden-file the output without spinning
-// up a database, while a separate integration test exercises the real
-// Store.DailySummary read path.
+// The rendering layer reads from the same SQLite metrics store the proxy
+// writes to (issue #4) and never writes to it, so it is safe to run
+// concurrently with a live proxy.
 package main
 
 import (
@@ -52,12 +49,12 @@ func allEmpty(summs []metrics.Summary) bool {
 	return true
 }
 
-// renderTable writes a plain-text, tab-aligned table to w. The header
+// renderDashboardTable writes a plain-text, tab-aligned table to w. The header
 // row is ALWAYS emitted — including when the store is empty — so an
 // operator piped into less/awk still sees a recognisable table. When
 // every queried day has zero requests, a short "no requests recorded"
 // hint is appended below the table.
-func renderTable(summs []metrics.Summary, costPer1k float64, w io.Writer) error {
+func renderDashboardTable(summs []metrics.Summary, costPer1k float64, w io.Writer) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	// Header. The route distribution is split into three columns
 	// (LOCAL / FRONTIER / FUSION) per the issue spec.
@@ -86,7 +83,7 @@ func renderTable(summs []metrics.Summary, costPer1k float64, w io.Writer) error 
 	return nil
 }
 
-// dayJSON is the per-day object emitted by renderJSON. Field names are
+// dayJSON is the per-day object emitted by renderDashboardJSON. Field names are
 // snake_case to match the conventions of the surrounding OpenAI-style
 // API surface; the shape is stable and additive-only.
 type dayJSON struct {
@@ -99,12 +96,12 @@ type dayJSON struct {
 	EstimatedSavingsUSD float64 `json:"estimated_savings_usd"`
 }
 
-// renderJSON writes the summaries as a JSON array. The output is a top
+// renderDashboardJSON writes the summaries as a JSON array. The output is a top
 // level array (not an object) so it pipes cleanly into jq / other CLIs.
 // Empty stores yield an array of zero-valued day objects — one per
 // queried day — rather than an empty array, so consumers can tell a
 // missing day from an unqueried one.
-func renderJSON(summs []metrics.Summary, costPer1k float64, w io.Writer) error {
+func renderDashboardJSON(summs []metrics.Summary, costPer1k float64, w io.Writer) error {
 	out := make([]dayJSON, 0, len(summs))
 	for _, s := range summs {
 		out = append(out, dayJSON{
@@ -192,4 +189,43 @@ func daysRange(start, end time.Time) []time.Time {
 		days = append(days, d)
 	}
 	return days
+}
+
+// resolveRange turns the --since / --days flags into an inclusive
+// [start, end] UTC day pair. Resolution rules:
+//   - neither flag        → just today (start == end == today)
+//   - --days N only       → last N days ending today
+//   - --since DATE only   → DATE through today
+//   - --since + --days N  → DATE through DATE+N-1
+//
+// "Today" is fixed once per invocation so a run that straddles
+// midnight UTC stays internally consistent.
+func resolveRange(sinceRaw string, days int) (start, end time.Time, err error) {
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+
+	var since time.Time
+	hasSince := sinceRaw != ""
+	if hasSince {
+		since, err = time.Parse("2006-01-02", sinceRaw)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("--since: want YYYY-MM-DD, got %q", sinceRaw)
+		}
+		since = since.UTC()
+	}
+
+	switch {
+	case hasSince && days > 0:
+		start = since
+		end = since.Add(time.Duration(days-1) * 24 * time.Hour)
+	case hasSince:
+		start = since
+		end = today
+	case days > 0:
+		start = today.Add(time.Duration(-(days - 1)) * 24 * time.Hour)
+		end = today
+	default:
+		start = today
+		end = today
+	}
+	return start, end, nil
 }
