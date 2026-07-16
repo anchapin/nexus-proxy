@@ -13,6 +13,7 @@
 package budget
 
 import (
+	"context"
 	"sort"
 	"sync"
 	"time"
@@ -50,17 +51,18 @@ type Guard struct {
 }
 
 // Alerter is invoked by Guard when spend events occur (issue #201).
-// It receives the current state and the event type.
+// It receives a context (for cancellation/timeout propagation) and the
+// current state.
 type Alerter interface {
 	// OnExceed is called when a request would exceed the budget.
-	OnExceed(State)
+	OnExceed(context.Context, State)
 	// OnSpend is called after a spend amount is recorded. The source
 	// label (e.g. "frontier" or "judge") allows the alerter to
 	// attribute spend to its origin.
-	OnSpend(State, float64, string)
+	OnSpend(context.Context, State, float64, string)
 	// OnApproaching is called when spend crosses the approaching threshold
 	// (e.g., 80% of limit). It is called at most once per threshold crossing.
-	OnApproaching(State)
+	OnApproaching(context.Context, State)
 }
 
 // SetAlerter installs an alerter. A nil alerter disables alerting (the
@@ -94,7 +96,7 @@ func limitLimit(limitUSD float64) float64 {
 // check. Returns false when the guard has no limit configured or the
 // result would be within budget; true when the request should be rejected
 // with a 429.
-func (g *Guard) Check(cost float64) bool {
+func (g *Guard) Check(ctx context.Context, cost float64) bool {
 	g.mu.Lock()
 	g.evictLocked()
 	if g.limit <= 0 {
@@ -103,7 +105,7 @@ func (g *Guard) Check(cost float64) bool {
 	}
 	over := g.currentSpentLocked()+cost > g.limit
 	if over && g.alerter != nil {
-		g.alerter.OnExceed(g.copyStateLocked())
+		g.alerter.OnExceed(ctx, g.copyStateLocked())
 	}
 	g.mu.Unlock()
 	return over
@@ -117,7 +119,7 @@ func (g *Guard) Check(cost float64) bool {
 // and passed to the alerter's OnSpend callback so spend can be attributed.
 //
 // If an alerter is set, it is called with the updated state after recording.
-func (g *Guard) Record(cost float64, source string) {
+func (g *Guard) Record(ctx context.Context, cost float64, source string) {
 	if cost <= 0 {
 		return
 	}
@@ -132,7 +134,7 @@ func (g *Guard) Record(cost float64, source string) {
 	g.mu.Unlock()
 
 	if g.alerter != nil {
-		g.alerter.OnSpend(state, cost, source)
+		g.alerter.OnSpend(ctx, state, cost, source)
 	}
 }
 
@@ -143,7 +145,7 @@ func (g *Guard) Record(cost float64, source string) {
 //
 // If an alerter is set, OnApproaching is called when the threshold is
 // first crossed.
-func (g *Guard) CheckApproaching() bool {
+func (g *Guard) CheckApproaching(ctx context.Context) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.evictLocked()
@@ -155,7 +157,7 @@ func (g *Guard) CheckApproaching() bool {
 	if spent >= threshold && !alreadySent {
 		alreadySent = true
 		if g.alerter != nil {
-			g.alerter.OnApproaching(g.copyStateLocked())
+			g.alerter.OnApproaching(ctx, g.copyStateLocked())
 		}
 		return true
 	}
