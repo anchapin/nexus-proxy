@@ -28,7 +28,11 @@ var (
 		regexp.MustCompile(`(?i)\b(architectural design|system architecture)\b`),
 	}
 	DefaultLocalPatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis)\b`),
+		regexp.MustCompile(`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis|code review|review code|review pr|pull request review)\b`),
+		regexp.MustCompile(`(?i)\b(migrate|migration|db migration|package migration)\b`),
+		regexp.MustCompile(`(?i)\b(write sql|design schema|database schema)\b`),
+		regexp.MustCompile(`(?i)\b(docker|containerize|deploy|kubernetes|k8s)\b`),
+		regexp.MustCompile(`(?i)\b(git rebase|git merge|resolve conflicts|cherry-pick)\b`),
 	}
 )
 
@@ -57,8 +61,8 @@ type Route string
 // local and frontier). formattingPatterns matches simple formatting keywords
 // (css, format, docstring, lint, typo, boilerplate). localPatterns matches
 // common coding task keywords (refactor, security scan, generate tests,
-// explain this code, performance analysis, etc.). Each pattern slice may be
-// nil or empty in which case that branch is skipped.
+// explain this code, code review, migrations, SQL/DB, docker, git, etc.).
+// Each pattern slice may be nil or empty in which case that branch is skipped.
 func DSL(prompt string, fusionPatterns, formattingPatterns, localPatterns []*regexp.Regexp) (Route, bool) {
 	lower := toLowerASCII(prompt)
 
