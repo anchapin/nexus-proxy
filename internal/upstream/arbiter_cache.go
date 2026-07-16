@@ -26,11 +26,21 @@ type ArbiterCache struct {
 
 	// Time source for expiration checks. Defaults to time.Now if nil.
 	NowFunc func() time.Time
+
+	// ttl is the configured TTL for cache entries. Enabled() returns
+	// true when ttl > 0.
+	ttl time.Duration
 }
 
-// NewArbiterCache constructs an empty, ready-to-use cache.
-func NewArbiterCache() *ArbiterCache {
-	return &ArbiterCache{items: make(map[uint64]*ArbiterCacheEntry)}
+// NewArbiterCache constructs an empty, ready-to-use cache with the
+// given TTL. Pass ttl > 0 to enable caching; ttl <= 0 creates a cache
+// where Enabled() returns false. The NowFunc is defaulted to time.Now.
+func NewArbiterCache(ttl time.Duration) *ArbiterCache {
+	return &ArbiterCache{
+		items:   make(map[uint64]*ArbiterCacheEntry),
+		NowFunc: time.Now,
+		ttl:     ttl,
+	}
 }
 
 // cacheKey computes a deterministic FNV-64a hash of the two panel-member
@@ -102,6 +112,23 @@ func (c *ArbiterCache) Len() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.items)
+}
+
+// Enabled reports whether the cache is active (TTL > 0 at construction).
+func (c *ArbiterCache) Enabled() bool {
+	if c == nil {
+		return false
+	}
+	return c.ttl > 0
+}
+
+// TTLSeconds returns the configured cache TTL in seconds. Returns 0 when
+// the cache is disabled.
+func (c *ArbiterCache) TTLSeconds() int {
+	if c == nil {
+		return 0
+	}
+	return int(c.ttl.Seconds())
 }
 
 // Purge removes all entries from the cache. For testing or graceful

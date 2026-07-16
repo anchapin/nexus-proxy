@@ -219,3 +219,29 @@ func (m *Middleware) BucketCount() int {
 	defer m.mu.Unlock()
 	return len(m.buckets)
 }
+
+// RPM returns the configured requests-per-minute rate. Returns 0 when
+// the middleware is disabled.
+func (m *Middleware) RPM() int {
+	if m == nil {
+		return 0
+	}
+	return m.rpm
+}
+
+// Burst returns the configured token-bucket burst capacity. Returns 0
+// when the middleware is disabled.
+func (m *Middleware) Burst() int {
+	if m == nil {
+		return 0
+	}
+	return m.burst
+}
+
+// Enabled reports whether rate limiting is active (RPM > 0).
+func (m *Middleware) Enabled() bool {
+	if m == nil {
+		return false
+	}
+	return m.rpm > 0
+}

@@ -231,6 +231,23 @@ func (c *SLMCache) Len() int {
 	return len(c.entries)
 }
 
+// Enabled reports whether the cache is active (TTL > 0).
+func (c *SLMCache) Enabled() bool {
+	if c == nil {
+		return false
+	}
+	return c.ttl > 0
+}
+
+// TTLSeconds returns the configured cache TTL in seconds. Returns 0 when
+// the cache is disabled.
+func (c *SLMCache) TTLSeconds() int {
+	if c == nil {
+		return 0
+	}
+	return int(c.ttl.Seconds())
+}
+
 // cosineSimilarity returns the cosine of the angle between a and b.
 // It is equivalent to rag.CosineSimilarity but lives here to keep
 // router free of a rag import cycle. A zero vector on either side
