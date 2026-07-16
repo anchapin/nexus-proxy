@@ -387,6 +387,14 @@ type Config struct {
 	TrustedProxiesRaw string
 	RateLimitRPM      int
 	RateLimitBurst    int
+
+	// Readiness mode for /readyz (issue #302). Controls whether the
+	// readiness probe returns 503 when Ollama is down (strict) or
+	// always returns 200 while surfacing the degraded flag (degraded,
+	// the default). Unknown values fail validation at boot rather
+	// than silently falling back, so a typo in NEXUS_READINESS_MODE
+	// is caught immediately instead of producing an indeterminate state.
+	ReadinessMode string
 }
 
 // DefaultMetricsDBPath returns the canonical metrics DB location:
@@ -1097,6 +1105,8 @@ func Load() (Config, error) {
 		rateBurst = 0
 	}
 	cfg.RateLimitBurst = rateBurst
+
+	cfg.ReadinessMode = getEnv("NEXUS_READINESS_MODE", "degraded")
 
 	return cfg, nil
 }
