@@ -27,12 +27,13 @@ import (
 // which method was called and with what confidence, and returns the
 // preconfigured route/error pair.
 type stubSLM struct {
-	route          Route
-	err            error
-	calledDecide   bool
-	calledWithConf bool
-	lastConfidence float64
-	lastPrompt     string
+	route              Route
+	err                error
+	calledDecide       bool
+	calledWithConf     bool
+	calledDecideBudget bool
+	lastConfidence     float64
+	lastPrompt         string
 }
 
 func (s *stubSLM) Decide(_ context.Context, prompt string) (Route, error) {
@@ -43,6 +44,13 @@ func (s *stubSLM) Decide(_ context.Context, prompt string) (Route, error) {
 
 func (s *stubSLM) DecideWithConfidence(_ context.Context, prompt string, confidence float64) (Route, error) {
 	s.calledWithConf = true
+	s.lastConfidence = confidence
+	s.lastPrompt = prompt
+	return s.route, s.err
+}
+
+func (s *stubSLM) DecideWithBudget(_ context.Context, prompt string, confidence float64, _ int) (Route, error) {
+	s.calledDecideBudget = true
 	s.lastConfidence = confidence
 	s.lastPrompt = prompt
 	return s.route, s.err
@@ -334,7 +342,7 @@ func TestPlanner_Plan(t *testing.T) {
 			if !ok {
 				t.Fatalf("SLM is not a *stubSLM: %T", tt.planner.SLM)
 			}
-			slmUsed := slm.calledDecide || slm.calledWithConf
+			slmUsed := slm.calledDecide || slm.calledWithConf || slm.calledDecideBudget
 			if slmUsed != tt.wantSLMCalled {
 				t.Errorf("SLM called = %v, want %v", slmUsed, tt.wantSLMCalled)
 			}
@@ -370,7 +378,7 @@ func TestPlanner_Plan(t *testing.T) {
 // A low-confidence value must NOT hard-override the SLM — it biases the
 // SLM's system prompt, and the SLM still makes the final call.
 func TestPlanner_ConfidenceEscalation(t *testing.T) {
-	t.Run("low confidence uses DecideWithConfidence not Decide", func(t *testing.T) {
+	t.Run("low confidence uses DecideWithBudget", func(t *testing.T) {
 		slm := &stubSLM{route: RouteFrontier}
 		conf := &stubConf{value: 0.1} // below DefaultConfidenceFloor
 		p := &Planner{
@@ -390,8 +398,8 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 		}
 		dec := p.Plan(req)
 
-		if !slm.calledWithConf {
-			t.Fatal("expected DecideWithConfidence to be called, it was not")
+		if !slm.calledDecideBudget {
+			t.Fatal("expected DecideWithBudget to be called, it was not")
 		}
 		if slm.calledDecide {
 			t.Error("plain Decide should NOT be called when ConfidenceStore is wired")
@@ -413,7 +421,7 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 		}
 	})
 
-	t.Run("high confidence uses DecideWithConfidence", func(t *testing.T) {
+	t.Run("high confidence uses DecideWithBudget", func(t *testing.T) {
 		slm := &stubSLM{route: RouteLocal}
 		conf := &stubConf{value: 0.95} // above DefaultConfidenceCeiling
 		p := &Planner{
@@ -431,8 +439,8 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 		}
 		dec := p.Plan(req)
 
-		if !slm.calledWithConf {
-			t.Fatal("expected DecideWithConfidence to be called")
+		if !slm.calledDecideBudget {
+			t.Fatal("expected DecideWithBudget to be called")
 		}
 		if slm.lastConfidence != 0.95 {
 			t.Errorf("confidence = %v, want 0.95", slm.lastConfidence)
@@ -442,7 +450,7 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 		}
 	})
 
-	t.Run("nil confidence uses plain Decide", func(t *testing.T) {
+	t.Run("nil confidence uses DecideWithBudget", func(t *testing.T) {
 		slm := &stubSLM{route: RouteFrontier}
 		p := &Planner{
 			SLM:                slm,
@@ -459,11 +467,14 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 		}
 		dec := p.Plan(req)
 
-		if !slm.calledDecide {
-			t.Fatal("expected plain Decide to be called when Confidence is nil")
+		if !slm.calledDecideBudget {
+			t.Fatal("expected DecideWithBudget to be called")
+		}
+		if slm.calledDecide {
+			t.Error("Decide should NOT be called (uses DecideWithBudget)")
 		}
 		if slm.calledWithConf {
-			t.Error("DecideWithConfidence should NOT be called when Confidence is nil")
+			t.Error("DecideWithConfidence should NOT be called (uses DecideWithBudget)")
 		}
 		if dec.Confidence != NeutralConfidence {
 			t.Errorf("Decision.Confidence = %v, want NeutralConfidence (%v)", dec.Confidence, NeutralConfidence)

@@ -141,6 +141,8 @@ type Decision struct {
 type SLMDecider interface {
 	Decide(ctx context.Context, prompt string) (Route, error)
 	DecideWithConfidence(ctx context.Context, prompt string, confidence float64) (Route, error)
+	// DecideWithBudget includes guardrailBudget in the cache key (issue #369).
+	DecideWithBudget(ctx context.Context, prompt string, confidence float64, guardrailBudget int) (Route, error)
 }
 
 // Planner is the single route-planning seam (issue #82). Construct one
@@ -336,9 +338,9 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	if p.Confidence != nil {
 		category = Categorize(req.Prompt)
 		confidence = p.Confidence.LocalConfidence(category)
-		dec, err = p.SLM.DecideWithConfidence(req.Context, req.Prompt, confidence)
+		dec, err = p.SLM.DecideWithBudget(req.Context, req.Prompt, confidence, req.GuardrailBudget)
 	} else {
-		dec, err = p.SLM.Decide(req.Context, req.Prompt)
+		dec, err = p.SLM.DecideWithBudget(req.Context, req.Prompt, NeutralConfidence, req.GuardrailBudget)
 	}
 	if err != nil {
 		return Decision{
