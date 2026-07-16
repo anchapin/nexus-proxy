@@ -701,8 +701,7 @@ func main() {
 	})
 
 	// RAG embedding cache hit/miss observer (issue #303).
-	var ragCacheObserver func(hit bool)
-	ragCacheObserver = func(hit bool) {
+	ragCacheObserver := func(hit bool) {
 		if hit {
 			routeCounters.ObserveRAGCacheHit()
 		} else {
