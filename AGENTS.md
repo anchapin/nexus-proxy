@@ -55,7 +55,7 @@ internal/
   telemetry/            # Recorder interface + JSONLRecorder
   tracing/              # W3C trace context + OTLP/JSON exporter
   transport/            # shared pooled http.Client (NEXUS_HTTP_* tuning)
-  upstream/             # stream.go, cascade.go, fusion.go (panel + arbiter)
+  upstream/             # upstream.go, cascade.go (Panel + PanelStreaming)
 ```
 
 **Critical: `internal/ratelimit` ≠ `internal/middleware`.** Rate limiting
@@ -78,7 +78,8 @@ to **frontier** (safe choice).
 | ------- | ----- |
 | `len(prompt)/4 > NEXUS_TOKEN_GUARDRAIL` | `frontier` (VRAM guardrail) |
 | Prompt matches `NEXUS_DSL_FUSION_PATTERNS` (default: `architectural design\|system architecture`) | `fusion` |
-| Prompt matches `NEXUS_DSL_LOCAL_PATTERNS` (default: `css\|format\|docstring\|lint\|typo\|boilerplate`) | `local` |
+| Prompt matches `NEXUS_DSL_FORMATTING_PATTERNS` (default: `css\|format\|docstring\|lint\|typo\|boilerplate\|debug\|fix bug\|git commit\|sql query\|parse json\|validate input\|regex\|api endpoint\|test\|optimize\|readme`) | `local` |
+| Prompt matches `NEXUS_DSL_LOCAL_PATTERNS` (default: `refactor\|security scan\|generate tests\|explain this code\|performance analysis`) | `local` |
 | Otherwise | SLM decides (qwen3-coder:4b JSON decision) |
 | SLM confidence < threshold OR SLM fails | `frontier` (escalation) |
 
@@ -86,8 +87,8 @@ DSL patterns are **comma-separated regexes** (set via env var, not a map).
 `NEXUS_DSL_FUSION_PATTERNS` and `NEXUS_DSL_LOCAL_PATTERNS` accept Go
 regex syntax.
 
-**SLM decision cache:** `NEXUS_SLM_CACHE_SIZE` + `NEXUS_SLM_CACHE_TTL`
-(default 1024 entries / 5m). Semantic dedup via
+**SLM decision cache:** `NEXUS_SLM_CACHE_MAX_ENTRIES` + `NEXUS_SLM_CACHE_TTL`
+(default 512 entries / 30s). Semantic dedup via
 `NEXUS_SLMCACHE_SEMANTIC_THRESHOLD` uses the embedder.
 
 **Fusion progressive delivery** (`NEXUS_FUSION_PROGRESSIVE=true`, default):
