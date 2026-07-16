@@ -40,6 +40,13 @@ type Config struct {
 	// may take. DefaultDefaultDialContextTimeout.
 	DialContextTimeout time.Duration
 
+	// ResponseHeaderTimeout is the maximum time the transport waits
+	// for the server's response headers after fully sending the request.
+	// This guards against slow upstream servers that hold the connection
+	// open after sending headers but send response body data very slowly.
+	// DefaultDefaultResponseHeaderTimeout.
+	ResponseHeaderTimeout time.Duration
+
 	// ClientCertFile is the path to the client certificate file (PEM).
 	// When set alongside ClientKeyFile, the transport presents this
 	// certificate for mTLS. Empty disables client-cert auth.
@@ -87,6 +94,7 @@ func New(cfg Config) *http.Client {
 		IdleConnTimeout:       cfg.IdleConnTimeout,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: cfg.ResponseHeaderTimeout,
 	}
 
 	if cfg.hasClientCert() {
@@ -159,17 +167,21 @@ func (c *Config) applyDefaults() {
 	if c.DialContextTimeout <= 0 {
 		c.DialContextTimeout = DefaultDialContextTimeout
 	}
+	if c.ResponseHeaderTimeout <= 0 {
+		c.ResponseHeaderTimeout = DefaultResponseHeaderTimeout
+	}
 }
 
 func loadConfigFromEnv() Config {
 	return Config{
-		MaxIdleConnsPerHost: parseEnvInt("NEXUS_HTTP_MAX_IDLE_CONNS_PER_HOST", DefaultMaxIdleConnsPerHost),
-		MaxConnsPerHost:     parseEnvInt("NEXUS_HTTP_MAX_CONNS_PER_HOST", 0),
-		IdleConnTimeout:     parseEnvDuration("NEXUS_HTTP_IDLE_CONN_TIMEOUT", DefaultIdleConnTimeout),
-		DialContextTimeout:  parseEnvDuration("NEXUS_HTTP_DIAL_CONTEXT_TIMEOUT", DefaultDialContextTimeout),
-		ClientCertFile:      os.Getenv("NEXUS_HTTP_CLIENT_CERT_FILE"),
-		ClientKeyFile:       os.Getenv("NEXUS_HTTP_CLIENT_KEY_FILE"),
-		CAFile:              os.Getenv("NEXUS_HTTP_CA_FILE"),
+		MaxIdleConnsPerHost:   parseEnvInt("NEXUS_HTTP_MAX_IDLE_CONNS_PER_HOST", DefaultMaxIdleConnsPerHost),
+		MaxConnsPerHost:       parseEnvInt("NEXUS_HTTP_MAX_CONNS_PER_HOST", 0),
+		IdleConnTimeout:       parseEnvDuration("NEXUS_HTTP_IDLE_CONN_TIMEOUT", DefaultIdleConnTimeout),
+		DialContextTimeout:    parseEnvDuration("NEXUS_HTTP_DIAL_CONTEXT_TIMEOUT", DefaultDialContextTimeout),
+		ResponseHeaderTimeout: parseEnvDuration("NEXUS_HTTP_RESPONSE_HEADER_TIMEOUT", DefaultResponseHeaderTimeout),
+		ClientCertFile:        os.Getenv("NEXUS_HTTP_CLIENT_CERT_FILE"),
+		ClientKeyFile:         os.Getenv("NEXUS_HTTP_CLIENT_KEY_FILE"),
+		CAFile:                os.Getenv("NEXUS_HTTP_CA_FILE"),
 	}
 }
 
@@ -193,7 +205,8 @@ func parseEnvDuration(key string, def time.Duration) time.Duration {
 
 // Default values for Config knobs.
 const (
-	DefaultMaxIdleConnsPerHost = 100
-	DefaultIdleConnTimeout     = 90 * time.Second
-	DefaultDialContextTimeout  = 30 * time.Second
+	DefaultMaxIdleConnsPerHost   = 100
+	DefaultIdleConnTimeout       = 90 * time.Second
+	DefaultDialContextTimeout    = 30 * time.Second
+	DefaultResponseHeaderTimeout = 30 * time.Second
 )
