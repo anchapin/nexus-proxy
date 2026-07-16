@@ -67,10 +67,14 @@ const writeBufferSize = 16 << 10
 // dashboard) can attribute each request to the stage that produced
 // the route. RouteSource is one of guardrail / dsl / slm / slm-error
 // / escalation; RouteReason is a short machine-readable detail
-// (e.g. "vram" for the guardrail path, the error string for the
+// (e.g. "vram" for the guardrail path, the error String for the
 // SLM-error path); SLMConfidence is the [0,1] confidence value (0.5
 // neutral, 0 for non-SLM sources); SLMTaskType is the Categorize()
 // bucket (empty for non-SLM sources).
+//
+// Per-stage timing fields (issue #300) track wall-clock milliseconds
+// spent in each pipeline stage. Omitempty keeps legacy JSONL rows
+// byte-for-byte compatible when these fields are zero-valued.
 type Record struct {
 	Timestamp               time.Time `json:"timestamp"`
 	RequestID               string    `json:"request_id"`
@@ -98,6 +102,15 @@ type Record struct {
 	RouteReason   string  `json:"route_reason,omitempty"`
 	SLMConfidence float64 `json:"slm_confidence,omitempty"`
 	SLMTaskType   string  `json:"slm_task_type,omitempty"`
+
+	// Per-stage latency breakdown (issue #300). All fields are
+	// integer milliseconds; 0 when the stage was skipped or
+	// not applicable.
+	RAGRetrievalMs      int64 `json:"rag_retrieval_ms,omitempty"`
+	PromptEngineeringMs int64 `json:"prompt_engineering_ms,omitempty"`
+	TOONCompressionMs   int64 `json:"toon_compression_ms,omitempty"`
+	SLMRoutingMs        int64 `json:"slm_routing_ms,omitempty"`
+	UpstreamFirstByteMs int64 `json:"upstream_first_byte_ms,omitempty"`
 }
 
 // EstimateTokens returns the cheap "4 chars per token" heuristic used

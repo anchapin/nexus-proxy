@@ -343,6 +343,11 @@ func main() {
 	// is available for wiring into the chat handler Deps.
 	circuitCollector := observability.NewCollector()
 
+	// Stage latency collector (issue #300). Separate from routeCounters
+	// so the per-stage histograms (RAGRetrievalMs, PromptEngineeringMs,
+	// TOONCompressionMs, SLMRoutingMs, UpstreamFirstByteMs) are collected
+	// without disturbing the existing /metrics route-counter path.
+	stageCollector := observability.NewCollector()
 	if cfg.JudgeEnabled && cfg.JudgeAPIKey != "" {
 		evalCfg := judge.Config{
 			URL:         cfg.JudgeURL,
@@ -691,6 +696,17 @@ func main() {
 		slog.String("path", "/metrics"),
 	)
 
+	// Stage latency histograms (issue #300): per-stage breakdown of
+	// RAGRetrievalMs, PromptEngineeringMs, TOONCompressionMs,
+	// SLMRoutingMs, UpstreamFirstByteMs. Exposed as a separate
+	// /metrics/stages endpoint so operators can correlate pipeline
+	// overhead with overall latency without changing the existing
+	// /metrics schema.
+	mux.Handle("/metrics/stages", stageCollector.Handler())
+	slog.Info("stage latency histograms exposed",
+		slog.String("path", "/metrics/stages"),
+	)
+
 	ragObserver := handlers.RAGObserverFunc(func(e handlers.RAGEvent) {
 		if e.Hit {
 			routeCounters.ObserveRAGHit(e.Filename)
@@ -756,6 +772,17 @@ func main() {
 		CircuitBreakerObserver:  circuitBreakerObs,
 		ArbiterCache:            arbiterCache,
 		Providers:               providerRegistry,
+		PipelineStageObserver: handlers.PipelineStageObserverFunc(
+			func(e handlers.PipelineStageEvent) {
+				stageCollector.ObservePipelineStage(observability.PipelineStageEvent{
+					RAGRetrievalMs:      e.RAGRetrievalMs,
+					PromptEngineeringMs: e.PromptEngineeringMs,
+					TOONCompressionMs:   e.TOONCompressionMs,
+					SLMRoutingMs:        e.SLMRoutingMs,
+					UpstreamFirstByteMs: e.UpstreamFirstByteMs,
+				})
+			},
+		),
 	})
 	// Apply the per-client rate limiter (issue #75) as the outermost
 	// wrapper so a flood of requests is rejected before any middleware

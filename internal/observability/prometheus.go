@@ -284,6 +284,8 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 			"frontier": c.ttftFrontier,
 			"fusion":   c.ttftFusion,
 		})
+	// Per-stage pipeline latency histograms (issue #300).
+	writeStageHistogram(w, c)
 
 	// --- Gauges (live readings from providers) --------------------------
 
@@ -393,6 +395,43 @@ func writeHistogram(w io.Writer, name, help string, h *Histogram) {
 	fmt.Fprintf(w, "%s_bucket{le=%q} %d\n", name, "+Inf", cum[len(upperBounds)])
 	fmt.Fprintf(w, "%s_sum %s\n", name, formatFloat(sum))
 	fmt.Fprintf(w, "%s_count %d\n", name, count)
+}
+
+// writeStageHistogram emits the nexus_pipeline_stage_latency_ms histogram
+// family with a "stage" label (issue #300). The five stages are emitted
+// in a fixed order for deterministic output.
+//
+//nolint:errcheck
+func writeStageHistogram(w io.Writer, c *Collector) {
+	stages := []struct {
+		name string
+		h    *Histogram
+	}{
+		{"rag", c.stageRAG},
+		{"prompt_eng", c.stagePromptEng},
+		{"toon", c.stageTOON},
+		{"slm", c.stageSLM},
+		{"upstream", c.stageUpstream},
+	}
+	writeMeta(w, "nexus_pipeline_stage_latency_ms",
+		"Pipeline stage latency in milliseconds, by stage (issue #300).",
+		"histogram")
+	for _, s := range stages {
+		if s.h == nil {
+			continue
+		}
+		cum, upperBounds, sum, count := s.h.Snapshot()
+		for i, ub := range upperBounds {
+			fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_bucket{stage=%q,le=%q} %d\n",
+				s.name, formatFloat(ub), cum[i])
+		}
+		fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_bucket{stage=%q,le=%q} %d\n",
+			s.name, "+Inf", cum[len(upperBounds)])
+		fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_sum{stage=%q} %s\n",
+			s.name, formatFloat(sum))
+		fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_count{stage=%q} %d\n",
+			s.name, count)
+	}
 }
 
 // collectGauges flattens the samples from every non-nil provider into a

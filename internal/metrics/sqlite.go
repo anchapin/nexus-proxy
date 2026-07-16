@@ -67,6 +67,8 @@ CREATE TABLE IF NOT EXISTS requests (
 );
 CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
 CREATE INDEX IF NOT EXISTS idx_requests_request_id ON requests(request_id);
+CREATE INDEX IF NOT EXISTS idx_requests_route_timestamp ON requests(route, timestamp);
+CREATE INDEX IF NOT EXISTS idx_requests_model_timestamp ON requests(model, timestamp);
 `
 
 // additiveMigrations is the set of additive ALTER TABLE statements
