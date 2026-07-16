@@ -95,10 +95,27 @@ func NewSLMCacheWithEmbedder(ttl time.Duration, embedder Embedder, threshold flo
 	}
 }
 
+// CacheHitKind describes the mechanism that produced a cache hit.
+// It is returned as the third value from Get.
+type CacheHitKind string
+
+const (
+	// CacheHitExact means the prompt was found by exact string match.
+	CacheHitExact CacheHitKind = "exact"
+	// CacheHitSemantic means the prompt was found by cosine similarity
+	// against stored embeddings (issue #245).
+	CacheHitSemantic CacheHitKind = "semantic"
+)
+
 // Get returns the cached route for prompt and true if a non-expired
 // entry exists; otherwise it returns the zero Route and false. On a
 // miss the caller should invoke the SLM and then call Set to populate
 // the cache.
+//
+// The returned string indicates how the hit was produced:
+//   - CacheHitExact ("exact") for an exact string match (O(1))
+//   - CacheHitSemantic ("semantic") for a cosine-similarity match
+//   - "" (empty) when there is no hit
 //
 // When an Embedder is configured, Get first tries exact string matching
 // (O(1), sub-millisecond). On an exact miss it falls back to semantic
@@ -106,7 +123,7 @@ func NewSLMCacheWithEmbedder(ttl time.Duration, embedder Embedder, threshold flo
 // for the best cosine similarity. If the best match exceeds the
 // configured threshold the cached route is returned. Semantic matching
 // requires an HTTP call to the embedder and may add latency.
-func (c *SLMCache) Get(ctx context.Context, prompt string) (Route, bool) {
+func (c *SLMCache) Get(ctx context.Context, prompt string) (Route, bool, CacheHitKind) {
 	// Fast path: exact string match. Hold RLock for the duration of the
 	// map read so we don't race with Set (which holds a Mutex).
 	c.mu.RLock()
@@ -114,25 +131,25 @@ func (c *SLMCache) Get(ctx context.Context, prompt string) (Route, bool) {
 	expired := !ok || time.Since(entry.stamp) > c.ttl
 	c.mu.RUnlock()
 	if ok && !expired {
-		return entry.Route, true
+		return entry.Route, true, CacheHitExact
 	}
 
 	// Semantic fallback: requires embedder.
 	if c.embedder == nil {
-		return "", false
+		return "", false, ""
 	}
 	return c.getSemantic(ctx, prompt)
 }
 
 // getSemantic embeds the prompt and finds the best cached embedding by
 // cosine similarity. It returns the route of the best match if above
-// the threshold; otherwise it returns "", false. Caller must not hold
-// a lock (it releases the lock around the embedder call to avoid
-// blocking Set during HTTP).
-func (c *SLMCache) getSemantic(ctx context.Context, prompt string) (Route, bool) {
+// the threshold, along with CacheHitSemantic; otherwise it returns
+// "", false, "". Caller must not hold a lock (it releases the lock
+// around the embedder call to avoid blocking Set during HTTP).
+func (c *SLMCache) getSemantic(ctx context.Context, prompt string) (Route, bool, CacheHitKind) {
 	emb, err := c.embedder.Embed(ctx, prompt)
 	if err != nil {
-		return "", false
+		return "", false, ""
 	}
 
 	c.mu.RLock()
@@ -157,9 +174,9 @@ func (c *SLMCache) getSemantic(ctx context.Context, prompt string) (Route, bool)
 	}
 
 	if bestScore >= c.semThreshold {
-		return best, true
+		return best, true, CacheHitSemantic
 	}
-	return "", false
+	return "", false, ""
 }
 
 // Set records the routing decision for prompt. Subsequent calls to Get
