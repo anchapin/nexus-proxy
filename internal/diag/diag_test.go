@@ -977,15 +977,3 @@ func TestRunModelsEndpointAllModelsPresentIsPass(t *testing.T) {
 	if got.Status != StatusPass {
 		t.Errorf("models_endpoint = %s (detail=%s), want pass", got.Status, got.Detail)
 	}
-}
-
-// --- front-end helpers -----------------------------------------------------
-
-func checkByName(r Result, name string) Check {
-	for _, c := range r {
-		if c.Name == name {
-			return c
-		}
-	}
-	return Check{Name: name, Status: StatusFail, Detail: "missing"}
-}
