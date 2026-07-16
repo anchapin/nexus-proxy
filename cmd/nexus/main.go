@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"regexp"
 	"sync"
 	"syscall"
 	"time"
@@ -43,8 +42,7 @@ import (
 )
 
 const (
-	formattingRegexPattern = `(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`
-	bootRAGTimeout         = 30 * time.Second
+	bootRAGTimeout = 30 * time.Second
 )
 
 // version is the build version. Overridden at compile time via
@@ -145,7 +143,6 @@ func main() {
 	// to the NewSLMClient defaults (5m TTL, 512 max entries).
 	slm.CacheTTL = cfg.SLMCacheTTL
 	slm.CacheMaxEntries = cfg.SLMCacheMaxEntries
-	re := regexp.MustCompile(formattingRegexPattern)
 
 	// Ollama health poller (issue #8). When NEXUS_HEALTH_POLL_INTERVAL
 	// is zero the handler treats Ollama as always healthy (useful for
@@ -713,7 +710,6 @@ func main() {
 		Client:                  httpClient,
 		RAG:                     store,
 		SLM:                     slm,
-		FormattingRegex:         re,
 		MiddlewareChain:         mwChain,
 		ContextAwareRAG:         ctxAwareRAG,
 		Confidence:              confidenceObs,
