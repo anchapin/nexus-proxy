@@ -14,15 +14,19 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
 
 // GaugeSample is one live gauge reading captured at scrape time. Name
 // is the full Prometheus metric name (e.g. "nexus_ollama_healthy").
+// Labels are optional key-value pairs rendered as Prometheus label
+// syntax; nil or empty labels produce an unlabelled sample line.
 type GaugeSample struct {
-	Name  string
-	Value float64
+	Name   string
+	Labels map[string]string
+	Value  float64
 }
 
 // GaugeProvider returns live gauge readings at scrape time. The
@@ -118,6 +122,21 @@ var gaugeMeta = map[string]metricMeta{
 	},
 	"nexus_budget_spend_usd": {
 		help: "Rolling 24-hour spend in USD from the daily frontier budget tracker.",
+		typ:  "gauge",
+	},
+	// Circuit breaker gauges (issue #304). Each circuit emits three
+	// labelled metrics: state (0=closed, 1=half_open, 2=open),
+	// failures_total, and last_failure_seconds.
+	"nexus_circuit_breaker_state": {
+		help: "Circuit breaker state: 0=closed, 1=half_open, 2=open (issue #304).",
+		typ:  "gauge",
+	},
+	"nexus_circuit_breaker_failures_total": {
+		help: "Total number of failure events recorded for this circuit breaker (issue #304).",
+		typ:  "counter",
+	},
+	"nexus_circuit_breaker_last_failure_seconds": {
+		help: "Unix timestamp of the last failure recorded for this circuit breaker (issue #304).",
 		typ:  "gauge",
 	},
 }
@@ -269,19 +288,30 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	// --- Gauges (live readings from providers) --------------------------
 
 	gauges := collectGauges(providers)
-	sort.Slice(gauges, func(i, j int) bool { return gauges[i].Name < gauges[j].Name })
-	seen := make(map[string]bool, len(gauges))
+
+	// Group samples by metric name so HELP/TYPE is emitted once per family.
+	type sampleEntry struct {
+		labels map[string]string
+		value  float64
+	}
+	family := make(map[string][]sampleEntry)
 	for _, g := range gauges {
-		if !seen[g.Name] {
-			meta, ok := gaugeMeta[g.Name]
-			if !ok {
-				meta = metricMeta{help: g.Name, typ: "gauge"}
-			}
-			writeMeta(w, g.Name, meta.help, meta.typ)
-			seen[g.Name] = true
+		family[g.Name] = append(family[g.Name], sampleEntry{labels: g.Labels, value: g.Value})
+	}
+	for _, name := range sortedKeys(family) {
+		meta, ok := gaugeMeta[name]
+		if !ok {
+			meta = metricMeta{help: name, typ: "gauge"}
 		}
-		//nolint:errcheck // cannot check error after headers committed
-		fmt.Fprintf(w, "%s %s\n", g.Name, formatFloat(g.Value))
+		writeMeta(w, name, meta.help, meta.typ)
+		for _, s := range family[name] {
+			//nolint:errcheck // cannot check error after headers committed
+			if len(s.labels) == 0 {
+				fmt.Fprintf(w, "%s %s\n", name, formatFloat(s.value))
+			} else {
+				fmt.Fprintf(w, "%s%s %s\n", name, formatLabelMap(s.labels), formatFloat(s.value))
+			}
+		}
 	}
 }
 
@@ -377,6 +407,43 @@ func collectGauges(providers []GaugeProvider) []GaugeSample {
 		out = append(out, p.Gauges()...)
 	}
 	return out
+}
+
+// sortedKeys returns the sorted keys of a map[string]T, for deterministic output.
+func sortedKeys[T any](m map[string]T) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// formatLabelMap renders a map as a Prometheus label set string,
+// e.g. {circuit="ollama",state="open"}. Keys are sorted for
+// deterministic output.
+func formatLabelMap(labels map[string]string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(k)
+		b.WriteString(`="`)
+		b.WriteString(labels[k])
+		b.WriteString(`"`)
+	}
+	b.WriteByte('}')
+	return b.String()
 }
 
 // formatFloat renders v in the most compact form Prometheus accepts:

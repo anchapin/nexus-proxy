@@ -421,6 +421,8 @@ func (c *countingErrEmbedder) Embed(_ context.Context, _ string) ([]float64, err
 }
 
 func (c *countingErrEmbedder) IsHealthy(context.Context) bool { return true }
+func (c *countingErrEmbedder) IsBreakerOpen() bool            { return false }
+func (c *countingErrEmbedder) RecordBreakerSuccess()          {}
 
 // Calls returns the number of Embed invocations observed by this
 // embedder. Safe for concurrent use.
@@ -454,6 +456,8 @@ func (v *vectorEmbedder) Embed(_ context.Context, text string) ([]float64, error
 }
 
 func (v *vectorEmbedder) IsHealthy(context.Context) bool { return true }
+func (v *vectorEmbedder) IsBreakerOpen() bool            { return false }
+func (v *vectorEmbedder) RecordBreakerSuccess()          {}
 
 // indexedCallCounter counts every Embed call so tests can
 // distinguish the disk-cache fast path (1 call — only the
@@ -478,6 +482,8 @@ func (c *indexedCallCounter) Embed(_ context.Context, text string) ([]float64, e
 }
 
 func (c *indexedCallCounter) IsHealthy(context.Context) bool { return true }
+func (c *indexedCallCounter) IsBreakerOpen() bool            { return false }
+func (c *indexedCallCounter) RecordBreakerSuccess()          {}
 
 func (c *indexedCallCounter) totalCalls() int {
 	c.mu.Lock()

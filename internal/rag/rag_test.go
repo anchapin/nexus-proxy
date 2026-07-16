@@ -54,6 +54,8 @@ func (s *stubEmbedder) Embed(_ context.Context, text string) ([]float64, error) 
 }
 
 func (s *stubEmbedder) IsHealthy(context.Context) bool { return true }
+func (s *stubEmbedder) IsBreakerOpen() bool            { return false }
+func (s *stubEmbedder) RecordBreakerSuccess()          {}
 
 func TestRetrieveThreshold(t *testing.T) {
 	emb := &stubEmbedder{vecs: map[string][]float64{
