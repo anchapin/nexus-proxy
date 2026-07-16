@@ -3,6 +3,13 @@
 // All values have safe defaults so the binary boots in development with a
 // local Ollama instance. Secrets (FRONTIER_API_KEY) must be supplied via env
 // in any non-development deployment.
+//
+// # Unknown env var detection
+//
+// Load() warns about any NEXUS_* env vars that are set but not recognised
+// by the config loader. This catches typos like NEXUS_FRONTIER_APIKEY (missing
+// underscore) or NEXUS_JUDGE_SAMPLE_RATES (trailing S) before they cause
+// silent feature-disable surprises at runtime.
 package config
 
 import (
@@ -19,6 +26,149 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/middleware"
 	ragpkg "github.com/anchapin/nexus-proxy/internal/rag"
 )
+
+// knownEnvVars is the exhaustive allowlist of NEXUS_* environment variables
+// that the config loader recognises. Variables not in this map are reported
+// as unknown (likely typos) via a warn-level log message at boot.
+//
+// Add new variables here when adding a new config field; the checker is
+// case-sensitive so NEXUS_FOO and NEXUS_Foo are distinct.
+var knownEnvVars = map[string]struct{}{
+	// Server
+	"NEXUS_ADDR":                    {},
+	"NEXUS_SERVER_READ_TIMEOUT":     {},
+	"NEXUS_SERVER_WRITE_TIMEOUT":    {},
+	"NEXUS_SERVER_IDLE_TIMEOUT":     {},
+	"NEXUS_SERVER_MAX_HEADER_BYTES": {},
+	"NEXUS_SHUTDOWN_TIMEOUT":        {},
+	// Ollama
+	"NEXUS_OLLAMA_URL":      {},
+	"NEXUS_ROUTER_MODEL":    {},
+	"NEXUS_LOCAL_MODEL":     {},
+	"NEXUS_EMBEDDING_MODEL": {},
+	// Frontier
+	"NEXUS_FRONTIER_URL":         {},
+	"NEXUS_FRONTIER_MODEL":       {},
+	"NEXUS_FRONTIER_API_KEY":     {},
+	"NEXUS_FRONTIER_COST_PER_1K": {},
+	// Z.ai
+	"NEXUS_ZAI_URL":         {},
+	"NEXUS_ZAI_MODEL":       {},
+	"NEXUS_ZAI_API_KEY":     {},
+	"NEXUS_ZAI_COST_PER_1K": {},
+	// Auth
+	"NEXUS_PROXY_API_KEY": {},
+	"NEXUS_STATUS_PUBLIC": {},
+	// RAG
+	"NEXUS_EXAMPLES_DIR":                  {},
+	"NEXUS_RAG_THRESHOLD":                 {},
+	"NEXUS_RAG_DB":                        {},
+	"NEXUS_RAG_POLL_INTERVAL":             {},
+	"NEXUS_RAG_EMBED_CACHE_SIZE":          {},
+	"NEXUS_RAG_EMBED_CACHE_TTL":           {},
+	"NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD": {},
+	"NEXUS_RAG_CIRCUIT_BREAKER_COOLDOWN":  {},
+	// Embedder plugin (issue #238)
+	"NEXUS_EMBEDDER_TYPE":     {},
+	"NEXUS_EMBEDDER_BASE_URL": {},
+	"NEXUS_COHERE_API_KEY":    {},
+	// Routing
+	"NEXUS_TOKEN_GUARDRAIL":               {},
+	"NEXUS_SLM_TIMEOUT":                   {},
+	"NEXUS_SLM_CACHE_MAX_ENTRIES":         {},
+	"NEXUS_SLM_CACHE_TTL":                 {},
+	"NEXUS_SLMCACHE_SIMILARITY_THRESHOLD": {},
+	"NEXUS_SLM_CONFIDENCE_THRESHOLD":      {},
+	"NEXUS_FUSION_TIMEOUT":                {},
+	"NEXUS_CASCADE_TIMEOUT":               {},
+	"NEXUS_ARBITER_TIMEOUT":               {},
+	"NEXUS_FUSION_PROGRESSIVE":            {},
+	"NEXUS_FUSION_AGREEMENT_THRESHOLD":    {},
+	"NEXUS_ARBITER_CACHE_TTL":             {},
+	// DSL
+	"NEXUS_DSL_FORMATTING_PATTERNS": {},
+	"NEXUS_DSL_FUSION_PATTERNS":     {},
+	"NEXUS_DSL_LOCAL_PATTERNS":      {},
+	// Provider selector (issue #45)
+	"NEXUS_SELECTOR_WINDOW":      {},
+	"NEXUS_SELECTOR_MIN_SAMPLES": {},
+	"NEXUS_SELECTOR_REFRESH":     {},
+	// Cost avoidance baseline (issue #73)
+	"NEXUS_COST_BASELINE_PROVIDER":    {},
+	"NEXUS_COST_BASELINE_MODEL":       {},
+	"NEXUS_COST_BASELINE_RATE_PER_1K": {},
+	// Judge (issue #15)
+	"NEXUS_JUDGE_URL":         {},
+	"NEXUS_JUDGE_MODEL":       {},
+	"NEXUS_JUDGE_API_KEY":     {},
+	"NEXUS_JUDGE_SAMPLE_RATE": {},
+	"NEXUS_JUDGE_CONCURRENCY": {},
+	"NEXUS_JUDGE_QUEUE":       {},
+	"NEXUS_JUDGE_TIMEOUT":     {},
+	"NEXUS_JUDGE_COST_PER_1K": {},
+	"NEXUS_JUDGE_DB":          {},
+	// Quality verifier (issue #13)
+	"NEXUS_QUALITY_CONCURRENCY": {},
+	"NEXUS_QUALITY_QUEUE":       {},
+	"NEXUS_QUALITY_TIMEOUT":     {},
+	"NEXUS_QUALITY_STDERR_CAP":  {},
+	// Health (issue #8)
+	"NEXUS_HEALTH_POLL_INTERVAL":     {},
+	"NEXUS_HEALTH_BREAKER_THRESHOLD": {},
+	"NEXUS_HEALTH_PROBE_TIMEOUT":     {},
+	// VRAM probe (issue #6)
+	"NEXUS_PROBE_INTERVAL":        {},
+	"NEXUS_PROBE_TIMEOUT":         {},
+	"NEXUS_PROBE_BYTES_PER_TOKEN": {},
+	// Local concurrency (issue #81)
+	"NEXUS_LOCAL_MAX_CONCURRENT":      {},
+	"NEXUS_LOCAL_VRAM_BYTES_PER_SLOT": {},
+	// Local cooldown (issue #80)
+	"NEXUS_LOCAL_COOLDOWN": {},
+	// Body cap (issue #11)
+	"NEXUS_MAX_BODY_BYTES": {},
+	// Middleware
+	"NEXUS_MIDDLEWARE_CHAIN":      {},
+	"NEXUS_META_PROMPT":           {},
+	"NEXUS_TOON_NOTICE":           {},
+	"NEXUS_TOON_UNFENCED":         {},
+	"NEXUS_PROMPT_INJECTION_MODE": {},
+	// Telemetry & tracing
+	"NEXUS_TELEMETRY_PATH":   {},
+	"NEXUS_METRICS_DB":       {},
+	"NEXUS_TRACING_ENDPOINT": {},
+	"NEXUS_TRACING_TIMEOUT":  {},
+	// Structured logging (issue #3)
+	"NEXUS_LOG_LEVEL":  {},
+	"NEXUS_LOG_FORMAT": {},
+	// Debug tracing (issue #33)
+	"NEXUS_DEBUG":            {},
+	"NEXUS_DEBUG_BODY_BYTES": {},
+	// Model discovery (issue #78)
+	"NEXUS_MODELS_ENDPOINT":  {},
+	"NEXUS_MODELS_CACHE_TTL": {},
+	// Trusted proxies & rate limiting (issue #75)
+	"NEXUS_TRUSTED_PROXIES":  {},
+	"NEXUS_RATE_LIMIT_RPM":   {},
+	"NEXUS_RATE_LIMIT_BURST": {},
+	// Auth brute-force (issue #296)
+	"NEXUS_AUTH_RATE_LIMIT_RPM":    {},
+	"NEXUS_AUTH_RATE_LIMIT_BURST":  {},
+	"NEXUS_AUTH_RATE_LIMIT_WINDOW": {},
+	// Budget guard (issue #183, #201)
+	"NEXUS_BUDGET_DAILY_LIMIT":       {},
+	"NEXUS_BUDGET_ALERT_ENABLED":     {},
+	"NEXUS_BUDGET_ALERT_THRESHOLD":   {},
+	"NEXUS_BUDGET_ALERT_WEBHOOK_URL": {},
+	// Readiness (issue #302)
+	"NEXUS_READINESS_MODE": {},
+	// Routing confidence (issue #47)
+	"NEXUS_ROUTING_CONFIDENCE_DB":          {},
+	"NEXUS_ROUTING_CONFIDENCE_FLOOR":       {},
+	"NEXUS_ROUTING_CONFIDENCE_CEILING":     {},
+	"NEXUS_ROUTING_CONFIDENCE_MIN_SAMPLES": {},
+	"NEXUS_ROUTING_CONFIDENCE_WINDOW":      {},
+}
 
 // Config holds all runtime knobs for the proxy. A zero value is invalid;
 // always go through Load.
@@ -962,6 +1112,8 @@ func Load() (Config, error) {
 		return cfg, fmt.Errorf("config: NEXUS_SHUTDOWN_TIMEOUT must not be negative, got %s", shutdownTimeout)
 	}
 	if shutdownTimeout == 0 {
+		slog.Warn("config: NEXUS_SHUTDOWN_TIMEOUT=0 is not supported; remapping to DefaultShutdownTimeout (30s) — set a positive duration to control the drain window",
+			"default", DefaultShutdownTimeout)
 		shutdownTimeout = DefaultShutdownTimeout
 	}
 	cfg.ShutdownTimeout = shutdownTimeout
@@ -1196,6 +1348,7 @@ func Load() (Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}
+	checkUnknownEnvVars()
 	return cfg, nil
 }
 
@@ -1549,6 +1702,25 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 	next.Debug = parseBoolEnv("NEXUS_DEBUG", prev.Debug)
 
 	return next, result
+}
+
+// checkUnknownEnvVars scans the process environment for any NEXUS_* variables
+// that are not in the knownEnvVars allowlist and logs a warn-level message for
+// each one. This catches typos (NEXUS_FRONTIER_APIKEY, NEXUS_JUDGE_SAMPLE_RATES,
+// etc.) before they cause silent feature-disable surprises at runtime.
+func checkUnknownEnvVars() {
+	const prefix = "NEXUS_"
+	for _, e := range os.Environ() {
+		if idx := strings.Index(e, "="); idx >= 0 {
+			key := e[:idx]
+			if strings.HasPrefix(key, prefix) {
+				if _, ok := knownEnvVars[key]; !ok {
+					slog.Warn("config: unknown NEXUS_* env var — check for a typo or remove it",
+						"env_var", key)
+				}
+			}
+		}
+	}
 }
 
 func getEnv(key, def string) string {
