@@ -20,6 +20,13 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/ratelimit"
 )
 
+// AuthObserver is the interface for receiving auth lifecycle callbacks.
+// The observability.Collector implements this interface (issue #295).
+type AuthObserver interface {
+	IncAuthRejectedInvalid()
+	IncAuthRejectedMissing()
+}
+
 // Middleware gates HTTP requests behind a bearer token. When key is
 // empty the middleware is a pass-through (auth disabled), so a
 // development proxy with no NEXUS_PROXY_API_KEY behaves identically
@@ -28,6 +35,7 @@ type Middleware struct {
 	key         string
 	exempt      func(*http.Request) bool
 	authLimiter *ratelimit.AuthLimiter
+	observer    AuthObserver
 }
 
 // NewMiddleware returns a middleware that rejects requests without a
@@ -36,8 +44,10 @@ type Middleware struct {
 // When authLimiter is non-nil, brute-force protection is enabled:
 // the client IP is checked against the limiter before auth, and failures
 // are reported to the limiter.
-func NewMiddleware(key string, exempt func(*http.Request) bool, authLimiter *ratelimit.AuthLimiter) *Middleware {
-	return &Middleware{key: key, exempt: exempt, authLimiter: authLimiter}
+// When observer is non-nil, auth rejection counters are incremented on
+// 401 responses (issue #295).
+func NewMiddleware(key string, exempt func(*http.Request) bool, authLimiter *ratelimit.AuthLimiter, observer AuthObserver) *Middleware {
+	return &Middleware{key: key, exempt: exempt, authLimiter: authLimiter, observer: observer}
 }
 
 // Enabled reports whether the middleware actually enforces auth.
@@ -58,6 +68,9 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		if token == "" {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="nexus-proxy"`)
 			http.Error(w, `{"error":"missing or malformed Authorization header"}`, http.StatusUnauthorized)
+			if m.observer != nil {
+				m.observer.IncAuthRejectedMissing()
+			}
 			return
 		}
 		// Use crypto/subtle.ConstantTimeCompare to prevent timing attacks
@@ -65,6 +78,9 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		if subtle.ConstantTimeCompare([]byte(token), []byte(m.key)) == 0 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="nexus-proxy", error="invalid_token"`)
 			http.Error(w, `{"error":"invalid API key"}`, http.StatusUnauthorized)
+			if m.observer != nil {
+				m.observer.IncAuthRejectedInvalid()
+			}
 			return
 		}
 		next.ServeHTTP(w, r)
