@@ -430,6 +430,15 @@ type Config struct {
 	// runs. Zero or negative falls back to DefaultMaxBodyBytes.
 	MaxBodyBytes int
 
+	// Upstream response cap (issue #386). BufferedFetchWithContext,
+	// FetchPanel, and fetchCascadeStep apply this via io.LimitReader
+	// so a malicious or misbehaving upstream returning multi-GB
+	// responses cannot exhaust proxy memory. The read error (including
+	// LimitReader's io.ErrUnexpectedEOF when the limit is hit) is
+	// propagated to the caller. Zero or negative falls back to
+	// DefaultMaxUpstreamResponseBytes.
+	MaxUpstreamResponseBytes int64
+
 	// Judge (async LLM-as-a-judge evaluator). All zero/empty values
 	// disable the judge; the chat handler is unaffected when the
 	// evaluator is wired to a no-op observer (see cmd/nexus/main.go).
@@ -1062,6 +1071,19 @@ func Load() (Config, error) {
 	}
 	cfg.MaxBodyBytes = maxBodyBytes
 
+	// Upstream response cap (issue #386). BufferedFetchWithContext,
+	// FetchPanel, and fetchCascadeStep wrap the response body with
+	// io.LimitReader so a malicious upstream cannot exhaust proxy memory.
+	// The limit is exposed via EffectiveMaxUpstreamResponseBytes so
+	// callers that need a different cap (e.g. the arbiter synthesis
+	// path) can pass it down without re-parsing env. Default 10 MiB
+	// accommodates multi-turn conversations with long contexts.
+	maxUpstreamBytes, err := getEnvInt64("NEXUS_MAX_UPSTREAM_RESPONSE_BYTES", DefaultMaxUpstreamResponseBytes)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.MaxUpstreamResponseBytes = maxUpstreamBytes
+
 	// HTTP listener timeouts and header cap (issue #77). These bound
 	// the inbound connection independently of the outbound transport
 	// knobs (NEXUS_HTTP_*). WriteTimeout defaults to 0 (disabled) so
@@ -1465,6 +1487,25 @@ func (c Config) EffectiveMaxBodyBytes() int {
 	return DefaultMaxBodyBytes
 }
 
+// DefaultMaxUpstreamResponseBytes is the fallback cap on buffered upstream
+// responses (issue #386). 10 MiB accommodates multi-turn conversations with
+// long contexts while preventing a malicious or misbehaving upstream from
+// exhausting proxy memory. Callers that need a different cap (e.g. the
+// arbiter synthesis path) pass it directly; this default is used only
+// when MaxUpstreamResponseBytes is zero.
+const DefaultMaxUpstreamResponseBytes int64 = 10 << 20 // 10 MiB
+
+// EffectiveMaxUpstreamResponseBytes returns the upstream response cap for
+// BufferedFetchWithContext, FetchPanel, and fetchCascadeStep. Zero or
+// negative falls back to DefaultMaxUpstreamResponseBytes so a zero-value
+// Config (e.g. inside unit tests) still gets a sane cap.
+func (c Config) EffectiveMaxUpstreamResponseBytes() int64 {
+	if c.MaxUpstreamResponseBytes > 0 {
+		return c.MaxUpstreamResponseBytes
+	}
+	return DefaultMaxUpstreamResponseBytes
+}
+
 // DefaultDebugBodyBytes is the upper bound on the response-body preview
 // the debug trace logs (issue #33). 512 bytes is enough to identify the
 // upstream model, see the first few tokens, and recognise a malformed
@@ -1777,6 +1818,18 @@ func getEnvBool(key string, def bool) bool {
 	default:
 		return false
 	}
+}
+
+func getEnvInt64(key string, def int64) (int64, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be an integer: %w", key, err)
+	}
+	return n, nil
 }
 
 func getEnvFloat(key string, def float64) (float64, error) {

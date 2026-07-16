@@ -290,7 +290,15 @@ func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payl
 		return AssistantMessage{}, "", newCascadeErr(true, reason, "transport: %v", dErr)
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, rErr := io.ReadAll(io.LimitReader(resp.Body, DefaultMaxUpstreamResponseBytes))
+	// err may be nil even when the limit was hit: io.LimitReader returns
+	// io.EOF (not an error) when the limit is reached. To detect this
+	// truncation we also check whether the body length equals the limit.
+	if rErr != nil || int64(len(respBody)) >= DefaultMaxUpstreamResponseBytes {
+		// Read errors (including limit-exceeded truncation) are treated as
+		// retryable since the upstream may have returned a truncated response.
+		return AssistantMessage{}, "", newCascadeErr(true, "", "read response: %v", rErr)
+	}
 
 	if ShouldRetry(resp.StatusCode, nil) {
 		return AssistantMessage{}, "", newCascadeErr(true, "transport_error", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
