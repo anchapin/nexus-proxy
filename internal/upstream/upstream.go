@@ -91,6 +91,14 @@ func copyAllowedHeaders(dst, src http.Header) {
 	}
 }
 
+// DefaultMaxUpstreamResponseBytes is the default cap on buffered upstream
+// responses. It is used by BufferedFetchWithContext, FetchPanel, and
+// fetchCascadeStep when no explicit limit is passed. The value (10 MiB)
+// accommodates multi-turn conversations with long contexts while preventing
+// a malicious or misbehaving upstream from exhausting proxy memory
+// (issue #386). Tests can override it via SetMaxUpstreamResponseBytes.
+var DefaultMaxUpstreamResponseBytes int64 = 10 << 20 // 10 MiB
+
 // Client is the minimal interface used by the stream and fusion helpers. The
 // default http.Client satisfies it; tests can pass a stub.
 type Client interface {
@@ -319,7 +327,15 @@ func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client
 		return fmt.Errorf("upstream: do: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, DefaultMaxUpstreamResponseBytes))
+	// err may be nil even when the limit was hit: io.LimitReader returns
+	// io.EOF (not an error) when the limit is reached but all requested
+	// bytes were returned. To detect this truncation we also check whether
+	// the body length equals the limit — if so, the upstream may have
+	// had more data we did not receive.
+	if err != nil || int64(len(respBody)) >= DefaultMaxUpstreamResponseBytes {
+		return fmt.Errorf("upstream: read response: %w", err)
+	}
 
 	// Validate the upstream body is a single JSON object. A misbehaving
 	// upstream returning HTML or plain text would otherwise propagate
@@ -375,7 +391,10 @@ func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName
 		return AssistantMessage{}, fmt.Errorf("fusion: do: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, DefaultMaxUpstreamResponseBytes))
+	if err != nil || int64(len(respBody)) >= DefaultMaxUpstreamResponseBytes {
+		return AssistantMessage{}, fmt.Errorf("fusion: read response: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return AssistantMessage{}, fmt.Errorf("fusion: %s status %d: %s", modelName, resp.StatusCode, respBody)
 	}

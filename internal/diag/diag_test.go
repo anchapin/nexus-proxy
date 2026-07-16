@@ -978,4 +978,3 @@ func TestRunModelsEndpointAllModelsPresentIsPass(t *testing.T) {
 		t.Errorf("models_endpoint = %s (detail=%s), want pass", got.Status, got.Detail)
 	}
 }
-
