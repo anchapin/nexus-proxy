@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"regexp"
 	"sync"
 	"syscall"
 	"time"
@@ -43,8 +42,7 @@ import (
 )
 
 const (
-	formattingRegexPattern = `(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`
-	bootRAGTimeout         = 30 * time.Second
+	bootRAGTimeout = 30 * time.Second
 )
 
 // version is the build version. Overridden at compile time via
@@ -145,7 +143,6 @@ func main() {
 	// to the NewSLMClient defaults (5m TTL, 512 max entries).
 	slm.CacheTTL = cfg.SLMCacheTTL
 	slm.CacheMaxEntries = cfg.SLMCacheMaxEntries
-	re := regexp.MustCompile(formattingRegexPattern)
 
 	// Ollama health poller (issue #8). When NEXUS_HEALTH_POLL_INTERVAL
 	// is zero the handler treats Ollama as always healthy (useful for
@@ -658,11 +655,18 @@ func main() {
 			routeCounters.ObserveArbiterCacheHit(cacheHit)
 		}
 	}
+	// Panel panic observer (issue #309). The chat handler detects
+	// "panic:" in error messages from Panel/PanelStreaming and
+	// calls this observer, which forwards to the in-process counter
+	// so it surfaces in /metrics as nexus_panel_panics_total.
+	panelPanicObs := func() {
+		routeCounters.ObservePanelPanic()
+	}
 	// Arbiter synthesis cache (issue #232). Created when TTL > 0;
 	// nil means caching is disabled.
 	var arbiterCache *upstream.ArbiterCache
 	if cfg.ArbiterCacheTTL > 0 {
-		arbiterCache = upstream.NewArbiterCache()
+		arbiterCache = upstream.NewArbiterCache(cfg.ArbiterCacheTTL)
 		slog.Info("fusion arbiter cache enabled",
 			slog.Duration("ttl", cfg.ArbiterCacheTTL),
 		)
@@ -706,7 +710,6 @@ func main() {
 		Client:                  httpClient,
 		RAG:                     store,
 		SLM:                     slm,
-		FormattingRegex:         re,
 		MiddlewareChain:         mwChain,
 		ContextAwareRAG:         ctxAwareRAG,
 		Confidence:              confidenceObs,
@@ -726,6 +729,7 @@ func main() {
 		RAGObserver:             ragObserver,
 		CascadeFallbackObserver: cascadeFallbackObs,
 		ArbiterCacheObserver:    arbiterCacheObserver,
+		PanelPanicObserver:      panelPanicObs,
 		ArbiterCache:            arbiterCache,
 		Providers:               providerRegistry,
 	})
@@ -795,7 +799,66 @@ func main() {
 			snap := routeCounters.Snapshot()
 			return handlers.RoutingSnapshot{Decisions: snap}
 		},
-		Uptime: func() time.Duration { return time.Since(startTime) },
+		Uptime:             func() time.Duration { return time.Since(startTime) },
+		RateLimiterEnabled: func() bool { return rateLimiter != nil && rateLimiter.Enabled() },
+		RateLimiterRPM:     func() int { return rateLimiter.RPM() },
+		RateLimiterBurst:   func() int { return rateLimiter.Burst() },
+		BudgetEnabled: func() bool {
+			if budgetGuard == nil {
+				return false
+			}
+			return budgetGuard.Limit() > 0
+		},
+		BudgetDailyLimitUSD: func() float64 {
+			if budgetGuard == nil {
+				return 0
+			}
+			return budgetGuard.Limit()
+		},
+		BudgetCurrentSpendUSD: func() float64 {
+			if budgetGuard == nil {
+				return 0
+			}
+			return budgetGuard.State().Spent
+		},
+		BudgetResetAt: func() time.Time {
+			if budgetGuard == nil {
+				return time.Time{}
+			}
+			return budgetGuard.State().NextReset
+		},
+		MetricsDBWritable: func() bool {
+			if metricsStore == nil {
+				return false
+			}
+			if ss, ok := metricsStore.(*metrics.SQLiteStore); ok {
+				return ss.Writable()
+			}
+			return false
+		},
+		MetricsDBPath: func() string {
+			if metricsStore == nil {
+				return ""
+			}
+			if ss, ok := metricsStore.(*metrics.SQLiteStore); ok {
+				return ss.Path()
+			}
+			return ""
+		},
+		SLMCacheEnabled: func() bool { return slmCache != nil && slmCache.Enabled() },
+		SLMCacheTTLSeconds: func() int {
+			if slmCache == nil {
+				return 0
+			}
+			return slmCache.TTLSeconds()
+		},
+		ArbiterCacheEnabled: func() bool { return arbiterCache != nil && arbiterCache.Enabled() },
+		ArbiterCacheTTLSeconds: func() int {
+			if arbiterCache == nil {
+				return 0
+			}
+			return arbiterCache.TTLSeconds()
+		},
 	}))
 	slog.Info("status endpoint serves async subsystem diagnostics")
 
@@ -884,6 +947,40 @@ func main() {
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Warn("server shutdown", slog.Any("err", err))
+		}
+	}()
+
+	// SIGHUP-based config hot reload (issue #306). A separate channel
+	// is used so SIGHUP does not interfere with the graceful shutdown
+	// path. The closure captures rateLimiter and cfg by reference so
+	// in-place updates take effect without a restart.
+	sighupCh := make(chan os.Signal, 1)
+	signal.Notify(sighupCh, syscall.SIGHUP)
+	go func() {
+		for range sighupCh {
+			newCfg, result := config.ReloadHotReloadable(cfg)
+			// Update in-place components.
+			if rateLimiter != nil {
+				rateLimiter.SetRPM(newCfg.RateLimitRPM)
+				rateLimiter.SetBurst(newCfg.RateLimitBurst)
+			}
+			// Update structured logger level and format.
+			newLogger := newCfg.NewLogger()
+			slog.SetDefault(newLogger)
+			cfg = newCfg
+			slog.Info("config reloaded via SIGHUP",
+				slog.Int("rate_limit_rpm", newCfg.RateLimitRPM),
+				slog.Int("rate_limit_burst", newCfg.RateLimitBurst),
+				slog.String("log_level", newCfg.LogLevel.String()),
+				slog.String("log_format", newCfg.LogFormat.String()),
+				slog.Bool("debug", newCfg.Debug),
+			)
+			for _, name := range result.NeedsRestart {
+				slog.Warn("config change requires restart",
+					slog.String("setting", name),
+					slog.String("hint", "send SIGTERM/SIGINT to gracefully restart"),
+				)
+			}
 		}
 	}()
 

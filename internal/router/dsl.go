@@ -17,6 +17,21 @@ const (
 	RouteFusion   = "fusion"
 )
 
+// Default DSL patterns. These match the hardcoded behaviour prior to issue #305.
+// Exported so the chat handler can fall back to them when the config fields
+// are nil (e.g. in tests that construct config.Config directly).
+var (
+	DefaultFormattingPatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`),
+	}
+	DefaultFusionPatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)\b(architectural design|system architecture)\b`),
+	}
+	DefaultLocalPatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis)\b`),
+	}
+)
+
 // Guardrail returns RouteFrontier when the prompt is too large for the
 // configured VRAM budget. The threshold is the maximum *estimated* token
 // count the local model can safely handle. When maxTokens <= 0 the
@@ -38,22 +53,35 @@ type Route string
 // DSL runs the heuristic fast-pass. Returns one of RouteLocal, RouteFusion,
 // or "" if no rule matched (caller should fall back to the SLM).
 //
-// formattingRegex matches simple formatting keywords (css, format, docstring,
-// lint, typo, boilerplate). localPatternsRegex matches common coding task
-// keywords (refactor, security scan, generate tests, explain this code,
-// performance analysis, etc.). Both may be nil.
-func DSL(prompt string, formattingRegex, localPatternsRegex *regexp.Regexp) (Route, bool) {
+// fusionPatterns matches architecture keywords that warrant fusion (both
+// local and frontier). formattingPatterns matches simple formatting keywords
+// (css, format, docstring, lint, typo, boilerplate). localPatterns matches
+// common coding task keywords (refactor, security scan, generate tests,
+// explain this code, performance analysis, etc.). Each pattern slice may be
+// nil or empty in which case that branch is skipped.
+func DSL(prompt string, fusionPatterns, formattingPatterns, localPatterns []*regexp.Regexp) (Route, bool) {
 	lower := toLowerASCII(prompt)
 
-	if stringsContains(lower, "architectural design") ||
-		stringsContains(lower, "system architecture") {
-		return RouteFusion, true
+	if len(fusionPatterns) > 0 {
+		for _, re := range fusionPatterns {
+			if re.MatchString(lower) {
+				return RouteFusion, true
+			}
+		}
 	}
-	if formattingRegex != nil && formattingRegex.MatchString(lower) {
-		return RouteLocal, true
+	if len(formattingPatterns) > 0 {
+		for _, re := range formattingPatterns {
+			if re.MatchString(lower) {
+				return RouteLocal, true
+			}
+		}
 	}
-	if localPatternsRegex != nil && localPatternsRegex.MatchString(lower) {
-		return RouteLocal, true
+	if len(localPatterns) > 0 {
+		for _, re := range localPatterns {
+			if re.MatchString(lower) {
+				return RouteLocal, true
+			}
+		}
 	}
 	return "", false
 }

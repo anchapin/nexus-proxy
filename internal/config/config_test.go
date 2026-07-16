@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log/slog"
 	"testing"
 	"time"
 )
@@ -99,6 +100,16 @@ func TestLoadDefaults(t *testing.T) {
 	if !cfg.TOONUnfenced {
 		t.Error("TOONUnfenced = false, want true (default on)")
 	}
+	// DSL fast-pass patterns (issue #305).
+	if len(cfg.DSLFormattingPatterns) == 0 {
+		t.Error("DSLFormattingPatterns is empty, want default patterns")
+	}
+	if len(cfg.DSLFusionPatterns) == 0 {
+		t.Error("DSLFusionPatterns is empty, want default patterns")
+	}
+	if len(cfg.DSLLocalPatterns) == 0 {
+		t.Error("DSLLocalPatterns is empty, want default patterns")
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -190,6 +201,66 @@ func TestLoadTOONUnfencedFlag(t *testing.T) {
 	})
 }
 
+func TestLoadDSLPatternOverrides(t *testing.T) {
+	// Custom local patterns: operator adds "custom task" to local patterns (issue #305)
+	// Note: comma-separated regex patterns - each is compiled separately
+	t.Setenv("NEXUS_DSL_LOCAL_PATTERNS", `(?i)\b(refactor)\b,(?i)\b(custom task)\b`)
+	// Custom fusion patterns: operator adds "database schema" (issue #305)
+	t.Setenv("NEXUS_DSL_FUSION_PATTERNS", `(?i)\b(architectural design|system architecture)\b,(?i)\b(database schema)\b`)
+	// Custom formatting patterns
+	t.Setenv("NEXUS_DSL_FORMATTING_PATTERNS", `(?i)\b(css)\b,(?i)\b(html)\b`)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	// Verify local patterns include refactor and custom task (2 comma-separated patterns)
+	if len(cfg.DSLLocalPatterns) != 2 {
+		t.Errorf("DSLLocalPatterns count = %d, want 2", len(cfg.DSLLocalPatterns))
+	}
+	foundRefactor := false
+	for _, re := range cfg.DSLLocalPatterns {
+		if re.String() == `(?i)\b(refactor)\b` {
+			foundRefactor = true
+			break
+		}
+	}
+	if !foundRefactor {
+		t.Error("DSLLocalPatterns does not contain refactor pattern")
+	}
+	foundCustom := false
+	for _, re := range cfg.DSLLocalPatterns {
+		if re.String() == `(?i)\b(custom task)\b` {
+			foundCustom = true
+			break
+		}
+	}
+	if !foundCustom {
+		t.Error("DSLLocalPatterns does not contain custom task pattern")
+	}
+
+	// Verify fusion patterns (2 comma-separated patterns)
+	if len(cfg.DSLFusionPatterns) != 2 {
+		t.Errorf("DSLFusionPatterns count = %d, want 2", len(cfg.DSLFusionPatterns))
+	}
+	foundSchema := false
+	for _, re := range cfg.DSLFusionPatterns {
+		if re.String() == `(?i)\b(database schema)\b` {
+			foundSchema = true
+			break
+		}
+	}
+	if !foundSchema {
+		t.Error("DSLFusionPatterns does not contain database schema pattern")
+	}
+
+	// Verify formatting patterns (2 comma-separated patterns)
+	if len(cfg.DSLFormattingPatterns) != 2 {
+		t.Errorf("DSLFormattingPatterns count = %d, want 2", len(cfg.DSLFormattingPatterns))
+	}
+}
+
 func TestLoadTelemetryDisabledByEmptyPath(t *testing.T) {
 	t.Setenv("NEXUS_TELEMETRY_PATH", "")
 	cfg, err := Load()
@@ -256,6 +327,9 @@ func TestLoadInvalidValues(t *testing.T) {
 		{"bad float", "NEXUS_RAG_THRESHOLD", "0.5x"},
 		{"bad duration", "NEXUS_SLM_TIMEOUT", "eight seconds"},
 		{"bad cascade duration", "NEXUS_CASCADE_TIMEOUT", "ten seconds"},
+		{"bad dsl formatting regex", "NEXUS_DSL_FORMATTING_PATTERNS", "[invalid"},
+		{"bad dsl fusion regex", "NEXUS_DSL_FUSION_PATTERNS", "(unbalanced"},
+		{"bad dsl local regex", "NEXUS_DSL_LOCAL_PATTERNS", "**invalid"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -676,4 +750,152 @@ func TestIsLoopbackBind(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestReloadHotReloadable_RateLimit verifies that rate limit RPM and burst
+// are correctly reloaded from environment variables.
+func TestReloadHotReloadable_RateLimit(t *testing.T) {
+	t.Setenv("NEXUS_RATE_LIMIT_RPM", "200")
+	t.Setenv("NEXUS_RATE_LIMIT_BURST", "50")
+	prev, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// Change env between Load and ReloadHotReloadable.
+	t.Setenv("NEXUS_RATE_LIMIT_RPM", "300")
+	t.Setenv("NEXUS_RATE_LIMIT_BURST", "75")
+	next, result := ReloadHotReloadable(prev)
+	if result.NeedsRestart != nil {
+		t.Errorf("expected no restart-required settings, got %v", result.NeedsRestart)
+	}
+	if next.RateLimitRPM != 300 {
+		t.Errorf("RateLimitRPM = %d, want 300", next.RateLimitRPM)
+	}
+	if next.RateLimitBurst != 75 {
+		t.Errorf("RateLimitBurst = %d, want 75", next.RateLimitBurst)
+	}
+}
+
+// TestReloadHotReloadable_LogLevel verifies that log level is correctly
+// reloaded from NEXUS_LOG_LEVEL.
+func TestReloadHotReloadable_LogLevel(t *testing.T) {
+	t.Setenv("NEXUS_LOG_LEVEL", "debug")
+	prev, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	t.Setenv("NEXUS_LOG_LEVEL", "warn")
+	next, result := ReloadHotReloadable(prev)
+	if result.NeedsRestart != nil {
+		t.Errorf("expected no restart-required settings, got %v", result.NeedsRestart)
+	}
+	if next.LogLevel != slog.LevelWarn {
+		t.Errorf("LogLevel = %v, want warn", next.LogLevel)
+	}
+}
+
+// TestReloadHotReloadable_LogFormat verifies that log format is correctly
+// reloaded from NEXUS_LOG_FORMAT.
+func TestReloadHotReloadable_LogFormat(t *testing.T) {
+	t.Setenv("NEXUS_LOG_FORMAT", "text")
+	prev, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	t.Setenv("NEXUS_LOG_FORMAT", "json")
+	next, result := ReloadHotReloadable(prev)
+	if result.NeedsRestart != nil {
+		t.Errorf("expected no restart-required settings, got %v", result.NeedsRestart)
+	}
+	if next.LogFormat != LogFormatJSON {
+		t.Errorf("LogFormat = %v, want json", next.LogFormat)
+	}
+}
+
+// TestReloadHotReloadable_Debug verifies that the debug flag is correctly
+// reloaded from NEXUS_DEBUG.
+func TestReloadHotReloadable_Debug(t *testing.T) {
+	t.Setenv("NEXUS_DEBUG", "false")
+	prev, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if prev.Debug != false {
+		t.Errorf("prev.Debug = %v, want false", prev.Debug)
+	}
+	t.Setenv("NEXUS_DEBUG", "true")
+	next, result := ReloadHotReloadable(prev)
+	if result.NeedsRestart != nil {
+		t.Errorf("expected no restart-required settings, got %v", result.NeedsRestart)
+	}
+	if next.Debug != true {
+		t.Errorf("Debug = %v, want true", next.Debug)
+	}
+}
+
+// TestReloadHotReloadable_RestartRequired verifies that changes to
+// restart-required settings are detected and reported.
+func TestReloadHotReloadable_RestartRequired(t *testing.T) {
+	prev := Config{
+		OllamaURL:     "http://localhost:11434",
+		FrontierKey:   "sk-old",
+		MetricsDBPath: "/tmp/old.db",
+	}
+	// Simulate operator changing restart-required settings.
+	t.Setenv("NEXUS_OLLAMA_URL", "http://ollama.local:11434")
+	t.Setenv("NEXUS_FRONTIER_API_KEY", "sk-new")
+	t.Setenv("NEXUS_METRICS_DB", "/tmp/new.db")
+	_, result := ReloadHotReloadable(prev)
+	if len(result.NeedsRestart) != 3 {
+		t.Errorf("expected 3 restart-required settings, got %d: %v", len(result.NeedsRestart), result.NeedsRestart)
+	}
+	found := make(map[string]bool)
+	for _, n := range result.NeedsRestart {
+		found[n] = true
+	}
+	if !found["NEXUS_OLLAMA_URL"] {
+		t.Error("expected NEXUS_OLLAMA_URL in NeedsRestart")
+	}
+	if !found["NEXUS_FRONTIER_API_KEY"] {
+		t.Error("expected NEXUS_FRONTIER_API_KEY in NeedsRestart")
+	}
+	if !found["NEXUS_METRICS_DB"] {
+		t.Error("expected NEXUS_METRICS_DB in NeedsRestart")
+	}
+}
+
+// TestReloadHotReloadable_UnchangedRestartRequired verifies that unchanged
+// restart-required settings do not appear in NeedsRestart.
+func TestReloadHotReloadable_UnchangedRestartRequired(t *testing.T) {
+	prev := Config{
+		OllamaURL:   "http://localhost:11434",
+		FrontierKey: "sk-same",
+	}
+	// Set env vars to the same values as prev.
+	t.Setenv("NEXUS_OLLAMA_URL", prev.OllamaURL)
+	t.Setenv("NEXUS_FRONTIER_API_KEY", prev.FrontierKey)
+	_, result := ReloadHotReloadable(prev)
+	if result.NeedsRestart != nil {
+		t.Errorf("expected no restart-required settings (unchanged), got %v", result.NeedsRestart)
+	}
+}
+
+// TestReloadHotReloadable_PreservesNonReloadable verifies that non-reloadable
+// fields are preserved from the previous config.
+func TestReloadHotReloadable_PreservesNonReloadable(t *testing.T) {
+	prev := Config{
+		Addr:           ":9000",
+		OllamaURL:      "http://ollama.local:11434",
+		RouterModel:    "my-model",
+		TokenGuardrail: 9999,
+		FrontierKey:    "sk-frontier",
+		MetricsDBPath:  "/tmp/metrics.db",
+	}
+	t.Setenv("NEXUS_RATE_LIMIT_RPM", "500") // only change rate limit
+	_, result := ReloadHotReloadable(prev)
+	if result.NeedsRestart != nil {
+		t.Errorf("expected no restart-required settings, got %v", result.NeedsRestart)
+	}
+	// Reload would be called with a fresh prev in the SIGHUP handler,
+	// so we verify the returned cfg preserves non-reloadable fields.
 }

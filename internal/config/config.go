@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -120,6 +121,17 @@ type Config struct {
 	FusionTimeout             time.Duration // per-panel-member fetch timeout (120s)
 	CascadeTimeout            time.Duration // per-attempt timeout for cascade fallback (30s)
 	ArbiterTimeout            time.Duration // per-call timeout for the fusion arbiter stream (60s)
+
+	// DSL fast-pass patterns (issue #305). DSLFormattingPatterns
+	// matches simple formatting keywords (css, format, docstring, ...).
+	// DSLFusionPatterns matches architecture keywords that warrant
+	// running both local and frontier (fusion). DSLLocalPatterns
+	// matches common coding task keywords (refactor, security scan,
+	// ...). All three default to the prior hardcoded behaviour when
+	// the corresponding env var is unset.
+	DSLFormattingPatterns []*regexp.Regexp // NEXUS_DSL_FORMATTING_PATTERNS
+	DSLFusionPatterns    []*regexp.Regexp // NEXUS_DSL_FUSION_PATTERNS
+	DSLLocalPatterns      []*regexp.Regexp // NEXUS_DSL_LOCAL_PATTERNS
 
 	// Frontier provider selector (issue #45). When more than one
 	// frontier provider is configured (frontier + z.ai), the chat
@@ -559,6 +571,28 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.ArbiterTimeout = arbiterTimeout
+
+	// DSL fast-pass patterns (issue #305). Defaults match the prior
+	// hardcoded behaviour so operators who upgrade see identical routing.
+	dslFormatting, err := getEnvRegexps("NEXUS_DSL_FORMATTING_PATTERNS",
+		`(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.DSLFormattingPatterns = dslFormatting
+
+	dslFusion, err := getEnvRegexps("NEXUS_DSL_FUSION_PATTERNS", `(?i)\b(architectural design|system architecture)\b`)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.DSLFusionPatterns = dslFusion
+
+	dslLocal, err := getEnvRegexps("NEXUS_DSL_LOCAL_PATTERNS",
+		`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis)\b`)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.DSLLocalPatterns = dslLocal
 
 	// Frontier provider selector (issue #45). Look-back window,
 	// observation floor, and cache cadence. Defaults match the
@@ -1349,6 +1383,56 @@ func (c Config) NewLogger() *slog.Logger {
 	return slog.New(h)
 }
 
+// HotReloadResult captures the outcome of a SIGHUP config reload (issue #306).
+type HotReloadResult struct {
+	// NeedsRestart is the list of env vars that were changed but require
+	// a full proxy restart to take effect.
+	NeedsRestart []string
+}
+
+// ReloadHotReloadable re-reads environment variables for settings that are
+// safe to change at runtime (NEXUS_RATE_LIMIT_RPM, NEXUS_RATE_LIMIT_BURST,
+// NEXUS_LOG_LEVEL, NEXUS_LOG_FORMAT, NEXUS_DEBUG) and returns a new Config
+// with those fields updated. Settings that require a restart
+// (NEXUS_OLLAMA_URL, NEXUS_FRONTIER_API_KEY, NEXUS_METRICS_DB) are checked
+// and reported via NeedsRestart if they have changed since the last load.
+// The caller should apply in-place changes (rate limiter RPM/Burst, logger
+// level/format, debug flag) and log NeedsRestart with a restart hint.
+func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
+	result := HotReloadResult{}
+	next := prev // start from previous so non-reloadable fields are preserved
+
+	// Check which restart-required settings have changed.
+	if v := os.Getenv("NEXUS_OLLAMA_URL"); v != "" && v != prev.OllamaURL {
+		result.NeedsRestart = append(result.NeedsRestart, "NEXUS_OLLAMA_URL")
+	}
+	if v := os.Getenv("NEXUS_FRONTIER_API_KEY"); v != "" && v != prev.FrontierKey {
+		result.NeedsRestart = append(result.NeedsRestart, "NEXUS_FRONTIER_API_KEY")
+	}
+	if v := os.Getenv("NEXUS_METRICS_DB"); v != "" && v != prev.MetricsDBPath {
+		result.NeedsRestart = append(result.NeedsRestart, "NEXUS_METRICS_DB")
+	}
+
+	// Hot-reloadable settings.
+	rateRPM, _ := getEnvInt("NEXUS_RATE_LIMIT_RPM", prev.RateLimitRPM)
+	if rateRPM < 0 {
+		rateRPM = 0
+	}
+	next.RateLimitRPM = rateRPM
+
+	rateBurst, _ := getEnvInt("NEXUS_RATE_LIMIT_BURST", prev.RateLimitBurst)
+	if rateBurst < 0 {
+		rateBurst = 0
+	}
+	next.RateLimitBurst = rateBurst
+
+	next.LogLevel = parseLogLevel(os.Getenv("NEXUS_LOG_LEVEL"))
+	next.LogFormat = parseLogFormat(os.Getenv("NEXUS_LOG_FORMAT"))
+	next.Debug = parseBoolEnv("NEXUS_DEBUG", prev.Debug)
+
+	return next, result
+}
+
 func getEnv(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		return v
@@ -1416,6 +1500,35 @@ func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("config: %s must be a duration (e.g. 8s, 2m): %w", key, err)
 	}
 	return d, nil
+}
+
+// getEnvRegexps parses a comma-separated list of regex patterns and
+// compiles each one. The default is returned when the env var is unset
+// or empty. An invalid pattern causes a fatal error at boot time.
+func getEnvRegexps(key string, defaultPattern string) ([]*regexp.Regexp, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		v = defaultPattern
+	}
+	// Special case: if the env var was explicitly set to empty string,
+	// return empty slice (operator wants to disable this DSL branch).
+	if ok && v == "" {
+		return []*regexp.Regexp{}, nil
+	}
+	patterns := strings.Split(v, ",")
+	result := make([]*regexp.Regexp, 0, len(patterns))
+	for _, p := range patterns {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return nil, fmt.Errorf("config: %s pattern %q is not a valid regex: %w", key, p, err)
+		}
+		result = append(result, re)
+	}
+	return result, nil
 }
 
 // parseBoolEnv maps a string env value to a bool with the supplied

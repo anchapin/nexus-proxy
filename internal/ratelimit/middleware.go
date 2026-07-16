@@ -209,6 +209,33 @@ func (m *Middleware) reap(now time.Time) {
 	}
 }
 
+// SetRPM updates the steady-state requests per minute. A value <= 0
+// disables the limiter (transparent passthrough). Safe to call while
+// the server is running; the new value is used on the next Allow call.
+// Exposed for SIGHUP-based config hot reload (issue #306).
+func (m *Middleware) SetRPM(rpm int) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rpm = rpm
+}
+
+// SetBurst updates the bucket capacity. A value <= 0 leaves the burst
+// unchanged. Safe to call while the server is running. Exposed for
+// SIGHUP-based config hot reload (issue #306).
+func (m *Middleware) SetBurst(burst int) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if burst > 0 {
+		m.burst = burst
+	}
+}
+
 // BucketCount returns the number of tracked client buckets. Exposed for
 // /healthz diagnostics and tests.
 func (m *Middleware) BucketCount() int {
@@ -218,4 +245,30 @@ func (m *Middleware) BucketCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.buckets)
+}
+
+// RPM returns the configured requests-per-minute rate. Returns 0 when
+// the middleware is disabled.
+func (m *Middleware) RPM() int {
+	if m == nil {
+		return 0
+	}
+	return m.rpm
+}
+
+// Burst returns the configured token-bucket burst capacity. Returns 0
+// when the middleware is disabled.
+func (m *Middleware) Burst() int {
+	if m == nil {
+		return 0
+	}
+	return m.burst
+}
+
+// Enabled reports whether rate limiting is active (RPM > 0).
+func (m *Middleware) Enabled() bool {
+	if m == nil {
+		return false
+	}
+	return m.rpm > 0
 }
