@@ -12,6 +12,7 @@ import (
 )
 
 func TestStatusHandler(t *testing.T) {
+	resetAt := time.Now().Add(24 * time.Hour)
 	// Setup a status handler with all deps wired.
 	handler := Status(StatusDeps{
 		JudgeEnabled:    func() bool { return true },
@@ -36,6 +37,19 @@ func TestStatusHandler(t *testing.T) {
 			}
 		},
 		Uptime: func() time.Duration { return 1 * time.Hour },
+		RateLimiterEnabled: func() bool { return true },
+		RateLimiterRPM:     func() int { return 120 },
+		RateLimiterBurst:   func() int { return 30 },
+		BudgetEnabled:         func() bool { return true },
+		BudgetDailyLimitUSD:   func() float64 { return 10.0 },
+		BudgetCurrentSpendUSD: func() float64 { return 2.5 },
+		BudgetResetAt:         func() time.Time { return resetAt },
+		MetricsDBWritable: func() bool { return true },
+		MetricsDBPath:     func() string { return "/var/lib/nexus-proxy/metrics.db" },
+		SLMCacheEnabled:    func() bool { return true },
+		SLMCacheTTLSeconds: func() int { return 30 },
+		ArbiterCacheEnabled:    func() bool { return true },
+		ArbiterCacheTTLSeconds: func() int { return 300 },
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/status", nil)
@@ -47,11 +61,16 @@ func TestStatusHandler(t *testing.T) {
 	}
 
 	var resp struct {
-		Judge   JudgeStatus     `json:"judge"`
-		Quality QualityStatus   `json:"quality"`
-		RAG     RAGStatus       `json:"rag"`
-		Routing RoutingSnapshot `json:"routing"`
-		Uptime  int64           `json:"uptime_ms"`
+		Judge         JudgeStatus        `json:"judge"`
+		Quality       QualityStatus      `json:"quality"`
+		RAG           RAGStatus        `json:"rag"`
+		Routing       RoutingSnapshot    `json:"routing"`
+		Uptime        int64             `json:"uptime_ms"`
+		RateLimiter   RateLimiterStatus `json:"rate_limiter"`
+		Budget        BudgetStatus      `json:"budget"`
+		MetricsDB     MetricsDBStatus   `json:"metrics_db"`
+		SLMCache     SLMCacheStatus   `json:"slm_cache"`
+		ArbiterCache  ArbiterCacheStatus `json:"arbiter_cache"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("json.Unmarshal: %v", err)
@@ -108,6 +127,55 @@ func TestStatusHandler(t *testing.T) {
 	if resp.Uptime != 3600000 {
 		t.Errorf("uptime_ms = %d, want 3600000", resp.Uptime)
 	}
+
+	// Rate limiter assertions
+	if !resp.RateLimiter.Enabled {
+		t.Error("rate_limiter.enabled = false, want true")
+	}
+	if resp.RateLimiter.RPM != 120 {
+		t.Errorf("rate_limiter.rpm = %d, want 120", resp.RateLimiter.RPM)
+	}
+	if resp.RateLimiter.Burst != 30 {
+		t.Errorf("rate_limiter.burst = %d, want 30", resp.RateLimiter.Burst)
+	}
+
+	// Budget assertions
+	if !resp.Budget.Enabled {
+		t.Error("budget.enabled = false, want true")
+	}
+	if resp.Budget.DailyLimitUSD != 10.0 {
+		t.Errorf("budget.daily_limit_usd = %f, want 10.0", resp.Budget.DailyLimitUSD)
+	}
+	if resp.Budget.CurrentSpendUSD != 2.5 {
+		t.Errorf("budget.current_spend_usd = %f, want 2.5", resp.Budget.CurrentSpendUSD)
+	}
+	if resp.Budget.ResetAt.IsZero() {
+		t.Error("budget.reset_at is zero, want non-zero time")
+	}
+
+	// Metrics DB assertions
+	if !resp.MetricsDB.Writable {
+		t.Error("metrics_db.writable = false, want true")
+	}
+	if resp.MetricsDB.Path != "/var/lib/nexus-proxy/metrics.db" {
+		t.Errorf("metrics_db.path = %q, want %q", resp.MetricsDB.Path, "/var/lib/nexus-proxy/metrics.db")
+	}
+
+	// SLM cache assertions
+	if !resp.SLMCache.Enabled {
+		t.Error("slm_cache.enabled = false, want true")
+	}
+	if resp.SLMCache.TTLSeconds != 30 {
+		t.Errorf("slm_cache.ttl_seconds = %d, want 30", resp.SLMCache.TTLSeconds)
+	}
+
+	// Arbiter cache assertions
+	if !resp.ArbiterCache.Enabled {
+		t.Error("arbiter_cache.enabled = false, want true")
+	}
+	if resp.ArbiterCache.TTLSeconds != 300 {
+		t.Errorf("arbiter_cache.ttl_seconds = %d, want 300", resp.ArbiterCache.TTLSeconds)
+	}
 }
 
 func TestStatusHandlerDisabledSubsystems(t *testing.T) {
@@ -128,7 +196,20 @@ func TestStatusHandlerDisabledSubsystems(t *testing.T) {
 		RoutingSnapshot: func() RoutingSnapshot {
 			return RoutingSnapshot{Decisions: nil}
 		},
-		Uptime: func() time.Duration { return 0 },
+		Uptime:               func() time.Duration { return 0 },
+		RateLimiterEnabled:   func() bool { return false },
+		RateLimiterRPM:       func() int { return 0 },
+		RateLimiterBurst:     func() int { return 0 },
+		BudgetEnabled:         func() bool { return false },
+		BudgetDailyLimitUSD:   func() float64 { return 0 },
+		BudgetCurrentSpendUSD: func() float64 { return 0 },
+		BudgetResetAt:         func() time.Time { return time.Time{} },
+		MetricsDBWritable:     func() bool { return false },
+		MetricsDBPath:         func() string { return "" },
+		SLMCacheEnabled:       func() bool { return false },
+		SLMCacheTTLSeconds:    func() int { return 0 },
+		ArbiterCacheEnabled:    func() bool { return false },
+		ArbiterCacheTTLSeconds: func() int { return 0 },
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/status", nil)
@@ -140,10 +221,15 @@ func TestStatusHandlerDisabledSubsystems(t *testing.T) {
 	}
 
 	var resp struct {
-		Judge   JudgeStatus   `json:"judge"`
-		Quality QualityStatus `json:"quality"`
-		RAG     RAGStatus     `json:"rag"`
-		Uptime  int64         `json:"uptime_ms"`
+		Judge         JudgeStatus        `json:"judge"`
+		Quality       QualityStatus      `json:"quality"`
+		RAG           RAGStatus        `json:"rag"`
+		Uptime        int64           `json:"uptime_ms"`
+		RateLimiter   RateLimiterStatus `json:"rate_limiter"`
+		Budget        BudgetStatus     `json:"budget"`
+		MetricsDB     MetricsDBStatus  `json:"metrics_db"`
+		SLMCache     SLMCacheStatus  `json:"slm_cache"`
+		ArbiterCache  ArbiterCacheStatus `json:"arbiter_cache"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("json.Unmarshal: %v", err)
@@ -164,6 +250,34 @@ func TestStatusHandlerDisabledSubsystems(t *testing.T) {
 	if resp.RAG.IndexedExamples != 0 {
 		t.Errorf("rag.indexed_examples = %d, want 0", resp.RAG.IndexedExamples)
 	}
+
+	// Rate limiter assertions
+	if resp.RateLimiter.Enabled {
+		t.Error("rate_limiter.enabled = true, want false")
+	}
+	if resp.RateLimiter.RPM != 0 {
+		t.Errorf("rate_limiter.rpm = %d, want 0", resp.RateLimiter.RPM)
+	}
+
+	// Budget assertions
+	if resp.Budget.Enabled {
+		t.Error("budget.enabled = true, want false")
+	}
+
+	// Metrics DB assertions
+	if resp.MetricsDB.Writable {
+		t.Error("metrics_db.writable = true, want false")
+	}
+
+	// SLM cache assertions
+	if resp.SLMCache.Enabled {
+		t.Error("slm_cache.enabled = true, want false")
+	}
+
+	// Arbiter cache assertions
+	if resp.ArbiterCache.Enabled {
+		t.Error("arbiter_cache.enabled = true, want false")
+	}
 }
 
 func TestStatusHandlerContentType(t *testing.T) {
@@ -180,6 +294,19 @@ func TestStatusHandlerContentType(t *testing.T) {
 		RAGIndexedExamples: func() int { return 0 },
 		RoutingSnapshot:    func() RoutingSnapshot { return RoutingSnapshot{} },
 		Uptime:             func() time.Duration { return 0 },
+		RateLimiterEnabled: func() bool { return false },
+		RateLimiterRPM:     func() int { return 0 },
+		RateLimiterBurst:   func() int { return 0 },
+		BudgetEnabled:         func() bool { return false },
+		BudgetDailyLimitUSD:   func() float64 { return 0 },
+		BudgetCurrentSpendUSD: func() float64 { return 0 },
+		BudgetResetAt:         func() time.Time { return time.Time{} },
+		MetricsDBWritable:     func() bool { return false },
+		MetricsDBPath:         func() string { return "" },
+		SLMCacheEnabled:       func() bool { return false },
+		SLMCacheTTLSeconds:    func() int { return 0 },
+		ArbiterCacheEnabled:    func() bool { return false },
+		ArbiterCacheTTLSeconds: func() int { return 0 },
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/status", nil)
@@ -195,18 +322,31 @@ func TestStatusHandlerContentType(t *testing.T) {
 func TestStatusHandlerNilFunctions(t *testing.T) {
 	// Verify that nil function fields don't panic.
 	handler := Status(StatusDeps{
-		JudgeEnabled:       nil,
-		JudgeDepth:         nil,
-		JudgeCapacity:      nil,
-		JudgeWorkers:       nil,
-		QualityEnabled:     nil,
-		QualityDepth:       nil,
-		QualityCapacity:    nil,
-		QualityWorkers:     nil,
-		RAGHealthy:         nil,
-		RAGIndexedExamples: nil,
-		RoutingSnapshot:    nil,
-		Uptime:             nil,
+		JudgeEnabled:           nil,
+		JudgeDepth:             nil,
+		JudgeCapacity:          nil,
+		JudgeWorkers:           nil,
+		QualityEnabled:         nil,
+		QualityDepth:           nil,
+		QualityCapacity:        nil,
+		QualityWorkers:         nil,
+		RAGHealthy:             nil,
+		RAGIndexedExamples:     nil,
+		RoutingSnapshot:        nil,
+		Uptime:                 nil,
+		RateLimiterEnabled:     nil,
+		RateLimiterRPM:         nil,
+		RateLimiterBurst:       nil,
+		BudgetEnabled:          nil,
+		BudgetDailyLimitUSD:    nil,
+		BudgetCurrentSpendUSD:  nil,
+		BudgetResetAt:          nil,
+		MetricsDBWritable:      nil,
+		MetricsDBPath:          nil,
+		SLMCacheEnabled:        nil,
+		SLMCacheTTLSeconds:     nil,
+		ArbiterCacheEnabled:    nil,
+		ArbiterCacheTTLSeconds: nil,
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/status", nil)
@@ -221,10 +361,15 @@ func TestStatusHandlerNilFunctions(t *testing.T) {
 
 	// Verify all zero values.
 	var resp struct {
-		Judge   JudgeStatus   `json:"judge"`
-		Quality QualityStatus `json:"quality"`
-		RAG     RAGStatus     `json:"rag"`
-		Uptime  int64         `json:"uptime_ms"`
+		Judge         JudgeStatus        `json:"judge"`
+		Quality       QualityStatus      `json:"quality"`
+		RAG           RAGStatus        `json:"rag"`
+		Uptime        int64           `json:"uptime_ms"`
+		RateLimiter   RateLimiterStatus `json:"rate_limiter"`
+		Budget        BudgetStatus     `json:"budget"`
+		MetricsDB     MetricsDBStatus  `json:"metrics_db"`
+		SLMCache     SLMCacheStatus  `json:"slm_cache"`
+		ArbiterCache  ArbiterCacheStatus `json:"arbiter_cache"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("json.Unmarshal: %v", err)

@@ -669,7 +669,7 @@ func main() {
 	// nil means caching is disabled.
 	var arbiterCache *upstream.ArbiterCache
 	if cfg.ArbiterCacheTTL > 0 {
-		arbiterCache = upstream.NewArbiterCache()
+		arbiterCache = upstream.NewArbiterCache(cfg.ArbiterCacheTTL)
 		slog.Info("fusion arbiter cache enabled",
 			slog.Duration("ttl", cfg.ArbiterCacheTTL),
 		)
@@ -804,6 +804,65 @@ func main() {
 			return handlers.RoutingSnapshot{Decisions: snap}
 		},
 		Uptime: func() time.Duration { return time.Since(startTime) },
+		RateLimiterEnabled: func() bool { return rateLimiter != nil && rateLimiter.Enabled() },
+		RateLimiterRPM:     func() int { return rateLimiter.RPM() },
+		RateLimiterBurst:   func() int { return rateLimiter.Burst() },
+		BudgetEnabled: func() bool {
+			if budgetGuard == nil {
+				return false
+			}
+			return budgetGuard.Limit() > 0
+		},
+		BudgetDailyLimitUSD: func() float64 {
+			if budgetGuard == nil {
+				return 0
+			}
+			return budgetGuard.Limit()
+		},
+		BudgetCurrentSpendUSD: func() float64 {
+			if budgetGuard == nil {
+				return 0
+			}
+			return budgetGuard.State().Spent
+		},
+		BudgetResetAt: func() time.Time {
+			if budgetGuard == nil {
+				return time.Time{}
+			}
+			return budgetGuard.State().NextReset
+		},
+		MetricsDBWritable: func() bool {
+			if metricsStore == nil {
+				return false
+			}
+			if ss, ok := metricsStore.(*metrics.SQLiteStore); ok {
+				return ss.Writable()
+			}
+			return false
+		},
+		MetricsDBPath: func() string {
+			if metricsStore == nil {
+				return ""
+			}
+			if ss, ok := metricsStore.(*metrics.SQLiteStore); ok {
+				return ss.Path()
+			}
+			return ""
+		},
+		SLMCacheEnabled: func() bool { return slmCache != nil && slmCache.Enabled() },
+		SLMCacheTTLSeconds: func() int {
+			if slmCache == nil {
+				return 0
+			}
+			return slmCache.TTLSeconds()
+		},
+		ArbiterCacheEnabled: func() bool { return arbiterCache != nil && arbiterCache.Enabled() },
+		ArbiterCacheTTLSeconds: func() int {
+			if arbiterCache == nil {
+				return 0
+			}
+			return arbiterCache.TTLSeconds()
+		},
 	}))
 	slog.Info("status endpoint serves async subsystem diagnostics")
 
