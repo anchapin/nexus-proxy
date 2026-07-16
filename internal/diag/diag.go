@@ -785,7 +785,7 @@ func checkMiddlewareChainFn(cfg config.Config) Check {
 	// has the canonical set available. This mirrors what main.go does
 	// before building the chain.
 	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.PromptInjectionIsolated())
-	if _, err := middleware.BuildChain(cfg.MiddlewareChain); err != nil {
+	if _, err := middleware.BuildChain(cfg.MiddlewareChain, middleware.MiddlewareConfig{}); err != nil {
 		return Check{
 			Name:   checkMiddlewareChain,
 			Status: StatusFail,

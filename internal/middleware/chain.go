@@ -88,12 +88,37 @@ func NewRAGMiddleware(store rag.RAGStore, threshold float64) ContextMiddleware {
 
 // Named middleware registry. Built-in transforms are registered at
 // package init; operators can override individual entries with
-// Register or override the entire chain via NEXUS_MIDDLEWARE_CHAIN.
+// Register or RegisterFactory.
 var registry = make(map[string]Middleware)
 
 // registeredContext is the set of names that are ContextMiddleware.
 // Used by BuildChain to return the correct interface type.
 var registeredContext = make(map[string]bool)
+
+// MiddlewareConfig holds the dependencies needed to construct middleware
+// via a factory function (issue #370). Factories receive this at
+// construction time so they can embed runtime dependencies (e.g. RAG store).
+type MiddlewareConfig struct {
+	// RAG store for the rag middleware.
+	RAGStore rag.RAGStore
+	// Meta prompt string for promptEngineering.
+	MetaPrompt string
+	// TOON notice string for appendSystemNote.
+	TOONNotice string
+	// Whether to use isolated (off) mode for prompt injection.
+	Isolated bool
+	// RAG similarity threshold.
+	RAGThreshold float64
+}
+
+// MiddlewareFactory creates a Middleware instance from the given config.
+// Registered via RegisterFactory to allow operator-extensible middleware
+// that need constructor-time dependencies.
+type MiddlewareFactory func(cfg MiddlewareConfig) Middleware
+
+// factoryRegistry maps middleware name to its factory.
+// When BuildChain finds a factory it calls it to construct the instance.
+var factoryRegistry = make(map[string]MiddlewareFactory)
 
 // Register adds m to the global registry under m.Name(). Registering
 // the same name twice panics. If m also implements ContextMiddleware,
@@ -106,6 +131,21 @@ func Register(m Middleware) {
 	if _, ok := m.(ContextMiddleware); ok {
 		registeredContext[m.Name()] = true
 	}
+}
+
+// RegisterFactory registers factory as the constructor for the named
+// middleware. When BuildChain is called, if a factory is registered
+// for a name it is called to produce the instance (otherwise the
+// pre-constructed instance in the registry is used). Panics if name
+// is already registered as a factory or an instance.
+func RegisterFactory(name string, factory MiddlewareFactory) {
+	if _, ok := registry[name]; ok {
+		panic("middleware: name already registered as instance: " + name)
+	}
+	if _, ok := factoryRegistry[name]; ok {
+		panic("middleware: factory already registered: " + name)
+	}
+	factoryRegistry[name] = factory
 }
 
 // Get returns the registered middleware with the given name, or nil if
@@ -123,15 +163,23 @@ func IsContextAware(name string) bool {
 // ordered Middleware slice. Unknown names cause an error. Empty spec
 // returns the default chain. The default chain is
 // "promptEngineering,rag,compressJSONBlocks,appendSystemNote".
-func BuildChain(chainSpec string) ([]Middleware, error) {
+//
+// When a factory is registered for a name (via RegisterFactory), BuildChain
+// calls it with cfg to construct the instance. This allows middleware with
+// constructor-time dependencies (e.g. rag store) to be built via the registry.
+func BuildChain(chainSpec string, cfg MiddlewareConfig) ([]Middleware, error) {
 	if chainSpec == "" {
-		return DefaultChain(), nil
+		return DefaultChain(cfg), nil
 	}
 	names := strings.Split(chainSpec, ",")
 	out := make([]Middleware, 0, len(names))
 	for _, n := range names {
 		n = strings.TrimSpace(n)
 		if n == "" {
+			continue
+		}
+		if factory, ok := factoryRegistry[n]; ok {
+			out = append(out, factory(cfg))
 			continue
 		}
 		m := registry[n]
@@ -147,14 +195,19 @@ func BuildChain(chainSpec string) ([]Middleware, error) {
 }
 
 // DefaultChain returns the default middleware chain: promptEngineering,
-// rag, compressJSONBlocks, appendSystemNote.
-func DefaultChain() []Middleware {
-	return []Middleware{
-		registry["promptEngineering"],
-		registry["rag"],
-		registry["compressJSONBlocks"],
-		registry["appendSystemNote"],
+// rag, compressJSONBlocks, appendSystemNote. Uses cfg to construct any
+// registered factories; falls back to pre-constructed instances.
+func DefaultChain(cfg MiddlewareConfig) []Middleware {
+	chain := []string{"promptEngineering", "rag", "compressJSONBlocks", "appendSystemNote"}
+	out := make([]Middleware, 0, len(chain))
+	for _, n := range chain {
+		if factory, ok := factoryRegistry[n]; ok {
+			out = append(out, factory(cfg))
+		} else {
+			out = append(out, registry[n])
+		}
 	}
+	return out
 }
 
 // Init registers the four built-in transforms under their canonical

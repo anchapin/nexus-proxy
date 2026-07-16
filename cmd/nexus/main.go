@@ -624,7 +624,13 @@ func main() {
 	var mwChain []middleware.Middleware
 	if cfg.MiddlewareChain != "" {
 		var err error
-		mwChain, err = middleware.BuildChain(cfg.MiddlewareChain)
+		mwChain, err = middleware.BuildChain(cfg.MiddlewareChain, middleware.MiddlewareConfig{
+			RAGStore:     store,
+			MetaPrompt:   cfg.MetaPrompt,
+			TOONNotice:   cfg.TOONNotice,
+			Isolated:     cfg.PromptInjectionIsolated(),
+			RAGThreshold: cfg.RAGThreshold,
+		})
 		if err != nil {
 			log.Fatalf("middleware chain: %v", err)
 		}

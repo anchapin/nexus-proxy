@@ -810,36 +810,143 @@ func (c *CohereEmbedder) IsBreakerOpen() bool { return false }
 // RecordBreakerSuccess is a no-op for CohereEmbedder (issue #304).
 func (c *CohereEmbedder) RecordBreakerSuccess() {}
 
+// AzureAIEmbedder calls the Azure OpenAI /v1/embeddings endpoint.
+// Unlike the OpenAI embedder, Azure uses an api-key header and a
+// deployment-name URL path. The baseURL should be the Azure OpenAI
+// endpoint (e.g. "https://my-resource.openai.azure.com/openai"),
+// and model is the deployment name.
+type AzureAIEmbedder struct {
+	BaseURL string // e.g. "https://my-resource.openai.azure.com/openai"
+	Model   string // deployment name, e.g. "text-embedding-3-small"
+	APIKey  string
+	Client  *http.Client
+	Version string // API version, e.g. "2024-02-1"
+}
+
+// NewAzureAIEmbedder returns an embedder wired to Azure OpenAI embeddings.
+func NewAzureAIEmbedder(baseURL, model, apiKey string, client *http.Client) *AzureAIEmbedder {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	version := "2024-02-1"
+	return &AzureAIEmbedder{BaseURL: baseURL, Model: model, APIKey: apiKey, Client: client, Version: version}
+}
+
+// Embed fetches the embedding vector via the Azure OpenAI /embeddings endpoint.
+func (a *AzureAIEmbedder) Embed(ctx context.Context, text string) ([]float64, error) {
+	payload, _ := json.Marshal(map[string]any{
+		"model": a.Model,
+		"input": text,
+	})
+	// Azure URL: {baseURL}/deployments/{model}/embeddings?api-version={version}
+	url := fmt.Sprintf("%s/deployments/%s/embeddings?api-version=%s", strings.TrimSuffix(a.BaseURL, "/"), a.Model, a.Version)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("api-key", a.APIKey)
+	resp, err := a.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("azureai embed %s: status %d: %s", a.Model, resp.StatusCode, body)
+	}
+	var raw struct {
+		Data []struct {
+			Embedding []float64 `json:"embedding"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("azureai embed: decode: %w", err)
+	}
+	if len(raw.Data) == 0 || len(raw.Data[0].Embedding) == 0 {
+		return nil, fmt.Errorf("azureai embed: empty embedding for model %s", a.Model)
+	}
+	return raw.Data[0].Embedding, nil
+}
+
+func (a *AzureAIEmbedder) IsHealthy(ctx context.Context) bool {
+	_, err := a.Embed(ctx, "health")
+	return err == nil
+}
+
+// IsBreakerOpen returns false for AzureAIEmbedder (no circuit breaker, issue #304).
+func (a *AzureAIEmbedder) IsBreakerOpen() bool { return false }
+
+// RecordBreakerSuccess is a no-op for AzureAIEmbedder (issue #304).
+func (a *AzureAIEmbedder) RecordBreakerSuccess() {}
+
 // EmbedderType is the discriminator for the embedder factory.
 type EmbedderType string
 
 const (
-	EmbedderTypeOllama EmbedderType = "ollama"
-	EmbedderTypeOpenAI EmbedderType = "openai"
-	EmbedderTypeCohere EmbedderType = "cohere"
+	EmbedderTypeOllama  EmbedderType = "ollama"
+	EmbedderTypeOpenAI  EmbedderType = "openai"
+	EmbedderTypeCohere  EmbedderType = "cohere"
+	EmbedderTypeAzureAI EmbedderType = "azure" // issue #370
 )
+
+// EmbedderFactory creates an Embedder from configuration fields.
+// Registered via RegisterEmbedder to allow operator-extensible embedder types.
+type EmbedderFactory func(baseURL, model, apiKey string, client *http.Client, breakerConfig BreakerConfig) (Embedder, error)
+
+// embedderRegistry maps EmbedderType to its factory function.
+// Built-in types are registered at package init; operators can add custom
+// embedders by calling RegisterEmbedder before the proxy boots.
+var embedderRegistry = make(map[EmbedderType]EmbedderFactory)
+
+// RegisterEmbedder registers factory as the constructor for embedder type t.
+// Calling RegisterEmbedder for an already-registered type panics.
+func RegisterEmbedder(t EmbedderType, factory EmbedderFactory) {
+	if _, ok := embedderRegistry[t]; ok {
+		panic("rag: embedder type already registered: " + t)
+	}
+	embedderRegistry[t] = factory
+}
+
+func init() {
+	RegisterEmbedder(EmbedderTypeOllama, func(baseURL, model, apiKey string, client *http.Client, breakerConfig BreakerConfig) (Embedder, error) {
+		return NewOllamaEmbedder(baseURL, model, client, breakerConfig), nil
+	})
+	RegisterEmbedder(EmbedderTypeOpenAI, func(baseURL, model, apiKey string, client *http.Client, _ BreakerConfig) (Embedder, error) {
+		if apiKey == "" {
+			return nil, fmt.Errorf("rag: NEXUS_EMBEDDER_TYPE=openai requires NEXUS_FRONTIER_API_KEY")
+		}
+		return NewOpenAIEmbedder(baseURL, model, apiKey, client), nil
+	})
+	RegisterEmbedder(EmbedderTypeCohere, func(baseURL, model, apiKey string, client *http.Client, _ BreakerConfig) (Embedder, error) {
+		if apiKey == "" {
+			return nil, fmt.Errorf("rag: NEXUS_EMBEDDER_TYPE=cohere requires NEXUS_COHERE_API_KEY")
+		}
+		return NewCohereEmbedder(baseURL, model, apiKey, client), nil
+	})
+	RegisterEmbedder(EmbedderTypeAzureAI, func(baseURL, model, apiKey string, client *http.Client, _ BreakerConfig) (Embedder, error) {
+		if apiKey == "" {
+			return nil, fmt.Errorf("rag: NEXUS_EMBEDDER_TYPE=azure requires NEXUS_AZURE_OPENAI_API_KEY")
+		}
+		return NewAzureAIEmbedder(baseURL, model, apiKey, client), nil
+	})
+}
 
 // NewEmbedder constructs an Embedder from the given config fields.
 // The returned Embedder must be wrapped with NewCachedEmbedder by the
 // caller when the cache is desired (as in main.go).
 // The breakerConfig is only used for the Ollama embedder.
+// Uses the embedder registry; falls back to Ollama for unknown types.
 func NewEmbedder(embedderType EmbedderType, baseURL, model, apiKey string, client *http.Client, breakerConfig BreakerConfig) (Embedder, error) {
-	switch embedderType {
-	case EmbedderTypeOpenAI:
-		if apiKey == "" {
-			return nil, fmt.Errorf("rag: NEXUS_EMBEDDER_TYPE=openai requires NEXUS_FRONTIER_API_KEY to be set")
-		}
-		return NewOpenAIEmbedder(baseURL, model, apiKey, client), nil
-	case EmbedderTypeCohere:
-		if apiKey == "" {
-			return nil, fmt.Errorf("rag: NEXUS_EMBEDDER_TYPE=cohere requires NEXUS_COHERE_API_KEY to be set")
-		}
-		return NewCohereEmbedder(baseURL, model, apiKey, client), nil
-	case EmbedderTypeOllama:
-		fallthrough
-	default:
-		return NewOllamaEmbedder(baseURL, model, client, breakerConfig), nil
+	factory, ok := embedderRegistry[embedderType]
+	if !ok {
+		// Unknown type — default to Ollama (safe fallback).
+		factory = embedderRegistry[EmbedderTypeOllama]
 	}
+	return factory(baseURL, model, apiKey, client, breakerConfig)
 }
 
 // isOpen reports whether the circuit breaker is currently in the open
