@@ -733,7 +733,7 @@ func main() {
 		RAGObserver:             ragObserver,
 		CascadeFallbackObserver: cascadeFallbackObs,
 		ArbiterCacheObserver:    arbiterCacheObserver,
-		PanelPanicObserver:       panelPanicObs,
+		PanelPanicObserver:      panelPanicObs,
 		ArbiterCache:            arbiterCache,
 		Providers:               providerRegistry,
 	})
@@ -803,7 +803,7 @@ func main() {
 			snap := routeCounters.Snapshot()
 			return handlers.RoutingSnapshot{Decisions: snap}
 		},
-		Uptime: func() time.Duration { return time.Since(startTime) },
+		Uptime:             func() time.Duration { return time.Since(startTime) },
 		RateLimiterEnabled: func() bool { return rateLimiter != nil && rateLimiter.Enabled() },
 		RateLimiterRPM:     func() int { return rateLimiter.RPM() },
 		RateLimiterBurst:   func() int { return rateLimiter.Burst() },

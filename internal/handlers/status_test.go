@@ -36,18 +36,18 @@ func TestStatusHandler(t *testing.T) {
 				},
 			}
 		},
-		Uptime: func() time.Duration { return 1 * time.Hour },
-		RateLimiterEnabled: func() bool { return true },
-		RateLimiterRPM:     func() int { return 120 },
-		RateLimiterBurst:   func() int { return 30 },
-		BudgetEnabled:         func() bool { return true },
-		BudgetDailyLimitUSD:   func() float64 { return 10.0 },
-		BudgetCurrentSpendUSD: func() float64 { return 2.5 },
-		BudgetResetAt:         func() time.Time { return resetAt },
-		MetricsDBWritable: func() bool { return true },
-		MetricsDBPath:     func() string { return "/var/lib/nexus-proxy/metrics.db" },
-		SLMCacheEnabled:    func() bool { return true },
-		SLMCacheTTLSeconds: func() int { return 30 },
+		Uptime:                 func() time.Duration { return 1 * time.Hour },
+		RateLimiterEnabled:     func() bool { return true },
+		RateLimiterRPM:         func() int { return 120 },
+		RateLimiterBurst:       func() int { return 30 },
+		BudgetEnabled:          func() bool { return true },
+		BudgetDailyLimitUSD:    func() float64 { return 10.0 },
+		BudgetCurrentSpendUSD:  func() float64 { return 2.5 },
+		BudgetResetAt:          func() time.Time { return resetAt },
+		MetricsDBWritable:      func() bool { return true },
+		MetricsDBPath:          func() string { return "/var/lib/nexus-proxy/metrics.db" },
+		SLMCacheEnabled:        func() bool { return true },
+		SLMCacheTTLSeconds:     func() int { return 30 },
 		ArbiterCacheEnabled:    func() bool { return true },
 		ArbiterCacheTTLSeconds: func() int { return 300 },
 	})
@@ -61,16 +61,16 @@ func TestStatusHandler(t *testing.T) {
 	}
 
 	var resp struct {
-		Judge         JudgeStatus        `json:"judge"`
-		Quality       QualityStatus      `json:"quality"`
-		RAG           RAGStatus        `json:"rag"`
-		Routing       RoutingSnapshot    `json:"routing"`
-		Uptime        int64             `json:"uptime_ms"`
-		RateLimiter   RateLimiterStatus `json:"rate_limiter"`
-		Budget        BudgetStatus      `json:"budget"`
-		MetricsDB     MetricsDBStatus   `json:"metrics_db"`
-		SLMCache     SLMCacheStatus   `json:"slm_cache"`
-		ArbiterCache  ArbiterCacheStatus `json:"arbiter_cache"`
+		Judge        JudgeStatus        `json:"judge"`
+		Quality      QualityStatus      `json:"quality"`
+		RAG          RAGStatus          `json:"rag"`
+		Routing      RoutingSnapshot    `json:"routing"`
+		Uptime       int64              `json:"uptime_ms"`
+		RateLimiter  RateLimiterStatus  `json:"rate_limiter"`
+		Budget       BudgetStatus       `json:"budget"`
+		MetricsDB    MetricsDBStatus    `json:"metrics_db"`
+		SLMCache     SLMCacheStatus     `json:"slm_cache"`
+		ArbiterCache ArbiterCacheStatus `json:"arbiter_cache"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("json.Unmarshal: %v", err)
@@ -196,18 +196,18 @@ func TestStatusHandlerDisabledSubsystems(t *testing.T) {
 		RoutingSnapshot: func() RoutingSnapshot {
 			return RoutingSnapshot{Decisions: nil}
 		},
-		Uptime:               func() time.Duration { return 0 },
-		RateLimiterEnabled:   func() bool { return false },
-		RateLimiterRPM:       func() int { return 0 },
-		RateLimiterBurst:     func() int { return 0 },
-		BudgetEnabled:         func() bool { return false },
-		BudgetDailyLimitUSD:   func() float64 { return 0 },
-		BudgetCurrentSpendUSD: func() float64 { return 0 },
-		BudgetResetAt:         func() time.Time { return time.Time{} },
-		MetricsDBWritable:     func() bool { return false },
-		MetricsDBPath:         func() string { return "" },
-		SLMCacheEnabled:       func() bool { return false },
-		SLMCacheTTLSeconds:    func() int { return 0 },
+		Uptime:                 func() time.Duration { return 0 },
+		RateLimiterEnabled:     func() bool { return false },
+		RateLimiterRPM:         func() int { return 0 },
+		RateLimiterBurst:       func() int { return 0 },
+		BudgetEnabled:          func() bool { return false },
+		BudgetDailyLimitUSD:    func() float64 { return 0 },
+		BudgetCurrentSpendUSD:  func() float64 { return 0 },
+		BudgetResetAt:          func() time.Time { return time.Time{} },
+		MetricsDBWritable:      func() bool { return false },
+		MetricsDBPath:          func() string { return "" },
+		SLMCacheEnabled:        func() bool { return false },
+		SLMCacheTTLSeconds:     func() int { return 0 },
 		ArbiterCacheEnabled:    func() bool { return false },
 		ArbiterCacheTTLSeconds: func() int { return 0 },
 	})
@@ -221,15 +221,15 @@ func TestStatusHandlerDisabledSubsystems(t *testing.T) {
 	}
 
 	var resp struct {
-		Judge         JudgeStatus        `json:"judge"`
-		Quality       QualityStatus      `json:"quality"`
-		RAG           RAGStatus        `json:"rag"`
-		Uptime        int64           `json:"uptime_ms"`
-		RateLimiter   RateLimiterStatus `json:"rate_limiter"`
-		Budget        BudgetStatus     `json:"budget"`
-		MetricsDB     MetricsDBStatus  `json:"metrics_db"`
-		SLMCache     SLMCacheStatus  `json:"slm_cache"`
-		ArbiterCache  ArbiterCacheStatus `json:"arbiter_cache"`
+		Judge        JudgeStatus        `json:"judge"`
+		Quality      QualityStatus      `json:"quality"`
+		RAG          RAGStatus          `json:"rag"`
+		Uptime       int64              `json:"uptime_ms"`
+		RateLimiter  RateLimiterStatus  `json:"rate_limiter"`
+		Budget       BudgetStatus       `json:"budget"`
+		MetricsDB    MetricsDBStatus    `json:"metrics_db"`
+		SLMCache     SLMCacheStatus     `json:"slm_cache"`
+		ArbiterCache ArbiterCacheStatus `json:"arbiter_cache"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("json.Unmarshal: %v", err)
@@ -282,29 +282,29 @@ func TestStatusHandlerDisabledSubsystems(t *testing.T) {
 
 func TestStatusHandlerContentType(t *testing.T) {
 	handler := Status(StatusDeps{
-		JudgeEnabled:       func() bool { return false },
-		JudgeDepth:         func() int { return 0 },
-		JudgeCapacity:      func() int { return 0 },
-		JudgeWorkers:       func() int { return 0 },
-		QualityEnabled:     func() bool { return false },
-		QualityDepth:       func() int { return 0 },
-		QualityCapacity:    func() int { return 0 },
-		QualityWorkers:     func() int { return 0 },
-		RAGHealthy:         func(ctx context.Context) bool { return false },
-		RAGIndexedExamples: func() int { return 0 },
-		RoutingSnapshot:    func() RoutingSnapshot { return RoutingSnapshot{} },
-		Uptime:             func() time.Duration { return 0 },
-		RateLimiterEnabled: func() bool { return false },
-		RateLimiterRPM:     func() int { return 0 },
-		RateLimiterBurst:   func() int { return 0 },
-		BudgetEnabled:         func() bool { return false },
-		BudgetDailyLimitUSD:   func() float64 { return 0 },
-		BudgetCurrentSpendUSD: func() float64 { return 0 },
-		BudgetResetAt:         func() time.Time { return time.Time{} },
-		MetricsDBWritable:     func() bool { return false },
-		MetricsDBPath:         func() string { return "" },
-		SLMCacheEnabled:       func() bool { return false },
-		SLMCacheTTLSeconds:    func() int { return 0 },
+		JudgeEnabled:           func() bool { return false },
+		JudgeDepth:             func() int { return 0 },
+		JudgeCapacity:          func() int { return 0 },
+		JudgeWorkers:           func() int { return 0 },
+		QualityEnabled:         func() bool { return false },
+		QualityDepth:           func() int { return 0 },
+		QualityCapacity:        func() int { return 0 },
+		QualityWorkers:         func() int { return 0 },
+		RAGHealthy:             func(ctx context.Context) bool { return false },
+		RAGIndexedExamples:     func() int { return 0 },
+		RoutingSnapshot:        func() RoutingSnapshot { return RoutingSnapshot{} },
+		Uptime:                 func() time.Duration { return 0 },
+		RateLimiterEnabled:     func() bool { return false },
+		RateLimiterRPM:         func() int { return 0 },
+		RateLimiterBurst:       func() int { return 0 },
+		BudgetEnabled:          func() bool { return false },
+		BudgetDailyLimitUSD:    func() float64 { return 0 },
+		BudgetCurrentSpendUSD:  func() float64 { return 0 },
+		BudgetResetAt:          func() time.Time { return time.Time{} },
+		MetricsDBWritable:      func() bool { return false },
+		MetricsDBPath:          func() string { return "" },
+		SLMCacheEnabled:        func() bool { return false },
+		SLMCacheTTLSeconds:     func() int { return 0 },
 		ArbiterCacheEnabled:    func() bool { return false },
 		ArbiterCacheTTLSeconds: func() int { return 0 },
 	})
@@ -361,15 +361,15 @@ func TestStatusHandlerNilFunctions(t *testing.T) {
 
 	// Verify all zero values.
 	var resp struct {
-		Judge         JudgeStatus        `json:"judge"`
-		Quality       QualityStatus      `json:"quality"`
-		RAG           RAGStatus        `json:"rag"`
-		Uptime        int64           `json:"uptime_ms"`
-		RateLimiter   RateLimiterStatus `json:"rate_limiter"`
-		Budget        BudgetStatus     `json:"budget"`
-		MetricsDB     MetricsDBStatus  `json:"metrics_db"`
-		SLMCache     SLMCacheStatus  `json:"slm_cache"`
-		ArbiterCache  ArbiterCacheStatus `json:"arbiter_cache"`
+		Judge        JudgeStatus        `json:"judge"`
+		Quality      QualityStatus      `json:"quality"`
+		RAG          RAGStatus          `json:"rag"`
+		Uptime       int64              `json:"uptime_ms"`
+		RateLimiter  RateLimiterStatus  `json:"rate_limiter"`
+		Budget       BudgetStatus       `json:"budget"`
+		MetricsDB    MetricsDBStatus    `json:"metrics_db"`
+		SLMCache     SLMCacheStatus     `json:"slm_cache"`
+		ArbiterCache ArbiterCacheStatus `json:"arbiter_cache"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("json.Unmarshal: %v", err)

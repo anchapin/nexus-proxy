@@ -46,9 +46,9 @@ type RateLimiterStatus struct {
 
 // BudgetStatus reports the rolling 24h spend guard state.
 type BudgetStatus struct {
-	Enabled          bool      `json:"enabled"`
-	DailyLimitUSD    float64   `json:"daily_limit_usd"`
-	CurrentSpendUSD  float64   `json:"current_spend_usd"`
+	Enabled         bool      `json:"enabled"`
+	DailyLimitUSD   float64   `json:"daily_limit_usd"`
+	CurrentSpendUSD float64   `json:"current_spend_usd"`
 	ResetAt         time.Time `json:"reset_at"`
 }
 
@@ -60,8 +60,8 @@ type MetricsDBStatus struct {
 
 // SLMCacheStatus reports the SLM routing decision cache state.
 type SLMCacheStatus struct {
-	Enabled     bool `json:"enabled"`
-	TTLSeconds  int  `json:"ttl_seconds"`
+	Enabled    bool `json:"enabled"`
+	TTLSeconds int  `json:"ttl_seconds"`
 }
 
 // ArbiterCacheStatus reports the fusion arbiter synthesis cache state.
@@ -154,16 +154,16 @@ func Status(d StatusDeps) http.Handler {
 		}
 
 		resp := struct {
-			Judge         JudgeStatus        `json:"judge"`
-			Quality       QualityStatus      `json:"quality"`
-			RAG           RAGStatus          `json:"rag"`
-			Routing       RoutingSnapshot    `json:"routing"`
-			Uptime        int64              `json:"uptime_ms"`
-			RateLimiter   RateLimiterStatus  `json:"rate_limiter"`
-			Budget        BudgetStatus       `json:"budget"`
-			MetricsDB     MetricsDBStatus    `json:"metrics_db"`
-			SLMCache      SLMCacheStatus     `json:"slm_cache"`
-			ArbiterCache  ArbiterCacheStatus `json:"arbiter_cache"`
+			Judge        JudgeStatus        `json:"judge"`
+			Quality      QualityStatus      `json:"quality"`
+			RAG          RAGStatus          `json:"rag"`
+			Routing      RoutingSnapshot    `json:"routing"`
+			Uptime       int64              `json:"uptime_ms"`
+			RateLimiter  RateLimiterStatus  `json:"rate_limiter"`
+			Budget       BudgetStatus       `json:"budget"`
+			MetricsDB    MetricsDBStatus    `json:"metrics_db"`
+			SLMCache     SLMCacheStatus     `json:"slm_cache"`
+			ArbiterCache ArbiterCacheStatus `json:"arbiter_cache"`
 		}{
 			Judge: JudgeStatus{
 				Enabled:  d.JudgeEnabled != nil && d.JudgeEnabled(),
