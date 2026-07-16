@@ -138,7 +138,12 @@ func ShouldRetry(statusCode int, err error) bool {
 //
 // Validation happens before any byte is sent to the client, so the harness
 // never sees a malformed response (issue requirement).
-func (c *Cascade) Run(w http.ResponseWriter, client Client, payload map[string]interface{}) (CascadeResult, error) {
+//
+// The ctx parameter is the request context (typically r.Context() from the
+// HTTP handler). When the client disconnects, ctx is cancelled and the
+// in-flight upstream call is cancelled within 1 second rather than waiting
+// for the full timeout (issue #297).
+func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client, payload map[string]interface{}) (CascadeResult, error) {
 	if len(c.Steps) == 0 {
 		return CascadeResult{}, errors.New("cascade: no steps configured")
 	}
@@ -153,7 +158,7 @@ func (c *Cascade) Run(w http.ResponseWriter, client Client, payload map[string]i
 		res.Attempts = i + 1
 		res.RouteAttempted = joinStepNames(c.Steps[:i+1])
 
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(ctx, timeout)
 		msg, servedModel, err := fetchCascadeStep(ctx, client, step, payload)
 		cancel()
 		if err == nil {

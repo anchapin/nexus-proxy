@@ -1318,6 +1318,7 @@ func Chat(d Deps) http.Handler {
 			if streaming && d.Config.FusionProgressiveDelivery {
 				var outcome upstream.PanelOutcome
 				outcome, upErr = upstream.PanelStreaming(
+					r.Context(),
 					obs, d.Client,
 					d.Config.OllamaURL, d.Config.LocalModel,
 					d.Config.FrontierURL, d.Config.FrontierModel,
@@ -1351,6 +1352,7 @@ func Chat(d Deps) http.Handler {
 			} else {
 				var cacheHit bool
 				cacheHit, upErr = upstream.Panel(
+					r.Context(),
 					obs, d.Client,
 					d.Config.OllamaURL, d.Config.LocalModel,
 					d.Config.FrontierURL, d.Config.FrontierModel,
@@ -1488,7 +1490,7 @@ func Chat(d Deps) http.Handler {
 				// #8) is honoured — when the health poller reports
 				// Ollama unreachable the cascade skips the local step
 				// entirely and starts at frontier.
-				res, err := cas.Run(rw, d.Client, body)
+				res, err := cas.Run(r.Context(), rw, d.Client, body)
 				logCascadeTelemetry(res, err, reqID)
 				// Issue #205: record cascade fallback metric when a retryable
 				// step failure caused the cascade to fall back to the next
