@@ -27,14 +27,18 @@ func TestNew_Defaults(t *testing.T) {
 	if tr.IdleConnTimeout != DefaultIdleConnTimeout {
 		t.Errorf("IdleConnTimeout = %v, want %v", tr.IdleConnTimeout, DefaultIdleConnTimeout)
 	}
+	if tr.ResponseHeaderTimeout != DefaultResponseHeaderTimeout {
+		t.Errorf("ResponseHeaderTimeout = %v, want %v", tr.ResponseHeaderTimeout, DefaultResponseHeaderTimeout)
+	}
 }
 
 func TestNew_CustomConfig(t *testing.T) {
 	cfg := Config{
-		MaxIdleConnsPerHost: 50,
-		MaxConnsPerHost:     200,
-		IdleConnTimeout:     60 * time.Second,
-		DialContextTimeout:  15 * time.Second,
+		MaxIdleConnsPerHost:   50,
+		MaxConnsPerHost:       200,
+		IdleConnTimeout:       60 * time.Second,
+		DialContextTimeout:    15 * time.Second,
+		ResponseHeaderTimeout: 20 * time.Second,
 	}
 	client := New(cfg)
 	tr := client.Transport.(*http.Transport)
@@ -48,6 +52,9 @@ func TestNew_CustomConfig(t *testing.T) {
 	if tr.IdleConnTimeout != 60*time.Second {
 		t.Errorf("IdleConnTimeout = %v, want 60s", tr.IdleConnTimeout)
 	}
+	if tr.ResponseHeaderTimeout != 20*time.Second {
+		t.Errorf("ResponseHeaderTimeout = %v, want 20s", tr.ResponseHeaderTimeout)
+	}
 }
 
 func TestNewFromEnv_Overrides(t *testing.T) {
@@ -56,6 +63,7 @@ func TestNewFromEnv_Overrides(t *testing.T) {
 		os.Unsetenv("NEXUS_HTTP_MAX_CONNS_PER_HOST")
 		os.Unsetenv("NEXUS_HTTP_IDLE_CONN_TIMEOUT")
 		os.Unsetenv("NEXUS_HTTP_DIAL_CONTEXT_TIMEOUT")
+		os.Unsetenv("NEXUS_HTTP_RESPONSE_HEADER_TIMEOUT")
 	}
 	restore()
 	defer restore()
@@ -64,6 +72,7 @@ func TestNewFromEnv_Overrides(t *testing.T) {
 	os.Setenv("NEXUS_HTTP_MAX_CONNS_PER_HOST", "100")
 	os.Setenv("NEXUS_HTTP_IDLE_CONN_TIMEOUT", "45s")
 	os.Setenv("NEXUS_HTTP_DIAL_CONTEXT_TIMEOUT", "10s")
+	os.Setenv("NEXUS_HTTP_RESPONSE_HEADER_TIMEOUT", "15s")
 
 	client := NewFromEnv()
 	tr := client.Transport.(*http.Transport)
@@ -76,6 +85,9 @@ func TestNewFromEnv_Overrides(t *testing.T) {
 	}
 	if tr.IdleConnTimeout != 45*time.Second {
 		t.Errorf("IdleConnTimeout = %v, want 45s", tr.IdleConnTimeout)
+	}
+	if tr.ResponseHeaderTimeout != 15*time.Second {
+		t.Errorf("ResponseHeaderTimeout = %v, want 15s", tr.ResponseHeaderTimeout)
 	}
 }
 
@@ -103,9 +115,10 @@ func TestNewFromEnv_InvalidValuesFallBackToDefaults(t *testing.T) {
 
 func TestNew_ZeroValuesGetDefaults(t *testing.T) {
 	cfg := Config{
-		MaxIdleConnsPerHost: 0,
-		IdleConnTimeout:     0,
-		DialContextTimeout:  0,
+		MaxIdleConnsPerHost:   0,
+		IdleConnTimeout:       0,
+		DialContextTimeout:    0,
+		ResponseHeaderTimeout: 0,
 	}
 	client := New(cfg)
 	tr := client.Transport.(*http.Transport)
@@ -115,6 +128,9 @@ func TestNew_ZeroValuesGetDefaults(t *testing.T) {
 	}
 	if tr.IdleConnTimeout != DefaultIdleConnTimeout {
 		t.Errorf("IdleConnTimeout = %v, want default %v", tr.IdleConnTimeout, DefaultIdleConnTimeout)
+	}
+	if tr.ResponseHeaderTimeout != DefaultResponseHeaderTimeout {
+		t.Errorf("ResponseHeaderTimeout = %v, want default %v", tr.ResponseHeaderTimeout, DefaultResponseHeaderTimeout)
 	}
 }
 
@@ -128,35 +144,40 @@ func TestConfig_ApplyDefaults(t *testing.T) {
 			name: "zero values get defaults",
 			cfg:  Config{},
 			want: Config{
-				MaxIdleConnsPerHost: DefaultMaxIdleConnsPerHost,
-				IdleConnTimeout:     DefaultIdleConnTimeout,
-				DialContextTimeout:  DefaultDialContextTimeout,
+				MaxIdleConnsPerHost:   DefaultMaxIdleConnsPerHost,
+				IdleConnTimeout:       DefaultIdleConnTimeout,
+				DialContextTimeout:    DefaultDialContextTimeout,
+				ResponseHeaderTimeout: DefaultResponseHeaderTimeout,
 			},
 		},
 		{
 			name: "negative values get defaults",
 			cfg: Config{
-				MaxIdleConnsPerHost: -1,
-				IdleConnTimeout:     -1,
-				DialContextTimeout:  -1,
+				MaxIdleConnsPerHost:   -1,
+				IdleConnTimeout:       -1,
+				DialContextTimeout:    -1,
+				ResponseHeaderTimeout: -1,
 			},
 			want: Config{
-				MaxIdleConnsPerHost: DefaultMaxIdleConnsPerHost,
-				IdleConnTimeout:     DefaultIdleConnTimeout,
-				DialContextTimeout:  DefaultDialContextTimeout,
+				MaxIdleConnsPerHost:   DefaultMaxIdleConnsPerHost,
+				IdleConnTimeout:       DefaultIdleConnTimeout,
+				DialContextTimeout:    DefaultDialContextTimeout,
+				ResponseHeaderTimeout: DefaultResponseHeaderTimeout,
 			},
 		},
 		{
 			name: "positive values are preserved",
 			cfg: Config{
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     30 * time.Second,
-				DialContextTimeout:  5 * time.Second,
+				MaxIdleConnsPerHost:   10,
+				IdleConnTimeout:       30 * time.Second,
+				DialContextTimeout:    5 * time.Second,
+				ResponseHeaderTimeout: 20 * time.Second,
 			},
 			want: Config{
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     30 * time.Second,
-				DialContextTimeout:  5 * time.Second,
+				MaxIdleConnsPerHost:   10,
+				IdleConnTimeout:       30 * time.Second,
+				DialContextTimeout:    5 * time.Second,
+				ResponseHeaderTimeout: 20 * time.Second,
 			},
 		},
 	}
@@ -172,6 +193,9 @@ func TestConfig_ApplyDefaults(t *testing.T) {
 			}
 			if tt.cfg.DialContextTimeout != tt.want.DialContextTimeout {
 				t.Errorf("DialContextTimeout = %v, want %v", tt.cfg.DialContextTimeout, tt.want.DialContextTimeout)
+			}
+			if tt.cfg.ResponseHeaderTimeout != tt.want.ResponseHeaderTimeout {
+				t.Errorf("ResponseHeaderTimeout = %v, want %v", tt.cfg.ResponseHeaderTimeout, tt.want.ResponseHeaderTimeout)
 			}
 		})
 	}
@@ -225,6 +249,7 @@ func TestLoadConfigFromEnv_AllDefaults(t *testing.T) {
 		os.Unsetenv("NEXUS_HTTP_MAX_CONNS_PER_HOST")
 		os.Unsetenv("NEXUS_HTTP_IDLE_CONN_TIMEOUT")
 		os.Unsetenv("NEXUS_HTTP_DIAL_CONTEXT_TIMEOUT")
+		os.Unsetenv("NEXUS_HTTP_RESPONSE_HEADER_TIMEOUT")
 	}
 	restore()
 	defer restore()
@@ -242,6 +267,9 @@ func TestLoadConfigFromEnv_AllDefaults(t *testing.T) {
 	if cfg.DialContextTimeout != DefaultDialContextTimeout {
 		t.Errorf("DialContextTimeout = %v, want %v", cfg.DialContextTimeout, DefaultDialContextTimeout)
 	}
+	if cfg.ResponseHeaderTimeout != DefaultResponseHeaderTimeout {
+		t.Errorf("ResponseHeaderTimeout = %v, want %v", cfg.ResponseHeaderTimeout, DefaultResponseHeaderTimeout)
+	}
 }
 
 func TestLoadConfigFromEnv_AllSet(t *testing.T) {
@@ -250,6 +278,7 @@ func TestLoadConfigFromEnv_AllSet(t *testing.T) {
 		os.Unsetenv("NEXUS_HTTP_MAX_CONNS_PER_HOST")
 		os.Unsetenv("NEXUS_HTTP_IDLE_CONN_TIMEOUT")
 		os.Unsetenv("NEXUS_HTTP_DIAL_CONTEXT_TIMEOUT")
+		os.Unsetenv("NEXUS_HTTP_RESPONSE_HEADER_TIMEOUT")
 	}
 	restore()
 	defer restore()
@@ -258,6 +287,7 @@ func TestLoadConfigFromEnv_AllSet(t *testing.T) {
 	os.Setenv("NEXUS_HTTP_MAX_CONNS_PER_HOST", "300")
 	os.Setenv("NEXUS_HTTP_IDLE_CONN_TIMEOUT", "120s")
 	os.Setenv("NEXUS_HTTP_DIAL_CONTEXT_TIMEOUT", "20s")
+	os.Setenv("NEXUS_HTTP_RESPONSE_HEADER_TIMEOUT", "45s")
 
 	cfg := loadConfigFromEnv()
 	if cfg.MaxIdleConnsPerHost != 150 {
@@ -271,6 +301,9 @@ func TestLoadConfigFromEnv_AllSet(t *testing.T) {
 	}
 	if cfg.DialContextTimeout != 20*time.Second {
 		t.Errorf("DialContextTimeout = %v, want 20s", cfg.DialContextTimeout)
+	}
+	if cfg.ResponseHeaderTimeout != 45*time.Second {
+		t.Errorf("ResponseHeaderTimeout = %v, want 45s", cfg.ResponseHeaderTimeout)
 	}
 }
 
@@ -296,12 +329,27 @@ func TestNew_DialContextIsWired(t *testing.T) {
 	}
 }
 
+func TestNew_ResponseHeaderTimeoutIsWired(t *testing.T) {
+	client := New(Config{
+		ResponseHeaderTimeout: 25 * time.Second,
+	})
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected *http.Transport, got %T", client.Transport)
+	}
+
+	if tr.ResponseHeaderTimeout != 25*time.Second {
+		t.Errorf("ResponseHeaderTimeout = %v, want 25s", tr.ResponseHeaderTimeout)
+	}
+}
+
 func TestNewFromEnv_ReadsEnvVars(t *testing.T) {
 	restore := func() {
 		os.Unsetenv("NEXUS_HTTP_MAX_IDLE_CONNS_PER_HOST")
 		os.Unsetenv("NEXUS_HTTP_MAX_CONNS_PER_HOST")
 		os.Unsetenv("NEXUS_HTTP_IDLE_CONN_TIMEOUT")
 		os.Unsetenv("NEXUS_HTTP_DIAL_CONTEXT_TIMEOUT")
+		os.Unsetenv("NEXUS_HTTP_RESPONSE_HEADER_TIMEOUT")
 	}
 	restore()
 	defer restore()
