@@ -79,9 +79,10 @@ var knownEnvVars = map[string]struct{}{
 	"NEXUS_SLM_CACHE_TTL":                 {},
 	"NEXUS_SLMCACHE_SIMILARITY_THRESHOLD": {},
 	"NEXUS_SLM_CONFIDENCE_THRESHOLD":      {},
-	"NEXUS_FUSION_TIMEOUT":                {},
-	"NEXUS_CASCADE_TIMEOUT":               {},
-	"NEXUS_ARBITER_TIMEOUT":               {},
+	"NEXUS_FUSION_TIMEOUT":                 {},
+	"NEXUS_FUSION_PER_FETCH_TIMEOUT":       {},
+	"NEXUS_CASCADE_TIMEOUT":                {},
+	"NEXUS_ARBITER_TIMEOUT":                {},
 	"NEXUS_FUSION_PROGRESSIVE":            {},
 	"NEXUS_FUSION_AGREEMENT_THRESHOLD":    {},
 	"NEXUS_ARBITER_CACHE_TTL":             {},
@@ -264,14 +265,15 @@ type Config struct {
 	RAGCircuitBreakerCooldown  time.Duration // cooldown duration after trip
 
 	// Routing
-	TokenGuardrail            int           // estimated tokens above this force frontier (6000)
-	SLMTimeout                time.Duration // Qwen3-Coder routing timeout (8s)
-	SLMCacheMaxEntries        int           // max entries in SLM routing decision cache (512)
-	SLMCacheSemanticThreshold float64       // cosine similarity floor for semantic cache hits (0.0..1.0, issue #245)
-	SLMConfidenceThreshold    float64       // hard escalation threshold: local/fusion decisions below this force frontier (default 0.3, issue #301)
-	FusionTimeout             time.Duration // per-panel-member fetch timeout (120s)
-	CascadeTimeout            time.Duration // per-attempt timeout for cascade fallback (30s)
-	ArbiterTimeout            time.Duration // per-call timeout for the fusion arbiter stream (60s)
+	TokenGuardrail              int           // estimated tokens above this force frontier (6000)
+	SLMTimeout                  time.Duration // Qwen3-Coder routing timeout (8s)
+	SLMCacheMaxEntries          int           // max entries in SLM routing decision cache (512)
+	SLMCacheSemanticThreshold   float64       // cosine similarity floor for semantic cache hits (0.0..1.0, issue #245)
+	SLMConfidenceThreshold      float64       // hard escalation threshold: local/fusion decisions below this force frontier (default 0.3, issue #301)
+	FusionTimeout               time.Duration // per-panel-member fetch timeout (120s)
+	FusionPerFetchTimeout       time.Duration // per-fetch timeout fallback for fusion panel members (120s); used when perFetchTimeout <= 0
+	CascadeTimeout              time.Duration // per-attempt timeout for cascade fallback (30s)
+	ArbiterTimeout              time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
 	// DSL fast-pass patterns (issue #305). DSLFormattingPatterns
 	// matches simple formatting keywords (css, format, docstring, ...).
@@ -763,6 +765,15 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.FusionTimeout = fusionTimeout
+
+	// Fusion per-fetch timeout fallback (issue #385). Used by upstream.withDefault
+	// when the perFetchTimeout argument to Panel/PanelStreaming is <= 0.
+	// Defaults to the same value as FusionTimeout for backward compatibility.
+	fusionPerFetchTimeout, err := getEnvDuration("NEXUS_FUSION_PER_FETCH_TIMEOUT", 120*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.FusionPerFetchTimeout = fusionPerFetchTimeout
 
 	cascadeTimeout, err := getEnvDuration("NEXUS_CASCADE_TIMEOUT", 30*time.Second)
 	if err != nil {

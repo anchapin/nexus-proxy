@@ -106,6 +106,11 @@ func main() {
 	logger := cfg.NewLogger()
 	slog.SetDefault(logger)
 
+	// Issue #385: configure upstream timeout defaults from config so they are
+	// env-var tunable instead of hardcoded package-level constants.
+	upstream.ConfigureCascadeTimeout(cfg.CascadeTimeout)
+	upstream.ConfigureTimeouts(cfg.ArbiterTimeout, cfg.FusionPerFetchTimeout)
+
 	// Shared pooled HTTP client for all outbound upstream calls (issue #184).
 	// Connection pooling reduces TCP handshake overhead across Ollama,
 	// frontier API, and arbiter calls. Created once and passed to every

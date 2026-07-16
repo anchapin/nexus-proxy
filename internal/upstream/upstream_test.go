@@ -1677,3 +1677,36 @@ func TestIsClientAbort(t *testing.T) {
 		t.Error("IsClientAbort(nil) = true, want false")
 	}
 }
+
+// TestConfigureTimeouts verifies ConfigureTimeouts sets the package-level defaults
+// and that withDefault/withDefaultArbiterTimeout use them. Issue #385.
+func TestConfigureTimeouts(t *testing.T) {
+	// Save original values to restore after test.
+	origArbiter := arbiterDefaultTimeout
+	origPerFetch := perFetchDefaultTimeout
+	defer func() {
+		arbiterDefaultTimeout = origArbiter
+		perFetchDefaultTimeout = origPerFetch
+	}()
+
+	// Configure with custom values.
+	ConfigureTimeouts(90*time.Second, 45*time.Second)
+
+	// Verify withDefaultArbiterTimeout uses the configured arbiter default.
+	if got := withDefaultArbiterTimeout(0); got != 90*time.Second {
+		t.Errorf("withDefaultArbiterTimeout(0) = %v, want 90s", got)
+	}
+	// Positive values are returned as-is.
+	if got := withDefaultArbiterTimeout(30*time.Second); got != 30*time.Second {
+		t.Errorf("withDefaultArbiterTimeout(30s) = %v, want 30s", got)
+	}
+
+	// Verify withDefault uses the configured per-fetch default.
+	if got := withDefault(0); got != 45*time.Second {
+		t.Errorf("withDefault(0) = %v, want 45s", got)
+	}
+	// Positive values are returned as-is.
+	if got := withDefault(10*time.Second); got != 10*time.Second {
+		t.Errorf("withDefault(10s) = %v, want 10s", got)
+	}
+}
