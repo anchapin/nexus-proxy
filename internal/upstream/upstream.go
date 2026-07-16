@@ -719,7 +719,13 @@ type PanelOutcome struct {
 // of (first.Content, second.Content). Cache hits stream the cached
 // text without calling the arbiter. When nil or TTL=0 the cache is
 // bypassed and the arbiter is called on every disagreement.
+//
+// The ctx parameter is the request context (typically r.Context() from the
+// HTTP handler). When the client disconnects, ctx is cancelled and the
+// in-flight upstream calls are cancelled within 1 second rather than
+// waiting for their individual timeouts (issue #297).
 func PanelStreaming(
+	ctx context.Context,
 	w http.ResponseWriter,
 	client Client,
 	localBaseURL, localModel, frontierURL, frontierModel string,
@@ -742,7 +748,7 @@ func PanelStreaming(
 	// hands PanelStreaming a stream=false body gets the existing
 	// JSON-object response shape (issue #10).
 	if s, ok := body["stream"].(bool); ok && !s {
-		cacheHit, err := Panel(w, client,
+		cacheHit, err := Panel(ctx, w, client,
 			localBaseURL, localModel, frontierURL, frontierModel,
 			arbiterURL, arbiterKey, arbiterModel,
 			body, latestPrompt, perFetchTimeout, arbiterTimeout,
@@ -792,10 +798,10 @@ func PanelStreaming(
 					results <- PanelResult{Source: "local", Err: fmt.Errorf("panic: %v", r)}
 				}
 			}()
-			ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
+			ctxLocal, cancel := context.WithTimeout(ctx, withDefault(perFetchTimeout))
 			cancelLocal = cancel
 			defer cancel()
-			msg, err := FetchPanel(ctx, client,
+			msg, err := FetchPanel(ctxLocal, client,
 				localBaseURL+"/v1/chat/completions", "", localModel, body)
 			results <- PanelResult{Source: "local", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
 		}()
@@ -807,10 +813,10 @@ func PanelStreaming(
 				results <- PanelResult{Source: "frontier", Err: fmt.Errorf("panic: %v", r)}
 			}
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
+		ctxFrontier, cancel := context.WithTimeout(ctx, withDefault(perFetchTimeout))
 		cancelFrontier = cancel
 		defer cancel()
-		msg, err := FetchPanel(ctx, client,
+		msg, err := FetchPanel(ctxFrontier, client,
 			frontierURL, "", frontierModel, body)
 		results <- PanelResult{Source: "frontier", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
 	}()

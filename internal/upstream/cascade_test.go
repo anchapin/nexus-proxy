@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -142,7 +143,7 @@ func TestCascadePrimarySucceeds(t *testing.T) {
 	client := &http.Client{Transport: ft}
 
 	rw := newSSERW()
-	res, err := twoStepCascade().Run(rw, client, map[string]interface{}{"messages": []interface{}{}})
+	res, err := twoStepCascade().Run(context.Background(), rw, client, map[string]interface{}{"messages": []interface{}{}})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -190,7 +191,7 @@ func TestCascadeFallsBackOn5xx(t *testing.T) {
 	client := &http.Client{Transport: ft}
 
 	rw := newSSERW()
-	res, err := twoStepCascade().Run(rw, client, map[string]interface{}{"messages": []interface{}{}})
+	res, err := twoStepCascade().Run(context.Background(), rw, client, map[string]interface{}{"messages": []interface{}{}})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -220,7 +221,7 @@ func TestCascadeFallsBackOn429(t *testing.T) {
 		w.WriteHeader(200)
 		_, _ = io.WriteString(w, chatBody200)
 	})
-	res, err := twoStepCascade().Run(newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
 	}
@@ -235,7 +236,7 @@ func TestCascadeFallsBackOn408(t *testing.T) {
 		w.WriteHeader(200)
 		_, _ = io.WriteString(w, chatBody200)
 	})
-	res, err := twoStepCascade().Run(newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
 	}
@@ -250,7 +251,7 @@ func TestCascadeFallsBackOnTransportError(t *testing.T) {
 		_, _ = io.WriteString(w, chatBody200)
 	})
 	client := &http.Client{Transport: ft}
-	res, err := twoStepCascade().Run(newSSERW(), client, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), client, nil)
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
 	}
@@ -278,7 +279,7 @@ func TestCascadeFallsBackOnTimeout(t *testing.T) {
 		},
 	}
 	start := time.Now()
-	res, err := cas.Run(newSSERW(), http.DefaultClient, nil)
+	res, err := cas.Run(context.Background(), newSSERW(), http.DefaultClient, nil)
 	elapsed := time.Since(start)
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
@@ -298,7 +299,7 @@ func TestCascadeFallsBackOnMalformedJSON(t *testing.T) {
 		w.WriteHeader(200)
 		_, _ = io.WriteString(w, chatBody200)
 	})
-	res, err := twoStepCascade().Run(newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
 	}
@@ -314,7 +315,7 @@ func TestCascadeFallsBackOnEmptyChoices(t *testing.T) {
 		w.WriteHeader(200)
 		_, _ = io.WriteString(w, chatBody200)
 	})
-	res, err := twoStepCascade().Run(newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
 	}
@@ -332,7 +333,7 @@ func TestCascadeFallsBackOnMalformedToolCall(t *testing.T) {
 		w.WriteHeader(200)
 		_, _ = io.WriteString(w, chatBody200)
 	})
-	res, err := twoStepCascade().Run(newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
 	}
@@ -348,7 +349,7 @@ func TestCascadeFallsBackOnMissingToolCallFields(t *testing.T) {
 		w.WriteHeader(200)
 		_, _ = io.WriteString(w, chatBody200)
 	})
-	res, err := twoStepCascade().Run(newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
 	}
@@ -363,7 +364,7 @@ func TestCascadeAcceptsValidToolCall(t *testing.T) {
 	ft.on("http://fallback.local/v1/chat/completions", func(_ http.ResponseWriter, _ *http.Request) {
 		t.Error("fallback should not fire when tool_call is valid")
 	})
-	res, err := twoStepCascade().Run(newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
 	if err != nil || res.ServedBy != "local" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
 	}
@@ -378,7 +379,7 @@ func TestCascadeAllFailReturnsLastError(t *testing.T) {
 		w.WriteHeader(502)
 	})
 	rw := newSSERW()
-	res, err := twoStepCascade().Run(rw, &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -413,7 +414,7 @@ func TestCascadeNonRetryableStopsImmediately(t *testing.T) {
 	ft.on("http://fallback.local/v1/chat/completions", func(_ http.ResponseWriter, _ *http.Request) {
 		t.Error("fallback should NOT have been called for non-retryable 401")
 	})
-	_, err := twoStepCascade().Run(newSSERW(), &http.Client{Transport: ft}, nil)
+	_, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -423,7 +424,7 @@ func TestCascadeNonRetryableStopsImmediately(t *testing.T) {
 }
 
 func TestCascadeEmptyStepsReturnsError(t *testing.T) {
-	_, err := (&Cascade{}).Run(newSSERW(), http.DefaultClient, nil)
+	_, err := (&Cascade{}).Run(context.Background(), newSSERW(), http.DefaultClient, nil)
 	if err == nil || !strings.Contains(err.Error(), "no steps") {
 		t.Errorf("got %v", err)
 	}
@@ -445,7 +446,7 @@ func TestCascadeDefaultTimeoutWhenZero(t *testing.T) {
 		w.WriteHeader(200)
 		_, _ = io.WriteString(w, chatBody200)
 	})
-	res, err := cas.Run(newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := cas.Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
 	if err != nil || !res.Succeeded {
 		t.Errorf("err=%v res=%+v", err, res)
 	}
@@ -543,7 +544,7 @@ func TestCascadeValidatesBeforeWritingBytes(t *testing.T) {
 		_, _ = io.WriteString(w, chatBody200)
 	})
 	rw := newSSERW()
-	_, err := twoStepCascade().Run(rw, &http.Client{Transport: ft}, nil)
+	_, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -559,7 +560,7 @@ func TestCascadeSSEChunkStructure(t *testing.T) {
 		_, _ = io.WriteString(w, chatBody200)
 	})
 	rw := newSSERW()
-	_, err := twoStepCascade().Run(rw, &http.Client{Transport: ft}, nil)
+	_, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -605,7 +606,7 @@ func TestCascadeLocalStepFailedOn5xx(t *testing.T) {
 	})
 	client := &http.Client{Transport: ft}
 
-	res, err := twoStepCascade().Run(newSSERW(), client, map[string]interface{}{"messages": []interface{}{}})
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), client, map[string]interface{}{"messages": []interface{}{}})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -624,7 +625,7 @@ func TestCascadeLocalStepFailedNotSetOnSuccess(t *testing.T) {
 	})
 	client := &http.Client{Transport: ft}
 
-	res, err := twoStepCascade().Run(newSSERW(), client, map[string]interface{}{"messages": []interface{}{}})
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), client, map[string]interface{}{"messages": []interface{}{}})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -643,7 +644,7 @@ func TestCascadeLocalStepFailedNotSetOnNonRetryable(t *testing.T) {
 	})
 	client := &http.Client{Transport: ft}
 
-	_, err := twoStepCascade().Run(newSSERW(), client, map[string]interface{}{"messages": []interface{}{}})
+	_, err := twoStepCascade().Run(context.Background(), newSSERW(), client, map[string]interface{}{"messages": []interface{}{}})
 	if err == nil {
 		t.Fatal("expected error for 401, got nil")
 	}
@@ -669,7 +670,7 @@ func TestCascadeToolCallsStreamedAsDeltaToolCalls(t *testing.T) {
 		t.Error("fallback should not fire for valid tool_calls")
 	})
 	rw := newSSERW()
-	res, err := twoStepCascade().Run(rw, &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -735,7 +736,7 @@ func TestCascadeEmptyContentWithToolCallsAccepted(t *testing.T) {
 	ft.on("http://fallback.local/v1/chat/completions", func(_ http.ResponseWriter, _ *http.Request) {
 		t.Error("fallback should not fire")
 	})
-	res, err := twoStepCascade().Run(newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -754,7 +755,7 @@ func TestCascadeContentOnlyBackwardCompat(t *testing.T) {
 		_, _ = io.WriteString(w, chatBody200)
 	})
 	rw := newSSERW()
-	res, err := twoStepCascade().Run(rw, &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -792,7 +793,7 @@ func TestCascadeMultipleToolCallsIndexed(t *testing.T) {
 		]}}]}`)
 	})
 	rw := newSSERW()
-	res, err := twoStepCascade().Run(rw, &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -823,7 +824,7 @@ func TestCascadeContentAndToolCallsBothPresent(t *testing.T) {
 		_, _ = io.WriteString(w, `{"model":"qwen","choices":[{"message":{"content":"Let me check that.","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{}"}}]}}]}`)
 	})
 	rw := newSSERW()
-	_, err := twoStepCascade().Run(rw, &http.Client{Transport: ft}, nil)
+	_, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
