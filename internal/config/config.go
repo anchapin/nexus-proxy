@@ -118,6 +118,7 @@ type Config struct {
 	SLMTimeout                time.Duration // Qwen3-Coder routing timeout (8s)
 	SLMCacheMaxEntries        int           // max entries in SLM routing decision cache (512)
 	SLMCacheSemanticThreshold float64       // cosine similarity floor for semantic cache hits (0.0..1.0, issue #245)
+	SLMConfidenceThreshold    float64       // hard escalation threshold: local/fusion decisions below this force frontier (default 0.3, issue #301)
 	FusionTimeout             time.Duration // per-panel-member fetch timeout (120s)
 	CascadeTimeout            time.Duration // per-attempt timeout for cascade fallback (30s)
 	ArbiterTimeout            time.Duration // per-call timeout for the fusion arbiter stream (60s)
@@ -558,6 +559,21 @@ func Load() (Config, error) {
 		slmCacheMax = 0
 	}
 	cfg.SLMCacheMaxEntries = slmCacheMax
+
+	// SLM confidence hard-escalation threshold (issue #301). When the
+	// SLM returns local/fusion with confidence below this value, the
+	// planner overrides to frontier. The default (0.3) is deliberately
+	// conservative: it only fires when the SLM is quite uncertain,
+	// preserving the cost savings of local routing for clear-cut cases.
+	// Set to 0 to disable the hard override (soft bias via
+	// DecideWithConfidence still applies when a ConfidenceStore is
+	// wired). The threshold is not validated — a value outside [0,1]
+	// simply never triggers in practice.
+	slmConfThreshold, err := getEnvFloat("NEXUS_SLM_CONFIDENCE_THRESHOLD", 0.3)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.SLMConfidenceThreshold = slmConfThreshold
 
 	fusionTimeout, err := getEnvDuration("NEXUS_FUSION_TIMEOUT", 120*time.Second)
 	if err != nil {
