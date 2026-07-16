@@ -463,6 +463,11 @@ func Panel(
 		}
 	} else {
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					results <- PanelResult{Source: "local", Err: fmt.Errorf("panic: %v", r)}
+				}
+			}()
 			ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
 			defer cancel()
 			msg, err := FetchPanel(ctx, client,
@@ -471,6 +476,11 @@ func Panel(
 		}()
 	}
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				results <- PanelResult{Source: "frontier", Err: fmt.Errorf("panic: %v", r)}
+			}
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
 		defer cancel()
 		msg, err := FetchPanel(ctx, client,
@@ -742,6 +752,11 @@ func PanelStreaming(
 		}
 	} else {
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					results <- PanelResult{Source: "local", Err: fmt.Errorf("panic: %v", r)}
+				}
+			}()
 			ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
 			cancelLocal = cancel
 			defer cancel()
@@ -751,6 +766,11 @@ func PanelStreaming(
 		}()
 	}
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				results <- PanelResult{Source: "frontier", Err: fmt.Errorf("panic: %v", r)}
+			}
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), withDefault(perFetchTimeout))
 		cancelFrontier = cancel
 		defer cancel()

@@ -635,6 +635,13 @@ type Deps struct {
 	// adapts the event to the in-process arbiter cache counter.
 	ArbiterCacheObserver func(cacheHit bool)
 
+	// PanelPanicObserver is invoked when a panel goroutine recovers from
+	// a panic (issue #309). The handler checks for "panic:" in the error
+	// message returned by Panel/PanelStreaming and calls this observer
+	// if detected. Safe for concurrent use; nil is "no observer" so the
+	// hot path is unaffected.
+	PanelPanicObserver func()
+
 	// ArbiterCache is the optional in-memory cache for fusion arbiter
 	// synthesis responses (issue #232). When non-nil and
 	// Config.ArbiterCacheTTL > 0, identical panel-member content
@@ -1247,6 +1254,12 @@ func Chat(d Deps) http.Handler {
 					slog.Any("err", upErr),
 					slog.String("request_id", reqID),
 				)
+				// Issue #309: detect panel goroutine panics by checking
+				// for "panic:" in the error message. The panel goroutines
+				// recover and send PanelResult{Err: fmt.Errorf("panic: %v", r)}.
+				if d.PanelPanicObserver != nil && strings.Contains(upErr.Error(), "panic:") {
+					d.PanelPanicObserver()
+				}
 				http.Error(w, "Upstream error", http.StatusBadGateway)
 			} else if d.SpendGuard != nil && frontierCost > 0 {
 				// Budget guard: record after successful fusion frontier leg (issue #220).
