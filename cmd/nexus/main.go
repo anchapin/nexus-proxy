@@ -975,7 +975,24 @@ func main() {
 	// middleware is a pass-through (zero overhead).
 	var rootHandler http.Handler = mux
 	if cfg.AuthEnabled() {
-		authMw := auth.NewMiddleware(cfg.ProxyAPIKey, publicPathExempt(cfg))
+		var authLimiter *ratelimit.AuthLimiter
+		if cfg.AuthRateLimitEnabled() {
+			authLimiter = ratelimit.NewAuthLimiter(
+				cfg.AuthRateLimitRPM,
+				cfg.AuthRateLimitBurst,
+				cfg.AuthRateLimitWindow,
+				ipResolver,
+			)
+			authLimiter.SetOnBlock(func() {
+				circuitCollector.IncAuthRateLimitRejected()
+			})
+			slog.Info("auth brute-force protection enabled",
+				slog.Int("rpm", cfg.AuthRateLimitRPM),
+				slog.Int("burst", cfg.AuthRateLimitBurst),
+				slog.Duration("window", cfg.AuthRateLimitWindow),
+			)
+		}
+		authMw := auth.NewMiddleware(cfg.ProxyAPIKey, publicPathExempt(cfg), authLimiter)
 		rootHandler = authMw.Wrap(mux)
 		slog.Info("inbound auth enabled",
 			slog.Bool("status_public", cfg.StatusPublic),

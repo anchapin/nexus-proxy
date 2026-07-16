@@ -389,6 +389,17 @@ type Config struct {
 	RateLimitRPM      int
 	RateLimitBurst    int
 
+	// Auth brute-force protection (issue #296). Tracks per-client-IP
+	// auth failures and blocks the client after AuthRateLimitBurst
+	// consecutive failures within a sliding AuthRateLimitWindow
+	// window. AuthRateLimitRPM controls the steady-state refill rate.
+	// When AuthRateLimitRPM <= 0 the limiter is disabled (transparent
+	// passthrough) so a stock deployment without the env vars set is
+	// unchanged from pre-#296 behaviour.
+	AuthRateLimitRPM    int
+	AuthRateLimitBurst  int
+	AuthRateLimitWindow time.Duration // window for auth failure tracking (default 5 min)
+
 	// Readiness mode for /readyz (issue #302). Controls whether the
 	// readiness probe returns 503 when Ollama is down (strict) or
 	// always returns 200 while surfacing the degraded flag (degraded,
@@ -1132,6 +1143,37 @@ func Load() (Config, error) {
 	}
 	cfg.RateLimitBurst = rateBurst
 
+	// Auth brute-force protection (issue #296). Defaults: RPM 5, burst 3,
+	// window 5 min. When RPM <= 0 the limiter is disabled so a stock
+	// deployment with no NEXUS_AUTH_RATE_LIMIT_RPM is byte-for-byte
+	// identical to the pre-#296 behaviour.
+	authRateRPM, err := getEnvInt("NEXUS_AUTH_RATE_LIMIT_RPM", 5)
+	if err != nil {
+		return cfg, err
+	}
+	if authRateRPM < 0 {
+		authRateRPM = 0
+	}
+	cfg.AuthRateLimitRPM = authRateRPM
+
+	authRateBurst, err := getEnvInt("NEXUS_AUTH_RATE_LIMIT_BURST", 3)
+	if err != nil {
+		return cfg, err
+	}
+	if authRateBurst < 0 {
+		authRateBurst = 0
+	}
+	cfg.AuthRateLimitBurst = authRateBurst
+
+	authRateWindow, err := getEnvDuration("NEXUS_AUTH_RATE_LIMIT_WINDOW", 5*time.Minute)
+	if err != nil {
+		return cfg, err
+	}
+	if authRateWindow < 0 {
+		authRateWindow = 0
+	}
+	cfg.AuthRateLimitWindow = authRateWindow
+
 	// Readiness mode for /readyz (issue #302). Controls whether the
 	// readiness probe returns 503 when Ollama is down (strict) or
 	// always returns 200 while surfacing the degraded flag (degraded,
@@ -1305,6 +1347,12 @@ func (c Config) BudgetEnabled() bool { return c.BudgetDailyLimit > 0 }
 // active (issue #75). Disabled when RateLimitRPM <= 0 so a stock
 // deployment is byte-for-byte identical to the pre-#75 path.
 func (c Config) RateLimitEnabled() bool { return c.RateLimitRPM > 0 }
+
+// AuthRateLimitEnabled reports whether the auth brute-force limiter is
+// active (issue #296). Disabled when AuthRateLimitRPM <= 0 so a stock
+// deployment with no NEXUS_AUTH_RATE_LIMIT_RPM is byte-for-byte identical
+// to the pre-#296 path.
+func (c Config) AuthRateLimitEnabled() bool { return c.AuthRateLimitRPM > 0 }
 
 // TrustedProxiesConfigured reports whether any trusted-proxy CIDRs are
 // set. Used by the boot-time warning to detect the "rate limit on +

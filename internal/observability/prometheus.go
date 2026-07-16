@@ -212,6 +212,11 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 			{value: "rejected_missing", n: c.authRejectedMissing.Load()},
 		})
 
+	// Auth rate limit counter (issue #296).
+	writeCounter(w, "nexus_requests_rejected_total",
+		"Total requests rejected by auth brute-force protection (issue #296).",
+		c.authRateLimitRejected.Load())
+
 	// Rate-limit counters are emitted as two labelled families so the
 	// {scope, allowed} matrix is one scrape away. scope values are
 	// "global" or "per_client"; the limiter never emits "both" — when
