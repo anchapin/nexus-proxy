@@ -596,7 +596,8 @@ type OllamaEmbedder struct {
 	breakerThreshold atomic.Int32
 	cooldownUntil    atomic.Int64 // nanoseconds since Unix epoch; 0 = never tripped
 	failureCount     atomic.Int32
-	OnBreakerTrip    func() // called synchronously when the circuit breaker trips (issue #411)
+	OnBreakerTrip  func() // called synchronously when the circuit breaker trips (issue #411)
+	OnBreakerOpen func() // called synchronously when the circuit breaker transitions to open state (issue #411)
 }
 
 // NewOllamaEmbedder returns an embedder wired to the given Ollama instance.
@@ -990,6 +991,9 @@ func (o *OllamaEmbedder) recordFailure() {
 		)
 		if o.OnBreakerTrip != nil {
 			o.OnBreakerTrip()
+		}
+		if o.OnBreakerOpen != nil {
+			o.OnBreakerOpen()
 		}
 	}
 }

@@ -460,3 +460,54 @@ func TestRenderPrometheusVRAMGauges(t *testing.T) {
 		}
 	}
 }
+
+// TestRenderPrometheusRAGCircuitBreakerGauges verifies that the RAG circuit
+// breaker state and trip metrics are rendered after state transitions (issue #411).
+func TestRenderPrometheusRAGCircuitBreakerGauges(t *testing.T) {
+	c := NewCollector()
+
+	// Initial state: closed (0)
+	var sb strings.Builder
+	RenderPrometheus(&sb, c)
+	out := sb.String()
+
+	if !strings.Contains(out, "# TYPE nexus_rag_circuit_breaker_state gauge") {
+		t.Errorf("nexus_rag_circuit_breaker_state TYPE line missing")
+	}
+	if !strings.Contains(out, "# TYPE nexus_rag_circuit_breaker_trip_total counter") {
+		t.Errorf("nexus_rag_circuit_breaker_trip_total TYPE line missing")
+	}
+	if !strings.Contains(out, "nexus_rag_circuit_breaker_state 0") {
+		t.Errorf("nexus_rag_circuit_breaker_state initial value missing or wrong, got:\n%s", out)
+	}
+	if !strings.Contains(out, "nexus_rag_circuit_breaker_trip_total 0") {
+		t.Errorf("nexus_rag_circuit_breaker_trip_total initial value missing or wrong, got:\n%s", out)
+	}
+
+	// After one trip: open (2)
+	c.RecordRAGBreakerOpen()
+	sb.Reset()
+	RenderPrometheus(&sb, c)
+	out = sb.String()
+
+	if !strings.Contains(out, "nexus_rag_circuit_breaker_state 2") {
+		t.Errorf("nexus_rag_circuit_breaker_state after trip = 2 missing, got:\n%s", out)
+	}
+	if !strings.Contains(out, "nexus_rag_circuit_breaker_trip_total 1") {
+		t.Errorf("nexus_rag_circuit_breaker_trip_total after 1 trip missing, got:\n%s", out)
+	}
+
+	// After recovery: closed (0)
+	c.RecordRAGBreakerRecovery()
+	sb.Reset()
+	RenderPrometheus(&sb, c)
+	out = sb.String()
+
+	if !strings.Contains(out, "nexus_rag_circuit_breaker_state 0") {
+		t.Errorf("nexus_rag_circuit_breaker_state after recovery missing, got:\n%s", out)
+	}
+	// Trip counter stays at 1 (monotonically increasing)
+	if !strings.Contains(out, "nexus_rag_circuit_breaker_trip_total 1") {
+		t.Errorf("nexus_rag_circuit_breaker_trip_total should stay at 1 after recovery, got:\n%s", out)
+	}
+}
