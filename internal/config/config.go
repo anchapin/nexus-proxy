@@ -249,9 +249,9 @@ type Config struct {
 	// goroutine that detects new / modified / deleted files in
 	// ExamplesDir and updates the store incrementally. Set
 	// NEXUS_RAG_DB="" to fall back to the legacy in-memory-only path.
-	RAGDBPath        string        // on-disk SQLite database for the RAG store
-	RAGPollInterval  time.Duration // watcher cadence; 0 means DefaultRAGPollInterval
-	RAGWatcherDisabled bool        // true to disable the watcher regardless of interval
+	RAGDBPath          string        // on-disk SQLite database for the RAG store
+	RAGPollInterval    time.Duration // watcher cadence; 0 means DefaultRAGPollInterval
+	RAGWatcherDisabled bool          // true to disable the watcher regardless of interval
 
 	// RAG embedding cache (issue #115). Prompt embeddings are
 	// deterministic for a given model+text pair, so they are memoized

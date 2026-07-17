@@ -74,16 +74,16 @@ type YAMLConfig struct {
 	SelectorRefreshInterval string `yaml:"selector_refresh_interval"`
 
 	// RAG
-	ExamplesDir       string  `yaml:"examples_dir"`
-	RAGThreshold      float64 `yaml:"rag_threshold"`
-	EmbedderType      string  `yaml:"embedder_type"`
-	EmbedderBaseURL   string  `yaml:"embedder_base_url"`
-	CohereAPIKey      string  `yaml:"cohere_api_key"`
-	RAGDBPath          string `yaml:"rag_db_path"`
-	RAGPollInterval    string `yaml:"rag_poll_interval"`
-	RAGWatcherDisabled bool   `yaml:"rag_watcher_disabled"`
-	RAGEmbedCacheSize int     `yaml:"rag_embed_cache_size"`
-	RAGEmbedCacheTTL  string  `yaml:"rag_embed_cache_ttl"`
+	ExamplesDir        string  `yaml:"examples_dir"`
+	RAGThreshold       float64 `yaml:"rag_threshold"`
+	EmbedderType       string  `yaml:"embedder_type"`
+	EmbedderBaseURL    string  `yaml:"embedder_base_url"`
+	CohereAPIKey       string  `yaml:"cohere_api_key"`
+	RAGDBPath          string  `yaml:"rag_db_path"`
+	RAGPollInterval    string  `yaml:"rag_poll_interval"`
+	RAGWatcherDisabled bool    `yaml:"rag_watcher_disabled"`
+	RAGEmbedCacheSize  int     `yaml:"rag_embed_cache_size"`
+	RAGEmbedCacheTTL   string  `yaml:"rag_embed_cache_ttl"`
 
 	// Routing
 	TokenGuardrail            int     `yaml:"token_guardrail"`
@@ -918,8 +918,8 @@ func (yc YAMLConfig) toConfig() Config {
 		ModelsEndpointEnabled: yc.boolFieldDefault(yc.ModelsEndpointEnabled, true),
 		ModelsCacheTTL:        yc.durationDefault(yc.ModelsCacheTTL, 5*time.Minute),
 
-		RAGPollInterval:       yc.durationDefault(yc.RAGPollInterval, DefaultRAGPollInterval),
-		RAGWatcherDisabled:    yc.boolFieldDefault(yc.RAGWatcherDisabled, false),
+		RAGPollInterval:    yc.durationDefault(yc.RAGPollInterval, DefaultRAGPollInterval),
+		RAGWatcherDisabled: yc.boolFieldDefault(yc.RAGWatcherDisabled, false),
 
 		RateLimitRPM:   yc.intDefault(yc.RateLimitRPM, 0),
 		RateLimitBurst: yc.intDefault(yc.RateLimitBurst, 0),
