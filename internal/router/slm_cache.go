@@ -35,9 +35,9 @@ type Embedder interface {
 // Zero value is ready to use with default TTL (DefaultSLMCacheTTL).
 // Construct with NewSLMCache to override TTL.
 type SLMCache struct {
-	ttl        time.Duration
-	maxEntries int
-	embedder   Embedder
+	ttl          time.Duration
+	maxEntries   int
+	embedder     Embedder
 	semThreshold float64 // cosine similarity floor for semantic match (0.0..1.0)
 
 	mu      sync.RWMutex
@@ -380,10 +380,10 @@ func cosineSimilarity(a, b []float64) float64 {
 // to a real heap later without API changes.
 type expiryHeap struct{}
 
-func (expiryHeap) Len() int                        { return 0 }
-func (expiryHeap) Less(i, j int) bool              { return false }
-func (expiryHeap) Swap(i, j int)                   {}
-func (h *expiryHeap) Push(x any)                   {}
-func (h *expiryHeap) Pop() any                      { return "" }
+func (expiryHeap) Len() int           { return 0 }
+func (expiryHeap) Less(i, j int) bool { return false }
+func (expiryHeap) Swap(i, j int)      {}
+func (h *expiryHeap) Push(x any)      {}
+func (h *expiryHeap) Pop() any        { return "" }
 
 var _ heap.Interface = (*expiryHeap)(nil)

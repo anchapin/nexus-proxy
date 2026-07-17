@@ -82,13 +82,13 @@ type hnswEntry struct {
 // HNSWIndex implements an approximate nearest-neighbor search index using the
 // HNSW algorithm. It is safe for concurrent readers and a single writer.
 type HNSWIndex struct {
-	cfg   HNSWConfig
-	mu    sync.RWMutex
-	rng   *rand.Rand
-	layers [][]*hnswEntry  // layers[layer] = entries in that layer
+	cfg         HNSWConfig
+	mu          sync.RWMutex
+	rng         *rand.Rand
+	layers      [][]*hnswEntry     // layers[layer] = entries in that layer
 	entryPoints map[int]*hnswEntry // layer -> entry point (top-1 node)
-	maxLayer   int
-	size       int
+	maxLayer    int
+	size        int
 }
 
 // NewHNSWIndex creates an empty HNSW index with the given configuration.
@@ -106,11 +106,11 @@ func NewHNSWIndex(cfg HNSWConfig) *HNSWIndex {
 		cfg.seed = 42
 	}
 	return &HNSWIndex{
-		cfg:        cfg,
-		rng:        rand.New(rand.NewSource(cfg.seed)),
-		layers:     make([][]*hnswEntry, 1),
+		cfg:         cfg,
+		rng:         rand.New(rand.NewSource(cfg.seed)),
+		layers:      make([][]*hnswEntry, 1),
 		entryPoints: make(map[int]*hnswEntry),
-		maxLayer:   0,
+		maxLayer:    0,
 	}
 }
 
@@ -188,7 +188,7 @@ func (h *HNSWIndex) randomLayer() int {
 			l = 0
 		}
 		// Cap at reasonable max (log2 of size)
-		maxL := int(math.Log2(float64(h.size + 1))) + 1
+		maxL := int(math.Log2(float64(h.size+1))) + 1
 		if l > maxL {
 			l = maxL
 		}
@@ -289,7 +289,7 @@ func (h *HNSWIndex) searchLayer(query []float64, ef, layer int) candidates {
 	// Track best candidates found.
 	var topCandidates minHeapItems
 
-	for pq.len() > 0 {
+	for pq.Len() > 0 {
 		// Get the nearest unvisited node.
 		d, id := pq.pop()
 		if len(topCandidates) > 0 {
@@ -380,7 +380,7 @@ func (h *HNSWIndex) searchLayerAtPoint(query []float64, ep *hnswEntry, ef, layer
 
 	var topCandidates minHeapItems
 
-	for pq.len() > 0 {
+	for pq.Len() > 0 {
 		d, id := pq.pop()
 		if len(topCandidates) >= ef && d > topCandidates[len(topCandidates)-1].dist {
 			break
@@ -442,69 +442,29 @@ type heapItem struct {
 // minHeapItems is a min-heap of heapItem, ordered by dist.
 type minHeapItems []heapItem
 
-func (h *minHeapItems) len() int   { return len(*h) }
+func (h *minHeapItems) Len() int           { return len(*h) }
 func (h *minHeapItems) less(i, j int) bool { return (*h)[i].dist < (*h)[j].dist }
-func (h *minHeapItems) swap(i, j int) { (*h)[i], (*h)[j] = (*h)[j], (*h)[i] }
-func (h *minHeapItems) push(item heapItem) { *h = append(*h, item); h.siftUp(h.len()-1) }
-func (h *minHeapItems) pop() (float64, int) {
-	if h.len() == 0 {
-		return 0, -1
-	}
-	item := (*h)[0]
-	last := h.len() - 1
-	(*h)[0] = (*h)[last]
-	*h = (*h)[:last]
-	h.siftDown(0)
-	return item.dist, item.id
-}
-func (h *minHeapItems) siftUp(i int) {
-	for i > 0 {
-		parent := (i - 1) / 2
-		if h.less(i, parent) {
-			h.swap(i, parent)
-			i = parent
-		} else {
-			break
-		}
-	}
-}
-func (h *minHeapItems) siftDown(i int) {
-	n := h.len()
-	for {
-		smallest := i
-		left := 2*i + 1
-		right := 2*i + 2
-		if left < n && h.less(left, smallest) {
-			smallest = left
-		}
-		if right < n && h.less(right, smallest) {
-			smallest = right
-		}
-		if smallest != i {
-			h.swap(i, smallest)
-			i = smallest
-		} else {
-			break
-		}
-	}
-}
+func (h *minHeapItems) swap(i, j int)      { (*h)[i], (*h)[j] = (*h)[j], (*h)[i] }
 
 // minHeap wraps minHeapItems to provide a push/pop interface.
 type minHeap struct{ items minHeapItems }
 
-func (m *minHeap) push(id int, dist float64) { m.items = append(m.items, heapItem{dist: dist, id: id}); m.siftUp(m.len() - 1) }
+func (m *minHeap) push(id int, dist float64) {
+	m.items = append(m.items, heapItem{dist: dist, id: id})
+	m.siftUp(m.Len() - 1)
+}
 func (m *minHeap) pop() (float64, int) {
-	if m.len() == 0 {
+	if m.Len() == 0 {
 		return 0, -1
 	}
 	item := m.items[0]
-	last := m.len() - 1
+	last := m.Len() - 1
 	m.items[0] = m.items[last]
 	m.items = m.items[:last]
 	m.siftDown(0)
 	return item.dist, item.id
 }
-func (m *minHeap) len() int { return len(m.items) }
+func (m *minHeap) Len() int { return len(m.items) }
 func (m *minHeap) siftUp(i int) {
 	for i > 0 {
 		parent := (i - 1) / 2
@@ -517,7 +477,7 @@ func (m *minHeap) siftUp(i int) {
 	}
 }
 func (m *minHeap) siftDown(i int) {
-	n := m.len()
+	n := m.Len()
 	for {
 		smallest := i
 		left := 2*i + 1
@@ -541,8 +501,8 @@ func (m *minHeap) siftDown(i int) {
 
 // HNSWIndexBlob is the persisted form of an HNSWIndex.
 type HNSWIndexBlob struct {
-	Entries []HNSWEntryBlob
-	Layers  int
+	Entries  []HNSWEntryBlob
+	Layers   int
 	MaxLayer int
 }
 
