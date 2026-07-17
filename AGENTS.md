@@ -22,6 +22,9 @@ make ci             # vet + build + test + test-race + lint + bench-short  ← C
 `go run ./cmd/nexus` also works. `nexus check` / `nexus doctor` run
 boot-time diagnostics without starting the server (issue #32).
 
+**CI order:** `go vet` → `go build` → `go test -race` → `golangci-lint`
+(coverage gate runs after test).
+
 **CI coverage floor is 70%** — `make ci` will fail if total coverage
 drops below 70%. Per-package numbers print for visibility; only the
 total gates.
@@ -63,8 +66,8 @@ lives in `internal/ratelimit` because it imports `net/http`. The
 `internal/middleware` package has no `net/http` dependency — keep it that
 way for unit-testability.
 
-**Dependency rule:** `internal/handlers` and `internal/upstream` must
-**never** import `internal/judge`. The judge hooks in via
+**Critical dependency rule:** `internal/handlers` and `internal/upstream`
+must **never** import `internal/judge`. The judge hooks in via
 `JudgeObserver` on `handlers.Deps` — a function-typed field wired in
 `cmd/nexus/main.go`. This keeps the hot path testable without spinning
 up a worker pool.
@@ -217,3 +220,6 @@ to record/replay HTTP calls. All tests run in <2s with `-race`.
 `make test-race` is required to pass before merging — race conditions in
 transport, metrics, budget tracker, and VRAM limiter are easy to miss
 in manual testing.
+
+**Test infrastructure:** `RecordingTransport` (internal/upstream/recording.go)
+records/replays HTTP calls so unit tests have no external dependencies.
