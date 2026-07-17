@@ -715,7 +715,7 @@ func main() {
 	// skip reason (agreement/tool_calls/one_member), similarity ratio, and
 	// speculative winner source. Surfaces as
 	// nexus_fusion_arbiter_skipped_total{reason},
-	// nexus_fusion_similarity_ratio_bucket, and
+	// nexus_fusion_jaccard_similarity_bucket, and
 	// nexus_fusion_speculative_winner_total{source}.
 	fusionArbiterSkipObs := handlers.FusionArbiterSkipObserverFunc(func(e handlers.FusionArbiterSkipEvent) {
 		routeCounters.ObserveFusionArbiterSkip(e.Reason)
