@@ -799,6 +799,7 @@ func main() {
 	}
 
 	chatHandler := handlers.Chat(handlers.Deps{
+<<<<<<< Updated upstream
 		Config:                    cfg,
 		Client:                    httpClient,
 		RAG:                       store,
@@ -828,6 +829,37 @@ func main() {
 		CircuitBreakerObserver:    circuitBreakerObs,
 		ArbiterCache:              arbiterCache,
 		Providers:                 providerRegistry,
+=======
+		Config:                  cfg,
+		Client:                  httpClient,
+		RAG:                     store,
+		SLM:                     slm,
+		MiddlewareChain:         mwChain,
+		ContextAwareRAG:         ctxAwareRAG,
+		Confidence:              confidenceObs,
+		SLMCache:                slmCache,
+		JudgeObserver:           judgeObs,
+		QualityObserver:         qualityO,
+		MetricsObserver:         metricsObs,
+		Recorder:                recorder,
+		Health:                  hpoller,
+		BudgetObserver:          budgetObserver(probeMgr),
+		SpendGuard:              budgetGuard, // nil when budget disabled (issue #220)
+		LocalLimiter:            localLimiter,
+		LocalCooldown:           localCooldown,
+		RouteDecisionObserver:   routeDecisionObs,
+		RejectionObserver:       rejectionObs,
+		FusionOutcomeObserver:    fusionOutcomeObs,
+		FusionArbiterSkipObserver: fusionArbiterSkipObs,
+		RAGObserver:             ragObserver,
+		RAGCacheObserver:        ragCacheObserver,
+		CascadeFallbackObserver: cascadeFallbackObs,
+		ArbiterCacheObserver:    arbiterCacheObserver,
+		PanelPanicObserver:      panelPanicObs,
+		CircuitBreakerObserver:  circuitBreakerObs,
+		ArbiterCache:            arbiterCache,
+		Providers:               providerRegistry,
+>>>>>>> Stashed changes
 		PipelineStageObserver: handlers.PipelineStageObserverFunc(
 			func(e handlers.PipelineStageEvent) {
 				stageCollector.ObservePipelineStage(observability.PipelineStageEvent{

@@ -283,10 +283,17 @@ func (f FusionOutcomeObserverFunc) ObserveFusionOutcome(e FusionOutcomeEvent) { 
 // arbiter skip for granular observability (issue #384). It is emitted
 // in addition to FusionOutcomeEvent when the arbiter was skipped.
 type FusionArbiterSkipEvent struct {
+<<<<<<< Updated upstream
 	RequestID  string
 	Reason     string // "agreement", "tool_calls", or "one_member"
 	Similarity float64
 	Source     string // "local" or "frontier"
+=======
+	RequestID string
+	Reason    string // "agreement", "tool_calls", or "one_member"
+	Similarity float64
+	Source    string // "local" or "frontier"
+>>>>>>> Stashed changes
 }
 
 // FusionArbiterSkipObserver is the hook invoked once per fusion request
