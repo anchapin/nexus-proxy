@@ -57,7 +57,7 @@ type circuitError struct {
 	kind embedderCircuitKind
 }
 
-func (e *circuitError) Error() string { return ErrCircuitOpen.Error() }
+func (e *circuitError) Error() string        { return ErrCircuitOpen.Error() }
 func (e *circuitError) Is(target error) bool { return target == ErrCircuitOpen }
 
 // newCircuitError returns an error that is equal to ErrCircuitOpen (so
@@ -725,11 +725,11 @@ func (s *Store) snapshot() []FewShotExample {
 // OllamaEmbedder calls the Ollama /api/embeddings endpoint. It is safe for
 // concurrent use via a shared http.Client.
 type OllamaEmbedder struct {
-	BaseURL  string // e.g. "http://localhost:11434"
-	Model    string // e.g. "nomic-embed-text"
-	Client   *http.Client
-	BreakerConfig    // optional; zero-value means breaker disabled
-	breaker  health.Breaker
+	BaseURL       string // e.g. "http://localhost:11434"
+	Model         string // e.g. "nomic-embed-text"
+	Client        *http.Client
+	BreakerConfig // optional; zero-value means breaker disabled
+	breaker       health.Breaker
 }
 
 // NewOllamaEmbedder returns an embedder wired to the given Ollama instance.
@@ -815,13 +815,13 @@ func (o *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 // OpenAIEmbedder calls the OpenAI /v1/embeddings endpoint. It is safe for
 // concurrent use via a shared http.Client.
 type OpenAIEmbedder struct {
-	BaseURL      string // e.g. "https://api.openai.com/v1"
-	Model        string // e.g. "text-embedding-3-small"
-	APIKey       string
-	Client       *http.Client
-	Audience     string   // optional OAuth audience for cURL-compatible header
-	BreakerConfig         // optional; zero-value means breaker disabled
-	breaker     health.Breaker
+	BaseURL       string // e.g. "https://api.openai.com/v1"
+	Model         string // e.g. "text-embedding-3-small"
+	APIKey        string
+	Client        *http.Client
+	Audience      string // optional OAuth audience for cURL-compatible header
+	BreakerConfig        // optional; zero-value means breaker disabled
+	breaker       health.Breaker
 }
 
 // NewOpenAIEmbedder returns an embedder wired to the OpenAI embeddings endpoint.
@@ -922,12 +922,12 @@ func (o *OpenAIEmbedder) RecordBreakerSuccess() {
 // CohereEmbedder calls the Cohere /v1/embed endpoint. It is safe for
 // concurrent use via a shared http.Client.
 type CohereEmbedder struct {
-	BaseURL      string // e.g. "https://api.cohere.ai/v1"
-	Model        string // e.g. "embed-english-v3.0"
-	APIKey       string
-	Client       *http.Client
-	BreakerConfig         // optional; zero-value means breaker disabled
-	breaker     health.Breaker
+	BaseURL       string // e.g. "https://api.cohere.ai/v1"
+	Model         string // e.g. "embed-english-v3.0"
+	APIKey        string
+	Client        *http.Client
+	BreakerConfig // optional; zero-value means breaker disabled
+	breaker       health.Breaker
 }
 
 // NewCohereEmbedder returns an embedder wired to the Cohere embeddings endpoint.

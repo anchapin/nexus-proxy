@@ -222,17 +222,17 @@ const (
 // RenderPrometheus scrapes from any goroutine.
 func NewCollector() *Collector {
 	c := &Collector{
-		latencyLocal:    NewHistogram(DefaultBuckets),
-		latencyFrontier: NewHistogram(DefaultBuckets),
-		latencyFusion:   NewHistogram(DefaultBuckets),
-		ttftLocal:       NewHistogram(DefaultBuckets),
-		ttftFrontier:    NewHistogram(DefaultBuckets),
-		ttftFusion:      NewHistogram(DefaultBuckets),
-		stageRAG:        NewHistogram(DefaultBuckets),
-		stagePromptEng:  NewHistogram(DefaultBuckets),
-		stageTOON:       NewHistogram(DefaultBuckets),
-		stageSLM:        NewHistogram(DefaultBuckets),
-		stageUpstream:   NewHistogram(DefaultBuckets),
+		latencyLocal:     NewHistogram(DefaultBuckets),
+		latencyFrontier:  NewHistogram(DefaultBuckets),
+		latencyFusion:    NewHistogram(DefaultBuckets),
+		ttftLocal:        NewHistogram(DefaultBuckets),
+		ttftFrontier:     NewHistogram(DefaultBuckets),
+		ttftFusion:       NewHistogram(DefaultBuckets),
+		stageRAG:         NewHistogram(DefaultBuckets),
+		stagePromptEng:   NewHistogram(DefaultBuckets),
+		stageTOON:        NewHistogram(DefaultBuckets),
+		stageSLM:         NewHistogram(DefaultBuckets),
+		stageUpstream:    NewHistogram(DefaultBuckets),
 		embedderFailures: make(map[string]*atomic.Uint64),
 	}
 	// Pre-allocate SLM confidence histograms for each known category

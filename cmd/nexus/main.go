@@ -59,9 +59,9 @@ type circuitBreakerAdapter struct {
 	incEmbedderFailure func(string)
 }
 
-func (a circuitBreakerAdapter) RecordCircuitFailure(circuit string)       { a.recordFailure(circuit) }
-func (a circuitBreakerAdapter) RecordCircuitRecovery(circuit string)      { a.recordRecovery(circuit) }
-func (a circuitBreakerAdapter) IncEmbedderFailure(kind string)           { a.incEmbedderFailure(kind) }
+func (a circuitBreakerAdapter) RecordCircuitFailure(circuit string)  { a.recordFailure(circuit) }
+func (a circuitBreakerAdapter) RecordCircuitRecovery(circuit string) { a.recordRecovery(circuit) }
+func (a circuitBreakerAdapter) IncEmbedderFailure(kind string)       { a.incEmbedderFailure(kind) }
 
 func main() {
 	startTime := time.Now()
