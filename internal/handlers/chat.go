@@ -100,7 +100,7 @@ type PipelineStageEvent struct {
 
 	// SLM confidence for histogram recording (issue #425).
 	SLMConfidence float64
-	SLMTaskType  string
+	SLMTaskType   string
 }
 
 // PipelineStageObserver is called after each request completes with
@@ -1818,7 +1818,7 @@ func Chat(d Deps) http.Handler {
 				SLMRoutingMs:        slmRoutingMs,
 				UpstreamFirstByteMs: ttftMs,
 				SLMConfidence:       decision.Confidence,
-				SLMTaskType:        decision.TaskType,
+				SLMTaskType:         decision.TaskType,
 			})
 		}
 

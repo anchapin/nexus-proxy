@@ -91,7 +91,7 @@ type ObservabilityEvent struct {
 	// Categorize() bucket. Both are zero when the SLM was not
 	// consulted (guardrail/DSL stages) or on cache hits.
 	SLMConfidence float64
-	SLMTaskType  string
+	SLMTaskType   string
 }
 
 // Collector is the in-process metrics surface. It is safe for
@@ -223,8 +223,8 @@ func NewCollector() *Collector {
 		ttftFusion:      NewHistogram(DefaultBuckets),
 		stageRAG:        NewHistogram(DefaultBuckets),
 		stagePromptEng:  NewHistogram(DefaultBuckets),
-		stageTOON:      NewHistogram(DefaultBuckets),
-		stageSLM:       NewHistogram(DefaultBuckets),
+		stageTOON:       NewHistogram(DefaultBuckets),
+		stageSLM:        NewHistogram(DefaultBuckets),
 		stageUpstream:   NewHistogram(DefaultBuckets),
 	}
 	// Pre-allocate SLM confidence histograms for each known category
@@ -569,7 +569,7 @@ type PipelineStageEvent struct {
 
 	// SLM confidence for histogram recording (issue #425).
 	SLMConfidence float64
-	SLMTaskType  string
+	SLMTaskType   string
 }
 
 // Handler returns an http.Handler that renders stage latency histograms
