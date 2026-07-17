@@ -19,14 +19,19 @@ make fmt            # gofmt -w (in place)
 make ci             # vet + build + test + test-race + lint (bench-short runs but does not block)
 ```
 
-`go run ./cmd/nexus` also works. `nexus check` / `nexus doctor` run
-boot-time diagnostics without starting the server (issue #32).
+`go run ./cmd/nexus` also works.
+
+**CLI subcommands:**
+- `nexus` (no args) — start the proxy server
+- `nexus check` / `nexus doctor` — boot-time diagnostics, exits 0 on success
+- `nexus dashboard` — print daily savings summary to stdout
+- `nexus --version` — print build version
+
+**Go version:** `go.mod` declares `1.25.0`; CI builds with Go 1.26 (see `.github/workflows/ci.yml`). Local dev needs at least 1.25.
 
 **CI coverage floor is 70%** — `make ci` will fail if total coverage
 drops below 70%. Per-package numbers print for visibility; only the
 total gates.
-
-**Go version:** `go.mod` declares `1.25.0`; CI builds with Go 1.26 (see `.github/workflows/ci.yml`). Local dev needs at least 1.25.
 
 **Runtime dependency only:** `modernc.org/sqlite` (metrics store).
 Everything else is stdlib.
@@ -34,10 +39,10 @@ Everything else is stdlib.
 ## Running tests
 
 ```bash
-make test           # all packages
-go test ./internal/handlers/...   # single package
+make test                          # all packages
+go test ./internal/handlers/...    # single package
 go test -run TestChatHandler ./...  # single test
-make test-race     # race detector (required before merge)
+make test-race                     # race detector (required before merge)
 ```
 
 Benchmarks are **non-blocking** in CI — the `bench` job has `continue-on-error: true`. `make ci` does not gate on them.
@@ -50,29 +55,24 @@ internal/
   auth/                 # inbound API-key middleware
   budget/               # 24h rolling frontier spend cap
   concurrencylimit/     # VRAM-aware local-route semaphore
-  config/               # Load() parses all NEXUS_* env vars (no central map)
-  handlers/              # chat.go + health.go (only package that touches net/http)
+  config/               # Load() parses all NEXUS_* env vars
+  handlers/             # chat.go + health.go (only package that touches net/http)
   health/               # Ollama circuit breaker
   judge/                # async LLM-as-a-judge (sampled local completions)
   metrics/              # SQLite metrics store → savings dashboard
-  middleware/           # prompt transforms only (toon, prompt_engine)
+  middleware/           # prompt transforms + security headers
   observability/        # Prometheus collector + /metrics endpoint
   probe/                # nvidia-smi / AMD sysfs VRAM probe
-  providers/             # multi-frontier registry + cost-latency selector
+  providers/            # multi-frontier registry + cost-latency selector
   quality/              # background cargo check / tsc verifier
   rag/                  # PersistentStore (SQLite) + Store + Watcher
-  ratelimit/            # ClientIPResolver + HTTP middleware (NOT in middleware/)
+  ratelimit/            # ClientIPResolver + HTTP middleware
   router/               # Guardrail → DSL → SLM.Decide routing pipeline
   telemetry/            # Recorder interface + JSONLRecorder
   tracing/              # W3C trace context + OTLP/JSON exporter
   transport/            # shared pooled http.Client (NEXUS_HTTP_* tuning)
   upstream/             # upstream.go, cascade.go (Panel + PanelStreaming)
 ```
-
-**Critical: `internal/ratelimit` ≠ `internal/middleware`.** Rate limiting
-lives in `internal/ratelimit` because it imports `net/http`. The
-`internal/middleware` package has no `net/http` dependency — keep it that
-way for unit-testability.
 
 **Dependency rule:** `internal/handlers` and `internal/upstream` must
 **never** import `internal/judge`. The judge hooks in via
@@ -111,13 +111,14 @@ Panel behavior.
 ## Middleware order (do not reorder)
 
 **Inbound HTTP chain** (`cmd/nexus/main.go`, outermost → innermost):
-1. Security headers (`X-Request-Id` sanitize, `X-Content-Type-Options`, etc.)
-2. Rate limiting (per-client-IP; exempts `/healthz /livez /readyz /status /metrics`)
-3. Inbound auth (bearer token; same exemptions; no-op when `NEXUS_PROXY_API_KEY` unset)
-4. Handler dispatch
+1. Security headers (`X-Content-Type-Options`, CSP, HSTS, etc.)
+2. Panic recovery
+3. Auth (bearer token; no-op when `NEXUS_PROXY_API_KEY` unset)
+4. Rate limiter (per-client-IP) wrapping the chat handler
+5. Handler dispatch
 
 Rate limiter fires **before** any prompt-pipeline work — a 429 terminates
-at the HTTP layer.
+at the HTTP layer. Exempt paths: `/healthz /livez /readyz /status /metrics`.
 
 **Prompt pipeline** (`internal/handlers/chat.go`):
 1. `ApplyPromptEngineering` — role/CoT/constraints into system prompt
@@ -197,16 +198,23 @@ overhead when off. API keys redacted; body preview capped at
 
 ## Adding new env vars
 
-Update `internal/config/config.go` — add the field to `Config` struct,
-then parse it inline in `Load()` using a helper:
-- `getEnv("NEXUS_VAR", "default")` — string
-- `getEnvBool("NEXUS_VAR", false)` — bool
-- `getEnvInt("NEXUS_VAR", 0)` — int
-- `getEnvFloat("NEXUS_VAR", 0.0)` — float64
-- `getEnvDuration("NEXUS_VAR", 30*time.Second)` — duration
-- `getEnvAllowEmpty("NEXUS_VAR", "default")` — string (including empty)
+Update `internal/config/config.go` in three places:
+1. Add field to `Config` struct
+2. Add entry to `knownEnvVars` map (case-sensitive allowlist — catches typos)
+3. Parse in `Load()` using a helper:
+   - `getEnv("NEXUS_VAR", "default")` — string
+   - `getEnvBool("NEXUS_VAR", false)` — bool
+   - `getEnvInt("NEXUS_VAR", 0)` — int
+   - `getEnvFloat("NEXUS_VAR", 0.0)` — float64
+   - `getEnvDuration("NEXUS_VAR", 30*time.Second)` — duration
+   - `getEnvAllowEmpty("NEXUS_VAR", "default")` — string (including empty)
+4. Add the variable to `.env.example`
 
-Also add the variable to `.env.example`. No central registry needed.
+## Important env vars not mentioned elsewhere
+
+- `NEXUS_MAX_BODY_BYTES` — max request body size (default 1 MiB). Rejected before allocation via `http.MaxBytesReader`.
+- `NEXUS_MAX_UPSTREAM_RESPONSE_BYTES` — cap on buffered upstream responses (default 10 MiB). Prevents a malicious upstream from exhausting proxy memory.
+- `NEXUS_SHUTDOWN_TIMEOUT` — graceful drain window (default 30s). Must accommodate long frontier SSE streams.
 
 ## Branch conventions
 
