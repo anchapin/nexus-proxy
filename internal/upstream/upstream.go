@@ -18,14 +18,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/anchapin/nexus-proxy/internal/ioutils"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
-
-// defaultMaxResponseBytes is the default cap on upstream response bodies.
-// It is used by ReadAllLimited to prevent memory exhaustion (issue #365).
-// The chat handler's Config.MaxResponseBytes takes precedence when set.
-const defaultMaxResponseBytes = 64 << 20 // 64 MiB
 
 // ErrClientAbort is returned by streamPanelResultAsSSE when the client
 // disconnects mid-stream (EPIPE, ECONNRESET). Callers must treat it as
@@ -96,6 +92,14 @@ func copyAllowedHeaders(dst, src http.Header) {
 		}
 	}
 }
+
+// DefaultMaxUpstreamResponseBytes is the default cap on buffered upstream
+// responses. It is used by BufferedFetchWithContext, FetchPanel, and
+// fetchCascadeStep when no explicit limit is passed. The value (10 MiB)
+// accommodates multi-turn conversations with long contexts while preventing
+// a malicious or misbehaving upstream from exhausting proxy memory
+// (issue #386). Tests can override it via SetMaxUpstreamResponseBytes.
+var DefaultMaxUpstreamResponseBytes int64 = 10 << 20 // 10 MiB
 
 // Client is the minimal interface used by the stream and fusion helpers. The
 // default http.Client satisfies it; tests can pass a stub.
@@ -325,7 +329,15 @@ func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client
 		return fmt.Errorf("upstream: do: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, _ := ioutils.ReadAllLimited(resp.Body, defaultMaxResponseBytes)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, DefaultMaxUpstreamResponseBytes))
+	// err may be nil even when the limit was hit: io.LimitReader returns
+	// io.EOF (not an error) when the limit is reached but all requested
+	// bytes were returned. To detect this truncation we also check whether
+	// the body length equals the limit — if so, the upstream may have
+	// had more data we did not receive.
+	if err != nil || int64(len(respBody)) >= DefaultMaxUpstreamResponseBytes {
+		return fmt.Errorf("upstream: read response: %w", err)
+	}
 
 	// Validate the upstream body is a single JSON object. A misbehaving
 	// upstream returning HTML or plain text would otherwise propagate
@@ -381,7 +393,10 @@ func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName
 		return AssistantMessage{}, fmt.Errorf("fusion: do: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, _ := ioutils.ReadAllLimited(resp.Body, defaultMaxResponseBytes)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, DefaultMaxUpstreamResponseBytes))
+	if err != nil || int64(len(respBody)) >= DefaultMaxUpstreamResponseBytes {
+		return AssistantMessage{}, fmt.Errorf("fusion: read response: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return AssistantMessage{}, fmt.Errorf("fusion: %s status %d: %s", modelName, resp.StatusCode, respBody)
 	}
@@ -627,8 +642,20 @@ func Panel(
 
 // arbiterDefaultTimeout is the per-call arbiter timeout used when
 // Panel's arbiterTimeout argument is <= 0. Mirrors the issue default
-// ("configurable, default 60s").
-const arbiterDefaultTimeout = 60 * time.Second
+// ("configurable, default 60s"). Configured via ConfigureTimeouts.
+var arbiterDefaultTimeout = 60 * time.Second
+
+// perFetchDefaultTimeout is the per-fetch timeout used when Panel's
+// perFetchTimeout argument is <= 0. Configured via ConfigureTimeouts.
+var perFetchDefaultTimeout = 120 * time.Second
+
+// ConfigureTimeouts sets the upstream package-level timeout defaults from
+// config values. Called once at startup from cmd/nexus/main.go after
+// loading config. Issue #385.
+func ConfigureTimeouts(arbiterTimeout, perFetchTimeout time.Duration) {
+	arbiterDefaultTimeout = arbiterTimeout
+	perFetchDefaultTimeout = perFetchTimeout
+}
 
 func withDefaultArbiterTimeout(d time.Duration) time.Duration {
 	if d <= 0 {
@@ -660,7 +687,7 @@ func formatCandidate(r PanelResult) string {
 
 func withDefault(d time.Duration) time.Duration {
 	if d <= 0 {
-		return 120 * time.Second
+		return perFetchDefaultTimeout
 	}
 	return d
 }
@@ -689,6 +716,12 @@ type PanelOutcome struct {
 	// When false and the arbiter was invoked, the synthesis was
 	// fetched from the arbiter and cached for future requests.
 	ArbiterCacheHit bool
+	// SkipReason describes why the arbiter was skipped (issue #384):
+	// "agreement" when Similarity >= agreementThreshold,
+	// "tool_calls" when the speculative winner carried tool calls,
+	// or "one_member" when only one panel member returned content.
+	// Empty when ArbiterSkipped is false.
+	SkipReason string
 }
 
 // PanelStreaming runs the fusion panel with progressive delivery
@@ -788,47 +821,51 @@ func PanelStreaming(
 
 	results := make(chan PanelResult, 2)
 	var cancelLocal, cancelFrontier context.CancelFunc
+
+	g, gCtx := errgroup.WithContext(ctx)
+
 	if skipLocal {
-		// Issue #8: synthetic local failure so the arbiter-style
-		// code paths below degrade cleanly. The handler sets
-		// X-Nexus-Degraded=true; we don't duplicate the header here.
 		results <- PanelResult{
 			Source: "local",
 			Err:    errors.New("ollama unavailable (degraded)"),
 		}
 	} else {
-		go func() {
+		g.Go(func() error {
 			defer func() {
 				if r := recover(); r != nil {
 					IncPanelPanics()
 					results <- PanelResult{Source: "local", Err: fmt.Errorf("panic: %v", r)}
 				}
 			}()
-			ctxLocal, cancel := context.WithTimeout(ctx, withDefault(perFetchTimeout))
+			ctxLocal, cancel := context.WithTimeout(gCtx, withDefault(perFetchTimeout))
 			cancelLocal = cancel
 			defer cancel()
 			msg, err := FetchPanel(ctxLocal, client,
 				localBaseURL+"/v1/chat/completions", "", localModel, body)
 			results <- PanelResult{Source: "local", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
-		}()
+			return nil
+		})
 	}
-	go func() {
+	g.Go(func() error {
 		defer func() {
 			if r := recover(); r != nil {
 				IncPanelPanics()
 				results <- PanelResult{Source: "frontier", Err: fmt.Errorf("panic: %v", r)}
 			}
 		}()
-		ctxFrontier, cancel := context.WithTimeout(ctx, withDefault(perFetchTimeout))
+		ctxFrontier, cancel := context.WithTimeout(gCtx, withDefault(perFetchTimeout))
 		cancelFrontier = cancel
 		defer cancel()
 		msg, err := FetchPanel(ctxFrontier, client,
 			frontierURL, "", frontierModel, body)
 		results <- PanelResult{Source: "frontier", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
-	}()
+		return nil
+	})
+
 	first := <-results
 	second := <-results
 
+	_ = g.Wait()
 	// Both members errored — there's nothing speculative to deliver.
 	// Surface the upstream errors so the handler renders a 502 with
 	// context. The legacy Panel path tolerates one failed member by
@@ -881,6 +918,7 @@ func PanelStreaming(
 	// change may add tool-call-aware arbitration.
 	if len(winner.ToolCalls) > 0 {
 		outcome.ArbiterSkipped = true
+		outcome.SkipReason = "tool_calls"
 		slog.Info("fusion tool-call winner, arbiter skipped",
 			slog.String("request_id", requestID),
 			slog.String("source", outcome.Source),
@@ -911,6 +949,7 @@ func PanelStreaming(
 	// The slow member's result was already consumed in the main flow.
 	if first.Err != nil || second.Err != nil {
 		outcome.ArbiterSkipped = true
+		outcome.SkipReason = "one_member"
 		// Cancel the slow member's goroutine to stop in-flight work.
 		if winnerFromSecond {
 			// winner is second; first (local) is slow
@@ -933,6 +972,7 @@ func PanelStreaming(
 	outcome.Similarity = SimilarityRatio(first.Content, second.Content)
 	if outcome.Similarity >= agreementThreshold {
 		outcome.ArbiterSkipped = true
+		outcome.SkipReason = "agreement"
 		slog.Info("fusion agreement, arbiter skipped",
 			slog.String("request_id", requestID),
 			slog.String("source", outcome.Source),

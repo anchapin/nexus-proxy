@@ -734,15 +734,17 @@ func main() {
 	var slmCache *router.SLMCache
 	if cfg.SLMCacheEnabled() {
 		if cfg.SLMCacheSemanticThreshold > 0 {
-			slmCache = router.NewSLMCacheWithEmbedder(cfg.SLMCacheTTL, ragEmbedder, cfg.SLMCacheSemanticThreshold)
+			slmCache = router.NewSLMCacheWithEmbedder(cfg.SLMCacheTTL, cfg.SLMCacheMaxEntries, ragEmbedder, cfg.SLMCacheSemanticThreshold)
 			slog.Info("slm decision cache enabled (with semantic deduplication)",
 				slog.Duration("ttl", cfg.SLMCacheTTL),
+				slog.Int("max_entries", cfg.SLMCacheMaxEntries),
 				slog.Float64("semantic_threshold", cfg.SLMCacheSemanticThreshold),
 			)
 		} else {
-			slmCache = router.NewSLMCache(cfg.SLMCacheTTL)
+			slmCache = router.NewSLMCache(cfg.SLMCacheTTL, cfg.SLMCacheMaxEntries)
 			slog.Info("slm decision cache enabled",
 				slog.Duration("ttl", cfg.SLMCacheTTL),
+				slog.Int("max_entries", cfg.SLMCacheMaxEntries),
 			)
 		}
 	} else {
