@@ -16,6 +16,9 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
+// defaultMaxResponseBytes is the default cap on upstream response bodies.
+const defaultMaxResponseBytes = 64 << 20 // 64 MiB
+
 // CascadeStep is one member of a Cascade: a single model endpoint the
 // runner will try in order. Name is a short identifier used in logs and
 // the telemetry route_attempted field (e.g. "local", "frontier", "zai").
