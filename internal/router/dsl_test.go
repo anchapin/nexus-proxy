@@ -48,7 +48,7 @@ func TestDSL(t *testing.T) {
 	}
 	// Unicode patterns (issue #422)
 	unicodePatterns := []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\p{Han}`),     // Chinese characters
+		regexp.MustCompile(`(?i)\p{Han}`),    // Chinese characters
 		regexp.MustCompile(`(?i)\p{Arabic}`), // Arabic characters
 	}
 	cases := []struct {
@@ -111,19 +111,19 @@ func TestDSL(t *testing.T) {
 
 func TestToUnicodeLower(t *testing.T) {
 	cases := map[string]string{
-		"":               "",
-		"abc":            "abc",
-		"ABC":            "abc",
-		"Hello, 世界":     "hello, 世界",
-		"  MIX  ":        "  mix  ",
-		"café":           "café",           // no-op: no uppercase
-		"ΑΛΦΑ":           "αλφα",           // Greek uppercase (simplified case fold)
-		"ΕΛΛΑΔΑ":         "ελλαδα",         // Greek uppercase (diacritics stripped by unicode.ToLower)
-		"ΠΑΡΑΔΕΙΓΜΑ":     "παραδειγμα",     // Greek uppercase (diacritics stripped)
-		"REFACTOR":       "refactor",        // ASCII uppercase
-		"RÉFACTOR":       "réfactor",        // Latin-1 uppercase with accent
+		"":           "",
+		"abc":        "abc",
+		"ABC":        "abc",
+		"Hello, 世界":  "hello, 世界",
+		"  MIX  ":    "  mix  ",
+		"café":       "café",       // no-op: no uppercase
+		"ΑΛΦΑ":       "αλφα",       // Greek uppercase (simplified case fold)
+		"ΕΛΛΑΔΑ":     "ελλαδα",     // Greek uppercase (diacritics stripped by unicode.ToLower)
+		"ΠΑΡΑΔΕΙΓΜΑ": "παραδειγμα", // Greek uppercase (diacritics stripped)
+		"REFACTOR":   "refactor",   // ASCII uppercase
+		"RÉFACTOR":   "réfactor",   // Latin-1 uppercase with accent
 		"請解釋這個函數的用法": "請解釋這個函數的用法", // Chinese: no case, unchanged
-		"🎉🎊":           "🎉🎊",           // emoji: no case, unchanged
+		"🎉🎊":         "🎉🎊",         // emoji: no case, unchanged
 	}
 	for in, want := range cases {
 		if got := toUnicodeLower(in); got != want {

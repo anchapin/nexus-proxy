@@ -35,7 +35,7 @@ var (
 	// DefaultUnicodePatterns matches non-ASCII text categories (issue #422).
 	// Operators can override via NEXUS_DSL_UNICODE_PATTERNS.
 	DefaultUnicodePatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\p{Han}`),   // Chinese characters
+		regexp.MustCompile(`(?i)\p{Han}`),    // Chinese characters
 		regexp.MustCompile(`(?i)\p{Arabic}`), // Arabic characters
 	}
 )
