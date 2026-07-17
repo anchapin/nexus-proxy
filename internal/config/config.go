@@ -466,32 +466,116 @@ func DefaultJudgeDBPath() string {
 	return filepath.Join(base, "nexus-proxy", "judge.db")
 }
 
-// Load reads configuration from environment variables, applying defaults
-// suitable for local development. It returns an error only when a required
-// value is malformed; missing optional values fall back to defaults.
-func Load() (Config, error) {
-	cfg := Config{
-		Addr:            getEnv("NEXUS_ADDR", ":8000"),
-		OllamaURL:       strings.TrimRight(getEnv("NEXUS_OLLAMA_URL", "http://localhost:11434"), "/"),
-		RouterModel:     getEnv("NEXUS_ROUTER_MODEL", "qwen3-coder:4b"),
-		LocalModel:      getEnv("NEXUS_LOCAL_MODEL", "qwen3-coder:8b"),
-		EmbeddingModel:  getEnv("NEXUS_EMBEDDING_MODEL", "nomic-embed-text"),
-		FrontierURL:     getEnv("NEXUS_FRONTIER_URL", "https://api.openai.com/v1/chat/completions"),
-		FrontierModel:   getEnv("NEXUS_FRONTIER_MODEL", "gpt-4o"),
-		FrontierKey:     getEnv("NEXUS_FRONTIER_API_KEY", ""),
-		ZAIURL:          getEnv("NEXUS_ZAI_URL", "https://api.z.ai/v1/chat/completions"),
-		ZAIModel:        getEnv("NEXUS_ZAI_MODEL", "glm-4.6"),
-		ZAIKey:          getEnv("NEXUS_ZAI_API_KEY", ""),
-		ProxyAPIKey:     getEnv("NEXUS_PROXY_API_KEY", ""),
-		StatusPublic:    getEnvBool("NEXUS_STATUS_PUBLIC", false),
-		ExamplesDir:     getEnv("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
-		MetaPrompt:      defaultMetaPrompt,
-		TOONNotice:      defaultTOONNotice,
-		TOONUnfenced:    getEnvBool("NEXUS_TOON_UNFENCED", true),
-		MiddlewareChain: getEnv("NEXUS_MIDDLEWARE_CHAIN", ""),
-		TelemetryPath:   getEnvAllowEmpty("NEXUS_TELEMETRY_PATH", "./nexus-telemetry.jsonl"),
-		MetricsDBPath:   getEnvAllowEmpty("NEXUS_METRICS_DB", DefaultMetricsDBPath()),
+// DefaultConfigFilePath returns the default YAML config file path:
+// $XDG_CONFIG_HOME/nexus-proxy/config.yaml if XDG_CONFIG_HOME is set,
+// otherwise ./config.yaml in the current working directory.
+// Operators can override this via NEXUS_CONFIG_FILE.
+func DefaultConfigFilePath() string {
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		return filepath.Join(xdg, "nexus-proxy", "config.yaml")
 	}
+	return "./config.yaml"
+}
+
+// configFilePath returns the effective config file path.
+// NEXUS_CONFIG_FILE takes precedence if set and non-empty;
+// otherwise DefaultConfigFilePath() is used.
+func configFilePath() string {
+	if f := os.Getenv("NEXUS_CONFIG_FILE"); f != "" {
+		return f
+	}
+	return DefaultConfigFilePath()
+}
+
+// Load reads configuration from environment variables and optionally from a
+// YAML config file, applying defaults suitable for local development.
+// The config file path is determined by NEXUS_CONFIG_FILE if set,
+// otherwise $XDG_CONFIG_HOME/nexus-proxy/config.yaml, or ./config.yaml
+// as a fallback. Env vars always take precedence over file values.
+// It returns an error only when a required value is malformed; missing
+// optional values fall back to defaults.
+func Load() (Config, error) {
+	// First pass: load from config file if present.
+	filePath := configFilePath()
+	fileCfg, err := LoadFile(filePath)
+	if err != nil {
+		return Config{}, err
+	}
+
+	// Second pass: build config, starting from file values as baseline
+	// so env vars (applied via the getEnv* helpers) can override them.
+	cfg := Config{}
+
+	// Helper to get a string from file config, falling back to env var
+	// or default. This lets the rest of Load() use the standard getEnv*
+	// pattern while still honouring file values as a lower-precedence base.
+	getFileString := func(key, envKey, def string) string {
+		// Mirrors getEnv: env wins only when non-empty (empty env == unset).
+		if v, ok := os.LookupEnv(envKey); ok && v != "" {
+			return v
+		}
+		// Env is unset or empty; use file value if non-empty, else default.
+		if fileCfg != nil {
+			if v, ok := fileCfg[key]; ok && v != "" {
+				return v
+			}
+		}
+		return def
+	}
+
+	getFileBool := func(key, envKey string, def bool) bool {
+		if fileCfg != nil {
+			if v, ok := fileCfg[key]; ok {
+				// YAML bools are parsed as strings by our LoadFile
+				// (yaml.v3 unmarshals bools to bool, but our LoadFile
+				// serialises them to "true"/"false" strings).
+				switch strings.ToLower(v) {
+				case "true", "1", "yes":
+					return true
+				case "false", "0", "no":
+					return false
+				}
+			}
+		}
+		return getEnvBool(envKey, def)
+	}
+
+	// Apply file-baseline + env-override for each top-level config field.
+	// The getFile* helpers prefer env (via getEnv*) when the env var is
+	// explicitly set, so existing deployments with env vars are unaffected.
+
+	cfg.Addr = getFileString("addr", "NEXUS_ADDR", ":8000")
+	cfg.OllamaURL = strings.TrimRight(getFileString("ollama_url", "NEXUS_OLLAMA_URL", "http://localhost:11434"), "/")
+	cfg.RouterModel = getFileString("router_model", "NEXUS_ROUTER_MODEL", "qwen3-coder:4b")
+	cfg.LocalModel = getFileString("local_model", "NEXUS_LOCAL_MODEL", "qwen3-coder:8b")
+	cfg.EmbeddingModel = getFileString("embedding_model", "NEXUS_EMBEDDING_MODEL", "nomic-embed-text")
+	cfg.FrontierURL = getFileString("frontier_url", "NEXUS_FRONTIER_URL", "https://api.openai.com/v1/chat/completions")
+	cfg.FrontierModel = getFileString("frontier_model", "NEXUS_FRONTIER_MODEL", "gpt-4o")
+	cfg.FrontierKey = getEnv("NEXUS_FRONTIER_API_KEY", "") // secrets via env only
+	cfg.ZAIURL = getFileString("zai_url", "NEXUS_ZAI_URL", "https://api.z.ai/v1/chat/completions")
+	cfg.ZAIModel = getFileString("zai_model", "NEXUS_ZAI_MODEL", "glm-4.6")
+	cfg.ZAIKey = getEnv("NEXUS_ZAI_API_KEY", "")        // secrets via env only
+	cfg.ProxyAPIKey = getEnv("NEXUS_PROXY_API_KEY", "") // secrets via env only
+	cfg.StatusPublic = getFileBool("status_public", "NEXUS_STATUS_PUBLIC", false)
+	cfg.ExamplesDir = getFileString("examples_dir", "NEXUS_EXAMPLES_DIR", "./few_shot_examples")
+	cfg.MetaPrompt = defaultMetaPrompt
+	cfg.TOONNotice = defaultTOONNotice
+	cfg.TOONUnfenced = getFileBool("toon_unfenced", "NEXUS_TOON_UNFENCED", true)
+	cfg.MiddlewareChain = getFileString("middleware_chain", "NEXUS_MIDDLEWARE_CHAIN", "")
+	// TelemetryPath: getEnvAllowEmpty semantics for env (empty = disabled),
+	// then file, then default.
+	if v, ok := os.LookupEnv("NEXUS_TELEMETRY_PATH"); ok {
+		cfg.TelemetryPath = v
+	} else if fileCfg != nil {
+		if v, ok := fileCfg["telemetry_path"]; ok {
+			cfg.TelemetryPath = v
+		} else {
+			cfg.TelemetryPath = "./nexus-telemetry.jsonl"
+		}
+	} else {
+		cfg.TelemetryPath = "./nexus-telemetry.jsonl"
+	}
+	cfg.MetricsDBPath = getFileString("metrics_db", "NEXUS_METRICS_DB", DefaultMetricsDBPath())
 
 	threshold, err := getEnvFloat("NEXUS_RAG_THRESHOLD", 0.55)
 	if err != nil {

@@ -1,53 +1,29 @@
-// Package config — file.go implements a minimal YAML loader for nexus.yaml.
+// Package config — file.go implements a YAML config file loader using
+// gopkg.in/yaml.v3, which properly handles YAML anchors and aliases
+// (issue #424).
 //
-// The parser supports a deliberately tiny subset of YAML so we can stay
-// stdlib-only per the PRD's "zero-dependency" rule (issue #31):
+// The output is a flat map of "section.key" -> string so that the
+// existing resolve* helpers in config.go can parse the string values
+// (strconv for int/float, time.ParseDuration for durations, etc.)
+// without needing to know the YAML type system.
 //
-//   - blank lines are skipped
-//   - full-line comments ("# ...") are skipped
-//   - trailing "# ..." comments after a value are stripped (only outside
-//     quoted strings, so `key: "value with # inside"` is preserved)
-//   - section headers: lines ending with ":" and no value, e.g. `server:`
-//   - top-level key-value pairs: `key: value`
-//   - indented key-value pairs under the most recent section:
-//     `  key: value`
-//   - quoted strings (double or single): surrounding quotes are stripped,
-//     interior contents are preserved verbatim
-//   - type inference is *implicit*: int / float / bool / duration strings
-//     are passed through as their source text because the existing
-//     resolve* helpers parse them with strconv/time.ParseDuration. The
-//     file's YAML literal "30s" becomes the string "30s" — exactly what
-//     env-var form requires.
-//
-// It does NOT support:
-//
-//   - YAML anchors / aliases
-//   - flow sequences ({a, b} or [a, b])
-//   - multi-document streams
-//   - nested sections (only one level of `section:` then `  key:`)
-//   - list / array values
-//   - multi-line scalars (| and >)
-//
-// The output is a flat map of "section.key" -> "string". String values
-// undergo env-variable expansion (${VAR}, $VAR) at parse time so secrets
-// can stay in env vars without committing them to nexus.yaml.
+// String values undergo env-variable expansion (${VAR}, $VAR) at parse
+// time so secrets can stay in env vars without committing them to the
+// config file.
 package config
 
 import (
 	"fmt"
 	"os"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 // LoadFile parses the YAML config file at path into a flat map of
 // "section.key" -> string. A missing file returns (nil, nil) so callers
 // can treat absence as "no file configured" without sprinkling os.Stat
-// checks around the package. Malformed input returns a parse error
-// with the offending line number.
-//
-// The parser does NOT do env expansion for unknown keys — it always
-// returns what it parsed. Translation from "section.key" to env-var
-// names is handled in config.go (see configKeys).
+// checks around the package. Malformed input returns a parse error.
 func LoadFile(path string) (map[string]string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -60,72 +36,27 @@ func LoadFile(path string) (map[string]string, error) {
 }
 
 // ParseYAML exposes the parser for tests that want to feed a string
-// directly instead of writing a temp file. The public surface here is
-// deliberately tiny: LoadFile is the only intended entry point for
-// production code.
+// directly instead of writing a temp file.
 func ParseYAML(content string) (map[string]string, error) {
-	out := make(map[string]string)
-	var section string
-
-	for lineNum, raw := range strings.Split(content, "\n") {
-		lineNum++ // 1-indexed for friendlier error messages
-
-		// Strip trailing CR for Windows-authored files.
-		line := strings.TrimRight(raw, "\r")
-
-		// Skip blank lines and full-line comments (after trim of leading
-		// whitespace, since `# indented comment` is also a comment).
-		if strings.HasPrefix(strings.TrimLeft(line, " \t"), "#") {
-			continue
-		}
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-
-		// Detect indentation. Any leading whitespace means the line is
-		// part of the current section.
-		leading := len(line) - len(strings.TrimLeft(line, " \t"))
-		isIndented := leading > 0
-
-		// Strip a trailing "# comment" portion, respecting quotes.
-		cleaned, _ := stripTrailingComment(line)
-		key, value, hasValue, err := splitKV(cleaned)
-		if err != nil {
-			return nil, fmt.Errorf("config: line %d: %w", lineNum, err)
-		}
-		if key == "" {
-			return nil, fmt.Errorf("config: line %d: empty key", lineNum)
-		}
-
-		if !isIndented {
-			if !hasValue {
-				// Top-level section header. Resets the active section so
-				// the next indented KV lands under it.
-				section = key
-				continue
-			}
-			// Top-level flat KV pair (rare, but valid).
-			section = ""
-			out[key] = value
-			continue
-		}
-
-		// Indented line.
-		if !hasValue {
-			// Nested section header — we don't support nesting, so
-			// reject loudly instead of silently mis-grouping values.
-			return nil, fmt.Errorf("config: line %d: nested sections are not supported (got %q)", lineNum, key)
-		}
-		if section == "" {
-			return nil, fmt.Errorf("config: line %d: indented key %q has no section header above it", lineNum, key)
-		}
-		out[section+"."+key] = value
+	// First pass: unmarshal into a generic map.
+	var raw map[string]any
+	if err := yaml.Unmarshal([]byte(content), &raw); err != nil {
+		return nil, fmt.Errorf("YAML parse error: %w", err)
 	}
 
-	// Apply env-variable expansion once, after the full file is parsed,
-	// so a single value can reference multiple env vars (e.g. a future
-	// user mashing $HOST:$PORT into one field) without us worrying
-	// about ordering.
+	// Second pass: pre-validate indentation constraints before flattening.
+	// We re-parse line-by-line to enforce the one-level-of-indentation rule
+	// that the old parser enforced: no nested sections and no indented KVs
+	// without a section header above them.
+	if err := validateIndentation(content); err != nil {
+		return nil, err
+	}
+
+	// Third pass: flatten "section.key" -> string with env expansion.
+	out := make(map[string]string)
+	flatten("", raw, out)
+
+	// Env-variable expansion on string values.
 	for k, v := range out {
 		out[k] = expandEnv(v)
 	}
@@ -133,10 +64,127 @@ func ParseYAML(content string) (map[string]string, error) {
 	return out, nil
 }
 
+// validateIndentation enforces the one-level-of-indentation rule:
+// - At most one level of section nesting is allowed (section: -> key:).
+// - Indented keys without a section header above them are rejected.
+func validateIndentation(content string) error {
+	type state int
+	const (
+		stateTop state = iota
+		stateSection
+	)
+
+	var (
+		currentState = stateTop
+		lineNum      int
+	)
+
+	for _, raw := range strings.Split(content, "\n") {
+		lineNum++
+		// Strip trailing CR but preserve leading whitespace for indent detection.
+		line := strings.TrimRight(raw, "\r")
+
+		// Skip blank lines and full-line comments.
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+
+		// Compute indentation level BEFORE trimming.
+		leading := len(line) - len(strings.TrimLeft(line, " \t"))
+
+		switch leading {
+		case 0:
+			// Top-level line.
+			if strings.HasSuffix(trimmed, ":") {
+				// Section header at top level.
+				currentState = stateSection
+			} else {
+				// Top-level key-value is fine.
+				currentState = stateTop
+			}
+		case 1:
+			// Indented under a section (1 space is always valid indentation under a section).
+			if currentState != stateSection {
+				return fmt.Errorf("line %d: indented key has no section header above it", lineNum)
+			}
+		default:
+			// leading >= 2: could be deeply indented key under a section (valid)
+			// or a nested section header (invalid). Reject only if this is a section header
+			// (ends with ":") because that would be nesting a section inside a section.
+			if currentState == stateSection && strings.HasSuffix(trimmed, ":") {
+				return fmt.Errorf("line %d: nested sections are not supported", lineNum)
+			}
+			// Leading >= 2 with no active section is also invalid.
+			if currentState != stateSection {
+				return fmt.Errorf("line %d: indented key has no section header above it", lineNum)
+			}
+		}
+	}
+
+	return nil
+}
+
+// flatten recurses through the raw YAML map and produces flat
+// "section.key" -> string entries in out. Section headers (maps with
+// no non-key sub-keys) are treated as section prefixes.
+func flatten(prefix string, node map[string]any, out map[string]string) {
+	for k, v := range node {
+		key := k
+		if prefix != "" {
+			key = prefix + "." + k
+		}
+		switch val := v.(type) {
+		case map[string]any:
+			// Check if this is a "section header" (all values are scalar)
+			// or a nested config block. A nested block has at least one
+			// non-map value; a section header is all maps.
+			isSection := true
+			for _, child := range val {
+				if _, ok := child.(map[string]any); ok {
+					isSection = false
+					break
+				}
+			}
+			if isSection && len(val) > 0 {
+				// Section header: descend with prefix but do NOT emit a
+				// string entry for this key (it has no scalar value).
+				flatten(key, val, out)
+			} else {
+				// Nested config block: flatten into the current prefix.
+				flatten(key, val, out)
+			}
+		case []any:
+			// Lists (e.g., dsl_formatted_patterns) are serialised as
+			// comma-separated strings so the existing getEnvRegexps helper
+			// can parse them identically to comma-separated env var values.
+			out[key] = joinYAMLList(val)
+		case nil:
+			// Null values are skipped.
+		default:
+			// Scalar types: bool, int, float64, string.
+			out[key] = fmt.Sprintf("%v", v)
+		}
+	}
+}
+
+// joinYAMLList converts a YAML list to a comma-separated string,
+// quoting elements that contain commas themselves.
+func joinYAMLList(list []any) string {
+	parts := make([]string, 0, len(list))
+	for _, item := range list {
+		s := fmt.Sprintf("%v", item)
+		if strings.Contains(s, ",") {
+			s = `"` + s + `"`
+		}
+		parts = append(parts, s)
+	}
+	return strings.Join(parts, ",")
+}
+
 // expandEnv expands ${VAR} and $VAR references in value. Unknown
 // variables expand to the empty string. Escaping with \$ keeps a literal
-// dollar sign in the output (handy when the operator wants to write a
-// regex like `$1` in a future prompt).
+// dollar sign in the output.
 func expandEnv(value string) string {
 	var b strings.Builder
 	b.Grow(len(value))
@@ -158,9 +206,6 @@ func expandEnv(value string) string {
 		if i+1 < len(value) && value[i+1] == '{' {
 			end := strings.IndexByte(value[i+2:], '}')
 			if end < 0 {
-				// Unmatched brace — emit the literal so the operator
-				// notices in the boot log instead of silently dropping
-				// characters.
 				b.WriteByte(c)
 				i++
 				continue
@@ -176,7 +221,6 @@ func expandEnv(value string) string {
 			j++
 		}
 		if j == i+1 {
-			// Lone "$" — keep literal.
 			b.WriteByte(c)
 			i++
 			continue
@@ -193,83 +237,6 @@ func isEnvNameByte(b byte) bool {
 		(b >= 'A' && b <= 'Z') ||
 		(b >= '0' && b <= '9') ||
 		b == '_'
-}
-
-// stripTrailingComment removes a "# comment" portion at the end of
-// line, but only when the "#" sits outside a quoted string. The bool
-// return signals whether anything was stripped (handy for callers that
-// want to log it; we currently use it only for tests).
-func stripTrailingComment(line string) (string, bool) {
-	var inQuote byte
-	for i := 0; i < len(line); i++ {
-		c := line[i]
-		if inQuote != 0 {
-			if c == inQuote {
-				inQuote = 0
-			}
-			continue
-		}
-		switch c {
-		case '"', '\'':
-			inQuote = c
-		case '#':
-			return strings.TrimRight(line[:i], " \t"), true
-		}
-	}
-	return line, false
-}
-
-// splitKV parses "key: value" / "key:" / "key" into (key, value,
-// hasValue). The colon is the first unquoted ":" in the line. Values
-// are unquoted (surrounding " or ' are stripped) but otherwise preserved
-// verbatim — type inference happens downstream in the resolve* helpers.
-func splitKV(line string) (key, value string, hasValue bool, err error) {
-	inQuote := byte(0)
-	colonIdx := -1
-	for i := 0; i < len(line); i++ {
-		c := line[i]
-		if inQuote != 0 {
-			if c == inQuote {
-				inQuote = 0
-			}
-			continue
-		}
-		switch c {
-		case '"', '\'':
-			inQuote = c
-		case ':':
-			if colonIdx == -1 {
-				colonIdx = i
-			}
-		}
-	}
-	if colonIdx == -1 {
-		return "", "", false, fmt.Errorf("missing ':' in %q", line)
-	}
-	key = strings.TrimSpace(line[:colonIdx])
-	rest := strings.TrimSpace(line[colonIdx+1:])
-	if key == "" {
-		return "", "", false, fmt.Errorf("empty key in %q", line)
-	}
-	if rest == "" {
-		return key, "", false, nil
-	}
-	return key, unquote(rest), true, nil
-}
-
-// unquote strips a matched pair of surrounding quote characters (either
-// both '"' or both '\”). Mismatched / partial quotes are returned
-// verbatim — the parse error surfaces elsewhere (missing closing quote
-// doesn't actually break our state machine, but it's also not a valid
-// YAML construct, so tests will assert the literal survives).
-func unquote(s string) string {
-	if len(s) >= 2 {
-		first, last := s[0], s[len(s)-1]
-		if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
-			return s[1 : len(s)-1]
-		}
-	}
-	return s
 }
 
 // DiscoverConfigFile returns the first existing config file path in the

@@ -50,7 +50,7 @@ func TestBuildMetrics(t *testing.T) {
 		path     string
 		expected bool // true if should be nil
 	}{
-		{"Disabled", "", true},
+		{"Disabled", "/nonexistent/metrics.db", true},
 		{"Enabled", "metrics.db", false},
 	}
 
