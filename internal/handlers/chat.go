@@ -1092,13 +1092,14 @@ func Chat(d Deps) http.Handler {
 		}
 
 		planner := &router.Planner{
-			SLM:                 d.SLM,
-			Confidence:          d.Confidence,
-			FusionPatterns:      d.Config.DSLFusionPatterns,
-			FormattingRegex:     d.Config.DSLFormattingPatterns,
-			LocalPatternsRegex:  d.LocalPatternsRegex,
-			SLMCache:            d.SLMCache,
-			ConfidenceThreshold: d.Config.SLMConfidenceThreshold,
+			SLM:                  d.SLM,
+			Confidence:           d.Confidence,
+			FusionPatterns:       d.Config.DSLFusionPatterns,
+			FormattingRegex:      d.Config.DSLFormattingPatterns,
+			LocalPatternsRegex:   d.LocalPatternsRegex,
+			UnicodePatternsRegex: d.Config.DSLUnicodePatterns,
+			SLMCache:             d.SLMCache,
+			ConfidenceThreshold:  d.Config.SLMConfidenceThreshold,
 		}
 		decision := planner.Plan(router.PlanRequest{
 			Prompt:          latestPrompt,

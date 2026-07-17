@@ -180,6 +180,11 @@ type Planner struct {
 	// local-patterns branch of the DSL.
 	LocalPatternsRegex []*regexp.Regexp
 
+	// UnicodePatternsRegex is the DSL fast-pass regex(es) for non-ASCII
+	// text categories (issue #422). E.g. \p{Han} matches Chinese characters.
+	// An empty/nil slice uses the hardcoded defaults (Chinese \p{Han}).
+	UnicodePatternsRegex []*regexp.Regexp
+
 	// SLMCache is the optional time-bounded prompt→route cache
 	// (issue #206). When non-nil the planner checks the cache before
 	// calling the SLM; a hit returns the cached route without calling
@@ -265,7 +270,11 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	if len(localPatterns) == 0 {
 		localPatterns = DefaultLocalPatterns
 	}
-	if r, hit := DSL(req.Prompt, fusionPatterns, formattingPatterns, localPatterns); hit {
+	unicodePatterns := p.UnicodePatternsRegex
+	if len(unicodePatterns) == 0 {
+		unicodePatterns = DefaultUnicodePatterns
+	}
+	if r, hit := DSL(req.Prompt, fusionPatterns, formattingPatterns, localPatterns, unicodePatterns); hit {
 		return Decision{
 			Route:           r,
 			Source:          SourceDSL,
