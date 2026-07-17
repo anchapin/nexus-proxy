@@ -673,3 +673,107 @@ func TestVRAMGaugesEmptyMap(t *testing.T) {
 		t.Errorf("VRAMGauges with nil map: got %d gauges, want 0", len(gauges))
 	}
 }
+
+// --- RAG circuit breaker instrumentation (issue #411) ----------------------
+
+func TestRecordRAGBreakerOpen(t *testing.T) {
+	c := NewCollector()
+
+	c.RecordRAGBreakerOpen()
+
+	if state := c.RAGBreakerState(); state != circuitStateOpen {
+		t.Errorf("RAGBreakerState after RecordRAGBreakerOpen = %d, want %d (open)", state, circuitStateOpen)
+	}
+	if trip := c.ragCBTrip.Load(); trip != 1 {
+		t.Errorf("ragCBTrip after RecordRAGBreakerOpen = %d, want 1", trip)
+	}
+}
+
+func TestRecordRAGBreakerHalfOpen(t *testing.T) {
+	c := NewCollector()
+	c.RecordRAGBreakerOpen()
+
+	c.RecordRAGBreakerHalfOpen()
+
+	if state := c.RAGBreakerState(); state != circuitStateHalfOpen {
+		t.Errorf("RAGBreakerState after RecordRAGBreakerHalfOpen = %d, want %d (half_open)", state, circuitStateHalfOpen)
+	}
+}
+
+func TestRecordRAGBreakerRecovery(t *testing.T) {
+	c := NewCollector()
+	c.RecordRAGBreakerOpen()
+	c.RecordRAGBreakerHalfOpen()
+
+	c.RecordRAGBreakerRecovery()
+
+	if state := c.RAGBreakerState(); state != circuitStateClosed {
+		t.Errorf("RAGBreakerState after RecordRAGBreakerRecovery = %d, want %d (closed)", state, circuitStateClosed)
+	}
+}
+
+func TestRecordRAGBreakerOpenMultipleTrips(t *testing.T) {
+	c := NewCollector()
+
+	c.RecordRAGBreakerOpen()
+	c.RecordRAGBreakerOpen()
+	c.RecordRAGBreakerOpen()
+
+	if trip := c.ragCBTrip.Load(); trip != 3 {
+		t.Errorf("ragCBTrip after 3 RecordRAGBreakerOpen = %d, want 3", trip)
+	}
+	// State remains open (2) regardless of trip count
+	if state := c.RAGBreakerState(); state != circuitStateOpen {
+		t.Errorf("RAGBreakerState after 3 trips = %d, want %d (open)", state, circuitStateOpen)
+	}
+}
+
+func TestRAGCircuitBreakerGauges(t *testing.T) {
+	c := NewCollector()
+
+	gauges := c.RAGCircuitBreakerGauges()
+	if len(gauges) != 2 {
+		t.Fatalf("RAGCircuitBreakerGauges: got %d gauges, want 2", len(gauges))
+	}
+
+	var stateGauge, tripGauge GaugeSample
+	for _, g := range gauges {
+		if g.Name == "nexus_rag_circuit_breaker_state" {
+			stateGauge = g
+		}
+		if g.Name == "nexus_rag_circuit_breaker_trip_total" {
+			tripGauge = g
+		}
+	}
+	if stateGauge.Name == "" {
+		t.Errorf("nexus_rag_circuit_breaker_state gauge missing")
+	}
+	if tripGauge.Name == "" {
+		t.Errorf("nexus_rag_circuit_breaker_trip_total gauge missing")
+	}
+	if stateGauge.Value != 0 {
+		t.Errorf("nexus_rag_circuit_breaker_state initial value = %f, want 0", stateGauge.Value)
+	}
+	if tripGauge.Value != 0 {
+		t.Errorf("nexus_rag_circuit_breaker_trip_total initial value = %f, want 0", tripGauge.Value)
+	}
+
+	// After one open event
+	c.RecordRAGBreakerOpen()
+	gauges = c.RAGCircuitBreakerGauges()
+	var stateVal, tripVal float64
+	for _, g := range gauges {
+		if g.Name == "nexus_rag_circuit_breaker_state" {
+			stateVal = g.Value
+		}
+		if g.Name == "nexus_rag_circuit_breaker_trip_total" {
+			tripVal = g.Value
+		}
+	}
+	if stateVal != float64(circuitStateOpen) {
+		t.Errorf("nexus_rag_circuit_breaker_state after open = %f, want %d", stateVal, circuitStateOpen)
+	}
+	if tripVal != 1 {
+		t.Errorf("nexus_rag_circuit_breaker_trip_total after 1 trip = %f, want 1", tripVal)
+	}
+}

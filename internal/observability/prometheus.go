@@ -148,6 +148,16 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total per-request Ollama embedding failures for RAG retrieval (issue #411).",
 		typ:  "counter",
 	},
+	// RAG circuit breaker state gauge (issue #411)
+	"nexus_rag_circuit_breaker_state": {
+		help: "RAG Ollama embedder circuit breaker state: 0=closed, 1=half_open, 2=open (issue #411).",
+		typ:  "gauge",
+	},
+	// RAG circuit breaker trip counter (issue #411)
+	"nexus_rag_circuit_breaker_trip_total": {
+		help: "Total number of times the RAG Ollama embedder circuit breaker has tripped (transitioned to open state) (issue #411).",
+		typ:  "counter",
+	},
 	// RAG watcher gauges (issue #367)
 	"nexus_rag_watcher_files_indexed": {
 		help: "Number of files processed (indexed or removed) in the last watcher scan.",
@@ -336,6 +346,8 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	gauges := collectGauges(providers)
 	// RAG watcher gauges (issue #367)
 	gauges = append(gauges, c.RAGWatcherGauges()...)
+	// RAG circuit breaker gauges (issue #411)
+	gauges = append(gauges, c.RAGCircuitBreakerGauges()...)
 	// VRAM gauges (issue #394)
 	gauges = append(gauges, c.VRAMGauges()...)
 

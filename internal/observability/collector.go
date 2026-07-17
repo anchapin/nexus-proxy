@@ -175,6 +175,15 @@ type Collector struct {
 	// escalation to frontier.
 	ragInjectionCausedEscalation atomic.Uint64
 
+	// --- RAG circuit breaker instrumentation (issue #411) ----------------
+	//
+	// Dedicated RAG circuit breaker state for the standalone
+	// nexus_rag_circuit_breaker_state gauge. This is separate from
+	// the labelled cbState map so the RAG metrics are always present
+	// (not gated on the first circuit-breaker event being recorded).
+	ragCBState atomic.Int32 // 0=closed, 1=half_open, 2=open
+	ragCBTrip  atomic.Uint64
+
 	// --- Circuit breaker instrumentation (issue #304, #411) ---------------
 	//
 	// Tracks the state of each named circuit breaker (ollama, rag).
@@ -552,6 +561,45 @@ func (c *Collector) CircuitBreakerGauges() []GaugeSample {
 		)
 	}
 	return out
+}
+
+// RecordRAGBreakerOpen records a RAG circuit breaker transition to open state
+// (issue #411). Called from main.go via the OnBreakerOpen callback when the
+// OllamaEmbedder circuit breaker trips due to consecutive embedding failures.
+func (c *Collector) RecordRAGBreakerOpen() {
+	c.ragCBState.Store(circuitStateOpen)
+	c.ragCBTrip.Add(1)
+}
+
+// RecordRAGBreakerHalfOpen records a RAG circuit breaker transition to half-open
+// state (issue #411). Used when the breaker begins recovery but has not yet
+// fully closed.
+func (c *Collector) RecordRAGBreakerHalfOpen() {
+	c.ragCBState.Store(circuitStateHalfOpen)
+}
+
+// RecordRAGBreakerRecovery records a RAG circuit breaker transition back to
+// closed state (issue #411). Called when the cooldown window expires or a
+// RAG request succeeds after the breaker was open.
+func (c *Collector) RecordRAGBreakerRecovery() {
+	c.ragCBState.Store(circuitStateClosed)
+}
+
+// RAGBreakerState returns the current RAG circuit breaker state:
+// 0=closed, 1=half_open, 2=open.
+func (c *Collector) RAGBreakerState() int32 {
+	return c.ragCBState.Load()
+}
+
+// RAGCircuitBreakerGauges returns the live state of the RAG circuit breaker
+// as unlabelled gauge samples for the Prometheus renderer (issue #411).
+// Emits nexus_rag_circuit_breaker_state (0=closed, 1=half_open, 2=open) and
+// nexus_rag_circuit_breaker_trip_total.
+func (c *Collector) RAGCircuitBreakerGauges() []GaugeSample {
+	return []GaugeSample{
+		{Name: "nexus_rag_circuit_breaker_state", Value: float64(c.ragCBState.Load())},
+		{Name: "nexus_rag_circuit_breaker_trip_total", Value: float64(c.ragCBTrip.Load())},
+	}
 }
 
 // getOrCreateCircuit returns the state for a named circuit, creating

@@ -133,6 +133,10 @@ func main() {
 		ollamaEmb.OnBreakerTrip = func() {
 			circuitCollector.RecordCircuitTrip("rag")
 		}
+		ollamaEmb.OnBreakerOpen = func() {
+			circuitCollector.RecordRAGBreakerOpen()
+			circuitCollector.RecordCircuitFailure("rag")
+		}
 	}
 	slog.Info("rag embedder configured",
 		slog.String("type", string(cfg.EmbedderType)),
