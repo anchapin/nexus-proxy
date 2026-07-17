@@ -85,18 +85,15 @@ up a worker pool.
 `internal/router`: Guardrail → DSL → SLM.Decide. Every failure defaults
 to **frontier** (safe choice).
 
-| Trigger | Route |
-| ------- | ----- |
-| `len(prompt)/4 > NEXUS_TOKEN_GUARDRAIL` | `frontier` (VRAM guardrail) |
-| Prompt matches `NEXUS_DSL_FUSION_PATTERNS` (default: `architectural design\|system architecture`) | `fusion` |
-| Prompt matches `NEXUS_DSL_FORMATTING_PATTERNS` (default: `css\|format\|docstring\|lint\|typo\|boilerplate\|debug\|fix bug\|git commit\|sql query\|parse json\|validate input\|regex\|api endpoint\|test\|optimize\|readme`) | `local` |
-| Prompt matches `NEXUS_DSL_LOCAL_PATTERNS` (default: `refactor\|security scan\|generate tests\|explain this code\|performance analysis`) | `local` |
-| Otherwise | SLM decides (qwen3-coder:4b JSON decision) |
-| SLM confidence < threshold OR SLM fails | `frontier` (escalation) |
-
 DSL patterns are **comma-separated regexes** (set via env var, not a map).
-`NEXUS_DSL_FUSION_PATTERNS` and `NEXUS_DSL_LOCAL_PATTERNS` accept Go
-regex syntax.
+Patterns in `NEXUS_DSL_*` use Go regex syntax with `(?i)` for case-insensitive
+matching (as shown in `.env.example`). Default patterns:
+
+| Env var | Default |
+|---|---|
+| `NEXUS_DSL_FORMATTING_PATTERNS` | `(?i)\b(css\|format\|docstring\|lint\|typo\|boilerplate\|debug\|fix bug\|git commit\|sql query\|parse json\|validate input\|regex\|api endpoint\|test\|optimize\|readme)\b` |
+| `NEXUS_DSL_FUSION_PATTERNS` | `(?i)\b(architectural design\|system architecture)\b` |
+| `NEXUS_DSL_LOCAL_PATTERNS` | `(?i)\b(refactor\|security scan\|generate tests\|explain this code\|performance analysis)\b` |
 
 **SLM decision cache:** `NEXUS_SLM_CACHE_MAX_ENTRIES` + `NEXUS_SLM_CACHE_TTL`
 (default 512 entries / 30s). Semantic dedup via
@@ -209,6 +206,20 @@ Update `internal/config/config.go` in three places:
    - `getEnvDuration("NEXUS_VAR", 30*time.Second)` — duration
    - `getEnvAllowEmpty("NEXUS_VAR", "default")` — string (including empty)
 4. Add the variable to `.env.example`
+
+## Prompt pipeline composability
+
+`NEXUS_MIDDLEWARE_CHAIN` overrides the default prompt pipeline order
+(default: `promptEngineering,rag,compressJSONBlocks,appendSystemNote`).
+Available middleware: `promptEngineering`, `rag`, `compressJSONBlocks`,
+`appendSystemNote`. Reorder or omit as needed.
+
+## OpenAI-compatible model discovery
+
+`NEXUS_MODELS_ENDPOINT=true` (default) serves `GET /v1/models` and
+`GET /v1/models/{id}` with OpenAI-compatible responses. Ollama's model
+list is cached per `NEXUS_MODELS_CACHE_TTL` (default 5m). Set `false` to
+disable discovery entirely.
 
 ## Important env vars not mentioned elsewhere
 
