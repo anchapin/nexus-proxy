@@ -17,6 +17,7 @@ import (
 )
 
 // defaultMaxResponseBytes is the default cap on upstream response bodies.
+// Used by ReadAllLimited to prevent memory exhaustion.
 const defaultMaxResponseBytes = 64 << 20 // 64 MiB
 
 // CascadeStep is one member of a Cascade: a single model endpoint the

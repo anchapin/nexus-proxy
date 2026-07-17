@@ -27,6 +27,24 @@ import (
 // frontier streams occasionally exceed 10 s.
 var DefaultBuckets = []float64{5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000}
 
+// ConfidenceBuckets are the histogram bucket upper bounds for SLM
+// confidence scores (issue #425). They span 0.1 through 1.0 in 0.1
+// increments; the implicit +Inf bucket catches any value > 1.0.
+var ConfidenceBuckets = []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0}
+
+// slmConfidenceCategories are the fixed low-cardinality task-category
+// labels used for the SLM confidence histogram (issue #425). They
+// mirror the Category* constants in internal/router/confidence.go.
+var slmConfidenceCategories = []string{
+	"css",
+	"refactoring",
+	"debugging",
+	"architecture",
+	"boilerplate",
+	"documentation",
+	"other",
+}
+
 // ObservabilityEvent is the per-request payload the chat handler
 // dispatches to the Collector via the ObservabilityObserver hook. Every
 // proxied request — success or failure — produces exactly one event;
@@ -67,6 +85,13 @@ type ObservabilityEvent struct {
 	TOONCompressionMs   int64 // JSON array compression
 	SLMRoutingMs        int64 // SLM routing decision (including DSL fast-pass)
 	UpstreamFirstByteMs int64 // upstream call to first byte (TTFT minus proxy overhead)
+
+	// SLM confidence recording (issue #425). Confidence is 0.0..1.0
+	// from the judge-guided adaptive routing store; TaskType is the
+	// Categorize() bucket. Both are zero when the SLM was not
+	// consulted (guardrail/DSL stages) or on cache hits.
+	SLMConfidence float64
+	SLMTaskType  string
 }
 
 // Collector is the in-process metrics surface. It is safe for
@@ -160,6 +185,15 @@ type Collector struct {
 	// Protected by cbMu; read via atomic for hot path.
 	cbMu    sync.RWMutex
 	cbState map[string]*circuitBreakerState
+
+	// --- SLM confidence histogram (issue #425) --------------------
+	//
+	// Per-task-category confidence histograms. Maps category name to
+	// histogram. Pre-allocated in NewCollector so ObserveSLMConfidence
+	// only needs a read lock to find the histogram; the histogram's
+	// Observe method itself is lock-free.
+	slmConfidenceMu         sync.RWMutex
+	slmConfidenceHistograms map[string]*Histogram
 }
 
 // circuitBreakerState holds the atomic state for one named circuit.
@@ -180,7 +214,7 @@ const (
 // The returned collector is ready to receive Submit calls and
 // RenderPrometheus scrapes from any goroutine.
 func NewCollector() *Collector {
-	return &Collector{
+	c := &Collector{
 		latencyLocal:    NewHistogram(DefaultBuckets),
 		latencyFrontier: NewHistogram(DefaultBuckets),
 		latencyFusion:   NewHistogram(DefaultBuckets),
@@ -189,10 +223,19 @@ func NewCollector() *Collector {
 		ttftFusion:      NewHistogram(DefaultBuckets),
 		stageRAG:        NewHistogram(DefaultBuckets),
 		stagePromptEng:  NewHistogram(DefaultBuckets),
-		stageTOON:       NewHistogram(DefaultBuckets),
-		stageSLM:        NewHistogram(DefaultBuckets),
+		stageTOON:      NewHistogram(DefaultBuckets),
+		stageSLM:       NewHistogram(DefaultBuckets),
 		stageUpstream:   NewHistogram(DefaultBuckets),
 	}
+	// Pre-allocate SLM confidence histograms for each known category
+	// (issue #425). Pre-allocation means ObserveSLMConfidence only
+	// needs a read lock to find the histogram; Histogram.Observe
+	// itself is lock-free.
+	c.slmConfidenceHistograms = make(map[string]*Histogram, len(slmConfidenceCategories))
+	for _, cat := range slmConfidenceCategories {
+		c.slmConfidenceHistograms[cat] = NewHistogram(ConfidenceBuckets)
+	}
+	return c
 }
 
 // Submit records one ObservabilityEvent. Called exactly once per
@@ -269,6 +312,14 @@ func (c *Collector) Submit(e ObservabilityEvent) {
 	}
 	if e.UpstreamFirstByteMs > 0 {
 		c.stageUpstream.Observe(float64(e.UpstreamFirstByteMs))
+	}
+	// SLM confidence histogram (issue #425). Recorded when both
+	// Confidence > 0 and TaskType is a known category. A zero
+	// confidence means the SLM was not consulted (guardrail/DSL
+	// path); an empty TaskType means cache hit or no confidence
+	// store was wired.
+	if e.SLMConfidence > 0 && e.SLMTaskType != "" {
+		c.ObserveSLMConfidence(e.SLMTaskType, e.SLMConfidence)
 	}
 }
 
@@ -482,6 +533,9 @@ func (c *Collector) getOrCreateCircuit(name string) *circuitBreakerState {
 // ObservePipelineStage records per-stage timing breakdown from the chat
 // handler (issue #300). Each field is milliseconds spent in that stage;
 // 0 when the stage was skipped. Safe for concurrent use.
+//
+// Also records the SLM confidence histogram (issue #425) when
+// SLMConfidence > 0 and SLMTaskType is non-empty.
 func (c *Collector) ObservePipelineStage(e PipelineStageEvent) {
 	if e.RAGRetrievalMs > 0 {
 		c.stageRAG.Observe(float64(e.RAGRetrievalMs))
@@ -498,6 +552,10 @@ func (c *Collector) ObservePipelineStage(e PipelineStageEvent) {
 	if e.UpstreamFirstByteMs > 0 {
 		c.stageUpstream.Observe(float64(e.UpstreamFirstByteMs))
 	}
+	// SLM confidence histogram (issue #425).
+	if e.SLMConfidence > 0 && e.SLMTaskType != "" {
+		c.ObserveSLMConfidence(e.SLMTaskType, e.SLMConfidence)
+	}
 }
 
 // PipelineStageEvent mirrors handlers.PipelineStageEvent so the
@@ -508,6 +566,10 @@ type PipelineStageEvent struct {
 	TOONCompressionMs   int64
 	SLMRoutingMs        int64
 	UpstreamFirstByteMs int64
+
+	// SLM confidence for histogram recording (issue #425).
+	SLMConfidence float64
+	SLMTaskType  string
 }
 
 // Handler returns an http.Handler that renders stage latency histograms
@@ -518,6 +580,32 @@ func (c *Collector) Handler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		RenderPrometheus(w, c)
 	})
+}
+
+// --- SLM confidence histogram (issue #425) ------------------------------
+//
+// ObserveSLMConfidence records a confidence observation for the given task
+// category. It is called from Submit (which is invoked in the handler's
+// request goroutine after the planner returns a Decision with a
+// confidence value). The histogram itself is pre-allocated per category
+// in NewCollector so this method only needs a read lock to find it;
+// Histogram.Observe is lock-free.
+func (c *Collector) ObserveSLMConfidence(category string, confidence float64) {
+	c.slmConfidenceMu.RLock()
+	h, ok := c.slmConfidenceHistograms[category]
+	c.slmConfidenceMu.RUnlock()
+	if ok && h != nil {
+		h.Observe(confidence)
+	}
+}
+
+// SLMConfidenceHistograms returns the per-category SLM confidence
+// histograms for rendering. Returns nil if the collector is not yet
+// initialized.
+func (c *Collector) SLMConfidenceHistograms() map[string]*Histogram {
+	c.slmConfidenceMu.RLock()
+	defer c.slmConfidenceMu.RUnlock()
+	return c.slmConfidenceHistograms
 }
 
 // Histogram}

@@ -292,6 +292,12 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	// Per-stage pipeline latency histograms (issue #300).
 	writeStageHistogram(w, c)
 
+	// SLM confidence histogram (issue #425). Written only when the
+	// histograms map is non-nil and contains at least one observation.
+	if hists := c.SLMConfidenceHistograms(); len(hists) > 0 {
+		writeSLMConfidenceHistogram(w, hists)
+	}
+
 	// --- Gauges (live readings from providers) --------------------------
 
 	gauges := collectGauges(providers)
@@ -436,6 +442,38 @@ func writeStageHistogram(w io.Writer, c *Collector) {
 			s.name, formatFloat(sum))
 		fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_count{stage=%q} %d\n",
 			s.name, count)
+	}
+}
+
+// writeSLMConfidenceHistogram emits the nexus_slm_confidence_histogram
+// histogram family labelled by task_category (issue #425). Categories
+// are emitted in sorted order for deterministic output.
+func writeSLMConfidenceHistogram(w io.Writer, histograms map[string]*Histogram) {
+	writeMeta(w, "nexus_slm_confidence_histogram",
+		"SLM routing confidence score distribution by task category (issue #425).",
+		"histogram")
+	// Sort categories for deterministic output.
+	categories := sortedKeys(histograms)
+	for _, cat := range categories {
+		h := histograms[cat]
+		if h == nil {
+			continue
+		}
+		cum, upperBounds, sum, count := h.Snapshot()
+		// Skip completely empty histograms.
+		if count == 0 {
+			continue
+		}
+		for i, ub := range upperBounds {
+			fmt.Fprintf(w, "nexus_slm_confidence_histogram_bucket{task_category=%q,le=%q} %d\n",
+				cat, formatFloat(ub), cum[i])
+		}
+		fmt.Fprintf(w, "nexus_slm_confidence_histogram_bucket{task_category=%q,le=%q} %d\n",
+			cat, "+Inf", cum[len(upperBounds)])
+		fmt.Fprintf(w, "nexus_slm_confidence_histogram_sum{task_category=%q} %s\n",
+			cat, formatFloat(sum))
+		fmt.Fprintf(w, "nexus_slm_confidence_histogram_count{task_category=%q} %d\n",
+			cat, count)
 	}
 }
 

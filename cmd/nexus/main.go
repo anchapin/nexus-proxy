@@ -799,6 +799,8 @@ func main() {
 					TOONCompressionMs:   e.TOONCompressionMs,
 					SLMRoutingMs:        e.SLMRoutingMs,
 					UpstreamFirstByteMs: e.UpstreamFirstByteMs,
+					SLMConfidence:       e.SLMConfidence,
+					SLMTaskType:         e.SLMTaskType,
 				})
 			},
 		),
