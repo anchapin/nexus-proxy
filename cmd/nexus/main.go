@@ -117,10 +117,22 @@ func main() {
 	// collaborator so all traffic shares the same transport.
 	httpClient := transport.NewFromEnv()
 
+	// Circuit breaker metrics collector (issue #304, #411). Created early so it
+	// is available for wiring into the chat handler Deps and the embedder
+	// OnBreakerTrip callback.
+	circuitCollector := observability.NewCollector()
+
 	emb, err := rag.NewEmbedder(cfg.EmbedderType, cfg.EmbedderBaseURL, cfg.EmbeddingModel, cfg.FrontierKey, httpClient,
 		rag.BreakerConfig{Threshold: cfg.RAGCircuitBreakerThreshold, Cooldown: cfg.RAGCircuitBreakerCooldown})
 	if err != nil {
 		log.Fatalf("rag embedder: %v", err)
+	}
+	// Wire the embedder trip callback so circuit breaker trips are
+	// recorded in the metrics collector (issue #411).
+	if ollamaEmb, ok := emb.(*rag.OllamaEmbedder); ok {
+		ollamaEmb.OnBreakerTrip = func() {
+			circuitCollector.RecordCircuitTrip("rag")
+		}
 	}
 	slog.Info("rag embedder configured",
 		slog.String("type", string(cfg.EmbedderType)),
@@ -361,10 +373,6 @@ func main() {
 			tracing.RegisterExporter(exporter)
 		}
 	}
-
-	// Circuit breaker metrics collector (issue #304). Created early so it
-	// is available for wiring into the chat handler Deps.
-	circuitCollector := observability.NewCollector()
 
 	// Wire RAG watcher metrics into the /metrics output (issue #367).
 	if ragWatcher != nil {
@@ -833,6 +841,7 @@ func main() {
 		FusionArbiterSkipObserver: fusionArbiterSkipObs,
 		RAGObserver:               ragObserver,
 		RAGCacheObserver:          ragCacheObserver,
+		RAGMetrics:                circuitCollector, // issue #411
 		CascadeFallbackObserver:   cascadeFallbackObs,
 		ArbiterCacheObserver:      arbiterCacheObserver,
 		PanelPanicObserver:        panelPanicObs,

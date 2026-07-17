@@ -2279,3 +2279,29 @@ func TestChatFrontierCostUsesFrontierCostPer1K(t *testing.T) {
 			map[bool]string{true: "CORRECT use of FrontierCostPer1K", false: "INCORRECT use of JudgeCostPer1KUSD"}[ratio > 4.5])
 	}
 }
+
+func TestTotalTokenSavings(t *testing.T) {
+	t.Run("compression reduces tokens", func(t *testing.T) {
+		orig := []byte(`[{"a":1},{"a":2},{"a":3},{"a":4},{"a":5}]`)
+		compressed := []byte(`items[5]{a}: 1, 2, 3, 4, 5`)
+		got := totalTokenSavings(orig, compressed)
+		if got <= 0 {
+			t.Errorf("totalTokenSavings = %d, want > 0 (token savings from compression)", got)
+		}
+	})
+	t.Run("expansion returns zero", func(t *testing.T) {
+		orig := []byte(`[{"a":1}]`)
+		compressed := []byte(`items[1]{a}: very long schema header that is longer than original`)
+		got := totalTokenSavings(orig, compressed)
+		if got != 0 {
+			t.Errorf("totalTokenSavings = %d, want 0 (expansion case)", got)
+		}
+	})
+	t.Run("equal length returns zero", func(t *testing.T) {
+		same := []byte(`[{"x":1}]`)
+		got := totalTokenSavings(same, same)
+		if got != 0 {
+			t.Errorf("totalTokenSavings = %d, want 0 (equal case)", got)
+		}
+	})
+}
