@@ -5,6 +5,7 @@ module github.com/anchapin/nexus-proxy
 go 1.25.0
 
 require (
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/pkoukk/tiktoken-go v0.1.8
 	golang.org/x/sync v0.20.0
 	gopkg.in/yaml.v3 v3.0.1
