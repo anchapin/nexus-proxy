@@ -86,12 +86,21 @@ func (f LatencyObserverFunc) ObserveLatency(e LatencyEvent) { f(e) }
 // PipelineStageEvent carries per-stage timing breakdown for a single
 // request (issue #300). Each field is integer milliseconds spent in
 // that pipeline stage; 0 when the stage was skipped or not applicable.
+//
+// SLMConfidence and SLMTaskType carry the routing decision metadata
+// (issue #425). Confidence is 0.0..1.0 from the judge-guided
+// adaptive routing store; TaskType is the Categorize() bucket.
+// Both are 0/"" when the SLM was not consulted (guardrail/DSL path).
 type PipelineStageEvent struct {
 	RAGRetrievalMs      int64
 	PromptEngineeringMs int64
 	TOONCompressionMs   int64
 	SLMRoutingMs        int64
 	UpstreamFirstByteMs int64 // TTFT minus all proxy overhead stages
+
+	// SLM confidence for histogram recording (issue #425).
+	SLMConfidence float64
+	SLMTaskType   string
 }
 
 // PipelineStageObserver is called after each request completes with
@@ -1808,6 +1817,8 @@ func Chat(d Deps) http.Handler {
 				TOONCompressionMs:   toonCompressionMs,
 				SLMRoutingMs:        slmRoutingMs,
 				UpstreamFirstByteMs: ttftMs,
+				SLMConfidence:       decision.Confidence,
+				SLMTaskType:         decision.TaskType,
 			})
 		}
 
