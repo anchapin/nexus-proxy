@@ -698,6 +698,14 @@ func TestPlanner_ConfidenceThresholdHardOverride(t *testing.T) {
 	})
 }
 
+func TestDecisionSource_TraceReason_RAGEscalation(t *testing.T) {
+	// issue #404: SourceRAGEscalation should map to "rag-escalation"
+	// for backward-compatible trace reason labeling.
+	if got := SourceRAGEscalation.TraceReason(); got != "rag-escalation" {
+		t.Errorf("SourceRAGEscalation.TraceReason() = %q, want %q", got, "rag-escalation")
+	}
+}
+
 // stringOf returns a String of n copies of byte b. A test helper for
 // generating oversized prompts without a strings.Builder import.
 func stringOf(b byte, n int) string {

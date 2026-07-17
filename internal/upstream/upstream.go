@@ -722,6 +722,12 @@ type PanelOutcome struct {
 	// or "one_member" when only one panel member returned content.
 	// Empty when ArbiterSkipped is false.
 	SkipReason string
+	// GoroutineWasteSeconds is the elapsed time between speculative
+	// winner selection and slow-member cancellation (issue #406). It is
+	// non-zero only when the arbiter was skipped (ArbiterSkipped=true)
+	// and the slow member was cancelled. 0 when the arbiter was invoked
+	// (disagreement path) or when no cancellation occurred.
+	GoroutineWasteSeconds float64
 }
 
 // PanelStreaming runs the fusion panel with progressive delivery
@@ -896,6 +902,10 @@ func PanelStreaming(
 	}
 	outcome.Source = winner.Source
 
+	// Issue #406: record when the speculative winner is selected so we
+	// can measure how long the slow member ran after it was no longer needed.
+	winnerSelectedAt := time.Now()
+
 	if err := streamPanelResultAsSSE(w, winner); err != nil {
 		if errors.Is(err, ErrClientAbort) {
 			// Client disconnected mid-stream. The speculative chunk
@@ -930,16 +940,25 @@ func PanelStreaming(
 		// Cancel the slow member's goroutine to stop in-flight work.
 		// The slow member's result was already consumed in the main
 		// flow (second := <-results), so no drain is needed.
+		outcome.GoroutineWasteSeconds = time.Since(winnerSelectedAt).Seconds()
 		if winnerFromSecond {
 			// winner is second; first (local) is slow
 			if cancelLocal != nil {
 				cancelLocal()
 			}
+			slog.Debug("fusion slow local cancelled",
+				slog.String("request_id", requestID),
+				slog.Float64("waste_seconds", outcome.GoroutineWasteSeconds),
+			)
 		} else {
 			// winner is first; second (frontier) is slow
 			if cancelFrontier != nil {
 				cancelFrontier()
 			}
+			slog.Debug("fusion slow frontier cancelled",
+				slog.String("request_id", requestID),
+				slog.Float64("waste_seconds", outcome.GoroutineWasteSeconds),
+			)
 		}
 		if err := writeSSEDone(w); err != nil {
 			return outcome, err
@@ -953,17 +972,26 @@ func PanelStreaming(
 	if first.Err != nil || second.Err != nil {
 		outcome.ArbiterSkipped = true
 		outcome.SkipReason = "one_member"
+		outcome.GoroutineWasteSeconds = time.Since(winnerSelectedAt).Seconds()
 		// Cancel the slow member's goroutine to stop in-flight work.
 		if winnerFromSecond {
 			// winner is second; first (local) is slow
 			if cancelLocal != nil {
 				cancelLocal()
 			}
+			slog.Debug("fusion slow local cancelled",
+				slog.String("request_id", requestID),
+				slog.Float64("waste_seconds", outcome.GoroutineWasteSeconds),
+			)
 		} else {
 			// winner is first; second (frontier) is slow
 			if cancelFrontier != nil {
 				cancelFrontier()
 			}
+			slog.Debug("fusion slow frontier cancelled",
+				slog.String("request_id", requestID),
+				slog.Float64("waste_seconds", outcome.GoroutineWasteSeconds),
+			)
 		}
 		if err := writeSSEDone(w); err != nil {
 			return outcome, err
@@ -985,16 +1013,25 @@ func PanelStreaming(
 		// Cancel the slow member's goroutine to stop in-flight work.
 		// Both results are already consumed from the channel (lines 499-500),
 		// so no drain is needed; cancelling aborts the slow HTTP request.
+		outcome.GoroutineWasteSeconds = time.Since(winnerSelectedAt).Seconds()
 		if winnerFromSecond {
 			// winner is second; first (local) is slow
 			if cancelLocal != nil {
 				cancelLocal()
 			}
+			slog.Debug("fusion slow local cancelled",
+				slog.String("request_id", requestID),
+				slog.Float64("waste_seconds", outcome.GoroutineWasteSeconds),
+			)
 		} else {
 			// winner is first; second (frontier) is slow
 			if cancelFrontier != nil {
 				cancelFrontier()
 			}
+			slog.Debug("fusion slow frontier cancelled",
+				slog.String("request_id", requestID),
+				slog.Float64("waste_seconds", outcome.GoroutineWasteSeconds),
+			)
 		}
 		if err := writeSSEDone(w); err != nil {
 			return outcome, err

@@ -168,6 +168,13 @@ type Collector struct {
 	// so operators can build alerts for "breaker about to trip".
 	ragEmbedFailures atomic.Uint64
 
+	// --- RAG budget escalation instrumentation (issue #404) ---------------
+	//
+	// ragInjectionCausedEscalation counts requests where RAG injection
+	// pushed the prompt over the VRAM budget, causing an automatic
+	// escalation to frontier.
+	ragInjectionCausedEscalation atomic.Uint64
+
 	// --- Circuit breaker instrumentation (issue #304, #411) ---------------
 	//
 	// Tracks the state of each named circuit breaker (ollama, rag).
@@ -444,6 +451,11 @@ func (c *Collector) IncTLSRejected() { c.tlsConnectionsRejected.Add(1) }
 // when the RAG embedder returns an error, giving operators an early-warning
 // signal before the circuit breaker trips.
 func (c *Collector) IncRAGEmbedFailure() { c.ragEmbedFailures.Add(1) }
+
+// IncRAGInjectionCausedEscalation increments the counter when RAG injection
+// pushes the prompt over the VRAM budget, causing an automatic escalation to
+// frontier (issue #404).
+func (c *Collector) IncRAGInjectionCausedEscalation() { c.ragInjectionCausedEscalation.Add(1) }
 
 // --- RAG watcher instrumentation (issue #367) ----------------------
 //

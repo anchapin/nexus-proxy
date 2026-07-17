@@ -668,8 +668,8 @@ func TestFusionArbiterSkipCounters(t *testing.T) {
 	}
 }
 
-// TestFusionSimilarityRatioHistogram tests the fusion similarity ratio histogram (issue #384).
-func TestFusionSimilarityRatioHistogram(t *testing.T) {
+// TestFusionJaccardSimilarityHistogram tests the fusion Jaccard similarity histogram (issue #410).
+func TestFusionJaccardSimilarityHistogram(t *testing.T) {
 	rc := NewRouteCounters()
 	rc.ObserveFusionSimilarityRatio(0.85)
 	rc.ObserveFusionSimilarityRatio(0.92)
@@ -685,8 +685,8 @@ func TestFusionSimilarityRatioHistogram(t *testing.T) {
 		fragment string
 		desc     string
 	}{
-		{"nexus_fusion_similarity_ratio_bucket", "metric family header"},
-		{"nexus_fusion_similarity_ratio_bucket_bucket{le=", "histogram buckets present"},
+		{"nexus_fusion_jaccard_similarity_bucket", "metric family header"},
+		{"nexus_fusion_jaccard_similarity_bucket_bucket{le=", "histogram buckets present"},
 		{"_sum", "sum field present"},
 		{"_count", "count field present"},
 	}

@@ -56,6 +56,12 @@ const (
 	// This is a hard override — the SLM made a decision but the low
 	// confidence signal triggered an automatic escalation.
 	SourceSLMEscalation DecisionSource = "slm-escalation"
+
+	// SourceRAGEscalation (issue #404) means RAG injection pushed the
+	// prompt over the VRAM budget after the initial planning decision.
+	// The handler re-evaluates the guardrail after RAG injection and
+	// escalates to frontier when the budget is exceeded.
+	SourceRAGEscalation DecisionSource = "rag-escalation"
 )
 
 // TraceReason maps a DecisionSource to the short string the handler
@@ -69,6 +75,8 @@ func (s DecisionSource) TraceReason() string {
 		return "guardrail"
 	case SourceDSL:
 		return "dsl"
+	case SourceRAGEscalation:
+		return "rag-escalation"
 	default:
 		return "slm"
 	}

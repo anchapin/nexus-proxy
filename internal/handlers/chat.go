@@ -261,6 +261,7 @@ func (f RejectionObserverFunc) ObserveRejection(e RejectionEvent) { f(e) }
 type FusionOutcomeEvent struct {
 	RequestID      string
 	ArbiterSkipped bool
+	Similarity     float64 // Jaccard similarity between panel members (issue #410)
 }
 
 // FusionOutcomeObserver is the hook invoked once per fusion request
@@ -283,10 +284,11 @@ func (f FusionOutcomeObserverFunc) ObserveFusionOutcome(e FusionOutcomeEvent) { 
 // arbiter skip for granular observability (issue #384). It is emitted
 // in addition to FusionOutcomeEvent when the arbiter was skipped.
 type FusionArbiterSkipEvent struct {
-	RequestID  string
-	Reason     string // "agreement", "tool_calls", or "one_member"
-	Similarity float64
-	Source     string // "local" or "frontier"
+	RequestID             string
+	Reason                string // "agreement", "tool_calls", or "one_member"
+	Similarity            float64
+	Source                string  // "local" or "frontier"
+	GoroutineWasteSeconds float64 // time between winner selection and slow-member cancellation (issue #406)
 }
 
 // FusionArbiterSkipObserver is the hook invoked once per fusion request
@@ -332,9 +334,11 @@ type RAGObserverFunc func(RAGEvent)
 // ObserveRAG implements RAGObserver.
 func (f RAGObserverFunc) ObserveRAG(e RAGEvent) { f(e) }
 
-// RAGMetrics instruments RAG embedder outcomes (issue #411).
+// RAGMetrics instruments RAG embedder outcomes (issue #411) and
+// RAG-caused escalations (issue #404).
 type RAGMetrics interface {
 	IncRAGEmbedFailure()
+	IncRAGInjectionCausedEscalation()
 }
 
 // RAGMetricsFunc adapts a plain function to the RAGMetrics interface.
@@ -342,6 +346,9 @@ type RAGMetricsFunc func()
 
 // IncRAGEmbedFailure implements RAGMetrics.
 func (f RAGMetricsFunc) IncRAGEmbedFailure() { f() }
+
+// IncRAGInjectionCausedEscalation implements RAGMetrics.
+func (f RAGMetricsFunc) IncRAGInjectionCausedEscalation() { f() }
 
 // CascadeFallbackEvent carries the reason for a cascade fallback (issue #205).
 // The handler dispatches one when a retryable step failure causes the cascade
@@ -1016,6 +1023,7 @@ func Chat(d Deps) http.Handler {
 		var ragInjected bool
 		var ragFilename string
 		var ragScore float64
+		var preRAGTokenCount int
 
 		// Snapshot the embedding cache hit count before Retrieve so we can
 		// determine whether the prompt embedding was served from cache (issue #303).
@@ -1024,6 +1032,7 @@ func Chat(d Deps) http.Handler {
 			cacheHitCountBefore = statsProvider.EmbedHitCount()
 		}
 
+		preRAGTokenCount = telemetry.EstimateTokens(latestPrompt)
 		ragEx, ragScore, ragErr := d.RAG.Retrieve(r.Context(), latestPrompt)
 		switch {
 		case ragErr != nil:
@@ -1170,6 +1179,25 @@ func Chat(d Deps) http.Handler {
 		})
 		slmRoutingMs = time.Since(started).Milliseconds() - promptEngineeringMs - ragRetrievalMs - toonCompressionMs
 		route := decision.Route
+
+		// Issue #404: check if RAG injection caused the guardrail to fire.
+		// The planner evaluated the post-RAG prompt; if the guardrail caught it
+		// but the pre-RAG prompt was within budget, RAG specifically caused
+		// the escalation. We override the source to SourceRAGEscalation and
+		// bump the dedicated counter so operators can distinguish this case.
+		if decision.Source == router.SourceGuardrail && ragInjected && preRAGTokenCount <= guardrailBudget && decision.EstimatedTokens > guardrailBudget {
+			decision.Source = router.SourceRAGEscalation
+			route = router.RouteFrontier
+			if d.RAGMetrics != nil {
+				d.RAGMetrics.IncRAGInjectionCausedEscalation()
+			}
+			slog.Info("rag injection caused guardrail escalation",
+				slog.String("request_id", reqID),
+				slog.Int("pre_rag_tokens", preRAGTokenCount),
+				slog.Int("post_rag_tokens", decision.EstimatedTokens),
+				slog.Int("budget_tokens", guardrailBudget),
+			)
+		}
 
 		// Surface route-decision metadata on the response and via the
 		// observer hook (issue #74). The four X-Nexus-Route-* headers
@@ -1415,14 +1443,16 @@ func Chat(d Deps) http.Handler {
 					d.FusionOutcomeObserver.ObserveFusionOutcome(FusionOutcomeEvent{
 						RequestID:      reqID,
 						ArbiterSkipped: outcome.ArbiterSkipped,
+						Similarity:     outcome.Similarity,
 					})
 				}
 				if outcome.ArbiterSkipped && d.FusionArbiterSkipObserver != nil {
 					d.FusionArbiterSkipObserver.ObserveFusionArbiterSkip(FusionArbiterSkipEvent{
-						RequestID:  reqID,
-						Reason:     outcome.SkipReason,
-						Similarity: outcome.Similarity,
-						Source:     outcome.Source,
+						RequestID:             reqID,
+						Reason:                outcome.SkipReason,
+						Similarity:            outcome.Similarity,
+						Source:                outcome.Source,
+						GoroutineWasteSeconds: outcome.GoroutineWasteSeconds,
 					})
 				}
 			} else {

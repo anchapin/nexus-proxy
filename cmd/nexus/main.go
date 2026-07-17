@@ -705,8 +705,11 @@ func main() {
 	// Fusion outcome observer (issue #187). Records whether the fusion
 	// arbiter was skipped (panel members agreed) or invoked (disagreement).
 	// Surfaces as nexus_fusion_arbiter_total{outcome="skipped"|"invoked"}.
+	// Also records Jaccard similarity (issue #410) for all fusion requests
+	// via nexus_fusion_jaccard_similarity histogram.
 	fusionOutcomeObs := handlers.FusionOutcomeObserverFunc(func(e handlers.FusionOutcomeEvent) {
 		routeCounters.ObserveFusionOutcome(e.ArbiterSkipped)
+		routeCounters.ObserveFusionSimilarityRatio(e.Similarity)
 	})
 	// Fusion arbiter skip observer (issue #384). Records detailed skip metadata:
 	// skip reason (agreement/tool_calls/one_member), similarity ratio, and
@@ -718,6 +721,7 @@ func main() {
 		routeCounters.ObserveFusionArbiterSkip(e.Reason)
 		routeCounters.ObserveFusionSimilarityRatio(e.Similarity)
 		routeCounters.ObserveFusionSpeculativeWinner(e.Source)
+		routeCounters.ObserveFusionGoroutineWaste(e.GoroutineWasteSeconds)
 	})
 	// Cascade fallback observer (issue #205): the chat handler dispatches
 	// one CascadeFallbackEvent per request when a retryable step failure

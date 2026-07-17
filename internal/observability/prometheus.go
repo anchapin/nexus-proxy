@@ -215,6 +215,8 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 		"Total proxied requests where no RAG snippet met the similarity threshold.", c.ragMissesTotal.Load())
 	writeCounter(w, "nexus_rag_embedder_failure_total",
 		"Total per-request Ollama embedding failures for RAG retrieval (issue #411).", c.ragEmbedFailures.Load())
+	writeCounter(w, "nexus_rag_injection_caused_escalation_total",
+		"Total requests where RAG injection pushed the prompt over the VRAM budget, causing escalation to frontier (issue #404).", c.ragInjectionCausedEscalation.Load())
 	writeCounter(w, "nexus_toon_compressed_total",
 		"Total proxied requests whose JSON-array blocks were TOON-compressed.", c.toonCompressedTotal.Load())
 	writeCounter(w, "nexus_degraded_total",

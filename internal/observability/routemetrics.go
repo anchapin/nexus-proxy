@@ -147,6 +147,12 @@ type RouteCounters struct {
 	// or "frontier" indicating which panel member streamed first.
 	fusionSpeculativeWinner map[string]*uint64
 
+	// Fusion goroutine waste histogram (issue #406). Records the elapsed
+	// time between winner selection and slow-member cancellation when the
+	// arbiter is skipped. Bucket boundaries are in seconds to align with
+	// the "within 100ms" acceptance criterion.
+	fusionGoroutineWaste *Histogram
+
 	// collector is an optional Collector whose CircuitBreakerGauges()
 	// are merged into the /metrics output when non-nil.
 	collector *Collector
@@ -174,6 +180,7 @@ func NewRouteCounters() *RouteCounters {
 		fusionArbiterSkips:       make(map[string]*uint64),
 		fusionSimilarityRatio:    NewHistogram([]float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0}),
 		fusionSpeculativeWinner:  make(map[string]*uint64),
+		fusionGoroutineWaste:     NewHistogram([]float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0}),
 	}
 }
 
@@ -506,6 +513,17 @@ func (rc *RouteCounters) fusionSpeculativeWinnerSlot(source string) *uint64 {
 	return p
 }
 
+// ObserveFusionGoroutineWaste records the elapsed time between speculative
+// winner selection and slow-member cancellation in the fusion panel (issue #406).
+// wasteSeconds is the duration in seconds. Safe for concurrent use; nil
+// receivers are a no-op.
+func (rc *RouteCounters) ObserveFusionGoroutineWaste(wasteSeconds float64) {
+	if rc == nil || rc.fusionGoroutineWaste == nil {
+		return
+	}
+	rc.fusionGoroutineWaste.Observe(wasteSeconds)
+}
+
 // reasonSlot returns the *uint64 for reason, creating it if absent.
 // Same lock-then-atomic pattern as slot: the mutex guards the map
 // mutation only, the increment happens lock-free.
@@ -743,11 +761,13 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 		total += n
 	}
 
-	// Fusion similarity ratio histogram (issue #384). Records Jaccard similarity
-	// when panel members disagreed and the arbiter was invoked.
+	// Fusion Jaccard similarity histogram (issue #410). Records Jaccard
+	// similarity between panel members for ALL fusion requests, providing
+	// operators visibility into similarity distribution for tuning
+	// NEXUS_FUSION_AGREEMENT_THRESHOLD.
 	if rc.fusionSimilarityRatio != nil {
-		writeHistogram(w, "nexus_fusion_similarity_ratio_bucket",
-			"Jaccard similarity ratio between panel members when arbiter was invoked (issue #384).",
+		writeHistogram(w, "nexus_fusion_jaccard_similarity_bucket",
+			"Jaccard similarity ratio between fusion panel members (issue #410).",
 			rc.fusionSimilarityRatio)
 	}
 
@@ -758,6 +778,16 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 		return total, err
 	} else {
 		total += n
+	}
+
+	// Fusion goroutine waste histogram (issue #406). Records the elapsed time
+	// between winner selection and slow-member cancellation when the arbiter
+	// is skipped (agreement, tool_calls, or one_member paths). High values
+	// indicate the slow member ran longer after its result was no longer needed.
+	if rc.fusionGoroutineWaste != nil {
+		writeHistogram(w, "nexus_fusion_goroutine_waste_seconds",
+			"Time between speculative winner selection and slow-member cancellation in fusion panel (issue #406).",
+			rc.fusionGoroutineWaste)
 	}
 
 	return total, nil
