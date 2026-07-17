@@ -79,8 +79,9 @@ type YAMLConfig struct {
 	EmbedderType      string  `yaml:"embedder_type"`
 	EmbedderBaseURL   string  `yaml:"embedder_base_url"`
 	CohereAPIKey      string  `yaml:"cohere_api_key"`
-	RAGDBPath         string  `yaml:"rag_db_path"`
-	RAGPollInterval   string  `yaml:"rag_poll_interval"`
+	RAGDBPath          string `yaml:"rag_db_path"`
+	RAGPollInterval    string `yaml:"rag_poll_interval"`
+	RAGWatcherDisabled bool   `yaml:"rag_watcher_disabled"`
 	RAGEmbedCacheSize int     `yaml:"rag_embed_cache_size"`
 	RAGEmbedCacheTTL  string  `yaml:"rag_embed_cache_ttl"`
 
@@ -445,7 +446,18 @@ func LoadYAML(path string) (Config, error) {
 		if d < 0 {
 			d = 0
 		}
+		if d == 0 {
+			d = DefaultRAGPollInterval
+		}
 		cfg.RAGPollInterval = d
+	}
+	if v := os.Getenv("NEXUS_RAG_WATCHER_DISABLED"); v != "" {
+		switch strings.ToLower(v) {
+		case "true", "1", "yes":
+			cfg.RAGWatcherDisabled = true
+		default:
+			cfg.RAGWatcherDisabled = false
+		}
 	}
 	if v := os.Getenv("NEXUS_RAG_EMBED_CACHE_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -906,7 +918,8 @@ func (yc YAMLConfig) toConfig() Config {
 		ModelsEndpointEnabled: yc.boolFieldDefault(yc.ModelsEndpointEnabled, true),
 		ModelsCacheTTL:        yc.durationDefault(yc.ModelsCacheTTL, 5*time.Minute),
 
-		RAGPollInterval: yc.durationDefault(yc.RAGPollInterval, 30*time.Second),
+		RAGPollInterval:       yc.durationDefault(yc.RAGPollInterval, DefaultRAGPollInterval),
+		RAGWatcherDisabled:    yc.boolFieldDefault(yc.RAGWatcherDisabled, false),
 
 		RateLimitRPM:   yc.intDefault(yc.RateLimitRPM, 0),
 		RateLimitBurst: yc.intDefault(yc.RateLimitBurst, 0),

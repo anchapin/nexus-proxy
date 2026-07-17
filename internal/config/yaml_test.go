@@ -293,6 +293,7 @@ embedder_type: "openai"
 embedder_base_url: "https://api.openai.com/v1"
 rag_db_path: "/var/nexus/rag.db"
 rag_poll_interval: "60s"
+rag_watcher_disabled: true
 rag_embed_cache_size: 512
 `
 	if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
@@ -320,6 +321,9 @@ rag_embed_cache_size: 512
 	}
 	if cfg.RAGPollInterval != 60*time.Second {
 		t.Errorf("RAGPollInterval = %v", cfg.RAGPollInterval)
+	}
+	if cfg.RAGWatcherDisabled != true {
+		t.Errorf("RAGWatcherDisabled = %v, want true", cfg.RAGWatcherDisabled)
 	}
 	if cfg.RAGEmbedCacheSize != 512 {
 		t.Errorf("RAGEmbedCacheSize = %d", cfg.RAGEmbedCacheSize)

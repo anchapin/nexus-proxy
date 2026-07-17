@@ -64,6 +64,7 @@ var knownEnvVars = map[string]struct{}{
 	"NEXUS_RAG_THRESHOLD":                 {},
 	"NEXUS_RAG_DB":                        {},
 	"NEXUS_RAG_POLL_INTERVAL":             {},
+	"NEXUS_RAG_WATCHER_DISABLED":          {},
 	"NEXUS_RAG_EMBED_CACHE_SIZE":          {},
 	"NEXUS_RAG_EMBED_CACHE_TTL":           {},
 	"NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD": {},
@@ -248,8 +249,9 @@ type Config struct {
 	// goroutine that detects new / modified / deleted files in
 	// ExamplesDir and updates the store incrementally. Set
 	// NEXUS_RAG_DB="" to fall back to the legacy in-memory-only path.
-	RAGDBPath       string        // on-disk SQLite database for the RAG store
-	RAGPollInterval time.Duration // watcher cadence; 0 disables the watcher
+	RAGDBPath        string        // on-disk SQLite database for the RAG store
+	RAGPollInterval  time.Duration // watcher cadence; 0 means DefaultRAGPollInterval
+	RAGWatcherDisabled bool        // true to disable the watcher regardless of interval
 
 	// RAG embedding cache (issue #115). Prompt embeddings are
 	// deterministic for a given model+text pair, so they are memoized
@@ -613,6 +615,11 @@ func DefaultRAGDBPath() string {
 	return filepath.Join(base, "nexus-proxy", "rag.db")
 }
 
+// DefaultRAGPollInterval is the default cadence for the background file
+// watcher (issue #409). Operators override with NEXUS_RAG_POLL_INTERVAL;
+// set NEXUS_RAG_WATCHER_DISABLED=true to disable the watcher.
+const DefaultRAGPollInterval = 60 * time.Second
+
 // DefaultJudgeDBPath returns the canonical location for the judge
 // SQLite store (issue #198): $XDG_CACHE_HOME/nexus-proxy/judge.db.
 // Operators override with NEXUS_JUDGE_DB (empty disables persistence,
@@ -667,18 +674,23 @@ func Load() (Config, error) {
 
 	// RAG persistence (issue #46). The DB path defaults to the user
 	// cache dir so multiple checkouts don't trample each other.
-	// NEXUS_RAG_POLL_INTERVAL=0 disables the file watcher but leaves
-	// persistence on (boot still loads from disk).
+	// NEXUS_RAG_POLL_INTERVAL=0 means "use the default interval";
+	// NEXUS_RAG_WATCHER_DISABLED=true explicitly disables the watcher.
 	cfg.RAGDBPath = getEnvAllowEmpty("NEXUS_RAG_DB", DefaultRAGDBPath())
 
-	pollInterval, err := getEnvDuration("NEXUS_RAG_POLL_INTERVAL", 30*time.Second)
+	pollInterval, err := getEnvDuration("NEXUS_RAG_POLL_INTERVAL", DefaultRAGPollInterval)
 	if err != nil {
 		return cfg, err
 	}
 	if pollInterval < 0 {
 		pollInterval = 0
 	}
+	if pollInterval == 0 {
+		pollInterval = DefaultRAGPollInterval
+	}
 	cfg.RAGPollInterval = pollInterval
+
+	cfg.RAGWatcherDisabled = getEnvBool("NEXUS_RAG_WATCHER_DISABLED", false)
 
 	// RAG embedding cache size (issue #115). Default 256 keeps the
 	// cache useful for repetitive coding prompts while bounding
@@ -1679,10 +1691,10 @@ func (c Config) SLMCacheEnabled() bool {
 func (c Config) RAGPersistentEnabled() bool { return c.RAGDBPath != "" }
 
 // RAGWatcherEnabled reports whether the background file watcher
-// (issue #46) should be started. Disabled when RAGPollInterval is
-// zero OR when the persistent store itself is disabled.
+// (issue #46) should be started. Disabled when the persistent store
+// itself is disabled or when NEXUS_RAG_WATCHER_DISABLED=true.
 func (c Config) RAGWatcherEnabled() bool {
-	return c.RAGPersistentEnabled() && c.RAGPollInterval > 0
+	return c.RAGPersistentEnabled() && !c.RAGWatcherDisabled && c.RAGPollInterval > 0
 }
 
 // JudgeDBEnabled reports whether the SQLite-backed judge store
