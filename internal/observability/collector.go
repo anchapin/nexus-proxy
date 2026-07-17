@@ -169,6 +169,19 @@ type Collector struct {
 	// Protected by cbMu; read via atomic for hot path.
 	cbMu    sync.RWMutex
 	cbState map[string]*circuitBreakerState
+
+	// --- VRAM gauge instrumentation (issue #394) ------------------
+	//
+	// vramGaugeFunc is the callback that returns per-GPU free VRAM
+	// readings (gpu_id -> free bytes) at scrape time. Set by main.go
+	// from the probe manager so the collector never imports internal/probe.
+	// Nil means VRAM data is not available.
+	vramGaugeFunc atomic.Value // func() map[string]int64
+
+	// bytesPerSlot is the VRAM bytes assumed per local-route concurrency
+	// slot, used to compute nexus_vram_slots_available. Set alongside
+	// vramGaugeFunc via SetVramGaugeFunc.
+	bytesPerSlot atomic.Int64
 }
 
 // circuitBreakerState holds the atomic state for one named circuit.
@@ -509,6 +522,47 @@ func (c *Collector) getOrCreateCircuit(name string) *circuitBreakerState {
 		c.cbState[name] = &circuitBreakerState{}
 	}
 	return c.cbState[name]
+}
+
+// --- VRAM gauge instrumentation (issue #394) ------------------------
+//
+// SetVramGaugeFunc configures the callback that supplies per-GPU free VRAM
+// readings at scrape time. The bytesPerSlot parameter is the VRAM bytes
+// assumed per local-route concurrency slot; it is used to compute
+// nexus_vram_slots_available. Called once from main.go at startup.
+func (c *Collector) SetVramGaugeFunc(fn func() map[string]int64, bytesPerSlot int64) {
+	c.vramGaugeFunc.Store(fn)
+	c.bytesPerSlot.Store(bytesPerSlot)
+}
+
+// VRAMGauges returns the live VRAM readings as gauge samples for the
+// Prometheus renderer. Each GPU emits two samples:
+//   - nexus_vram_free_bytes{gpu_id="cardN"} — free VRAM in bytes
+//   - nexus_vram_slots_available{gpu_id="cardN"} — derived slot count
+//
+// Slots are computed as freeVRAM / bytesPerSlot, floored at 0.
+// When no VRAM function has been configured, returns nil (no samples emitted).
+func (c *Collector) VRAMGauges() []GaugeSample {
+	fnRaw := c.vramGaugeFunc.Load()
+	if fnRaw == nil {
+		return nil
+	}
+	fn := fnRaw.(func() map[string]int64)
+	perGPU := fn()
+	if len(perGPU) == 0 {
+		return nil
+	}
+	bps := c.bytesPerSlot.Load()
+	var out []GaugeSample
+	for gpuID, freeBytes := range perGPU {
+		labels := map[string]string{"gpu_id": gpuID}
+		out = append(out, GaugeSample{Name: "nexus_vram_free_bytes", Labels: labels, Value: float64(freeBytes)})
+		if bps > 0 {
+			slots := freeBytes / bps
+			out = append(out, GaugeSample{Name: "nexus_vram_slots_available", Labels: labels, Value: float64(slots)})
+		}
+	}
+	return out
 }
 
 // --- Pipeline stage latency breakdown (issue #300) -------------------

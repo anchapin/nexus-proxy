@@ -371,6 +371,15 @@ func main() {
 		ragWatcher.SetMetrics(circuitCollector)
 	}
 
+	// Wire VRAM gauge function into the /metrics output (issue #394).
+	// The callback reads per-GPU free VRAM from the probe manager; the
+	// bytes-per-slot mirrors the concurrencylimit.New default so the
+	// derived slot count is consistent with what the limiter computes.
+	circuitCollector.SetVramGaugeFunc(
+		func() map[string]int64 { return probeMgr.GetFreeVRAMBytesPerGPU() },
+		concurrencylimit.DefaultBytesPerSlot,
+	)
+
 	// Stage latency collector (issue #300). Separate from routeCounters
 	// so the per-stage histograms (RAGRetrievalMs, PromptEngineeringMs,
 	// TOONCompressionMs, SLMRoutingMs, UpstreamFirstByteMs) are collected
@@ -799,7 +808,6 @@ func main() {
 	}
 
 	chatHandler := handlers.Chat(handlers.Deps{
-<<<<<<< Updated upstream
 		Config:                    cfg,
 		Client:                    httpClient,
 		RAG:                       store,
@@ -829,37 +837,6 @@ func main() {
 		CircuitBreakerObserver:    circuitBreakerObs,
 		ArbiterCache:              arbiterCache,
 		Providers:                 providerRegistry,
-=======
-		Config:                  cfg,
-		Client:                  httpClient,
-		RAG:                     store,
-		SLM:                     slm,
-		MiddlewareChain:         mwChain,
-		ContextAwareRAG:         ctxAwareRAG,
-		Confidence:              confidenceObs,
-		SLMCache:                slmCache,
-		JudgeObserver:           judgeObs,
-		QualityObserver:         qualityO,
-		MetricsObserver:         metricsObs,
-		Recorder:                recorder,
-		Health:                  hpoller,
-		BudgetObserver:          budgetObserver(probeMgr),
-		SpendGuard:              budgetGuard, // nil when budget disabled (issue #220)
-		LocalLimiter:            localLimiter,
-		LocalCooldown:           localCooldown,
-		RouteDecisionObserver:   routeDecisionObs,
-		RejectionObserver:       rejectionObs,
-		FusionOutcomeObserver:    fusionOutcomeObs,
-		FusionArbiterSkipObserver: fusionArbiterSkipObs,
-		RAGObserver:             ragObserver,
-		RAGCacheObserver:        ragCacheObserver,
-		CascadeFallbackObserver: cascadeFallbackObs,
-		ArbiterCacheObserver:    arbiterCacheObserver,
-		PanelPanicObserver:      panelPanicObs,
-		CircuitBreakerObserver:  circuitBreakerObs,
-		ArbiterCache:            arbiterCache,
-		Providers:               providerRegistry,
->>>>>>> Stashed changes
 		PipelineStageObserver: handlers.PipelineStageObserverFunc(
 			func(e handlers.PipelineStageEvent) {
 				stageCollector.ObservePipelineStage(observability.PipelineStageEvent{
