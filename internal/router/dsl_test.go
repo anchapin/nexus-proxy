@@ -46,6 +46,11 @@ func TestDSL(t *testing.T) {
 	localPatterns := []*regexp.Regexp{
 		regexp.MustCompile(`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis|debug|fix bug|git commit|sql query|parse json|validate input|test|optimize|readme)\b`),
 	}
+	// Unicode patterns (issue #422)
+	unicodePatterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?i)\p{Han}`),     // Chinese characters
+		regexp.MustCompile(`(?i)\p{Arabic}`), // Arabic characters
+	}
 	cases := []struct {
 		name    string
 		prompt  string
@@ -81,10 +86,21 @@ func TestDSL(t *testing.T) {
 		{"test hit", "write a test for this function", RouteLocal, true},
 		{"optimize hit", "optimize the database queries", RouteLocal, true},
 		{"readme hit", "update the readme file", RouteLocal, true},
+		// ASCII regression (issue #422) — /* format this JSON */ still routes to local
+		{"ascii format comment", " /* format this JSON */", RouteLocal, true},
+		{"ascii refactor comment", " /* refactor this code */", RouteLocal, true},
+		// Unicode: Chinese prompt (issue #422)
+		{"chinese请解释这个函数的用法", "请解释这个函数的用法", RouteLocal, true},
+		{"chinese explain mixed", "请 explain this code", RouteLocal, true},
+		// Unicode: emoji-spam (no match, not local)
+		{"emoji spam", "🎉🎊🎈💯🔥💯🎉💯", "", false},
+		// Unicode: Arabic (issue #422)
+		{"arabic explain", "اشرح هذا الكود", RouteLocal, true},
+		{"arabic mixed ascii", "please refactor هذا الكود", RouteLocal, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, hit := DSL(tc.prompt, fusionPatterns, formattingPatterns, localPatterns)
+			got, hit := DSL(tc.prompt, fusionPatterns, formattingPatterns, localPatterns, unicodePatterns)
 			if got != tc.want || hit != tc.wantHit {
 				t.Errorf("DSL(%q) = (%q,%v), want (%q,%v)",
 					tc.prompt, got, hit, tc.want, tc.wantHit)
@@ -93,17 +109,25 @@ func TestDSL(t *testing.T) {
 	}
 }
 
-func TestToLowerASCII(t *testing.T) {
+func TestToUnicodeLower(t *testing.T) {
 	cases := map[string]string{
-		"":          "",
-		"abc":       "abc",
-		"ABC":       "abc",
-		"Hello, 世界": "hello, 世界",
-		"  MIX  ":   "  mix  ",
+		"":               "",
+		"abc":            "abc",
+		"ABC":            "abc",
+		"Hello, 世界":     "hello, 世界",
+		"  MIX  ":        "  mix  ",
+		"café":           "café",           // no-op: no uppercase
+		"ΑΛΦΑ":           "αλφα",           // Greek uppercase (simplified case fold)
+		"ΕΛΛΑΔΑ":         "ελλαδα",         // Greek uppercase (diacritics stripped by unicode.ToLower)
+		"ΠΑΡΑΔΕΙΓΜΑ":     "παραδειγμα",     // Greek uppercase (diacritics stripped)
+		"REFACTOR":       "refactor",        // ASCII uppercase
+		"RÉFACTOR":       "réfactor",        // Latin-1 uppercase with accent
+		"請解釋這個函數的用法": "請解釋這個函數的用法", // Chinese: no case, unchanged
+		"🎉🎊":           "🎉🎊",           // emoji: no case, unchanged
 	}
 	for in, want := range cases {
-		if got := toLowerASCII(in); got != want {
-			t.Errorf("toLowerASCII(%q) = %q, want %q", in, got, want)
+		if got := toUnicodeLower(in); got != want {
+			t.Errorf("toUnicodeLower(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

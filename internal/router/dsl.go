@@ -6,6 +6,8 @@ package router
 
 import (
 	"regexp"
+	"strings"
+	"unicode"
 
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
 )
@@ -29,6 +31,12 @@ var (
 	}
 	DefaultLocalPatterns = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis)\b`),
+	}
+	// DefaultUnicodePatterns matches non-ASCII text categories (issue #422).
+	// Operators can override via NEXUS_DSL_UNICODE_PATTERNS.
+	DefaultUnicodePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)\p{Han}`),   // Chinese characters
+		regexp.MustCompile(`(?i)\p{Arabic}`), // Arabic characters
 	}
 )
 
@@ -57,10 +65,12 @@ type Route string
 // local and frontier). formattingPatterns matches simple formatting keywords
 // (css, format, docstring, lint, typo, boilerplate). localPatterns matches
 // common coding task keywords (refactor, security scan, generate tests,
-// explain this code, performance analysis, etc.). Each pattern slice may be
+// explain this code, performance analysis, etc.). unicodePatterns matches
+// non-ASCII text categories (e.g. Chinese characters via \p{Han}) via
+// NEXUS_DSL_UNICODE_PATTERNS (issue #422). Each pattern slice may be
 // nil or empty in which case that branch is skipped.
-func DSL(prompt string, fusionPatterns, formattingPatterns, localPatterns []*regexp.Regexp) (Route, bool) {
-	lower := toLowerASCII(prompt)
+func DSL(prompt string, fusionPatterns, formattingPatterns, localPatterns, unicodePatterns []*regexp.Regexp) (Route, bool) {
+	lower := toUnicodeLower(prompt)
 
 	if len(fusionPatterns) > 0 {
 		for _, re := range fusionPatterns {
@@ -83,12 +93,49 @@ func DSL(prompt string, fusionPatterns, formattingPatterns, localPatterns []*reg
 			}
 		}
 	}
+	// Unicode patterns match non-ASCII text directly (issue #422).
+	// These patterns are NOT lowercased because they target script
+	// categories (e.g. \p{Han}) rather than ASCII keywords.
+	if len(unicodePatterns) > 0 {
+		for _, re := range unicodePatterns {
+			if re.MatchString(prompt) {
+				return RouteLocal, true
+			}
+		}
+	}
 	return "", false
 }
 
-// toLowerASCII lowercases ASCII letters only. The DSL rules are
-// ASCII-keyword matches; full Unicode lowercasing is unnecessary and
-// would force an allocation proportional to prompt length.
+// toUnicodeLower converts s to lowercase using Unicode case-folding rules
+// (issue #422). Unlike the prior toLowerASCII, this handles all scripts
+// (Chinese, Arabic, Greek, etc.). The allocation is proportional to the
+// number of uppercase runes in s; prompts without uppercase return s
+// unchanged (zero allocation).
+func toUnicodeLower(s string) string {
+	if !hasUpperUnicode(s) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		b.WriteRune(unicode.ToLower(r))
+	}
+	return b.String()
+}
+
+// hasUpperUnicode returns true if s contains any uppercase Unicode rune.
+// Used to skip the toUnicodeLower allocation for already-lowercase strings.
+func hasUpperUnicode(s string) bool {
+	for _, r := range s {
+		if r != unicode.ToLower(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// toLowerASCII lowercases ASCII letters only. Kept for backward compatibility
+// with confidence.go. Use toUnicodeLower for Unicode-aware lowercasing.
 func toLowerASCII(s string) string {
 	if !hasUpperASCII(s) {
 		return s

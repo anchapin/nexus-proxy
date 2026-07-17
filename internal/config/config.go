@@ -133,6 +133,7 @@ type Config struct {
 	DSLFormattingPatterns []*regexp.Regexp // NEXUS_DSL_FORMATTING_PATTERNS
 	DSLFusionPatterns     []*regexp.Regexp // NEXUS_DSL_FUSION_PATTERNS
 	DSLLocalPatterns      []*regexp.Regexp // NEXUS_DSL_LOCAL_PATTERNS
+	DSLUnicodePatterns    []*regexp.Regexp // NEXUS_DSL_UNICODE_PATTERNS (issue #422)
 
 	// Frontier provider selector (issue #45). When more than one
 	// frontier provider is configured (frontier + z.ai), the chat
@@ -644,6 +645,14 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.DSLLocalPatterns = dslLocal
+
+	// DSL Unicode patterns (issue #422). Matches non-ASCII text categories
+	// like \p{Han} for Chinese. Empty means no Unicode fast-pass.
+	dslUnicode, err := getEnvRegexps("NEXUS_DSL_UNICODE_PATTERNS", "")
+	if err != nil {
+		return cfg, err
+	}
+	cfg.DSLUnicodePatterns = dslUnicode
 
 	// Frontier provider selector (issue #45). Look-back window,
 	// observation floor, and cache cadence. Defaults match the
