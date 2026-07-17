@@ -1,8 +1,10 @@
 package router
 
 import (
+	"container/heap"
 	"context"
 	"math"
+	"sort"
 	"sync"
 	"time"
 )
@@ -34,11 +36,13 @@ type Embedder interface {
 // Construct with NewSLMCache to override TTL.
 type SLMCache struct {
 	ttl          time.Duration
+	maxEntries   int
 	embedder     Embedder
 	semThreshold float64 // cosine similarity floor for semantic match (0.0..1.0)
 
 	mu      sync.RWMutex
 	entries map[string]cachedDecision
+	expiry  []string // keys sorted by expiry time (earliest first)
 }
 
 // cachedDecision pairs a routing decision with its insertion time for
@@ -55,44 +59,105 @@ type cachedDecision struct {
 // same prompt. Operators can override via NewSLMCache(ttl).
 const DefaultSLMCacheTTL = 30 * time.Second
 
+// DefaultSLMCacheMaxEntries is the default max entries cap. 512 covers
+// a typical burst of distinct prompts without excessive memory use.
+const DefaultSLMCacheMaxEntries = 512
+
 // DefaultSemanticThreshold is the default cosine similarity floor for
 // semantic cache hits (issue #245). 0.85 is a conservative threshold
 // that groups very similar prompts (same intent, different wording)
 // without false positives.
 const DefaultSemanticThreshold = 0.85
 
-// NewSLMCache constructs a cache with the given TTL. Pass zero to use
-// DefaultSLMCacheTTL. The returned cache has semantic deduplication
-// disabled; use NewSLMCacheWithEmbedder to enable it.
-func NewSLMCache(ttl time.Duration) *SLMCache {
+// NewSLMCache constructs a cache with the given TTL and max entries.
+// Pass zero TTL to use DefaultSLMCacheTTL; zero maxEntries to use
+// DefaultSLMCacheMaxEntries. The returned cache has semantic
+// deduplication disabled; use NewSLMCacheWithEmbedder to enable it.
+func NewSLMCache(ttl time.Duration, maxEntries int) *SLMCache {
 	if ttl <= 0 {
 		ttl = DefaultSLMCacheTTL
 	}
+	if maxEntries <= 0 {
+		maxEntries = DefaultSLMCacheMaxEntries
+	}
 	return &SLMCache{
 		ttl:          ttl,
+		maxEntries:   maxEntries,
 		entries:      make(map[string]cachedDecision),
 		semThreshold: DefaultSemanticThreshold,
 	}
 }
 
-// NewSLMCacheWithEmbedder constructs a cache with the given TTL and
-// semantic deduplication enabled. embedder is used to compute prompt
-// embeddings; threshold is the cosine similarity floor (0.0..1.0) for
-// two prompts to be considered semantically equivalent. Pass zero
-// threshold to use DefaultSemanticThreshold.
-func NewSLMCacheWithEmbedder(ttl time.Duration, embedder Embedder, threshold float64) *SLMCache {
+// NewSLMCacheWithEmbedder constructs a cache with the given TTL, max
+// entries, and semantic deduplication enabled. embedder is used to
+// compute prompt embeddings; threshold is the cosine similarity floor
+// (0.0..1.0) for two prompts to be considered semantically equivalent.
+// Pass zero threshold to use DefaultSemanticThreshold.
+func NewSLMCacheWithEmbedder(ttl time.Duration, maxEntries int, embedder Embedder, threshold float64) *SLMCache {
 	if ttl <= 0 {
 		ttl = DefaultSLMCacheTTL
+	}
+	if maxEntries <= 0 {
+		maxEntries = DefaultSLMCacheMaxEntries
 	}
 	if threshold <= 0 {
 		threshold = DefaultSemanticThreshold
 	}
 	return &SLMCache{
 		ttl:          ttl,
+		maxEntries:   maxEntries,
 		embedder:     embedder,
 		semThreshold: threshold,
 		entries:      make(map[string]cachedDecision),
 	}
+}
+
+// sortExpiry sorts the expiry slice by stamp (earliest first).
+// This maintains the invariant that expiry[0] is the entry to evict next.
+func (c *SLMCache) sortExpiry() {
+	sort.Slice(c.expiry, func(i, j int) bool {
+		iEntry, oki := c.entries[c.expiry[i]]
+		jEntry, okj := c.entries[c.expiry[j]]
+		if !oki {
+			return true
+		}
+		if !okj {
+			return false
+		}
+		return iEntry.stamp.Before(jEntry.stamp)
+	})
+}
+
+// evictExpired removes all entries whose TTL has expired.
+// It is called during Set to clean up before deciding what to evict.
+func (c *SLMCache) evictExpired() {
+	now := time.Now()
+	var keep []string
+	for _, key := range c.expiry {
+		entry, ok := c.entries[key]
+		if !ok {
+			continue // already removed
+		}
+		if now.Sub(entry.stamp) > c.ttl {
+			delete(c.entries, key)
+		} else {
+			keep = append(keep, key)
+		}
+	}
+	c.expiry = keep
+	c.sortExpiry()
+}
+
+// evictLru removes the least-recently-used (oldest by stamp) non-expired
+// entry to make room for a new insertion. Caller must hold c.mu.
+func (c *SLMCache) evictLru() {
+	if len(c.expiry) == 0 {
+		return
+	}
+	// expiry is sorted by stamp, so the first element is the oldest.
+	lruKey := c.expiry[0]
+	delete(c.entries, lruKey)
+	c.expiry = c.expiry[1:]
 }
 
 // CacheHitKind describes the mechanism that produced a cache hit.
@@ -190,11 +255,15 @@ func (c *SLMCache) Set(ctx context.Context, prompt string, route Route) {
 
 	var emb []float64
 	if c.embedder != nil {
-		// Embed synchronously while holding the lock so the entry is
-		// fully populated before any reader can see it.
-		// Embed is assumed to be fast enough (local Ollama) that this
-		// does not block Set significantly.
 		emb, _ = c.embedder.Embed(ctx, prompt) // best-effort; embed errors are logged by caller
+	}
+
+	// If at capacity, evict expired entries first, then LRU.
+	if c.maxEntries > 0 && len(c.entries) >= c.maxEntries {
+		c.evictExpired()
+		if len(c.entries) >= c.maxEntries {
+			c.evictLru()
+		}
 	}
 
 	c.entries[prompt] = cachedDecision{
@@ -202,6 +271,8 @@ func (c *SLMCache) Set(ctx context.Context, prompt string, route Route) {
 		stamp: time.Now(),
 		emb:   emb,
 	}
+	c.expiry = append(c.expiry, prompt)
+	c.sortExpiry()
 }
 
 // SetEmbedding stores a routing decision with a pre-computed embedding.
@@ -210,11 +281,21 @@ func (c *SLMCache) Set(ctx context.Context, prompt string, route Route) {
 func (c *SLMCache) SetEmbedding(prompt string, route Route, emb []float64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if c.maxEntries > 0 && len(c.entries) >= c.maxEntries {
+		c.evictExpired()
+		if len(c.entries) >= c.maxEntries {
+			c.evictLru()
+		}
+	}
+
 	c.entries[prompt] = cachedDecision{
 		Route: route,
 		stamp: time.Now(),
 		emb:   emb,
 	}
+	c.expiry = append(c.expiry, prompt)
+	c.sortExpiry()
 }
 
 // SLMCacheStats holds state counters for the SLM cache. It is
@@ -265,6 +346,14 @@ func (c *SLMCache) TTLSeconds() int {
 	return int(c.ttl.Seconds())
 }
 
+// MaxEntries returns the configured max entries cap.
+func (c *SLMCache) MaxEntries() int {
+	if c == nil {
+		return 0
+	}
+	return c.maxEntries
+}
+
 // cosineSimilarity returns the cosine of the angle between a and b.
 // It is equivalent to rag.CosineSimilarity but lives here to keep
 // router free of a rag import cycle. A zero vector on either side
@@ -285,3 +374,16 @@ func cosineSimilarity(a, b []float64) float64 {
 	}
 	return dot / (math.Sqrt(na) * math.Sqrt(nb))
 }
+
+// expiryHeap is a placeholder to satisfy heap.Interface for future use.
+// Currently we use sort.Slice for simplicity; this allows us to swap
+// to a real heap later without API changes.
+type expiryHeap struct{}
+
+func (expiryHeap) Len() int           { return 0 }
+func (expiryHeap) Less(i, j int) bool { return false }
+func (expiryHeap) Swap(i, j int)      {}
+func (h *expiryHeap) Push(x any)      {}
+func (h *expiryHeap) Pop() any        { return "" }
+
+var _ heap.Interface = (*expiryHeap)(nil)
