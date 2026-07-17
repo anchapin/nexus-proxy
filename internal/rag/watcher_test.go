@@ -333,10 +333,59 @@ func TestWatcherScanOnceRemovesDeleted(t *testing.T) {
 func TestWatcherNewWatcherDefaultsInterval(t *testing.T) {
 	dir := t.TempDir()
 	ps, _ := newWatcherStore(t)
-	w := NewWatcher(ps, dir, 0) // 0 -> default
+	w := NewWatcher(ps, dir, 0) // 0 -> default (fsnotify disabled, 60s fallback)
 	if w.interval <= 0 {
 		t.Errorf("interval = %v, want positive default", w.interval)
 	}
+	if w.interval != 60*time.Second {
+		t.Errorf("interval = %v, want 60s fallback for NEXUS_RAG_POLL_INTERVAL=0", w.interval)
+	}
 	w.Start(context.Background())
 	w.Stop()
+}
+
+func TestWatcherFsnotifyDetection(t *testing.T) {
+	// This test verifies that when fsnotify is available (interval > 0),
+	// the watcher uses immediate event detection rather than waiting
+	// for a full poll interval.
+	dir := t.TempDir()
+	ps, emb := newWatcherStore(t)
+
+	w := NewWatcher(ps, dir, 10*time.Millisecond) // short interval, fsnotify active
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.Start(ctx)
+	defer w.Stop()
+
+	// Wait for initial scan.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ps.Size() == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Write a new file.
+	if err := os.WriteFile(filepath.Join(dir, "fast.go"), []byte("fast"), 0o644); err != nil {
+		t.Fatalf("write fast.go: %v", err)
+	}
+
+	// With fsnotify, detection should be nearly immediate (sub-second),
+	// not bounded by the poll interval.
+	deadline = time.Now().Add(500 * time.Millisecond)
+	detected := false
+	for time.Now().Before(deadline) {
+		if ps.Size() == 1 {
+			detected = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !detected {
+		t.Errorf("watcher did not detect new file within 500ms (fsnotify may be unavailable)")
+	}
+	if len(emb.Called()) < 1 {
+		t.Errorf("embedder was not called for new file")
+	}
 }

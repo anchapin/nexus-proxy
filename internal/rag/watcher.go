@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 // fileSnapshot is the per-file state the watcher remembers between
@@ -20,15 +22,15 @@ type fileSnapshot struct {
 	size    int64
 }
 
-// Watcher polls an examples directory on a fixed cadence and
-// reconciles the PersistentStore against the on-disk state. New
-// files are embedded and upserted; modified files are re-embedded
-// and replaced; deleted files are removed from the store.
+// Watcher monitors an examples directory for changes and reconciles
+// the PersistentStore against the on-disk state. New files are
+// embedded and upserted; modified files are re-embedded and replaced;
+// deleted files are removed from the store.
 //
-// The polling approach is stdlib-only by design (no fsnotify
-// dependency): the directory is low-cardinality (operator-curated
-// snippets), so a 30s poll is cheap and the implementation stays
-// inside the project's "stdlib-ish spirit" (AGENTS.md).
+// Primary detection uses github.com/fsnotify/fsnotify for sub-second
+// notification. A fallback ticker fires when fsnotify is unavailable
+// (e.g., network-mounted filesystems) or when NEXUS_RAG_POLL_INTERVAL=0
+// is set explicitly.
 //
 // A single goroutine owns the watcher loop and the `known` map, so
 // no internal locking is required. The watcher interacts with the
@@ -36,7 +38,7 @@ type fileSnapshot struct {
 type Watcher struct {
 	store    *PersistentStore
 	dir      string
-	interval time.Duration
+	interval time.Duration // fallback poll interval (fsnotify-unavailable cases)
 
 	mu    sync.Mutex
 	known map[string]fileSnapshot
@@ -46,13 +48,18 @@ type Watcher struct {
 	once   sync.Once
 }
 
-// NewWatcher constructs a Watcher; call Start to spawn the polling
+// NewWatcher constructs a Watcher; call Start to spawn the watcher
 // goroutine. The directory must already exist (the persistent
 // store's LoadOrIndex creates it on first boot); if the directory
 // is removed later the watcher logs and waits for it to reappear.
+//
+// When interval > 0, fsnotify is used for immediate file-change
+// detection with fallback polling at interval. When interval <= 0,
+// fsnotify is disabled and a 60-second fallback poll is used (NFS
+// / network-mount edge case).
 func NewWatcher(store *PersistentStore, dir string, interval time.Duration) *Watcher {
 	if interval <= 0 {
-		interval = 30 * time.Second
+		interval = 60 * time.Second // fallback poll for fsnotify-unavailable cases
 	}
 	return &Watcher{
 		store:    store,
@@ -80,9 +87,10 @@ func (w *Watcher) Stop() {
 }
 
 // run is the single goroutine that owns the `known` map. It
-// performs an initial scan to seed the state, then ticks on the
-// configured interval. Errors are logged and the loop continues so
-// a transient filesystem glitch doesn't kill the watcher.
+// performs an initial scan to seed the state, then waits for
+// fsnotify events and/or fallback ticker ticks. Errors are logged
+// and the loop continues so a transient filesystem glitch doesn't
+// kill the watcher.
 func (w *Watcher) run(parent context.Context) {
 	defer close(w.doneCh)
 
@@ -94,16 +102,112 @@ func (w *Watcher) run(parent context.Context) {
 		)
 	}
 
-	t := time.NewTicker(w.interval)
-	defer t.Stop()
+	// Attempt to open an fsnotify watcher. If it fails (e.g.,
+	// network mount with no inotify support), fall back to polling-only.
+	fw, err := fsnotify.NewWatcher()
+	if err != nil {
+		slog.Warn("rag: fsnotify unavailable, using fallback polling",
+			slog.String("component", "rag"),
+			slog.String("dir", w.dir),
+			slog.Any("err", err),
+		)
+		fw = nil // ensures no channel reads below
+	} else {
+		if err := fw.Add(w.dir); err != nil {
+			slog.Warn("rag: fsnotify add failed, using fallback polling",
+				slog.String("component", "rag"),
+				slog.String("dir", w.dir),
+				slog.Any("err", err),
+			)
+			_ = fw.Close()
+			fw = nil
+		} else {
+			defer func() { _ = fw.Close() }()
+		}
+	}
+
+	ticker := time.NewTicker(w.interval)
+	defer ticker.Stop()
 
 	for {
+		// When fw is nil (unavailable), both fw.Events and
+		// fw.Errors are nil channels — reading from them would
+		// block forever, so we guard those cases.
+		if fw == nil {
+			// Polling-only path.
+			select {
+			case <-parent.Done():
+				return
+			case <-w.stopCh:
+				return
+			case <-ticker.C:
+				if err := w.scanOnce(parent); err != nil && !errors.Is(err, context.Canceled) {
+					slog.Warn("rag: scan failed",
+						slog.String("component", "rag"),
+						slog.String("dir", w.dir),
+						slog.Any("err", err),
+					)
+				}
+			}
+			continue
+		}
+
+		// fsnotify + fallback ticker path.
 		select {
 		case <-parent.Done():
 			return
 		case <-w.stopCh:
 			return
-		case <-t.C:
+		case evt, ok := <-fw.Events:
+			if !ok {
+				// Watcher closed; degrade to polling.
+				_ = fw.Close()
+				fw = nil
+				slog.Warn("rag: fsnotify watcher closed, degrading to polling",
+					slog.String("component", "rag"),
+					slog.String("dir", w.dir),
+				)
+				continue
+			}
+			// macOS FSEvents buffer overflow fires a Remove event
+			// with an empty name; reconcile by scanning.
+			if evt.Has(fsnotify.Remove) || evt.Has(fsnotify.Rename) {
+				if err := w.scanOnce(parent); err != nil && !errors.Is(err, context.Canceled) {
+					slog.Warn("rag: scan failed",
+						slog.String("component", "rag"),
+						slog.String("dir", w.dir),
+						slog.Any("err", err),
+					)
+				}
+			} else if evt.Has(fsnotify.Write) || evt.Has(fsnotify.Create) {
+				if err := w.scanOnce(parent); err != nil && !errors.Is(err, context.Canceled) {
+					slog.Warn("rag: scan failed",
+						slog.String("component", "rag"),
+						slog.String("dir", w.dir),
+						slog.Any("err", err),
+					)
+				}
+			}
+		case err, ok := <-fw.Errors:
+			if !ok {
+				// Watcher closed; degrade to polling.
+				_ = fw.Close()
+				fw = nil
+				slog.Warn("rag: fsnotify watcher closed, degrading to polling",
+					slog.String("component", "rag"),
+					slog.String("dir", w.dir),
+				)
+				continue
+			}
+			slog.Warn("rag: fsnotify error",
+				slog.String("component", "rag"),
+				slog.String("dir", w.dir),
+				slog.Any("err", err),
+			)
+			// Continue to ticker to keep reconciling.
+		case <-ticker.C:
+			// Fallback ticker: reconciles state periodically and
+			// handles buffer-overflow gaps on macOS FSEvents.
 			if err := w.scanOnce(parent); err != nil && !errors.Is(err, context.Canceled) {
 				slog.Warn("rag: scan failed",
 					slog.String("component", "rag"),
