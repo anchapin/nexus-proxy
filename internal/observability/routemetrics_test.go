@@ -686,11 +686,7 @@ func TestFusionSimilarityRatioHistogram(t *testing.T) {
 		desc     string
 	}{
 		{"nexus_fusion_similarity_ratio_bucket", "metric family header"},
-<<<<<<< Updated upstream
 		{"nexus_fusion_similarity_ratio_bucket_bucket{le=", "histogram buckets present"},
-=======
-		{"nexus_fusion_similarity_ratio_bucket{le=", "histogram buckets present"},
->>>>>>> Stashed changes
 		{"_sum", "sum field present"},
 		{"_count", "count field present"},
 	}
@@ -719,13 +715,8 @@ func TestFusionSpeculativeWinnerCounters(t *testing.T) {
 		desc     string
 	}{
 		{"nexus_fusion_speculative_winner_total", "metric family header"},
-<<<<<<< Updated upstream
 		{`reason="local"} 2`, "local counted twice"},
 		{`reason="frontier"} 1`, "frontier counted once"},
-=======
-		{`source="local"} 2`, "local counted twice"},
-		{`source="frontier"} 1`, "frontier counted once"},
->>>>>>> Stashed changes
 	}
 	for _, c := range checks {
 		if !strings.Contains(out, c.fragment) {
