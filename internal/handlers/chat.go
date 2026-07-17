@@ -2231,18 +2231,6 @@ func buildRecord(
 
 // --- metrics (issue #4) helpers ----------------------------------------
 
-// totalMessageChars marshals messages and returns the JSON byte
-// length. Used to compute the TOON savings token estimate. Mirrors
-// json.Marshal's own overflow behaviour (returns roughly the same
-// bytes the proxy would emit across the wire).
-func totalMessageChars(messages []interface{}) int {
-	b, err := json.Marshal(messages)
-	if err != nil {
-		return 0
-	}
-	return len(b)
-}
-
 // totalTokenSavings returns the tokens saved by the TOON
 // compression pass (preTokens - postTokens via EstimateTokens), clamped
 // to zero in case the rewrite expanded the message (which can happen
