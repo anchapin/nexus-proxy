@@ -139,6 +139,11 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Unix timestamp of the last failure recorded for this circuit breaker (issue #304).",
 		typ:  "gauge",
 	},
+	// Embedder circuit breaker failures (issue #423).
+	"nexus_embedder_failures_total": {
+		help: "Total number of circuit breaker trip events for embedder kinds (issue #423).",
+		typ:  "counter",
+	},
 }
 
 // RenderPrometheus writes the full /metrics body in Prometheus
@@ -272,6 +277,18 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 		"Cumulative accepted authentications (issue #70).", "gauge")
 	//nolint:errcheck // cannot check error after headers committed
 	fmt.Fprintf(w, "nexus_auth_authenticated_clients %d\n", c.AuthAuthenticatedClients())
+
+	// Embedder circuit breaker failures (issue #423).
+	failures := c.EmbedderFailures()
+	if len(failures) > 0 {
+		samples := make([]labelSample, 0, len(failures))
+		for kind, count := range failures {
+			samples = append(samples, labelSample{value: kind, n: count})
+		}
+		writeCounterLabeled(w, "nexus_embedder_failures_total",
+			"Total circuit breaker trip events for embedder kinds (issue #423).",
+			"kind", samples)
+	}
 
 	// --- Histograms -----------------------------------------------------
 

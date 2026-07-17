@@ -25,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/ioutils"
 
 	"time"
@@ -34,11 +35,46 @@ import (
 // It is used by ReadAllLimited to prevent memory exhaustion (issue #365).
 const defaultMaxResponseBytes = 64 << 20 // 64 MiB
 
-// ErrCircuitOpen is returned by OllamaEmbedder.Embed when the circuit
+// ErrCircuitOpen is returned by any embedder's Embed method when the circuit
 // breaker has tripped and the cooldown window has not yet elapsed.
 // Callers should treat this as a transient failure and retry after the
 // cooldown expires.
-var ErrCircuitOpen = fmt.Errorf("rag: ollama embedder circuit breaker open")
+var ErrCircuitOpen = fmt.Errorf("rag: embedder circuit breaker open")
+
+// embedderCircuitKind identifies which embedder's circuit breaker is open.
+// It is used by the chat handler to call the correct observability method.
+type embedderCircuitKind string
+
+const (
+	circuitKindOllama embedderCircuitKind = "ollama"
+	circuitKindOpenAI embedderCircuitKind = "openai"
+	circuitKindCohere embedderCircuitKind = "cohere"
+)
+
+// circuitError wraps ErrCircuitOpen with the embedder kind so the chat
+// handler can call the correct observability method when a circuit trips.
+type circuitError struct {
+	kind embedderCircuitKind
+}
+
+func (e *circuitError) Error() string { return ErrCircuitOpen.Error() }
+func (e *circuitError) Is(target error) bool { return target == ErrCircuitOpen }
+
+// newCircuitError returns an error that is equal to ErrCircuitOpen (so
+// errors.Is works) but carries the embedder kind for observability.
+func newCircuitError(kind embedderCircuitKind) error {
+	return &circuitError{kind: kind}
+}
+
+// CircuitKind extracts the embedder circuit kind from an error returned
+// by an embedder's Embed method. Returns "" if the error is not an embedder
+// circuit error.
+func CircuitKind(err error) string {
+	if ce, ok := err.(*circuitError); ok {
+		return string(ce.kind)
+	}
+	return ""
+}
 
 // BreakerConfig configures the circuit breaker on OllamaEmbedder.
 // A zero Threshold disables the breaker.
@@ -689,13 +725,11 @@ func (s *Store) snapshot() []FewShotExample {
 // OllamaEmbedder calls the Ollama /api/embeddings endpoint. It is safe for
 // concurrent use via a shared http.Client.
 type OllamaEmbedder struct {
-	BaseURL          string // e.g. "http://localhost:11434"
-	Model            string // e.g. "nomic-embed-text"
-	Client           *http.Client
+	BaseURL  string // e.g. "http://localhost:11434"
+	Model    string // e.g. "nomic-embed-text"
+	Client   *http.Client
 	BreakerConfig    // optional; zero-value means breaker disabled
-	breakerThreshold atomic.Int32
-	cooldownUntil    atomic.Int64 // nanoseconds since Unix epoch; 0 = never tripped
-	failureCount     atomic.Int32
+	breaker  health.Breaker
 }
 
 // NewOllamaEmbedder returns an embedder wired to the given Ollama instance.
@@ -709,8 +743,14 @@ func NewOllamaEmbedder(baseURL, model string, client *http.Client, cb BreakerCon
 		Model:         model,
 		Client:        client,
 		BreakerConfig: cb,
+		breaker: health.Breaker{
+			Threshold: cb.Threshold,
+			Cooldown:  cb.Cooldown,
+		},
 	}
-	e.breakerThreshold.Store(int32(cb.Threshold))
+	if cb.Threshold > 0 {
+		health.RegisterBreaker("ollama", &e.breaker)
+	}
 	return e
 }
 
@@ -731,8 +771,8 @@ func (o *OllamaEmbedder) IsHealthy(ctx context.Context) bool {
 // Embed fetches the embedding vector for text. If the circuit breaker is
 // open it returns ErrCircuitOpen without calling Ollama.
 func (o *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float64, error) {
-	if o.isOpen() {
-		return nil, ErrCircuitOpen
+	if o.breaker.IsOpen() {
+		return nil, newCircuitError(circuitKindOllama)
 	}
 	payload, _ := json.Marshal(map[string]string{"model": o.Model, "prompt": text})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -743,55 +783,77 @@ func (o *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := o.Client.Do(req)
 	if err != nil {
-		o.recordFailure()
+		o.breaker.RecordFailure()
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		o.recordFailure()
+		o.breaker.RecordFailure()
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		o.recordFailure()
+		o.breaker.RecordFailure()
 		return nil, fmt.Errorf("ollama embed %s: status %d: %s", o.Model, resp.StatusCode, body)
 	}
 	var raw struct {
 		Embedding []float64 `json:"embedding"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
-		o.recordFailure()
+		o.breaker.RecordFailure()
 		return nil, fmt.Errorf("ollama embed: decode: %w", err)
 	}
 	if len(raw.Embedding) == 0 {
-		o.recordFailure()
+		o.breaker.RecordFailure()
 		return nil, fmt.Errorf("ollama embed: empty embedding for model %s", o.Model)
 	}
-	o.recordSuccess()
+	o.breaker.RecordSuccess()
 	return raw.Embedding, nil
 }
 
 // OpenAIEmbedder calls the OpenAI /v1/embeddings endpoint. It is safe for
 // concurrent use via a shared http.Client.
 type OpenAIEmbedder struct {
-	BaseURL  string // e.g. "https://api.openai.com/v1"
-	Model    string // e.g. "text-embedding-3-small"
-	APIKey   string
-	Client   *http.Client
-	Audience string // optional OAuth audience for cURL-compatible header
+	BaseURL      string // e.g. "https://api.openai.com/v1"
+	Model        string // e.g. "text-embedding-3-small"
+	APIKey       string
+	Client       *http.Client
+	Audience     string   // optional OAuth audience for cURL-compatible header
+	BreakerConfig         // optional; zero-value means breaker disabled
+	breaker     health.Breaker
 }
 
 // NewOpenAIEmbedder returns an embedder wired to the OpenAI embeddings endpoint.
-func NewOpenAIEmbedder(baseURL, model, apiKey string, client *http.Client) *OpenAIEmbedder {
+// Passing a zero BreakerConfig (Threshold==0) disables the circuit breaker.
+func NewOpenAIEmbedder(baseURL, model, apiKey string, client *http.Client, cb BreakerConfig) *OpenAIEmbedder {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &OpenAIEmbedder{BaseURL: baseURL, Model: model, APIKey: apiKey, Client: client}
+	e := &OpenAIEmbedder{
+		BaseURL:       baseURL,
+		Model:         model,
+		APIKey:        apiKey,
+		Client:        client,
+		Audience:      "",
+		BreakerConfig: cb,
+		breaker: health.Breaker{
+			Threshold: cb.Threshold,
+			Cooldown:  cb.Cooldown,
+		},
+	}
+	if cb.Threshold > 0 {
+		health.RegisterBreaker("openai", &e.breaker)
+	}
+	return e
 }
 
 // Embed fetches the embedding vector for text via the OpenAI /v1/embeddings API.
+// If the circuit breaker is open, it returns ErrCircuitOpen without calling OpenAI.
 func (o *OpenAIEmbedder) Embed(ctx context.Context, text string) ([]float64, error) {
+	if o.breaker.IsOpen() {
+		return nil, newCircuitError(circuitKindOpenAI)
+	}
 	payload, _ := json.Marshal(map[string]any{
 		"model": o.Model,
 		"input": text,
@@ -808,15 +870,18 @@ func (o *OpenAIEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 	}
 	resp, err := o.Client.Do(req)
 	if err != nil {
+		o.breaker.RecordFailure()
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := ioutils.ReadAllLimited(resp.Body, defaultMaxResponseBytes)
 	if err != nil {
+		o.breaker.RecordFailure()
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
+		o.breaker.RecordFailure()
 		return nil, fmt.Errorf("openai embed %s: status %d: %s", o.Model, resp.StatusCode, body)
 	}
 	var raw struct {
@@ -825,44 +890,75 @@ func (o *OpenAIEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
+		o.breaker.RecordFailure()
 		return nil, fmt.Errorf("openai embed: decode: %w", err)
 	}
 	if len(raw.Data) == 0 || len(raw.Data[0].Embedding) == 0 {
+		o.breaker.RecordFailure()
 		return nil, fmt.Errorf("openai embed: empty embedding for model %s", o.Model)
 	}
+	o.breaker.RecordSuccess()
 	return raw.Data[0].Embedding, nil
 }
 
 func (o *OpenAIEmbedder) IsHealthy(ctx context.Context) bool {
+	if o.breaker.IsOpen() {
+		return false
+	}
 	_, err := o.Embed(ctx, "health")
 	return err == nil
 }
 
-// IsBreakerOpen returns false for OpenAIEmbedder (no circuit breaker, issue #304).
-func (o *OpenAIEmbedder) IsBreakerOpen() bool { return false }
+// IsBreakerOpen reports whether the circuit is currently open.
+func (o *OpenAIEmbedder) IsBreakerOpen() bool {
+	return o.breaker.IsOpen()
+}
 
-// RecordBreakerSuccess is a no-op for OpenAIEmbedder (issue #304).
-func (o *OpenAIEmbedder) RecordBreakerSuccess() {}
+// RecordBreakerSuccess resets the circuit breaker failure counter.
+func (o *OpenAIEmbedder) RecordBreakerSuccess() {
+	o.breaker.RecordSuccess()
+}
 
 // CohereEmbedder calls the Cohere /v1/embed endpoint. It is safe for
 // concurrent use via a shared http.Client.
 type CohereEmbedder struct {
-	BaseURL string // e.g. "https://api.cohere.ai/v1"
-	Model   string // e.g. "embed-english-v3.0"
-	APIKey  string
-	Client  *http.Client
+	BaseURL      string // e.g. "https://api.cohere.ai/v1"
+	Model        string // e.g. "embed-english-v3.0"
+	APIKey       string
+	Client       *http.Client
+	BreakerConfig         // optional; zero-value means breaker disabled
+	breaker     health.Breaker
 }
 
 // NewCohereEmbedder returns an embedder wired to the Cohere embeddings endpoint.
-func NewCohereEmbedder(baseURL, model, apiKey string, client *http.Client) *CohereEmbedder {
+// Passing a zero BreakerConfig (Threshold==0) disables the circuit breaker.
+func NewCohereEmbedder(baseURL, model, apiKey string, client *http.Client, cb BreakerConfig) *CohereEmbedder {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &CohereEmbedder{BaseURL: baseURL, Model: model, APIKey: apiKey, Client: client}
+	e := &CohereEmbedder{
+		BaseURL:       baseURL,
+		Model:         model,
+		APIKey:        apiKey,
+		Client:        client,
+		BreakerConfig: cb,
+		breaker: health.Breaker{
+			Threshold: cb.Threshold,
+			Cooldown:  cb.Cooldown,
+		},
+	}
+	if cb.Threshold > 0 {
+		health.RegisterBreaker("cohere", &e.breaker)
+	}
+	return e
 }
 
 // Embed fetches the embedding vector for text via the Cohere /v1/embed API.
+// If the circuit breaker is open, it returns ErrCircuitOpen without calling Cohere.
 func (c *CohereEmbedder) Embed(ctx context.Context, text string) ([]float64, error) {
+	if c.breaker.IsOpen() {
+		return nil, newCircuitError(circuitKindCohere)
+	}
 	payload, _ := json.Marshal(map[string]any{
 		"model": c.Model,
 		"texts": []string{text},
@@ -876,39 +972,52 @@ func (c *CohereEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	resp, err := c.Client.Do(req)
 	if err != nil {
+		c.breaker.RecordFailure()
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		c.breaker.RecordFailure()
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
+		c.breaker.RecordFailure()
 		return nil, fmt.Errorf("cohere embed %s: status %d: %s", c.Model, resp.StatusCode, body)
 	}
 	var raw struct {
 		Embeddings [][]float64 `json:"embeddings"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
+		c.breaker.RecordFailure()
 		return nil, fmt.Errorf("cohere embed: decode: %w", err)
 	}
 	if len(raw.Embeddings) == 0 || len(raw.Embeddings[0]) == 0 {
+		c.breaker.RecordFailure()
 		return nil, fmt.Errorf("cohere embed: empty embedding for model %s", c.Model)
 	}
+	c.breaker.RecordSuccess()
 	return raw.Embeddings[0], nil
 }
 
 func (c *CohereEmbedder) IsHealthy(ctx context.Context) bool {
+	if c.breaker.IsOpen() {
+		return false
+	}
 	_, err := c.Embed(ctx, "health")
 	return err == nil
 }
 
-// IsBreakerOpen returns false for CohereEmbedder (no circuit breaker, issue #304).
-func (c *CohereEmbedder) IsBreakerOpen() bool { return false }
+// IsBreakerOpen reports whether the circuit is currently open.
+func (c *CohereEmbedder) IsBreakerOpen() bool {
+	return c.breaker.IsOpen()
+}
 
-// RecordBreakerSuccess is a no-op for CohereEmbedder (issue #304).
-func (c *CohereEmbedder) RecordBreakerSuccess() {}
+// RecordBreakerSuccess resets the circuit breaker failure counter.
+func (c *CohereEmbedder) RecordBreakerSuccess() {
+	c.breaker.RecordSuccess()
+}
 
 // EmbedderType is the discriminator for the embedder factory.
 type EmbedderType string
@@ -922,19 +1031,19 @@ const (
 // NewEmbedder constructs an Embedder from the given config fields.
 // The returned Embedder must be wrapped with NewCachedEmbedder by the
 // caller when the cache is desired (as in main.go).
-// The breakerConfig is only used for the Ollama embedder.
+// The breakerConfig applies to all embedder types.
 func NewEmbedder(embedderType EmbedderType, baseURL, model, apiKey string, client *http.Client, breakerConfig BreakerConfig) (Embedder, error) {
 	switch embedderType {
 	case EmbedderTypeOpenAI:
 		if apiKey == "" {
 			return nil, fmt.Errorf("rag: NEXUS_EMBEDDER_TYPE=openai requires NEXUS_FRONTIER_API_KEY to be set")
 		}
-		return NewOpenAIEmbedder(baseURL, model, apiKey, client), nil
+		return NewOpenAIEmbedder(baseURL, model, apiKey, client, breakerConfig), nil
 	case EmbedderTypeCohere:
 		if apiKey == "" {
 			return nil, fmt.Errorf("rag: NEXUS_EMBEDDER_TYPE=cohere requires NEXUS_COHERE_API_KEY to be set")
 		}
-		return NewCohereEmbedder(baseURL, model, apiKey, client), nil
+		return NewCohereEmbedder(baseURL, model, apiKey, client, breakerConfig), nil
 	case EmbedderTypeOllama:
 		fallthrough
 	default:
@@ -942,69 +1051,21 @@ func NewEmbedder(embedderType EmbedderType, baseURL, model, apiKey string, clien
 	}
 }
 
-// isOpen reports whether the circuit breaker is currently in the open
-// (cooldown) state. A zero cooldownUntil means the breaker has never
-// tripped or has recovered.
-//
-// When the cooldown deadline has passed, both the failure counter and the
-// deadline are reset so that the next request starts fresh — if it fails it
-// will re-trip the breaker, creating a new cooldown window.
-func (o *OllamaEmbedder) isOpen() bool {
-	deadline := o.cooldownUntil.Load()
-	if deadline == 0 {
-		return false
-	}
-	if time.Now().UnixNano() >= deadline {
-		// Cooldown has expired; give the next request a clean slate.
-		o.failureCount.Store(0)
-		o.cooldownUntil.Store(0)
-		return false
-	}
-	return true
-}
-
-// recordFailure increments the consecutive-failure counter and trips the
-// breaker when the threshold is reached. The cooldown window is set to
-// BreakerCooldown from the current time.
-func (o *OllamaEmbedder) recordFailure() {
-	if o.breakerThreshold.Load() == 0 {
-		return // breaker disabled
-	}
-	count := o.failureCount.Add(1)
-	if count >= o.breakerThreshold.Load() {
-		// Trip: set the cooldown deadline. We add one nanosecond so that
-		// the comparison in isOpen is strict (deadline > now, not >=).
-		o.cooldownUntil.Store(time.Now().Add(o.BreakerConfig.Cooldown).UnixNano() + 1)
-		slog.Warn("rag: ollama embedder circuit breaker tripped",
-			slog.Int("failures", int(count)),
-			slog.Int("threshold", int(o.breakerThreshold.Load())),
-			slog.Duration("cooldown", o.BreakerConfig.Cooldown),
-		)
-	}
-}
-
-// recordSuccess resets the consecutive-failure counter and clears the
-// cooldown deadline. No-op when the breaker is already closed.
-func (o *OllamaEmbedder) recordSuccess() {
-	o.failureCount.Store(0)
-	o.cooldownUntil.Store(0)
-}
-
 // FailureCount returns the current consecutive-failure counter. Exported
 // for the Prometheus gauge provider in main.go.
 func (o *OllamaEmbedder) FailureCount() int {
-	return int(o.failureCount.Load())
+	return int(o.breaker.FailureCount())
 }
 
 // RecordBreakerSuccess resets the circuit breaker failure counter. Called
 // by the chat handler when a RAG retrieval succeeds so the breaker does
 // not remain open after transient failures (issue #304).
 func (o *OllamaEmbedder) RecordBreakerSuccess() {
-	o.recordSuccess()
+	o.breaker.RecordSuccess()
 }
 
 // IsBreakerOpen reports whether the circuit is currently in the open
 // (cooldown) state. Exported for tests and operational dashboards.
 func (o *OllamaEmbedder) IsBreakerOpen() bool {
-	return o.isOpen()
+	return o.breaker.IsOpen()
 }

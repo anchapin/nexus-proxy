@@ -3,6 +3,7 @@ package rag
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -78,7 +79,7 @@ func TestOllamaEmbedder_CircuitBreaker_TripsAfterThreshold(t *testing.T) {
 	// Three failures should trip the breaker.
 	for i := 0; i < 3; i++ {
 		_, err := emb.Embed(ctx, "test")
-		if err == ErrCircuitOpen {
+		if errors.Is(err, ErrCircuitOpen) {
 			t.Fatalf("call %d: got ErrCircuitOpen before threshold", i+1)
 		}
 	}
@@ -101,7 +102,7 @@ func TestOllamaEmbedder_CircuitBreaker_TripsAfterThreshold(t *testing.T) {
 		BreakerConfig{Threshold: 1, Cooldown: 10 * time.Second})
 	_, _ = emb2.Embed(ctx, "test") // trips the breaker (firstCall=true, doesn't count)
 	_, err := emb2.Embed(ctx, "test")
-	if err != ErrCircuitOpen {
+	if !errors.Is(err, ErrCircuitOpen) {
 		t.Fatalf("expected ErrCircuitOpen, got %v", err)
 	}
 	if calls != 0 {
@@ -121,13 +122,13 @@ func TestOllamaEmbedder_CircuitBreaker_BlocksWhileOpen(t *testing.T) {
 	ctx := context.Background()
 	// First call fails and trips the breaker.
 	_, err := emb.Embed(ctx, "test")
-	if err == ErrCircuitOpen {
+	if errors.Is(err, ErrCircuitOpen) {
 		t.Fatalf("first call: expected non-circuit error, got %v", err)
 	}
 
 	// Second call should be blocked by circuit breaker.
 	_, err = emb.Embed(ctx, "test")
-	if err != ErrCircuitOpen {
+	if !errors.Is(err, ErrCircuitOpen) {
 		t.Fatalf("second call: expected ErrCircuitOpen, got %v", err)
 	}
 
@@ -161,7 +162,7 @@ func TestOllamaEmbedder_CircuitBreaker_RecoversAfterCooldown(t *testing.T) {
 	// recordFailure increments failureCount to 1, and since threshold=1 the
 	// breaker re-trips immediately. IsBreakerOpen() is true AFTER the call.
 	_, err := emb.Embed(ctx, "test")
-	if err == ErrCircuitOpen {
+	if errors.Is(err, ErrCircuitOpen) {
 		t.Error("expected HTTP error after cooldown, not ErrCircuitOpen")
 	}
 	if !emb.IsBreakerOpen() {
@@ -192,7 +193,7 @@ func TestOllamaEmbedder_CircuitBreaker_ResetsOnSuccess(t *testing.T) {
 	// Two failures: failureCount should be 2 after.
 	for i := 0; i < 2; i++ {
 		_, err := emb.Embed(ctx, "test")
-		if err == ErrCircuitOpen {
+		if errors.Is(err, ErrCircuitOpen) {
 			t.Fatalf("call %d: got ErrCircuitOpen before threshold", i+1)
 		}
 	}
@@ -202,12 +203,12 @@ func TestOllamaEmbedder_CircuitBreaker_ResetsOnSuccess(t *testing.T) {
 
 	// Third failure trips the breaker (threshold=3).
 	_, err := emb.Embed(ctx, "test")
-	if err == ErrCircuitOpen {
+	if errors.Is(err, ErrCircuitOpen) {
 		t.Fatal("3rd call should not be blocked before cooldown starts")
 	}
 	// Breaker is now open due to cooldown. Subsequent failures are blocked.
 	_, err = emb.Embed(ctx, "test")
-	if err != ErrCircuitOpen {
+	if !errors.Is(err, ErrCircuitOpen) {
 		t.Fatalf("call 4: expected ErrCircuitOpen (blocked by cooldown), got %v", err)
 	}
 
@@ -218,7 +219,7 @@ func TestOllamaEmbedder_CircuitBreaker_ResetsOnSuccess(t *testing.T) {
 	// The call proceeds, fails, and records failureCount=1 (NOT re-tripped,
 	// since 1 < threshold=3). Breaker remains closed.
 	_, err = emb.Embed(ctx, "test")
-	if err == ErrCircuitOpen {
+	if errors.Is(err, ErrCircuitOpen) {
 		t.Fatal("post-cooldown call should not be blocked")
 	}
 	if emb.IsBreakerOpen() {
@@ -256,7 +257,7 @@ func TestOllamaEmbedder_CircuitBreaker_ZeroConfigDefaults(t *testing.T) {
 	_, err := emb.Embed(ctx, "test")
 	// With zero threshold the breaker is disabled; we should get a connection
 	// error, not ErrCircuitOpen.
-	if err == ErrCircuitOpen {
+	if errors.Is(err, ErrCircuitOpen) {
 		t.Error("breaker should be disabled with zero threshold")
 	}
 }

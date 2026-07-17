@@ -194,6 +194,13 @@ type Collector struct {
 	// Observe method itself is lock-free.
 	slmConfidenceMu         sync.RWMutex
 	slmConfidenceHistograms map[string]*Histogram
+
+	// --- Embedder circuit breaker instrumentation (issue #423) -----
+	//
+	// Tracks failures for each embedder circuit breaker (ollama, openai, cohere).
+	// Protected by cbMu for map access; individual counters are atomic.
+	embedderMu       sync.RWMutex
+	embedderFailures map[string]atomic.Uint64 // keyed by "ollama", "openai", "cohere"
 }
 
 // circuitBreakerState holds the atomic state for one named circuit.
@@ -226,6 +233,7 @@ func NewCollector() *Collector {
 		stageTOON:       NewHistogram(DefaultBuckets),
 		stageSLM:        NewHistogram(DefaultBuckets),
 		stageUpstream:   NewHistogram(DefaultBuckets),
+		embedderFailures: make(map[string]atomic.Uint64),
 	}
 	// Pre-allocate SLM confidence histograms for each known category
 	// (issue #425). Pre-allocation means ObserveSLMConfidence only
@@ -526,6 +534,33 @@ func (c *Collector) getOrCreateCircuit(name string) *circuitBreakerState {
 		c.cbState[name] = &circuitBreakerState{}
 	}
 	return c.cbState[name]
+}
+
+// IncEmbedderFailure increments the failure counter for the given embedder kind
+// (one of "ollama", "openai", "cohere"). Called when an embedder circuit breaker
+// trips (issue #423).
+func (c *Collector) IncEmbedderFailure(kind string) {
+	if kind == "" {
+		return
+	}
+	c.embedderMu.Lock()
+	defer c.embedderMu.Unlock()
+	if c.embedderFailures == nil {
+		c.embedderFailures = make(map[string]atomic.Uint64)
+	}
+	c.embedderFailures[kind].Add(1)
+}
+
+// EmbedderFailures returns the current failure counts keyed by embedder kind.
+// Used by the Prometheus renderer.
+func (c *Collector) EmbedderFailures() map[string]uint64 {
+	c.embedderMu.RLock()
+	defer c.embedderMu.RUnlock()
+	out := make(map[string]uint64, len(c.embedderFailures))
+	for k, v := range c.embedderFailures {
+		out[k] = v.Load()
+	}
+	return out
 }
 
 // --- Pipeline stage latency breakdown (issue #300) -------------------
