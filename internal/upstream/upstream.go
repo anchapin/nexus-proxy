@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
@@ -819,6 +821,9 @@ func PanelStreaming(
 
 	results := make(chan PanelResult, 2)
 	var cancelLocal, cancelFrontier context.CancelFunc
+
+	g, gCtx := errgroup.WithContext(ctx)
+
 	if skipLocal {
 		// Issue #8: synthetic local failure so the arbiter-style
 		// code paths below degrade cleanly. The handler sets
@@ -828,37 +833,41 @@ func PanelStreaming(
 			Err:    errors.New("ollama unavailable (degraded)"),
 		}
 	} else {
-		go func() {
+		g.Go(func() error {
 			defer func() {
 				if r := recover(); r != nil {
 					IncPanelPanics()
 					results <- PanelResult{Source: "local", Err: fmt.Errorf("panic: %v", r)}
 				}
 			}()
-			ctxLocal, cancel := context.WithTimeout(ctx, withDefault(perFetchTimeout))
+			ctxLocal, cancel := context.WithTimeout(gCtx, withDefault(perFetchTimeout))
 			cancelLocal = cancel
 			defer cancel()
 			msg, err := FetchPanel(ctxLocal, client,
 				localBaseURL+"/v1/chat/completions", "", localModel, body)
 			results <- PanelResult{Source: "local", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
-		}()
+			return nil
+		})
 	}
-	go func() {
+	g.Go(func() error {
 		defer func() {
 			if r := recover(); r != nil {
 				IncPanelPanics()
 				results <- PanelResult{Source: "frontier", Err: fmt.Errorf("panic: %v", r)}
 			}
 		}()
-		ctxFrontier, cancel := context.WithTimeout(ctx, withDefault(perFetchTimeout))
+		ctxFrontier, cancel := context.WithTimeout(gCtx, withDefault(perFetchTimeout))
 		cancelFrontier = cancel
 		defer cancel()
 		msg, err := FetchPanel(ctxFrontier, client,
 			frontierURL, "", frontierModel, body)
 		results <- PanelResult{Source: "frontier", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
-	}()
+		return nil
+	})
 	first := <-results
 	second := <-results
+
+	_ = g.Wait()
 
 	// Both members errored — there's nothing speculative to deliver.
 	// Surface the upstream errors so the handler renders a 502 with
