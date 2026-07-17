@@ -1078,13 +1078,12 @@ func Chat(d Deps) http.Handler {
 		if d.RAGCacheObserver != nil {
 			d.RAGCacheObserver(cacheHit)
 		}
-		// Snapshot the JSON size BEFORE TOON compression so the
+		// Snapshot the JSON bytes BEFORE TOON compression so the
 		// metrics observer can attribute tokens saved by the
-		// round-trip pass. Uses the cheap "4 chars per token"
-		// heuristic the rest of the project uses for telemetry
-		// (see internal/telemetry.EstimateTokens).
-		preCompressionChars := totalMessageChars(messages)
-		trace.Transforms.TOONBytesBefore = preCompressionChars
+		// round-trip pass. Uses EstimateTokens for accurate token
+		// counting (issue #408).
+		preCompressionJSON, _ := json.Marshal(messages)
+		trace.Transforms.TOONBytesBefore = len(preCompressionJSON)
 		toonCompressionMethod := middleware.CompressJSONBlocks(messages)
 		if toonCompressionMethod != "" {
 			if d.Config.PromptInjectionIsolated() {
@@ -1096,10 +1095,10 @@ func Chat(d Deps) http.Handler {
 				slog.String("request_id", reqID),
 				slog.String("method", string(toonCompressionMethod)))
 		}
-		postCompressionChars := totalMessageChars(messages)
-		trace.Transforms.TOONApplied = postCompressionChars != preCompressionChars
-		trace.Transforms.TOONBytesAfter = postCompressionChars
-		trace.Transforms.TOONTokensSaved = totalTokenSavings(preCompressionChars, postCompressionChars)
+		postCompressionJSON, _ := json.Marshal(messages)
+		trace.Transforms.TOONApplied = len(preCompressionJSON) != len(postCompressionJSON)
+		trace.Transforms.TOONBytesAfter = len(postCompressionJSON)
+		trace.Transforms.TOONTokensSaved = totalTokenSavings(preCompressionJSON, postCompressionJSON)
 		body["messages"] = messages
 		latestPrompt = middleware.ExtractLatestUserPrompt(messages)
 		// Promote the post-middleware prompt length into the
@@ -1777,8 +1776,8 @@ func Chat(d Deps) http.Handler {
 		outputTokens := int(obs.BytesOut() / 4)
 		rec := buildRecord(reqID, started, firstWriteAt.Load(), obs.BytesOut(), streaming, route, model, latestPrompt, upErr, fusionArbiterSkipped, fusionJaccardSimilarity, toolCallCount, decision)
 		if d.MetricsObserver != nil {
-			postCompressionChars := totalMessageChars(messages)
-			savings := totalTokenSavings(preCompressionChars, postCompressionChars)
+			postCompressionJSON, _ := json.Marshal(messages)
+			savings := totalTokenSavings(preCompressionJSON, postCompressionJSON)
 			inputTokens := telemetry.EstimateTokens(latestPrompt)
 			cost := frontierCostEstimate(string(route), model, inputTokens, d.Config.FrontierCostPer1K)
 			baselineCost := baselineCostEstimate(inputTokens+outputTokens, d.Config.CostBaselineRatePer1K)
@@ -2232,27 +2231,21 @@ func buildRecord(
 
 // --- metrics (issue #4) helpers ----------------------------------------
 
-// totalMessageChars marshals messages and returns the JSON byte
-// length. Used to compute the TOON savings token estimate. Mirrors
-// json.Marshal's own overflow behaviour (returns roughly the same
-// bytes the proxy would emit across the wire).
-func totalMessageChars(messages []interface{}) int {
-	b, err := json.Marshal(messages)
-	if err != nil {
-		return 0
-	}
-	return len(b)
-}
-
 // totalTokenSavings returns the tokens saved by the TOON
-// compression pass (pre - post character count, /4), clamped to
-// zero in case the rewrite expanded the message (which can happen
+// compression pass (preTokens - postTokens via EstimateTokens), clamped
+// to zero in case the rewrite expanded the message (which can happen
 // when the schema header outweighs the value rows for tiny inputs).
-func totalTokenSavings(preChars, postChars int) int {
-	if preChars <= postChars {
+func totalTokenSavings(preJSON, postJSON []byte) int {
+	if len(preJSON) <= len(postJSON) {
 		return 0
 	}
-	return (preChars - postChars) / 4
+	preTokens := telemetry.EstimateTokens(string(preJSON))
+	postTokens := telemetry.EstimateTokens(string(postJSON))
+	savings := preTokens - postTokens
+	if savings < 0 {
+		return 0
+	}
+	return savings
 }
 
 // frontierCostEstimate multiplies input tokens by the configured
