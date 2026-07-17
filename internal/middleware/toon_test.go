@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 )
@@ -277,6 +278,76 @@ func TestLatestSystemIndex(t *testing.T) {
 	}
 	if got := LatestSystemIndex([]interface{}{}); got != -1 {
 		t.Errorf("empty: got %d, want -1", got)
+	}
+}
+
+func TestSerializeToTOONHeterogeneousKeysExtra(t *testing.T) {
+	in := []byte(`[{"a":1,"b":2}, {"a":3,"c":4}]`)
+	_, err := SerializeToTOON(in)
+	if err == nil {
+		t.Fatal("expected error on heterogeneous keys")
+	}
+	if !errors.Is(err, ErrHeterogeneousKeys) {
+		t.Errorf("got %v, want ErrHeterogeneousKeys", err)
+	}
+}
+
+func TestSerializeToTOONHeterogeneousKeysMissing(t *testing.T) {
+	in := []byte(`[{"a":1,"b":2}, {"a":3}]`)
+	_, err := SerializeToTOON(in)
+	if err == nil {
+		t.Fatal("expected error on heterogeneous keys (missing key)")
+	}
+	if !errors.Is(err, ErrHeterogeneousKeys) {
+		t.Errorf("got %v, want ErrHeterogeneousKeys", err)
+	}
+}
+
+func TestCompressJSONBlocksHeterogeneousKeysFenced(t *testing.T) {
+	msgs := []interface{}{
+		map[string]interface{}{
+			"role":    "user",
+			"content": "```json\n[{\"a\":1,\"b\":2}, {\"a\":3,\"c\":4}]\n```",
+		},
+	}
+	if CompressJSONBlocks(msgs) != CompressionMethodNone {
+		t.Error("expected no compression for heterogeneous fenced array")
+	}
+	content := msgs[0].(map[string]interface{})["content"].(string)
+	if !contains(content, "[{\"a\":1,\"b\":2}, {\"a\":3,\"c\":4}]") {
+		t.Errorf("original JSON should be preserved, got %q", content)
+	}
+}
+
+func TestCompressJSONBlocksHeterogeneousKeysNested(t *testing.T) {
+	msgs := []interface{}{
+		map[string]interface{}{
+			"role":    "user",
+			"content": `{"results": [{"id":1,"name":"alpha"}, {"id":2,"extra":"beta"}]}`,
+		},
+	}
+	if CompressJSONBlocks(msgs) != CompressionMethodNone {
+		t.Error("expected no compression for heterogeneous nested array")
+	}
+	content := msgs[0].(map[string]interface{})["content"].(string)
+	if !contains(content, `"results"`) {
+		t.Errorf("original JSON should be preserved, got %q", content)
+	}
+}
+
+func TestCompressJSONBlocksHeterogeneousKeysUnfenced(t *testing.T) {
+	msgs := []interface{}{
+		map[string]interface{}{
+			"role":    "user",
+			"content": "[{\"x\":1,\"y\":2}, {\"x\":3}]",
+		},
+	}
+	if CompressJSONBlocks(msgs) != CompressionMethodNone {
+		t.Error("expected no compression for heterogeneous unfenced array")
+	}
+	content := msgs[0].(map[string]interface{})["content"].(string)
+	if !contains(content, "[{\"x\":1,\"y\":2}, {\"x\":3}]") {
+		t.Errorf("original JSON should be preserved, got %q", content)
 	}
 }
 

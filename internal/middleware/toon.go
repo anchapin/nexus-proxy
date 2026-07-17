@@ -9,7 +9,10 @@ package middleware
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -53,6 +56,8 @@ const (
 	CompressionMethodNone     CompressionMethod = ""
 )
 
+var ErrHeterogeneousKeys = errors.New("toon: heterogeneous keys in JSON array")
+
 // CompressJSONBlocks rewrites every ```json [ {...}, ... ] ``` block in the
 // user/assistant message content into a TOON text block. Returns the
 // compression method used: "fenced" for ```json [...] ``` blocks, "nested"
@@ -86,6 +91,9 @@ func CompressJSONBlocks(messages []interface{}) CompressionMethod {
 			}
 			toon, err := SerializeToTOON([]byte(m[1]))
 			if err != nil {
+				if errors.Is(err, ErrHeterogeneousKeys) {
+					slog.Debug("toon: skipping fenced JSON array with heterogeneous keys", "block", truncate(m[1], 64))
+				}
 				continue
 			}
 			block := "```text\n" + toon + "```"
@@ -105,6 +113,9 @@ func CompressJSONBlocks(messages []interface{}) CompressionMethod {
 			arrayMatch := content[m[2]:m[3]]
 			toon, err := SerializeToTOON([]byte(arrayMatch))
 			if err != nil {
+				if errors.Is(err, ErrHeterogeneousKeys) {
+					slog.Debug("toon: skipping nested JSON array with heterogeneous keys", "array", truncate(arrayMatch, 64))
+				}
 				continue
 			}
 			// Extract key from full match: "key": [...] -> "key": <toon>
@@ -134,6 +145,9 @@ func CompressJSONBlocks(messages []interface{}) CompressionMethod {
 			arrayMatch := content[m[2]:m[3]]
 			toon, err := SerializeToTOON([]byte(arrayMatch))
 			if err != nil {
+				if errors.Is(err, ErrHeterogeneousKeys) {
+					slog.Debug("toon: skipping unfenced JSON array with heterogeneous keys", "array", truncate(arrayMatch, 64))
+				}
 				continue
 			}
 			// Preserve leading context (newline/whitespace) by replacing only
@@ -162,10 +176,43 @@ func CompressJSONBlocks(messages []interface{}) CompressionMethod {
 	return CompressionMethodNone
 }
 
+// allSameKeys returns true if every object in data has the same set of keys.
+// Used to detect heterogeneous JSON arrays which must not be compressed.
+func allSameKeys(data []map[string]interface{}) bool {
+	if len(data) <= 1 {
+		return true
+	}
+	base := data[0]
+	for _, item := range data[1:] {
+		if !reflect.DeepEqual(keysOf(base), keysOf(item)) {
+			return false
+		}
+	}
+	return true
+}
+
+func keysOf(m map[string]interface{}) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
 // SerializeToTOON converts a JSON array of objects into the canonical TOON
 // shape: a header line `items[N]{k1,k2,...}:` followed by indented rows of
 // comma-joined values. Returns "items[0]{}:\n" for an empty array so the
 // downstream model still sees a well-formed block.
+// Returns ErrHeterogeneousKeys if objects in the array have different keys,
+// causing the caller to skip compression and fall back to the original JSON.
 func SerializeToTOON(jsonBytes []byte) (string, error) {
 	var data []map[string]interface{}
 	if err := json.Unmarshal(jsonBytes, &data); err != nil {
@@ -173,6 +220,10 @@ func SerializeToTOON(jsonBytes []byte) (string, error) {
 	}
 	if len(data) == 0 {
 		return "items[0]{}:\n", nil
+	}
+
+	if !allSameKeys(data) {
+		return "", fmt.Errorf("%w: objects in array have different keys", ErrHeterogeneousKeys)
 	}
 
 	keys := make([]string, 0, len(data[0]))
