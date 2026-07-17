@@ -63,26 +63,28 @@ type Route string
 // common coding task keywords (refactor, security scan, generate tests,
 // explain this code, code review, migrations, SQL/DB, docker, git, etc.).
 // Each pattern slice may be nil or empty in which case that branch is skipped.
+//
+// The patterns use (?i) case-insensitive flags, so MatchString is called
+// directly on the original prompt without lowercasing — avoiding the O(n)
+// allocation that toLowerASCII would impose on large prompts (issue #393).
 func DSL(prompt string, fusionPatterns, formattingPatterns, localPatterns []*regexp.Regexp) (Route, bool) {
-	lower := toLowerASCII(prompt)
-
 	if len(fusionPatterns) > 0 {
 		for _, re := range fusionPatterns {
-			if re.MatchString(lower) {
+			if re.MatchString(prompt) {
 				return RouteFusion, true
 			}
 		}
 	}
 	if len(formattingPatterns) > 0 {
 		for _, re := range formattingPatterns {
-			if re.MatchString(lower) {
+			if re.MatchString(prompt) {
 				return RouteLocal, true
 			}
 		}
 	}
 	if len(localPatterns) > 0 {
 		for _, re := range localPatterns {
-			if re.MatchString(lower) {
+			if re.MatchString(prompt) {
 				return RouteLocal, true
 			}
 		}
