@@ -100,18 +100,4 @@ func runConfigValidate(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// checkConfigFileIsValid is exported so internal packages can call the
-// validation logic without spinning up a subprocess. Returns the number
-// of keys and any error.
-func checkConfigFileIsValid(filePath string) (int, error) {
-	fileCfg, err := config.LoadFile(filePath)
-	if err != nil {
-		return 0, err
-	}
-	if fileCfg == nil {
-		return 0, fmt.Errorf("file is empty or does not exist: %s", filePath)
-	}
-	return len(fileCfg), nil
-}
-
 // Note: os is not directly used here; retained for future FilePrinter interface.

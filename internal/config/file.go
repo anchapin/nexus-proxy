@@ -75,8 +75,8 @@ func validateIndentation(content string) error {
 	)
 
 	var (
-		currentState state = stateTop
-		lineNum     int
+		currentState = stateTop
+		lineNum      int
 	)
 
 	for _, raw := range strings.Split(content, "\n") {
@@ -93,7 +93,8 @@ func validateIndentation(content string) error {
 		// Compute indentation level BEFORE trimming.
 		leading := len(line) - len(strings.TrimLeft(line, " \t"))
 
-		if leading == 0 {
+		switch leading {
+		case 0:
 			// Top-level line.
 			if strings.HasSuffix(trimmed, ":") {
 				// Section header at top level.
@@ -102,12 +103,12 @@ func validateIndentation(content string) error {
 				// Top-level key-value is fine.
 				currentState = stateTop
 			}
-		} else if leading == 1 {
+		case 1:
 			// Indented under a section (1 space is always valid indentation under a section).
 			if currentState != stateSection {
 				return fmt.Errorf("line %d: indented key has no section header above it", lineNum)
 			}
-		} else {
+		default:
 			// leading >= 2: could be deeply indented key under a section (valid)
 			// or a nested section header (invalid). Reject only if this is a section header
 			// (ends with ":") because that would be nesting a section inside a section.

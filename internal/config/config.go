@@ -553,7 +553,7 @@ func Load() (Config, error) {
 	cfg.FrontierKey = getEnv("NEXUS_FRONTIER_API_KEY", "") // secrets via env only
 	cfg.ZAIURL = getFileString("zai_url", "NEXUS_ZAI_URL", "https://api.z.ai/v1/chat/completions")
 	cfg.ZAIModel = getFileString("zai_model", "NEXUS_ZAI_MODEL", "glm-4.6")
-	cfg.ZAIKey = getEnv("NEXUS_ZAI_API_KEY", "") // secrets via env only
+	cfg.ZAIKey = getEnv("NEXUS_ZAI_API_KEY", "")        // secrets via env only
 	cfg.ProxyAPIKey = getEnv("NEXUS_PROXY_API_KEY", "") // secrets via env only
 	cfg.StatusPublic = getFileBool("status_public", "NEXUS_STATUS_PUBLIC", false)
 	cfg.ExamplesDir = getFileString("examples_dir", "NEXUS_EXAMPLES_DIR", "./few_shot_examples")
