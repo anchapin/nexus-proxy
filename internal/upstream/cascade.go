@@ -89,6 +89,9 @@ type CascadeResult struct {
 // is <= 0. Mirrors the issue default ("configurable, default 30s").
 const cascadeDefaultTimeout = 30 * time.Second
 
+// defaultMaxResponseBytes is the default cap on upstream response bodies.
+const defaultMaxResponseBytes = 64 << 20 // 64 MiB
+
 // ErrSSEPartialWrite is returned by writeSSEResponse when an SSE body write
 // fails after HTTP headers have already been committed (WriteHeader called).
 // The caller must not call http.Error after receiving this error; the
