@@ -120,12 +120,16 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Rolling 24-hour spend in USD from the daily frontier budget tracker.",
 		typ:  "gauge",
 	},
-	// Circuit breaker gauges (issue #304). Each circuit emits three
+	// Circuit breaker gauges (issue #304, #411). Each circuit emits five
 	// labelled metrics: state (0=closed, 1=half_open, 2=open),
-	// failures_total, and last_failure_seconds.
+	// trip_total, failures_total, last_failure_seconds, and last_trip_seconds.
 	"nexus_circuit_breaker_state": {
 		help: "Circuit breaker state: 0=closed, 1=half_open, 2=open (issue #304).",
 		typ:  "gauge",
+	},
+	"nexus_circuit_breaker_trip_total": {
+		help: "Total number of times this circuit breaker has tripped (transitioned to open state) (issue #411).",
+		typ:  "counter",
 	},
 	"nexus_circuit_breaker_failures_total": {
 		help: "Total number of failure events recorded for this circuit breaker (issue #304).",
@@ -134,6 +138,15 @@ var gaugeMeta = map[string]metricMeta{
 	"nexus_circuit_breaker_last_failure_seconds": {
 		help: "Unix timestamp of the last failure recorded for this circuit breaker (issue #304).",
 		typ:  "gauge",
+	},
+	"nexus_circuit_breaker_last_trip_seconds": {
+		help: "Unix timestamp of the last trip event for this circuit breaker (issue #411).",
+		typ:  "gauge",
+	},
+	// RAG embedder failure counter (issue #411)
+	"nexus_rag_embedder_failure_total": {
+		help: "Total per-request Ollama embedding failures for RAG retrieval (issue #411).",
+		typ:  "counter",
 	},
 	// RAG watcher gauges (issue #367)
 	"nexus_rag_watcher_files_indexed": {
@@ -200,6 +213,8 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 		"Total proxied requests where a RAG few-shot snippet was injected.", c.ragHitsTotal.Load())
 	writeCounter(w, "nexus_rag_misses_total",
 		"Total proxied requests where no RAG snippet met the similarity threshold.", c.ragMissesTotal.Load())
+	writeCounter(w, "nexus_rag_embedder_failure_total",
+		"Total per-request Ollama embedding failures for RAG retrieval (issue #411).", c.ragEmbedFailures.Load())
 	writeCounter(w, "nexus_toon_compressed_total",
 		"Total proxied requests whose JSON-array blocks were TOON-compressed.", c.toonCompressedTotal.Load())
 	writeCounter(w, "nexus_degraded_total",

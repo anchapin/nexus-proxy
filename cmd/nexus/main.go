@@ -117,10 +117,22 @@ func main() {
 	// collaborator so all traffic shares the same transport.
 	httpClient := transport.NewFromEnv()
 
+	// Circuit breaker metrics collector (issue #304, #411). Created early so it
+	// is available for wiring into the chat handler Deps and the embedder
+	// OnBreakerTrip callback.
+	circuitCollector := observability.NewCollector()
+
 	emb, err := rag.NewEmbedder(cfg.EmbedderType, cfg.EmbedderBaseURL, cfg.EmbeddingModel, cfg.FrontierKey, httpClient,
 		rag.BreakerConfig{Threshold: cfg.RAGCircuitBreakerThreshold, Cooldown: cfg.RAGCircuitBreakerCooldown})
 	if err != nil {
 		log.Fatalf("rag embedder: %v", err)
+	}
+	// Wire the embedder trip callback so circuit breaker trips are
+	// recorded in the metrics collector (issue #411).
+	if ollamaEmb, ok := emb.(*rag.OllamaEmbedder); ok {
+		ollamaEmb.OnBreakerTrip = func() {
+			circuitCollector.RecordCircuitTrip("rag")
+		}
 	}
 	slog.Info("rag embedder configured",
 		slog.String("type", string(cfg.EmbedderType)),
@@ -361,10 +373,6 @@ func main() {
 			tracing.RegisterExporter(exporter)
 		}
 	}
-
-	// Circuit breaker metrics collector (issue #304). Created early so it
-	// is available for wiring into the chat handler Deps.
-	circuitCollector := observability.NewCollector()
 
 	// Wire RAG watcher metrics into the /metrics output (issue #367).
 	if ragWatcher != nil {
@@ -833,6 +841,7 @@ func main() {
 		FusionArbiterSkipObserver: fusionArbiterSkipObs,
 		RAGObserver:               ragObserver,
 		RAGCacheObserver:          ragCacheObserver,
+		RAGMetrics:                circuitCollector, // issue #411
 		CascadeFallbackObserver:   cascadeFallbackObs,
 		ArbiterCacheObserver:      arbiterCacheObserver,
 		PanelPanicObserver:        panelPanicObs,
@@ -1232,8 +1241,8 @@ func (b *confidenceBridge) Close() error { return b.inner.Close() }
 //     identical to the pre-issue-46 behaviour.
 //
 // The watcher is started only when persistence is enabled AND
-// NEXUS_RAG_POLL_INTERVAL > 0; an interval of zero leaves
-// persistence on but disables runtime updates (boot-only load).
+// NEXUS_RAG_WATCHER_DISABLED is not set; NEXUS_RAG_POLL_INTERVAL=0
+// now means "use the default interval" (60s).
 func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context) (rag.RAGStore, *rag.PersistentStore, *rag.Watcher) {
 	// emb is already wrapped with EmbedCache by the caller (issue #115, #303)
 	cachedEmb := emb
@@ -1288,12 +1297,12 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 	if cfg.RAGWatcherEnabled() {
 		watcher = rag.NewWatcher(ps, cfg.ExamplesDir, cfg.RAGPollInterval)
 		watcher.Start(context.Background())
-		slog.Info("rag file watcher enabled",
+		slog.Info("rag watcher active",
 			slog.String("dir", cfg.ExamplesDir),
 			slog.Duration("interval", cfg.RAGPollInterval),
 		)
 	} else {
-		slog.Info("rag file watcher disabled (NEXUS_RAG_POLL_INTERVAL=0); boot-time load only")
+		slog.Info("rag watcher disabled; boot-time load only")
 	}
 
 	return ps, ps, watcher

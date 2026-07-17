@@ -332,6 +332,17 @@ type RAGObserverFunc func(RAGEvent)
 // ObserveRAG implements RAGObserver.
 func (f RAGObserverFunc) ObserveRAG(e RAGEvent) { f(e) }
 
+// RAGMetrics instruments RAG embedder outcomes (issue #411).
+type RAGMetrics interface {
+	IncRAGEmbedFailure()
+}
+
+// RAGMetricsFunc adapts a plain function to the RAGMetrics interface.
+type RAGMetricsFunc func()
+
+// IncRAGEmbedFailure implements RAGMetrics.
+func (f RAGMetricsFunc) IncRAGEmbedFailure() { f() }
+
 // CascadeFallbackEvent carries the reason for a cascade fallback (issue #205).
 // The handler dispatches one when a retryable step failure causes the cascade
 // to fall back to the next step. The reason is one of "timeout",
@@ -708,6 +719,10 @@ type Deps struct {
 	// that adapts the event to RouteCounters.ObserveRAGCacheHit/Miss.
 	RAGCacheObserver func(hit bool)
 
+	// RAGMetrics instruments RAG embedder outcomes (issue #411).
+	// Nil means RAG embedder metrics are not recorded.
+	RAGMetrics RAGMetrics
+
 	// CascadeFallbackObserver is invoked when the cascade falls back to a
 	// later step due to a retryable error (issue #205). The handler
 	// dispatches exactly one event per request when FallbackReason is
@@ -1018,6 +1033,9 @@ func Chat(d Deps) http.Handler {
 			)
 			if d.RAGObserver != nil {
 				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "embed_error"})
+			}
+			if d.RAGMetrics != nil {
+				d.RAGMetrics.IncRAGEmbedFailure()
 			}
 			// Record circuit failure for rag only when the circuit is open
 			// (transient embed errors are not circuit breaker events).

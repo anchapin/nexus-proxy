@@ -985,6 +985,55 @@ func TestShutdownTimeoutZeroRemapsToDefault(t *testing.T) {
 	}
 }
 
+// Issue #409: RAG watcher now runs by default and NEXUS_RAG_WATCHER_DISABLED=true
+// explicitly disables it. NEXUS_RAG_POLL_INTERVAL=0 means "use default interval".
+func TestRAGWatcherDisabledEnvVar(t *testing.T) {
+	t.Run("default_disabled_false", func(t *testing.T) {
+		t.Setenv("NEXUS_RAG_DB", "mem:")
+		t.Setenv("NEXUS_RAG_WATCHER_DISABLED", "")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.RAGWatcherDisabled {
+			t.Error("RAGWatcherDisabled = true, want false (default)")
+		}
+		if !cfg.RAGWatcherEnabled() {
+			t.Error("RAGWatcherEnabled = false, want true when RAGPersistentEnabled and not disabled")
+		}
+	})
+
+	t.Run("explicit_disable", func(t *testing.T) {
+		t.Setenv("NEXUS_RAG_DB", "mem:")
+		t.Setenv("NEXUS_RAG_WATCHER_DISABLED", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.RAGWatcherDisabled {
+			t.Error("RAGWatcherDisabled = false, want true")
+		}
+		if cfg.RAGWatcherEnabled() {
+			t.Error("RAGWatcherEnabled = true, want false when explicitly disabled")
+		}
+	})
+
+	t.Run("poll_interval_zero_means_default", func(t *testing.T) {
+		t.Setenv("NEXUS_RAG_DB", "mem:")
+		t.Setenv("NEXUS_RAG_POLL_INTERVAL", "0")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.RAGPollInterval != DefaultRAGPollInterval {
+			t.Errorf("RAGPollInterval = %v, want %v (DefaultRAGPollInterval)", cfg.RAGPollInterval, DefaultRAGPollInterval)
+		}
+		if !cfg.RAGWatcherEnabled() {
+			t.Error("RAGWatcherEnabled = false, want true when interval is set to default")
+		}
+	})
+}
+
 func TestCheckUnknownEnvVarsNoPanic(t *testing.T) {
 	// checkUnknownEnvVars should not panic regardless of env var content.
 	// It logs warnings for unknown vars but never fails.

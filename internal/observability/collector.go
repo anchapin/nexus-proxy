@@ -162,7 +162,13 @@ type Collector struct {
 	ragWatcherScanDurationMs atomic.Uint64 // last scan duration in milliseconds
 	ragWatcherIndexingErrors atomic.Uint64 // cumulative indexing errors
 
-	// --- Circuit breaker instrumentation (issue #304) ---------------
+	// --- RAG embedder instrumentation (issue #411) ----------------
+	//
+	// ragEmbedFailures counts per-request Ollama embedding failures
+	// so operators can build alerts for "breaker about to trip".
+	ragEmbedFailures atomic.Uint64
+
+	// --- Circuit breaker instrumentation (issue #304, #411) ---------------
 	//
 	// Tracks the state of each named circuit breaker (ollama, rag).
 	// State values: 0=closed, 1=half_open, 2=open.
@@ -187,8 +193,10 @@ type Collector struct {
 // circuitBreakerState holds the atomic state for one named circuit.
 type circuitBreakerState struct {
 	state       atomic.Int32 // 0=closed, 1=half_open, 2=open
+	tripCount   atomic.Uint64
 	failures    atomic.Uint64
 	lastFailure atomic.Int64 // Unix timestamp (seconds) of last failure
+	lastTrip    atomic.Int64 // Unix timestamp (seconds) of last trip to open
 }
 
 const (
@@ -431,6 +439,12 @@ func (c *Collector) IncTLSAccepted() { c.tlsConnectionsAccepted.Add(1) }
 // close before reaching http.StateTLSHandshakeComplete.
 func (c *Collector) IncTLSRejected() { c.tlsConnectionsRejected.Add(1) }
 
+// IncRAGEmbedFailure increments the per-request Ollama embedding failure
+// counter (issue #411). Called from the chat handler after a ragErr != nil
+// when the RAG embedder returns an error, giving operators an early-warning
+// signal before the circuit breaker trips.
+func (c *Collector) IncRAGEmbedFailure() { c.ragEmbedFailures.Add(1) }
+
 // --- RAG watcher instrumentation (issue #367) ----------------------
 //
 // OnScanComplete records the outcome of one watcher scan. Called by
@@ -471,6 +485,18 @@ func (c *Collector) RecordCircuitFailure(circuit string) {
 	cb.lastFailure.Store(time.Now().Unix())
 }
 
+// RecordCircuitTrip records a circuit breaker trip event (issue #411).
+// Called via the OnBreakerTrip callback wired from the Ollama health
+// breaker in main.go so the collector can emit nexus_circuit_breaker_trip_total.
+func (c *Collector) RecordCircuitTrip(circuit string) {
+	if circuit == "" {
+		return
+	}
+	cb := c.getOrCreateCircuit(circuit)
+	cb.tripCount.Add(1)
+	cb.lastTrip.Store(time.Now().Unix())
+}
+
 // RecordCircuitRecovery transitions the named circuit back to "closed".
 // Called from the chat handler when the cooldown window expires or a
 // RAG request succeeds after the breaker was open.
@@ -494,19 +520,23 @@ func (c *Collector) RecordCircuitHalfOpen(circuit string) {
 
 // CircuitBreakerGauges returns the live state of all tracked circuit
 // breakers as gauge samples for the Prometheus renderer. Each circuit
-// emits three samples: state (0=closed, 1=half_open, 2=open),
-// failures_total, and last_failure_seconds.
+// emits five samples: state (0=closed, 1=half_open, 2=open),
+// trip_total, failures_total, last_failure_seconds, and last_trip_seconds
+// (issue #411).
 func (c *Collector) CircuitBreakerGauges() []GaugeSample {
 	var out []GaugeSample
 	c.cbMu.RLock()
 	defer c.cbMu.RUnlock()
 	for name, cb := range c.cbState {
 		lastFail := cb.lastFailure.Load()
+		lastTrip := cb.lastTrip.Load()
 		labels := map[string]string{"circuit": name}
 		out = append(out,
 			GaugeSample{Name: "nexus_circuit_breaker_state", Labels: labels, Value: float64(cb.state.Load())},
+			GaugeSample{Name: "nexus_circuit_breaker_trip_total", Labels: labels, Value: float64(cb.tripCount.Load())},
 			GaugeSample{Name: "nexus_circuit_breaker_failures_total", Labels: labels, Value: float64(cb.failures.Load())},
 			GaugeSample{Name: "nexus_circuit_breaker_last_failure_seconds", Labels: labels, Value: float64(lastFail)},
+			GaugeSample{Name: "nexus_circuit_breaker_last_trip_seconds", Labels: labels, Value: float64(lastTrip)},
 		)
 	}
 	return out
