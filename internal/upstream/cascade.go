@@ -79,6 +79,14 @@ type CascadeResult struct {
 	// when no fallback occurred (cascade succeeded on first step or all
 	// steps failed without retryable errors).
 	FallbackReason string
+	// PartialWriteOccurred is true when a step wrote bytes to the client
+	// (HTTP headers committed) but then failed with a partial-write error
+	// before completing the SSE response. The client receives a corrupted
+	// SSE stream in this case. When a fallback step is attempted after
+	// a partial write, the fallback response is preceded by a
+	// `data: [ERROR]` chunk so the client can detect the corruption.
+	// Issue #405.
+	PartialWriteOccurred bool
 }
 
 // cascadeDefaultTimeout is the per-attempt timeout used when Cascade.Timeout
@@ -161,9 +169,23 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 
 	res := CascadeResult{}
 	var lastErr error
+	var stepHadPartialWrite bool
 	for i, step := range c.Steps {
 		res.Attempts = i + 1
 		res.RouteAttempted = joinStepNames(c.Steps[:i+1])
+
+		// Issue #405: if the previous step partially wrote SSE data before
+		// failing, write an error marker so the client can detect the
+		// corruption before we attempt the fallback.
+		if stepHadPartialWrite {
+			if err := writeCascadeErrorChunk(w); err == nil {
+				slog.Warn("cascade partial write, error chunk written before fallback",
+					slog.String("step", step.Name),
+					slog.Int("attempt", i+1),
+				)
+			}
+			stepHadPartialWrite = false
+		}
 
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		msg, servedModel, err := fetchCascadeStep(ctx, client, step, payload)
@@ -174,16 +196,26 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 				slog.Int("attempt", i+1),
 				slog.Int("total", len(c.Steps)),
 			)
-			res.Succeeded = true
-			res.ServedBy = step.Name
-			res.ToolCalls = msg.ToolCalls
 			if werr := writeSSEResponse(w, step.Name, servedModel, msg); werr != nil {
-				return res, werr
+				if errors.Is(werr, ErrSSEPartialWrite) {
+					res.PartialWriteOccurred = true
+					stepHadPartialWrite = true
+					lastErr = werr
+				} else {
+					return res, werr
+				}
+			} else {
+				res.Succeeded = true
+				res.ServedBy = step.Name
+				res.ToolCalls = msg.ToolCalls
+				if !stepHadPartialWrite {
+					return res, nil
+				}
 			}
-			return res, nil
+		} else {
+			lastErr = err
 		}
-		lastErr = err
-		retry := classifyFailure(err)
+		retry := classifyFailure(lastErr)
 		// Issue #80: expose whether the local step was the one that
 		// failed so the chat handler can arm the local-route cooldown.
 		// Only set when the step is named "local" AND the error is
@@ -198,18 +230,21 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 		// is used for the cascade_fallback_total{reason} Prometheus
 		// counter so operators can observe cascade fallback rates.
 		if retry {
-			res.FallbackReason = CascadeFallbackReason(err)
+			res.FallbackReason = CascadeFallbackReason(lastErr)
 		}
 		slog.Warn("cascade step failed",
 			slog.String("step", step.Name),
 			slog.Int("attempt", i+1),
 			slog.Int("total", len(c.Steps)),
 			slog.Bool("retry", retry),
-			slog.Any("err", err),
+			slog.Any("err", lastErr),
 		)
 		if !retry {
 			// Non-retryable (e.g. upstream returned 401/403): stop and surface.
-			return res, err
+			return res, lastErr
+		}
+		if stepHadPartialWrite {
+			writeCascadeErrorChunk(w)
 		}
 	}
 	if lastErr == nil {
@@ -464,6 +499,21 @@ func writeSSEResponse(w http.ResponseWriter, stepName, servedModel string, msg A
 	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
 		// Body write after headers committed — sentinel (issue #241).
 		return ErrSSEPartialWrite
+	}
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return nil
+}
+
+// writeCascadeErrorChunk writes a `data: [ERROR]` SSE chunk to w so the
+// client can detect that a partial write corruption occurred and the
+// subsequent SSE chunks belong to a fallback response (issue #405).
+// This is best-effort: if the write fails there is nothing meaningful
+// we can do since the headers are already committed.
+func writeCascadeErrorChunk(w http.ResponseWriter) error {
+	if _, err := io.WriteString(w, "data: [ERROR]\n\n"); err != nil {
+		return err
 	}
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()

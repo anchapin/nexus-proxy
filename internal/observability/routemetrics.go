@@ -153,6 +153,13 @@ type RouteCounters struct {
 	// the "within 100ms" acceptance criterion.
 	fusionGoroutineWaste *Histogram
 
+	// Cascade partial write counter (issue #405). Counts how many times a
+	// cascade step wrote HTTP headers and partial SSE bytes before failing,
+	// and a fallback step was subsequently attempted. The fallback response
+	// is preceded by a `data: [ERROR]` chunk so the client can detect the
+	// corrupted partial write.
+	cascadePartialWrite uint64 // atomic
+
 	// collector is an optional Collector whose CircuitBreakerGauges()
 	// are merged into the /metrics output when non-nil.
 	collector *Collector
@@ -398,6 +405,26 @@ func (rc *RouteCounters) ObserveCascadeFallback(reason string) {
 		return
 	}
 	atomic.AddUint64(rc.cascadeFallbackSlot(reason), 1)
+}
+
+// ObserveCascadePartialWrite records one cascade partial-write event
+// (issue #405). This is incremented when a cascade step wrote HTTP
+// headers and partial SSE bytes to the client before failing, and a
+// fallback step was subsequently attempted. Safe for concurrent use;
+// nil receivers are a no-op.
+func (rc *RouteCounters) ObserveCascadePartialWrite() {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(&rc.cascadePartialWrite, 1)
+}
+
+// CascadePartialWriteTotal returns the current partial-write count.
+func (rc *RouteCounters) CascadePartialWriteTotal() uint64 {
+	if rc == nil {
+		return 0
+	}
+	return atomic.LoadUint64(&rc.cascadePartialWrite)
 }
 
 // ObserveArbiterCacheHit records an arbiter cache lookup result
@@ -723,6 +750,16 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += n
 	}
+
+	// Cascade partial write counter (issue #405).
+	if n, err := writeOverflowSeries(w, "nexus_cascade_partial_write_total",
+		"Cascade steps that wrote partial SSE data before failing, causing fallback to prepend an error chunk.",
+		&rc.cascadePartialWrite); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+
 	if n, err := writeRejectionSeries(w, "nexus_fusion_arbiter_cache_total",
 		"Fusion arbiter synthesis cache hits and misses (issue #232).",
 		rc.arbiterCache); err != nil {

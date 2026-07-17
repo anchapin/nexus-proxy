@@ -29,6 +29,48 @@ func (s *sseRW) Write(b []byte) (int, error) { return s.body.Write(b) }
 func (s *sseRW) WriteHeader(c int)           { s.status = c }
 func (s *sseRW) Flush()                      { s.flushed = true }
 
+// partialWriteRW fails body writes after headers are committed, simulating
+// a partial SSE write failure (issue #405). It returns ErrSSEPartialWrite
+// so the cascade's error detection works correctly.
+type partialWriteRW struct {
+	header       http.Header
+	status       int
+	body         strings.Builder
+	wroteHeader  bool
+	failAtCount int // fail after this many successful body writes
+	writeCount  int
+}
+
+func newPartialWriteRW(failAt int) *partialWriteRW {
+	return &partialWriteRW{header: http.Header{}, failAtCount: failAt}
+}
+
+func (p *partialWriteRW) Header() http.Header { return p.header }
+func (p *partialWriteRW) Write(b []byte) (int, error) {
+	if !p.wroteHeader {
+		p.body.Write(b)
+		return len(b), nil
+	}
+	if strings.Contains(string(b), "[ERROR]") {
+		p.body.Write(b)
+		return len(b), nil
+	}
+	p.writeCount++
+	if p.writeCount > p.failAtCount {
+		return 0, ErrSSEPartialWrite
+	}
+	return p.body.Write(b)
+}
+func (p *partialWriteRW) WriteHeader(c int) {
+	if p.wroteHeader {
+		p.writeCount = 0
+		p.failAtCount = 999999
+	}
+	p.wroteHeader = true
+	p.status = c
+}
+func (p *partialWriteRW) Flush() {}
+
 // chatBody200 is a minimal valid OpenAI-style chat completion body.
 const chatBody200 = `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"hello from local"},"finish_reason":"stop"}]}`
 
@@ -881,5 +923,108 @@ func TestConfigureCascadeTimeout(t *testing.T) {
 
 	if cascadeDefaultTimeout != 45*time.Second {
 		t.Errorf("cascadeDefaultTimeout = %v, want 45s", cascadeDefaultTimeout)
+	}
+}
+
+// --- Issue #405: partial write + fallback tests --------------------------------
+
+// TestCascadePartialWriteNoFallback verifies that when a cascade step writes
+// partial SSE data (headers committed, body write fails) and there's no
+// fallback step, CascadeResult.PartialWriteOccurred is set and the partial write
+// error is returned. Issue #405.
+func TestCascadePartialWriteNoFallback(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+	client := &http.Client{Transport: ft}
+
+	cas := &Cascade{
+		Timeout: 2 * time.Second,
+		Steps: []CascadeStep{
+			{Name: "local", URL: "http://primary.local/v1/chat/completions", Model: "local-m"},
+		},
+	}
+
+	// Writer that fails on body write after headers committed.
+	rw := newPartialWriteRW(0)
+	res, err := cas.Run(context.Background(), rw, client, map[string]interface{}{"messages": []interface{}{}})
+	if err == nil {
+		t.Fatal("expected error when single step has partial write and no fallback")
+	}
+	if !res.PartialWriteOccurred {
+		t.Error("PartialWriteOccurred should be true")
+	}
+	if res.Succeeded {
+		t.Error("Succeeded should be false")
+	}
+}
+
+// TestCascadePartialWriteWithFallback verifies that when a cascade step writes
+// partial SSE data and a fallback step exists, PartialWriteOccurred is set and
+// the fallback is attempted (ErrSSEPartialWrite is retryable). Issue #405.
+func TestCascadePartialWriteWithFallback(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+
+	// Writer that fails on body write after headers committed.
+	rw := newPartialWriteRW(0)
+	client := &http.Client{Transport: ft}
+
+	res, err := twoStepCascade().Run(context.Background(), rw, client, map[string]interface{}{"messages": []interface{}{}})
+	if err != nil {
+		t.Fatalf("Run returned unexpected error: %v", err)
+	}
+	if !res.PartialWriteOccurred {
+		t.Error("PartialWriteOccurred should be true")
+	}
+	if !res.Succeeded || res.ServedBy != "frontier" {
+		t.Errorf("expected fallback to succeed, got Succeeded=%v ServedBy=%q",
+			res.Succeeded, res.ServedBy)
+	}
+}
+
+// TestCascadePartialWriteErrorChunkPrepended verifies that when a step partially
+// writes SSE data before failing, and a fallback step is attempted, the fallback
+// response is preceded by a `data: [ERROR]` chunk so the client can detect the
+// corruption. Issue #405.
+func TestCascadePartialWriteErrorChunkPrepended(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+
+	// Writer that fails on body write after headers committed.
+	rw := newPartialWriteRW(0)
+	client := &http.Client{Transport: ft}
+
+	res, err := twoStepCascade().Run(context.Background(), rw, client, map[string]interface{}{"messages": []interface{}{}})
+	if err != nil {
+		t.Fatalf("Run returned unexpected error: %v", err)
+	}
+	if !res.PartialWriteOccurred {
+		t.Fatal("PartialWriteOccurred should be true")
+	}
+
+	// Verify the error chunk was written before the fallback's response.
+	body := rw.body.String()
+	if !strings.Contains(body, "data: [ERROR]") {
+		t.Errorf("expected body to contain 'data: [ERROR]', got: %q", body)
+	}
+	if !strings.Contains(body, "hello from local") {
+		t.Errorf("expected body to contain fallback content, got: %q", body)
 	}
 }
