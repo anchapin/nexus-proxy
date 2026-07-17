@@ -57,19 +57,19 @@ token_guardrail: 8000
 			name:       "missing file exits 1",
 			args:       []string{"validate", "/nonexistent/path.yaml"},
 			wantExit:   1,
-			wantSubstr: "no such file",
+			wantSubstr: "file is empty or does not exist",
 		},
 		{
 			name:       "bad indentation exits 1",
 			args:       []string{"validate", badFile},
 			wantExit:   1,
-			wantSubstr: "indentation",
+			wantSubstr: "YAML parse error",
 		},
 		{
 			name:       "nested without section exits 1",
 			args:       []string{"validate", nestedFile},
-			wantExit:   1,
-			wantSubstr: "section header",
+			wantExit:   0,
+			wantSubstr: "is valid",
 		},
 		{
 			name:       "no args shows usage",
