@@ -200,7 +200,7 @@ type Collector struct {
 	// Tracks failures for each embedder circuit breaker (ollama, openai, cohere).
 	// Protected by cbMu for map access; individual counters are atomic.
 	embedderMu       sync.RWMutex
-	embedderFailures map[string]atomic.Uint64 // keyed by "ollama", "openai", "cohere"
+	embedderFailures map[string]*atomic.Uint64 // keyed by "ollama", "openai", "cohere"
 }
 
 // circuitBreakerState holds the atomic state for one named circuit.
@@ -233,7 +233,7 @@ func NewCollector() *Collector {
 		stageTOON:       NewHistogram(DefaultBuckets),
 		stageSLM:        NewHistogram(DefaultBuckets),
 		stageUpstream:   NewHistogram(DefaultBuckets),
-		embedderFailures: make(map[string]atomic.Uint64),
+		embedderFailures: make(map[string]*atomic.Uint64),
 	}
 	// Pre-allocate SLM confidence histograms for each known category
 	// (issue #425). Pre-allocation means ObserveSLMConfidence only
@@ -546,7 +546,10 @@ func (c *Collector) IncEmbedderFailure(kind string) {
 	c.embedderMu.Lock()
 	defer c.embedderMu.Unlock()
 	if c.embedderFailures == nil {
-		c.embedderFailures = make(map[string]atomic.Uint64)
+		c.embedderFailures = make(map[string]*atomic.Uint64)
+	}
+	if c.embedderFailures[kind] == nil {
+		c.embedderFailures[kind] = new(atomic.Uint64)
 	}
 	c.embedderFailures[kind].Add(1)
 }
