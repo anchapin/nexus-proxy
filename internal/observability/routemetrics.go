@@ -171,15 +171,9 @@ func NewRouteCounters() *RouteCounters {
 		slmEscalations:           make(map[string]*uint64),
 		ragCacheHits:             &cHits,
 		ragCacheMisses:           &cMisses,
-<<<<<<< Updated upstream
 		fusionArbiterSkips:       make(map[string]*uint64),
 		fusionSimilarityRatio:    NewHistogram([]float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0}),
 		fusionSpeculativeWinner:  make(map[string]*uint64),
-=======
-		fusionArbiterSkips:      make(map[string]*uint64),
-		fusionSimilarityRatio:    NewHistogram([]float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0}),
-		fusionSpeculativeWinner: make(map[string]*uint64),
->>>>>>> Stashed changes
 	}
 }
 
@@ -752,19 +746,9 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	// Fusion similarity ratio histogram (issue #384). Records Jaccard similarity
 	// when panel members disagreed and the arbiter was invoked.
 	if rc.fusionSimilarityRatio != nil {
-<<<<<<< Updated upstream
 		writeHistogram(w, "nexus_fusion_similarity_ratio_bucket",
 			"Jaccard similarity ratio between panel members when arbiter was invoked (issue #384).",
 			rc.fusionSimilarityRatio)
-=======
-		if n, err := writeHistogram(w, "nexus_fusion_similarity_ratio_bucket",
-			"Jaccard similarity ratio between panel members when arbiter was invoked (issue #384).",
-			rc.fusionSimilarityRatio); err != nil {
-			return total, err
-		} else {
-			total += n
-		}
->>>>>>> Stashed changes
 	}
 
 	// Fusion speculative winner counters (issue #384).

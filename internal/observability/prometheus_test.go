@@ -409,3 +409,54 @@ func TestRenderPrometheusTLSCounters(t *testing.T) {
 		}
 	}
 }
+
+// TestRenderPrometheusVRAMGauges verifies that VRAM gauges are rendered
+// when a callback is configured (issue #394).
+func TestRenderPrometheusVRAMGauges(t *testing.T) {
+	c := NewCollector()
+	c.SetVramGaugeFunc(func() map[string]int64 {
+		return map[string]int64{
+			"card0": int64(8) << 30, // 8 GiB free
+			"card1": int64(4) << 30, // 4 GiB free
+		}
+	}, int64(2)<<30) // 2 GiB per slot
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c)
+	out := sb.String()
+
+	// Check TYPE lines are present for both VRAM metric families.
+	vramTypes := []string{
+		"# TYPE nexus_vram_free_bytes gauge",
+		"# TYPE nexus_vram_slots_available gauge",
+	}
+	for _, want := range vramTypes {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in output", want)
+		}
+	}
+
+	// Check HELP lines.
+	vramHelps := []string{
+		"# HELP nexus_vram_free_bytes Free VRAM in bytes per GPU",
+		"# HELP nexus_vram_slots_available Available local-route concurrency slots",
+	}
+	for _, want := range vramHelps {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in output", want)
+		}
+	}
+
+	// Check sample lines with gpu_id labels.
+	samples := []string{
+		`nexus_vram_free_bytes{gpu_id="card0"}`,
+		`nexus_vram_free_bytes{gpu_id="card1"}`,
+		`nexus_vram_slots_available{gpu_id="card0"} 4`, // 8 GiB / 2 GiB = 4
+		`nexus_vram_slots_available{gpu_id="card1"} 2`, // 4 GiB / 2 GiB = 2
+	}
+	for _, want := range samples {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in output", want)
+		}
+	}
+}

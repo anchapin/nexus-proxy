@@ -59,11 +59,20 @@ const (
 // Tokens is zero and Source is SourceStatic so the caller can fall
 // back to the static NEXUS_TOKEN_GUARDRAIL.
 type Budget struct {
-	Tokens        int   // the budget the router should use
-	ModelContext  int   // context_length from /api/ps, 0 if unknown
-	FreeVRAMBytes int64 // free VRAM in bytes, 0 if unknown
-	BytesPerToken int   // bytes-per-token heuristic used to convert VRAM -> tokens
+	Tokens        int // the budget the router should use
+	ModelContext  int // context_length from /api/ps, 0 if unknown
+	BytesPerToken int // bytes-per-token heuristic used to convert VRAM -> tokens
 	Source        Source
+
+	// FreeVRAMBytes is the aggregate free VRAM in bytes across all GPUs.
+	// Zero when the probe does not measure VRAM.
+	FreeVRAMBytes int64
+
+	// FreeVRAMBytesPerGPU is free VRAM broken down by GPU (gpu_id -> bytes).
+	// The gpu_id is the sysfs card name, e.g. "card0", "card1".
+	// Used by the observability collector to emit per-GPU Prometheus gauges
+	// with a gpu_id label for multi-GPU hosts (issue #394).
+	FreeVRAMBytesPerGPU map[string]int64
 }
 
 // Disabled reports whether the probe could not produce a budget.
@@ -174,6 +183,19 @@ func (m *Manager) Get() Budget {
 		return *p
 	}
 	return Budget{Source: SourceStatic}
+}
+
+// GetFreeVRAMBytesPerGPU returns the most recently observed per-GPU
+// free VRAM readings. The returned map is nil when no probe has
+// completed yet. Callers must not modify the map.
+func (m *Manager) GetFreeVRAMBytesPerGPU() map[string]int64 {
+	if m == nil {
+		return nil
+	}
+	if p := m.latest.Load(); p != nil {
+		return p.FreeVRAMBytesPerGPU
+	}
+	return nil
 }
 
 // Run performs an initial synchronous probe and then starts the

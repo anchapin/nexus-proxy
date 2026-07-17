@@ -180,6 +180,78 @@ func TestReadFreeVRAMBytesSumAcrossCards(t *testing.T) {
 	}
 }
 
+func TestReadFreeVRAMBytesPerGPUMultiCard(t *testing.T) {
+	// Test that readFreeVRAMBytesPerGPU returns per-GPU readings with
+	// correct gpu_id labels (card0, card1) for multi-GPU hosts (issue #394).
+	dir := t.TempDir()
+	// Two cards, each with different free VRAM.
+	// card0: 16 GiB total, 4 GiB used → 12 GiB free
+	// card1: 16 GiB total, 6 GiB used → 10 GiB free
+	for i, name := range []string{"card0", "card1"} {
+		card := filepath.Join(dir, name, "device")
+		if err := os.MkdirAll(card, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		total := int64(16) << 30
+		used := int64(4+2*int64(i)) << 30
+		_ = os.WriteFile(filepath.Join(card, "mem_info_vram_total"),
+			[]byte(fmt.Sprintf("%d\n", total)), 0o644)
+		_ = os.WriteFile(filepath.Join(card, "mem_info_vram_used"),
+			[]byte(fmt.Sprintf("%d\n", used)), 0o644)
+	}
+	perGPU, err := readFreeVRAMBytesPerGPU(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(perGPU) != 2 {
+		t.Fatalf("got %d GPUs, want 2", len(perGPU))
+	}
+	want := map[string]int64{
+		"card0": int64(12) << 30,
+		"card1": int64(10) << 30,
+	}
+	for gpuID, wantFree := range want {
+		got, ok := perGPU[gpuID]
+		if !ok {
+			t.Errorf("missing gpu_id %q in per-GPU map", gpuID)
+			continue
+		}
+		if got != wantFree {
+			t.Errorf("perGPU[%q] = %d, want %d", gpuID, got, wantFree)
+		}
+	}
+}
+
+func TestReadFreeVRAMBytesPerGPUSumsToTotal(t *testing.T) {
+	// Verify that the sum of per-GPU readings equals what readFreeVRAMBytes returns.
+	dir := t.TempDir()
+	for _, name := range []string{"card0", "card1", "card2"} {
+		card := filepath.Join(dir, name, "device")
+		if err := os.MkdirAll(card, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		_ = os.WriteFile(filepath.Join(card, "mem_info_vram_total"),
+			[]byte(fmt.Sprintf("%d\n", int64(8)<<30)), 0o644)
+		_ = os.WriteFile(filepath.Join(card, "mem_info_vram_used"),
+			[]byte(fmt.Sprintf("%d\n", int64(3)<<30)), 0o644)
+	}
+	perGPU, err := readFreeVRAMBytesPerGPU(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	total, err := readFreeVRAMBytes(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sumPerGPU int64
+	for _, free := range perGPU {
+		sumPerGPU += free
+	}
+	if sumPerGPU != total {
+		t.Errorf("sum of per-GPU readings = %d, total = %d", sumPerGPU, total)
+	}
+}
+
 // ---------------------------------------------------------------------
 // OllamaProbe with httptest stub for /api/ps
 // ---------------------------------------------------------------------
