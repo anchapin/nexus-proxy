@@ -691,6 +691,17 @@ func main() {
 	fusionOutcomeObs := handlers.FusionOutcomeObserverFunc(func(e handlers.FusionOutcomeEvent) {
 		routeCounters.ObserveFusionOutcome(e.ArbiterSkipped)
 	})
+	// Fusion arbiter skip observer (issue #384). Records detailed skip metadata:
+	// skip reason (agreement/tool_calls/one_member), similarity ratio, and
+	// speculative winner source. Surfaces as
+	// nexus_fusion_arbiter_skipped_total{reason},
+	// nexus_fusion_similarity_ratio_bucket, and
+	// nexus_fusion_speculative_winner_total{source}.
+	fusionArbiterSkipObs := handlers.FusionArbiterSkipObserverFunc(func(e handlers.FusionArbiterSkipEvent) {
+		routeCounters.ObserveFusionArbiterSkip(e.Reason)
+		routeCounters.ObserveFusionSimilarityRatio(e.Similarity)
+		routeCounters.ObserveFusionSpeculativeWinner(e.Source)
+	})
 	// Cascade fallback observer (issue #205): the chat handler dispatches
 	// one CascadeFallbackEvent per request when a retryable step failure
 	// caused the cascade to fall back to the next step. The closure
@@ -788,34 +799,35 @@ func main() {
 	}
 
 	chatHandler := handlers.Chat(handlers.Deps{
-		Config:                  cfg,
-		Client:                  httpClient,
-		RAG:                     store,
-		SLM:                     slm,
-		MiddlewareChain:         mwChain,
-		ContextAwareRAG:         ctxAwareRAG,
-		Confidence:              confidenceObs,
-		SLMCache:                slmCache,
-		JudgeObserver:           judgeObs,
-		QualityObserver:         qualityO,
-		MetricsObserver:         metricsObs,
-		Recorder:                recorder,
-		Health:                  hpoller,
-		BudgetObserver:          budgetObserver(probeMgr),
-		SpendGuard:              budgetGuard, // nil when budget disabled (issue #220)
-		LocalLimiter:            localLimiter,
-		LocalCooldown:           localCooldown,
-		RouteDecisionObserver:   routeDecisionObs,
-		RejectionObserver:       rejectionObs,
-		FusionOutcomeObserver:   fusionOutcomeObs,
-		RAGObserver:             ragObserver,
-		RAGCacheObserver:        ragCacheObserver,
-		CascadeFallbackObserver: cascadeFallbackObs,
-		ArbiterCacheObserver:    arbiterCacheObserver,
-		PanelPanicObserver:      panelPanicObs,
-		CircuitBreakerObserver:  circuitBreakerObs,
-		ArbiterCache:            arbiterCache,
-		Providers:               providerRegistry,
+		Config:                    cfg,
+		Client:                    httpClient,
+		RAG:                       store,
+		SLM:                       slm,
+		MiddlewareChain:           mwChain,
+		ContextAwareRAG:           ctxAwareRAG,
+		Confidence:                confidenceObs,
+		SLMCache:                  slmCache,
+		JudgeObserver:             judgeObs,
+		QualityObserver:           qualityO,
+		MetricsObserver:           metricsObs,
+		Recorder:                  recorder,
+		Health:                    hpoller,
+		BudgetObserver:            budgetObserver(probeMgr),
+		SpendGuard:                budgetGuard, // nil when budget disabled (issue #220)
+		LocalLimiter:              localLimiter,
+		LocalCooldown:             localCooldown,
+		RouteDecisionObserver:     routeDecisionObs,
+		RejectionObserver:         rejectionObs,
+		FusionOutcomeObserver:     fusionOutcomeObs,
+		FusionArbiterSkipObserver: fusionArbiterSkipObs,
+		RAGObserver:               ragObserver,
+		RAGCacheObserver:          ragCacheObserver,
+		CascadeFallbackObserver:   cascadeFallbackObs,
+		ArbiterCacheObserver:      arbiterCacheObserver,
+		PanelPanicObserver:        panelPanicObs,
+		CircuitBreakerObserver:    circuitBreakerObs,
+		ArbiterCache:              arbiterCache,
+		Providers:                 providerRegistry,
 		PipelineStageObserver: handlers.PipelineStageObserverFunc(
 			func(e handlers.PipelineStageEvent) {
 				stageCollector.ObservePipelineStage(observability.PipelineStageEvent{

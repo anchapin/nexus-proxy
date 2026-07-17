@@ -279,6 +279,33 @@ type FusionOutcomeObserverFunc func(FusionOutcomeEvent)
 // ObserveFusionOutcome implements FusionOutcomeObserver.
 func (f FusionOutcomeObserverFunc) ObserveFusionOutcome(e FusionOutcomeEvent) { f(e) }
 
+// FusionArbiterSkipEvent carries the detailed outcome of a fusion panel
+// arbiter skip for granular observability (issue #384). It is emitted
+// in addition to FusionOutcomeEvent when the arbiter was skipped.
+type FusionArbiterSkipEvent struct {
+	RequestID  string
+	Reason     string // "agreement", "tool_calls", or "one_member"
+	Similarity float64
+	Source     string // "local" or "frontier"
+}
+
+// FusionArbiterSkipObserver is the hook invoked once per fusion request
+// when the arbiter is skipped, with the detailed skip metadata (issue #384).
+// Safe for concurrent use, must not block, nil means "no observer".
+// The handler does not import the observability package; main.go wires
+// a closure that forwards to RouteCounters.ObserveFusionArbiterSkip,
+// ObserveFusionSimilarityRatio, and ObserveFusionSpeculativeWinner.
+type FusionArbiterSkipObserver interface {
+	ObserveFusionArbiterSkip(FusionArbiterSkipEvent)
+}
+
+// FusionArbiterSkipObserverFunc adapts a plain function to the
+// FusionArbiterSkipObserver interface.
+type FusionArbiterSkipObserverFunc func(FusionArbiterSkipEvent)
+
+// ObserveFusionArbiterSkip implements FusionArbiterSkipObserver.
+func (f FusionArbiterSkipObserverFunc) ObserveFusionArbiterSkip(e FusionArbiterSkipEvent) { f(e) }
+
 // RAGEvent carries the outcome of a single RAG retrieval attempt
 // (issue #186). Hit is true when Retrieve returned a non-nil example;
 // Filename is the matched snippet (meaningful only when Hit is true).
@@ -708,6 +735,15 @@ type Deps struct {
 	// if detected. Safe for concurrent use; nil is "no observer" so the
 	// hot path is unaffected.
 	PanelPanicObserver func()
+
+	// FusionArbiterSkipObserver is invoked once per fusion request when
+	// the arbiter is skipped, with the detailed skip metadata (issue #384):
+	// reason (agreement/tool_calls/one_member), similarity ratio, and
+	// speculative winner source. Safe for concurrent use; nil is "no
+	// observer". The handler does not import observability; main.go wires
+	// a closure that forwards to RouteCounters.ObserveFusionArbiterSkip,
+	// ObserveFusionSimilarityRatio, and ObserveFusionSpeculativeWinner.
+	FusionArbiterSkipObserver FusionArbiterSkipObserver
 
 	// ArbiterCache is the optional in-memory cache for fusion arbiter
 	// synthesis responses (issue #232). When non-nil and
@@ -1362,6 +1398,14 @@ func Chat(d Deps) http.Handler {
 					d.FusionOutcomeObserver.ObserveFusionOutcome(FusionOutcomeEvent{
 						RequestID:      reqID,
 						ArbiterSkipped: outcome.ArbiterSkipped,
+					})
+				}
+				if outcome.ArbiterSkipped && d.FusionArbiterSkipObserver != nil {
+					d.FusionArbiterSkipObserver.ObserveFusionArbiterSkip(FusionArbiterSkipEvent{
+						RequestID:  reqID,
+						Reason:     outcome.SkipReason,
+						Similarity: outcome.Similarity,
+						Source:     outcome.Source,
 					})
 				}
 			} else {
