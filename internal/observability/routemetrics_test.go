@@ -725,6 +725,52 @@ func TestFusionSpeculativeWinnerCounters(t *testing.T) {
 	}
 }
 
+// TestFusionGoroutineWasteHistogram tests the fusion goroutine waste histogram (issue #406).
+func TestFusionGoroutineWasteHistogram(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveFusionGoroutineWaste(0.05)
+	rc.ObserveFusionGoroutineWaste(0.025)
+	rc.ObserveFusionGoroutineWaste(0.1)
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_fusion_goroutine_waste_seconds", "metric family header"},
+		{"nexus_fusion_goroutine_waste_seconds_bucket{le=", "histogram buckets present"},
+		{"_sum", "sum field present"},
+		{"_count", "count field present"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+
+	// Verify the count is 3 (three observations)
+	if !strings.Contains(out, `nexus_fusion_goroutine_waste_seconds_count 3`) {
+		t.Errorf("count mismatch: output missing expected count line\nfull output:\n%s", out)
+	}
+}
+
+// TestFusionGoroutineWasteHistogramNilSafe verifies that nil receivers are safe
+// when ObserveFusionGoroutineWaste is called.
+func TestFusionGoroutineWasteHistogramNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveFusionGoroutineWaste(0.05)
+	// Must not panic; WriteTo should return (0, nil).
+	n, err := rc.WriteTo(&strings.Builder{})
+	if err != nil || n != 0 {
+		t.Errorf("nil + ObserveFusionGoroutineWaste: expected (0, nil), got (%d, %v)", n, err)
+	}
+}
+
 // TestFusionArbiterSkipCountersNilSafe verifies that nil receivers are safe
 // when ObserveFusionArbiterSkip is called.
 func TestFusionArbiterSkipCountersNilSafe(t *testing.T) {
