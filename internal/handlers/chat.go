@@ -285,7 +285,7 @@ func (f FusionOutcomeObserverFunc) ObserveFusionOutcome(e FusionOutcomeEvent) { 
 // in addition to FusionOutcomeEvent when the arbiter was skipped.
 type FusionArbiterSkipEvent struct {
 	RequestID             string
-	Reason                string  // "agreement", "tool_calls", or "one_member"
+	Reason                string // "agreement", "tool_calls", or "one_member"
 	Similarity            float64
 	Source                string  // "local" or "frontier"
 	GoroutineWasteSeconds float64 // time between winner selection and slow-member cancellation (issue #406)
