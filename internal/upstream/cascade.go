@@ -244,7 +244,7 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 			return res, lastErr
 		}
 		if stepHadPartialWrite {
-			writeCascadeErrorChunk(w)
+			_ = writeCascadeErrorChunk(w)
 		}
 	}
 	if lastErr == nil {

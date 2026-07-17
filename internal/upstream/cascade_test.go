@@ -33,10 +33,10 @@ func (s *sseRW) Flush()                      { s.flushed = true }
 // a partial SSE write failure (issue #405). It returns ErrSSEPartialWrite
 // so the cascade's error detection works correctly.
 type partialWriteRW struct {
-	header       http.Header
-	status       int
-	body         strings.Builder
-	wroteHeader  bool
+	header      http.Header
+	status      int
+	body        strings.Builder
+	wroteHeader bool
 	failAtCount int // fail after this many successful body writes
 	writeCount  int
 }
