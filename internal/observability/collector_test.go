@@ -575,3 +575,101 @@ func TestObservePipelineStageConcurrent(t *testing.T) {
 		}
 	}
 }
+
+// TestVRAMGaugesNoneSet verifies that VRAMGauges returns nil when no
+// callback has been configured.
+func TestVRAMGaugesNoneSet(t *testing.T) {
+	c := NewCollector()
+	gauges := c.VRAMGauges()
+	if len(gauges) != 0 {
+		t.Errorf("VRAMGauges with no callback: got %d gauges, want 0", len(gauges))
+	}
+}
+
+// TestVRAMGaugesSingleGPU verifies that a single-GPU callback produces
+// exactly two samples (free_bytes and slots_available) with the correct gpu_id label.
+func TestVRAMGaugesSingleGPU(t *testing.T) {
+	c := NewCollector()
+	c.SetVramGaugeFunc(func() map[string]int64 {
+		return map[string]int64{"card0": int64(8) << 30} // 8 GiB free
+	}, int64(2)<<30) // 2 GiB per slot
+	gauges := c.VRAMGauges()
+	if len(gauges) != 2 {
+		t.Fatalf("VRAMGauges: got %d gauges, want 2", len(gauges))
+	}
+	var freeBytes, slotsAvailable float64
+	for _, g := range gauges {
+		if g.Name == "nexus_vram_free_bytes" {
+			freeBytes = g.Value
+			if g.Labels["gpu_id"] != "card0" {
+				t.Errorf("gpu_id label = %q, want %q", g.Labels["gpu_id"], "card0")
+			}
+		}
+		if g.Name == "nexus_vram_slots_available" {
+			slotsAvailable = g.Value
+		}
+	}
+	// 8 GiB free / 2 GiB per slot = 4 slots
+	if freeBytes != float64(int64(8)<<30) {
+		t.Errorf("nexus_vram_free_bytes = %f, want %d", freeBytes, int64(8)<<30)
+	}
+	if slotsAvailable != 4 {
+		t.Errorf("nexus_vram_slots_available = %f, want 4", slotsAvailable)
+	}
+}
+
+// TestVRAMGaugesMultiGPU verifies that a multi-GPU callback produces
+// per-GPU sample pairs with distinct gpu_id labels (issue #394).
+func TestVRAMGaugesMultiGPU(t *testing.T) {
+	c := NewCollector()
+	c.SetVramGaugeFunc(func() map[string]int64 {
+		return map[string]int64{
+			"card0": int64(8) << 30, // 8 GiB free
+			"card1": int64(4) << 30, // 4 GiB free
+		}
+	}, int64(2)<<30) // 2 GiB per slot
+	gauges := c.VRAMGauges()
+	// 2 GPUs × 2 gauges each = 4
+	if len(gauges) != 4 {
+		t.Fatalf("VRAMGauges: got %d gauges, want 4", len(gauges))
+	}
+	for _, g := range gauges {
+		if g.Labels["gpu_id"] == "card0" && g.Name == "nexus_vram_slots_available" {
+			if g.Value != 4 {
+				t.Errorf("card0 slots = %f, want 4", g.Value)
+			}
+		}
+		if g.Labels["gpu_id"] == "card1" && g.Name == "nexus_vram_slots_available" {
+			if g.Value != 2 {
+				t.Errorf("card1 slots = %f, want 2", g.Value)
+			}
+		}
+	}
+}
+
+// TestVRAMGaugesZeroBytesPerSlot verifies that slots are not emitted
+// when bytesPerSlot is zero (avoid divide-by-zero).
+func TestVRAMGaugesZeroBytesPerSlot(t *testing.T) {
+	c := NewCollector()
+	c.SetVramGaugeFunc(func() map[string]int64 {
+		return map[string]int64{"card0": int64(8) << 30}
+	}, 0)
+	gauges := c.VRAMGauges()
+	// Only free_bytes should be present; no slots_available
+	if len(gauges) != 1 {
+		t.Fatalf("VRAMGauges: got %d gauges, want 1", len(gauges))
+	}
+	if gauges[0].Name != "nexus_vram_free_bytes" {
+		t.Errorf("gauge name = %q, want %q", gauges[0].Name, "nexus_vram_free_bytes")
+	}
+}
+
+// TestVRAMGaugesEmptyMap verifies that an empty per-GPU map produces no gauges.
+func TestVRAMGaugesEmptyMap(t *testing.T) {
+	c := NewCollector()
+	c.SetVramGaugeFunc(func() map[string]int64 { return nil }, int64(2)<<30)
+	gauges := c.VRAMGauges()
+	if len(gauges) != 0 {
+		t.Errorf("VRAMGauges with nil map: got %d gauges, want 0", len(gauges))
+	}
+}

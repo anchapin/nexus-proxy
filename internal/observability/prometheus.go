@@ -76,10 +76,6 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Current dynamic VRAM token budget from the latest probe (0 = static fallback in use).",
 		typ:  "gauge",
 	},
-	"nexus_vram_free_bytes": {
-		help: "Free VRAM in bytes reported by the latest probe (0 if the probe does not measure VRAM).",
-		typ:  "gauge",
-	},
 	"nexus_judge_queue_depth": {
 		help: "Number of buffered, unjudged samples waiting in the judge evaluator queue.",
 		typ:  "gauge",
@@ -155,6 +151,15 @@ var gaugeMeta = map[string]metricMeta{
 	"nexus_rag_watcher_indexing_errors": {
 		help: "Cumulative count of file indexing errors in the RAG watcher.",
 		typ:  "counter",
+	},
+	// VRAM gauges (issue #394)
+	"nexus_vram_free_bytes": {
+		help: "Free VRAM in bytes per GPU, labelled by gpu_id (e.g. card0, card1).",
+		typ:  "gauge",
+	},
+	"nexus_vram_slots_available": {
+		help: "Available local-route concurrency slots per GPU, computed as freeVRAM / bytesPerSlot (issue #394).",
+		typ:  "gauge",
 	},
 }
 
@@ -314,6 +319,8 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	gauges := collectGauges(providers)
 	// RAG watcher gauges (issue #367)
 	gauges = append(gauges, c.RAGWatcherGauges()...)
+	// VRAM gauges (issue #394)
+	gauges = append(gauges, c.VRAMGauges()...)
 
 	// Group samples by metric name so HELP/TYPE is emitted once per family.
 	type sampleEntry struct {

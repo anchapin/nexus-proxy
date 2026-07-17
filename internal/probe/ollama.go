@@ -69,7 +69,13 @@ func (p *OllamaProbe) Budget(ctx context.Context) (Budget, error) {
 	}
 
 	modelCtx, modelName, err := p.fetchModelContext(ctx)
-	freeVRAM, sysfsErr := readFreeVRAMBytes(sysfsRoot)
+	freeVRAMPerGPU, sysfsErr := readFreeVRAMBytesPerGPU(sysfsRoot)
+
+	// Compute aggregate total for backward-compatible callers.
+	var freeVRAM int64
+	for _, v := range freeVRAMPerGPU {
+		freeVRAM += v
+	}
 
 	switch {
 	case err != nil && sysfsErr != nil:
@@ -79,10 +85,11 @@ func (p *OllamaProbe) Budget(ctx context.Context) (Budget, error) {
 		// Ollama unreachable but VRAM is read; budget from VRAM only.
 		toks := vramBytesToTokens(freeVRAM, bpt)
 		return Budget{
-			Tokens:        toks,
-			FreeVRAMBytes: freeVRAM,
-			BytesPerToken: bpt,
-			Source:        SourceSysfs,
+			Tokens:              toks,
+			FreeVRAMBytes:       freeVRAM,
+			FreeVRAMBytesPerGPU: freeVRAMPerGPU,
+			BytesPerToken:       bpt,
+			Source:              SourceSysfs,
 		}, nil
 	case sysfsErr != nil:
 		// No sysfs (e.g. macOS dev box) but Ollama answered; trust the model context.
@@ -109,11 +116,12 @@ func (p *OllamaProbe) Budget(ctx context.Context) (Budget, error) {
 			source = SourceBoth
 		}
 		return Budget{
-			Tokens:        toks,
-			ModelContext:  modelCtx,
-			FreeVRAMBytes: freeVRAM,
-			BytesPerToken: bpt,
-			Source:        source,
+			Tokens:              toks,
+			ModelContext:        modelCtx,
+			FreeVRAMBytes:       freeVRAM,
+			FreeVRAMBytesPerGPU: freeVRAMPerGPU,
+			BytesPerToken:       bpt,
+			Source:              source,
 		}, nil
 	}
 }
@@ -188,15 +196,42 @@ func (p *OllamaProbe) fetchModelContext(ctx context.Context) (int, string, error
 // /sys/class/dri/cardN paths also exist on Tegra but the file names
 // differ; that's why NVIDIA is out of scope (per PRD) for now.
 func readFreeVRAMBytes(sysfsRoot string) (int64, error) {
+	perGPU, err := readFreeVRAMBytesPerGPU(sysfsRoot)
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, free := range perGPU {
+		total += free
+	}
+	return total, nil
+}
+
+// readFreeVRAMBytesPerGPU walks the sysfs DRI tree for amdgpu nodes and
+// returns free VRAM broken down by GPU (gpu_id -> free bytes). The gpu_id
+// is the sysfs card name, e.g. "card0", "card1". This enables the
+// observability collector to emit per-GPU Prometheus gauges with a gpu_id
+// label for multi-GPU hosts (issue #394).
+//
+// The amdgpu driver exposes two naming schemes for backward compatibility:
+//
+//   - new (Linux 5.10+): /sys/class/dri/cardN/device/mem_info_vram_total,
+//     mem_info_vram_used
+//   - old (older kernels): /sys/class/dri/cardN/mem_total_vram,
+//     mem_used_vram
+//
+// We try the new scheme first, then fall back to the legacy one,
+// so the probe still works on long-lived kernel pins.
+func readFreeVRAMBytesPerGPU(sysfsRoot string) (map[string]int64, error) {
 	driPath := sysfsRoot
 	if driPath == "" {
 		driPath = DefaultSysfsRoot
 	}
 	entries, err := os.ReadDir(driPath)
 	if err != nil {
-		return 0, fmt.Errorf("probe: read %s: %w", driPath, err)
+		return nil, fmt.Errorf("probe: read %s: %w", driPath, err)
 	}
-	var total, used int64
+	result := make(map[string]int64)
 	var seen bool
 	for _, e := range entries {
 		name := e.Name()
@@ -217,14 +252,13 @@ func readFreeVRAMBytes(sysfsRoot string) (int64, error) {
 		if tu > t {
 			tu = t // defensive; kernel counters briefly disagree under load
 		}
-		total += t
-		used += tu
+		result[name] = t - tu
 		seen = true
 	}
 	if !seen {
-		return 0, fmt.Errorf("probe: no AMD sysfs nodes under %s", driPath)
+		return nil, fmt.Errorf("probe: no AMD sysfs nodes under %s", driPath)
 	}
-	return total - used, nil
+	return result, nil
 }
 
 // readAmdVramPair reads (total, used) VRAM in bytes from a sysfs
