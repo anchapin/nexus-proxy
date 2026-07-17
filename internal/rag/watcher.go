@@ -113,15 +113,16 @@ func (w *Watcher) run(parent context.Context) {
 		)
 		fw = nil // ensures no channel reads below
 	} else {
-		defer fw.Close()
 		if err := fw.Add(w.dir); err != nil {
 			slog.Warn("rag: fsnotify add failed, using fallback polling",
 				slog.String("component", "rag"),
 				slog.String("dir", w.dir),
 				slog.Any("err", err),
 			)
-			fw.Close()
+			_ = fw.Close()
 			fw = nil
+		} else {
+			defer func() { _ = fw.Close() }()
 		}
 	}
 
@@ -160,7 +161,7 @@ func (w *Watcher) run(parent context.Context) {
 		case evt, ok := <-fw.Events:
 			if !ok {
 				// Watcher closed; degrade to polling.
-				fw.Close()
+				_ = fw.Close()
 				fw = nil
 				slog.Warn("rag: fsnotify watcher closed, degrading to polling",
 					slog.String("component", "rag"),
@@ -190,7 +191,7 @@ func (w *Watcher) run(parent context.Context) {
 		case err, ok := <-fw.Errors:
 			if !ok {
 				// Watcher closed; degrade to polling.
-				fw.Close()
+				_ = fw.Close()
 				fw = nil
 				slog.Warn("rag: fsnotify watcher closed, degrading to polling",
 					slog.String("component", "rag"),
