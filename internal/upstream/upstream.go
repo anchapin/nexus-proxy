@@ -808,17 +808,6 @@ func PanelStreaming(
 		agreementThreshold = 1
 	}
 
-	// SSE response headers must be set before the first Write. We
-	// commit them now so the speculative chunk goes out with the
-	// correct Content-Type regardless of which member wins.
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Nexus-Fusion-Progressive", "true")
-	w.WriteHeader(http.StatusOK)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-
 	results := make(chan PanelResult, 2)
 	var cancelLocal, cancelFrontier context.CancelFunc
 
@@ -892,6 +881,17 @@ func PanelStreaming(
 		winnerFromSecond = true
 	}
 	outcome.Source = winner.Source
+
+	// Issue #437: commit SSE headers only after confirming at least
+	// one panel member succeeded. If both failed the handler above
+	// returns an error and the chat handler can emit a real 502.
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Nexus-Fusion-Progressive", "true")
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 
 	if err := streamPanelResultAsSSE(w, winner); err != nil {
 		if errors.Is(err, ErrClientAbort) {
