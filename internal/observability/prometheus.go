@@ -310,6 +310,12 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 		writeSLMConfidenceHistogram(w, hists)
 	}
 
+	// RAG similarity histogram (issue #447). Written only when at
+	// least one (path, outcome) histogram has observations.
+	if hists := c.RAGSimilarityHistograms(); len(hists) > 0 {
+		writeRAGSimilarityHistogram(w, hists)
+	}
+
 	// --- Gauges (live readings from providers) --------------------------
 
 	gauges := collectGauges(providers)
@@ -486,6 +492,80 @@ func writeSLMConfidenceHistogram(w io.Writer, histograms map[string]*Histogram) 
 			cat, formatFloat(sum))
 		fmt.Fprintf(w, "nexus_slm_confidence_histogram_count{task_category=%q} %d\n",
 			cat, count)
+	}
+}
+
+// writeRAGSimilarityHistogram emits the nexus_rag_similarity_histogram
+// histogram family labelled by path and outcome (issue #447).
+//
+// Labels:
+//   - path    ∈ {"hnsw", "brute_force"} — the retrieval algorithm
+//     Retrieve actually used; see rag.IndexPath.
+//   - outcome ∈ {"hit", "miss"}         — "hit" when a snippet cleared
+//     the configured threshold, "miss" when it did not.
+//
+// Cardinality: 4 series (path × outcome), each with RAGSimilarityBuckets
+// (10) + +Inf bucket lines, plus _sum and _count. The map key is
+// "path|outcome" — we split it back into two labels at render time so
+// the Prometheus exposition matches the documented label schema.
+//
+// Series are emitted in a fixed order (hnsw/then brute_force, then
+// hit/then miss) so scrape-to-scrape diffs are stable and friendly to
+// human inspection. Empty histograms (count == 0) are skipped so the
+// scrape output stays clean until the first observation lands — and
+// when ALL four histograms are empty the HELP/TYPE header is omitted
+// too, so a freshly-booted scraper never sees a misleading zero-count
+// family.
+func writeRAGSimilarityHistogram(w io.Writer, histograms map[string]*Histogram) {
+	order := []struct{ path, outcome string }{
+		{"hnsw", "hit"},
+		{"hnsw", "miss"},
+		{"brute_force", "hit"},
+		{"brute_force", "miss"},
+	}
+	type snapshot struct {
+		path, outcome string
+		cum           []uint64
+		upperBounds   []float64
+		sum           float64
+		count         uint64
+	}
+	var snaps []snapshot
+	for _, l := range order {
+		h, ok := histograms[ragSimilarityKey(l.path, l.outcome)]
+		if !ok || h == nil {
+			continue
+		}
+		cum, upperBounds, sum, count := h.Snapshot()
+		if count == 0 {
+			continue
+		}
+		snaps = append(snaps, snapshot{
+			path:        l.path,
+			outcome:     l.outcome,
+			cum:         cum,
+			upperBounds: upperBounds,
+			sum:         sum,
+			count:       count,
+		})
+	}
+	if len(snaps) == 0 {
+		return
+	}
+	writeMeta(w, "nexus_rag_similarity_histogram",
+		"RAG retrieval cosine-similarity score distribution, labelled by index path and outcome (issue #447).",
+		"histogram")
+	for _, s := range snaps {
+		for i, ub := range s.upperBounds {
+			fmt.Fprintf(w, "nexus_rag_similarity_histogram_bucket{path=%q,outcome=%q,le=%q} %d\n",
+				s.path, s.outcome, formatFloat(ub), s.cum[i])
+		}
+		fmt.Fprintf(w, "nexus_rag_similarity_histogram_bucket{path=%q,outcome=%q,le=%q} %d\n",
+			s.path, s.outcome, "+Inf", s.cum[len(s.upperBounds)])
+		fmt.Fprintf(w, "nexus_rag_similarity_histogram_sum{path=%q,outcome=%q} %s\n",
+			s.path, s.outcome, formatFloat(s.sum))
+		fmt.Fprintf(w, "nexus_rag_similarity_histogram_count{path=%q,outcome=%q} %d\n",
+			s.path, s.outcome, s.count)
 	}
 }
 

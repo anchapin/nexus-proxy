@@ -9,14 +9,14 @@ import (
 
 // mockStore implements rag.RAGStore for testing.
 type mockStore struct {
-	retrieveFn func(ctx context.Context, query string) (*rag.FewShotExample, float64, error)
+	retrieveFn func(ctx context.Context, query string) (*rag.FewShotExample, float64, rag.IndexPath, error)
 }
 
-func (m *mockStore) Retrieve(ctx context.Context, query string) (*rag.FewShotExample, float64, error) {
+func (m *mockStore) Retrieve(ctx context.Context, query string) (*rag.FewShotExample, float64, rag.IndexPath, error) {
 	if m.retrieveFn != nil {
 		return m.retrieveFn(ctx, query)
 	}
-	return nil, 0, nil
+	return nil, 0, "", nil
 }
 func (m *mockStore) Add(filename, content string, embedding []float64) {}
 func (m *mockStore) Size() int                                         { return 0 }
@@ -88,8 +88,8 @@ func TestRAGMiddleware_Transform_ReturnsInput(t *testing.T) {
 
 func TestRAGMiddleware_TransformContext_NoMatch(t *testing.T) {
 	store := &mockStore{
-		retrieveFn: func(ctx context.Context, query string) (*rag.FewShotExample, float64, error) {
-			return nil, 0, nil
+		retrieveFn: func(ctx context.Context, query string) (*rag.FewShotExample, float64, rag.IndexPath, error) {
+			return nil, 0, "", nil
 		},
 	}
 	r := NewRAGMiddleware(store, 0.5)
@@ -106,12 +106,12 @@ func TestRAGMiddleware_TransformContext_NoMatch(t *testing.T) {
 
 func TestRAGMiddleware_TransformContext_WithMatch(t *testing.T) {
 	store := &mockStore{
-		retrieveFn: func(ctx context.Context, query string) (*rag.FewShotExample, float64, error) {
+		retrieveFn: func(ctx context.Context, query string) (*rag.FewShotExample, float64, rag.IndexPath, error) {
 			return &rag.FewShotExample{
 				Filename:  "test.go",
 				Content:   "test content",
 				Embedding: []float64{0.1, 0.2},
-			}, 0.9, nil
+			}, 0.9, rag.IndexPathBruteForce, nil
 		},
 	}
 	r := NewRAGMiddleware(store, 0.5)

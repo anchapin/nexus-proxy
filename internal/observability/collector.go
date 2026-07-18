@@ -32,6 +32,36 @@ var DefaultBuckets = []float64{5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 1
 // increments; the implicit +Inf bucket catches any value > 1.0.
 var ConfidenceBuckets = []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0}
 
+// RAGSimilarityBuckets are the histogram bucket upper bounds for RAG
+// cosine-similarity scores (issue #447). Cosine similarity on the
+// [-1, 1] range is, in practice for code retrieval, 0..1 with the
+// default floor at 0.55 — same shape as ConfidenceBuckets so the two
+// distributions are visually comparable in Grafana. The implicit
+// +Inf bucket catches any value > 1.0 (which should never happen for
+// cosine but defends against a buggy embedder emitting >1).
+var RAGSimilarityBuckets = []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0}
+
+// ragSimilarityLabels are the fixed low-cardinality (path, outcome)
+// label pairs used for the RAG similarity histogram (issue #447).
+// Both axes are bounded at construction:
+//
+//   - path: "hnsw" or "brute_force" (see rag.IndexPath)
+//   - outcome: "hit" or "miss"
+//
+// Total cardinality is 4 series. We pre-allocate one histogram per pair
+// so ObserveRAGSimilarity is a lock-free single increment — the
+// histogram map lookup is read-locked but the histogram's Observe
+// method itself never contends.
+var ragSimilarityLabels = []struct {
+	path    string
+	outcome string
+}{
+	{path: "hnsw", outcome: "hit"},
+	{path: "hnsw", outcome: "miss"},
+	{path: "brute_force", outcome: "hit"},
+	{path: "brute_force", outcome: "miss"},
+}
+
 // slmConfidenceCategories are the fixed low-cardinality task-category
 // labels used for the SLM confidence histogram (issue #425). They
 // mirror the Category* constants in internal/router/confidence.go.
@@ -191,6 +221,16 @@ type Collector struct {
 	slmConfidenceMu         sync.RWMutex
 	slmConfidenceHistograms map[string]*Histogram
 
+	// --- RAG similarity histogram (issue #447) -------------------
+	//
+	// Per-(path, outcome) cosine-similarity histograms. The (path,
+	// outcome) label set is fixed at 4 pairs (see ragSimilarityLabels)
+	// so we pre-allocate the histograms in NewCollector and never
+	// mutate the map after boot. ObserveRAGSimilarity only needs a
+	// read lock to find the histogram; Histogram.Observe is lock-free.
+	ragSimilarityMu         sync.RWMutex
+	ragSimilarityHistograms map[string]*Histogram // keyed by "path|outcome"
+
 	// --- Embedder circuit breaker instrumentation (issue #423) -----
 	//
 	// Tracks failures for each embedder circuit breaker (ollama, openai, cohere).
@@ -239,7 +279,20 @@ func NewCollector() *Collector {
 	for _, cat := range slmConfidenceCategories {
 		c.slmConfidenceHistograms[cat] = NewHistogram(ConfidenceBuckets)
 	}
+	// Pre-allocate RAG similarity histograms for each (path, outcome)
+	// pair (issue #447). 4 fixed series — see ragSimilarityLabels.
+	c.ragSimilarityHistograms = make(map[string]*Histogram, len(ragSimilarityLabels))
+	for _, l := range ragSimilarityLabels {
+		key := ragSimilarityKey(l.path, l.outcome)
+		c.ragSimilarityHistograms[key] = NewHistogram(RAGSimilarityBuckets)
+	}
 	return c
+}
+
+// ragSimilarityKey builds the lookup key for the (path, outcome) pair.
+// Stable across processes so scrape diffs are reproducible.
+func ragSimilarityKey(path, outcome string) string {
+	return path + "|" + outcome
 }
 
 // Submit records one ObservabilityEvent. Called exactly once per
@@ -648,6 +701,54 @@ func (c *Collector) SLMConfidenceHistograms() map[string]*Histogram {
 	c.slmConfidenceMu.RLock()
 	defer c.slmConfidenceMu.RUnlock()
 	return c.slmConfidenceHistograms
+}
+
+// --- RAG similarity histogram (issue #447) ------------------------------
+//
+// ObserveRAGSimilarity records one similarity observation for the
+// given (path, outcome) pair (issue #447). Called from the RAG
+// observer closure in main.go when handlers.RAGEvent carries a
+// non-empty IndexPath.
+//
+// The outcome is "hit" when the retrieval returned a snippet above the
+// configured threshold and "miss" otherwise; both observations land in
+// the same bucket layout so the bucket counts can be directly compared.
+// Score values outside [0, 1] are clamped to the [0, 1] range so a
+// buggy embedder cannot push an observation into the +Inf bucket
+// spuriously — the cosine contract is that similarity is bounded by 1.
+//
+// path values outside the fixed set ("hnsw", "brute_force") are
+// silently dropped rather than bucketed under a third label, to
+// preserve the bounded-cardinality contract documented for
+// nexus_rag_similarity_histogram.
+func (c *Collector) ObserveRAGSimilarity(path, outcome string, score float64) {
+	if score < 0 {
+		score = 0
+	} else if score > 1 {
+		score = 1
+	}
+	key := ragSimilarityKey(path, outcome)
+	c.ragSimilarityMu.RLock()
+	h, ok := c.ragSimilarityHistograms[key]
+	c.ragSimilarityMu.RUnlock()
+	if ok && h != nil {
+		h.Observe(score)
+	}
+}
+
+// RAGSimilarityHistograms returns the per-(path, outcome) RAG
+// similarity histograms for rendering. The map is keyed by
+// "path|outcome" (e.g. "hnsw|hit"); callers iterate the keys to
+// emit nexus_rag_similarity_histogram_bucket lines.
+//
+// Returns nil when the collector is not yet initialised (e.g. when a
+// nil receiver is passed to RenderPrometheus). Safe to call from
+// multiple goroutines — returns a snapshot reference to the internal
+// map, which is never mutated after NewCollector returns.
+func (c *Collector) RAGSimilarityHistograms() map[string]*Histogram {
+	c.ragSimilarityMu.RLock()
+	defer c.ragSimilarityMu.RUnlock()
+	return c.ragSimilarityHistograms
 }
 
 // Histogram}
