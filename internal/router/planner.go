@@ -58,17 +58,25 @@ const (
 	SourceSLMEscalation DecisionSource = "slm-escalation"
 )
 
-// TraceReason maps a DecisionSource to the short string the handler
-// stamps on the debug RouteTrace.Reason field. The handler's pre-issue-
-// 82 ladder used "guardrail", "dsl", and "slm" as reason labels; the
-// SLM-error and escalation paths also map to "slm" so the trace remains
-// backward-compatible with any log-scraping tooling.
+// TraceReason returns the stable machine-readable trace label for a decision source:
+// "guardrail", "dsl", "slm" for a clean SLM decision, "slm-error" for an
+// SLM failure, "slm-no-client" when no SLM client is configured, and
+// "slm-low-confidence" for a confidence-triggered escalation. Unknown
+// sources retain the legacy "slm" fallback.
 func (s DecisionSource) TraceReason() string {
 	switch s {
 	case SourceGuardrail:
 		return "guardrail"
 	case SourceDSL:
 		return "dsl"
+	case SourceSLM:
+		return "slm"
+	case SourceSLMError:
+		return "slm-error"
+	case SourceEscalation:
+		return "slm-no-client"
+	case SourceSLMEscalation:
+		return "slm-low-confidence"
 	default:
 		return "slm"
 	}

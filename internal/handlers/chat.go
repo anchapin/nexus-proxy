@@ -1203,8 +1203,9 @@ func Chat(d Deps) http.Handler {
 
 		// Populate the debug trace from the Decision. The trace reason
 		// uses the planner's source-to-reason mapping so the labels
-		// ("guardrail", "dsl", "slm") are backward-compatible with the
-		// pre-extraction handler.
+		// ("guardrail", "dsl", "slm", "slm-error", "slm-no-client",
+		// "slm-low-confidence") remain stable and distinguish the SLM
+		// outcome that produced the route.
 		trace.Routing.Route = string(decision.Route)
 		trace.Routing.Reason = decision.Source.TraceReason()
 		trace.Routing.BudgetSource = decision.BudgetSource
