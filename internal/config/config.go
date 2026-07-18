@@ -338,6 +338,16 @@ type Config struct {
 	//   - strict: proxy text delimited + suspicious patterns rejected (400).
 	PromptInjectionMode middleware.InjectionMode
 
+	// InjectionScanRoles is the set of OpenAI message roles scanned for
+	// prompt-injection override attempts in warn/strict mode (issue #481).
+	// Defaults to ["system"] so a stock deployment is byte-for-byte
+	// identical to the pre-#481 behaviour. Operators who also want
+	// user-turn messages scanned (e.g. "ignore previous instructions"
+	// appearing in a user message) set NEXUS_INJECTION_SCAN_ROLES=system,user.
+	// Only "system" and "user" are honoured; anything else falls back to
+	// ["system"]. Not hot-reloadable — the role set is read once at boot.
+	InjectionScanRoles []string
+
 	// Telemetry
 	//
 	// TelemetryPath is the on-disk JSON-lines log written by the
@@ -1213,6 +1223,12 @@ func Load() (Config, error) {
 	cfg.PromptInjectionMode = middleware.ParseInjectionMode(
 		os.Getenv("NEXUS_PROMPT_INJECTION_MODE"),
 	)
+	// Injection scan roles (issue #481). Defaults to "system" so today's
+	// system-only scan is byte-for-byte unchanged. Empty / unrecognised
+	// values fall back to ["system"]. Not hot-reloadable — read once at boot.
+	cfg.InjectionScanRoles = parseInjectionScanRoles(
+		getEnv("NEXUS_INJECTION_SCAN_ROLES", "system"),
+	)
 	// Trusted-proxy enforcement + rate limiting (issue #75).
 	//
 	// NEXUS_TRUSTED_PROXIES is a comma-separated CIDR list. Empty
@@ -1709,6 +1725,30 @@ func getEnv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// parseInjectionScanRoles canonicalises the comma-separated role list
+// from NEXUS_INJECTION_SCAN_ROLES (issue #481). It lower-cases, trims,
+// deduplicates, and keeps only recognised roles ("system", "user"). An
+// empty or fully-unrecognised input returns []string{"system"} so the
+// default scan scope is byte-for-byte identical to the pre-#481 path.
+func parseInjectionScanRoles(raw string) []string {
+	seen := make(map[string]bool)
+	var roles []string
+	for _, r := range strings.Split(raw, ",") {
+		r = strings.ToLower(strings.TrimSpace(r))
+		switch r {
+		case "system", "user":
+			if !seen[r] {
+				seen[r] = true
+				roles = append(roles, r)
+			}
+		}
+	}
+	if len(roles) == 0 {
+		return []string{"system"}
+	}
+	return roles
 }
 
 // getEnvAllowEmpty is like getEnv but returns the empty string when the

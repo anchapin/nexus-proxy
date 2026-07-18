@@ -98,9 +98,13 @@ func TestChatSetsRouteDecisionHeadersForGuardrail(t *testing.T) {
 	deps, rt := baseDeps(t)
 	deps.RouteDecisionObserver = &routeDecisionRecorder{}
 
-	// 48500 char prompt ≈ 6062 tokens > 6000 guardrail. Reduced from
-	// 49000 to speed tiktoken encoding in race mode on shared CI runners.
-	largeUser := strings.Repeat("a", 48500)
+	// Lower the guardrail threshold so a small prompt trips it. This
+	// avoids the expensive tiktoken BPE encoding of a multi-thousand-char
+	// prompt (which pushed the package over the 10m CI timeout under the
+	// race detector on slower runners). The test validates route-decision
+	// headers, not tokenizer performance.
+	deps.Config.TokenGuardrail = 10
+	largeUser := strings.Repeat("a", 100) // len/4 = 25 > 10 guardrail
 	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "frontier stream")
