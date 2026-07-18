@@ -44,10 +44,14 @@ type ragRetrievalStatus struct {
 	MissesByReason   map[string]uint64 `json:"misses_by_reason"`
 }
 
+// ragCacheStatus reports the LRU embed-cache hit/miss counters plus
+// the derived cache hit rate. HitRate is 0 when the cache has not
+// been exercised yet (issue #446).
 type ragCacheStatus struct {
-	Enabled bool   `json:"enabled"`
-	Hits    uint64 `json:"hits"`
-	Misses  uint64 `json:"misses"`
+	Enabled bool    `json:"enabled"`
+	Hits    uint64  `json:"hits"`
+	Misses  uint64  `json:"misses"`
+	HitRate float64 `json:"hit_rate"`
 }
 
 // RAGStatus reports the health of the RAG embedder.
@@ -58,6 +62,7 @@ type RAGStatus struct {
 	StorePath       string             `json:"store_path"`
 	DocumentCount   int                `json:"document_count"`
 	Threshold       float64            `json:"threshold"`
+	IndexMode       string             `json:"index_mode"`
 	Embedder        ragEmbedderStatus  `json:"embedder"`
 	LastIndexAt     time.Time          `json:"last_index_at"`
 	Retrieval       ragRetrievalStatus `json:"retrieval"`
