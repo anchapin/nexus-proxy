@@ -47,9 +47,45 @@ env:
   GO_VERSION: '1.26'
 
 jobs:
+  # ── Pre-release gate: vet, build, test, lint ─────────────────────
+  # Mirrors the merge gate from ci.yml so a failing test or lint on the
+  # tagged commit blocks every downstream artifact (binaries, GHCR image,
+  # SBOM, GitHub Release). Coverage gate is intentionally omitted from
+  # the release path — it gates merges, not tags. Issue #479.
+  prereq:
+    name: vet, build, test, lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./cmd/nexus
+
+      - name: go test (with race detector)
+        run: go test -race -covermode=atomic ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.12.2
+          args: --timeout=5m
+
   # ── Cross-compile binaries + checksums ──────────────────────────
   build-binaries:
     name: Build binaries
+    needs: [prereq]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -105,6 +141,7 @@ jobs:
   # ── Build & publish multi-arch GHCR image + cosign signature ────
   docker:
     name: GHCR image + signature
+    needs: [prereq]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -190,6 +227,7 @@ jobs:
   # ── SBOM generation ─────────────────────────────────────────────
   sbom:
     name: Generate SBOM
+    needs: [prereq]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
