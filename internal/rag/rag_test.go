@@ -153,11 +153,54 @@ func TestStoreConcurrentRetrieveAndAdd(t *testing.T) {
 	<-done
 }
 
-var errSentinel = errStub("embed down")
+func TestStoreStats(t *testing.T) {
+	emb := &stubEmbedder{vecs: map[string][]float64{"prompt": {1, 0, 0}}}
+	store := NewStore(emb, 0.55)
+
+	if _, _, err := store.Retrieve(context.Background(), "prompt"); err != nil {
+		t.Fatalf("empty Retrieve: %v", err)
+	}
+	store.Add("match.go", "match", []float64{1, 0, 0})
+	if _, _, err := store.Retrieve(context.Background(), "prompt"); err != nil {
+		t.Fatalf("hit Retrieve: %v", err)
+	}
+	if _, _, err := store.Retrieve(context.Background(), "unknown"); err != nil {
+		t.Fatalf("threshold Retrieve: %v", err)
+	}
+	emb.err = errSentinel
+	if _, _, err := store.Retrieve(context.Background(), "prompt"); err == nil {
+		t.Fatal("expected embedding error")
+	}
+
+	stats := store.Stats()
+	if stats.RetrievalAttempts != 4 {
+		t.Errorf("RetrievalAttempts = %d, want 4", stats.RetrievalAttempts)
+	}
+	if stats.RetrievalHits != 1 {
+		t.Errorf("RetrievalHits = %d, want 1", stats.RetrievalHits)
+	}
+	if stats.RetrievalMisses != 3 {
+		t.Errorf("RetrievalMisses = %d, want 3", stats.RetrievalMisses)
+	}
+	if stats.EmptyStoreMisses != 1 {
+		t.Errorf("EmptyStoreMisses = %d, want 1", stats.EmptyStoreMisses)
+	}
+	if stats.ThresholdMisses != 1 {
+		t.Errorf("ThresholdMisses = %d, want 1", stats.ThresholdMisses)
+	}
+	if stats.EmbedErrors != 1 {
+		t.Errorf("EmbedErrors = %d, want 1", stats.EmbedErrors)
+	}
+	if stats.LastIndexAt.IsZero() {
+		t.Error("LastIndexAt is zero, want non-zero time")
+	}
+}
 
 type errStub string
 
 func (e errStub) Error() string { return string(e) }
+
+var errSentinel = errStub("embed down")
 
 // TestIndexDirSkipsSymlinks is a regression test for issue #107:
 // a symlink inside the examples directory pointing to a sensitive file
@@ -434,6 +477,10 @@ func TestStoreWithCachingEmbedder(t *testing.T) {
 	}
 	if misses != 1 {
 		t.Errorf("misses = %d, want 1", misses)
+	}
+	stats := store.Stats()
+	if stats.CacheHits != 1 || stats.CacheMisses != 1 {
+		t.Errorf("cache stats = hits %d misses %d, want 1/1", stats.CacheHits, stats.CacheMisses)
 	}
 
 	hitCount := store.EmbedHitCount()

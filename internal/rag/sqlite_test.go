@@ -91,6 +91,9 @@ func TestPersistentStoreUpsertAndLoad(t *testing.T) {
 	if got := disk2.Size(); got != 2 {
 		t.Errorf("Size after Load = %d, want 2", got)
 	}
+	if disk2.Stats().LastIndexAt.IsZero() {
+		t.Error("LastIndexAt after Load is zero, want persisted index time")
+	}
 
 	// Reopen with a counting embedder keyed by the prompt text. If
 	// the disk cache is bypassed (i.e. someone re-embedded every

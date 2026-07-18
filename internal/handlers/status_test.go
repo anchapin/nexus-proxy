@@ -27,6 +27,34 @@ func TestStatusHandler(t *testing.T) {
 			return true
 		},
 		RAGIndexedExamples: func() int { return 12 },
+		RAGDiagnostics: func(context.Context) RAGStatus {
+			return RAGStatus{
+				Healthy:         true,
+				IndexedExamples: 12,
+				StoreType:       "sqlite",
+				StorePath:       "/var/lib/nexus-proxy/rag.db",
+				DocumentCount:   12,
+				Threshold:       0.55,
+				Embedder: ragEmbedderStatus{
+					Type:        "ollama",
+					Model:       "nomic-embed-text",
+					Healthy:     true,
+					CircuitOpen: false,
+				},
+				LastIndexAt: resetAt,
+				Retrieval: ragRetrievalStatus{
+					Attempts:         20,
+					Hits:             12,
+					Misses:           8,
+					HitRate:          0.6,
+					EmptyStoreMisses: 2,
+					ThresholdMisses:  5,
+					EmbedErrors:      1,
+					MissesByReason:   map[string]uint64{"empty_store": 2, "threshold": 5, "embed_error": 1},
+				},
+				Cache: ragCacheStatus{Enabled: true, Hits: 7, Misses: 13},
+			}
+		},
 		RoutingSnapshot: func() RoutingSnapshot {
 			return RoutingSnapshot{
 				Decisions: []observability.RouteCounterEntry{
@@ -110,6 +138,33 @@ func TestStatusHandler(t *testing.T) {
 	}
 	if resp.RAG.IndexedExamples != 12 {
 		t.Errorf("rag.indexed_examples = %d, want 12", resp.RAG.IndexedExamples)
+	}
+	if resp.RAG.StoreType != "sqlite" {
+		t.Errorf("rag.store_type = %q, want sqlite", resp.RAG.StoreType)
+	}
+	if resp.RAG.StorePath != "/var/lib/nexus-proxy/rag.db" {
+		t.Errorf("rag.store_path = %q, want rag db path", resp.RAG.StorePath)
+	}
+	if resp.RAG.DocumentCount != 12 {
+		t.Errorf("rag.document_count = %d, want 12", resp.RAG.DocumentCount)
+	}
+	if resp.RAG.Threshold != 0.55 {
+		t.Errorf("rag.threshold = %f, want 0.55", resp.RAG.Threshold)
+	}
+	if resp.RAG.Embedder.Type != "ollama" || resp.RAG.Embedder.Model != "nomic-embed-text" {
+		t.Errorf("rag.embedder = %+v, want ollama/nomic-embed-text", resp.RAG.Embedder)
+	}
+	if resp.RAG.LastIndexAt.IsZero() {
+		t.Error("rag.last_index_at is zero, want non-zero time")
+	}
+	if resp.RAG.Retrieval.Attempts != 20 || resp.RAG.Retrieval.Hits != 12 || resp.RAG.Retrieval.Misses != 8 {
+		t.Errorf("rag.retrieval = %+v, want attempts=20 hits=12 misses=8", resp.RAG.Retrieval)
+	}
+	if resp.RAG.Retrieval.HitRate != 0.6 {
+		t.Errorf("rag.retrieval.hit_rate = %f, want 0.6", resp.RAG.Retrieval.HitRate)
+	}
+	if resp.RAG.Cache.Hits != 7 || resp.RAG.Cache.Misses != 13 {
+		t.Errorf("rag.cache = %+v, want hits=7 misses=13", resp.RAG.Cache)
 	}
 
 	// Routing assertions

@@ -167,6 +167,7 @@ func (p *PersistentStore) Load(ctx context.Context) (int, error) {
 	defer rows.Close()
 
 	out := make([]FewShotExample, 0, 64)
+	var lastIndexedAt time.Time
 	for rows.Next() {
 		var (
 			name      string
@@ -190,11 +191,17 @@ func (p *PersistentStore) Load(ctx context.Context) (int, error) {
 			Content:   content,
 			Embedding: emb,
 		})
+		if indexedAt.After(lastIndexedAt) {
+			lastIndexedAt = indexedAt
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return 0, fmt.Errorf("rag: iterate: %w", err)
 	}
 	p.replace(out)
+	if !lastIndexedAt.IsZero() {
+		p.markIndexed(lastIndexedAt)
+	}
 	return len(out), nil
 }
 
@@ -327,12 +334,14 @@ func (p *PersistentStore) Upsert(ctx context.Context, ex FewShotExample) error {
 	cctx, cancel := context.WithTimeout(ctx, ragOpTimeout)
 	defer cancel()
 
+	indexedAt := time.Now().UTC()
 	if _, err := p.db.ExecContext(cctx, ragUpsertSQL,
-		ex.Filename, ex.Content, blob, time.Now().UTC(),
+		ex.Filename, ex.Content, blob, indexedAt,
 	); err != nil {
 		return fmt.Errorf("rag: upsert %q: %w", ex.Filename, err)
 	}
 	p.upsertExample(ex)
+	p.markIndexed(indexedAt)
 	return nil
 }
 

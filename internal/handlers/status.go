@@ -26,10 +26,42 @@ type QualityStatus struct {
 	Workers  int  `json:"quality_workers"`
 }
 
+type ragEmbedderStatus struct {
+	Type        string `json:"type"`
+	Model       string `json:"model"`
+	Healthy     bool   `json:"healthy"`
+	CircuitOpen bool   `json:"circuit_open"`
+}
+
+type ragRetrievalStatus struct {
+	Attempts         uint64            `json:"attempts"`
+	Hits             uint64            `json:"hits"`
+	Misses           uint64            `json:"misses"`
+	HitRate          float64           `json:"hit_rate"`
+	EmptyStoreMisses uint64            `json:"empty_store_misses"`
+	ThresholdMisses  uint64            `json:"threshold_misses"`
+	EmbedErrors      uint64            `json:"embed_errors"`
+	MissesByReason   map[string]uint64 `json:"misses_by_reason"`
+}
+
+type ragCacheStatus struct {
+	Enabled bool   `json:"enabled"`
+	Hits    uint64 `json:"hits"`
+	Misses  uint64 `json:"misses"`
+}
+
 // RAGStatus reports the health of the RAG embedder.
 type RAGStatus struct {
-	Healthy         bool `json:"rag_embedding_healthy"`
-	IndexedExamples int  `json:"rag_indexed_examples"`
+	Healthy         bool               `json:"rag_embedding_healthy"`
+	IndexedExamples int                `json:"rag_indexed_examples"`
+	StoreType       string             `json:"store_type"`
+	StorePath       string             `json:"store_path"`
+	DocumentCount   int                `json:"document_count"`
+	Threshold       float64            `json:"threshold"`
+	Embedder        ragEmbedderStatus  `json:"embedder"`
+	LastIndexAt     time.Time          `json:"last_index_at"`
+	Retrieval       ragRetrievalStatus `json:"retrieval"`
+	Cache           ragCacheStatus     `json:"cache"`
 }
 
 // RoutingSnapshot is a point-in-time copy of the routing decision counters.
@@ -84,6 +116,7 @@ type StatusDeps struct {
 
 	RAGHealthy         func(context.Context) bool // returns true if RAG embedder is reachable
 	RAGIndexedExamples func() int                 // returns number of indexed examples (0 if none/disabled)
+	RAGDiagnostics     func(context.Context) RAGStatus
 
 	RoutingSnapshot func() RoutingSnapshot // returns a point-in-time snapshot of routing counters
 
@@ -138,9 +171,18 @@ func Status(d StatusDeps) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
-		ragHealthy := false
-		if d.RAGHealthy != nil {
-			ragHealthy = d.RAGHealthy(ctx)
+		var ragStatus RAGStatus
+		if d.RAGDiagnostics != nil {
+			ragStatus = d.RAGDiagnostics(ctx)
+		} else {
+			ragHealthy := false
+			if d.RAGHealthy != nil {
+				ragHealthy = d.RAGHealthy(ctx)
+			}
+			ragStatus = RAGStatus{
+				Healthy:         ragHealthy,
+				IndexedExamples: intOrZero(d.RAGIndexedExamples),
+			}
 		}
 
 		snapshot := RoutingSnapshot{}
@@ -177,10 +219,7 @@ func Status(d StatusDeps) http.Handler {
 				Capacity: intOrZero(d.QualityCapacity),
 				Workers:  intOrZero(d.QualityWorkers),
 			},
-			RAG: RAGStatus{
-				Healthy:         ragHealthy,
-				IndexedExamples: intOrZero(d.RAGIndexedExamples),
-			},
+			RAG:     ragStatus,
 			Routing: snapshot,
 			Uptime:  uptimeMs,
 			RateLimiter: RateLimiterStatus{

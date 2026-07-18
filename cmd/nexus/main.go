@@ -939,6 +939,53 @@ func main() {
 			return emb.IsHealthy(ctx)
 		},
 		RAGIndexedExamples: func() int { return store.Size() },
+		RAGDiagnostics: func(ctx context.Context) handlers.RAGStatus {
+			documentCount := store.Size()
+			stats := rag.StoreStats{}
+			if provider, ok := store.(interface{ Stats() rag.StoreStats }); ok {
+				stats = provider.Stats()
+			}
+			healthy := ragEmbedder.IsHealthy(ctx)
+			storeType := "memory"
+			storePath := ""
+			if persistentStore != nil {
+				storeType = "sqlite"
+				storePath = persistentStore.Path()
+			}
+			hitRate := 0.0
+			if stats.RetrievalAttempts > 0 {
+				hitRate = float64(stats.RetrievalHits) / float64(stats.RetrievalAttempts)
+			}
+			status := handlers.RAGStatus{
+				Healthy:         healthy,
+				IndexedExamples: documentCount,
+				StoreType:       storeType,
+				StorePath:       storePath,
+				DocumentCount:   documentCount,
+				Threshold:       store.Threshold(),
+				LastIndexAt:     stats.LastIndexAt,
+			}
+			status.Embedder.Type = string(cfg.EmbedderType)
+			status.Embedder.Model = cfg.EmbeddingModel
+			status.Embedder.Healthy = healthy
+			status.Embedder.CircuitOpen = store.IsBreakerOpen()
+			status.Retrieval.Attempts = stats.RetrievalAttempts
+			status.Retrieval.Hits = stats.RetrievalHits
+			status.Retrieval.Misses = stats.RetrievalMisses
+			status.Retrieval.HitRate = hitRate
+			status.Retrieval.EmptyStoreMisses = stats.EmptyStoreMisses
+			status.Retrieval.ThresholdMisses = stats.ThresholdMisses
+			status.Retrieval.EmbedErrors = stats.EmbedErrors
+			status.Retrieval.MissesByReason = map[string]uint64{
+				"empty_store": stats.EmptyStoreMisses,
+				"threshold":   stats.ThresholdMisses,
+				"embed_error": stats.EmbedErrors,
+			}
+			status.Cache.Enabled = cfg.RAGEmbedCacheSize > 0 && cfg.RAGEmbedCacheTTL > 0
+			status.Cache.Hits = stats.CacheHits
+			status.Cache.Misses = stats.CacheMisses
+			return status
+		},
 		RoutingSnapshot: func() handlers.RoutingSnapshot {
 			snap := routeCounters.Snapshot()
 			return handlers.RoutingSnapshot{Decisions: snap}

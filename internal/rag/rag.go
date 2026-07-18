@@ -328,22 +328,34 @@ type RAGCacheStatsProvider interface {
 	EmbedHitCount() int64
 }
 
+type StoreStats struct {
+	LastIndexAt       time.Time
+	RetrievalAttempts uint64
+	RetrievalHits     uint64
+	RetrievalMisses   uint64
+	EmptyStoreMisses  uint64
+	ThresholdMisses   uint64
+	EmbedErrors       uint64
+	CacheHits         uint64
+	CacheMisses       uint64
+}
+
 // Store holds the indexed few-shot examples.
 type Store struct {
-	// mu guards examples for concurrent readers (Retrieve) and writers
-	// (IndexDir / Add / PersistentStore.Upsert). Operations that don't
-	// touch the slice (Size / Threshold) skip the lock.
-	mu        sync.RWMutex
-	examples  []FewShotExample
-	embedder  Embedder
-	threshold float64
-	// index is the HNSW approximate nearest-neighbor index. It is built
-	// lazily when the store reaches indexThreshold snippets and is used
-	// by Retrieve for O(log n) search instead of O(n) brute-force scan.
-	index *HNSWIndex
-	// indexConfig stores the HNSW configuration so the index can be
-	// rebuilt when the examples slice is replaced.
+	mu          sync.RWMutex
+	examples    []FewShotExample
+	embedder    Embedder
+	threshold   float64
+	index       *HNSWIndex
 	indexConfig HNSWConfig
+
+	lastIndexAt       int64
+	retrievalAttempts uint64
+	retrievalHits     uint64
+	retrievalMisses   uint64
+	emptyStoreMisses  uint64
+	thresholdMisses   uint64
+	embedErrors       uint64
 }
 
 // indexThreshold is the minimum store size before the HNSW index is used.
@@ -377,6 +389,38 @@ func (s *Store) Size() int {
 // call concurrently because threshold is set once at
 // construction and never mutated.
 func (s *Store) Threshold() float64 { return s.threshold }
+
+func (s *Store) Stats() StoreStats {
+	attempts := atomic.LoadUint64(&s.retrievalAttempts)
+	hits := atomic.LoadUint64(&s.retrievalHits)
+	misses := atomic.LoadUint64(&s.retrievalMisses)
+	cacheHits, cacheMisses := s.CacheStats()
+	stats := StoreStats{
+		RetrievalAttempts: attempts,
+		RetrievalHits:     hits,
+		RetrievalMisses:   misses,
+		EmptyStoreMisses:  atomic.LoadUint64(&s.emptyStoreMisses),
+		ThresholdMisses:   atomic.LoadUint64(&s.thresholdMisses),
+		EmbedErrors:       atomic.LoadUint64(&s.embedErrors),
+	}
+	if cacheHits > 0 {
+		stats.CacheHits = uint64(cacheHits)
+	}
+	if cacheMisses > 0 {
+		stats.CacheMisses = uint64(cacheMisses)
+	}
+	if timestamp := atomic.LoadInt64(&s.lastIndexAt); timestamp > 0 {
+		stats.LastIndexAt = time.Unix(0, timestamp).UTC()
+	}
+	return stats
+}
+
+func (s *Store) markIndexed(at time.Time) {
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	atomic.StoreInt64(&s.lastIndexAt, at.UnixNano())
+}
 
 // isSymlink reports whether a DirEntry represents a symbolic link.
 // os.ReadDir uses Lstat under the hood, so the ModeSymlink bit is
@@ -498,6 +542,7 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 			Embedding: emb,
 		})
 		s.mu.Unlock()
+		s.markIndexed(time.Now().UTC())
 		slog.Info("rag indexed", slog.String("filename", f.Name()))
 	}
 	return nil
@@ -513,14 +558,24 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 // Recall@5 ≥ 0.95 vs brute-force while cutting p99 latency from ~50ms to
 // ~10ms for 10,000 snippets (issue #420).
 func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, float64, error) {
+	atomic.AddUint64(&s.retrievalAttempts, 1)
 	s.mu.RLock()
 	n := len(s.examples)
 	s.mu.RUnlock()
-	if n == 0 || prompt == "" {
+	if n == 0 {
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.emptyStoreMisses, 1)
+		return nil, 0, nil
+	}
+	if prompt == "" {
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.thresholdMisses, 1)
 		return nil, 0, nil
 	}
 	promptEmb, err := s.embedder.Embed(ctx, prompt)
 	if err != nil {
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.embedErrors, 1)
 		return nil, 0, err
 	}
 
@@ -552,8 +607,11 @@ func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, f
 			}
 		}
 		if best != nil && bestScore > s.threshold {
+			atomic.AddUint64(&s.retrievalHits, 1)
 			return best, bestScore, nil
 		}
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.thresholdMisses, 1)
 		return nil, bestScore, nil
 	}
 
@@ -570,8 +628,11 @@ func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, f
 		}
 	}
 	if best != nil && bestScore > s.threshold {
+		atomic.AddUint64(&s.retrievalHits, 1)
 		return best, bestScore, nil
 	}
+	atomic.AddUint64(&s.retrievalMisses, 1)
+	atomic.AddUint64(&s.thresholdMisses, 1)
 	return nil, bestScore, nil
 }
 
@@ -609,7 +670,6 @@ func FormatInjection(ex *FewShotExample) string {
 // tests) can populate the store without going through the embedding API.
 func (s *Store) Add(filename, content string, embedding []float64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	id := len(s.examples)
 	s.examples = append(s.examples, FewShotExample{
 		Filename:  filename,
@@ -619,6 +679,8 @@ func (s *Store) Add(filename, content string, embedding []float64) {
 	if s.index != nil {
 		s.index.Add(id, embedding)
 	}
+	s.mu.Unlock()
+	s.markIndexed(time.Now().UTC())
 }
 
 // IsBreakerOpen delegates to the underlying embedder's circuit breaker
