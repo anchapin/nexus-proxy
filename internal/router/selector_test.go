@@ -148,6 +148,90 @@ func TestProviderSelector_SelectFrontier(t *testing.T) {
 			},
 			wantName: "b",
 		},
+		// Issue #450: TailWeight blends P95 into effective latency.
+		// The legacy P50-only ordering must remain byte-for-byte
+		// stable when TailWeight is the package default (0). The
+		// case below mirrors "lower latency wins when costs are
+		// equal" but with both providers carrying identical
+		// P95==P50 (no tail), confirming that the new field does
+		// not perturb the existing ranking.
+		{
+			name:     "TailWeight 0 preserves legacy P50-only ordering",
+			selector: &ProviderSelector{MinSamples: 5, MaxErrorRate: 0.3, TailWeight: 0},
+			stats: []ProviderStats{
+				{Name: "slow", SampleCount: 10, P50LatencyMs: 1000, P95LatencyMs: 1000, AvgCostUSD: 0.001},
+				{Name: "fast", SampleCount: 10, P50LatencyMs: 200, P95LatencyMs: 200, AvgCostUSD: 0.001},
+			},
+			wantName: "fast",
+		},
+		{
+			// A provider with severe long-tail stalls should not
+			// rank identically to a consistent provider with the
+			// same median. With TailWeight=0 they are tied on
+			// P50; with TailWeight=1 the noisy-tail provider loses
+			// outright. The synthetic high-P95 dataset is
+			// deliberately extreme (P95 = 10x P50) so any
+			// non-zero weight changes the winner.
+			name:     "TailWeight 1 penalises synthetic high-P95 provider",
+			selector: &ProviderSelector{MinSamples: 5, MaxErrorRate: 0.3, TailWeight: 1.0},
+			stats: []ProviderStats{
+				{Name: "noisy", SampleCount: 10, P50LatencyMs: 400, P95LatencyMs: 4000, AvgCostUSD: 0.001},
+				{Name: "steady", SampleCount: 10, P50LatencyMs: 400, P95LatencyMs: 400, AvgCostUSD: 0.001},
+			},
+			wantName: "steady",
+		},
+		{
+			// TailWeight=0 must leave the noisy provider in the
+			// same tied position as steady. Sort.SliceStable
+			// preserves input order for equal scores, but the
+			// name-ascending tiebreaker is what actually picks
+			// the winner here.
+			name:     "TailWeight 0 ties the synthetic high-P95 pair",
+			selector: &ProviderSelector{MinSamples: 5, MaxErrorRate: 0.3, TailWeight: 0},
+			stats: []ProviderStats{
+				{Name: "noisy", SampleCount: 10, P50LatencyMs: 400, P95LatencyMs: 4000, AvgCostUSD: 0.001},
+				{Name: "steady", SampleCount: 10, P50LatencyMs: 400, P95LatencyMs: 400, AvgCostUSD: 0.001},
+			},
+			wantName: "noisy", // name-ascending tiebreaker; tied on P50+cost
+		},
+		{
+			// P95 below P50 (data anomaly — fewer samples in the
+			// percentile query than the median) must never
+			// improve a provider's score. The blend uses
+			// max(0, P95 - P50) so the effective latency stays
+			// at P50.
+			name:     "P95 below P50 is treated as zero tail",
+			selector: &ProviderSelector{MinSamples: 5, MaxErrorRate: 0.3, TailWeight: 1.0},
+			stats: []ProviderStats{
+				{Name: "anomalous", SampleCount: 10, P50LatencyMs: 800, P95LatencyMs: 200, AvgCostUSD: 0.001},
+				{Name: "normal", SampleCount: 10, P50LatencyMs: 800, P95LatencyMs: 800, AvgCostUSD: 0.001},
+			},
+			wantName: "anomalous", // both score 1/(800 * cost); name-ascending tiebreak
+		},
+		{
+			// Negative TailWeight (e.g. a struct literal that
+			// bypassed config validation) must be coerced to the
+			// default 0 — never invert the ranking.
+			name:     "negative TailWeight falls back to default 0",
+			selector: &ProviderSelector{MinSamples: 5, MaxErrorRate: 0.3, TailWeight: -0.5},
+			stats: []ProviderStats{
+				{Name: "noisy", SampleCount: 10, P50LatencyMs: 400, P95LatencyMs: 4000, AvgCostUSD: 0.001},
+				{Name: "steady", SampleCount: 10, P50LatencyMs: 400, P95LatencyMs: 400, AvgCostUSD: 0.001},
+			},
+			wantName: "noisy", // same as TailWeight=0 tiebreak
+		},
+		{
+			// Mid-range TailWeight (0.5) should pick the steady
+			// provider because (P50 + 0.5 * (P95 - P50)) makes the
+			// noisy provider's effective latency twice as large.
+			name:     "TailWeight 0.5 prefers steady over high-P95",
+			selector: &ProviderSelector{MinSamples: 5, MaxErrorRate: 0.3, TailWeight: 0.5},
+			stats: []ProviderStats{
+				{Name: "noisy", SampleCount: 10, P50LatencyMs: 400, P95LatencyMs: 1000, AvgCostUSD: 0.001},
+				{Name: "steady", SampleCount: 10, P50LatencyMs: 400, P95LatencyMs: 400, AvgCostUSD: 0.001},
+			},
+			wantName: "steady",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -168,6 +252,76 @@ func TestProviderSelector_SelectFrontier(t *testing.T) {
 				t.Errorf("stats.Name = %q, want %q", gotStats.Name, tc.wantName)
 			}
 		})
+	}
+}
+
+func TestProviderScore_FormulaAndLegacyOrdering(t *testing.T) {
+	// Issue #450: providerScore must collapse to the legacy P50-only
+	// formula when tailWeight is 0, and blend P95 into effective
+	// latency when tailWeight > 0. The legacy score is computed
+	// independently below so any drift in either formula is caught
+	// immediately.
+	legacy := func(p ProviderStats) float64 {
+		return 1.0 / (float64(p.P50LatencyMs) * (p.AvgCostUSD + selectorEpsilon))
+	}
+
+	cases := []struct {
+		name       string
+		stats      ProviderStats
+		tailWeight float64
+		wantScore  float64 // expected; tolerance handled inside the loop
+	}{
+		{
+			name:       "tailWeight 0 collapses to legacy P50-only score",
+			stats:      ProviderStats{P50LatencyMs: 400, P95LatencyMs: 4000, AvgCostUSD: 0.001},
+			tailWeight: 0,
+			wantScore:  legacy(ProviderStats{P50LatencyMs: 400, P95LatencyMs: 4000, AvgCostUSD: 0.001}),
+		},
+		{
+			name:       "tailWeight 1 uses full P95 as effective latency",
+			stats:      ProviderStats{P50LatencyMs: 400, P95LatencyMs: 4000, AvgCostUSD: 0.001},
+			tailWeight: 1.0,
+			wantScore:  1.0 / (4000 * (0.001 + selectorEpsilon)),
+		},
+		{
+			name:       "tailWeight 0.5 blends P50 and P95 evenly",
+			stats:      ProviderStats{P50LatencyMs: 400, P95LatencyMs: 1000, AvgCostUSD: 0.001},
+			tailWeight: 0.5,
+			wantScore:  1.0 / ((400 + 0.5*(1000-400)) * (0.001 + selectorEpsilon)),
+		},
+		{
+			// P95 < P50 (anomalous data) clamps tail to zero so
+			// the score equals the P50-only score.
+			name:       "P95 below P50 clamps tail to zero",
+			stats:      ProviderStats{P50LatencyMs: 800, P95LatencyMs: 200, AvgCostUSD: 0.001},
+			tailWeight: 1.0,
+			wantScore:  legacy(ProviderStats{P50LatencyMs: 800, P95LatencyMs: 200, AvgCostUSD: 0.001}),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := providerScore(tc.stats, tc.tailWeight)
+			diff := got - tc.wantScore
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff > 1e-12 {
+				t.Errorf("providerScore(%+v, %v) = %v, want %v (diff %v)", tc.stats, tc.tailWeight, got, tc.wantScore, diff)
+			}
+		})
+	}
+}
+
+func TestNewProviderSelector_TailWeightDefault(t *testing.T) {
+	// NewProviderSelector must initialise TailWeight to
+	// DefaultSelectorTailWeight so callers that do not set the
+	// field directly continue to get the legacy P50-only ordering.
+	sel := NewProviderSelector()
+	if sel.TailWeight != DefaultSelectorTailWeight {
+		t.Errorf("TailWeight = %v, want %v", sel.TailWeight, DefaultSelectorTailWeight)
+	}
+	if sel.TailWeight != 0 {
+		t.Errorf("DefaultSelectorTailWeight = %v, want 0", sel.TailWeight)
 	}
 }
 

@@ -19,9 +19,10 @@ import (
 // calling SelectFrontier.
 //
 // P50LatencyMs / P95LatencyMs are millisecond percentiles over the
-// observation window. P95 is exposed so future operators can reason about
-// tail latency without expanding the selector surface; the v1 scoring
-// formula only consumes P50.
+// observation window. P50 is the steady-state latency the selector
+// scores against; P95 is the long-tail latency. ProviderSelector.TailWeight
+// blends P95 into the effective latency — see DefaultSelectorTailWeight
+// below for the byte-for-byte preserving default (issue #450).
 //
 // AvgCostUSD is the average per-request USD cost observed over the
 // window. The selector treats it as a tie-breaker / weight — providers
@@ -75,6 +76,18 @@ const (
 	// only thing this knob tunes.
 	DefaultSelectorRefreshInterval = 60 * time.Second
 
+	// DefaultSelectorTailWeight (issue #450) is the blend factor
+	// applied to (P95 - P50) when computing effective latency. The
+	// zero default preserves the legacy P50-only scoring formula
+	// byte-for-byte — score = 1 / (p50 * (cost + epsilon)). A
+	// nonzero weight penalises providers whose long-tail stalls
+	// drag the user-visible completion time, while leaving the
+	// relative ranking of equal-tail providers untouched. Values
+	// outside [0,1] are not enforced here; the config loader
+	// rejects them at boot so a misconfigured operator gets a clear
+	// error rather than silent re-ranking.
+	DefaultSelectorTailWeight = 0.0
+
 	// selectorEpsilon is added to the cost weight so a provider that
 	// has served zero cost (e.g. all requests happened to be free
 	// local traffic) is still scored deterministically — the divisor
@@ -89,7 +102,9 @@ const (
 //
 // The scoring formula is the issue's:
 //
-//	score = 1.0 / (p50_latency_ms * (avg_cost_usd + epsilon))
+//	score = 1.0 / (effective_latency_ms * (avg_cost_usd + epsilon))
+//
+// where effective_latency_ms = p50 + tail_weight * max(0, p95 - p50).
 //
 // Higher score = better. Lower latency AND lower cost raise the score.
 // Providers with SampleCount < MinSamples or ErrorRate > MaxErrorRate
@@ -106,6 +121,14 @@ type ProviderSelector struct {
 	// "exclude any provider with errors"; values >=1 effectively
 	// exclude nothing (ErrorRate is bounded at 1.0).
 	MaxErrorRate float64
+
+	// TailWeight (issue #450) blends P95 into the effective latency
+	// used for scoring. 0 disables the blend entirely (byte-for-byte
+	// legacy ordering); 1 uses (P50 + (P95 - P50)) = P95 as the
+	// effective latency. The config loader rejects values outside
+	// [0,1] at boot; negative values here are treated as 0 so a
+	// misconfigured selector never inverts the ranking.
+	TailWeight float64
 }
 
 // NewProviderSelector constructs a selector with default thresholds.
@@ -115,6 +138,7 @@ func NewProviderSelector() *ProviderSelector {
 	return &ProviderSelector{
 		MinSamples:   DefaultSelectorMinSamples,
 		MaxErrorRate: DefaultSelectorMaxErrorRate,
+		TailWeight:   DefaultSelectorTailWeight,
 	}
 }
 
@@ -138,6 +162,15 @@ func (s *ProviderSelector) SelectFrontier(stats []ProviderStats) (string, Provid
 	// passes through unchanged.
 	if maxErr < 0 {
 		maxErr = DefaultSelectorMaxErrorRate
+	}
+	// TailWeight is bounded at [0,1] by the config loader. Treat
+	// a negative struct value as the legacy default rather than
+	// silently inverting the ranking; values > 1 are accepted as-is
+	// so a deliberate experimental setting (e.g. emphasising the
+	// tail more strongly) still works.
+	tailWeight := s.TailWeight
+	if tailWeight < 0 {
+		tailWeight = DefaultSelectorTailWeight
 	}
 
 	// Filter then sort: the sort is on (score desc, name asc) so
@@ -168,8 +201,8 @@ func (s *ProviderSelector) SelectFrontier(stats []ProviderStats) (string, Provid
 	}
 
 	sort.SliceStable(filtered, func(i, j int) bool {
-		si := providerScore(filtered[i])
-		sj := providerScore(filtered[j])
+		si := providerScore(filtered[i], tailWeight)
+		sj := providerScore(filtered[j], tailWeight)
 		if si != sj {
 			return si > sj
 		}
@@ -186,13 +219,28 @@ func (s *ProviderSelector) SelectFrontier(stats []ProviderStats) (string, Provid
 // providerScore returns the cost-adjusted latency score for p.
 // Higher = better. Implements the issue's formula:
 //
-//	score = 1.0 / (p50_latency_ms * (avg_cost_usd + epsilon))
+//	score = 1.0 / (effective_latency_ms * (avg_cost_usd + epsilon))
+//
+// where effective_latency_ms = p50 + tail_weight * max(0, p95 - p50).
 //
 // The selectorEpsilon keeps the divisor strictly positive even when a
-// provider observed zero cost. Callers should not invoke this directly
-// — it is exported only via the package's test surface.
-func providerScore(p ProviderStats) float64 {
-	return 1.0 / (float64(p.P50LatencyMs) * (p.AvgCostUSD + selectorEpsilon))
+// provider observed zero cost. When tailWeight == 0 the formula
+// collapses to the legacy P50-only score so an operator who never
+// sets the env var sees the original ordering byte-for-byte. Callers
+// should not invoke this directly — it is exported only via the
+// package's test surface.
+func providerScore(p ProviderStats, tailWeight float64) float64 {
+	p50 := float64(p.P50LatencyMs)
+	tail := float64(p.P95LatencyMs - p.P50LatencyMs)
+	if tail < 0 {
+		// P95 below P50 is a data anomaly (e.g. the percentile
+		// query returned fewer samples for P95 than P50).
+		// Treat as zero so the blend can only penalise, never
+		// reward, a noisy tail.
+		tail = 0
+	}
+	effective := p50 + tailWeight*tail
+	return 1.0 / (effective * (p.AvgCostUSD + selectorEpsilon))
 }
 
 // ProviderStatsSource is the data source the ProviderStatsCache reads

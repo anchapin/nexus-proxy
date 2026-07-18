@@ -152,6 +152,7 @@ type Config struct {
 	SelectorWindow          time.Duration // look-back window for provider stats (1h)
 	SelectorMinSamples      int           // per-provider observation floor (5)
 	SelectorRefreshInterval time.Duration // background cache refresh cadence (60s)
+	ProviderTailWeight      float64       // P95 blend factor in [0,1]; 0 = P50-only (legacy) (issue #450)
 	FrontierCostPer1K       float64       // USD per 1k input tokens for frontier (0.005)
 	ZAICostPer1K            float64       // USD per 1k input tokens for z.ai (0.002)
 
@@ -768,6 +769,23 @@ func Load() (Config, error) {
 		selectorRefresh = 0
 	}
 	cfg.SelectorRefreshInterval = selectorRefresh
+
+	// Provider tail weight (issue #450). Blends P95 latency into the
+	// selector's effective-latency score so a provider with severe
+	// long-tail stalls stops ranking identically to a steady
+	// provider with the same median. 0 = legacy P50-only ordering;
+	// 1 = full P95 weighting. Values outside [0,1] fail boot
+	// rather than being silently clamped so a typo (e.g. "1.5" or
+	// "-0.1") surfaces immediately instead of flipping the
+	// ranking in subtle ways.
+	tailWeight, err := getEnvFloat("NEXUS_PROVIDER_TAIL_WEIGHT", 0.0)
+	if err != nil {
+		return cfg, err
+	}
+	if tailWeight < 0 || tailWeight > 1 {
+		return cfg, fmt.Errorf("config: NEXUS_PROVIDER_TAIL_WEIGHT must be in [0,1], got %v", tailWeight)
+	}
+	cfg.ProviderTailWeight = tailWeight
 
 	// Per-provider cost rates. Defaults approximate OpenAI gpt-4o
 	// (~$5/M input tokens) and z.ai glm-4.6 (~$2/M). The chat

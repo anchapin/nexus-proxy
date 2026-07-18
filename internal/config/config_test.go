@@ -104,6 +104,11 @@ func TestLoadDefaults(t *testing.T) {
 	if len(cfg.DSLFormattingPatterns) == 0 {
 		t.Error("DSLFormattingPatterns is empty, want default patterns")
 	}
+	// Provider tail weight (issue #450) defaults to 0 so a stock
+	// deployment preserves the legacy P50-only scoring byte-for-byte.
+	if cfg.ProviderTailWeight != 0 {
+		t.Errorf("ProviderTailWeight = %v, want 0 (default)", cfg.ProviderTailWeight)
+	}
 	if len(cfg.DSLFusionPatterns) == 0 {
 		t.Error("DSLFusionPatterns is empty, want default patterns")
 	}
@@ -125,6 +130,7 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("NEXUS_PROBE_INTERVAL", "120s")
 	t.Setenv("NEXUS_PROBE_TIMEOUT", "2s")
 	t.Setenv("NEXUS_PROBE_BYTES_PER_TOKEN", "131072")
+	t.Setenv("NEXUS_PROVIDER_TAIL_WEIGHT", "0.25")
 
 	cfg, err := Load()
 	if err != nil {
@@ -165,6 +171,9 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if cfg.ProbeBytesPerToken != 131072 {
 		t.Errorf("ProbeBytesPerToken = %d, want 131072", cfg.ProbeBytesPerToken)
+	}
+	if cfg.ProviderTailWeight != 0.25 {
+		t.Errorf("ProviderTailWeight = %v, want 0.25", cfg.ProviderTailWeight)
 	}
 }
 
@@ -336,6 +345,51 @@ func TestLoadInvalidValues(t *testing.T) {
 			t.Setenv(tc.key, tc.val)
 			if _, err := Load(); err == nil {
 				t.Errorf("expected error for %s=%s", tc.key, tc.val)
+			}
+		})
+	}
+}
+
+func TestLoadProviderTailWeightBounds(t *testing.T) {
+	// Issue #450: NEXUS_PROVIDER_TAIL_WEIGHT must accept only
+	// values in [0,1]. Anything outside fails config validation
+	// rather than being silently clamped, so a typo surfaces
+	// immediately instead of flipping the ranking in subtle ways.
+	cases := []struct {
+		name    string
+		key     string
+		val     string
+		wantErr bool
+	}{
+		{"unparseable fails", "NEXUS_PROVIDER_TAIL_WEIGHT", "halfway", true},
+		{"negative fails", "NEXUS_PROVIDER_TAIL_WEIGHT", "-0.1", true},
+		{"above one fails", "NEXUS_PROVIDER_TAIL_WEIGHT", "1.5", true},
+		{"zero accepted", "NEXUS_PROVIDER_TAIL_WEIGHT", "0", false},
+		{"one accepted", "NEXUS_PROVIDER_TAIL_WEIGHT", "1", false},
+		{"mid range accepted", "NEXUS_PROVIDER_TAIL_WEIGHT", "0.42", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.key, tc.val)
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error for %s=%s", tc.key, tc.val)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			want := 0.0
+			switch tc.val {
+			case "1":
+				want = 1.0
+			case "0.42":
+				want = 0.42
+			}
+			if cfg.ProviderTailWeight != want {
+				t.Errorf("ProviderTailWeight = %v, want %v", cfg.ProviderTailWeight, want)
 			}
 		})
 	}

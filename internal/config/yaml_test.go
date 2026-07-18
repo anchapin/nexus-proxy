@@ -452,6 +452,7 @@ func TestLoadYAMLSelectorSettings(t *testing.T) {
 selector_window: "2h"
 selector_min_samples: 10
 selector_refresh_interval: "120s"
+provider_tail_weight: 0.5
 frontier_cost_per_1k: 0.01
 zai_cost_per_1k: 0.005
 `
@@ -472,11 +473,47 @@ zai_cost_per_1k: 0.005
 	if cfg.SelectorRefreshInterval != 120*time.Second {
 		t.Errorf("SelectorRefreshInterval = %v", cfg.SelectorRefreshInterval)
 	}
+	if cfg.ProviderTailWeight != 0.5 {
+		t.Errorf("ProviderTailWeight = %v, want 0.5", cfg.ProviderTailWeight)
+	}
 	if cfg.FrontierCostPer1K != 0.01 {
 		t.Errorf("FrontierCostPer1K = %v", cfg.FrontierCostPer1K)
 	}
 	if cfg.ZAICostPer1K != 0.005 {
 		t.Errorf("ZAICostPer1K = %v", cfg.ZAICostPer1K)
+	}
+}
+
+func TestLoadYAMLProviderTailWeightEnvOverride(t *testing.T) {
+	// Issue #450: the env var must override the YAML default and
+	// reject out-of-range values. Set a YAML file with the default
+	// 0, then push NEXUS_PROVIDER_TAIL_WEIGHT through the loader's
+	// env-override branch and assert it wins. A separate sub-test
+	// pins the strict range check on the env-var path.
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(path, []byte("provider_tail_weight: 0.0\n"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv("NEXUS_PROVIDER_TAIL_WEIGHT", "0.3")
+	cfg, err := LoadYAML(path)
+	if err != nil {
+		t.Fatalf("LoadYAML: %v", err)
+	}
+	if cfg.ProviderTailWeight != 0.3 {
+		t.Errorf("ProviderTailWeight = %v, want 0.3 (env override)", cfg.ProviderTailWeight)
+	}
+}
+
+func TestLoadYAMLProviderTailWeightEnvInvalid(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(path, []byte("provider_tail_weight: 0.0\n"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv("NEXUS_PROVIDER_TAIL_WEIGHT", "1.5")
+	if _, err := LoadYAML(path); err == nil {
+		t.Error("LoadYAML: expected error for NEXUS_PROVIDER_TAIL_WEIGHT=1.5")
 	}
 }
 
