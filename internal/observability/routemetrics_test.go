@@ -2,6 +2,7 @@ package observability
 
 import (
 	"fmt"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -774,5 +775,107 @@ func TestSLMCacheEvictionsNilAndEmptySafe(t *testing.T) {
 	}
 	if strings.Contains(sb.String(), "nexus_slm_cache_evictions_total{") {
 		t.Errorf("empty reason should not emit any series:\n%s", sb.String())
+	}
+}
+
+// TestHandlerEmitsCircuitBreakerGauges (issue #443) wires a real
+// Collector into the production RouteCounters.Handler() and confirms
+// that a recorded RAG failure surfaces in /metrics as the three
+// labelled circuit-breaker samples referenced by the dashboard and
+// runbook queries. This is the live-handler integration test the
+// issue calls out; the standalone CircuitBreakerGauges renderer
+// already passes — the bug is that those samples never reach /metrics.
+func TestHandlerEmitsCircuitBreakerGauges(t *testing.T) {
+	rc := NewRouteCounters()
+	col := NewCollector()
+	rc.SetCollector(col)
+
+	// Simulate the chat handler tripping the RAG breaker (issue #411).
+	col.RecordCircuitFailure("rag")
+	col.RecordCircuitFailure("rag")
+	col.RecordCircuitFailure("rag")
+	col.RecordCircuitRecovery("rag")
+	// And the Ollama breaker reaching half-open during recovery.
+	col.RecordCircuitHalfOpen("ollama")
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	rec := httptest.NewRecorder()
+	rc.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("handler returned status %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
+		t.Errorf("Content-Type = %q, want text/plain prefix", got)
+	}
+	body := rec.Body.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{`# TYPE nexus_circuit_breaker_state gauge`, "state gauge type line"},
+		{`nexus_circuit_breaker_state{circuit="rag"} 0`, "rag circuit closed (0) after recovery"},
+		{`nexus_circuit_breaker_state{circuit="ollama"} 1`, "ollama circuit half_open (1)"},
+		{`# TYPE nexus_circuit_breaker_failures_total counter`, "failures_total counter type line"},
+		{`nexus_circuit_breaker_failures_total{circuit="rag"} 3`, "rag failures_total = 3"},
+		{`nexus_circuit_breaker_last_failure_seconds{circuit="rag"}`, "rag last_failure_seconds label set present"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(body, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, body)
+		}
+	}
+}
+
+// TestHandlerEmitsCircuitBreakerGaugesWithProviders (issue #443)
+// confirms that a downstream gauge provider wired via SetGaugeProviders
+// continues to render alongside the collector's circuit-breaker
+// gauges — the collector joins the providers list rather than
+// replacing it.
+func TestHandlerEmitsCircuitBreakerGaugesWithProviders(t *testing.T) {
+	rc := NewRouteCounters()
+	col := NewCollector()
+	rc.SetCollector(col)
+	rc.SetGaugeProviders(GaugeProviderFunc(func() []GaugeSample {
+		return []GaugeSample{{Name: "nexus_custom_gauge", Value: 42}}
+	}))
+
+	col.RecordCircuitFailure("rag")
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	rec := httptest.NewRecorder()
+	rc.Handler().ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `nexus_circuit_breaker_state{circuit="rag"} 2`) {
+		t.Errorf("missing rag open state sample (2) from collector\n%s", body)
+	}
+	if !strings.Contains(body, "nexus_custom_gauge 42") {
+		t.Errorf("missing external gauge sample from SetGaugeProviders\n%s", body)
+	}
+}
+
+// TestHandlerNilCollectorSafe (issue #443) verifies the handler
+// remains safe when SetCollector was never called — the original
+// behaviour must not regress.
+func TestHandlerNilCollectorSafe(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.Observe("frontier", "guardrail", 0, "", "")
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	rec := httptest.NewRecorder()
+	rc.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("handler returned status %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "nexus_route_decisions_total") {
+		t.Errorf("expected route_decisions_total in nil-collector output\n%s", body)
+	}
+	// Circuit breaker metrics must be absent — no collector means no circuits.
+	if strings.Contains(body, "nexus_circuit_breaker_state") {
+		t.Errorf("circuit_breaker_state should be absent without a collector\n%s", body)
 	}
 }

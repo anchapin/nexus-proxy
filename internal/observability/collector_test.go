@@ -575,3 +575,80 @@ func TestObservePipelineStageConcurrent(t *testing.T) {
 		}
 	}
 }
+
+// TestCollectorSatisfiesGaugeProvider (issue #443) is a compile-time
+// guard that *Collector implements GaugeProvider so the RouteCounters
+// handler can pass it directly to RenderPrometheus. If Gauges() ever
+// drifts in signature the build fails here rather than at runtime.
+func TestCollectorSatisfiesGaugeProvider(t *testing.T) {
+	var _ GaugeProvider = (*Collector)(nil)
+}
+
+// TestCollectorGaugesReturnsCircuitState (issue #443) verifies that a
+// fresh collector returns an empty slice, then transitions and reports
+// three labelled samples per known circuit.
+func TestCollectorGaugesReturnsCircuitState(t *testing.T) {
+	c := NewCollector()
+
+	if got := c.Gauges(); len(got) != 0 {
+		t.Errorf("fresh collector Gauges() = %d samples, want 0", len(got))
+	}
+
+	c.RecordCircuitFailure("rag")
+	c.RecordCircuitFailure("rag")
+	c.RecordCircuitRecovery("rag")
+	c.RecordCircuitHalfOpen("ollama")
+
+	samples := c.Gauges()
+	wantNames := map[string]bool{
+		"nexus_circuit_breaker_state":                false,
+		"nexus_circuit_breaker_failures_total":       false,
+		"nexus_circuit_breaker_last_failure_seconds": false,
+	}
+	gotByCircuit := map[string]map[string]float64{}
+	for _, s := range samples {
+		wantNames[s.Name] = true
+		circuit := s.Labels["circuit"]
+		if gotByCircuit[circuit] == nil {
+			gotByCircuit[circuit] = map[string]float64{}
+		}
+		gotByCircuit[circuit][s.Name] = s.Value
+	}
+	for name, seen := range wantNames {
+		if !seen {
+			t.Errorf("expected sample for %q in collector.Gauges()", name)
+		}
+	}
+
+	rag := gotByCircuit["rag"]
+	if rag == nil {
+		t.Fatalf("missing rag circuit samples")
+	}
+	if rag["nexus_circuit_breaker_state"] != float64(circuitStateClosed) {
+		t.Errorf("rag state = %v, want %d (closed after recovery)", rag["nexus_circuit_breaker_state"], circuitStateClosed)
+	}
+	if rag["nexus_circuit_breaker_failures_total"] != 2 {
+		t.Errorf("rag failures_total = %v, want 2", rag["nexus_circuit_breaker_failures_total"])
+	}
+	if rag["nexus_circuit_breaker_last_failure_seconds"] == 0 {
+		t.Errorf("rag last_failure_seconds should be non-zero, got 0")
+	}
+
+	ollama := gotByCircuit["ollama"]
+	if ollama == nil {
+		t.Fatalf("missing ollama circuit samples")
+	}
+	if ollama["nexus_circuit_breaker_state"] != float64(circuitStateHalfOpen) {
+		t.Errorf("ollama state = %v, want %d (half_open)", ollama["nexus_circuit_breaker_state"], circuitStateHalfOpen)
+	}
+}
+
+// TestCollectorGaugesNilSafe (issue #443) verifies Gauges() on a nil
+// *Collector returns nil so main.go can skip the collector during boot
+// or in tests without a nil-deref panic.
+func TestCollectorGaugesNilSafe(t *testing.T) {
+	var c *Collector
+	if got := c.Gauges(); got != nil {
+		t.Errorf("nil collector Gauges() = %v, want nil", got)
+	}
+}

@@ -598,13 +598,22 @@ func (rc *RouteCounters) slot(m map[counterKey]*uint64, key counterKey) *uint64 
 // exposition. The handler sets Content-Type to the Prometheus text
 // format and never errors — a scrape always returns 200 with the
 // current counter snapshot. When a Collector is set (via SetCollector),
-// circuit breaker gauges from the collector are also included.
+// counter/histogram families plus the collector's circuit-breaker
+// gauges (issue #443) are merged into the output via RenderPrometheus.
 func (rc *RouteCounters) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		_, _ = rc.WriteTo(w)
 		if rc.collector != nil || len(rc.gaugeProviders) > 0 {
-			RenderPrometheus(w, rc.collector, rc.gaugeProviders...)
+			// *Collector satisfies GaugeProvider (issue #443), so its
+			// circuit-breaker state/failures/last-failure samples are
+			// merged into the gauge section alongside the explicit
+			// providers wired in main.go.
+			providers := rc.gaugeProviders
+			if rc.collector != nil {
+				providers = append(providers, rc.collector)
+			}
+			RenderPrometheus(w, rc.collector, providers...)
 		}
 	})
 }

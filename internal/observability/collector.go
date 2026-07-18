@@ -516,6 +516,18 @@ func (c *Collector) CircuitBreakerGauges() []GaugeSample {
 	return out
 }
 
+// Gauges implements GaugeProvider so *Collector can be passed
+// directly to RenderPrometheus via the RouteCounters.Handler() chain
+// (issue #443). It returns the circuit-breaker state, failures, and
+// last-failure samples. Safe for a nil receiver — returns nil so the
+// collector can be omitted without panicking during boot or in tests.
+func (c *Collector) Gauges() []GaugeSample {
+	if c == nil {
+		return nil
+	}
+	return c.CircuitBreakerGauges()
+}
+
 // getOrCreateCircuit returns the state for a named circuit, creating
 // it if first seen. Caller must hold cbMu.
 func (c *Collector) getOrCreateCircuit(name string) *circuitBreakerState {
