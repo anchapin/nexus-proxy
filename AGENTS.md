@@ -25,11 +25,17 @@ boot-time diagnostics without starting the server (issue #32).
 **CI order:** `go vet` → `go build` → `go test -race` → `golangci-lint`
 (coverage gate runs after test).
 
-**CI coverage floor is 70%** — `make ci` will fail if total coverage
+**CI coverage floor is 70%** — `make ci` fails if total coverage
 drops below 70%. Per-package numbers print for visibility; only the
 total gates.
 
 **Go version:** CI uses Go 1.26 (see `.github/workflows/ci.yml`).
+
+**Startup diagnostics:** `nexus check` (alias `nexus doctor`) runs the
+boot-time diagnostic suite and exits without starting the server. Use
+this to verify Ollama reachability, model availability, frontier key
+validity, VRAM probe budget, and RAG directory state before routing
+any traffic.
 
 **Runtime dependency only:** `modernc.org/sqlite` (metrics store).
 Everything else is stdlib.
@@ -41,16 +47,18 @@ cmd/nexus/              # main: wires config → middleware → handlers → HTT
 internal/
   auth/                 # inbound API-key middleware
   budget/               # 24h rolling frontier spend cap
-  concurrencylimit/     # VRAM-aware local-route semaphore
+  circuit/              # local-route cooldown after cascade failure (issue #80)
+  concurrencylimit/      # VRAM-aware local-route semaphore
   config/               # Load() parses all NEXUS_* env vars (no central map)
-  handlers/              # chat.go + health.go (only package that touches net/http)
+  diag/                 # boot-time diagnostics (nexus check / nexus doctor)
+  handlers/             # chat.go + health.go (only package that touches net/http)
   health/               # Ollama circuit breaker
   judge/                # async LLM-as-a-judge (sampled local completions)
   metrics/              # SQLite metrics store → savings dashboard
   middleware/           # prompt transforms only (toon, prompt_engine)
   observability/        # Prometheus collector + /metrics endpoint
   probe/                # nvidia-smi / AMD sysfs VRAM probe
-  providers/             # multi-frontier registry + cost-latency selector
+  providers/            # multi-frontier registry + cost-latency selector
   quality/              # background cargo check / tsc verifier
   rag/                  # PersistentStore (SQLite) + Store + Watcher
   ratelimit/            # ClientIPResolver + HTTP middleware (NOT in middleware/)
@@ -67,10 +75,10 @@ lives in `internal/ratelimit` because it imports `net/http`. The
 way for unit-testability.
 
 **Critical dependency rule:** `internal/handlers` and `internal/upstream`
-must **never** import `internal/judge`. The judge hooks in via
-`JudgeObserver` on `handlers.Deps` — a function-typed field wired in
-`cmd/nexus/main.go`. This keeps the hot path testable without spinning
-up a worker pool.
+must **never** import `internal/judge` or `internal/quality`. Both hook
+in via observer interfaces on `handlers.Deps` — `JudgeObserver` and
+`QualityObserver` are function-typed fields wired in `cmd/nexus/main.go`.
+This keeps the hot path testable without spinning up worker pools.
 
 ## Routing pipeline
 
@@ -104,12 +112,14 @@ Panel behavior.
 
 **Inbound HTTP chain** (`cmd/nexus/main.go`, outermost → innermost):
 1. Security headers (`X-Request-Id` sanitize, `X-Content-Type-Options`, etc.)
-2. Rate limiting (per-client-IP; exempts `/healthz /livez /readyz /status /metrics`)
-3. Inbound auth (bearer token; same exemptions; no-op when `NEXUS_PROXY_API_KEY` unset)
-4. Handler dispatch
+2. Panic recovery (turns panics into structured 500 JSON envelopes)
+3. Inbound auth (bearer token; exempts `/healthz`, `/metrics`; also `/status` when `NEXUS_STATUS_PUBLIC=true`; no-op when `NEXUS_PROXY_API_KEY` unset)
+4. mux routing (rate limiting is **not** a global header — it is path-specific)
 
-Rate limiter fires **before** any prompt-pipeline work — a 429 terminates
-at the HTTP layer.
+Rate limiter wraps only `/v1/chat/completions`. Health, status, and metrics
+endpoints are registered on the unprotected mux and are never rate-limited.
+A 429 from the rate limiter terminates at the HTTP layer, before any
+prompt-pipeline work runs.
 
 **Prompt pipeline** (`internal/handlers/chat.go`):
 1. `ApplyPromptEngineering` — role/CoT/constraints into system prompt
@@ -180,6 +190,23 @@ historical scores aggregated by task category feed back to the SLM as a
 confidence signal. Dormant when judge is off — routing is byte-for-byte
 identical to non-adaptive path.
 
+## Request body and response guards
+
+`NEXUS_MAX_BODY_BYTES` (default 1 MiB) caps inbound request bodies. The
+chat handler rejects oversized POSTs with 413 before any allocation
+happens — zero overhead on normal traffic.
+
+`NEXUS_MAX_RESPONSE_BYTES` (default 64 MiB) caps upstream response bodies
+read into memory. Prevents a malicious upstream from exhausting proxy
+memory on large completions.
+
+`NEXUS_SHUTDOWN_TIMEOUT` (default 30s) is the graceful drain window.
+The prior 10s hardcoded value truncated frontier SSE streams mid-token.
+Set this and your K8s `terminationGracePeriodSeconds` consistently when
+running long-streaming workloads. A warning fires at boot if
+`SHUTDOWN_TIMEOUT < SERVER_READ_TIMEOUT` since in-flight uploads could
+be truncated.
+
 ## Debug tracing (issue #33)
 
 `NEXUS_DEBUG=true` emits five structured slog groups per request:
@@ -223,3 +250,11 @@ in manual testing.
 
 **Test infrastructure:** `RecordingTransport` (internal/upstream/recording.go)
 records/replays HTTP calls so unit tests have no external dependencies.
+
+## Local-route cooldown (issue #80)
+
+After the cascade detects an Ollama failure and falls back, `circuit.Cooldown`
+arms a short cooldown so subsequent requests skip local and go directly to
+fallback — closing the gap between cascade failure detection and the health
+poller tripping the breaker. Set `NEXUS_LOCAL_COOLDOWN=0` to disable
+(pre-issue-#80 behaviour).
