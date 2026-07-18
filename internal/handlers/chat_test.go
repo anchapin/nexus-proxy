@@ -1494,12 +1494,16 @@ func TestChatRejectsOversizedBodyBeforeUnmarshal(t *testing.T) {
 	}
 }
 
-// TestWriteJSONError confirms the helper emits a parseable envelope.
+// TestWriteJSONError confirms the helper emits a parseable envelope
+// carrying a stable error type, message, and code (issue #453).
 func TestWriteJSONError(t *testing.T) {
 	rw := httptest.NewRecorder()
-	writeJSONError(rw, http.StatusRequestEntityTooLarge, "boom")
+	writeJSONError(rw, http.StatusRequestEntityTooLarge, ErrTypeRequestTooLarge, "boom")
 	if rw.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("status = %d, want 413", rw.Code)
+	}
+	if got := rw.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("content-type = %q, want application/json", got)
 	}
 	var env struct {
 		Error map[string]string `json:"error"`
@@ -1510,8 +1514,28 @@ func TestWriteJSONError(t *testing.T) {
 	if env.Error["message"] != "boom" {
 		t.Errorf("message = %q, want boom", env.Error["message"])
 	}
-	if env.Error["type"] != "Request Entity Too Large" {
-		t.Errorf("type = %q, want %q", env.Error["type"], "Request Entity Too Large")
+	if env.Error["type"] != ErrTypeRequestTooLarge {
+		t.Errorf("type = %q, want %q", env.Error["type"], ErrTypeRequestTooLarge)
+	}
+	if env.Error["code"] != "Request Entity Too Large" {
+		t.Errorf("code = %q, want %q", env.Error["code"], "Request Entity Too Large")
+	}
+}
+
+// TestWriteJSONErrorDefaultsType verifies that an empty type fallback
+// falls back to the generic server_error classifier instead of an
+// empty string, so SDKs always see a non-empty `error.type`.
+func TestWriteJSONErrorDefaultsType(t *testing.T) {
+	rw := httptest.NewRecorder()
+	writeJSONError(rw, http.StatusInternalServerError, "", "boom")
+	var env struct {
+		Error map[string]string `json:"error"`
+	}
+	if err := json.Unmarshal(rw.Body.Bytes(), &env); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if env.Error["type"] != ErrTypeServerError {
+		t.Errorf("type = %q, want default %q", env.Error["type"], ErrTypeServerError)
 	}
 }
 
