@@ -69,9 +69,10 @@ type YAMLConfig struct {
 	BudgetAlertWebhookURL string  `yaml:"budget_alert_webhook_url"`
 
 	// Selector
-	SelectorWindow          string `yaml:"selector_window"`
-	SelectorMinSamples      int    `yaml:"selector_min_samples"`
-	SelectorRefreshInterval string `yaml:"selector_refresh_interval"`
+	SelectorWindow          string  `yaml:"selector_window"`
+	SelectorMinSamples      int     `yaml:"selector_min_samples"`
+	SelectorRefreshInterval string  `yaml:"selector_refresh_interval"`
+	ProviderTailWeight      float64 `yaml:"provider_tail_weight"`
 
 	// RAG
 	ExamplesDir       string  `yaml:"examples_dir"`
@@ -412,6 +413,16 @@ func LoadYAML(path string) (Config, error) {
 			d = 0
 		}
 		cfg.SelectorRefreshInterval = d
+	}
+	if v := os.Getenv("NEXUS_PROVIDER_TAIL_WEIGHT"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_PROVIDER_TAIL_WEIGHT: %w", err)
+		}
+		if f < 0 || f > 1 {
+			return cfg, fmt.Errorf("config: NEXUS_PROVIDER_TAIL_WEIGHT must be in [0,1], got %v", f)
+		}
+		cfg.ProviderTailWeight = f
 	}
 
 	// RAG
@@ -882,6 +893,7 @@ func (yc YAMLConfig) toConfig() Config {
 		SelectorWindow:          yc.durationDefault(yc.SelectorWindow, time.Hour),
 		SelectorMinSamples:      yc.intDefault(yc.SelectorMinSamples, 5),
 		SelectorRefreshInterval: yc.durationDefault(yc.SelectorRefreshInterval, 60*time.Second),
+		ProviderTailWeight:      clampFloat(yc.floatDefault(yc.ProviderTailWeight, 0.0), 0, 1),
 		FrontierCostPer1K:       yc.floatDefault(yc.FrontierCostPer1K, 0.005),
 		ZAICostPer1K:            yc.floatDefault(yc.ZAICostPer1K, 0.002),
 
