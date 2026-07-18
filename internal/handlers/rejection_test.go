@@ -298,6 +298,9 @@ func TestRejectionQueueConstants(t *testing.T) {
 	if RejectionQualityQueue != "quality_queue" {
 		t.Errorf("RejectionQualityQueue = %q, want %q", RejectionQualityQueue, "quality_queue")
 	}
+	if RejectionAuthRateLimit != "auth_rate_limit" {
+		t.Errorf("RejectionAuthRateLimit = %q, want %q", RejectionAuthRateLimit, "auth_rate_limit")
+	}
 }
 
 // TestRejectionObserverFuncQueueOverflow exercises the RejectionObserverFunc

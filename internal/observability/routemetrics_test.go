@@ -172,6 +172,7 @@ func TestRouteCountersRejections(t *testing.T) {
 	rc.ObserveRejection("bad_request")
 	rc.ObserveRejection("bad_request")
 	rc.ObserveRejection("rate_limit")
+	rc.ObserveRejection("auth_rate_limit")
 
 	var sb strings.Builder
 	if _, err := rc.WriteTo(&sb); err != nil {
@@ -189,6 +190,7 @@ func TestRouteCountersRejections(t *testing.T) {
 		{`nexus_requests_rejected_total{reason="body_too_large"} 1`, "body_too_large counted once"},
 		{`nexus_requests_rejected_total{reason="bad_request"} 3`, "bad_request counted three times"},
 		{`nexus_requests_rejected_total{reason="rate_limit"} 1`, "rate_limit counted once"},
+		{`nexus_requests_rejected_total{reason="auth_rate_limit"} 1`, "auth_rate_limit counted once"},
 	}
 	for _, c := range checks {
 		if !strings.Contains(out, c.fragment) {
@@ -218,7 +220,7 @@ func TestRouteCountersRejectionDeterministicOrder(t *testing.T) {
 // from many goroutines; the race detector is the primary assertion.
 func TestRouteCountersRejectionConcurrentSafe(t *testing.T) {
 	rc := NewRouteCounters()
-	reasons := []string{"method", "body_too_large", "bad_request", "rate_limit"}
+	reasons := []string{"method", "body_too_large", "bad_request", "rate_limit", "auth_rate_limit"}
 	var wg sync.WaitGroup
 	for i := 0; i < 200; i++ {
 		wg.Add(1)
