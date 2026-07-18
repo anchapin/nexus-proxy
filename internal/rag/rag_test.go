@@ -558,3 +558,59 @@ func TestStoreWithCachingEmbedder(t *testing.T) {
 		t.Errorf("EmbedHitCount = %d, want 1", hitCount)
 	}
 }
+
+// TestStoreIndexMode exercises the IndexMode accessor added for
+// issue #446 so operators can confirm which retrieval path the
+// next Retrieve call will take. The three modes are: "none" (empty
+// store), "brute_force" (below indexThreshold or index invalidated),
+// and "hnsw" (large store with a populated HNSW index).
+func TestStoreIndexMode(t *testing.T) {
+	emb := &stubEmbedder{vecs: map[string][]float64{}}
+
+	t.Run("empty store reports none", func(t *testing.T) {
+		store := NewStore(emb, 0.55)
+		if got := store.IndexMode(); got != IndexModeNone {
+			t.Errorf("IndexMode() = %q, want %q", got, IndexModeNone)
+		}
+	})
+
+	t.Run("below threshold reports brute_force", func(t *testing.T) {
+		store := NewStore(emb, 0.0)
+		// Any count strictly less than indexThreshold (50) reports
+		// brute_force even when the HNSW index is technically
+		// present.
+		for i := 0; i < indexThreshold-1; i++ {
+			store.Add(fmt.Sprintf("snippet-%d", i), "x", []float64{1, 0, 0})
+		}
+		if got := store.IndexMode(); got != IndexModeBruteForce {
+			t.Errorf("IndexMode() = %q, want %q", got, IndexModeBruteForce)
+		}
+	})
+
+	t.Run("at or above threshold with index reports hnsw", func(t *testing.T) {
+		store := NewStore(emb, 0.0)
+		for i := 0; i < indexThreshold+5; i++ {
+			store.Add(fmt.Sprintf("snippet-%d", i), "x", []float64{1, 0, 0})
+		}
+		if got := store.IndexMode(); got != IndexModeHNSW {
+			t.Errorf("IndexMode() = %q, want %q", got, IndexModeHNSW)
+		}
+	})
+
+	t.Run("upsertInvalidatesIndexReportsBruteForce", func(t *testing.T) {
+		store := NewStore(emb, 0.0)
+		for i := 0; i < indexThreshold+5; i++ {
+			store.Add(fmt.Sprintf("snippet-%d", i), "x", []float64{1, 0, 0})
+		}
+		if got := store.IndexMode(); got != IndexModeHNSW {
+			t.Fatalf("IndexMode() before upsert = %q, want %q", got, IndexModeHNSW)
+		}
+		// upsertExample invalidates the HNSW index (issue #420) —
+		// the next Retrieve will fall back to brute_force until the
+		// lazy rebuild happens.
+		store.upsertExample(FewShotExample{Filename: "snippet-0", Content: "x", Embedding: []float64{1, 0, 0}})
+		if got := store.IndexMode(); got != IndexModeBruteForce {
+			t.Errorf("IndexMode() after upsert = %q, want %q", got, IndexModeBruteForce)
+		}
+	})
+}

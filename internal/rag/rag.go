@@ -309,6 +309,9 @@ type RAGStore interface {
 	Add(filename, content string, embedding []float64)
 	Size() int
 	Threshold() float64
+	// IndexMode reports which retrieval path the next Retrieve call
+	// will take: "none", "brute_force", or "hnsw" (issue #446).
+	IndexMode() string
 	// IsBreakerOpen returns true when the RAG embedder's circuit breaker
 	// has tripped and is blocking requests (issue #304).
 	IsBreakerOpen() bool
@@ -399,6 +402,42 @@ const (
 	// nexus_rag_similarity_histogram carry these observations.
 	IndexPathBruteForce IndexPath = "brute_force"
 )
+
+// IndexMode describes which retrieval path Store.Retrieve will use for
+// the current example count (issue #446). The /status endpoint reports
+// this value so operators can confirm whether the HNSW index is in use.
+const (
+	// IndexModeNone is reported when the store is empty — Retrieve
+	// short-circuits before any search happens.
+	IndexModeNone = "none"
+	// IndexModeBruteForce is reported when the store has fewer than
+	// indexThreshold examples or when the HNSW index has been
+	// invalidated by an upsert (issue #420).
+	IndexModeBruteForce = "brute_force"
+	// IndexModeHNSW is reported when the store is large enough and
+	// the HNSW index is fully populated — Retrieve then uses the
+	// approximate-neighbour code path.
+	IndexModeHNSW = "hnsw"
+)
+
+// IndexMode returns the retrieval path the next Retrieve call will
+// take: "none" (empty store), "brute_force" (small store or
+// invalidated index), or "hnsw" (approximate index active). Race-safe
+// — the same lock pattern Retrieve uses to decide the path (issue #446).
+func (s *Store) IndexMode() string {
+	s.mu.RLock()
+	n := len(s.examples)
+	indexed := s.index != nil && s.index.Size() >= n
+	s.mu.RUnlock()
+	switch {
+	case n == 0:
+		return IndexModeNone
+	case n < indexThreshold || !indexed:
+		return IndexModeBruteForce
+	default:
+		return IndexModeHNSW
+	}
+}
 
 // NewStore constructs an empty store. dir is the on-disk location of the
 // snippets; threshold is the cosine similarity floor (0..1) for retrieval.

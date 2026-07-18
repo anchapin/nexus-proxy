@@ -21,6 +21,7 @@ func (m *mockStore) Retrieve(ctx context.Context, query string) (*rag.FewShotExa
 func (m *mockStore) Add(filename, content string, embedding []float64) {}
 func (m *mockStore) Size() int                                         { return 0 }
 func (m *mockStore) Threshold() float64                                { return 0.5 }
+func (m *mockStore) IndexMode() string                                 { return rag.IndexModeNone }
 func (m *mockStore) IsBreakerOpen() bool                               { return false }
 func (m *mockStore) RecordBreakerSuccess()                             {}
 

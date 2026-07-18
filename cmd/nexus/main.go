@@ -975,6 +975,7 @@ func main() {
 				StorePath:       storePath,
 				DocumentCount:   documentCount,
 				Threshold:       store.Threshold(),
+				IndexMode:       store.IndexMode(),
 				LastIndexAt:     stats.LastIndexAt,
 			}
 			status.Embedder.Type = string(cfg.EmbedderType)
@@ -996,6 +997,10 @@ func main() {
 			status.Cache.Enabled = cfg.RAGEmbedCacheSize > 0 && cfg.RAGEmbedCacheTTL > 0
 			status.Cache.Hits = stats.CacheHits
 			status.Cache.Misses = stats.CacheMisses
+			total := stats.CacheHits + stats.CacheMisses
+			if total > 0 {
+				status.Cache.HitRate = float64(stats.CacheHits) / float64(total)
+			}
 			return status
 		},
 		RoutingSnapshot: func() handlers.RoutingSnapshot {
