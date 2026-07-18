@@ -308,16 +308,18 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 		dec        Route
 		err        error
 		confidence float64 = NeutralConfidence
-		category   string
 	)
+
+	// Categorize once for observability. Every decision reaching the SLM
+	// stage (including cache hits) carries a non-empty TaskType so that
+	// Prometheus and JSONL telemetry lose their per-category dimension
+	// even when no ConfidenceStore is wired (issue #441).
+	category := Categorize(req.Prompt)
 
 	// Check cache first if enabled.
 	if p.SLMCache != nil {
 		if cached, hit, hitKind := p.SLMCache.Get(req.Context, req.Prompt); hit {
-			// We still categorize for observability even on cache hit,
-			// but we use the cached route directly.
 			if p.Confidence != nil {
-				category = Categorize(req.Prompt)
 				confidence = p.Confidence.LocalConfidence(category)
 			}
 			// Hard override: same check as the miss path — a cached
@@ -351,7 +353,6 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	}
 
 	if p.Confidence != nil {
-		category = Categorize(req.Prompt)
 		confidence = p.Confidence.LocalConfidence(category)
 		dec, err = p.SLM.DecideWithConfidence(req.Context, req.Prompt, confidence)
 	} else {
@@ -377,7 +378,6 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	// The check uses > so threshold 0.3 fires on 0.29. A zero or
 	// negative threshold disables the override.
 	if p.ConfidenceThreshold > 0 && (dec == RouteLocal || dec == RouteFusion) && confidence < p.ConfidenceThreshold {
-		category = Categorize(req.Prompt)
 		return Decision{
 			Route:           RouteFrontier,
 			Source:          SourceSLMEscalation,
