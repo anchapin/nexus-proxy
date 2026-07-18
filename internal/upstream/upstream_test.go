@@ -1168,7 +1168,8 @@ func TestPanelStreamingOneMemberFailedSkipsArbiter(t *testing.T) {
 // TestPanelStreamingBothMembersFailedSurfacesError confirms the
 // failure mode when no panel member returns content: the call
 // returns an error containing both upstream messages, mirroring
-// the existing Panel path's surfacing of upstream errors.
+// the existing Panel path's surfacing of upstream errors. Issue #437:
+// no headers, body, or flush may occur so the handler can emit 502.
 func TestPanelStreamingBothMembersFailedSurfacesError(t *testing.T) {
 	const (
 		localURL    = "http://local.local/v1/chat/completions"
@@ -1204,6 +1205,20 @@ func TestPanelStreamingBothMembersFailedSurfacesError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "both members failed") {
 		t.Errorf("err = %v, want 'both members failed'", err)
+	}
+	// Issue #437: writer must be untouched so the chat handler can
+	// emit a real HTTP 502 instead of a 200 with an error body.
+	if rw.status != 0 {
+		t.Errorf("status = %d, want 0 (uncommitted)", rw.status)
+	}
+	if rw.body.Len() != 0 {
+		t.Errorf("body = %q, want empty", rw.body.String())
+	}
+	if rw.flushed {
+		t.Error("flush called on dual failure, want no flush")
+	}
+	if rw.header.Get("Content-Type") != "" {
+		t.Errorf("Content-Type header set on dual failure, want none")
 	}
 }
 
