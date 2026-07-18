@@ -219,6 +219,31 @@ misses and `"reason":"slm-escalation"` when the SLM escalates to frontier.
 | `nexus_rag_hits_total` | counter | Successful RAG injections |
 | `nexus_ollama_healthy` | gauge | Ollama health probe result (1 or 0) |
 
+### `/status` RAG block fields (issue #446)
+
+The `rag` object in `GET /status` now surfaces the configured embedder,
+effective threshold, breaker state, retrieval path, and cache
+behaviour so operators don't have to correlate logs with configuration:
+
+| Field | Type | Meaning |
+| ----- | ---- | ------- |
+| `rag.embedder.type` | string | Configured embedder plugin (`ollama`, `openai`, `cohere`). Mirrors `NEXUS_EMBEDDER_TYPE`. |
+| `rag.embedder.model` | string | Embedding model name. Mirrors `NEXUS_EMBEDDING_MODEL`. |
+| `rag.embedder.healthy` | bool | Last probe result (short-timeout health check). |
+| `rag.embedder.circuit_open` | bool | RAG circuit breaker state. Trips when `NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD` consecutive embedder failures occur. |
+| `rag.threshold` | float64 | Cosine similarity floor; matches above this trigger an injection. Mirrors `NEXUS_RAG_THRESHOLD`. |
+| `rag.index_mode` | string | Retrieval path the next `Retrieve` call will take: `none` (empty store), `brute_force` (< 50 examples or HNSW invalidated by upsert), `hnsw` (approximate index active). See `BENCHMARKS.md` §3 for the size-vs-latency crossover rationale. |
+| `rag.cache.enabled` | bool | Whether the LRU embed cache is active (true when `NEXUS_RAG_EMBED_CACHE_SIZE > 0` and `NEXUS_RAG_EMBED_CACHE_TTL > 0`). |
+| `rag.cache.hits` | uint64 | Cumulative LRU cache hits since boot. |
+| `rag.cache.misses` | uint64 | Cumulative LRU cache misses since boot. |
+| `rag.cache.hit_rate` | float64 | `hits / (hits + misses)`, or 0.0 when the cache has not been exercised yet. |
+| `rag.retrieval.attempts` | uint64 | Total `Retrieve` calls since boot. |
+| `rag.retrieval.hits` | uint64 | `Retrieve` calls that returned an example above threshold. |
+| `rag.retrieval.misses_by_reason` | object | Counters bucketed by cause: `empty_store`, `threshold`, `embed_error`. Useful for surfacing which miss mode dominates. |
+| `rag.store_type` | string | `memory` when `NEXUS_RAG_DB` is empty; `sqlite` otherwise. |
+| `rag.store_path` | string | On-disk path of the persistent store (issue #46); empty for in-memory. |
+| `rag.last_index_at` | timestamp | Wall-clock time the most recent `IndexDir` / `Upsert` finished. |
+
 ### Useful diagnostics commands
 
 ```bash
