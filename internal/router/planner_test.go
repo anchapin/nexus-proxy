@@ -71,6 +71,29 @@ var fusionPatterns = []*regexp.Regexp{regexp.MustCompile(`(?i)\b(architectural d
 // localPatterns matches common coding task keywords (issue #202, #305).
 var localPatterns = []*regexp.Regexp{regexp.MustCompile(`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis)\b`)}
 
+func TestDecisionSourceTraceReason(t *testing.T) {
+	tests := []struct {
+		name   string
+		source DecisionSource
+		want   string
+	}{
+		{name: "guardrail", source: SourceGuardrail, want: "guardrail"},
+		{name: "dsl", source: SourceDSL, want: "dsl"},
+		{name: "clean slm", source: SourceSLM, want: "slm"},
+		{name: "slm error", source: SourceSLMError, want: "slm-error"},
+		{name: "slm no client", source: SourceEscalation, want: "slm-no-client"},
+		{name: "slm low confidence", source: SourceSLMEscalation, want: "slm-low-confidence"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.source.TraceReason(); got != tt.want {
+				t.Errorf("TraceReason() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestPlanner_Plan(t *testing.T) {
 	tests := []struct {
 		name          string

@@ -264,6 +264,34 @@ func TestChatDebugRoutingIncludesReasonAndBudget(t *testing.T) {
 // TestChatDebugTransformsLogsTOONAndRAG ensures the transform trace
 // surfaces both the RAG hit and the TOON compression result. We use
 // a TOON-friendly payload so CompressJSONBlocks fires.
+func TestChatDebugSLMErrorRoutingReason(t *testing.T) {
+	deps, rt := debugDeps(t)
+	rt.OnAny(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.String(), "ollama") {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		_, _ = io.WriteString(w, "frontier stream")
+	})
+
+	stop := captureDebugSlog(t)
+	body := `{"messages":[{"role":"user","content":"review this unfamiliar design"}]}`
+	Chat(deps).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	lines, _ := stop()
+
+	matches := findDebugLines(lines, "[DEBUG] routing")
+	if len(matches) != 1 {
+		t.Fatalf("expected one routing trace, got %d", len(matches))
+	}
+	group, ok := matches[0]["routing"].(map[string]any)
+	if !ok {
+		t.Fatalf("routing trace missing group: %v", matches[0])
+	}
+	if got, _ := group["reason"].(string); got != "slm-error" {
+		t.Errorf("routing.reason = %q, want slm-error", got)
+	}
+}
+
 func TestChatDebugTransformsLogsTOONAndRAG(t *testing.T) {
 	deps, rt := debugDeps(t)
 	// The default stubEmbedder returns [0,0,0] which makes cosine
