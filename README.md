@@ -90,7 +90,64 @@ cp .env.example .env
 # Edit .env and set NEXUS_FRONTIER_API_KEY
 ```
 
+### Verify (before serving traffic)
+
+Before the first start, run the boot-time diagnostic suite so missing
+models, invalid keys, unreachable Ollama, RAG directory issues, and
+writable-path problems surface as a clear pass/fail report instead of
+the first proxied request timing out:
+
+```bash
+./bin/nexus check
+# or, equivalently:
+./bin/nexus doctor
+```
+
+Sample output:
+
+```text
+Nexus Proxy — Configuration Check
+===================================
+[PASS] ollama_reachable — reachable at http://localhost:11434
+[PASS] ollama_router_model — model "qwen3-coder:4b" available
+[PASS] ollama_local_model — model "qwen3-coder:8b" available
+[PASS] ollama_embedding_model — model "nomic-embed-text" functional (768-dim vector)
+[PASS] frontier_api_key — key accepted (endpoint: https://api.openai.com/v1)
+[WARN] zai_api_key — no NEXUS_ZAI_API_KEY set — cascade fallback to z.ai disabled
+[PASS] vram_probe — budget: 4096 tokens (source: ollama)
+[PASS] rag_directory — 12 file(s) in "./few_shot_examples"
+[PASS] telemetry_path_writable — writable (./nexus-telemetry.jsonl)
+[PASS] metrics_db_writable — writable (~/.cache/nexus-proxy/metrics.db)
+[PASS] judge_readiness — ready (model=glm-4.5, sample_rate=0.10)
+[PASS] rag_circuit_breaker — threshold=3 consecutive failures
+[WARN] quality_verifier — NEXUS_QUALITY_CONCURRENCY=0 — quality verifier dormant
+[WARN] budget_guard — NEXUS_BUDGET_DAILY_LIMIT=0 — budget guard disabled
+[SKIP] rate_limit_proxy_config — rate limiting disabled (NEXUS_RATE_LIMIT_RPM <= 0)
+[PASS] provider_registry — JSON valid
+[PASS] middleware_chain — chain valid (promptEngineering,rag,compressJSONBlocks,appendSystemNote)
+[SKIP] models_endpoint — models endpoint disabled (NEXUS_MODELS_ENDPOINT=false)
+
+All checks passed, 3 warning(s).
+```
+
+**Exit codes:**
+
+| Code | Meaning |
+| ---- | ------- |
+| `0`  | Every check passed (warnings and skips are fine — see [issue #32](https://github.com/anchapin/nexus-proxy/issues/32)). |
+| `1`  | At least one check failed. Read the `[FAIL]` lines and the `Detail` column for the remediation hint (often a missing `ollama pull <model>` or an unset API key). |
+
+The `--json` flag (`./bin/nexus check --json`) emits a stable JSON array
+of `{name, status, detail}` objects suitable for `jq` filtering and CI
+gates:
+
+```bash
+./bin/nexus check --json | jq '.[] | select(.status == "fail") | .detail'
+```
+
 ### Build and run
+
+Once `nexus check` is green:
 
 ```bash
 make build && ./bin/nexus
@@ -318,6 +375,26 @@ nexus v1.0.0
 `--version` (or `-v`) prints the build version and exits. The version is
 injected at compile time via `-ldflags`; a local `make build` reports
 `nexus dev` unless you override it with `make build VERSION=v1.2.3`.
+
+### CLI reference
+
+The `nexus` binary ships with the subcommands below. The default
+invocation (no args) starts the proxy on `:8000`.
+
+| Command | Purpose |
+| ------- | ------- |
+| `nexus` | Start the proxy (binds `:8000` by default; override with `NEXUS_ADDR`). |
+| `nexus check` | Run the boot-time diagnostic suite and exit. Use `--json` for machine-readable output. See [Verify](#verify-before-serving-traffic) above. |
+| `nexus doctor` | Alias for `nexus check`. |
+| `nexus config validate <file>` | Parse and validate a YAML config file, then print the resolved keys. Exits `0` on success, `1` on parse / indentation errors. |
+| `nexus dashboard` | Print the daily savings summary from the SQLite metrics store. Flags: `--json`, `--since YYYY-MM-DD`, `--days N`, `--db PATH`, `--cost-per-1k RATE`. |
+| `nexus --version` / `-v` | Print the build version (`nexus dev` for local builds). |
+| `nexus --help` / `-h` | Print the usage banner. |
+
+An unknown verb exits with code `2`. The full subcommand dispatch lives
+in `cmd/nexus/main.go:67-99`; the diagnostic suite is implemented in
+`internal/diag/diag.go`. Run any subcommand with `--help` for
+subcommand-specific flags.
 
 ## Architecture
 

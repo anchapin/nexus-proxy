@@ -25,6 +25,10 @@ We use GitHub Issues to track bugs and requested features. Please use the provid
 ### Local Setup
 - **Prerequisites**: Install Go 1.21+ and ensure Ollama is running locally.
 - **Build**: Run `make build`.
+- **Verify**: Run `./bin/nexus check` (alias `./bin/nexus doctor`) to
+  validate boot-time configuration before serving traffic. Exits `0`
+  on pass (warnings + skips are fine), `1` when at least one check
+  fails — see the Quickstart in `README.md` for the full table.
 - **Run**: `./bin/nexus`.
 - **Test**: `make test`.
 - **Lint**: `make lint`.
