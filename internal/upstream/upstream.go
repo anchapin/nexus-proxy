@@ -496,7 +496,7 @@ func Panel(
 	ctx context.Context,
 	w http.ResponseWriter,
 	client Client,
-	localBaseURL, localModel, frontierURL, frontierModel string,
+	localBaseURL, localModel, frontierURL, frontierKey, frontierModel string,
 	arbiterURL, arbiterKey, arbiterModel string,
 	body map[string]interface{},
 	latestPrompt string,
@@ -539,7 +539,7 @@ func Panel(
 		ctx, cancel := context.WithTimeout(ctx, withDefault(perFetchTimeout))
 		defer cancel()
 		msg, err := FetchPanel(ctx, client,
-			frontierURL, "", frontierModel, body)
+			frontierURL, frontierKey, frontierModel, body)
 		results <- PanelResult{Source: "frontier", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
 	}()
 	r1 := <-results
@@ -767,7 +767,7 @@ func PanelStreaming(
 	ctx context.Context,
 	w http.ResponseWriter,
 	client Client,
-	localBaseURL, localModel, frontierURL, frontierModel string,
+	localBaseURL, localModel, frontierURL, frontierKey, frontierModel string,
 	arbiterURL, arbiterKey, arbiterModel string,
 	body map[string]interface{},
 	latestPrompt string,
@@ -788,7 +788,7 @@ func PanelStreaming(
 	// JSON-object response shape (issue #10).
 	if s, ok := body["stream"].(bool); ok && !s {
 		cacheHit, err := Panel(ctx, w, client,
-			localBaseURL, localModel, frontierURL, frontierModel,
+			localBaseURL, localModel, frontierURL, frontierKey, frontierModel,
 			arbiterURL, arbiterKey, arbiterModel,
 			body, latestPrompt, perFetchTimeout, arbiterTimeout,
 			skipLocal, arbiterCache, arbiterCacheTTL)
@@ -857,7 +857,7 @@ func PanelStreaming(
 		cancelFrontier = cancel
 		defer cancel()
 		msg, err := FetchPanel(ctxFrontier, client,
-			frontierURL, "", frontierModel, body)
+			frontierURL, frontierKey, frontierModel, body)
 		results <- PanelResult{Source: "frontier", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
 		return nil
 	})

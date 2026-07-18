@@ -373,7 +373,7 @@ func TestPanelArbiterTimeoutBoundsHangingCall(t *testing.T) {
 	_, err := Panel(
 		context.Background(), newSSERW(), http.DefaultClient,
 		localSrv.URL, "local-m",
-		frontierSrv.URL, "frontier-m",
+		frontierSrv.URL, "", "frontier-m",
 		arbiterSrv.URL+"/v1/chat/completions", "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
@@ -428,7 +428,7 @@ func TestPanelArbiterHappyPathNoRegression(t *testing.T) {
 	if _, err := Panel(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
-		"http://frontier.local", "frontier-m",
+		"http://frontier.local", "", "frontier-m",
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
@@ -484,7 +484,7 @@ func TestPanelSkipLocalOmitsLocalFetch(t *testing.T) {
 	if _, err := Panel(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
-		"http://frontier.local", "frontier-m",
+		"http://frontier.local", "", "frontier-m",
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
@@ -535,7 +535,7 @@ func TestPanelSkipLocalArbiterPromptHasDegradedMarker(t *testing.T) {
 	if _, err := Panel(
 		context.Background(), newSSERW(), client,
 		localURL, "local-m",
-		frontierURL, "frontier-m",
+		frontierURL, "", "frontier-m",
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"the user prompt",
@@ -725,7 +725,7 @@ func TestPanelArbiterHonorsStreamFlagFalse(t *testing.T) {
 	if _, err := Panel(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
-		"http://frontier.local", "frontier-m",
+		"http://frontier.local", "", "frontier-m",
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}, "stream": false},
 		"test prompt",
@@ -787,7 +787,7 @@ func TestPanelArbiterHonorsStreamFlagTrueRegression(t *testing.T) {
 	if _, err := Panel(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
-		"http://frontier.local", "frontier-m",
+		"http://frontier.local", "", "frontier-m",
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}, "stream": true},
 		"test prompt",
@@ -803,6 +803,52 @@ func TestPanelArbiterHonorsStreamFlagTrueRegression(t *testing.T) {
 	}
 	if !strings.Contains(rw.body.String(), `"a":1`) {
 		t.Errorf("arbiter SSE not forwarded: %q", rw.body.String())
+	}
+}
+
+// TestPanelForwardsFrontierBearerToken verifies that the frontier panel
+// member receives the configured bearer token via the Authorization
+// header (issue #436). Before the fix, both Panel and PanelStreaming
+// hardcoded an empty string for the frontier FetchPanel apiKey parameter,
+// causing authenticated frontier endpoints to reject the request.
+func TestPanelForwardsFrontierBearerToken(t *testing.T) {
+	var frontierAuth, arbiterAuth string
+	ft := newFakeTransport()
+	ft.on("http://local.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local"}}]}`)
+	})
+	ft.on("http://frontier.local", func(w http.ResponseWriter, r *http.Request) {
+		frontierAuth = r.Header.Get("Authorization")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier"}}]}`)
+	})
+	ft.on("http://arbiter.local/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		arbiterAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "data: {\"synthesized\":\"ok\"}\n\n")
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	if _, err := Panel(
+		context.Background(), rw, client,
+		"http://local.local", "local-m",
+		"http://frontier.local", "sk-frontier-key", "frontier-m",
+		"http://arbiter.local/v1/chat/completions", "sk-arbiter-key", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		5*time.Second, 5*time.Second,
+		false, nil, 0*time.Second,
+	); err != nil {
+		t.Fatalf("Panel: %v", err)
+	}
+	if frontierAuth != "Bearer sk-frontier-key" {
+		t.Errorf("frontier bearer token = %q, want %q", frontierAuth, "Bearer sk-frontier-key")
+	}
+	if arbiterAuth != "Bearer sk-arbiter-key" {
+		t.Errorf("arbiter bearer token = %q, want %q", arbiterAuth, "Bearer sk-arbiter-key")
 	}
 }
 
@@ -841,7 +887,7 @@ func TestPanelStreamingAgreementSkipsArbiter(t *testing.T) {
 	outcome, err := PanelStreaming(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
-		frontierURL, "frontier-m",
+		frontierURL, "", "frontier-m",
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
@@ -932,7 +978,7 @@ func TestPanelStreamingAgreementCancelsSlowMember(t *testing.T) {
 	outcome, err := PanelStreaming(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
-		frontierURL, "frontier-m",
+		frontierURL, "", "frontier-m",
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
@@ -1003,7 +1049,7 @@ func TestPanelStreamingDisagreementRunsArbiter(t *testing.T) {
 	outcome, err := PanelStreaming(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
-		frontierURL, "frontier-m",
+		frontierURL, "", "frontier-m",
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
@@ -1075,7 +1121,7 @@ func TestPanelStreamingDegradedSkipLocal(t *testing.T) {
 	outcome, err := PanelStreaming(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
-		frontierURL, "frontier-m",
+		frontierURL, "", "frontier-m",
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
@@ -1139,7 +1185,7 @@ func TestPanelStreamingOneMemberFailedSkipsArbiter(t *testing.T) {
 	outcome, err := PanelStreaming(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
-		frontierURL, "frontier-m",
+		frontierURL, "", "frontier-m",
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
@@ -1190,7 +1236,7 @@ func TestPanelStreamingBothMembersFailedSurfacesError(t *testing.T) {
 	_, err := PanelStreaming(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
-		frontierURL, "frontier-m",
+		frontierURL, "", "frontier-m",
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
@@ -1242,7 +1288,7 @@ func TestPanelStreamingHonorsStreamFalseFallsBackToPanel(t *testing.T) {
 	outcome, err := PanelStreaming(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
-		frontierURL, "frontier-m",
+		frontierURL, "", "frontier-m",
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}, "stream": false},
 		"test prompt",
@@ -1309,7 +1355,7 @@ func TestPanelStreamingThresholdClamping(t *testing.T) {
 		outcome, err := PanelStreaming(
 			context.Background(), rw, client,
 			"http://local.local", "local-m",
-			frontierURL, "frontier-m",
+			frontierURL, "", "frontier-m",
 			arbiterURL, "", "arbiter-m",
 			map[string]interface{}{"messages": []interface{}{}},
 			"test prompt",
@@ -1354,7 +1400,7 @@ func TestPanelStreamingThresholdClamping(t *testing.T) {
 		outcome, err := PanelStreaming(
 			context.Background(), rw, client,
 			"http://local.local", "local-m",
-			frontierURL, "frontier-m",
+			frontierURL, "", "frontier-m",
 			arbiterURL, "", "arbiter-m",
 			map[string]interface{}{"messages": []interface{}{}},
 			"test prompt",
@@ -1404,7 +1450,7 @@ func TestPanelStreamingSpeculativeSourceIdentified(t *testing.T) {
 	outcome, err := PanelStreaming(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
-		frontierURL, "frontier-m",
+		frontierURL, "", "frontier-m",
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
@@ -1453,7 +1499,7 @@ func TestPanelStreamingSetsProgressiveHeader(t *testing.T) {
 	if _, err := PanelStreaming(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
-		frontierURL, "frontier-m",
+		frontierURL, "", "frontier-m",
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
@@ -1504,7 +1550,7 @@ func TestPanelStreamingToolCallWinnerSkipsArbiter(t *testing.T) {
 	outcome, err := PanelStreaming(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
-		frontierURL, "frontier-m",
+		frontierURL, "", "frontier-m",
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
@@ -1625,7 +1671,7 @@ func TestPanelStreamingClientAbortSkipsArbiter(t *testing.T) {
 	outcome, err := PanelStreaming(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
-		frontierURL, "frontier-m",
+		frontierURL, "", "frontier-m",
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
@@ -1675,5 +1721,52 @@ func TestIsClientAbort(t *testing.T) {
 	}
 	if IsClientAbort(nil) {
 		t.Error("IsClientAbort(nil) = true, want false")
+	}
+}
+
+// TestPanelStreamingForwardsFrontierBearerToken verifies that the
+// streaming fusion path also forwards the frontier bearer token
+// (issue #436). This mirrors TestPanelForwardsFrontierBearerToken but
+// exercises the PanelStreaming code path.
+func TestPanelStreamingForwardsFrontierBearerToken(t *testing.T) {
+	var frontierAuth, arbiterAuth string
+	ft := newFakeTransport()
+	ft.on("http://local.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local"}}]}`)
+	})
+	ft.on("http://frontier.local", func(w http.ResponseWriter, r *http.Request) {
+		frontierAuth = r.Header.Get("Authorization")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier"}}]}`)
+	})
+	ft.on("http://arbiter.local/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		arbiterAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "data: {\"synthesized\":\"ok\"}\n\n")
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	_, err := PanelStreaming(
+		context.Background(), rw, client,
+		"http://local.local", "local-m",
+		"http://frontier.local", "sk-frontier-key", "frontier-m",
+		"http://arbiter.local/v1/chat/completions", "sk-arbiter-key", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		5*time.Second, 5*time.Second,
+		false, 0.85, "test-request",
+		nil, 0*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("PanelStreaming: %v", err)
+	}
+	if frontierAuth != "Bearer sk-frontier-key" {
+		t.Errorf("frontier bearer token = %q, want %q", frontierAuth, "Bearer sk-frontier-key")
+	}
+	if arbiterAuth != "Bearer sk-arbiter-key" {
+		t.Errorf("arbiter bearer token = %q, want %q", arbiterAuth, "Bearer sk-arbiter-key")
 	}
 }
