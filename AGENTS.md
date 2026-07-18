@@ -207,6 +207,27 @@ running long-streaming workloads. A warning fires at boot if
 `SHUTDOWN_TIMEOUT < SERVER_READ_TIMEOUT` since in-flight uploads could
 be truncated.
 
+## Security headers (issue #444)
+
+`handlers.SecurityHeaders(tlsActive bool)` is the **single source of
+truth** for response hardening. The middleware is wired as the
+outermost layer in `cmd/nexus/main.go`:
+
+```go
+Handler: handlers.SecurityHeaders(cfg.TLSEnabled)(handlers.Recover()(rootHandler)),
+```
+
+HSTS (`Strict-Transport-Security: max-age=31536000`) is only emitted
+when `cfg.TLSEnabled` is true. Default false: a stock plaintext bind
+must not advertise HSTS (spec violation, silently ignored by browsers).
+The mirror env var is `NEXUS_TLS_ENABLED` and the YAML key is
+`tls_enabled:`.
+
+`internal/middleware/security.go` was removed — there is no duplicate.
+Do not reintroduce it; the package comment forbids `net/http`
+dependencies in `internal/middleware` (kept pure for unit-testability
+and to mirror `internal/ratelimit`'s split).
+
 ## Debug tracing (issue #33)
 
 `NEXUS_DEBUG=true` emits five structured slog groups per request:

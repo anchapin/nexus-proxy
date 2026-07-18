@@ -26,6 +26,7 @@ type YAMLConfig struct {
 	MaxHeaderBytes  int    `yaml:"server_max_header_bytes"`
 	ShutdownTimeout string `yaml:"shutdown_timeout"`
 	MaxBodyBytes    int    `yaml:"max_body_bytes"`
+	TLSEnabled      bool   `yaml:"tls_enabled"`
 
 	// Logging
 	LogLevel  string `yaml:"log_level"`
@@ -254,6 +255,9 @@ func LoadYAML(path string) (Config, error) {
 			d = DefaultShutdownTimeout
 		}
 		cfg.ShutdownTimeout = d
+	}
+	if v := os.Getenv("NEXUS_TLS_ENABLED"); v != "" {
+		cfg.TLSEnabled = parseBoolEnvStr(v, false)
 	}
 
 	// Logging
@@ -884,6 +888,7 @@ func (yc YAMLConfig) toConfig() Config {
 		IdleTimeout:     yc.durationDefault(yc.IdleTimeout, DefaultServerIdleTimeout),
 		MaxHeaderBytes:  yc.intDefault(yc.MaxHeaderBytes, DefaultServerMaxHeaderBytes),
 		ShutdownTimeout: yc.durationDefault(yc.ShutdownTimeout, DefaultShutdownTimeout),
+		TLSEnabled:      yc.TLSEnabled,
 
 		BudgetDailyLimit:      yc.floatDefault(yc.BudgetDailyLimit, 0),
 		BudgetAlertEnabled:    yc.BudgetAlertEnabled,
