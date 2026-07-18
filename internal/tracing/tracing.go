@@ -277,6 +277,15 @@ func Enabled() bool {
 	return globalExporter.Load() != nil
 }
 
+// GlobalExporter returns the process-wide exporter registered by
+// RegisterExporter, or nil when no exporter is active. The returned
+// pointer is safe to read concurrently — it is a snapshot of the
+// atomic pointer at the moment of the call. Used by the /metrics
+// handler to surface the exporter's dropped-span counter.
+func GlobalExporter() *Exporter {
+	return globalExporter.Load()
+}
+
 // ctxKey is the unexported type used as the context.Context key
 // for storing the parent tracing Context. Unexported so external
 // packages cannot collide on the same key.

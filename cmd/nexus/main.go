@@ -37,6 +37,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/ratelimit"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 	"github.com/anchapin/nexus-proxy/internal/transport"
 	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
@@ -607,6 +608,48 @@ func main() {
 			}
 		}
 	}()
+
+	// Wire dropped-counter gauge providers into /metrics (issue #442).
+	// Each provider reads the cumulative drop count from its backing
+	// store at scrape time so the Prometheus counter stays live.
+	routeCounters.SetGaugeProviders(
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var v uint64
+			if verifier != nil {
+				v = verifier.Dropped()
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_quality_dropped_total",
+				Value: float64(v),
+			}}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var v uint64
+			if ms, ok := metricsStore.(*metrics.SQLiteStore); ok {
+				v = ms.Dropped()
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_metrics_dropped_total",
+				Value: float64(v),
+			}}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var v uint64
+			if d, ok := recorder.(interface{ Dropped() uint64 }); ok {
+				v = d.Dropped()
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_telemetry_dropped_total",
+				Value: float64(v),
+			}}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			return []observability.GaugeSample{{
+				Name:  "nexus_tracing_dropped_total",
+				Value: float64(tracing.GlobalExporter().Dropped()),
+			}}
+		}),
+	)
 
 	// Middleware chain (issue #224). Initialize the middleware registry
 	// with the config values so closures capture the per-config state.

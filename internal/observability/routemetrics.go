@@ -167,6 +167,10 @@ type RouteCounters struct {
 	// collector is an optional Collector whose CircuitBreakerGauges()
 	// are merged into the /metrics output when non-nil.
 	collector *Collector
+
+	// gaugeProviders supply live gauge readings (e.g. dropped counters)
+	// at scrape time. They are passed to RenderPrometheus by Handler().
+	gaugeProviders []GaugeProvider
 }
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
@@ -599,8 +603,8 @@ func (rc *RouteCounters) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		_, _ = rc.WriteTo(w)
-		if rc.collector != nil {
-			RenderPrometheus(w, rc.collector)
+		if rc.collector != nil || len(rc.gaugeProviders) > 0 {
+			RenderPrometheus(w, rc.collector, rc.gaugeProviders...)
 		}
 	})
 }
@@ -609,6 +613,13 @@ func (rc *RouteCounters) Handler() http.Handler {
 // included in the /metrics output. Nil clears the collector.
 func (rc *RouteCounters) SetCollector(c *Collector) {
 	rc.collector = c
+}
+
+// SetGaugeProviders attaches one or more GaugeProviders whose live
+// readings are included in the /metrics output via RenderPrometheus.
+// Nil providers are silently ignored at scrape time.
+func (rc *RouteCounters) SetGaugeProviders(providers ...GaugeProvider) {
+	rc.gaugeProviders = append(rc.gaugeProviders, providers...)
 }
 
 // Snapshot returns a point-in-time copy of the routing decision counters

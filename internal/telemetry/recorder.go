@@ -164,6 +164,9 @@ func (Noop) Record(Record) {}
 // Close implements Recorder.
 func (Noop) Close() error { return nil }
 
+// Dropped returns 0. Noop never drops records.
+func (Noop) Dropped() uint64 { return 0 }
+
 // JSONLRecorder appends one JSON object per line to a file. The file is
 // opened in append mode and the parent directory is created on demand.
 type JSONLRecorder struct {
