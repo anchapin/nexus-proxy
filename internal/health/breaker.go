@@ -54,35 +54,44 @@ const (
 )
 
 // IsOpen reports whether the circuit is currently in the open (cooldown)
-// state. When the cooldown deadline has passed, IsOpen resets the failure
-// counter and transitions to half-open so the next request can probe.
+// state. When the cooldown deadline has passed, IsOpen atomically transitions
+// to half-open and admits exactly one probe request.
 func (b *Breaker) IsOpen() bool {
 	if b.Threshold == 0 {
 		return false
 	}
-	deadline := b.cooldownUntil.Load()
-	if deadline == 0 {
-		return b.state.Load() == breakerStateOpen
+	for {
+		switch b.state.Load() {
+		case breakerStateClosed:
+			return false
+		case breakerStateHalfOpen:
+			return true
+		case breakerStateOpen:
+			deadline := b.cooldownUntil.Load()
+			if deadline == 0 || time.Now().UnixNano() < deadline {
+				return true
+			}
+			if !b.state.CompareAndSwap(breakerStateOpen, breakerStateHalfOpen) {
+				continue
+			}
+			b.failureCount.Store(0)
+			b.cooldownUntil.Store(0)
+			return false
+		default:
+			return true
+		}
 	}
-	if time.Now().UnixNano() >= deadline {
-		// Cooldown has expired; give the next request a clean slate.
-		b.failureCount.Store(0)
-		b.cooldownUntil.Store(0)
-		b.state.Store(breakerStateHalfOpen)
-		return false
-	}
-	return true
 }
 
 // RecordFailure increments the consecutive-failure counter and trips the
 // breaker when the threshold is reached. The cooldown window starts from
-// the current time.
+// the current time, or immediately when a half-open probe fails.
 func (b *Breaker) RecordFailure() {
 	if b.Threshold == 0 {
 		return
 	}
 	count := b.failureCount.Add(1)
-	if count >= int32(b.Threshold) {
+	if b.state.Load() == breakerStateHalfOpen || count >= int32(b.Threshold) {
 		// Trip: set the cooldown deadline. We add one nanosecond so that
 		// the comparison in IsOpen is strict (deadline > now, not >=).
 		b.cooldownUntil.Store(time.Now().Add(b.Cooldown).UnixNano() + 1)

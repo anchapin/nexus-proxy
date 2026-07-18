@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -171,6 +173,89 @@ func TestOllamaEmbedder_CircuitBreaker_RecoversAfterCooldown(t *testing.T) {
 	}
 }
 
+func TestOllamaEmbedder_CircuitBreaker_HalfOpenAdmitsOneProbe(t *testing.T) {
+	var calls atomic.Int32
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch calls.Add(1) {
+		case 1:
+			w.WriteHeader(http.StatusInternalServerError)
+		case 2:
+			close(probeStarted)
+			<-releaseProbe
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"embedding": []float64{0.1, 0.2, 0.3},
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"embedding": []float64{0.1, 0.2, 0.3},
+			})
+		}
+	}))
+	defer svr.Close()
+
+	emb := NewOllamaEmbedder(svr.URL, "nomic-embed-text", svr.Client(),
+		BreakerConfig{Threshold: 1, Cooldown: 20 * time.Millisecond})
+	if _, err := emb.Embed(context.Background(), "initial"); err == nil {
+		t.Fatal("initial request should fail")
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	const callers = 32
+	start := make(chan struct{})
+	results := make(chan error, callers)
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := emb.Embed(context.Background(), "probe")
+			results <- err
+		}()
+	}
+	close(start)
+
+	probeTimedOut := false
+	select {
+	case <-probeStarted:
+	case <-time.After(time.Second):
+		probeTimedOut = true
+	}
+
+	rejected := 0
+	for i := 0; i < callers-1 && !probeTimedOut; i++ {
+		select {
+		case err := <-results:
+			if !errors.Is(err, ErrCircuitOpen) {
+				t.Errorf("concurrent caller %d: expected ErrCircuitOpen, got %v", i, err)
+			}
+			rejected++
+		case <-time.After(time.Second):
+			probeTimedOut = true
+		}
+	}
+
+	close(releaseProbe)
+	wg.Wait()
+	if probeTimedOut {
+		t.Fatal("half-open probe did not admit exactly one request")
+	}
+	if rejected != callers-1 {
+		t.Fatalf("rejected callers = %d, want %d", rejected, callers-1)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("provider requests = %d, want 2 including initial failure", got)
+	}
+	if err := <-results; err != nil {
+		t.Fatalf("half-open probe: %v", err)
+	}
+	if emb.IsBreakerOpen() {
+		t.Fatal("breaker should close after a successful half-open probe")
+	}
+}
+
 func TestOllamaEmbedder_CircuitBreaker_ResetsOnSuccess(t *testing.T) {
 	// Server always fails (to avoid cooldown blocking failure recording).
 	failCount := 999
@@ -215,18 +300,17 @@ func TestOllamaEmbedder_CircuitBreaker_ResetsOnSuccess(t *testing.T) {
 	// Wait for cooldown to expire.
 	time.Sleep(600 * time.Millisecond)
 
-	// After cooldown: isOpen resets failureCount to 0 and cooldownUntil to 0.
-	// The call proceeds, fails, and records failureCount=1 (NOT re-tripped,
-	// since 1 < threshold=3). Breaker remains closed.
+	// After cooldown, a failure from the half-open probe re-trips the breaker
+	// immediately, even though the normal threshold is three failures.
 	_, err = emb.Embed(ctx, "test")
 	if errors.Is(err, ErrCircuitOpen) {
 		t.Fatal("post-cooldown call should not be blocked")
 	}
-	if emb.IsBreakerOpen() {
-		t.Error("breaker should be closed after post-cooldown failure (count=1 < threshold=3)")
+	if !emb.IsBreakerOpen() {
+		t.Error("breaker should reopen after a failed half-open probe")
 	}
 
-	// After cooldown, a success resets the counter.
+	// After a failed probe, a success resets the counter.
 	// Temporarily make server succeed.
 	svr.Close()
 	svr = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
