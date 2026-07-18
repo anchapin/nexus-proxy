@@ -18,7 +18,7 @@ We use GitHub Issues to track bugs and requested features. Please use the provid
 
 ### Project Conventions
 - **Middleware Order**: Do not reorder middleware in `cmd/nexus/main.go` casually. The order of security headers, rate limiting, and authentication is critical for security.
-- **Environment Variables**: When adding a new configuration option, update the `configKeys` map in `internal/config/config.go` and add the variable to `.env.example`.
+- **Environment Variables**: There is no central registry to edit. When adding a new configuration option: (1) add the field to the `Config` struct in `internal/config/config.go` and parse it inline in `Load()` using a `getEnv*` helper (`getEnv`, `getEnvAllowEmpty`, `getEnvInt`, `getEnvBool`, `getEnvFloat`, `getEnvDuration`, `getEnvRegexps`); (2) mirror the field on `YAMLConfig` and add the env override branch in `LoadYAML()` (`internal/config/yaml.go`) so config-file users get the same knob; (3) document the variable in `.env.example`.
 - **Logging**: Use `log/slog` for structured logging. Avoid `fmt.Println` in production paths.
 - **Dependency Rule**: Follow the architecture outlined in `Nexus Proxy PRD and Architecture.md`. Avoid circular dependencies between `internal/` packages.
 
