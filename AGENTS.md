@@ -14,28 +14,35 @@ See `Nexus Proxy PRD and Architecture.md` for full design intent and
 make build          # → ./bin/nexus
 make test           # unit tests
 make test-race      # race detector (required to merge)
-make lint           # golangci-lint
+make lint           # golangci-lint v2.12.2 (.golangci.yml is v2 format)
 make fmt            # gofmt -w (in place)
-make ci             # vet + build + test + test-race + lint + bench-short  ← CI gate
+make ci             # vet + build + test + test-race + lint + bench-short
 ```
 
-`go run ./cmd/nexus` also works. `nexus check` / `nexus doctor` run
-boot-time diagnostics without starting the server (issue #32).
+`go run ./cmd/nexus` also works.
 
-**CI order:** `go vet` → `go build` → `go test -race` → `golangci-lint`
-(coverage gate runs after test).
+**CI gate (what actually blocks a merge):** `.github/workflows/ci.yml`
+runs three separate jobs — `test` (`go vet ./...` → `go build ./cmd/nexus`
+→ `go test -race -coverprofile=coverage.txt -covermode=atomic ./...` then
+the coverage gate), `bench` (non-blocking `make bench-short`, smoke only),
+and `lint` (`golangci-lint-action@v7`). It does **not** invoke `make ci`;
+that target is a local convenience wrapper that runs the same steps plus
+bench-short on one machine.
 
-**CI coverage floor is 70%** — `make ci` fails if total coverage
-drops below 70%. Per-package numbers print for visibility; only the
-total gates.
+**Coverage floor is 70%** — CI fails the `test` job if total coverage
+drops below `COVERAGE_THRESHOLD`. Per-package numbers print for
+visibility; only the total gates.
 
-**Go version:** CI uses Go 1.26 (see `.github/workflows/ci.yml`).
+**Go version:** CI pins Go 1.26 in `.github/workflows/ci.yml` (and
+`release.yml`). `go.mod` declares `go 1.25.0` — 1.26 is fully supported
+because it is a strict superset.
 
 **Startup diagnostics:** `nexus check` (alias `nexus doctor`) runs the
 boot-time diagnostic suite and exits without starting the server. Use
 this to verify Ollama reachability, model availability, frontier key
 validity, VRAM probe budget, and RAG directory state before routing
-any traffic.
+any traffic (issue #32). The README Quickstart intentionally puts this
+*before* `Build and run` — guarded by `cmd/nexus/doc_test.go` (issue #455).
 
 **Runtime dependency only:** `modernc.org/sqlite` (metrics store).
 Everything else is stdlib.
@@ -48,25 +55,28 @@ internal/
   auth/                 # inbound API-key middleware
   budget/               # 24h rolling frontier spend cap
   circuit/              # local-route cooldown after cascade failure (issue #80)
-  concurrencylimit/      # VRAM-aware local-route semaphore
-  config/               # Load() parses all NEXUS_* env vars (no central map)
+  concurrencylimit/     # VRAM-aware local-route semaphore
+  config/               # Load() (env parsing) + LoadYAML() (file + env override)
   diag/                 # boot-time diagnostics (nexus check / nexus doctor)
-  handlers/             # chat.go + health.go (only package that touches net/http)
-  health/               # Ollama circuit breaker
+  handlers/             # chat.go + health.go + recover/security/sanitize (only pkg that touches net/http in the request hot path)
+  health/               # Ollama circuit breaker (separate from internal/circuit)
+  ioutils/              # shared io helpers (decompression, etc.)
   judge/                # async LLM-as-a-judge (sampled local completions)
   metrics/              # SQLite metrics store → savings dashboard
-  middleware/           # prompt transforms only (toon, prompt_engine)
-  observability/        # Prometheus collector + /metrics endpoint
+  middleware/           # prompt transforms only (toon, prompt_engine, chain) — NO net/http
+  observability/        # collector.go, prometheus.go, routemetrics.go → /metrics endpoint
   probe/                # nvidia-smi / AMD sysfs VRAM probe
   providers/            # multi-frontier registry + cost-latency selector
   quality/              # background cargo check / tsc verifier
-  rag/                  # PersistentStore (SQLite) + Store + Watcher
+  rag/                  # PersistentStore (SQLite) + Store + Watcher + embedders
   ratelimit/            # ClientIPResolver + HTTP middleware (NOT in middleware/)
   router/               # Guardrail → DSL → SLM.Decide routing pipeline
   telemetry/            # Recorder interface + JSONLRecorder
+  tokenizer/            # tiktoken wrapper (single shared instance)
   tracing/              # W3C trace context + OTLP/JSON exporter
+  tracingtest/          # test helpers for the tracing package
   transport/            # shared pooled http.Client (NEXUS_HTTP_* tuning)
-  upstream/             # upstream.go, cascade.go (Panel + PanelStreaming)
+  upstream/             # upstream.go, cascade.go, arbiter_cache.go, similarity.go, recording.go
 ```
 
 **Critical: `internal/ratelimit` ≠ `internal/middleware`.** Rate limiting
@@ -99,8 +109,10 @@ DSL patterns are **comma-separated regexes** (set via env var, not a map).
 regex syntax.
 
 **SLM decision cache:** `NEXUS_SLM_CACHE_MAX_ENTRIES` + `NEXUS_SLM_CACHE_TTL`
-(default 512 entries / 30s). Semantic dedup via
-`NEXUS_SLMCACHE_SEMANTIC_THRESHOLD` uses the embedder.
+(default 512 entries / 30s). Set `NEXUS_SLM_CACHE_TTL=0` to disable.
+Semantic dedup via `NEXUS_SLMCACHE_SIMILARITY_THRESHOLD` (yaml key
+`slm_cache_similarity_threshold`, range 0..1) — `0.0` disables semantic
+matching.
 
 **Fusion progressive delivery** (`NEXUS_FUSION_PROGRESSIVE=true`, default):
 panels race local + frontier, stream the faster as speculative SSE, and
@@ -209,9 +221,10 @@ be truncated.
 
 ## Security headers (issue #444)
 
-`handlers.SecurityHeaders(tlsActive bool)` is the **single source of
-truth** for response hardening. The middleware is wired as the
-outermost layer in `cmd/nexus/main.go`:
+`handlers.SecurityHeaders(tlsActive bool)` — defined in
+`internal/handlers/security.go` — is the **single source of truth**
+for response hardening. Wired as the outermost layer in
+`cmd/nexus/main.go`:
 
 ```go
 Handler: handlers.SecurityHeaders(cfg.TLSEnabled)(handlers.Recover()(rootHandler)),
@@ -223,10 +236,10 @@ must not advertise HSTS (spec violation, silently ignored by browsers).
 The mirror env var is `NEXUS_TLS_ENABLED` and the YAML key is
 `tls_enabled:`.
 
-`internal/middleware/security.go` was removed — there is no duplicate.
-Do not reintroduce it; the package comment forbids `net/http`
-dependencies in `internal/middleware` (kept pure for unit-testability
-and to mirror `internal/ratelimit`'s split).
+`internal/middleware/security.go` does not exist — there is no duplicate.
+Do not add it; `internal/middleware` is intentionally net/http-free
+(kept pure for unit-testability, mirroring `internal/ratelimit`'s split).
+Any response-header middleware belongs in `internal/handlers`.
 
 ## Debug tracing (issue #33)
 
@@ -237,22 +250,71 @@ overhead when off. API keys redacted; body preview capped at
 
 ## Adding new env vars
 
-Update `internal/config/config.go` — add the field to `Config` struct,
-then parse it inline in `Load()` using a helper:
-- `getEnv("NEXUS_VAR", "default")` — string
-- `getEnvBool("NEXUS_VAR", false)` — bool
-- `getEnvInt("NEXUS_VAR", 0)` — int
-- `getEnvFloat("NEXUS_VAR", 0.0)` — float64
-- `getEnvDuration("NEXUS_VAR", 30*time.Second)` — duration
-- `getEnvAllowEmpty("NEXUS_VAR", "default")` — string (including empty)
+Config env vars are split across two files. New vars need **both**:
 
-Also add the variable to `.env.example`. No central registry needed.
+1. **Struct field** in `internal/config/config.go` (`Config` struct) +
+   parsed inline in `Load()` using one of these helpers (lines
+   ~1707–1789):
+   - `getEnv(key, def)` — string
+   - `getEnvAllowEmpty(key, def)` — string (including empty)
+   - `getEnvInt(key, def)` — int
+   - `getEnvBool(key, def)` — bool
+   - `getEnvFloat(key, def)` — float64
+   - `getEnvDuration(key, def)` — duration
+   - `getEnvRegexps(key, default)` — `[]*regexp.Regexp`
+2. **YAML mirror** in `internal/config/yaml.go` (`YAMLConfig` struct
+   field, snake_case) + an env-overrides-yaml branch in `LoadYAML()` so
+   file-based config users get the same knob.
+
+No central registry — but `internal/config/env_example_audit_test.go`
+enforces that any `NEXUS_*` var referenced by the parser is documented
+in `.env.example`. Add it there too.
+
+For hot-reloadable knobs (rate limit, log level, log format, debug) add
+the field to `ReloadHotReloadable()` in `config.go` — knobs not in that
+list require a server restart.
 
 ## Branch conventions
 
 - **`develop`** is the default branch — base for all feature/fix branches
 - **`main`** — only as PR target from `develop` for releases
 - Naming: `fix/issue-<number>` or `feat/<short-description>`
+- **Conventional Commits** for messages: `feat:`, `fix:`, `docs:`, etc.
+  Commit subject should reference the issue (e.g. `feat: resolve #123 — …`)
+- **PR body must link the issue** with `Fixes #N` / `Closes #N` /
+  `Resolves #N` (any case). The `auto-close` workflow
+  (`.github/workflows/auto-close.yml`) closes the linked issue when the
+  PR merges — but only if at least one such token is in the body. Use
+  `scripts/check_pr_closing_refs.sh <PR_NUMBER> <EXPECTED_COUNT>` to
+  verify when a PR title says `resolve #N` it actually closes exactly N.
+
+## Operator / load-test scripts (`scripts/`)
+
+- `scripts/check_pr_closing_refs.sh` — gates a PR's closing refs.
+  See the comment at the top for exit codes.
+- `scripts/loadtest.sh` — burst-load a live `/v1/chat/completions`,
+  prefers `hey` (auto-downloaded), falls back to curl. Outputs
+  p50/p90/p99 + throughput for comparison against `docs/BENCHMARKS.md`.
+
+## Contributor docs (`docs/`)
+
+- `docs/runbook.md` — operational triage (Ollama down, RAG breaker,
+  DSL mis-routes, trace flags).
+- `docs/observability-surface.md` — Prometheus metrics + `/status`
+  field inventory.
+- `docs/BENCHMARKS.md` — baseline numbers + how to re-run.
+- `docs/tracing.example.md` — W3C trace context + OTLP/JSON setup.
+
+## Release flow
+
+`.github/workflows/release.yml` triggers on `v*` tags or
+`workflow_dispatch`. Produces linux/amd64, linux/arm64, darwin/arm64
+binaries, SHA256 checksums, multi-arch GHCR image, keyless cosign
+signature (requires `id-token: write`), and SPDX SBOM. The
+`docker/build-push-action` block uses `provenance: true` /
+`sbom: true` and consumes `cache-from: type=gha` / `cache-to:
+type=gha,mode=max`. Do **not** set `outputs: push-by-digest` — it
+silently overrides `tags` and leaves the image untagged.
 
 ## Logging
 
