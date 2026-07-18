@@ -20,10 +20,13 @@ snake_case naming.
 | `nexus_route_decisions_total` | counter | `route`, `source` | 3 × 5 = 15 | `routemetrics.go` |
 | `nexus_slm_decisions_total` | counter | `route`, `confidence_bucket`, `task_type` | 3 × 4 × 8 = 96 | `routemetrics.go` |
 | `nexus_slm_low_confidence_escalations_total` | counter | `task_type` | 8 | `routemetrics.go` |
+| `nexus_slm_cache_hits_total` | counter | `kind` | 2 (`exact`, `semantic`) | `routemetrics.go` |
+| `nexus_slm_cache_misses_total` | counter | *(none)* | 1 | `routemetrics.go` |
+| `nexus_slm_cache_evictions_total` | counter | `reason` | 2 (`ttl`, `lru`) | `routemetrics.go` |
 | `nexus_requests_rejected_total` | counter | `reason` | 4 | `routemetrics.go` |
 | `nexus_judge_dropped_total` | counter | *(none)* | 1 | `routemetrics.go` |
 
-**Maximum theoretical series**: 15 + 96 + 8 + 4 + 1 = 124 series.
+**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 4 + 1 = 129 series.
 
 ### Label value catalog
 
@@ -83,6 +86,25 @@ Defined in `internal/handlers/chat.go`:
 | `bad_request` | `RejectionBadRequest` | 400 |
 | `rate_limit` | `RejectionRateLimit` | 429 |
 
+For the `nexus_slm_cache_evictions_total` family, `reason` is a
+separate bounded label set defined in `internal/router/slm_cache.go`
+(issue #449):
+
+| Value | Constant | Meaning |
+|-------|----------|---------|
+| `ttl` | `router.EvictionReasonTTL` | Entry removed because its TTL elapsed |
+| `lru` | `router.EvictionReasonLRU` | Entry removed to make room at capacity |
+
+`ttl` events indicate that the configured
+`NEXUS_SLM_CACHE_TTL` (default 30s) is shorter than the natural
+burst window of duplicate prompts — operators can raise the TTL to
+absorb more duplicate traffic. `lru` events indicate the cache is
+saturated (`NEXUS_SLM_CACHE_MAX_ENTRIES` is too small) — operators
+can raise the cap to keep more prompts warm. Together the two
+counters let operators diagnose cache effectiveness without changing
+configuration: a high `ttl / (ttl + lru)` ratio points at TTL churn;
+a high `lru / (ttl + lru)` ratio points at capacity pressure.
+
 ### Naming convention audit
 
 | Check | Result |
@@ -101,7 +123,9 @@ Defined in `internal/handlers/chat.go`:
 | `source` | Yes | 5 | Fixed enum: guardrail, dsl, slm, slm-error, escalation |
 | `confidence_bucket` | Yes | 4 | Collapsed from float64 to 4 ordinal buckets |
 | `task_type` | Yes | 8 | Fixed set from Categorize() + empty |
-| `reason` | Yes | 4 | Fixed set of rejection reasons |
+| `reason` (rejections) | Yes | 4 | Fixed set of rejection reasons |
+| `reason` (SLM cache evictions) | Yes | 2 | `ttl`, `lru` — closed set defined in `internal/router/slm_cache.go` (issue #449) |
+| `kind` (SLM cache hits) | Yes | 2 | `exact`, `semantic` |
 
 **No unbounded cardinality labels exist.** All label values are
 short, pre-defined strings with no user-controlled input.

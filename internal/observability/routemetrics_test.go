@@ -1,6 +1,7 @@
 package observability
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -635,5 +636,141 @@ func TestRouteCountersSLMEscalationsNilSafe(t *testing.T) {
 	n, err := rc.WriteTo(&strings.Builder{})
 	if err != nil || n != 0 {
 		t.Errorf("nil + Observe slm-escalation: expected (0, nil), got (%d, %v)", n, err)
+	}
+}
+
+// --- SLM cache eviction counters (issue #449) ---
+
+// TestSLMCacheEvictionCountersByReason verifies the issue #449 metric
+// family: ObserveSLMCacheEviction increments per-reason counters and
+// WriteTo emits nexus_slm_cache_evictions_total{reason="ttl|lru"}.
+func TestSLMCacheEvictionCountersByReason(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveSLMCacheEviction("ttl")
+	rc.ObserveSLMCacheEviction("ttl")
+	rc.ObserveSLMCacheEviction("ttl")
+	rc.ObserveSLMCacheEviction("lru")
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_slm_cache_evictions_total", "metric family header"},
+		{"# TYPE nexus_slm_cache_evictions_total counter", "counter type line"},
+		{`nexus_slm_cache_evictions_total{reason="lru"} 1`, "lru counted once"},
+		{`nexus_slm_cache_evictions_total{reason="ttl"} 3`, "ttl counted thrice"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+}
+
+// TestSLMCacheEvictionsDeterministicOrder verifies that repeated
+// scrapes produce identical output (sorted by reason label) so
+// Prometheus diff alerts are not triggered by reordering. The label
+// order must be "lru" before "ttl" lexicographically.
+func TestSLMCacheEvictionsDeterministicOrder(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveSLMCacheEviction("ttl")
+	rc.ObserveSLMCacheEviction("lru")
+
+	var first, second strings.Builder
+	_, _ = rc.WriteTo(&first)
+	_, _ = rc.WriteTo(&second)
+	if first.String() != second.String() {
+		t.Errorf("eviction output not deterministic between scrapes\nfirst:\n%s\nsecond:\n%s", first.String(), second.String())
+	}
+
+	out := first.String()
+	lruIdx := strings.Index(out, `nexus_slm_cache_evictions_total{reason="lru"}`)
+	ttlIdx := strings.Index(out, `nexus_slm_cache_evictions_total{reason="ttl"}`)
+	if lruIdx == -1 || ttlIdx == -1 {
+		t.Fatalf("missing eviction series in output:\n%s", out)
+	}
+	if lruIdx > ttlIdx {
+		t.Errorf("expected lru before ttl in sorted output, got:\n%s", out)
+	}
+}
+
+// TestSLMCacheEvictionsEmptyFamilyStillEmitsHeader verifies the
+// metric family is announced with HELP/TYPE even before the first
+// eviction, so scrapers can discover it without a placeholder sample.
+func TestSLMCacheEvictionsEmptyFamilyStillEmitsHeader(t *testing.T) {
+	rc := NewRouteCounters()
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+	if !strings.Contains(out, "# HELP nexus_slm_cache_evictions_total") {
+		t.Errorf("missing HELP header for empty eviction family:\n%s", out)
+	}
+	if !strings.Contains(out, "# TYPE nexus_slm_cache_evictions_total counter") {
+		t.Errorf("missing TYPE header for empty eviction family:\n%s", out)
+	}
+}
+
+// TestSLMCacheEvictionsConcurrentSafe exercises ObserveSLMCacheEviction
+// from many goroutines to ensure the lock-then-atomic pattern is
+// race-clean.
+func TestSLMCacheEvictionsConcurrentSafe(t *testing.T) {
+	rc := NewRouteCounters()
+	const goroutines = 32
+	const perGoroutine = 1000
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			reason := "ttl"
+			if g%2 == 0 {
+				reason = "lru"
+			}
+			for i := 0; i < perGoroutine; i++ {
+				rc.ObserveSLMCacheEviction(reason)
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+	wantTTL := uint64(goroutines / 2 * perGoroutine)
+	wantLRU := uint64(goroutines / 2 * perGoroutine)
+	if !strings.Contains(out, fmt.Sprintf(`nexus_slm_cache_evictions_total{reason="ttl"} %d`, wantTTL)) {
+		t.Errorf("missing or wrong ttl count %d:\n%s", wantTTL, out)
+	}
+	if !strings.Contains(out, fmt.Sprintf(`nexus_slm_cache_evictions_total{reason="lru"} %d`, wantLRU)) {
+		t.Errorf("missing or wrong lru count %d:\n%s", wantLRU, out)
+	}
+}
+
+// TestSLMCacheEvictionsNilAndEmptySafe verifies that nil receivers and
+// empty reason strings are no-ops so callers can invoke
+// ObserveSLMCacheEviction unconditionally.
+func TestSLMCacheEvictionsNilAndEmptySafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveSLMCacheEviction("ttl") // nil receiver: must not panic
+
+	rc = NewRouteCounters()
+	rc.ObserveSLMCacheEviction("") // empty reason: must not bump or panic
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	if strings.Contains(sb.String(), "nexus_slm_cache_evictions_total{") {
+		t.Errorf("empty reason should not emit any series:\n%s", sb.String())
 	}
 }

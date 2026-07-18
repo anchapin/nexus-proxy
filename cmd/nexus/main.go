@@ -752,6 +752,15 @@ func main() {
 				slog.Int("max_entries", cfg.SLMCacheMaxEntries),
 			)
 		}
+		// Issue #449: forward every TTL/LRU eviction into the route
+		// counters so /metrics shows nexus_slm_cache_evictions_total
+		// with reason="ttl" or "lru". Distinguishing the two paths lets
+		// operators tell whether the cache is undersized (high lru) or
+		// its TTL is too short (high ttl) without changing the cache
+		// configuration.
+		slmCache.SetEvictionObserver(func(reason string) {
+			routeCounters.ObserveSLMCacheEviction(reason)
+		})
 	} else {
 		slog.Info("slm decision cache disabled (NEXUS_SLMCACHE_TTL<=0)")
 	}

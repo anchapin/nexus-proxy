@@ -6,7 +6,18 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
+)
+
+// Eviction reason labels for the bounded Prometheus
+// `nexus_slm_cache_evictions_total{reason=...}` series (issue #449).
+// The set is intentionally closed: any new reason must be added here
+// so the cardinality stays bounded and the observability surface can
+// be documented exhaustively.
+const (
+	EvictionReasonTTL = "ttl"
+	EvictionReasonLRU = "lru"
 )
 
 // Embedder turns text into a vector for semantic similarity comparison.
@@ -32,6 +43,12 @@ type Embedder interface {
 // readers (cache lookups) do not block each other; writers (cache
 // inserts) take an exclusive lock.
 //
+// Eviction counters (issue #449): TTL and LRU removals each bump an
+// atomic counter that is exposed via Stats() and forwarded to a
+// caller-supplied eviction observer so the proxy can distinguish
+// "TTL too short" (high churn) from "cache undersized" (capacity
+// pressure) in /metrics as `nexus_slm_cache_evictions_total{reason}`.
+//
 // Zero value is ready to use with default TTL (DefaultSLMCacheTTL).
 // Construct with NewSLMCache to override TTL.
 type SLMCache struct {
@@ -43,6 +60,22 @@ type SLMCache struct {
 	mu      sync.RWMutex
 	entries map[string]cachedDecision
 	expiry  []string // keys sorted by expiry time (earliest first)
+
+	// ttlEvictions and lruEvictions are cumulative atomic counters
+	// bumped inside the synchronized eviction paths so they are safe
+	// to read concurrently with Set (issue #449). They are not
+	// guarded by mu because the hot path already holds it; atomic
+	// updates keep Stats() lock-free.
+	ttlEvictions uint64
+	lruEvictions uint64
+
+	// onEviction, when non-nil, is invoked once per evicted entry
+	// with reason = "ttl" or "lru". The callback runs AFTER the
+	// cache mutex is released so it is safe to call into observability
+	// or any other subsystem without risking re-entrant deadlocks.
+	// The slice pointer is captured under mu; callbacks should not
+	// mutate it.
+	onEviction func(reason string)
 }
 
 // cachedDecision pairs a routing decision with its insertion time for
@@ -128,11 +161,14 @@ func (c *SLMCache) sortExpiry() {
 	})
 }
 
-// evictExpired removes all entries whose TTL has expired.
-// It is called during Set to clean up before deciding what to evict.
-func (c *SLMCache) evictExpired() {
+// evictExpired removes all entries whose TTL has expired and bumps the
+// TTL eviction counter once per removed entry (issue #449). It returns
+// the number of entries removed so the caller can dispatch the
+// eviction observer after unlocking. Caller must hold c.mu.
+func (c *SLMCache) evictExpired() int {
 	now := time.Now()
 	var keep []string
+	removed := 0
 	for _, key := range c.expiry {
 		entry, ok := c.entries[key]
 		if !ok {
@@ -140,24 +176,34 @@ func (c *SLMCache) evictExpired() {
 		}
 		if now.Sub(entry.stamp) > c.ttl {
 			delete(c.entries, key)
+			removed++
 		} else {
 			keep = append(keep, key)
 		}
 	}
 	c.expiry = keep
 	c.sortExpiry()
+	if removed > 0 {
+		atomic.AddUint64(&c.ttlEvictions, uint64(removed))
+	}
+	return removed
 }
 
 // evictLru removes the least-recently-used (oldest by stamp) non-expired
-// entry to make room for a new insertion. Caller must hold c.mu.
-func (c *SLMCache) evictLru() {
+// entry to make room for a new insertion and bumps the LRU eviction
+// counter (issue #449). It returns 1 when an entry was removed, 0
+// otherwise, so the caller can dispatch the eviction observer after
+// unlocking. Caller must hold c.mu.
+func (c *SLMCache) evictLru() int {
 	if len(c.expiry) == 0 {
-		return
+		return 0
 	}
 	// expiry is sorted by stamp, so the first element is the oldest.
 	lruKey := c.expiry[0]
 	delete(c.entries, lruKey)
 	c.expiry = c.expiry[1:]
+	atomic.AddUint64(&c.lruEvictions, 1)
+	return 1
 }
 
 // CacheHitKind describes the mechanism that produced a cache hit.
@@ -250,8 +296,10 @@ func (c *SLMCache) getSemantic(ctx context.Context, prompt string) (Route, bool,
 // prompt embedding for semantic deduplication. Set is safe for
 // concurrent use.
 func (c *SLMCache) Set(ctx context.Context, prompt string, route Route) {
+	var ttlRemoved, lruRemoved int
+	var onEvict func(reason string)
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	var emb []float64
 	if c.embedder != nil {
@@ -260,9 +308,9 @@ func (c *SLMCache) Set(ctx context.Context, prompt string, route Route) {
 
 	// If at capacity, evict expired entries first, then LRU.
 	if c.maxEntries > 0 && len(c.entries) >= c.maxEntries {
-		c.evictExpired()
+		ttlRemoved = c.evictExpired()
 		if len(c.entries) >= c.maxEntries {
-			c.evictLru()
+			lruRemoved = c.evictLru()
 		}
 	}
 
@@ -273,19 +321,29 @@ func (c *SLMCache) Set(ctx context.Context, prompt string, route Route) {
 	}
 	c.expiry = append(c.expiry, prompt)
 	c.sortExpiry()
+
+	onEvict = c.onEviction
+	c.mu.Unlock()
+
+	// Dispatch the eviction observer AFTER releasing the cache lock
+	// so the observer can safely call into observability, logging,
+	// or any other subsystem (issue #449).
+	c.dispatchEvictions(onEvict, ttlRemoved, lruRemoved)
 }
 
 // SetEmbedding stores a routing decision with a pre-computed embedding.
 // Use this when the caller has already computed the embedding to avoid
 // redundant embedder calls (e.g. during cache warming).
 func (c *SLMCache) SetEmbedding(prompt string, route Route, emb []float64) {
+	var ttlRemoved, lruRemoved int
+	var onEvict func(reason string)
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	if c.maxEntries > 0 && len(c.entries) >= c.maxEntries {
-		c.evictExpired()
+		ttlRemoved = c.evictExpired()
 		if len(c.entries) >= c.maxEntries {
-			c.evictLru()
+			lruRemoved = c.evictLru()
 		}
 	}
 
@@ -296,17 +354,60 @@ func (c *SLMCache) SetEmbedding(prompt string, route Route, emb []float64) {
 	}
 	c.expiry = append(c.expiry, prompt)
 	c.sortExpiry()
+
+	onEvict = c.onEviction
+	c.mu.Unlock()
+
+	c.dispatchEvictions(onEvict, ttlRemoved, lruRemoved)
+}
+
+// dispatchEvictions fires the eviction observer once per removed
+// entry. It runs without holding the cache lock so the observer is
+// free to call into other subsystems. A nil observer is a no-op so
+// the common path stays cheap.
+func (c *SLMCache) dispatchEvictions(onEvict func(reason string), ttlRemoved, lruRemoved int) {
+	if onEvict == nil {
+		return
+	}
+	for i := 0; i < ttlRemoved; i++ {
+		onEvict(EvictionReasonTTL)
+	}
+	for i := 0; i < lruRemoved; i++ {
+		onEvict(EvictionReasonLRU)
+	}
+}
+
+// SetEvictionObserver registers a callback that is invoked once per
+// evicted entry with reason = "ttl" or "lru" (issue #449). Pass nil
+// to clear the observer. The callback runs on the goroutine that
+// called Set/SetEmbedding, after the cache lock is released, so it
+// must not be assumed to be on a dedicated worker. Callers that want
+// to record into observability.RouteCounters should pass a closure
+// that forwards to ObserveSLMCacheEviction; the closure will execute
+// without re-entering the cache.
+func (c *SLMCache) SetEvictionObserver(fn func(reason string)) {
+	c.mu.Lock()
+	c.onEviction = fn
+	c.mu.Unlock()
 }
 
 // SLMCacheStats holds state counters for the SLM cache. It is
 // returned by Stats so callers can inspect cache effectiveness.
+// TTLEvictions and LRUEvictions are cumulative since cache creation
+// (issue #449) and reflect removals that actually happened; entries
+// past TTL but not yet evicted are reflected by the Expired counter.
 type SLMCacheStats struct {
-	Entries int // live (non-expired) entries
-	Expired int // entries past TTL (not yet evicted)
+	Entries      int    // live (non-expired) entries
+	Expired      int    // entries past TTL (not yet evicted)
+	TTLEvictions uint64 // cumulative TTL removals
+	LRUEvictions uint64 // cumulative LRU removals (capacity pressure)
 }
 
-// Stats returns a snapshot of cache entry counts. Counters are
-// incremented by Get; there is no separate increment for misses.
+// Stats returns a snapshot of cache entry counts and cumulative
+// eviction counters (issue #449). Counters are incremented by Get;
+// there is no separate increment for misses. The eviction counters
+// are read atomically without holding the cache lock so concurrent
+// Sets do not block Stats reads.
 func (c *SLMCache) Stats() SLMCacheStats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -318,7 +419,12 @@ func (c *SLMCache) Stats() SLMCacheStats {
 			expired++
 		}
 	}
-	return SLMCacheStats{Entries: n, Expired: expired}
+	return SLMCacheStats{
+		Entries:      n,
+		Expired:      expired,
+		TTLEvictions: atomic.LoadUint64(&c.ttlEvictions),
+		LRUEvictions: atomic.LoadUint64(&c.lruEvictions),
+	}
 }
 
 // Len returns the number of entries in the cache (including expired
