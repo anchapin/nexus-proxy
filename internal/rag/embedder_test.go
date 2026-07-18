@@ -6,11 +6,31 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// writeOversizeBody writes exactly want bytes to w using a fixed-size chunk
+// buffer, so the test never holds the full oversize payload in a single
+// allocation. Aborts silently on write errors.
+func writeOversizeBody(w http.ResponseWriter, want int) {
+	const chunkSize = 4096
+	chunk := make([]byte, chunkSize)
+	written := 0
+	for written < want {
+		n := want - written
+		if n > len(chunk) {
+			n = len(chunk)
+		}
+		if _, err := w.Write(chunk[:n]); err != nil {
+			return
+		}
+		written += n
+	}
+}
 
 // TestNewEmbedder_Ollama verifies that the factory produces an OllamaEmbedder
 // when the type is Ollama (the default).
@@ -385,3 +405,77 @@ func TestNewEmbedder_UnknownType_FallsBackToOllama(t *testing.T) {
 var _ Embedder = (*OllamaEmbedder)(nil)
 var _ Embedder = (*OpenAIEmbedder)(nil)
 var _ Embedder = (*CohereEmbedder)(nil)
+
+// TestOllamaEmbedder_BoundsResponseBody ensures that an Ollama embedder
+// response larger than defaultMaxResponseBytes is bounded, returns a
+// wrapped size-limit error, and records exactly one breaker failure
+// (issue #435).
+func TestOllamaEmbedder_BoundsResponseBody(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping oversize-body test in -short mode (transfers 64 MiB)")
+	}
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeOversizeBody(w, defaultMaxResponseBytes+1)
+	}))
+	defer svr.Close()
+
+	emb := NewOllamaEmbedder(svr.URL, "nomic-embed-text", svr.Client(),
+		BreakerConfig{Threshold: 5, Cooldown: 5 * time.Second})
+
+	vec, err := emb.Embed(context.Background(), "test")
+	if err == nil {
+		t.Fatal("expected error from oversize body, got nil")
+	}
+	if vec != nil {
+		t.Errorf("expected nil embedding on oversize body, got %v", vec)
+	}
+	if !strings.Contains(err.Error(), "size limit") {
+		t.Errorf("expected error to mention size limit, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "ollama embed") {
+		t.Errorf("expected error to mention ollama embed, got %v", err)
+	}
+	if got := emb.FailureCount(); got != 1 {
+		t.Errorf("breaker failure count = %d, want 1", got)
+	}
+	if emb.IsBreakerOpen() {
+		t.Error("breaker should not be open after a single failure (threshold=5)")
+	}
+}
+
+// TestCohereEmbedder_BoundsResponseBody ensures that a Cohere embedder
+// response larger than defaultMaxResponseBytes is bounded, returns a
+// wrapped size-limit error, and records exactly one breaker failure
+// (issue #435).
+func TestCohereEmbedder_BoundsResponseBody(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping oversize-body test in -short mode (transfers 64 MiB)")
+	}
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeOversizeBody(w, defaultMaxResponseBytes+1)
+	}))
+	defer svr.Close()
+
+	emb := NewCohereEmbedder(svr.URL, "embed-english-v3.0", "test-key", svr.Client(),
+		BreakerConfig{Threshold: 5, Cooldown: 5 * time.Second})
+
+	vec, err := emb.Embed(context.Background(), "test")
+	if err == nil {
+		t.Fatal("expected error from oversize body, got nil")
+	}
+	if vec != nil {
+		t.Errorf("expected nil embedding on oversize body, got %v", vec)
+	}
+	if !strings.Contains(err.Error(), "size limit") {
+		t.Errorf("expected error to mention size limit, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "cohere embed") {
+		t.Errorf("expected error to mention cohere embed, got %v", err)
+	}
+	if got := emb.breaker.FailureCount(); got != 1 {
+		t.Errorf("breaker failure count = %d, want 1", got)
+	}
+	if emb.IsBreakerOpen() {
+		t.Error("breaker should not be open after a single failure (threshold=5)")
+	}
+}

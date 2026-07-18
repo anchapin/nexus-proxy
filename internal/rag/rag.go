@@ -15,7 +15,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	"net/http"
@@ -788,10 +787,14 @@ func (o *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := ioutils.ReadAllLimited(resp.Body, defaultMaxResponseBytes)
 	if err != nil {
 		o.breaker.RecordFailure()
 		return nil, err
+	}
+	if len(body) >= defaultMaxResponseBytes {
+		o.breaker.RecordFailure()
+		return nil, fmt.Errorf("ollama embed: response body exceeds %d-byte size limit", defaultMaxResponseBytes)
 	}
 	if resp.StatusCode != http.StatusOK {
 		o.breaker.RecordFailure()
@@ -977,10 +980,14 @@ func (c *CohereEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := ioutils.ReadAllLimited(resp.Body, defaultMaxResponseBytes)
 	if err != nil {
 		c.breaker.RecordFailure()
 		return nil, err
+	}
+	if len(body) >= defaultMaxResponseBytes {
+		c.breaker.RecordFailure()
+		return nil, fmt.Errorf("cohere embed: response body exceeds %d-byte size limit", defaultMaxResponseBytes)
 	}
 	if resp.StatusCode != http.StatusOK {
 		c.breaker.RecordFailure()
