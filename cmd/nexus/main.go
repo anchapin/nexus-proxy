@@ -1006,7 +1006,7 @@ func main() {
 				ipResolver,
 			)
 			authLimiter.SetOnBlock(func() {
-				circuitCollector.IncAuthRateLimitRejected()
+				routeCounters.ObserveRejection(handlers.RejectionAuthRateLimit)
 			})
 			slog.Info("auth brute-force protection enabled",
 				slog.Int("rpm", cfg.AuthRateLimitRPM),

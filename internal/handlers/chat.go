@@ -234,6 +234,9 @@ const (
 	// RejectionBudget marks a 429 Too Many Requests response emitted
 	// when the rolling 24h frontier budget is exhausted (issue #220).
 	RejectionBudget = "budget"
+	// RejectionAuthRateLimit marks a 429 Too Many Requests response
+	// emitted by the auth brute-force limiter (issue #296).
+	RejectionAuthRateLimit = "auth_rate_limit"
 )
 
 // RejectionEvent carries the minimal context a rejection observer

@@ -151,10 +151,6 @@ type Collector struct {
 	authRejectedInvalid atomic.Uint64
 	authRejectedMissing atomic.Uint64
 
-	// Auth rate limit counter (issue #296). Bumped when the auth
-	// brute-force limiter rejects a client with 429.
-	authRateLimitRejected atomic.Uint64
-
 	// Rate-limit counters are emitted per bucket (global / per_client)
 	// so operators can tell at a glance whether the global bucket or a
 	// specific client is the bottleneck (issue #70 AC: "How many
@@ -389,10 +385,6 @@ func (c *Collector) IncAuthRejectedInvalid() { c.authRejectedInvalid.Add(1) }
 // IncAuthRejectedMissing records a request that presented no
 // credential at all (no Authorization / X-API-Key header).
 func (c *Collector) IncAuthRejectedMissing() { c.authRejectedMissing.Add(1) }
-
-// IncAuthRateLimitRejected bumps the auth-rate-limit counter when
-// the auth brute-force limiter rejects a client (issue #296).
-func (c *Collector) IncAuthRateLimitRejected() { c.authRateLimitRejected.Add(1) }
 
 // AuthAuthenticatedClients returns the cumulative count of accepted
 // authentications. The /metrics renderer exposes it under the gauge
