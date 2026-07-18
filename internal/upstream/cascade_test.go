@@ -652,6 +652,115 @@ func TestCascadeLocalStepFailedNotSetOnNonRetryable(t *testing.T) {
 	// never called and LocalStepFailed should be false.
 }
 
+// --- Issue #438: local model 404 cascade tests --------------------------------
+
+// TestCascadeFallsBackOnLocal404 verifies that a 404 from the local step
+// (model missing/not pulled) triggers cascade to the frontier instead of
+// aborting. The outcome must record LocalStepFailed=true and FallbackReason="model_unavailable".
+func TestCascadeFallsBackOnLocal404(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"error":"model \"missing-model\" not found"}`)
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	res, err := twoStepCascade().Run(context.Background(), rw, client, map[string]interface{}{"messages": []interface{}{}})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Succeeded {
+		t.Error("Succeeded = false, want true (frontier should have served)")
+	}
+	if res.ServedBy != "frontier" {
+		t.Errorf("ServedBy = %q, want frontier", res.ServedBy)
+	}
+	if res.RouteAttempted != "local->frontier" {
+		t.Errorf("RouteAttempted = %q, want local->frontier", res.RouteAttempted)
+	}
+	if !res.LocalStepFailed {
+		t.Error("LocalStepFailed = false, want true (local 404 should flag cooldown)")
+	}
+	if res.FallbackReason != "model_unavailable" {
+		t.Errorf("FallbackReason = %q, want model_unavailable", res.FallbackReason)
+	}
+	if !strings.Contains(rw.body.String(), "hello from local") {
+		t.Errorf("body missing frontier content: %q", rw.body.String())
+	}
+}
+
+// TestCascadeLocal404LocalStepFailedSet verifies LocalStepFailed is set
+// when local returns 404 and frontier serves (issue #438 acceptance criteria).
+func TestCascadeLocal404LocalStepFailedSet(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.LocalStepFailed {
+		t.Error("LocalStepFailed = false, want true after local 404 + frontier fallback")
+	}
+	if res.FallbackReason != "model_unavailable" {
+		t.Errorf("FallbackReason = %q, want model_unavailable", res.FallbackReason)
+	}
+}
+
+// TestCascadeFrontier404Stops verifies that a 404 from a frontier step is
+// terminal — a missing frontier model is a configuration error, not a
+// transient condition worth retrying (issue #438 acceptance criteria).
+func TestCascadeFrontier404Stops(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, "local down")
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"error":"model not found"}`)
+	})
+	client := &http.Client{Transport: ft}
+
+	_, err := twoStepCascade().Run(context.Background(), newSSERW(), client, nil)
+	if err == nil {
+		t.Fatal("expected error when frontier returns 404")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Errorf("err should mention 404: %v", err)
+	}
+}
+
+// TestCascadeLocal403Stops verifies that a 403 from the local step is
+// terminal — auth failures should not cascade (issue #438 acceptance criteria).
+func TestCascadeLocal403Stops(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, "forbidden")
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("fallback should NOT have been called for non-retryable 403")
+	})
+	_, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
+	if err == nil {
+		t.Fatal("expected error for 403")
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Errorf("err = %v", err)
+	}
+}
+
 // --- Issue #72: tool_calls preservation tests --------------------------------
 
 // toolCallBody is a minimal OpenAI-compatible response with one tool call.

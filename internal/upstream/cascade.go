@@ -293,6 +293,13 @@ func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payl
 	if ShouldRetry(resp.StatusCode, nil) {
 		return AssistantMessage{}, "", newCascadeErr(true, "transport_error", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
 	}
+	// Issue #438: A 404 from the local step means the model is missing or
+	// not pulled. Treat as retryable so the cascade falls through to the
+	// frontier. Frontier 404s remain terminal — a missing frontier model
+	// is a configuration error, not a transient condition.
+	if resp.StatusCode == http.StatusNotFound && step.Name == "local" {
+		return AssistantMessage{}, "", newCascadeErr(true, "model_unavailable", "local model not found (404): %s", truncateForLog(respBody, 200))
+	}
 	if resp.StatusCode != http.StatusOK {
 		// Non-retryable 4xx (auth, bad request, etc.). Surface to caller.
 		return AssistantMessage{}, "", newCascadeErr(false, "", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
