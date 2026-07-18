@@ -164,29 +164,49 @@ func (l *Limiter) Acquire(ctx context.Context) (func(), error) {
 		return func() {}, nil
 	}
 	// Wake blocked acquirers when ctx is cancelled so they do not
-	// wait forever. context.AfterFunc runs f in a new goroutine if
-	// the context is already done; Broadcast is safe to call without
-	// holding the lock (sync.Cond allows it).
-	stop := context.AfterFunc(ctx, func() { l.cond.Broadcast() })
+	// wait forever (issue #439). The callback grabs l.mu so the
+	// Broadcast is strictly ordered with respect to Cond.Wait's
+	// register-and-park step: either the Broadcast acquires l.mu
+	// before Wait releases it (lost — but in that case Wait has not
+	// yet registered, so Wait will re-check ctx.Err() on the next
+	// loop iteration once it does register), or the Broadcast is
+	// sequenced behind Wait's release and observes the waiter
+	// already on the list. The naive "Broadcast without l.mu"
+	// pattern can lose the wakeup because the Broadcast can run
+	// before Cond.Wait installs the listener.
+	stop := context.AfterFunc(ctx, func() {
+		l.mu.Lock()
+		l.cond.Broadcast()
+		l.mu.Unlock()
+	})
 
+	var err error
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	for {
-		if err := ctx.Err(); err != nil {
-			// stop is documented as not waiting for a running f, so
-			// this cannot deadlock against our held mutex.
-			stop()
-			return nil, err
+		if err = ctx.Err(); err != nil {
+			break
 		}
 		if l.inFlight < l.effectiveLocked() {
 			l.inFlight++
-			// Deregister the AfterFunc; a late Broadcast would be a
-			// harmless no-op but cleaning up avoids leaking it.
-			stop()
-			return l.release, nil
+			break
 		}
 		l.cond.Wait()
 	}
+	l.mu.Unlock()
+
+	// Deregister the AfterFunc outside the mutex. If a cancellation
+	// callback is currently running its Broadcast under l.mu, Stop
+	// may block briefly waiting for it to complete; that is safe
+	// because we have already released l.mu and so cannot be the
+	// reason the callback is stuck. Calling stop inside the locked
+	// section would risk a self-deadlock against the callback's
+	// own l.mu.Lock().
+	stop()
+
+	if err != nil {
+		return nil, err
+	}
+	return l.release, nil
 }
 
 // release decrements the in-flight counter and wakes one blocked

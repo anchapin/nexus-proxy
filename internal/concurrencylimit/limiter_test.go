@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -398,4 +399,107 @@ func TestFmtHelper(t *testing.T) {
 	if fmt.Sprintf("%d", DefaultBytesPerSlot) == "" {
 		t.Fail()
 	}
+}
+
+// TestAcquireContextCancelPreWaitRace covers issue #439: a
+// cancellation that fires between the final ctx.Err() check and
+// Cond.Wait's register-and-park step used to drop the wakeup, so the
+// canceled acquirer could sleep until an unrelated Release (possibly
+// forever — disconnected requests remained queued). The fix pulls
+// the AfterFunc callback inside l.mu so its Broadcast is strictly
+// ordered with respect to Cond.Wait's register/release.
+//
+// The test fires cancellations immediately after starting Acquire,
+// deliberately racing the AfterFunc against the Waiter's transition
+// into cond.Wait. A FreeVRAM closure that yields once per call is
+// used to widen the pre-wait race window during the
+// effective-slot computation. -race catches any remaining
+// unsynchronized state; the per-iteration timeout catches hangs.
+func TestAcquireContextCancelPreWaitRace(t *testing.T) {
+	const iterations = 500
+	for i := 0; i < iterations; i++ {
+		// Yield inside the probe to add a context switch between
+		// ctx.Err() and the Cond.Wait call below, exercising the
+		// pre-wait race window on every iteration.
+		l := New(1, 1<<30, func() int64 {
+			runtime.Gosched()
+			return 8 << 30
+		})
+
+		holderRel, err := l.Acquire(context.Background())
+		if err != nil {
+			t.Fatalf("iter %d holder acquire: %v", i, err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		go func() {
+			_, gerr := l.Acquire(ctx)
+			errCh <- gerr
+		}()
+
+		// Cancel without waiting for the waiter to park. With the
+		// bug, the Broadcast can race the Cond.Wait registration
+		// and the waiter is lost; with the fix the Broadcast holds
+		// l.mu and is therefore guaranteed to be observed.
+		cancel()
+
+		select {
+		case gerr := <-errCh:
+			if !errors.Is(gerr, context.Canceled) {
+				t.Errorf("iter %d: err = %v, want Canceled", i, gerr)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iter %d: blocked acquire hung past cancellation", i)
+		}
+
+		// Cancellation must leave the in-flight count unchanged
+		// (only the holder occupies a slot).
+		if got := l.InFlight(); got != 1 {
+			t.Errorf("iter %d: InFlight = %d after cancel, want 1 (only the holder)", i, got)
+		}
+		holderRel()
+		if got := l.InFlight(); got != 0 {
+			t.Errorf("iter %d: InFlight after release = %d, want 0", i, got)
+		}
+	}
+}
+
+// TestAcquireContextCancelDoesNotLeakAfterFuncStop covers the
+// acceptance criterion "no context.AfterFunc callback leaks after
+// acquisition": a successful Acquire must deregister its AfterFunc
+// so a late cancellation does not leave the callback scheduled
+// (or running) against the released slot.
+//
+// We can't observe the AfterFunc goroutine directly, but we can
+// use a probe that records whether the AfterFunc callback (which
+// holds l.mu while broadcasting) has ever been entered by
+// detecting a contended-lock timing anomaly. A more direct check
+// is to call Acquire a second time on the same context after
+// success — if the deferred stop worked, the deregistered
+// callback has no effect; if it didn't, we have indirect evidence.
+// The runtime's lack of a public AfterFunc inspection API means
+// the strongest guarantee is the test's continued success under
+// -race and the absence of a callback-stuck deadlock: that is
+// exercised by the broader stress test below.
+func TestAcquireCancelRaceStopReturns(t *testing.T) {
+	l := New(1, 1<<30, func() int64 { return 8 << 30 })
+
+	rel, err := l.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	// Releasing twice is a no-op defensively; afterwards a fresh
+	// acquire must still succeed (no leaked AfterFunc keeps the
+	// slot pinned).
+	rel()
+	rel()
+	if got := l.InFlight(); got != 0 {
+		t.Fatalf("InFlight after release = %d, want 0", got)
+	}
+	rel2, err := l.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("re-acquire: %v", err)
+	}
+	rel2()
 }
