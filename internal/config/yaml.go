@@ -145,6 +145,7 @@ type YAMLConfig struct {
 
 	// Prompt injection
 	PromptInjectionMode string `yaml:"prompt_injection_mode"`
+	InjectionScanRoles  string `yaml:"injection_scan_roles"`
 
 	// Telemetry
 	TelemetryPath string `yaml:"telemetry_path"`
@@ -758,6 +759,9 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_PROMPT_INJECTION_MODE"); v != "" {
 		cfg.PromptInjectionMode = middleware.ParseInjectionMode(v)
 	}
+	if v := os.Getenv("NEXUS_INJECTION_SCAN_ROLES"); v != "" {
+		cfg.InjectionScanRoles = parseInjectionScanRoles(v)
+	}
 
 	// Telemetry
 	if v := os.Getenv("NEXUS_TELEMETRY_PATH"); v != "" {
@@ -913,6 +917,7 @@ func (yc YAMLConfig) toConfig() Config {
 		QualityEnabled:     yc.intDefault(yc.QualityConcurrency, 2) > 0,
 
 		PromptInjectionMode: middleware.ParseInjectionMode(yc.PromptInjectionMode),
+		InjectionScanRoles:  parseInjectionScanRoles(yc.stringDefault(yc.InjectionScanRoles, "system")),
 
 		LogLevel:  parseLogLevel(yc.LogLevel),
 		LogFormat: parseLogFormat(yc.LogFormat),

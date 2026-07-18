@@ -92,10 +92,34 @@ var suspiciousInjectionPatterns = []*regexp.Regexp{
 // patterns that look like prompt-injection override attempts. Returns
 // a slice of human-readable pattern descriptions (empty if clean).
 //
+// It is a convenience wrapper equivalent to
+// DetectSuspiciousRoles(messages, []string{"system"}) and is preserved
+// for backward compatibility with the default scan scope (issue #481).
+//
 // Proxy-controlled policy blocks (delimited by ProxyPolicyBegin /
 // ProxyPolicyEnd) are skipped so the proxy's own injected text is
 // never flagged — only the user's original system content is scanned.
 func DetectSuspiciousSystem(messages []interface{}) []string {
+	return DetectSuspiciousRoles(messages, []string{"system"})
+}
+
+// DetectSuspiciousRoles scans messages whose role appears in roles for
+// patterns that look like prompt-injection override attempts (issue #481).
+// Returns a slice of human-readable pattern descriptions (empty if clean).
+//
+// This is the configurable counterpart to DetectSuspiciousSystem: an
+// operator who sets NEXUS_INJECTION_SCAN_ROLES=system,user extends the
+// scan to user-turn messages, closing the gap where a user message such
+// as "ignore your previous instructions" would otherwise pass strict
+// mode unflagged.
+//
+// Proxy-controlled policy blocks (delimited by ProxyPolicyBegin /
+// ProxyPolicyEnd) are ALWAYS skipped regardless of role so the proxy's
+// own injected text is never self-flagged. If roles is empty or contains
+// no recognised values, it defaults to {"system"} — preserving today's
+// behaviour byte-for-byte.
+func DetectSuspiciousRoles(messages []interface{}, roles []string) []string {
+	allowed := normalizeScanRoles(roles)
 	var hits []string
 	for _, raw := range messages {
 		msg, ok := raw.(map[string]interface{})
@@ -103,7 +127,7 @@ func DetectSuspiciousSystem(messages []interface{}) []string {
 			continue
 		}
 		role, _ := msg["role"].(string)
-		if role != "system" {
+		if !allowed[role] {
 			continue
 		}
 		content, _ := msg["content"].(string)
@@ -122,6 +146,31 @@ func DetectSuspiciousSystem(messages []interface{}) []string {
 		}
 	}
 	return hits
+}
+
+// NormalizeScanRoles canonicalises the configured role set for
+// DetectSuspiciousRoles. It lower-cases, trims, deduplicates, and keeps
+// only recognised message roles ("system", "user"). An empty or
+// fully-unrecognised input returns the safe default {"system"} so the
+// out-of-the-box behaviour is byte-for-byte identical to the pre-#481
+// system-only scan. Returned set is never empty.
+func NormalizeScanRoles(roles []string) map[string]bool {
+	return normalizeScanRoles(roles)
+}
+
+func normalizeScanRoles(roles []string) map[string]bool {
+	out := make(map[string]bool, 2)
+	for _, r := range roles {
+		r = strings.ToLower(strings.TrimSpace(r))
+		switch r {
+		case "system", "user":
+			out[r] = true
+		}
+	}
+	if len(out) == 0 {
+		out["system"] = true
+	}
+	return out
 }
 
 // ApplyPromptEngineeringIsolated inserts a new leading system message

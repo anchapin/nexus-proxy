@@ -946,20 +946,21 @@ func Chat(d Deps) http.Handler {
 			trace.Request.Stream = s
 		}
 
-		// Prompt-injection hardening (issue #76). In warn and strict
-		// modes the proxy scans the user-supplied system messages for
-		// suspicious override patterns BEFORE applying its own policy.
-		// Strict mode rejects the request with a 400 OpenAI-style
-		// error; warn mode logs and continues. Off mode (default)
-		// skips detection entirely for zero overhead.
+		// Prompt-injection hardening (issue #76, #481). In warn and
+		// strict modes the proxy scans the configured message roles
+		// (InjectionScanRoles; default ["system"]) for suspicious
+		// override patterns BEFORE applying its own policy. Strict
+		// mode rejects the request with a 400 OpenAI-style error; warn
+		// mode logs and continues. Off mode (default) skips detection
+		// entirely for zero overhead.
 		if d.Config.PromptInjectionIsolated() {
-			hits := middleware.DetectSuspiciousSystem(rawMessages)
+			hits := middleware.DetectSuspiciousRoles(rawMessages, d.Config.InjectionScanRoles)
 			if len(hits) > 0 {
 				if d.Config.PromptInjectionMode == middleware.InjectionModeStrict {
 					recordRejection(RejectionBadRequest)
 					writeJSONError(w, http.StatusBadRequest, ErrTypeInvalidRequest,
-						"Request rejected: suspicious prompt-injection pattern detected in system message")
-					slog.Warn("strict mode rejected suspicious system message",
+						"Request rejected: suspicious prompt-injection pattern detected in message")
+					slog.Warn("strict mode rejected suspicious message",
 						slog.Int("patterns", len(hits)),
 						slog.String("request_id", reqID),
 					)
