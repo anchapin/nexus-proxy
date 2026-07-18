@@ -465,7 +465,7 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 		}
 	})
 
-	t.Run("nil confidence uses plain Decide", func(t *testing.T) {
+	t.Run("nil confidence uses plain Decide and still populates TaskType", func(t *testing.T) {
 		slm := &stubSLM{route: RouteFrontier}
 		p := &Planner{
 			SLM:                slm,
@@ -491,8 +491,8 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 		if dec.Confidence != NeutralConfidence {
 			t.Errorf("Decision.Confidence = %v, want NeutralConfidence (%v)", dec.Confidence, NeutralConfidence)
 		}
-		if dec.TaskType != "" {
-			t.Errorf("Decision.TaskType = %q, want empty (no categorization on nil store)", dec.TaskType)
+		if dec.TaskType != CategoryDebugging {
+			t.Errorf("Decision.TaskType = %q, want %q (issue #441: TaskType must be populated even without ConfidenceStore)", dec.TaskType, CategoryDebugging)
 		}
 	})
 
@@ -525,6 +525,110 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 		}
 		if dec.TaskType != CategoryDebugging {
 			t.Errorf("TaskType = %q, want %q", dec.TaskType, CategoryDebugging)
+		}
+	})
+}
+
+// TestPlanner_NilConfidenceTaskType verifies issue #441: every decision
+// reaching the SLM stage must have a non-empty TaskType even when no
+// ConfidenceStore is wired. This ensures Prometheus and JSONL telemetry
+// always carry the per-category dimension.
+func TestPlanner_NilConfidenceTaskType(t *testing.T) {
+	t.Run("nil confidence success path populates TaskType", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		p := &Planner{
+			SLM:                slm,
+			Confidence:         nil,
+			FusionPatterns:     fusionPatterns,
+			FormattingRegex:    formattingPatterns,
+			LocalPatternsRegex: localPatterns,
+		}
+		req := PlanRequest{
+			Prompt:          "analyze why this exception keeps happening",
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		if dec.TaskType == "" {
+			t.Error("Decision.TaskType must not be empty on nil-confidence SLM path")
+		}
+		if dec.TaskType != CategoryDebugging {
+			t.Errorf("Decision.TaskType = %q, want %q", dec.TaskType, CategoryDebugging)
+		}
+		if dec.Source != SourceSLM {
+			t.Errorf("Source = %q, want %q", dec.Source, SourceSLM)
+		}
+	})
+
+	t.Run("nil confidence error path populates TaskType", func(t *testing.T) {
+		slm := &stubSLM{err: errors.New("connection refused")}
+		p := &Planner{
+			SLM:                slm,
+			Confidence:         nil,
+			FusionPatterns:     fusionPatterns,
+			FormattingRegex:    formattingPatterns,
+			LocalPatternsRegex: localPatterns,
+		}
+		req := PlanRequest{
+			Prompt:          "analyze this stack trace that keeps appearing",
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		if dec.TaskType == "" {
+			t.Error("Decision.TaskType must not be empty on nil-confidence SLM-error path")
+		}
+		if dec.TaskType != CategoryDebugging {
+			t.Errorf("Decision.TaskType = %q, want %q", dec.TaskType, CategoryDebugging)
+		}
+	})
+
+	t.Run("nil confidence unmatched prompt gets other category", func(t *testing.T) {
+		slm := &stubSLM{route: RouteFrontier}
+		p := &Planner{
+			SLM:                slm,
+			Confidence:         nil,
+			FusionPatterns:     fusionPatterns,
+			FormattingRegex:    formattingPatterns,
+			LocalPatternsRegex: localPatterns,
+		}
+		req := PlanRequest{
+			Prompt:          "write a small helper function", // no category keyword match
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		if dec.TaskType != CategoryOther {
+			t.Errorf("Decision.TaskType = %q, want %q", dec.TaskType, CategoryOther)
+		}
+	})
+
+	t.Run("hard override path populates TaskType with nil confidence", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		p := &Planner{
+			SLM:                 slm,
+			Confidence:          nil,
+			FusionPatterns:      fusionPatterns,
+			FormattingRegex:     formattingPatterns,
+			LocalPatternsRegex:  localPatterns,
+			ConfidenceThreshold: 0.3,
+		}
+		req := PlanRequest{
+			Prompt:          "fix the bug in this function",
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		if dec.TaskType == "" {
+			t.Error("Decision.TaskType must not be empty on hard override path")
 		}
 	})
 }
