@@ -42,6 +42,21 @@ type Config struct {
 	IdleTimeout    time.Duration // keep-alive idle wait; 0 disables
 	MaxHeaderBytes int           // max request header bytes; 0 uses Go default (1 MiB)
 
+	// TLSEnabled drives the Strict-Transport-Security emission policy
+	// (issue #444). When true, the security-headers middleware stamps
+	// `Strict-Transport-Security: max-age=31536000` on every response so
+	// clients pin HTTPS and refuse plaintext fallbacks. When false the
+	// header is omitted: emitting HSTS over plaintext would be ignored by
+	// browsers AND is a spec violation. Operators terminate TLS either by
+	// configuring a cert/key on the inbound listener (future work tracked
+	// under #39) OR by fronting the proxy with a TLS-terminating reverse
+	// proxy (nginx, Caddy, ELB, Cloudflare). For the reverse-proxy path,
+	// set NEXUS_TLS_ENABLED=true on the proxy even though the proxy
+	// itself only speaks plaintext — the security-headers middleware is
+	// the single source of truth and trusts the operator-supplied
+	// posture.
+	TLSEnabled bool // emit HSTS; true when the effective inbound is TLS
+
 	// Graceful shutdown timeout (issue #121). Upper bound on the drain
 	// window the HTTP server observes after SIGTERM/SIGINT — a frontier
 	// SSE stream mid-token or a fusion arbiter call that just opened its
@@ -1047,6 +1062,14 @@ func Load() (Config, error) {
 		return cfg, fmt.Errorf("config: NEXUS_SERVER_MAX_HEADER_BYTES must not be negative, got %d", maxHeader)
 	}
 	cfg.MaxHeaderBytes = maxHeader
+
+	// Effective inbound TLS posture (issue #444). Drives the security-
+	// headers middleware HSTS gate. Default false: stock deployments
+	// serve plaintext and HSTS would be a spec violation. Set true when
+	// the proxy terminates TLS directly OR sits behind a TLS-terminating
+	// proxy that strips/rewrites the inner scheme — in both cases the
+	// outer hop is HTTPS and HSTS is safe to advertise.
+	cfg.TLSEnabled = getEnvBool("NEXUS_TLS_ENABLED", false)
 
 	// Graceful shutdown drain window (issue #121). Replaces the prior
 	// hardcoded `const shutdownTimeout = 10 * time.Second` in main.go

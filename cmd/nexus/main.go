@@ -1066,17 +1066,25 @@ func main() {
 		slog.Info("inbound auth disabled (NEXUS_PROXY_API_KEY unset)")
 	}
 
-	// Security headers (issue #235) are the OUTERMOST layer so every
-	// response — including 401, 429, and 500 error envelopes — carries
-	// the hardening headers. Inside that we apply panic recovery so a
-	// nil dereference or surprise regex anywhere downstream is turned
+	// Security headers (issue #235, hardened in #444) are the OUTERMOST
+	// layer so every response — including 401, 429, and 500 error
+	// envelopes — carries the hardening headers. The middleware takes the
+	// effective TLS posture (cfg.TLSEnabled, derived from NEXUS_TLS_ENABLED
+	// or yaml `tls_enabled:`) and gates Strict-Transport-Security on it:
+	// HSTS is only stamped when the operator declares the inbound as TLS
+	// (direct termination OR a TLS-terminating reverse proxy in front).
+	// Emitting HSTS over plaintext is a spec violation and is silently
+	// ignored by browsers, so the canonical implementation is the single
+	// source of truth — there is no longer a duplicate middleware that
+	// unconditionally stamps HSTS. Inside that we apply panic recovery so
+	// a nil dereference or surprise regex anywhere downstream is turned
 	// into a structured slog.Error plus a 500 JSON envelope (or a
 	// trailing SSE error frame when the response already started
-	// streaming) instead of a TCP reset with no body. Zero overhead
-	// on the happy path.
+	// streaming) instead of a TCP reset with no body. Zero overhead on
+	// the happy path.
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           middleware.SecurityHeaders()(handlers.Recover()(rootHandler)),
+		Handler:           handlers.SecurityHeaders(cfg.TLSEnabled)(handlers.Recover()(rootHandler)),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,

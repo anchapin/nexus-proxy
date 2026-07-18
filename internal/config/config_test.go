@@ -94,6 +94,11 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ShutdownTimeout != DefaultShutdownTimeout {
 		t.Errorf("ShutdownTimeout = %v, want %v", cfg.ShutdownTimeout, DefaultShutdownTimeout)
 	}
+	// Effective inbound TLS posture (issue #444). Default false so a stock
+	// plaintext deployment never advertises HSTS.
+	if cfg.TLSEnabled {
+		t.Error("TLSEnabled = true, want false (default)")
+	}
 	// TOON unfenced-array detection (issue #123) defaults to on so a
 	// stock deployment compresses bare arrays; operators can opt out
 	// with NEXUS_TOON_UNFENCED=false.
@@ -206,6 +211,56 @@ func TestLoadTOONUnfencedFlag(t *testing.T) {
 		}
 		if !cfg.TOONUnfenced {
 			t.Error("TOONUnfenced = false, want true when NEXUS_TOON_UNFENCED=true")
+		}
+	})
+}
+
+// TestLoadTLSEnabledFlag (issue #444) verifies NEXUS_TLS_ENABLED gates the
+// HSTS emission policy. The default is false so a stock plaintext
+// deployment never advertises HSTS; operators behind a TLS-terminating
+// reverse proxy (or running with inbound HTTPS) flip the flag.
+func TestLoadTLSEnabledFlag(t *testing.T) {
+	t.Run("default_off", func(t *testing.T) {
+		t.Setenv("NEXUS_TLS_ENABLED", "")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.TLSEnabled {
+			t.Error("TLSEnabled = true, want false when NEXUS_TLS_ENABLED unset")
+		}
+	})
+	t.Run("explicit_false", func(t *testing.T) {
+		t.Setenv("NEXUS_TLS_ENABLED", "false")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.TLSEnabled {
+			t.Error("TLSEnabled = true, want false when NEXUS_TLS_ENABLED=false")
+		}
+	})
+	t.Run("explicit_true", func(t *testing.T) {
+		t.Setenv("NEXUS_TLS_ENABLED", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.TLSEnabled {
+			t.Error("TLSEnabled = false, want true when NEXUS_TLS_ENABLED=true")
+		}
+	})
+	t.Run("alternate_truthy", func(t *testing.T) {
+		// "1" / "yes" should also turn the flag on so operators with
+		// muscle memory for boolean env vars (e.g. NEXUS_DEBUG=1) get
+		// the same behaviour.
+		t.Setenv("NEXUS_TLS_ENABLED", "1")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.TLSEnabled {
+			t.Error("TLSEnabled = false, want true when NEXUS_TLS_ENABLED=1")
 		}
 	})
 }

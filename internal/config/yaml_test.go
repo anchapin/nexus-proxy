@@ -610,6 +610,25 @@ max_body_bytes: 2097152
 	}
 }
 
+// TestLoadYAMLTLSEnabled (issue #444) verifies the YAML mirror of
+// NEXUS_TLS_ENABLED. Operators running behind a TLS-terminating reverse
+// proxy can set the flag via config.yaml instead of an env var.
+func TestLoadYAMLTLSEnabled(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(path, []byte("tls_enabled: true\n"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := LoadYAML(path)
+	if err != nil {
+		t.Fatalf("LoadYAML: %v", err)
+	}
+	if !cfg.TLSEnabled {
+		t.Error("TLSEnabled = false, want true when tls_enabled: true in YAML")
+	}
+}
+
 func TestLoadYAMLCLoudEndpoint(t *testing.T) {
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "config.yaml")
