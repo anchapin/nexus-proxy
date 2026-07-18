@@ -118,6 +118,12 @@ type counterKey struct {
 // A seventh family (issue #232) records fusion arbiter cache hits/misses:
 //   - nexus_fusion_arbiter_cache_total{hit}
 //
+// An eighth family (issue #449) records SLM decision cache evictions:
+//   - nexus_slm_cache_evictions_total{reason}
+//     where reason is "ttl" (entries removed because their TTL elapsed)
+//     or "lru" (entries removed to make room at capacity). The label
+//     set is bounded so cardinality stays at 2 series maximum.
+//
 // The reason label values are short, bounded strings (method,
 // body_too_large, bad_request, rate_limit, ...) defined as constants
 // in internal/handlers so the chat handler and the rate-limit
@@ -137,6 +143,7 @@ type RouteCounters struct {
 	lowConfidenceEscalations map[counterKey]*uint64
 	slmCacheHits             map[string]*uint64 // "exact" | "semantic" (issue #352)
 	slmCacheMisses           *uint64
+	slmCacheEvictions        map[string]*uint64 // "ttl" | "lru" (issue #449)
 	rejections               map[string]*uint64
 	responseTruncated        uint64 // nexus_upstream_response_truncated_total
 	fusionArbiter            map[string]*uint64
@@ -172,6 +179,7 @@ func NewRouteCounters() *RouteCounters {
 		lowConfidenceEscalations: make(map[counterKey]*uint64),
 		slmCacheHits:             make(map[string]*uint64),
 		slmCacheMisses:           &misses,
+		slmCacheEvictions:        make(map[string]*uint64),
 		rejections:               make(map[string]*uint64),
 		fusionArbiter:            make(map[string]*uint64),
 		rRAGHits:                 make(map[string]*uint64),
@@ -404,6 +412,37 @@ func (rc *RouteCounters) ObserveSLMCacheMiss() {
 		return
 	}
 	atomic.AddUint64(rc.slmCacheMisses, 1)
+}
+
+// ObserveSLMCacheEviction records one SLM decision cache eviction
+// (issue #449). reason is the bounded label value: "ttl" when an
+// entry was removed because its TTL elapsed, or "lru" when an entry
+// was removed to make room at capacity. Distinguishing the two
+// reasons lets operators tell whether the cache is undersized (high
+// lru) or its TTL is too short (high ttl). Safe for concurrent use;
+// nil receivers and empty reason are no-ops so callers can invoke
+// unconditionally without guarding the call site.
+func (rc *RouteCounters) ObserveSLMCacheEviction(reason string) {
+	if rc == nil || reason == "" {
+		return
+	}
+	atomic.AddUint64(rc.slmCacheEvictionSlot(reason), 1)
+}
+
+// slmCacheEvictionSlot returns the *uint64 for the SLM cache eviction
+// reason label, creating it if absent. Same lock-then-atomic pattern
+// as reasonSlot: the mutex guards the map mutation only, the increment
+// happens lock-free.
+func (rc *RouteCounters) slmCacheEvictionSlot(reason string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.slmCacheEvictions[reason]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.slmCacheEvictions[reason] = p
+	}
+	rc.mu.Unlock()
+	return p
 }
 
 // ObserveCascadeFallback records a single cascade fallback event,
@@ -644,6 +683,11 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 		total += n
 	}
 	if n, err := writeSLMCacheSeries(w, rc.slmCacheHits, rc.slmCacheMisses); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	if n, err := writeSLMCacheEvictionsSeries(w, rc.slmCacheEvictions); err != nil {
 		return total, err
 	} else {
 		total += n
@@ -933,6 +977,40 @@ func writeSLMCacheSeries(w io.Writer, hits map[string]*uint64, misses *uint64) (
 		return total, err
 	}
 	total += int64(n)
+
+	return total, nil
+}
+
+// writeSLMCacheEvictionsSeries emits the
+// nexus_slm_cache_evictions_total counter family (issue #449). The
+// reason label is bounded to the small closed set defined by the
+// router.EvictionReasonTTL / EvictionReasonLRU constants so the metric
+// family never exceeds two series. Output is sorted by reason label
+// for deterministic scrape diffs. The map may be nil or empty; an
+// empty map still emits HELP/TYPE so scrapers can discover the
+// family even before the first eviction fires.
+func writeSLMCacheEvictionsSeries(w io.Writer, evictions map[string]*uint64) (int64, error) {
+	var total int64
+
+	n, err := fmt.Fprintf(w, "# HELP nexus_slm_cache_evictions_total SLM decision cache evictions partitioned by reason (issue #449).\n# TYPE nexus_slm_cache_evictions_total counter\n")
+	if err != nil {
+		return total, err
+	}
+	total += int64(n)
+
+	keys := make([]string, 0, len(evictions))
+	for k := range evictions {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := atomic.LoadUint64(evictions[k])
+		n, err := fmt.Fprintf(w, "nexus_slm_cache_evictions_total{reason=%q} %d\n", k, v)
+		if err != nil {
+			return total, err
+		}
+		total += int64(n)
+	}
 
 	return total, nil
 }
