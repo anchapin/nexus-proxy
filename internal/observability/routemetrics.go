@@ -115,6 +115,13 @@ type counterKey struct {
 // A sixth family (issue #186) records RAG retrieval outcomes:
 //   - nexus_rag_retrieval_total{hit}
 //
+// Hits are collapsed to a single unlabelled sample line
+// `nexus_rag_retrieval_total{hit="true"}` so the family does not
+// create one Prometheus series per indexed source file (issue #486).
+// The per-filename breakdown is preserved in the SQLite `rag_filename`
+// column for offline analysis. Misses carry a bounded `reason` label
+// (empty_store, threshold, embed_error).
+//
 // A seventh family (issue #232) records fusion arbiter cache hits/misses:
 //   - nexus_fusion_arbiter_cache_total{hit}
 //
@@ -147,7 +154,7 @@ type RouteCounters struct {
 	rejections               map[string]*uint64
 	responseTruncated        uint64 // nexus_upstream_response_truncated_total
 	fusionArbiter            map[string]*uint64
-	rRAGHits                 map[string]*uint64
+	rRAGHits                 *uint64 // single unlabelled hit counter (issue #486)
 	rRAGMisses               map[string]*uint64
 	cascadeFallbacks         map[string]*uint64
 	arbiterCache             map[string]*uint64 // "hit" | "miss"
@@ -177,6 +184,7 @@ type RouteCounters struct {
 func NewRouteCounters() *RouteCounters {
 	misses := uint64(0)
 	cHits, cMisses := uint64(0), uint64(0)
+	ragHits := uint64(0)
 	return &RouteCounters{
 		routeDecisions:           make(map[counterKey]*uint64),
 		slmDecisions:             make(map[counterKey]*uint64),
@@ -186,7 +194,7 @@ func NewRouteCounters() *RouteCounters {
 		slmCacheEvictions:        make(map[string]*uint64),
 		rejections:               make(map[string]*uint64),
 		fusionArbiter:            make(map[string]*uint64),
-		rRAGHits:                 make(map[string]*uint64),
+		rRAGHits:                 &ragHits,
 		rRAGMisses:               make(map[string]*uint64),
 		cascadeFallbacks:         make(map[string]*uint64),
 		arbiterCache:             make(map[string]*uint64),
@@ -323,14 +331,17 @@ func (rc *RouteCounters) fusionSlot(outcome string) *uint64 {
 	return p
 }
 
-// ObserveRAGHit records a RAG retrieval hit (issue #186). filename
-// is the source file of the matched example and is attached as a
-// label so operators can see which snippets are being retrieved.
-func (rc *RouteCounters) ObserveRAGHit(filename string) {
-	if rc == nil {
+// ObserveRAGHit records a RAG retrieval hit (issue #186). The hit
+// counter is intentionally unlabelled — recording one Prometheus
+// series per source filename produced unbounded cardinality (issue
+// #486). The per-filename breakdown is still captured in the SQLite
+// metrics store via the `rag_filename` column for offline analysis.
+// Safe for concurrent use; nil receivers are a no-op.
+func (rc *RouteCounters) ObserveRAGHit() {
+	if rc == nil || rc.rRAGHits == nil {
 		return
 	}
-	atomic.AddUint64(rc.ragHitSlot(filename), 1)
+	atomic.AddUint64(rc.rRAGHits, 1)
 }
 
 // ObserveRAGMiss records a RAG retrieval miss (issue #186). reason
@@ -358,19 +369,6 @@ func (rc *RouteCounters) ObserveRAGCacheMiss() {
 		return
 	}
 	atomic.AddUint64(rc.ragCacheMisses, 1)
-}
-
-// ragHitSlot returns the *uint64 for a hit filename, creating it if absent.
-func (rc *RouteCounters) ragHitSlot(filename string) *uint64 {
-	rc.mu.Lock()
-	p, ok := rc.rRAGHits[filename]
-	if !ok {
-		v := uint64(0)
-		p = &v
-		rc.rRAGHits[filename] = p
-	}
-	rc.mu.Unlock()
-	return p
 }
 
 // ragMissSlot returns the *uint64 for a miss reason, creating it if absent.
@@ -739,7 +737,7 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 		total += n
 	}
 	if n, err := writeRAGSeries(w, "nexus_rag_retrieval_total",
-		"RAG retrieval outcomes partitioned by hit/miss and reason or filename.",
+		"RAG retrieval outcomes partitioned by hit/miss and miss reason.",
 		rc.rRAGHits, rc.rRAGMisses); err != nil {
 		return total, err
 	} else {
@@ -895,12 +893,15 @@ func writeFusionSeries(w io.Writer, name, help string, m map[string]*uint64) (in
 }
 
 // writeRAGSeries emits the nexus_rag_retrieval_total family.
-// hits and misses share the same metric name but are distinguished by
-// the "hit" label (true/false). filename is attached to hits so
-// operators can see which snippets fire most often; reason is attached
-// to misses so they can diagnose why retrieval fails. Output is sorted
-// by hit then by key for deterministic scrape diffs.
-func writeRAGSeries(w io.Writer, name, help string, hits, misses map[string]*uint64) (int64, error) {
+//
+// Hits are emitted as a single unlabelled sample line
+// `{hit="true"} N` (issue #486): the proxy never attaches a filename
+// label to the Prometheus exposition, so the family contributes one
+// hit series regardless of how many distinct source files were
+// retrieved. Misses carry a bounded `reason` label
+// (empty_store, threshold, embed_error). Output is sorted by key for
+// deterministic scrape diffs.
+func writeRAGSeries(w io.Writer, name, help string, hits *uint64, misses map[string]*uint64) (int64, error) {
 	var total int64
 	n, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", name, help, name)
 	if err != nil {
@@ -908,51 +909,31 @@ func writeRAGSeries(w io.Writer, name, help string, hits, misses map[string]*uin
 	}
 	total += int64(n)
 
-	writeHitPairs := func(m map[string]*uint64) (int64, error) {
-		var subTotal int64
-		keys := make([]string, 0, len(m))
-		for k := range m {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			v := atomic.LoadUint64(m[k])
-			n, err := fmt.Fprintf(w, "%s{hit=%q,filename=%q} %d\n", name, "true", sanitizeLabel(k), v)
-			if err != nil {
-				return subTotal + int64(n), err
-			}
-			subTotal += int64(n)
-		}
-		return subTotal, nil
+	// Single hit sample line. We emit it even when hits is zero so the
+	// series shape is stable for scrapers; a zero counter line is
+	// spec-compliant Prometheus text format.
+	hitVal := uint64(0)
+	if hits != nil {
+		hitVal = atomic.LoadUint64(hits)
 	}
+	n, err = fmt.Fprintf(w, "%s{hit=%q} %d\n", name, "true", hitVal)
+	if err != nil {
+		return total + int64(n), err
+	}
+	total += int64(n)
 
-	writeMissPairs := func(m map[string]*uint64) (int64, error) {
-		var subTotal int64
-		keys := make([]string, 0, len(m))
-		for k := range m {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			v := atomic.LoadUint64(m[k])
-			n, err := fmt.Fprintf(w, "%s{hit=%q,reason=%q} %d\n", name, "false", sanitizeLabel(k), v)
-			if err != nil {
-				return subTotal + int64(n), err
-			}
-			subTotal += int64(n)
-		}
-		return subTotal, nil
+	keys := make([]string, 0, len(misses))
+	for k := range misses {
+		keys = append(keys, k)
 	}
-
-	if n, err := writeHitPairs(hits); err != nil {
-		return total, err
-	} else {
-		total += n
-	}
-	if n, err := writeMissPairs(misses); err != nil {
-		return total, err
-	} else {
-		total += n
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := atomic.LoadUint64(misses[k])
+		n, err := fmt.Fprintf(w, "%s{hit=%q,reason=%q} %d\n", name, "false", sanitizeLabel(k), v)
+		if err != nil {
+			return total + int64(n), err
+		}
+		total += int64(n)
 	}
 	return total, nil
 }
