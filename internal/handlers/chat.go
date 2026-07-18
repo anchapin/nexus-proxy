@@ -871,7 +871,8 @@ func Chat(d Deps) http.Handler {
 
 		if r.Method != http.MethodPost {
 			recordRejection(RejectionMethod)
-			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			writeJSONError(w, http.StatusMethodNotAllowed, ErrTypeMethodNotAllowed,
+				"Only POST is supported on /v1/chat/completions")
 			return
 		}
 
@@ -888,7 +889,7 @@ func Chat(d Deps) http.Handler {
 			var maxErr *http.MaxBytesError
 			if errors.As(err, &maxErr) {
 				recordRejection(RejectionBodyTooLarge)
-				writeJSONError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
+				writeJSONError(w, http.StatusRequestEntityTooLarge, ErrTypeRequestTooLarge, fmt.Sprintf(
 					"Request body exceeds NEXUS_MAX_BODY_BYTES (%d bytes)", maxBytes))
 				slog.Warn("rejected oversized request",
 					slog.String("remote", r.RemoteAddr),
@@ -898,19 +899,22 @@ func Chat(d Deps) http.Handler {
 				return
 			}
 			recordRejection(RejectionBadRequest)
-			http.Error(w, "Failed to read request", http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, ErrTypeInvalidRequest,
+				"Failed to read request body")
 			return
 		}
 		var body map[string]interface{}
 		if err := json.Unmarshal(bodyBytes, &body); err != nil {
 			recordRejection(RejectionBadRequest)
-			http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, ErrTypeInvalidRequest,
+				"Invalid JSON payload")
 			return
 		}
 		rawMessages, ok := body["messages"].([]interface{})
 		if !ok {
 			recordRejection(RejectionBadRequest)
-			http.Error(w, "Invalid or missing messages array", http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, ErrTypeInvalidRequest,
+				"Invalid or missing messages array")
 			return
 		}
 
@@ -939,7 +943,7 @@ func Chat(d Deps) http.Handler {
 			if len(hits) > 0 {
 				if d.Config.PromptInjectionMode == middleware.InjectionModeStrict {
 					recordRejection(RejectionBadRequest)
-					writeJSONError(w, http.StatusBadRequest,
+					writeJSONError(w, http.StatusBadRequest, ErrTypeInvalidRequest,
 						"Request rejected: suspicious prompt-injection pattern detected in system message")
 					slog.Warn("strict mode rejected suspicious system message",
 						slog.Int("patterns", len(hits)),
@@ -1339,7 +1343,8 @@ func Chat(d Deps) http.Handler {
 					slog.Float64("cost_estimate", frontierCost),
 				)
 				recordRejection(RejectionBudget)
-				http.Error(w, "Budget exhausted", http.StatusTooManyRequests)
+				writeJSONError(w, http.StatusTooManyRequests, ErrTypeBudgetExceeded,
+					"Frontier budget exhausted for the rolling 24h window")
 				break
 			}
 			if streaming && d.Config.FusionProgressiveDelivery {
@@ -1405,7 +1410,8 @@ func Chat(d Deps) http.Handler {
 				if d.PanelPanicObserver != nil && strings.Contains(upErr.Error(), "panic:") {
 					d.PanelPanicObserver()
 				}
-				http.Error(w, "Upstream error", http.StatusBadGateway)
+				writeJSONError(w, http.StatusBadGateway, ErrTypeUpstreamError,
+					"Fusion panel failed; both local and frontier members errored")
 			} else if d.SpendGuard != nil && frontierCost > 0 {
 				// Budget guard: record after successful fusion frontier leg (issue #220).
 				d.SpendGuard.Record(r.Context(), frontierCost, "frontier")
@@ -1436,7 +1442,8 @@ func Chat(d Deps) http.Handler {
 					trace.Upstream.Streaming = streaming
 					trace.Upstream.Model = model
 					trace.Upstream.TargetHost = HostOfURL(d.Config.OllamaURL)
-					http.Error(w, "Local route busy", http.StatusServiceUnavailable)
+					writeJSONError(w, http.StatusServiceUnavailable, ErrTypeLocalCapacityError,
+						"Local route is at capacity; retry or fall back to frontier")
 					break
 				}
 				defer release()
@@ -1552,7 +1559,8 @@ func Chat(d Deps) http.Handler {
 						slog.String("request_id", reqID),
 					)
 					upErr = err
-					http.Error(w, "Upstream error", http.StatusBadGateway)
+					writeJSONError(w, http.StatusBadGateway, ErrTypeUpstreamError,
+						"Cascade failed; all local and frontier steps errored")
 					// fall through: telemetry Record still fires
 					// below so the failed request shows up in the
 					// dashboard.
@@ -1618,7 +1626,8 @@ func Chat(d Deps) http.Handler {
 						slog.String("request_id", reqID),
 					)
 					upErr = err
-					http.Error(w, "Upstream error", http.StatusBadGateway)
+					writeJSONError(w, http.StatusBadGateway, ErrTypeUpstreamError,
+						"Buffered fetch of upstream failed")
 					// Issue #80: a non-streaming local fetch failure is
 					// also a local failure — arm the cooldown so the next
 					// request skips local and goes to the fallback.
@@ -1669,7 +1678,8 @@ func Chat(d Deps) http.Handler {
 					slog.Float64("cost_estimate", frontierCost),
 				)
 				recordRejection(RejectionBudget)
-				http.Error(w, "Budget exhausted", http.StatusTooManyRequests)
+				writeJSONError(w, http.StatusTooManyRequests, ErrTypeBudgetExceeded,
+					"Frontier budget exhausted for the rolling 24h window")
 				break
 			}
 			// Honor the harness's stream flag (issue #10). Stream
@@ -1703,7 +1713,8 @@ func Chat(d Deps) http.Handler {
 						slog.Any("err", upErr),
 						slog.String("request_id", reqID),
 					)
-					http.Error(w, "Upstream error", http.StatusBadGateway)
+					writeJSONError(w, http.StatusBadGateway, ErrTypeUpstreamError,
+						"Frontier upstream call failed")
 				}
 			} else if d.SpendGuard != nil && frontierCost > 0 {
 				// Budget guard: record after successful frontier call (issue #220).
@@ -1879,18 +1890,49 @@ func logCascadeTelemetry(res upstream.CascadeResult, err error, requestID string
 	)
 }
 
-// writeJSONError writes a structured JSON error response. Used for the
-// 413 body-cap overflow (issue #11) so clients get a parseable error
-// rather than a plain-text body. The shape matches the OpenAI error
-// envelope (`{"error":{"message":...,"type":...}}`) so existing
-// OpenAI-compatible clients surface the message without changes.
-func writeJSONError(w http.ResponseWriter, status int, message string) {
+// Stable error type identifiers used in the OpenAI-style error envelope
+// (issue #453). These strings are part of the public contract: they
+// let an OpenAI-compatible SDK dispatch on `error.type` without
+// parsing the localized message. The taxonomy mirrors OpenAI's own
+// vocabulary where applicable (invalid_request_error, rate_limit_
+// exceeded, server_error) and adds a few nexus-specific categories for
+// non-OpenAI failure modes (method_not_allowed, request_too_large,
+// upstream_error, local_capacity_exceeded).
+const (
+	ErrTypeInvalidRequest     = "invalid_request_error"
+	ErrTypeMethodNotAllowed   = "method_not_allowed"
+	ErrTypeRequestTooLarge    = "request_too_large"
+	ErrTypeRateLimitExceeded  = "rate_limit_exceeded"
+	ErrTypeBudgetExceeded     = "budget_exceeded"
+	ErrTypeUpstreamError      = "upstream_error"
+	ErrTypeServerError        = "server_error"
+	ErrTypeLocalCapacityError = "local_capacity_exceeded"
+)
+
+// writeJSONError writes a structured JSON error response. The shape
+// matches the OpenAI error envelope
+// (`{"error":{"message":...,"type":...,"code":...}}`) so existing
+// OpenAI-compatible SDKs surface the message without having to parse
+// `text/plain` bodies. errorType is a stable identifier (see the
+// ErrType* constants above); clients can dispatch on it without
+// parsing the message. The code field echoes the HTTP status as a
+// short ASCII token so SDKs that expect a numeric status string
+// (rather than parsing the header) keep working.
+//
+// Every chat-handler rejection and upstream-failure path uses this
+// helper (issue #453); the handler's error envelope is now uniformly
+// OpenAI-style.
+func writeJSONError(w http.ResponseWriter, status int, errorType, message string) {
+	if errorType == "" {
+		errorType = ErrTypeServerError
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"error": map[string]string{
 			"message": message,
-			"type":    http.StatusText(status),
+			"type":    errorType,
+			"code":    http.StatusText(status),
 		},
 	})
 }
