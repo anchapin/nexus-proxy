@@ -112,7 +112,7 @@ func TestPersistentStoreUpsertAndLoad(t *testing.T) {
 	if _, err := failingStore.Load(ctx); err != nil {
 		t.Fatalf("Load with counter: %v", err)
 	}
-	ex, _, err := failingStore.Retrieve(ctx, "alpha content")
+	ex, _, _, err := failingStore.Retrieve(ctx, "alpha content")
 	if err != nil {
 		t.Fatalf("Retrieve: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestPersistentStoreUpsertReplacesExisting(t *testing.T) {
 	if got := ps.Size(); got != 1 {
 		t.Errorf("Size after duplicate Upsert = %d, want 1 (replaced)", got)
 	}
-	ex, _, err := ps.Retrieve(ctx, "v2")
+	ex, _, _, err := ps.Retrieve(ctx, "v2")
 	if err != nil {
 		t.Fatalf("Retrieve: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestPersistentStoreRetrieveUsesInMemoryState(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
-	ex, _, err := ps.Retrieve(ctx, "match")
+	ex, _, _, err := ps.Retrieve(ctx, "match")
 	if err != nil {
 		t.Fatalf("Retrieve: %v", err)
 	}

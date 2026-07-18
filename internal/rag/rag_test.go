@@ -72,7 +72,7 @@ func TestRetrieveThreshold(t *testing.T) {
 		{Filename: "weak.go", Content: "weak match", Embedding: emb.vecs["weak match"]},
 	}
 
-	ex, score, err := store.Retrieve(context.Background(), "prompt")
+	ex, score, path, err := store.Retrieve(context.Background(), "prompt")
 	if err != nil {
 		t.Fatalf("Retrieve: %v", err)
 	}
@@ -85,16 +85,22 @@ func TestRetrieveThreshold(t *testing.T) {
 	if score <= 0.55 {
 		t.Errorf("score %v should exceed threshold", score)
 	}
+	if path != IndexPathBruteForce {
+		t.Errorf("path = %q, want %q (small store should use brute force)", path, IndexPathBruteForce)
+	}
 }
 
 func TestRetrieveEmptyStore(t *testing.T) {
 	store := NewStore(&stubEmbedder{}, 0.55)
-	ex, _, err := store.Retrieve(context.Background(), "anything")
+	ex, _, path, err := store.Retrieve(context.Background(), "anything")
 	if err != nil {
 		t.Fatalf("Retrieve: %v", err)
 	}
 	if ex != nil {
 		t.Errorf("expected nil from empty store, got %+v", ex)
+	}
+	if path != IndexPathNone {
+		t.Errorf("path = %q, want %q (empty store skips search)", path, IndexPathNone)
 	}
 }
 
@@ -107,20 +113,30 @@ func TestRetrieveBelowThreshold(t *testing.T) {
 	store.examples = []FewShotExample{
 		{Filename: "weak.go", Content: "weak", Embedding: emb.vecs["weak"]},
 	}
-	ex, _, err := store.Retrieve(context.Background(), "prompt")
+	ex, score, path, err := store.Retrieve(context.Background(), "prompt")
 	if err != nil {
 		t.Fatalf("Retrieve: %v", err)
 	}
 	if ex != nil {
 		t.Errorf("expected no match below threshold, got %s", ex.Filename)
 	}
+	// Score should still be reported (best candidate's similarity)
+	// so the observability layer can populate the histogram bucket.
+	if score <= 0 || score > 1 {
+		t.Errorf("score = %v, want positive cosine-similarity in [0,1]", score)
+	}
+	if path != IndexPathBruteForce {
+		t.Errorf("path = %q, want %q", path, IndexPathBruteForce)
+	}
 }
 
 func TestRetrieveEmbedderError(t *testing.T) {
 	store := NewStore(&stubEmbedder{err: errSentinel}, 0.55)
 	store.examples = []FewShotExample{{Filename: "x.go", Content: "x", Embedding: []float64{1, 0}}}
-	if _, _, err := store.Retrieve(context.Background(), "prompt"); err == nil {
+	if _, _, path, err := store.Retrieve(context.Background(), "prompt"); err == nil {
 		t.Error("expected error from embedder")
+	} else if path != IndexPathNone {
+		t.Errorf("path = %q, want %q on embedder error", path, IndexPathNone)
 	}
 }
 
@@ -147,7 +163,7 @@ func TestStoreConcurrentRetrieveAndAdd(t *testing.T) {
 		}
 	}()
 	for i := 0; i < 200; i++ {
-		if _, _, err := store.Retrieve(context.Background(), "prompt"); err != nil {
+		if _, _, _, err := store.Retrieve(context.Background(), "prompt"); err != nil {
 			t.Fatalf("Retrieve: %v", err)
 		}
 	}
@@ -158,18 +174,18 @@ func TestStoreStats(t *testing.T) {
 	emb := &stubEmbedder{vecs: map[string][]float64{"prompt": {1, 0, 0}}}
 	store := NewStore(emb, 0.55)
 
-	if _, _, err := store.Retrieve(context.Background(), "prompt"); err != nil {
+	if _, _, _, err := store.Retrieve(context.Background(), "prompt"); err != nil {
 		t.Fatalf("empty Retrieve: %v", err)
 	}
 	store.Add("match.go", "match", []float64{1, 0, 0})
-	if _, _, err := store.Retrieve(context.Background(), "prompt"); err != nil {
+	if _, _, _, err := store.Retrieve(context.Background(), "prompt"); err != nil {
 		t.Fatalf("hit Retrieve: %v", err)
 	}
-	if _, _, err := store.Retrieve(context.Background(), "unknown"); err != nil {
+	if _, _, _, err := store.Retrieve(context.Background(), "unknown"); err != nil {
 		t.Fatalf("threshold Retrieve: %v", err)
 	}
 	emb.err = errSentinel
-	if _, _, err := store.Retrieve(context.Background(), "prompt"); err == nil {
+	if _, _, _, err := store.Retrieve(context.Background(), "prompt"); err == nil {
 		t.Fatal("expected embedding error")
 	}
 
@@ -194,6 +210,59 @@ func TestStoreStats(t *testing.T) {
 	}
 	if stats.LastIndexAt.IsZero() {
 		t.Error("LastIndexAt is zero, want non-zero time")
+	}
+}
+
+// TestRetrieveReturnsHNSWPath verifies that when the store has at
+// least indexThreshold snippets, Retrieve reports IndexPathHNSW so the
+// observability layer can partition the similarity histogram by index
+// path (issue #447).
+func TestRetrieveReturnsHNSWPath(t *testing.T) {
+	emb := &stubEmbedder{vecs: map[string][]float64{
+		"prompt": {1, 0, 0},
+	}}
+	store := NewStore(emb, 0.0)
+	// Populate with indexThreshold entries so the HNSW index is used.
+	for i := 0; i < indexThreshold+5; i++ {
+		store.Add(fmt.Sprintf("e%d.go", i), "content", []float64{1, 0, 0})
+	}
+	ex, _, path, err := store.Retrieve(context.Background(), "prompt")
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if ex == nil {
+		t.Fatal("expected a match above threshold=0")
+	}
+	if path != IndexPathHNSW {
+		t.Errorf("path = %q, want %q (>= %d entries should use HNSW)", path, IndexPathHNSW, indexThreshold)
+	}
+}
+
+// TestRetrieveThresholdMissReturnsPath guards the histogram
+// contract: a threshold miss still reports the score and the index
+// path so the miss bucket advances exactly once per retrieval
+// (issue #447 AC).
+func TestRetrieveThresholdMissReturnsPath(t *testing.T) {
+	emb := &stubEmbedder{vecs: map[string][]float64{
+		"prompt": {1, 0, 0},
+		"weak":   {0.1, 0.99, 0},
+	}}
+	store := NewStore(emb, 0.9) // tight threshold; "weak" stays below
+	store.examples = []FewShotExample{
+		{Filename: "weak.go", Content: "weak", Embedding: emb.vecs["weak"]},
+	}
+	ex, score, path, err := store.Retrieve(context.Background(), "prompt")
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if ex != nil {
+		t.Fatalf("expected nil below threshold, got %s", ex.Filename)
+	}
+	if score <= 0 {
+		t.Errorf("threshold miss score = %v, want positive cosine similarity", score)
+	}
+	if path != IndexPathBruteForce {
+		t.Errorf("path = %q, want %q", path, IndexPathBruteForce)
 	}
 }
 
@@ -461,13 +530,13 @@ func TestStoreWithCachingEmbedder(t *testing.T) {
 	store.Add("match.go", "matching", inner.vecs["match"])
 
 	// First Retrieve: cache miss (prompt not cached).
-	store.Retrieve(context.Background(), "prompt")
+	_, _, _, _ = store.Retrieve(context.Background(), "prompt")
 	if inner.callCount != 1 {
 		t.Errorf("first Retrieve: inner.callCount = %d, want 1", inner.callCount)
 	}
 
 	// Second Retrieve with same prompt: cache hit.
-	store.Retrieve(context.Background(), "prompt")
+	_, _, _, _ = store.Retrieve(context.Background(), "prompt")
 	if inner.callCount != 1 {
 		t.Errorf("second Retrieve: inner.callCount = %d, want 1 (cached)", inner.callCount)
 	}

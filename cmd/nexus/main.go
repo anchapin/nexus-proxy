@@ -765,6 +765,18 @@ func main() {
 		} else {
 			routeCounters.ObserveRAGMiss(e.MissReason)
 		}
+		// RAG similarity histogram (issue #447). Only recorded when
+		// Retrieve actually performed a search — empty-store and
+		// embed-error events carry no path/score so we skip them to
+		// avoid spurious bucket advancement for the "no candidate
+		// scored" sentinel.
+		if e.IndexPath != "" {
+			outcome := "miss"
+			if e.Hit {
+				outcome = "hit"
+			}
+			circuitCollector.ObserveRAGSimilarity(e.IndexPath, outcome, e.Score)
+		}
 	})
 
 	// RAG embedding cache hit/miss observer (issue #303).

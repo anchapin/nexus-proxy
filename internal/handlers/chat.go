@@ -291,16 +291,27 @@ type FusionOutcomeObserverFunc func(FusionOutcomeEvent)
 func (f FusionOutcomeObserverFunc) ObserveFusionOutcome(e FusionOutcomeEvent) { f(e) }
 
 // RAGEvent carries the outcome of a single RAG retrieval attempt
-// (issue #186). Hit is true when Retrieve returned a non-nil example;
-// Filename is the matched snippet (meaningful only when Hit is true).
-// MissReason is the miss cause when Hit is false: "empty_store" when
-// the store has no indexed examples, "threshold" when the best match
-// fell below the similarity floor, or "embed_error" when the embedding
-// call failed.
+// (issue #186, extended in #447). Hit is true when Retrieve returned a
+// non-nil example; Filename is the matched snippet (meaningful only
+// when Hit is true). MissReason is the miss cause when Hit is false:
+// "empty_store" when the store has no indexed examples, "threshold"
+// when the best match fell below the similarity floor, or
+// "embed_error" when the embedding call failed.
+//
+// Score and IndexPath record the search telemetry (issue #447):
+// IndexPath is the algorithm Retrieve actually used
+// ("hnsw" or "brute_force"), and Score is the cosine similarity of the
+// best candidate (always populated when IndexPath is non-empty, even
+// for threshold misses). For the fast-exit cases
+// (empty_store / empty_prompt / embed_error) both fields are zero so
+// the observability layer can partition the similarity histogram by
+// path without polluting it with sentinel values.
 type RAGEvent struct {
 	Hit        bool
 	Filename   string
 	MissReason string
+	Score      float64
+	IndexPath  string // "" | "hnsw" | "brute_force" (see rag.IndexPath)
 }
 
 // RAGObserver is the hook invoked once per RAG retrieval attempt,
@@ -978,6 +989,7 @@ func Chat(d Deps) http.Handler {
 		var ragInjected bool
 		var ragFilename string
 		var ragScore float64
+		var ragIndexPath rag.IndexPath
 
 		// Snapshot the embedding cache hit count before Retrieve so we can
 		// determine whether the prompt embedding was served from cache (issue #303).
@@ -986,7 +998,7 @@ func Chat(d Deps) http.Handler {
 			cacheHitCountBefore = statsProvider.EmbedHitCount()
 		}
 
-		ragEx, ragScore, ragErr := d.RAG.Retrieve(r.Context(), latestPrompt)
+		ragEx, ragScore, ragIndexPath, ragErr := d.RAG.Retrieve(r.Context(), latestPrompt)
 		switch {
 		case ragErr != nil:
 			slog.Info("rag miss",
@@ -1012,12 +1024,18 @@ func Chat(d Deps) http.Handler {
 			slog.Info("rag hit",
 				slog.String("filename", ragEx.Filename),
 				slog.Float64("score", ragScore),
+				slog.String("index_path", string(ragIndexPath)),
 				slog.String("request_id", reqID),
 			)
 			ragInjected = true
 			ragFilename = ragEx.Filename
 			if d.RAGObserver != nil {
-				d.RAGObserver.ObserveRAG(RAGEvent{Hit: true, Filename: ragEx.Filename})
+				d.RAGObserver.ObserveRAG(RAGEvent{
+					Hit:       true,
+					Filename:  ragEx.Filename,
+					Score:     ragScore,
+					IndexPath: string(ragIndexPath),
+				})
 			}
 			if d.CircuitBreakerObserver != nil {
 				d.CircuitBreakerObserver.RecordCircuitRecovery("rag")
@@ -1039,10 +1057,16 @@ func Chat(d Deps) http.Handler {
 			slog.Info("rag miss",
 				slog.String("reason", "threshold"),
 				slog.Float64("score", ragScore),
+				slog.String("index_path", string(ragIndexPath)),
 				slog.String("request_id", reqID),
 			)
 			if d.RAGObserver != nil {
-				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "threshold"})
+				d.RAGObserver.ObserveRAG(RAGEvent{
+					Hit:        false,
+					MissReason: "threshold",
+					Score:      ragScore,
+					IndexPath:  string(ragIndexPath),
+				})
 			}
 		}
 		// Determine embedding cache hit by diffing the hit counter before/after

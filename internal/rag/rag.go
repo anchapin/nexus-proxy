@@ -299,8 +299,13 @@ func (c *EmbedCache) RecordBreakerSuccess() {
 // RAGStore is the read+seed API the chat handler depends on. PersistentStore
 // (issue #46) embeds *Store and implements the same surface; the handler
 // is unaffected because both types satisfy this interface.
+//
+// Retrieve's fourth return value reports the index path the search
+// actually used (issue #447); see IndexPath for the label vocabulary.
+// Callers that don't need the path can ignore it with `_, _, _, err :=`
+// or the blank-identifier shorthand.
 type RAGStore interface {
-	Retrieve(ctx context.Context, prompt string) (*FewShotExample, float64, error)
+	Retrieve(ctx context.Context, prompt string) (*FewShotExample, float64, IndexPath, error)
 	Add(filename, content string, embedding []float64)
 	Size() int
 	Threshold() float64
@@ -366,6 +371,37 @@ type Store struct {
 // index build cost. Issue #420 measured ~1ms for 50 snippets brute-force
 // vs ~0.1ms HNSW — the crossover point is around 50-100 snippets.
 const indexThreshold = 50
+
+// IndexPath identifies which retrieval algorithm Retrieve used to find
+// the best matching example (issue #447). The value is one of HNSWIndexPath
+// or BruteForceIndexPath when Retrieve actually performed a search; it is
+// empty (IndexPathNone) for the fast-exit cases (empty store, empty
+// prompt, embedder error) where no candidate was ever scored.
+//
+// Callers surface the value through RAGEvent.IndexPath so the
+// observability layer can partition the similarity histogram by index
+// path — operators tune the HNSW crossover and diagnose embedding-model
+// drift by comparing the two distributions.
+type IndexPath string
+
+const (
+	// IndexPathNone means no retrieval was attempted (empty store,
+	// empty prompt, or embedder error). No similarity score is
+	// available for this retrieval.
+	IndexPathNone IndexPath = ""
+
+	// IndexPathHNSW means Retrieve used the HNSW approximate
+	// nearest-neighbor index (issue #420). Buckets labelled
+	// {path="hnsw"} in nexus_rag_similarity_histogram carry
+	// these observations.
+	IndexPathHNSW IndexPath = "hnsw"
+
+	// IndexPathBruteForce means Retrieve fell back to the linear
+	// cosine scan (small store, or HNSW unavailable). Buckets
+	// labelled {path="brute_force"} in
+	// nexus_rag_similarity_histogram carry these observations.
+	IndexPathBruteForce IndexPath = "brute_force"
+)
 
 // IndexMode describes which retrieval path Store.Retrieve will use for
 // the current example count (issue #446). The /status endpoint reports
@@ -591,12 +627,18 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 // prompt embedding meets the configured threshold, or nil if nothing clears
 // the bar. An empty store or empty prompt always yields nil.
 //
+// The fourth return value is the IndexPath actually used for the search
+// (issue #447): IndexPathHNSW or IndexPathBruteForce when a search
+// happened, IndexPathNone for the fast-exit cases. Callers forward this
+// to the RAG observer so the similarity histogram is partitioned by
+// index path.
+//
 // When the store has at least indexThreshold snippets, Retrieve uses the
 // HNSW approximate nearest-neighbor index for O(log n) search, then
 // re-ranks the top candidates with exact cosine similarity. This delivers
 // Recall@5 ≥ 0.95 vs brute-force while cutting p99 latency from ~50ms to
 // ~10ms for 10,000 snippets (issue #420).
-func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, float64, error) {
+func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, float64, IndexPath, error) {
 	atomic.AddUint64(&s.retrievalAttempts, 1)
 	s.mu.RLock()
 	n := len(s.examples)
@@ -604,18 +646,18 @@ func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, f
 	if n == 0 {
 		atomic.AddUint64(&s.retrievalMisses, 1)
 		atomic.AddUint64(&s.emptyStoreMisses, 1)
-		return nil, 0, nil
+		return nil, 0, IndexPathNone, nil
 	}
 	if prompt == "" {
 		atomic.AddUint64(&s.retrievalMisses, 1)
 		atomic.AddUint64(&s.thresholdMisses, 1)
-		return nil, 0, nil
+		return nil, 0, IndexPathNone, nil
 	}
 	promptEmb, err := s.embedder.Embed(ctx, prompt)
 	if err != nil {
 		atomic.AddUint64(&s.retrievalMisses, 1)
 		atomic.AddUint64(&s.embedErrors, 1)
-		return nil, 0, err
+		return nil, 0, IndexPathNone, err
 	}
 
 	s.mu.RLock()
@@ -647,11 +689,11 @@ func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, f
 		}
 		if best != nil && bestScore > s.threshold {
 			atomic.AddUint64(&s.retrievalHits, 1)
-			return best, bestScore, nil
+			return best, bestScore, IndexPathHNSW, nil
 		}
 		atomic.AddUint64(&s.retrievalMisses, 1)
 		atomic.AddUint64(&s.thresholdMisses, 1)
-		return nil, bestScore, nil
+		return nil, bestScore, IndexPathHNSW, nil
 	}
 
 	// Brute-force path: O(n) scan for small stores or when index unavailable.
@@ -668,11 +710,11 @@ func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, f
 	}
 	if best != nil && bestScore > s.threshold {
 		atomic.AddUint64(&s.retrievalHits, 1)
-		return best, bestScore, nil
+		return best, bestScore, IndexPathBruteForce, nil
 	}
 	atomic.AddUint64(&s.retrievalMisses, 1)
 	atomic.AddUint64(&s.thresholdMisses, 1)
-	return nil, bestScore, nil
+	return nil, bestScore, IndexPathBruteForce, nil
 }
 
 // CosineSimilarity returns the cosine of the angle between a and b. A zero

@@ -652,3 +652,170 @@ func TestCollectorGaugesNilSafe(t *testing.T) {
 		t.Errorf("nil collector Gauges() = %v, want nil", got)
 	}
 }
+
+// TestRAGSimilarityHistogramsPreAllocated (issue #447) verifies that
+// NewCollector pre-allocates one Histogram per (path, outcome) pair
+// so ObserveRAGSimilarity never needs to allocate on the hot path.
+// All four buckets must be present and empty (count == 0) until an
+// observation lands.
+func TestRAGSimilarityHistogramsPreAllocated(t *testing.T) {
+	c := NewCollector()
+	hists := c.RAGSimilarityHistograms()
+	if len(hists) != 4 {
+		t.Fatalf("pre-allocated histograms = %d, want 4 (one per path×outcome)", len(hists))
+	}
+	wantKeys := []string{"hnsw|hit", "hnsw|miss", "brute_force|hit", "brute_force|miss"}
+	for _, k := range wantKeys {
+		h, ok := hists[k]
+		if !ok || h == nil {
+			t.Errorf("missing pre-allocated histogram for %q", k)
+			continue
+		}
+		_, _, _, count := h.Snapshot()
+		if count != 0 {
+			t.Errorf("fresh histogram %q has count=%d, want 0", k, count)
+		}
+	}
+}
+
+// TestObserveRAGSimilarityAdvancesBucket (issue #447) is the bucket
+// advancement check from the acceptance criteria. One observation at
+// score=0.7 must land in the (path="hnsw", outcome="hit") bucket
+// count == 1 and bucket le="0.8" cumulative == 1.
+func TestObserveRAGSimilarityAdvancesBucket(t *testing.T) {
+	c := NewCollector()
+	c.ObserveRAGSimilarity("hnsw", "hit", 0.7)
+
+	hists := c.RAGSimilarityHistograms()
+	h, ok := hists["hnsw|hit"]
+	if !ok {
+		t.Fatalf("missing hnsw|hit histogram")
+	}
+	cum, upperBounds, _, count := h.Snapshot()
+	if count != 1 {
+		t.Errorf("count = %d, want 1", count)
+	}
+	// Score 0.7 must fall in the (0.6, 0.8] bucket — i.e. cum[7] = 1
+	// (upperBounds[7] == 0.8) and the trailing buckets remain 0.
+	for i, ub := range upperBounds {
+		var want uint64
+		if ub >= 0.7 {
+			want = 1
+		}
+		if cum[i] != want {
+			t.Errorf("cum[%d] (le=%v) = %d, want %d", i, ub, cum[i], want)
+		}
+	}
+	if cum[len(upperBounds)] != 1 {
+		t.Errorf("+Inf bucket = %d, want 1", cum[len(upperBounds)])
+	}
+}
+
+// TestObserveRAGSimilarityHitAndMissSeparate asserts the AC
+// "Hits and misses record exactly once": a hit and a miss at the
+// same score on the same path advance different histograms and do
+// not cross-contaminate.
+func TestObserveRAGSimilarityHitAndMissSeparate(t *testing.T) {
+	c := NewCollector()
+	c.ObserveRAGSimilarity("brute_force", "hit", 0.9)
+	c.ObserveRAGSimilarity("brute_force", "miss", 0.4)
+
+	hists := c.RAGSimilarityHistograms()
+	hitCount := snapshotCount(t, hists["brute_force|hit"])
+	missCount := snapshotCount(t, hists["brute_force|miss"])
+	if hitCount != 1 {
+		t.Errorf("hit count = %d, want 1", hitCount)
+	}
+	if missCount != 1 {
+		t.Errorf("miss count = %d, want 1", missCount)
+	}
+	// Other paths must remain untouched.
+	if got := snapshotCount(t, hists["hnsw|hit"]); got != 0 {
+		t.Errorf("hnsw|hit count = %d, want 0 (unobserved)", got)
+	}
+	if got := snapshotCount(t, hists["hnsw|miss"]); got != 0 {
+		t.Errorf("hnsw|miss count = %d, want 0 (unobserved)", got)
+	}
+}
+
+// TestObserveRAGSimilarityClampsOutOfRange confirms the
+// documented safety net: scores outside [0, 1] are clamped rather
+// than pushed into the +Inf bucket by a buggy embedder. The 1.5
+// observation must land in the (0.9, 1.0] bucket, not the +Inf
+// overflow.
+func TestObserveRAGSimilarityClampsOutOfRange(t *testing.T) {
+	c := NewCollector()
+	c.ObserveRAGSimilarity("hnsw", "hit", 1.5)
+	c.ObserveRAGSimilarity("hnsw", "miss", -0.2)
+
+	hists := c.RAGSimilarityHistograms()
+	cum, upperBounds, _, _ := hists["hnsw|hit"].Snapshot()
+	// Clamped to 1.0 → bucket le="1" cumulative = 1, +Inf = 1.
+	if cum[len(upperBounds)-1] != 1 {
+		t.Errorf("hit bucket le=1 = %d, want 1 (clamped from 1.5)", cum[len(upperBounds)-1])
+	}
+	if cum[len(upperBounds)] != 1 {
+		t.Errorf("hit +Inf bucket = %d, want 1 (single observation)", cum[len(upperBounds)])
+	}
+
+	cum, upperBounds, _, _ = hists["hnsw|miss"].Snapshot()
+	if cum[0] != 1 {
+		t.Errorf("miss bucket le=0.1 = %d, want 1 (clamped from -0.2)", cum[0])
+	}
+	if cum[len(upperBounds)] != 1 {
+		t.Errorf("miss +Inf bucket = %d, want 1", cum[len(upperBounds)])
+	}
+}
+
+// TestObserveRAGSimilarityUnknownPathIgnored confirms the
+// bounded-cardinality contract: an unrecognised path or outcome
+// label is silently dropped rather than landing under a third
+// bucket. This is the "labels and cardinality are documented"
+// half of the AC.
+func TestObserveRAGSimilarityUnknownPathIgnored(t *testing.T) {
+	c := NewCollector()
+	c.ObserveRAGSimilarity("pinecone", "hit", 0.8)
+	c.ObserveRAGSimilarity("hnsw", "unknown", 0.8)
+
+	for _, k := range []string{"hnsw|hit", "hnsw|miss", "brute_force|hit", "brute_force|miss"} {
+		if got := snapshotCount(t, c.RAGSimilarityHistograms()[k]); got != 0 {
+			t.Errorf("%s count = %d after unknown label, want 0", k, got)
+		}
+	}
+}
+
+// TestObserveRAGSimilarityConcurrent (issue #447) exercises the
+// histogram under concurrent Observe calls. 100 goroutines × 100
+// observations = 10,000 events; -race catches any data race and
+// the count assertion confirms no observation is lost.
+func TestObserveRAGSimilarityConcurrent(t *testing.T) {
+	c := NewCollector()
+	const goroutines, perG = 100, 100
+	done := make(chan struct{}, goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			for i := 0; i < perG; i++ {
+				c.ObserveRAGSimilarity("hnsw", "hit", 0.5)
+			}
+		}()
+	}
+	for g := 0; g < goroutines; g++ {
+		<-done
+	}
+	want := uint64(goroutines * perG)
+	if got := snapshotCount(t, c.RAGSimilarityHistograms()["hnsw|hit"]); got != want {
+		t.Errorf("concurrent hit count = %d, want %d", got, want)
+	}
+}
+
+// snapshotCount is a tiny helper to keep the table-style tests
+// above compact.
+func snapshotCount(t *testing.T, h *Histogram) uint64 {
+	t.Helper()
+	if h == nil {
+		return 0
+	}
+	_, _, _, count := h.Snapshot()
+	return count
+}

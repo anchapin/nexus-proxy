@@ -74,7 +74,7 @@ func (r ragMiddleware) Transform(m []interface{}) ([]interface{}, error) {
 
 func (r ragMiddleware) TransformContext(ctx context.Context, msgs []interface{}) ([]interface{}, error) {
 	prompt := ExtractLatestUserPrompt(msgs)
-	ex, _, err := r.rag.Retrieve(ctx, prompt)
+	ex, _, _, err := r.rag.Retrieve(ctx, prompt)
 	if err != nil || ex == nil {
 		return msgs, nil
 	}
