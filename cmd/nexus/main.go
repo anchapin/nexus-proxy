@@ -761,7 +761,7 @@ func main() {
 
 	ragObserver := handlers.RAGObserverFunc(func(e handlers.RAGEvent) {
 		if e.Hit {
-			routeCounters.ObserveRAGHit(e.Filename)
+			routeCounters.ObserveRAGHit()
 		} else {
 			routeCounters.ObserveRAGMiss(e.MissReason)
 		}

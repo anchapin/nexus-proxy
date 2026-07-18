@@ -24,9 +24,17 @@ snake_case naming.
 | `nexus_slm_cache_misses_total` | counter | *(none)* | 1 | `routemetrics.go` |
 | `nexus_slm_cache_evictions_total` | counter | `reason` | 2 (`ttl`, `lru`) | `routemetrics.go` |
 | `nexus_requests_rejected_total` | counter | `reason` | 4 | `routemetrics.go` |
+| `nexus_rag_retrieval_total` | counter | `hit`, `reason` (miss only) | 1 + 3 = 4 | `routemetrics.go` |
 | `nexus_judge_dropped_total` | counter | *(none)* | 1 | `routemetrics.go` |
 
-**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 4 + 1 = 129 series.
+**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 4 + 4 + 1 = 133 series.
+
+> **Note (issue #486):** `nexus_rag_retrieval_total` previously carried
+> a `filename` label whose value was the raw RAG source filename, which
+> produced one series per indexed document — unbounded cardinality. The
+> label has been removed; hits are now collapsed into a single
+> `{hit="true"}` sample line. The per-filename breakdown is preserved
+> in the SQLite `rag_filename` column for offline analysis.
 
 ### Label value catalog
 
@@ -126,9 +134,16 @@ a high `lru / (ttl + lru)` ratio points at capacity pressure.
 | `reason` (rejections) | Yes | 4 | Fixed set of rejection reasons |
 | `reason` (SLM cache evictions) | Yes | 2 | `ttl`, `lru` — closed set defined in `internal/router/slm_cache.go` (issue #449) |
 | `kind` (SLM cache hits) | Yes | 2 | `exact`, `semantic` |
+| `hit` (RAG retrieval) | Yes | 2 | `true`, `false` (issue #186, #486) |
+| `reason` (RAG retrieval miss) | Yes | 3 | `empty_store`, `threshold`, `embed_error` — closed set emitted only when `hit="false"` |
 
 **No unbounded cardinality labels exist.** All label values are
-short, pre-defined strings with no user-controlled input.
+short, pre-defined strings with no user-controlled input. The
+`filename` label that previously adorned
+`nexus_rag_retrieval_total{hit="true"}` was removed in issue #486
+because it derived from raw RAG source filenames and grew one series
+per indexed document; the per-filename breakdown now lives only in
+the SQLite `rag_filename` column.
 
 ## SQLite metrics store (`internal/metrics`)
 

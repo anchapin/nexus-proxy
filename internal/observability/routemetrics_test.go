@@ -311,15 +311,17 @@ func TestObserveCascadeFallback(t *testing.T) {
 }
 
 // TestRAGCountersHitMiss verifies the issue #186 RAG retrieval
-// metric family: ObserveRAGHit increments per-filename counters and
-// ObserveRAGMiss increments per-reason counters. WriteTo emits
-// nexus_rag_retrieval_total{hit="true",filename="..."} and
-// nexus_rag_retrieval_total{hit="false",reason="..."} lines.
+// metric family. ObserveRAGHit increments a single unlabelled hit
+// counter and ObserveRAGMiss increments per-reason counters.
+// WriteTo emits exactly one nexus_rag_retrieval_total{hit="true"}
+// line (collapsed across all hit filenames, issue #486) plus one
+// nexus_rag_retrieval_total{hit="false",reason="..."} line per
+// distinct miss reason.
 func TestRAGCountersHitMiss(t *testing.T) {
 	rc := NewRouteCounters()
-	rc.ObserveRAGHit("example1.go")
-	rc.ObserveRAGHit("example1.go") // same file again
-	rc.ObserveRAGHit("example2.go")
+	rc.ObserveRAGHit()
+	rc.ObserveRAGHit() // hit again — counter should sum
+	rc.ObserveRAGHit()
 	rc.ObserveRAGMiss("empty_store")
 	rc.ObserveRAGMiss("threshold")
 	rc.ObserveRAGMiss("threshold")
@@ -337,8 +339,7 @@ func TestRAGCountersHitMiss(t *testing.T) {
 	}{
 		{"nexus_rag_retrieval_total", "metric family header"},
 		{`# TYPE nexus_rag_retrieval_total counter`, "counter type line"},
-		{`nexus_rag_retrieval_total{hit="true",filename="example1.go"} 2`, "example1.go hit counted twice"},
-		{`nexus_rag_retrieval_total{hit="true",filename="example2.go"} 1`, "example2.go hit counted once"},
+		{`nexus_rag_retrieval_total{hit="true"} 3`, "hits collapsed to a single unlabelled line"},
 		{`nexus_rag_retrieval_total{hit="false",reason="empty_store"} 1`, "empty_store miss counted once"},
 		{`nexus_rag_retrieval_total{hit="false",reason="threshold"} 2`, "threshold miss counted twice"},
 		{`nexus_rag_retrieval_total{hit="false",reason="embed_error"} 1`, "embed_error miss counted once"},
@@ -347,6 +348,44 @@ func TestRAGCountersHitMiss(t *testing.T) {
 		if !strings.Contains(out, c.fragment) {
 			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
 		}
+	}
+	// Issue #486 regression guard: hits must never carry a filename label.
+	if strings.Contains(out, `nexus_rag_retrieval_total{hit="true",filename=`) {
+		t.Errorf("hit line must not carry filename label; got filename-labelled sample in output:\n%s", out)
+	}
+}
+
+// TestRAGCountersSingleHitSeriesRegardlessOfFilenames is the issue
+// #486 regression test. Recording hits for N distinct filenames must
+// produce exactly one nexus_rag_retrieval_total{hit="true"} sample
+// line whose value equals the total hit count. This asserts the
+// unbounded-cardinality bug does not regress: before the fix the
+// family emitted one series per filename.
+func TestRAGCountersSingleHitSeriesRegardlessOfFilenames(t *testing.T) {
+	const N = 50
+	rc := NewRouteCounters()
+	for i := 0; i < N; i++ {
+		// ObserveRAGHit no longer takes a filename — we exercise the
+		// post-fix shape. Each call increments the single hit counter.
+		rc.ObserveRAGHit()
+	}
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	// Count occurrences of the hit sample line. There must be exactly one.
+	hitLine := `nexus_rag_retrieval_total{hit="true"}`
+	count := strings.Count(out, hitLine)
+	if count != 1 {
+		t.Errorf("expected exactly 1 %q sample line, got %d\nfull output:\n%s", hitLine, count, out)
+	}
+	// The single hit line must carry the aggregated value of N.
+	want := fmt.Sprintf(`nexus_rag_retrieval_total{hit="true"} %d`, N)
+	if !strings.Contains(out, want) {
+		t.Errorf("expected aggregated hit line %q in output\nfull output:\n%s", want, out)
 	}
 }
 
@@ -372,9 +411,9 @@ func TestRouteCountersFusionOutcomeDeterministicOrder(t *testing.T) {
 func TestRAGCountersDeterministicOrder(t *testing.T) {
 	rc := NewRouteCounters()
 	rc.ObserveRAGMiss("threshold")
-	rc.ObserveRAGHit("b.go")
+	rc.ObserveRAGHit()
 	rc.ObserveRAGMiss("embed_error")
-	rc.ObserveRAGHit("a.go")
+	rc.ObserveRAGHit()
 
 	var first, second strings.Builder
 	_, _ = rc.WriteTo(&first)
@@ -413,7 +452,6 @@ func TestRouteCountersFusionOutcomeConcurrentSafe(t *testing.T) {
 // primary assertion.
 func TestRAGCountersConcurrentSafe(t *testing.T) {
 	rc := NewRouteCounters()
-	filenames := []string{"a.go", "b.go", "c.go"}
 	reasons := []string{"threshold", "empty_store", "embed_error"}
 	var wg sync.WaitGroup
 	for i := 0; i < 200; i++ {
@@ -421,7 +459,7 @@ func TestRAGCountersConcurrentSafe(t *testing.T) {
 		go func(n int) {
 			defer wg.Done()
 			if n%2 == 0 {
-				rc.ObserveRAGHit(filenames[n%len(filenames)])
+				rc.ObserveRAGHit()
 			} else {
 				rc.ObserveRAGMiss(reasons[n%len(reasons)])
 			}
@@ -449,7 +487,7 @@ func TestRouteCountersFusionOutcomeNilSafe(t *testing.T) {
 // TestRAGCountersNilSafe verifies that nil receivers are safe.
 func TestRAGCountersNilSafe(t *testing.T) {
 	var rc *RouteCounters
-	rc.ObserveRAGHit("example.go")
+	rc.ObserveRAGHit()
 	rc.ObserveRAGMiss("threshold")
 }
 
