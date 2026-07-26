@@ -1161,7 +1161,7 @@ func TestChatFrontierStreamTruncationObserverNilSafe(t *testing.T) {
 func TestChatTelemetryJSONLRecorderEndToEnd(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "tel.jsonl")
-	r, err := telemetry.NewJSONLRecorder(path)
+	r, err := telemetry.NewJSONLRecorder(path, 0, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}
@@ -2049,7 +2049,7 @@ func TestChatFusionProgressiveDisabledBackwardCompat(t *testing.T) {
 func TestChatFusionProgressiveTelemetryFlag(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "tel.jsonl")
-	r, err := telemetry.NewJSONLRecorder(path)
+	r, err := telemetry.NewJSONLRecorder(path, 0, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}

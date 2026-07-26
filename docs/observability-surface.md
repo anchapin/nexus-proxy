@@ -195,6 +195,21 @@ appended to the file. Fields mirror the SQLite schema. No Prometheus
 labels are derived directly from the JSONL — the JSONL is a
 tail-friendly log, not a metrics source.
 
+### File rotation (issue #485)
+
+`NEXUS_TELEMETRY_MAX_BYTES` (default `0` = disabled) enables size-based
+rotation. When the next record would push the active file past the cap
+it is atomically renamed to `path.<unix-nanoseconds>` and a fresh file
+is opened. `NEXUS_TELEMETRY_MAX_FILES` (default `5`) bounds the number
+of rotated files retained; the oldest is evicted at the cap. Both knobs
+require a restart — the file handle is swapped atomically at boot, so
+they are intentionally excluded from hot-reload.
+
+| Metric | Source | Notes |
+|--------|--------|-------|
+| `nexus_telemetry_rotations_total` | `JSONLRecorder.Rotations()` | Counter; always 0 when rotation is disabled. Confirm operators can see this climbing to verify rotation is firing. |
+| `nexus_telemetry_dropped_total` | `JSONLRecorder.Dropped()` | Counter; buffer-full drops (unchanged by #485). |
+
 ## Distributed tracing (`internal/tracing`)
 
 Referenced in AGENTS.md as an OTLP/JSON exporter (#41). **Not yet

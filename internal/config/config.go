@@ -355,14 +355,27 @@ type Config struct {
 	// (the handler installs a Noop recorder). Parent directories are
 	// created on demand.
 	//
+	// TelemetryMaxBytes (issue #485) enables size-based rotation of the
+	// JSONL file. When > 0, the active file is atomically renamed with a
+	// timestamp suffix the moment the next record would push it past the
+	// cap, and a fresh file is opened. 0 (default) preserves the
+	// append-only, never-rotate behaviour. Not hot-reloadable — the file
+	// handle must be swapped atomically at boot.
+	//
+	// TelemetryMaxFiles bounds the number of rotated files retained once
+	// the cap is exceeded; the oldest is evicted. Only consulted when
+	// TelemetryMaxBytes > 0. Not hot-reloadable.
+	//
 	// MetricsDBPath is the on-disk SQLite database written by
 	// internal/metrics (issue #4). An empty value disables the
 	// metrics store (the handler treats a nil store as "skip me").
 	// Parent directories are created on demand. The default lives
 	// under the user's XDG-style cache directory so multiple checkouts
 	// don't trample each other.
-	TelemetryPath string
-	MetricsDBPath string
+	TelemetryPath     string
+	TelemetryMaxBytes int
+	TelemetryMaxFiles int
+	MetricsDBPath     string
 
 	// Structured logging (issue #3). LogLevel maps NEXUS_LOG_LEVEL
 	// ("debug" | "info" | "warn" | "error") to a slog.Level. LogFormat
@@ -601,6 +614,28 @@ func Load() (Config, error) {
 	} else {
 		cfg.TelemetryPath = "./nexus-telemetry.jsonl"
 	}
+	// Size-based rotation knobs (issue #485). MAX_BYTES=0 disables
+	// rotation entirely (the default, preserving pre-#485 behaviour).
+	// MAX_FILES clamps the rotated-file retention and is only consulted
+	// when MAX_BYTES > 0. Both require a restart to take effect because
+	// swapping the file handle mid-stream is unsafe.
+	telemetryMaxBytes, err := getEnvInt("NEXUS_TELEMETRY_MAX_BYTES", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if telemetryMaxBytes < 0 {
+		telemetryMaxBytes = 0
+	}
+	cfg.TelemetryMaxBytes = telemetryMaxBytes
+
+	telemetryMaxFiles, err := getEnvInt("NEXUS_TELEMETRY_MAX_FILES", 5)
+	if err != nil {
+		return cfg, err
+	}
+	if telemetryMaxFiles < 1 {
+		telemetryMaxFiles = 1
+	}
+	cfg.TelemetryMaxFiles = telemetryMaxFiles
 	cfg.MetricsDBPath = getFileString("metrics_db", "NEXUS_METRICS_DB", DefaultMetricsDBPath())
 
 	threshold, err := getEnvFloat("NEXUS_RAG_THRESHOLD", 0.55)
