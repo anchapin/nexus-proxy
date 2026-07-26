@@ -8,13 +8,9 @@ func TestSimilarityRatioIdentical(t *testing.T) {
 		a, b string
 		want float64
 	}{
-		// Token-set Jaccard is sensitive to per-token differences
-		// (e.g. "Hello," vs "hello") so the "punctuation differs"
-		// case is high-but-not-1.0 — it's the surface-form noise
-		// the streaming fusion arbiter is designed to absorb.
 		{"exact", "hello world", "hello world", 1.0},
 		{"whitespace normalised", "hello   world\n\nfoo", "hello world foo", 1.0},
-		{"punctuation differs", "Hello, world!", "hello world", 0.0},
+		{"punctuation differs", "Hello, world!", "hello world", 1.0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -83,5 +79,60 @@ func TestSimilarityRatioAgreementThreshold(t *testing.T) {
 	d := "Switch the database schema. Migrate every column. Drop the legacy index. Reindex from scratch."
 	if got := SimilarityRatio(c, d); got > 0.5 {
 		t.Errorf("unrelated paragraphs scored %v, want < 0.5", got)
+	}
+}
+
+func TestSimilarityRatioCaseInsensitive(t *testing.T) {
+	if got := SimilarityRatio("Use JSON", "use json"); got != 1.0 {
+		t.Errorf("SimilarityRatio(%q, %q) = %v, want 1.0", "Use JSON", "use json", got)
+	}
+}
+
+func TestSimilarityRatioPunctuationTolerant(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b string
+		min  float64
+	}{
+		{"case + punctuation", "Hello, world!", "hello world", 0.8},
+		{"trailing punctuation", "hello.", "hello", 1.0},
+		{"multiple punctuation", "foo!!!", "foo", 1.0},
+		{"brackets", "[foo]", "foo", 1.0},
+		{"parens", "(bar)", "bar", 1.0},
+		{"mixed case + punctuation", "The Quick Brown Fox!", "the quick brown fox", 1.0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SimilarityRatio(tc.a, tc.b); got < tc.min {
+				t.Errorf("SimilarityRatio(%q, %q) = %v, want >= %v", tc.a, tc.b, got, tc.min)
+			}
+		})
+	}
+}
+
+func TestNormalizeToken(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"Hello", "hello"},
+		{"WORLD", "world"},
+		{"foo.", "foo"},
+		{".bar", "bar"},
+		{"hello!", "hello"},
+		{"[test]", "test"},
+		{"(example)", "example"},
+		{`"quoted"`, "quoted"},
+		{`"hello"`, "hello"},
+		{`hello\nworld`, "hello world"},
+		{`a\\b`, "a\\b"},
+		{"Already_Lower", "already_lower"},
+		{"   spaces   ", "spaces"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := normalizeToken(tc.in); got != tc.want {
+				t.Errorf("normalizeToken(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
