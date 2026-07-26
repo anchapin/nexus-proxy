@@ -2322,3 +2322,49 @@ func TestPanelGoroutinePanicIncrementsCounter(t *testing.T) {
 		t.Errorf("PanelPanicsTotal() = %d, want %d", after, before+1)
 	}
 }
+
+// TestStreamCachedArbiterSynthesisClientAbortOnDataPrefix verifies EPIPE on the
+// first "data: " write returns ErrClientAbort (issue #568).
+func TestStreamCachedArbiterSynthesisClientAbortOnDataPrefix(t *testing.T) {
+	w := newFailWriteRW(1, syscall.EPIPE)
+	err := streamCachedArbiterSynthesis(w, "test synthesis")
+	if !errors.Is(err, ErrClientAbort) {
+		t.Errorf("err = %v, want ErrClientAbort", err)
+	}
+}
+
+// TestStreamCachedArbiterSynthesisClientAbortOnJSONChunk verifies EPIPE on the
+// JSON chunk write returns ErrClientAbort (issue #568).
+func TestStreamCachedArbiterSynthesisClientAbortOnJSONChunk(t *testing.T) {
+	w := newFailWriteRW(2, syscall.EPIPE)
+	err := streamCachedArbiterSynthesis(w, "test synthesis")
+	if !errors.Is(err, ErrClientAbort) {
+		t.Errorf("err = %v, want ErrClientAbort", err)
+	}
+}
+
+// TestStreamCachedArbiterSynthesisClientAbortOnNewlineWrite verifies EPIPE on the
+// "\n\n" terminator write returns ErrClientAbort (issue #568).
+func TestStreamCachedArbiterSynthesisClientAbortOnNewlineWrite(t *testing.T) {
+	w := newFailWriteRW(3, syscall.EPIPE)
+	err := streamCachedArbiterSynthesis(w, "test synthesis")
+	if !errors.Is(err, ErrClientAbort) {
+		t.Errorf("err = %v, want ErrClientAbort", err)
+	}
+}
+
+// TestStreamCachedArbiterSynthesisNonAbortError verifies that non-abort errors
+// (like io.ErrShortWrite) are returned verbatim and NOT converted to ErrClientAbort
+// (issue #568).
+func TestStreamCachedArbiterSynthesisNonAbortError(t *testing.T) {
+	for _, failOn := range []int{1, 2, 3} {
+		w := newFailWriteRW(failOn, io.ErrShortWrite)
+		err := streamCachedArbiterSynthesis(w, "test synthesis")
+		if !errors.Is(err, io.ErrShortWrite) {
+			t.Errorf("write %d: err = %v, want io.ErrShortWrite", failOn, err)
+		}
+		if errors.Is(err, ErrClientAbort) {
+			t.Errorf("write %d: err is ErrClientAbort, want plain error", failOn)
+		}
+	}
+}
