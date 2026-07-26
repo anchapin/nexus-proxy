@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,7 +21,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// ragSchema is the v1 schema for the few-shot cache table. One row
+// ragSchema is the v2 schema for the few-shot cache table. One row
 // per indexed file; filename is the natural primary key because the
 // file watcher (issue #46) addresses rows by basename. The embedding
 // blob is a gob-encoded []float64 — no third-party serialization
@@ -29,33 +30,58 @@ import (
 // indexed_at is informational (helps operators see when a row was
 // last refreshed); the authoritative freshness signal is the file's
 // mtime, which the watcher compares against the directory listing.
+//
+// embedder_model and dims (issue #536) stamp each row with the
+// embedder model name and vector dimension at UPSERT time so Load
+// can detect a changed embedder and refuse to serve stale vectors.
 const ragSchema = `
 CREATE TABLE IF NOT EXISTS rag_examples (
     filename TEXT PRIMARY KEY,
     content TEXT NOT NULL,
     embedding BLOB NOT NULL,
-    indexed_at DATETIME NOT NULL
+    indexed_at DATETIME NOT NULL,
+    embedder_model TEXT NOT NULL DEFAULT '',
+    dims INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_rag_indexed_at ON rag_examples(indexed_at);
 `
 
 const ragUpsertSQL = `INSERT INTO rag_examples
-    (filename, content, embedding, indexed_at)
-    VALUES (?, ?, ?, ?)
+    (filename, content, embedding, indexed_at, embedder_model, dims)
+    VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(filename) DO UPDATE SET
         content = excluded.content,
         embedding = excluded.embedding,
-        indexed_at = excluded.indexed_at`
+        indexed_at = excluded.indexed_at,
+        embedder_model = excluded.embedder_model,
+        dims = excluded.dims`
 
 const ragDeleteSQL = `DELETE FROM rag_examples WHERE filename = ?`
 
-const ragSelectAllSQL = `SELECT filename, content, embedding, indexed_at
+const ragSelectAllSQL = `SELECT filename, content, embedding, indexed_at, embedder_model, dims
     FROM rag_examples ORDER BY filename`
 
 // ragOpTimeout bounds a single DB op. The table is small and the
 // read is one-shot on boot, so the timeout only guards a
 // pathological disk stall.
 const ragOpTimeout = 5 * time.Second
+
+var ragMigrations = []string{
+	`ALTER TABLE rag_examples ADD COLUMN embedder_model TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE rag_examples ADD COLUMN dims INTEGER NOT NULL DEFAULT 0`,
+}
+
+func runRAGMigrations(ctx context.Context, db *sql.DB) error {
+	for _, stmt := range ragMigrations {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			if strings.Contains(err.Error(), "duplicate column name") {
+				continue
+			}
+			return fmt.Errorf("rag: migrate: %w", err)
+		}
+	}
+	return nil
+}
 
 // PersistentStore is the SQLite-backed RAG store (issue #46). It
 // embeds *Store so the public retrieval API (Retrieve / Add / Size
@@ -72,8 +98,10 @@ type PersistentStore struct {
 	db   *sql.DB
 	path string
 
-	closeOnce sync.Once
-	closeErr  error
+	closeOnce     sync.Once
+	closeErr      error
+	embedderModel string
+	embedderDims  int
 }
 
 // OpenPersistentStore opens (creating on demand) the SQLite database
@@ -120,11 +148,23 @@ func OpenPersistentStore(path string, embedder Embedder, threshold float64) (*Pe
 		_ = db.Close()
 		return nil, fmt.Errorf("rag: create schema: %w", err)
 	}
+	if err := runRAGMigrations(context.Background(), db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("rag: run migrations: %w", err)
+	}
+
+	embedderModel := extractEmbedderModel(embedder)
+	var embedderDims int
+	if embedderModel != "" && embedderModel != "unknown" {
+		embedderDims, _ = probeEmbedderDims(context.Background(), embedder)
+	}
 
 	return &PersistentStore{
-		Store: NewStore(embedder, threshold),
-		db:    db,
-		path:  path,
+		Store:         NewStore(embedder, threshold),
+		db:            db,
+		path:          path,
+		embedderModel: embedderModel,
+		embedderDims:  embedderDims,
 	}, nil
 }
 
@@ -150,9 +190,10 @@ func (p *PersistentStore) Path() string { return p.path }
 // loaded. Ollama is not contacted — this is the headline win for
 // boot time on a populated cache.
 //
-// Callers should treat a Load error as fatal for the persistence
-// path (return to caller; main.go falls back to re-indexing) but the
-// store itself remains usable as an in-memory cache.
+// Mismatch detection (issue #536): if any stored row's embedder_model
+// or dims differs from the currently-configured embedder, the row is
+// treated as stale and the entire in-memory store is cleared. Callers
+// (LoadOrIndex) should treat n=0 after Load as a signal to re-index.
 func (p *PersistentStore) Load(ctx context.Context) (int, error) {
 	if p == nil || p.db == nil {
 		return 0, errors.New("rag: persistent store not opened")
@@ -168,14 +209,17 @@ func (p *PersistentStore) Load(ctx context.Context) (int, error) {
 
 	out := make([]FewShotExample, 0, 64)
 	var lastIndexedAt time.Time
+	var mismatch bool
 	for rows.Next() {
 		var (
-			name      string
-			content   string
-			embBlob   []byte
-			indexedAt time.Time
+			name        string
+			content     string
+			embBlob     []byte
+			indexedAt   time.Time
+			storedModel string
+			storedDims  int
 		)
-		if err := rows.Scan(&name, &content, &embBlob, &indexedAt); err != nil {
+		if err := rows.Scan(&name, &content, &embBlob, &indexedAt, &storedModel, &storedDims); err != nil {
 			return 0, fmt.Errorf("rag: scan %q: %w", name, err)
 		}
 		emb, err := decodeEmbedding(embBlob)
@@ -185,6 +229,25 @@ func (p *PersistentStore) Load(ctx context.Context) (int, error) {
 				slog.Any("err", err),
 			)
 			continue
+		}
+		if p.embedderModel != "" && p.embedderModel != "unknown" && storedModel != "" && storedModel != "unknown" && storedModel != p.embedderModel {
+			slog.Warn("rag: embedder model changed, clearing stale cache",
+				slog.String("filename", name),
+				slog.String("stored_model", storedModel),
+				slog.String("current_model", p.embedderModel),
+			)
+			mismatch = true
+			break
+		}
+		if p.embedderModel != "" && p.embedderModel != "unknown" && storedModel != "" && storedModel != "unknown" && p.embedderDims > 0 && storedDims > 0 && storedDims != p.embedderDims {
+			slog.Warn("rag: embedding dimension mismatch, clearing stale cache",
+				slog.String("filename", name),
+				slog.Int("stored_dims", storedDims),
+				slog.Int("current_dims", p.embedderDims),
+				slog.String("current_model", p.embedderModel),
+			)
+			mismatch = true
+			break
 		}
 		out = append(out, FewShotExample{
 			Filename:  name,
@@ -198,6 +261,11 @@ func (p *PersistentStore) Load(ctx context.Context) (int, error) {
 	if err := rows.Err(); err != nil {
 		return 0, fmt.Errorf("rag: iterate: %w", err)
 	}
+	slog.Debug("rag: Load done", slog.Int("out_len", len(out)), slog.Bool("mismatch", mismatch))
+	if mismatch {
+		p.replace(nil)
+		return 0, nil
+	}
 	p.replace(out)
 	if !lastIndexedAt.IsZero() {
 		p.markIndexed(lastIndexedAt)
@@ -209,6 +277,10 @@ func (p *PersistentStore) Load(ctx context.Context) (int, error) {
 // Load first; if the DB has zero rows, index the directory (which
 // embeds each file via Ollama and persists it via Upsert). Returns
 // the number of examples in memory after the operation.
+//
+// When Load detects a model/dimension mismatch (issue #536) it clears
+// the in-memory store and returns n=0, which triggers the IndexDir
+// fallthrough so stale embeddings are never served.
 func (p *PersistentStore) LoadOrIndex(ctx context.Context, dir string) (int, error) {
 	n, err := p.Load(ctx)
 	if err != nil {
@@ -336,7 +408,7 @@ func (p *PersistentStore) Upsert(ctx context.Context, ex FewShotExample) error {
 
 	indexedAt := time.Now().UTC()
 	if _, err := p.db.ExecContext(cctx, ragUpsertSQL,
-		ex.Filename, ex.Content, blob, indexedAt,
+		ex.Filename, ex.Content, blob, indexedAt, p.embedderModel, len(ex.Embedding),
 	); err != nil {
 		return fmt.Errorf("rag: upsert %q: %w", ex.Filename, err)
 	}
@@ -438,4 +510,40 @@ func chmodIfWider(path string, mode os.FileMode) {
 			slog.Any("err", err),
 		)
 	}
+}
+
+// extractEmbedderModel returns the model name from the embedder via
+// type assertion. Returns "unknown" when the concrete type is unknown
+// (test stubs). This is safe to call on nil embedders.
+func extractEmbedderModel(embedder Embedder) string {
+	if embedder == nil {
+		return "unknown"
+	}
+	switch e := embedder.(type) {
+	case *OllamaEmbedder:
+		return e.Model
+	case *OpenAIEmbedder:
+		return e.Model
+	case *CohereEmbedder:
+		return e.Model
+	case interface{ Model() string }:
+		return e.Model()
+	default:
+		return "unknown"
+	}
+}
+
+// probeEmbedderDims calls Embed with a probe string and returns the
+// resulting vector length. Returns 0 and nil error if the embedder
+// cannot be probed (e.g., stub in tests or unreachable server).
+// The probe result is not cached — callers only call this once at boot.
+func probeEmbedderDims(ctx context.Context, embedder Embedder) (int, error) {
+	if embedder == nil {
+		return 0, nil
+	}
+	vec, err := embedder.Embed(ctx, "nexus rag dimension probe")
+	if err != nil || len(vec) == 0 {
+		return 0, err
+	}
+	return len(vec), nil
 }

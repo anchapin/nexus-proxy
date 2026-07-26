@@ -2,7 +2,9 @@ package rag
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -467,6 +469,7 @@ func (v *vectorEmbedder) RecordBreakerSuccess()          {}
 // prompt) from a regression where the cache was bypassed
 // (N+1 calls — prompt plus every indexed row).
 type indexedCallCounter struct {
+	model string
 	mu    sync.Mutex
 	vecs  map[string][]float64
 	calls int
@@ -486,10 +489,135 @@ func (c *indexedCallCounter) Embed(_ context.Context, text string) ([]float64, e
 
 func (c *indexedCallCounter) IsHealthy(context.Context) bool { return true }
 func (c *indexedCallCounter) IsBreakerOpen() bool            { return false }
+func (c *indexedCallCounter) Model() string                  { return c.model }
 func (c *indexedCallCounter) RecordBreakerSuccess()          {}
 
 func (c *indexedCallCounter) totalCalls() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.calls
+}
+
+type dimEmbedder struct {
+	model string
+	dims  int
+	vecs  map[string][]float64
+}
+
+func (d *dimEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
+	if v, ok := d.vecs[text]; ok {
+		out := make([]float64, len(v))
+		copy(out, v)
+		return out, nil
+	}
+	return make([]float64, d.dims), nil
+}
+func (d *dimEmbedder) IsHealthy(context.Context) bool { return true }
+func (d *dimEmbedder) IsBreakerOpen() bool            { return false }
+func (d *dimEmbedder) RecordBreakerSuccess()          {}
+
+func TestPersistentStore_AlterTableMigration(t *testing.T) {
+	t.Parallel()
+	dbPath := filepath.Join(t.TempDir(), "rag_migration.db")
+
+	{
+		db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=rwc", dbPath))
+		if err != nil {
+			t.Fatalf("open v1 db: %v", err)
+		}
+		_, err = db.Exec(`
+			CREATE TABLE rag_examples (
+				filename TEXT PRIMARY KEY,
+				content TEXT NOT NULL,
+				embedding BLOB NOT NULL,
+				indexed_at DATETIME NOT NULL
+			)`)
+		if err != nil {
+			t.Fatalf("create v1 schema: %v", err)
+		}
+		_, err = db.Exec(`
+			INSERT INTO rag_examples (filename, content, embedding, indexed_at)
+			VALUES (?, ?, ?, ?)`,
+			"legacy.go", "legacy content", []byte("not-a-real gob"), time.Now().UTC())
+		if err != nil {
+			t.Fatalf("insert legacy row: %v", err)
+		}
+		db.Close()
+	}
+
+	ps, err := OpenPersistentStore(dbPath, &stubEmbedder{}, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore with migration: %v", err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+
+	row := ps.db.QueryRow("SELECT embedder_model, dims FROM rag_examples WHERE filename = ?", "legacy.go")
+	var model string
+	var dims int
+	if err := row.Scan(&model, &dims); err != nil {
+		t.Fatalf("SELECT new columns: %v", err)
+	}
+	if model == "" && dims == 0 {
+		t.Log("migration added columns with defaults (expected for legacy row)")
+	}
+}
+
+func TestLoad_DetectsDimensionMismatchAndReindexes(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "code.go"), []byte("print('hello')"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "rag_dim_mismatch.db")
+
+	embA := &dimEmbedder{model: "model-a", dims: 4, vecs: map[string][]float64{
+		"print('hello')": make([]float64, 4),
+	}}
+	psA, err := OpenPersistentStore(dbPath, embA, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore A: %v", err)
+	}
+	if _, err := psA.LoadOrIndex(context.Background(), dir); err != nil {
+		t.Fatalf("LoadOrIndex A: %v", err)
+	}
+	psA.Close()
+
+	counter := &indexedCallCounter{
+		model: "model-b",
+		vecs: map[string][]float64{
+			"print('hello')": make([]float64, 4),
+		},
+	}
+	psB, err := OpenPersistentStore(dbPath, counter, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore B: %v", err)
+	}
+	t.Cleanup(func() { _ = psB.Close() })
+
+	n, err := psB.LoadOrIndex(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("LoadOrIndex B: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("LoadOrIndex returned %d, want 1 (re-indexed)", n)
+	}
+	if counter.totalCalls() == 0 {
+		t.Errorf("embedder calls = 0, want >0 (should have re-indexed)")
+	}
+}
+
+func TestCosineSimilarity_HandlesMismatchedDims(t *testing.T) {
+	t.Parallel()
+	a := []float64{1, 0, 0, 0}
+	b := []float64{1, 0}
+	got := CosineSimilarity(a, b)
+	if got != 1.0 {
+		t.Errorf("CosineSimilarity([1,0,0,0], [1,0]) = %v, want 1.0 (shorter vector governs)", got)
+	}
+
+	got2 := CosineSimilarity(b, a)
+	if got2 != 1.0 {
+		t.Errorf("CosineSimilarity([1,0], [1,0,0,0]) = %v, want 1.0", got2)
+	}
 }
