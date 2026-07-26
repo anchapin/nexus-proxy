@@ -289,7 +289,8 @@ func readFreeVRAMBytes(sysfsRoot string) (int64, error) {
 		seen = true
 	}
 	if !seen {
-		return 0, fmt.Errorf("probe: no AMD sysfs nodes under %s", driPath)
+		slog.Info("probe: no AMD GPU nodes found under /sys/class/dri — is an AMD GPU present?")
+		return 0, nil
 	}
 	return total - used, nil
 }
