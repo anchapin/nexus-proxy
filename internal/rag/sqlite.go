@@ -156,7 +156,21 @@ func OpenPersistentStore(path string, embedder Embedder, threshold float64) (*Pe
 	embedderModel := extractEmbedderModel(embedder)
 	var embedderDims int
 	if embedderModel != "" && embedderModel != "unknown" {
-		embedderDims, _ = probeEmbedderDims(context.Background(), embedder)
+		dims, probeErr := probeEmbedderDims(context.Background(), embedder)
+		embedderDims = dims
+		if probeErr != nil {
+			// Issue #593: surface the probe failure instead of
+			// silently discarding it. embedderDims stays 0, so the
+			// per-row dimension check in Load cannot fire — Load
+			// falls back to model-name-based mismatch detection
+			// (issue #536) to avoid serving stale vectors. The WARN
+			// tells operators dimension validation is degraded.
+			slog.Warn("rag: embedder dimension probe failed at boot; dimension validation degraded to model-name check",
+				slog.String("embedder", embedderURL(embedder)),
+				slog.String("model", embedderModel),
+				slog.Any("err", probeErr),
+			)
+		}
 	}
 
 	return &PersistentStore{
@@ -184,6 +198,19 @@ func ragDSN(path string) string {
 // Path returns the on-disk path the store was opened with. Empty for
 // ":memory:" stores.
 func (p *PersistentStore) Path() string { return p.path }
+
+// EmbedderDims reports the embedder vector dimension probed at boot
+// and whether it is usable for per-row validation. Returns 0,false
+// when the probe failed (embedder unreachable at boot) or the
+// embedder model is unknown (issue #593). Operators can inspect this
+// via /status to detect when dimension validation was skipped; in
+// that state Load falls back to model-name-based mismatch detection.
+func (p *PersistentStore) EmbedderDims() (int, bool) {
+	if p == nil {
+		return 0, false
+	}
+	return p.embedderDims, p.embedderDims > 0
+}
 
 // Load reads every row from the DB and replaces the in-memory
 // examples slice in a single atomic swap. Returns the number of rows
@@ -515,7 +542,12 @@ func chmodIfWider(path string, mode os.FileMode) {
 // extractEmbedderModel returns the model name from the embedder via
 // type assertion. Returns "unknown" when the concrete type is unknown
 // (test stubs). This is safe to call on nil embedders.
+//
+// EmbedCache (issue #115/#303) is unwrapped first so model extraction
+// — and therefore the boot-time dimension probe — works in the common
+// cache-enabled configuration (issue #593).
 func extractEmbedderModel(embedder Embedder) string {
+	embedder = unwrapEmbedder(embedder)
 	if embedder == nil {
 		return "unknown"
 	}
@@ -531,6 +563,45 @@ func extractEmbedderModel(embedder Embedder) string {
 	default:
 		return "unknown"
 	}
+}
+
+// embedderURL returns the base URL of the embedder for diagnostic
+// logging (issue #593). Returns "" for stubs/unknown types.
+func embedderURL(embedder Embedder) string {
+	embedder = unwrapEmbedder(embedder)
+	if embedder == nil {
+		return ""
+	}
+	switch e := embedder.(type) {
+	case *OllamaEmbedder:
+		return e.BaseURL
+	case *OpenAIEmbedder:
+		return e.BaseURL
+	case *CohereEmbedder:
+		return e.BaseURL
+	case interface{ URL() string }:
+		return e.URL()
+	default:
+		return ""
+	}
+}
+
+// unwrapEmbedder peels off EmbedCache (and any other wrapper that
+// exposes an Unwrap method) so introspection reaches the concrete
+// provider.
+func unwrapEmbedder(embedder Embedder) Embedder {
+	for embedder != nil {
+		if c, ok := embedder.(*EmbedCache); ok {
+			embedder = c.inner
+			continue
+		}
+		if u, ok := embedder.(interface{ Unwrap() Embedder }); ok {
+			embedder = u.Unwrap()
+			continue
+		}
+		break
+	}
+	return embedder
 }
 
 // probeEmbedderDims calls Embed with a probe string and returns the

@@ -1,12 +1,16 @@
 package rag
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,6 +27,14 @@ func newTestPersistentStore(t *testing.T) *PersistentStore {
 	}
 	t.Cleanup(func() { _ = ps.Close() })
 	return ps
+}
+
+// logOutput redirects slog's default logger into w and returns the
+// previous logger so callers can restore it via slog.SetDefault.
+func logOutput(w io.Writer) *slog.Logger {
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	return prev
 }
 
 func TestOpenPersistentStoreRejectsEmptyPath(t *testing.T) {
@@ -515,6 +527,7 @@ func (d *dimEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
 func (d *dimEmbedder) IsHealthy(context.Context) bool { return true }
 func (d *dimEmbedder) IsBreakerOpen() bool            { return false }
 func (d *dimEmbedder) RecordBreakerSuccess()          {}
+func (d *dimEmbedder) Model() string                  { return d.model }
 
 func TestPersistentStore_AlterTableMigration(t *testing.T) {
 	t.Parallel()
@@ -619,5 +632,156 @@ func TestCosineSimilarity_HandlesMismatchedDims(t *testing.T) {
 	got2 := CosineSimilarity(b, a)
 	if got2 != 1.0 {
 		t.Errorf("CosineSimilarity([1,0], [1,0,0,0]) = %v, want 1.0", got2)
+	}
+}
+
+// modelErrEmbedder reports a known model name (so extractEmbedderModel
+// returns it and the boot-time probe is attempted) but always fails
+// Embed, simulating an unreachable embedder at boot (issue #593).
+type modelErrEmbedder struct {
+	model string
+	err   error
+}
+
+func (m *modelErrEmbedder) Embed(context.Context, string) ([]float64, error) {
+	return nil, m.err
+}
+func (m *modelErrEmbedder) IsHealthy(context.Context) bool { return false }
+func (m *modelErrEmbedder) IsBreakerOpen() bool            { return false }
+func (m *modelErrEmbedder) RecordBreakerSuccess()          {}
+func (m *modelErrEmbedder) Model() string                  { return m.model }
+
+// TestOpenPersistentStore_ProbeFailureLogged verifies that when the
+// embedder is unreachable at boot, the probeEmbedderDims error is
+// surfaced as a WARN (issue #593) instead of being silently
+// discarded, and EmbedderDims() reports the probe as unavailable.
+func TestOpenPersistentStore_ProbeFailureLogged(t *testing.T) {
+	t.Parallel()
+
+	// Capture slog output so we can assert the WARN was emitted.
+	var buf bytes.Buffer
+	prev := logOutput(&buf)
+	defer slog.SetDefault(prev)
+
+	ps, err := OpenPersistentStore(":memory:",
+		&modelErrEmbedder{model: "unreachable-model", err: errors.New("connection refused")},
+		0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+
+	// Issue #593 acceptance: embedderDims=0, probe marked unusable.
+	if dims, ok := ps.EmbedderDims(); ok || dims != 0 {
+		t.Errorf("EmbedderDims() = (%d, %v), want (0, false) after probe failure", dims, ok)
+	}
+
+	logged := buf.String()
+	for _, want := range []string{"probe failed", "unreachable-model", "connection refused"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("log missing %q; got:\n%s", want, logged)
+		}
+	}
+}
+
+// TestLoad_ProbeFailedStillDetectsModelMismatch verifies the
+// issue #593 recovery path: when the probe failed at boot (so
+// embedderDims=0 and the per-row dimension check cannot fire), Load
+// still clears the cache via the model-name mismatch check when
+// stored rows were stamped with a different model. This prevents
+// stale embeddings from being served while the embedder is down.
+func TestLoad_ProbeFailedStillDetectsModelMismatch(t *testing.T) {
+	t.Parallel()
+	dbPath := filepath.Join(t.TempDir(), "rag_probe.db")
+
+	// Phase 1: index with model-a so rows are stamped on disk.
+	seedEmb := &dimEmbedder{model: "model-a", dims: 4, vecs: map[string][]float64{
+		"snippet": make([]float64, 4),
+	}}
+	psA, err := OpenPersistentStore(dbPath, seedEmb, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore A: %v", err)
+	}
+	ctx := context.Background()
+	if err := psA.Upsert(ctx, FewShotExample{
+		Filename:  "code.go",
+		Content:   "snippet",
+		Embedding: make([]float64, 4),
+	}); err != nil {
+		t.Fatalf("seed Upsert: %v", err)
+	}
+	if err := psA.Close(); err != nil {
+		t.Fatalf("close A: %v", err)
+	}
+
+	// Phase 2: reopen with a different model whose probe FAILS
+	// (embedder unreachable). embedderDims will be 0, so only the
+	// model-name check can catch the drift.
+	failing := &modelErrEmbedder{model: "model-b", err: errors.New("unreachable")}
+	psB, err := OpenPersistentStore(dbPath, failing, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore B: %v", err)
+	}
+	t.Cleanup(func() { _ = psB.Close() })
+
+	// EmbedderDims must report unavailable (probe failed).
+	if _, ok := psB.EmbedderDims(); ok {
+		t.Fatal("EmbedderDims() ok=true, want false (probe failed)")
+	}
+
+	n, err := psB.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// The model-name mismatch should have cleared the store so
+	// stale vectors are not served.
+	if n != 0 {
+		t.Errorf("Load returned %d rows, want 0 (model mismatch cleared cache)", n)
+	}
+	if psB.Size() != 0 {
+		t.Errorf("Size after mismatch Load = %d, want 0", psB.Size())
+	}
+}
+
+// TestExtractEmbedderModel_UnwrapsEmbedCache ensures the boot-time
+// probe and model stamping work in the cache-enabled production path
+// (issue #593), where the embedder is wrapped in an EmbedCache.
+func TestExtractEmbedderModel_UnwrapsEmbedCache(t *testing.T) {
+	t.Parallel()
+
+	inner := &OllamaEmbedder{BaseURL: "http://localhost:11434", Model: "nomic-embed-text"}
+	wrapped := NewEmbedCache(inner, 8, time.Minute)
+
+	if got := extractEmbedderModel(wrapped); got != "nomic-embed-text" {
+		t.Errorf("extractEmbedderModel(EmbedCache) = %q, want %q", got, "nomic-embed-text")
+	}
+	if got := embedderURL(wrapped); got != "http://localhost:11434" {
+		t.Errorf("embedderURL(EmbedCache) = %q, want %q", got, "http://localhost:11434")
+	}
+
+	// Unwrapping a bare embedder is a no-op.
+	if got := extractEmbedderModel(inner); got != "nomic-embed-text" {
+		t.Errorf("extractEmbedderModel(bare) = %q, want %q", got, "nomic-embed-text")
+	}
+	// Unknown/stub types degrade gracefully.
+	if got := extractEmbedderModel(&stubEmbedder{}); got != "unknown" {
+		t.Errorf("extractEmbedderModel(stub) = %q, want %q", got, "unknown")
+	}
+	if got := embedderURL(&stubEmbedder{}); got != "" {
+		t.Errorf("embedderURL(stub) = %q, want empty", got)
+	}
+}
+
+// TestEmbedderDims_HealthyProbe reports the probed dimension when the
+// embedder is reachable at boot.
+func TestEmbedderDims_HealthyProbe(t *testing.T) {
+	t.Parallel()
+	ps, err := OpenPersistentStore(":memory:", &dimEmbedder{model: "ok-model", dims: 768}, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+	if dims, ok := ps.EmbedderDims(); !ok || dims != 768 {
+		t.Errorf("EmbedderDims() = (%d, %v), want (768, true)", dims, ok)
 	}
 }
