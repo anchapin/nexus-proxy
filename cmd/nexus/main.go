@@ -240,12 +240,14 @@ func main() {
 	// missing probe never opens the floodgates. The closure reads
 	// probeMgr directly so the limiter never imports internal/probe.
 	var localLimiter handlers.LocalLimiter
+	var localConcLimiter *concurrencylimit.Limiter
 	if cfg.LocalMaxConcurrent > 0 {
-		localLimiter = concurrencylimit.New(
+		localConcLimiter = concurrencylimit.New(
 			cfg.LocalMaxConcurrent,
 			cfg.LocalVRAMBytesPerSlot,
 			func() int64 { return probeMgr.Get().FreeVRAMBytes },
 		)
+		localLimiter = localConcLimiter
 		slog.Info("local-route concurrency limiter enabled",
 			slog.Int("ceiling", cfg.LocalMaxConcurrent),
 			slog.Int64("bytes_per_slot", cfg.LocalVRAMBytesPerSlot),
@@ -684,6 +686,15 @@ func main() {
 				Name:  "nexus_tracing_flush_failures_total",
 				Value: float64(tracing.GlobalExporter().FlushFailures()),
 			}}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			if localConcLimiter == nil {
+				return nil
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_local_concurrency_effective_slots", Value: float64(localConcLimiter.Effective())},
+				{Name: "nexus_local_concurrency_in_flight", Value: float64(localConcLimiter.InFlight())},
+			}
 		}),
 	)
 

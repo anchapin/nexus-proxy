@@ -1,8 +1,11 @@
 package observability
 
 import (
+	"context"
 	"strings"
 	"testing"
+
+	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
 )
 
 // TestRenderPrometheusHasRequiredMetrics asserts every metric named in
@@ -485,5 +488,45 @@ func TestRenderPrometheusRAGSimilarityEmpty(t *testing.T) {
 	out := sb.String()
 	if strings.Contains(out, "nexus_rag_similarity_histogram") {
 		t.Errorf("fresh collector should not emit nexus_rag_similarity_histogram header; got:\n%s", out)
+	}
+}
+
+// TestRenderPrometheusLocalConcurrencyGauges (issue #487) drives a real
+// concurrencylimit.Limiter to in_flight=1 and asserts both local-route
+// concurrency gauges render with correct HELP/TYPE headers and values.
+func TestRenderPrometheusLocalConcurrencyGauges(t *testing.T) {
+	c := NewCollector()
+	limiter := concurrencylimit.New(2, 1<<30, func() int64 { return 8 << 30 })
+
+	// Acquire one slot so in_flight=1; do not release until after render.
+	release, err := limiter.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	defer release()
+
+	provider := GaugeProviderFunc(func() []GaugeSample {
+		return []GaugeSample{
+			{Name: "nexus_local_concurrency_effective_slots", Value: float64(limiter.Effective())},
+			{Name: "nexus_local_concurrency_in_flight", Value: float64(limiter.InFlight())},
+		}
+	})
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c, provider)
+	out := sb.String()
+
+	wantLines := []string{
+		"# HELP nexus_local_concurrency_effective_slots",
+		"# TYPE nexus_local_concurrency_effective_slots gauge",
+		"nexus_local_concurrency_effective_slots 2",
+		"# HELP nexus_local_concurrency_in_flight",
+		"# TYPE nexus_local_concurrency_in_flight gauge",
+		"nexus_local_concurrency_in_flight 1",
+	}
+	for _, want := range wantLines {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q\n--- output ---\n%s", want, out)
+		}
 	}
 }
