@@ -550,3 +550,136 @@ func TestBudgetString(t *testing.T) {
 		t.Errorf("budget string = %q, want tokens+source substrings", got)
 	}
 }
+
+// ---------------------------------------------------------------------
+// ChatModel filtering (issue #490)
+// ---------------------------------------------------------------------
+
+// TestOllamaProbeChatModelFiltersOutEmbedder verifies the core fix:
+// when an embedding model (nomic-embed-text, 8192) is resident
+// alongside the chat model (qwen3-coder:4b, 32768), scoping the probe
+// to the chat model yields the chat model's real context window
+// instead of the embedder's smaller one.
+func TestOllamaProbeChatModelFiltersOutEmbedder(t *testing.T) {
+	srv := psServer(t, 0, []psModel{
+		{name: "nomic-embed-text", contextLength: 8192},
+		{name: "qwen3-coder:4b", contextLength: 32768},
+	})
+	defer srv.Close()
+	dir := t.TempDir() // no sysfs → signal degenerates to PS only
+	p := NewOllamaProbe(srv.URL, srv.Client())
+	p.SysfsRoot = dir
+	p.ChatModel = "qwen3-coder:4b"
+
+	b, err := p.Budget(context.Background())
+	if err != nil {
+		t.Fatalf("Budget: %v", err)
+	}
+	if b.Tokens != 32768 {
+		t.Errorf("tokens = %d, want 32768 (chat model context, not embedder's 8192)", b.Tokens)
+	}
+	if b.ModelContext != 32768 {
+		t.Errorf("model context = %d, want 32768", b.ModelContext)
+	}
+}
+
+// TestOllamaProbeChatModelEmptyKeepsLegacyMin verifies the
+// backwards-compat path: with ChatModel unset the probe still picks
+// the smallest context across every loaded model.
+func TestOllamaProbeChatModelEmptyKeepsLegacyMin(t *testing.T) {
+	srv := psServer(t, 0, []psModel{
+		{name: "nomic-embed-text", contextLength: 8192},
+		{name: "qwen3-coder:4b", contextLength: 32768},
+	})
+	defer srv.Close()
+	dir := t.TempDir()
+	p := NewOllamaProbe(srv.URL, srv.Client())
+	p.SysfsRoot = dir
+	// ChatModel intentionally left empty → legacy min-across-all.
+
+	b, err := p.Budget(context.Background())
+	if err != nil {
+		t.Fatalf("Budget: %v", err)
+	}
+	if b.Tokens != 8192 {
+		t.Errorf("tokens = %d, want 8192 (legacy smallest-across-all)", b.Tokens)
+	}
+	if b.ModelContext != 8192 {
+		t.Errorf("model context = %d, want 8192", b.ModelContext)
+	}
+}
+
+// TestOllamaProbeChatModelNotResidentReturnsError verifies that when
+// ChatModel is set but no matching model is resident,
+// fetchModelContext surfaces an error so Budget falls through to the
+// static fallback rather than silently adopting an embedder context.
+func TestOllamaProbeChatModelNotResidentReturnsError(t *testing.T) {
+	srv := psServer(t, 0, []psModel{
+		{name: "nomic-embed-text", contextLength: 8192},
+	})
+	defer srv.Close()
+	dir := t.TempDir()
+	// Provide sysfs so Budget does not fail with ErrNoSignal — instead
+	// it should produce a sysfs-only budget while the model-context
+	// signal is treated as unavailable.
+	writeAMDNode(t, dir, int64(8)<<30, int64(2)<<30)
+
+	p := NewOllamaProbe(srv.URL, srv.Client())
+	p.SysfsRoot = dir
+	p.ChatModel = "qwen3-coder:4b" // not in the resident list
+
+	b, err := p.Budget(context.Background())
+	// sysfs is available, so Budget succeeds with a sysfs-only budget
+	// and the chat-context error is consumed internally.
+	if err != nil {
+		t.Fatalf("Budget: %v (expected sysfs-only fallback)", err)
+	}
+	if b.Source != SourceSysfs {
+		t.Errorf("source = %q, want %q (sysfs-only fallback)", b.Source, SourceSysfs)
+	}
+	if b.ModelContext != 0 {
+		t.Errorf("model context = %d, want 0 (chat model not resident)", b.ModelContext)
+	}
+}
+
+// TestOllamaProbeChatModelNotResidentBothDownIsErrNoSignal confirms
+// that when ChatModel is set, no matching model is resident, AND sysfs
+// is also unavailable, Budget returns ErrNoSignal so the caller falls
+// all the way back to the static guardrail.
+func TestOllamaProbeChatModelNotResidentBothDownIsErrNoSignal(t *testing.T) {
+	srv := psServer(t, 0, []psModel{
+		{name: "nomic-embed-text", contextLength: 8192},
+	})
+	defer srv.Close()
+	p := NewOllamaProbe(srv.URL, srv.Client())
+	p.SysfsRoot = t.TempDir() // no sysfs nodes
+	p.ChatModel = "qwen3-coder:4b"
+
+	_, err := p.Budget(context.Background())
+	if !errors.Is(err, ErrNoSignal) {
+		t.Errorf("got %v, want ErrNoSignal", err)
+	}
+}
+
+// TestModelMatchesChat covers the matcher helper directly.
+func TestModelMatchesChat(t *testing.T) {
+	cases := []struct {
+		loaded, chat string
+		want         bool
+	}{
+		{"qwen3-coder:4b", "qwen3-coder:4b", true},
+		{"qwen3-coder:4b-q8_0", "qwen3-coder:4b", false}, // strict equality; variant must set LocalModel exactly
+		{"nomic-embed-text", "qwen3-coder:4b", false},
+		{"qwen3-coder", "qwen3-coder:4b", false},
+		{"qwen3-coder:8b", "qwen3-coder:4b", false},
+		{"qwen3", "qwen3-coder:4b", false},
+		{"", "qwen3-coder:4b", false},
+		{"qwen3-coder:4b", "", false},
+	}
+	for _, tc := range cases {
+		got := modelMatchesChat(tc.loaded, tc.chat)
+		if got != tc.want {
+			t.Errorf("modelMatchesChat(%q,%q) = %v, want %v", tc.loaded, tc.chat, got, tc.want)
+		}
+	}
+}

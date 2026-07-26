@@ -23,6 +23,7 @@ For environment-variable reference see `.env.example` and
 | ----- | ------- |
 | **Ollama health circuit breaker tripped** | `NEXUS_HEALTH_BREAKER_THRESHOLD` (default 3) consecutive failed probes trips the breaker. `RouteLocal` transparently reroutes to frontier; the local panel member of `RouteFusion` is skipped. |
 | **Local cooldown window active** | After a cascade detects an Ollama failure and falls back, a short cooldown (`NEXUS_LOCAL_COOLDOWN`, default 10 s) arms so subsequent requests skip local immediately. The response carries `X-Nexus-Local-Cooldown: true`. |
+| **Chat model not resident (probe scoped)** | When a resident embedding model (e.g. `nomic-embed-text`, 8192 ctx) would otherwise shrink the guardrail, the VRAM probe scopes its `/api/ps` read to `NEXUS_LOCAL_MODEL`; if that model is not loaded the budget falls back to the static guardrail and large prompts route to frontier. Confirm with `ollama ps` that the chat model is loaded. |
 
 ### Diagnosis
 
