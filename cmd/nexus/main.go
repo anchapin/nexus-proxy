@@ -734,6 +734,13 @@ func main() {
 	panelPanicObs := func() {
 		routeCounters.ObservePanelPanic()
 	}
+	// Prompt-injection hit observer (issue #482). The chat handler calls
+	// this once per request that produced >=1 suspicious-pattern hit,
+	// forwarding the injection mode ("warn" or "strict") so the
+	// nexus_prompt_injection_hits_total{mode} counter can be alerted on.
+	injectionHitObs := func(mode string) {
+		routeCounters.ObservePromptInjectionHit(mode)
+	}
 	// Arbiter synthesis cache (issue #232). Created when TTL > 0;
 	// nil means caching is disabled.
 	var arbiterCache *upstream.ArbiterCache
@@ -855,6 +862,7 @@ func main() {
 		CascadeFallbackObserver: cascadeFallbackObs,
 		ArbiterCacheObserver:    arbiterCacheObserver,
 		PanelPanicObserver:      panelPanicObs,
+		InjectionHitObserver:    injectionHitObs,
 		CircuitBreakerObserver:  circuitBreakerObs,
 		ArbiterCache:            arbiterCache,
 		Providers:               providerRegistry,
