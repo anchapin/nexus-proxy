@@ -4,10 +4,12 @@
 # Produces:
 #   - Cross-compiled binaries (linux/amd64, linux/arm64, darwin/arm64,
 #     windows/amd64)
-#   - SHA256 checksums file
+#   - Per-binary SBOM (SPDX JSON via syft) — one per cross-compiled binary
+#     so binary-only operators have a component inventory (issue #585)
+#   - SHA256 checksums file (covers binaries + their SBOMs)
 #   - GitHub Release with all artifacts attached
 #   - Multi-arch (amd64 + arm64) GHCR image
-#   - SBOM (SPDX JSON) attached to the release
+#   - Source-level SBOM (SPDX JSON) attached to the release
 #   - Keyless cosign signature on the image (requires OIDC permissions)
 #
 # workflow_dispatch lets operators smoke-test the full pipeline from the
@@ -126,9 +128,35 @@ jobs:
           build_one darwin  arm64 "nexus-${VERSION}-darwin-arm64"
           build_one windows amd64 "nexus-${VERSION}-windows-amd64.exe"
 
+      - name: Install syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Generate per-binary SBOM (SPDX JSON)
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          # syft reads the Go module list from the runtime.buildinfo
+          # section embedded by the toolchain, which survives the
+          # -s -w -trimpath flags used above. Each binary gets its own
+          # SPDX JSON so binary-only operators have a complete component
+          # inventory without pulling the container image (issue #585).
+          for bin in nexus-${VERSION}-linux-amd64 \
+                     nexus-${VERSION}-linux-arm64 \
+                     nexus-${VERSION}-darwin-arm64; do
+            echo "::group::SBOM for ${bin}"
+            syft packages "${bin}" -o spdx-json="${bin}.spdx.json"
+            echo "::endgroup::"
+          done
+
       - name: Generate SHA256 checksums
         working-directory: dist
         run: |
+          # Covers binaries AND their per-binary SBOMs (the nexus-* glob
+          # matches both), satisfying the checksum contract in #585.
           sha256sum nexus-* > checksums-sha256.txt
           echo "Checksums:"
           cat checksums-sha256.txt
@@ -322,8 +350,11 @@ jobs:
             | `nexus-*-linux-arm64` | Linux ARM64 binary |
             | `nexus-*-darwin-arm64` | macOS Apple Silicon binary |
             | `nexus-*-windows-amd64.exe` | Windows x86_64 binary |
-            | `checksums-sha256.txt` | SHA256 checksums for all binaries |
-            | `*-sbom.spdx.json` | SPDX SBOM |
+            | `nexus-*-linux-amd64.spdx.json` | Per-binary SBOM (SPDX JSON) — Linux x86_64 |
+            | `nexus-*-linux-arm64.spdx.json` | Per-binary SBOM (SPDX JSON) — Linux ARM64 |
+            | `nexus-*-darwin-arm64.spdx.json` | Per-binary SBOM (SPDX JSON) — macOS Apple Silicon |
+            | `checksums-sha256.txt` | SHA256 checksums for binaries + SBOMs |
+            | `*-sbom.spdx.json` | Source-level SPDX SBOM |
 
             ## Verify
 
