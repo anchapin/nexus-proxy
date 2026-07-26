@@ -21,6 +21,21 @@ func TestCategorize(t *testing.T) {
 		{"arch-word", "review the architectural design of this module", CategoryArchitecture},
 		{"boilerplate", "generate the CRUD boilerplate for this model", CategoryBoilerplate},
 		{"documentation", "write a docstring for this method", CategoryDocumentation},
+		// New categories from issue #528
+		{"testing_unit_test", "generate unit tests for the auth module", CategoryTesting},
+		{"testing_test_case", "write a test case for the login function", CategoryTesting},
+		{"testing_coverage", "run test coverage on the new feature", CategoryTesting},
+		{"testing_mock", "add mocks for the database calls", CategoryTesting},
+		{"testing_fixture", "set up test fixtures for the API", CategoryTesting},
+		{"security_scan", "run a security scan on the input handler", CategorySecurity},
+		{"security_vulnerability", "check for SQL injection vulnerabilities", CategorySecurity},
+		{"security_xss", "prevent XSS attacks in the template", CategorySecurity},
+		{"security_owasp", "follow owasp best practices for auth", CategorySecurity},
+		{"data_sql_query", "optimize this SQL query for the users table", CategoryData},
+		{"data_database", "design the database schema for orders", CategoryData},
+		{"data_migration", "write a migration to add the audit column", CategoryData},
+		{"data_json", "parse json from the webhook payload", CategoryData},
+		// Existing uncategorized
 		{"other", "what is the capital of France", CategoryOther},
 		{"empty", "", CategoryOther},
 	}
