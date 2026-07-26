@@ -700,6 +700,15 @@ func main() {
 				Value: float64(tracing.GlobalExporter().FlushFailures()),
 			}}
 		}),
+		// Tracing queue-depth gauge (issue #596). Exposes the live
+		// number of spans buffered in the export queue so operators
+		// can alert on exporter saturation before spans are dropped.
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			return []observability.GaugeSample{{
+				Name:  "nexus_tracing_queue_depth",
+				Value: float64(tracing.GlobalExporter().QueueDepth()),
+			}}
+		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
 			if localConcLimiter == nil {
 				return nil

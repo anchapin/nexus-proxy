@@ -2,6 +2,9 @@ package observability
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +12,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
 	"github.com/anchapin/nexus-proxy/internal/router"
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
 // TestRenderPrometheusHasRequiredMetrics asserts every metric named in
@@ -181,6 +185,129 @@ func TestRenderPrometheusDroppedCounterType(t *testing.T) {
 	}
 	if !strings.Contains(out, "# TYPE nexus_metrics_dropped_total counter") {
 		t.Errorf("metrics_dropped_total not typed counter\n%s", out)
+	}
+}
+
+// TestRenderPrometheusTracingQueueDepthGauge (issue #596) verifies the
+// nexus_tracing_queue_depth gauge is registered with type "gauge" and a
+// HELP line, and that a supplied queue-depth value flows through to the
+// rendered output. This is the registry/render contract; the end-to-end
+// exporter → gauge wiring is covered by the tracing package.
+func TestRenderPrometheusTracingQueueDepthGauge(t *testing.T) {
+	c := NewCollector()
+	provider := GaugeProviderFunc(func() []GaugeSample {
+		return []GaugeSample{
+			{Name: "nexus_tracing_queue_depth", Value: 0},
+		}
+	})
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c, provider)
+	out := sb.String()
+
+	if !strings.Contains(out, "# HELP nexus_tracing_queue_depth ") {
+		t.Errorf("tracing_queue_depth HELP line missing\n%s", out)
+	}
+	if !strings.Contains(out, "# TYPE nexus_tracing_queue_depth gauge") {
+		t.Errorf("tracing_queue_depth not typed gauge\n%s", out)
+	}
+	if !strings.Contains(out, "nexus_tracing_queue_depth 0") {
+		t.Errorf("tracing_queue_depth value 0 missing\n%s", out)
+	}
+
+	// A non-zero value (saturated buffer) must render identically.
+	sb.Reset()
+	provider = GaugeProviderFunc(func() []GaugeSample {
+		return []GaugeSample{{Name: "nexus_tracing_queue_depth", Value: 42}}
+	})
+	RenderPrometheus(&sb, c, provider)
+	if !strings.Contains(sb.String(), "nexus_tracing_queue_depth 42") {
+		t.Errorf("tracing_queue_depth value 42 missing\n%s", sb.String())
+	}
+}
+
+// TestRenderPrometheusTracingQueueDepthLiveExporter (issue #596) wires a
+// real tracing.Exporter through the same GaugeProviderFunc closure shape
+// that cmd/nexus/main.go uses and asserts the gauge reads 0 on a fresh
+// exporter, then rises above zero once spans accumulate in the buffer
+// while the collector hangs (consumer parked in a blocking flush).
+func TestRenderPrometheusTracingQueueDepthLiveExporter(t *testing.T) {
+	release := make(chan struct{})
+	flushStarted := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case flushStarted <- struct{}{}:
+		default:
+		}
+		<-release // park the consumer so subsequent submits buffer up.
+		w.WriteHeader(http.StatusOK)
+	}))
+	e := tracing.NewExporter(tracing.ExporterConfig{
+		Endpoint:  srv.URL,
+		QueueSize: 128,
+	})
+	// Deterministic teardown: unblock the collector first so the
+	// exporter's blocked flush completes, then drain/close exporter,
+	// then stop the test server.
+	t.Cleanup(func() {
+		close(release)
+		if err := e.Close(); err != nil {
+			t.Errorf("exporter close: %v", err)
+		}
+		srv.Close()
+	})
+
+	// Gauge provider closure, identical in shape to cmd/nexus/main.go.
+	provider := GaugeProviderFunc(func() []GaugeSample {
+		return []GaugeSample{{
+			Name:  "nexus_tracing_queue_depth",
+			Value: float64(e.QueueDepth()),
+		}}
+	})
+	render := func() string {
+		var sb strings.Builder
+		RenderPrometheus(&sb, NewCollector(), provider)
+		return sb.String()
+	}
+
+	// Fresh exporter: no spans submitted, gauge must read 0.
+	if out := render(); !strings.Contains(out, "nexus_tracing_queue_depth 0") {
+		t.Fatalf("fresh exporter gauge not 0\n%s", out)
+	}
+
+	// Fill the first batch (batchCap=64) so the export goroutine enters
+	// flush() and blocks on the hanging collector. This parks the only
+	// consumer, so further submits accumulate in the queue channel.
+	for i := 0; i < 64; i++ {
+		e.Submit(&tracing.Span{
+			TraceID: tracing.NewTraceID(),
+			SpanID:  tracing.NewSpanID(),
+			Name:    "warm",
+		})
+	}
+	select {
+	case <-flushStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the first flush to reach the collector")
+	}
+
+	// Consumer is blocked; submit more spans that pile up in the buffer.
+	const queued = 10
+	for i := 0; i < queued; i++ {
+		e.Submit(&tracing.Span{
+			TraceID: tracing.NewTraceID(),
+			SpanID:  tracing.NewSpanID(),
+			Name:    "queued",
+		})
+	}
+
+	depth := e.QueueDepth()
+	if depth == 0 {
+		t.Fatalf("expected buffered spans, QueueDepth=0")
+	}
+	out := render()
+	if !strings.Contains(out, fmt.Sprintf("nexus_tracing_queue_depth %d", depth)) {
+		t.Errorf("gauge does not reflect live queue depth %d\n%s", depth, out)
 	}
 }
 
