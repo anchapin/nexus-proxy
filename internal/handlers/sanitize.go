@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"strconv"
 	"strings"
 )
 
@@ -17,7 +18,13 @@ const MaxHeaderValue = 128
 //   - strips CR and LF (header injection prevention);
 //   - collapses other control characters to spaces;
 //   - trims leading/trailing whitespace;
-//   - truncates to MaxHeaderValue runes.
+//   - truncates to MaxHeaderValue runes, appending a trailing
+//     "...(+N)" marker when truncation occurs (issue #494), where N is
+//     the count of dropped runes. The marker is consistent with the
+//     TruncateForDebug precedent so operators can tell at a glance that
+//     data was elided. Clean values and values whose length is exactly
+//     MaxHeaderValue runes are returned unchanged (no false positive at
+//     the boundary).
 //
 // The function never returns an empty string when the input is
 // non-empty after cleaning — callers that want a placeholder for an
@@ -43,7 +50,8 @@ func SanitizeHeaderValue(s string) string {
 	}
 	out := strings.TrimSpace(b.String())
 	if r := []rune(out); len(r) > MaxHeaderValue {
-		out = string(r[:MaxHeaderValue])
+		dropped := len(r) - MaxHeaderValue
+		out = string(r[:MaxHeaderValue]) + "...(+" + strconv.Itoa(dropped) + ")"
 	}
 	return out
 }

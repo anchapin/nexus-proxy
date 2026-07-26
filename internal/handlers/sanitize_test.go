@@ -15,7 +15,13 @@ func TestSanitizeHeaderValue(t *testing.T) {
 		{"line1\r\nline2", "line1line2"},
 		{"line1\n", "line1"},
 		{"a\x00b\x01c", "a b c"},
-		{strings.Repeat("x", 200), strings.Repeat("x", MaxHeaderValue)},
+		// Exactly at the boundary: no marker (issue #494).
+		{strings.Repeat("x", MaxHeaderValue), strings.Repeat("x", MaxHeaderValue)},
+		// Below the boundary: no marker.
+		{strings.Repeat("x", 50), strings.Repeat("x", 50)},
+		// Above the boundary: truncated prefix plus "...(+N)" marker,
+		// where N is the count of dropped runes (issue #494).
+		{strings.Repeat("x", 200), strings.Repeat("x", MaxHeaderValue) + "...(+72)"},
 	}
 	for _, c := range cases {
 		got := SanitizeHeaderValue(c.in)

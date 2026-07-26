@@ -397,7 +397,11 @@ func TestSanitizeHeaderValueAdversarial(t *testing.T) {
 		{"crlf", "a\r\nb", "ab"},
 		{"only_newline", "\n", ""},
 		{"low_control", "a\x01b\x02c", "a b c"},
-		{"pathological_long", strings.Repeat("x", MaxHeaderValue*4), strings.Repeat("x", MaxHeaderValue)},
+		// Exactly at the boundary: returned unchanged, no marker (issue #494).
+		{"at_boundary", strings.Repeat("x", MaxHeaderValue), strings.Repeat("x", MaxHeaderValue)},
+		// Pathological length: prefix plus "...(+N)" truncation marker (issue #494).
+		// MaxHeaderValue*4 = 512 runes; dropped = 512 - 128 = 384.
+		{"pathological_long", strings.Repeat("x", MaxHeaderValue*4), strings.Repeat("x", MaxHeaderValue) + "...(+384)"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
