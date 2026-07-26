@@ -20,7 +20,7 @@ type stubConfidenceStore struct {
 	queried    []string
 }
 
-func (s *stubConfidenceStore) RecordOutcome(_ string, _ router.Route, _ int) {}
+func (s *stubConfidenceStore) RecordOutcome(_ string, _ router.Route, _ int) error { return nil }
 
 func (s *stubConfidenceStore) LocalConfidence(category string) float64 {
 	s.mu.Lock()

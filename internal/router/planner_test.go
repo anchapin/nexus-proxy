@@ -55,7 +55,7 @@ type stubConf struct {
 	queried []string
 }
 
-func (s *stubConf) RecordOutcome(_ string, _ Route, _ int) {}
+func (s *stubConf) RecordOutcome(_ string, _ Route, _ int) error { return nil }
 
 func (s *stubConf) LocalConfidence(category string) float64 {
 	s.queried = append(s.queried, category)

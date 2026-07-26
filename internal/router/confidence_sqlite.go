@@ -161,23 +161,26 @@ func confidenceDSN(path string) string {
 func (s *SQLiteConfidenceStore) Path() string { return s.path }
 
 // RecordOutcome implements ConfidenceStore. Best-effort: DB errors are
-// logged and dropped. Scores outside the 1..5 judge range are ignored so a
-// parse-failure JudgeScore (Score == 0) never skews the aggregate.
-func (s *SQLiteConfidenceStore) RecordOutcome(category string, route Route, judgeScore int) {
-	s.recordAt(category, route, judgeScore, time.Now().UTC())
+// logged and returned so the caller can decide. Scores outside the 1..5
+// judge range are ignored (return nil) so a parse-failure JudgeScore
+// (Score == 0) never skews the aggregate. An empty category is rejected
+// with an error instead of being silently coerced to CategoryOther so
+// upstream RecordOutcome bugs are visible (issue #591).
+func (s *SQLiteConfidenceStore) RecordOutcome(category string, route Route, judgeScore int) error {
+	return s.recordAt(category, route, judgeScore, time.Now().UTC())
 }
 
 // recordAt is RecordOutcome with an explicit timestamp. It exists so tests
 // can seed old rows and exercise the sliding-window expiry path.
-func (s *SQLiteConfidenceStore) recordAt(category string, route Route, judgeScore int, ts time.Time) {
+func (s *SQLiteConfidenceStore) recordAt(category string, route Route, judgeScore int, ts time.Time) error {
 	if s == nil || s.db == nil {
-		return
-	}
-	if judgeScore < 1 || judgeScore > 5 {
-		return
+		return nil
 	}
 	if category == "" {
-		category = CategoryOther
+		return fmt.Errorf("router: empty category in recordAt (caller failed to categorize the prompt)")
+	}
+	if judgeScore < 1 || judgeScore > 5 {
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), confidenceOpTimeout)
 	defer cancel()
@@ -188,7 +191,9 @@ func (s *SQLiteConfidenceStore) recordAt(category string, route Route, judgeScor
 			slog.String("route", string(route)),
 			slog.Any("err", err),
 		)
+		return err
 	}
+	return nil
 }
 
 // LocalConfidence implements ConfidenceStore. Returns NeutralConfidence
