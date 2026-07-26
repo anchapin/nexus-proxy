@@ -766,3 +766,27 @@ toon_unfenced: false
 		t.Error("TOONUnfenced = false, want true (env overrides YAML)")
 	}
 }
+
+func TestClampFloatBoundaryConditions(t *testing.T) {
+	tests := []struct {
+		name string
+		v    float64
+		min  float64
+		max  float64
+		want float64
+	}{
+		{"in_range", 0.5, 0.0, 1.0, 0.5},
+		{"below_min", -0.5, 0.0, 1.0, 0.0},
+		{"above_max", 1.5, 0.0, 1.0, 1.0},
+		{"exact_min", 0.0, 0.0, 1.0, 0.0},
+		{"exact_max", 1.0, 0.0, 1.0, 1.0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := clampFloat(tc.v, tc.min, tc.max)
+			if got != tc.want {
+				t.Errorf("clampFloat(%v, %v, %v) = %v, want %v", tc.v, tc.min, tc.max, got, tc.want)
+			}
+		})
+	}
+}
