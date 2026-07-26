@@ -5,6 +5,8 @@
 package router
 
 import (
+	"fmt"
+	"log"
 	"regexp"
 	"strings"
 	"unicode"
@@ -22,23 +24,52 @@ const (
 // Default DSL patterns. These match the hardcoded behaviour prior to issue #305.
 // Exported so the chat handler can fall back to them when the config fields
 // are nil (e.g. in tests that construct config.Config directly).
+//
+// The patterns are compiled via mustCompileDefaultPattern (issue #588) so that
+// an invalid default surfaces as a structured boot error (log.Fatalf) rather
+// than a runtime panic from regexp.MustCompile.
 var (
 	DefaultFormattingPatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`),
+		mustCompileDefaultPattern("formatting", `(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`),
 	}
 	DefaultFusionPatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\b(architectural design|system architecture)\b`),
+		mustCompileDefaultPattern("fusion", `(?i)\b(architectural design|system architecture)\b`),
 	}
 	DefaultLocalPatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis)\b`),
+		mustCompileDefaultPattern("local", `(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis)\b`),
 	}
 	// DefaultUnicodePatterns matches non-ASCII text categories (issue #422).
 	// Operators can override via NEXUS_DSL_UNICODE_PATTERNS.
 	DefaultUnicodePatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\p{Han}`),    // Chinese characters
-		regexp.MustCompile(`(?i)\p{Arabic}`), // Arabic characters
+		mustCompileDefaultPattern("unicode", `(?i)\p{Han}`),    // Chinese characters
+		mustCompileDefaultPattern("unicode", `(?i)\p{Arabic}`), // Arabic characters
 	}
 )
+
+// compileDefaultPattern compiles a single default DSL regex expression and
+// returns a descriptive error identifying the pattern group (formatting,
+// fusion, local, or unicode) if the syntax is invalid. It never panics.
+// This is the testable core of mustCompileDefaultPattern (issue #588).
+func compileDefaultPattern(name, expr string) (*regexp.Regexp, error) {
+	re, err := regexp.Compile(expr)
+	if err != nil {
+		return nil, fmt.Errorf("dsl: invalid default %s pattern %q: %w", name, expr, err)
+	}
+	return re, nil
+}
+
+// mustCompileDefaultPattern compiles a default DSL regex expression and is
+// intended for package-level var initialization. On invalid syntax it logs a
+// descriptive message (identifying the pattern group and the parse error) and
+// calls log.Fatalf, so the proxy exits with a clear boot error instead of a
+// panic (issue #588).
+func mustCompileDefaultPattern(name, expr string) *regexp.Regexp {
+	re, err := compileDefaultPattern(name, expr)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	return re
+}
 
 // Guardrail returns RouteFrontier when the prompt is too large for the
 // configured VRAM budget. The threshold is the maximum *estimated* token
