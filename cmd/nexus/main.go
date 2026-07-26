@@ -701,7 +701,7 @@ func main() {
 	// Middleware chain (issue #224). Initialize the middleware registry
 	// with the config values so closures capture the per-config state.
 	// Empty MiddlewareChain uses the built-in default chain.
-	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.PromptInjectionIsolated())
+	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.TOONUnfenced, cfg.PromptInjectionIsolated())
 	var mwChain []middleware.Middleware
 	if cfg.MiddlewareChain != "" {
 		var err error

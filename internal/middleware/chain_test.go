@@ -151,7 +151,7 @@ func TestNewRAGMiddleware(t *testing.T) {
 // --- Registry tests ---
 
 func TestRegister_Success(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	m := NewMiddleware("register-test", func([]interface{}) ([]interface{}, error) {
 		return nil, nil
 	})
@@ -162,7 +162,7 @@ func TestRegister_Success(t *testing.T) {
 }
 
 func TestRegister_DuplicatePanics(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	m := NewMiddleware("dup-test", func([]interface{}) ([]interface{}, error) {
 		return nil, nil
 	})
@@ -176,7 +176,7 @@ func TestRegister_DuplicatePanics(t *testing.T) {
 }
 
 func TestGet_NotFound(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	if Get("nonexistent") != nil {
 		t.Error("Get() should return nil for unknown name")
 	}
@@ -185,7 +185,7 @@ func TestGet_NotFound(t *testing.T) {
 // --- BuildChain tests ---
 
 func TestBuildChain_EmptySpec(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	chain, err := BuildChain("")
 	if err != nil {
 		t.Fatalf("BuildChain() error = %v", err)
@@ -196,7 +196,7 @@ func TestBuildChain_EmptySpec(t *testing.T) {
 }
 
 func TestBuildChain_ValidSpec(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	chain, err := BuildChain("promptEngineering,compressJSONBlocks")
 	if err != nil {
 		t.Fatalf("BuildChain() error = %v", err)
@@ -213,7 +213,7 @@ func TestBuildChain_ValidSpec(t *testing.T) {
 }
 
 func TestBuildChain_UnknownName(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	_, err := BuildChain("promptEngineering,unknownMiddleware,compressJSONBlocks")
 	if err == nil {
 		t.Fatal("BuildChain() expected error for unknown middleware, got nil")
@@ -221,7 +221,7 @@ func TestBuildChain_UnknownName(t *testing.T) {
 }
 
 func TestBuildChain_EmptyAfterTrim(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	_, err := BuildChain("promptEngineering, , compressJSONBlocks")
 	if err != nil {
 		t.Fatalf("BuildChain() should skip empty entries, got error: %v", err)
@@ -229,7 +229,7 @@ func TestBuildChain_EmptyAfterTrim(t *testing.T) {
 }
 
 func TestBuildChain_AllEmpty(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	_, err := BuildChain(" , ")
 	if err == nil {
 		t.Fatal("BuildChain() expected error for all-empty chain")
@@ -239,7 +239,7 @@ func TestBuildChain_AllEmpty(t *testing.T) {
 // --- DefaultChain tests ---
 
 func TestDefaultChain_HasFourEntries(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	chain := DefaultChain()
 	if len(chain) != 4 {
 		t.Errorf("DefaultChain() len = %d, want 4", len(chain))
@@ -259,14 +259,14 @@ func TestDefaultChain_HasFourEntries(t *testing.T) {
 // --- Init tests ---
 
 func TestInit_ReInitializesRegistry(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	// Register a custom middleware under a name not in the built-in set
 	Register(NewMiddleware("custom-init-test", func([]interface{}) ([]interface{}, error) {
 		return []interface{}{"custom"}, nil
 	}))
 
 	// Re-init should clear the registry and re-register only built-ins
-	Init("sysprompt", "toon", false)
+	Init("sysprompt", "toon", true, false)
 
 	// custom-init-test should be gone after re-init
 	if Get("custom-init-test") != nil {
@@ -287,7 +287,7 @@ func TestInit_ReInitializesRegistry(t *testing.T) {
 // --- Integration: full chain ---
 
 func TestBuildChain_CanBuildPartialChain(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	// Operator can drop RAG from the chain
 	chain, err := BuildChain("promptEngineering,compressJSONBlocks,appendSystemNote")
 	if err != nil {

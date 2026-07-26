@@ -63,7 +63,7 @@ func baseDeps(t *testing.T) (Deps, *upstream.RecordingTransport) {
 	}
 	// Re-initialize the middleware chain so closures capture cfg values
 	// instead of the empty defaults from the package init (issue #224).
-	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.PromptInjectionIsolated())
+	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.TOONUnfenced, cfg.PromptInjectionIsolated())
 	store := rag.NewStore(stubEmbedder{vec: []float64{0, 0, 0}}, 0.55)
 	store.Add("no-match.go", "x", []float64{0, 1, 0})
 	rt := upstream.NewRecordingTransport()

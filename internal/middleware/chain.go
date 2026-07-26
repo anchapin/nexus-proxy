@@ -162,7 +162,7 @@ func DefaultChain() []Middleware {
 // Init registers the four built-in transforms under their canonical
 // names. Called automatically via package initialization; exported for
 // tests that need to re-init with different Config values.
-func Init(metaPrompt string, toonNotice string, isolated bool) {
+func Init(metaPrompt string, toonNotice string, toonUnfenced bool, isolated bool) {
 	registry = make(map[string]Middleware)
 	registeredContext = make(map[string]bool)
 
@@ -193,7 +193,7 @@ func Init(metaPrompt string, toonNotice string, isolated bool) {
 	Register(MiddlewareFunc{
 		name: "compressJSONBlocks",
 		fn: func(msgs []interface{}) ([]interface{}, error) {
-			CompressJSONBlocks(msgs)
+			CompressJSONBlocks(msgs, toonUnfenced)
 			return msgs, nil
 		},
 	})
@@ -213,5 +213,5 @@ func Init(metaPrompt string, toonNotice string, isolated bool) {
 func init() {
 	// Sensible defaults for init; main.go re-initializes with real
 	// config values before building the chain.
-	Init("", "", false)
+	Init("", "", true, false)
 }

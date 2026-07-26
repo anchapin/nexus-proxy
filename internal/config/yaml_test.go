@@ -713,3 +713,43 @@ slm_cache_similarity_threshold: 0.5
 		t.Errorf("SLMCacheSemanticThreshold = %v", cfg.SLMCacheSemanticThreshold)
 	}
 }
+
+func TestLoadYAMLTOONUnfencedSettings(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	yamlContent := `
+toon_unfenced: false
+`
+	if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := LoadYAML(path)
+	if err != nil {
+		t.Fatalf("LoadYAML: %v", err)
+	}
+	if cfg.TOONUnfenced {
+		t.Error("TOONUnfenced = true, want false from YAML")
+	}
+}
+
+func TestLoadYAMLTOONUnfencedEnvOverridesYAML(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	yamlContent := `
+toon_unfenced: false
+`
+	if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	t.Setenv("NEXUS_TOON_UNFENCED", "true")
+
+	cfg, err := LoadYAML(path)
+	if err != nil {
+		t.Fatalf("LoadYAML: %v", err)
+	}
+	if !cfg.TOONUnfenced {
+		t.Error("TOONUnfenced = false, want true (env overrides YAML)")
+	}
+}
