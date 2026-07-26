@@ -8,6 +8,16 @@ import (
 	"runtime/debug"
 )
 
+// HandlerPanicObserver is the hook handlers.Recover invokes when it
+// catches a panic in the request hot path (issue #480). The path
+// argument is the mux route template (not the raw URL) so label
+// cardinality stays bounded. Implementations must be safe to call
+// concurrently and must not block; the Recover middleware invokes the
+// observer synchronously after logging, before writing the response.
+// A nil observer is a no-op so the middleware works unchanged when no
+// metrics collection is wired.
+type HandlerPanicObserver func(path string)
+
 // Recover returns HTTP middleware that catches panics arising anywhere in
 // the downstream handler chain (issue #110). Without it a panic — a nil
 // dereference, a malformed input that surprises a regex, a JSON parse
@@ -22,7 +32,11 @@ import (
 // panics in every downstream middleware and handler are caught. It has
 // zero overhead on the happy path: the deferred recover is cheap and the
 // requestID lookup runs only when a panic actually fires.
-func Recover() func(http.Handler) http.Handler {
+//
+// obs is an optional HandlerPanicObserver invoked after the slog.Error
+// call (issue #480). Pass nil when no metrics collection is needed; the
+// middleware is nil-safe.
+func Recover(obs HandlerPanicObserver) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			rw := &panicRecorder{ResponseWriter: w}
@@ -32,6 +46,7 @@ func Recover() func(http.Handler) http.Handler {
 					return
 				}
 				reqID := requestID(r)
+				route := routePattern(r)
 				slog.Error("panic recovered",
 					slog.String("component", "recovery"),
 					slog.Any("panic", rv),
@@ -40,6 +55,9 @@ func Recover() func(http.Handler) http.Handler {
 					slog.String("path", r.URL.Path),
 					slog.String("stack", string(debug.Stack())),
 				)
+				if obs != nil {
+					obs(route)
+				}
 				if rw.headerWritten {
 					// The response already started (e.g. a partial SSE
 					// flush after WriteHeader(200)). We can no longer
@@ -104,4 +122,15 @@ func (p *panicRecorder) Write(b []byte) (int, error) {
 		p.headerWritten = true
 	}
 	return p.ResponseWriter.Write(b)
+}
+
+// routePattern returns the mux route template for r, falling back to the
+// URL path when the request did not traverse a ServeMux (or the mux has
+// not yet set the pattern). Using the template rather than the raw URL
+// keeps the panic counter's label cardinality bounded (issue #480).
+func routePattern(r *http.Request) string {
+	if r.Pattern != "" {
+		return r.Pattern
+	}
+	return r.URL.Path
 }

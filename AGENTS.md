@@ -124,7 +124,7 @@ Panel behavior.
 
 **Inbound HTTP chain** (`cmd/nexus/main.go`, outermost → innermost):
 1. Security headers (`X-Request-Id` sanitize, `X-Content-Type-Options`, etc.)
-2. Panic recovery (turns panics into structured 500 JSON envelopes)
+2. Panic recovery (turns panics into structured 500 JSON envelopes; bumps `nexus_handler_panics_total{path}` via `HandlerPanicObserver`)
 3. Inbound auth (bearer token; exempts `/healthz`, `/metrics`; also `/status` when `NEXUS_STATUS_PUBLIC=true`; no-op when `NEXUS_PROXY_API_KEY` unset)
 4. mux routing (rate limiting is **not** a global header — it is path-specific)
 
@@ -227,7 +227,7 @@ for response hardening. Wired as the outermost layer in
 `cmd/nexus/main.go`:
 
 ```go
-Handler: handlers.SecurityHeaders(cfg.TLSEnabled)(handlers.Recover()(rootHandler)),
+Handler: handlers.SecurityHeaders(cfg.TLSEnabled)(handlers.Recover(handlerPanicObs)(rootHandler)),
 ```
 
 HSTS (`Strict-Transport-Security: max-age=31536000`) is only emitted
