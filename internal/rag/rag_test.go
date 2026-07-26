@@ -614,3 +614,98 @@ func TestStoreIndexMode(t *testing.T) {
 		}
 	})
 }
+
+// breakerStub is a controllable Embedder whose breaker/health state can
+// be configured and whose delegation call counts can be inspected. It
+// exercises CachedEmbedder's breaker-delegation paths (issue #600).
+type breakerStub struct {
+	breakerOpen  bool
+	healthy      bool
+	successCalls int
+	healthyCalls int
+	breakerCalls int
+}
+
+func (b *breakerStub) Embed(context.Context, string) ([]float64, error) {
+	return []float64{1, 0, 0}, nil
+}
+
+func (b *breakerStub) IsHealthy(context.Context) bool {
+	b.healthyCalls++
+	return b.healthy
+}
+
+func (b *breakerStub) IsBreakerOpen() bool {
+	b.breakerCalls++
+	return b.breakerOpen
+}
+
+func (b *breakerStub) RecordBreakerSuccess() {
+	b.successCalls++
+}
+
+// TestCachedEmbedderBreakerDelegation verifies that CachedEmbedder
+// propagates the inner embedder's open breaker state instead of always
+// reporting closed (issue #600 AC).
+func TestCachedEmbedderBreakerDelegation(t *testing.T) {
+	inner := &breakerStub{breakerOpen: true}
+	c := NewCachedEmbedder(inner, 8)
+
+	if !c.IsBreakerOpen() {
+		t.Error("IsBreakerOpen() = false, want true (should propagate inner breaker)")
+	}
+	if inner.breakerCalls != 1 {
+		t.Errorf("inner.breakerCalls = %d, want 1", inner.breakerCalls)
+	}
+
+	inner.breakerOpen = false
+	if c.IsBreakerOpen() {
+		t.Error("IsBreakerOpen() = true, want false after inner closes")
+	}
+}
+
+// TestCachedEmbedderRecordBreakerSuccess verifies the success signal
+// delegates to the inner embedder's breaker (issue #600 AC).
+func TestCachedEmbedderRecordBreakerSuccess(t *testing.T) {
+	inner := &breakerStub{}
+	c := NewCachedEmbedder(inner, 8)
+
+	c.RecordBreakerSuccess()
+	c.RecordBreakerSuccess()
+
+	if inner.successCalls != 2 {
+		t.Errorf("inner.successCalls = %d, want 2", inner.successCalls)
+	}
+}
+
+// TestCachedEmbedderIsHealthy verifies health-state delegation and
+// that a context the inner embedder ignores is handled without panic
+// (issue #600 AC).
+func TestCachedEmbedderIsHealthy(t *testing.T) {
+	inner := &breakerStub{healthy: true}
+	c := NewCachedEmbedder(inner, 8)
+
+	if !c.IsHealthy(context.Background()) {
+		t.Error("IsHealthy() = false, want true")
+	}
+	if inner.healthyCalls != 1 {
+		t.Errorf("inner.healthyCalls = %d, want 1", inner.healthyCalls)
+	}
+
+	inner.healthy = false
+	if c.IsHealthy(context.Background()) {
+		t.Error("IsHealthy() = true, want false after inner goes unhealthy")
+	}
+}
+
+// TestCachedEmbedderNoBreaker wraps an embedder whose breaker reports
+// closed and verifies CachedEmbedder returns false without panicking
+// (issue #600 AC).
+func TestCachedEmbedderNoBreaker(t *testing.T) {
+	c := NewCachedEmbedder(&stubEmbedder{}, 8)
+
+	if c.IsBreakerOpen() {
+		t.Error("IsBreakerOpen() = true, want false for plain embedder")
+	}
+	c.RecordBreakerSuccess()
+}
