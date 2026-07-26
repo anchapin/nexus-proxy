@@ -267,8 +267,19 @@ Config env vars are split across two files. New vars need **both**:
    file-based config users get the same knob.
 
 No central registry — but `internal/config/env_example_audit_test.go`
-enforces that any `NEXUS_*` var referenced by the parser is documented
-in `.env.example`. Add it there too.
+enforces the `.env.example` ↔ parser contract in **both directions**
+(issue #478):
+
+- **code → docs:** any `NEXUS_*` var referenced by the parser must have a
+  canonical entry in `.env.example`.
+- **docs → code:** any `NEXUS_*` entry in `.env.example` must still be
+  referenced by the parser; otherwise it is reported as stale (renamed or
+  deleted vars can no longer linger silently).
+
+When you add a var, add the `.env.example` line. When you rename or remove
+a var, delete or update its `.env.example` line in the same change. The
+eight skip prefixes (`NEXUS_PROVIDER_`, `NEXUS_FRONTIER_`, `NEXUS_ZAI_`,
+`NEXUS_HTTP_`, etc.) exempt dynamic-construction vars symmetrically.
 
 For hot-reloadable knobs (rate limit, log level, log format, debug) add
 the field to `ReloadHotReloadable()` in `config.go` — knobs not in that

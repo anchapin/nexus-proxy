@@ -13,6 +13,12 @@ import (
 // in config.go, yaml.go, and the providers package has a canonical entry
 // in .env.example. It fails when a new env var is added to the code but
 // not documented, catching drift before it reaches users.
+//
+// Issue #478 adds the reverse direction: any NEXUS_* entry in .env.example
+// that the parser no longer references is reported as stale, so renamed or
+// deleted vars cannot linger silently (operators copying the file would get
+// a silent no-op). Both directions share the skip() filter so dynamic vars
+// are exempted symmetrically.
 func TestEnvExampleCoverage(t *testing.T) {
 	_, here, _, ok := runtime.Caller(0)
 	if !ok {
@@ -20,13 +26,22 @@ func TestEnvExampleCoverage(t *testing.T) {
 	}
 	repoRoot := filepath.Join(filepath.Dir(here), "..", "..")
 
-	// Scan these source files for NEXUS_* env var references.
+	// Scan these source files for NEXUS_* env var references. The set
+	// covers the config parser (config.go, yaml.go) plus packages that
+	// read NEXUS_* vars directly via os.Getenv (providers, quality) and
+	// the tracing package (whose NEXUS_TRACING_ENDPOINT is referenced in
+	// its package docs). Without these, the reverse-direction check
+	// (issue #478) would false-positive on vars consumed outside the
+	// parser. See AGENTS.md "Adding new env vars".
 	srcFiles := []string{
 		filepath.Join(repoRoot, "internal", "config", "config.go"),
 		filepath.Join(repoRoot, "internal", "config", "yaml.go"),
 		filepath.Join(repoRoot, "internal", "providers", "providers.go"),
 		filepath.Join(repoRoot, "internal", "providers", "registry.go"),
 		filepath.Join(repoRoot, "internal", "providers", "frontier.go"),
+		filepath.Join(repoRoot, "internal", "quality", "quality.go"),
+		filepath.Join(repoRoot, "internal", "tracing", "tracing.go"),
+		filepath.Join(repoRoot, "internal", "tracing", "exporter.go"),
 	}
 
 	// Match NEXUS_ followed by at least two word chars (not ending with
@@ -103,5 +118,26 @@ func TestEnvExampleCoverage(t *testing.T) {
 		t.Errorf("NEXUS_* env vars in code but missing from .env.example: %s\n"+
 			"Add canonical entries with defaults matching the parser (issue #448).",
 			strings.Join(missing, ", "))
+	}
+
+	// Reverse direction (issue #478): flag .env.example entries that no
+	// longer have a matching parser reference, so renamed/deleted vars do
+	// not linger silently. Reuse skip() so dynamic-construction vars are
+	// exempted in both directions.
+	stale := []string{}
+	for v := range exampleVars {
+		if skip(v) {
+			continue
+		}
+		if !codeVars[v] {
+			stale = append(stale, v)
+		}
+	}
+
+	if len(stale) > 0 {
+		t.Errorf("NEXUS_* env vars in .env.example but no longer referenced by the config parser: %s\n"+
+			"For each, either re-add the getEnv*(...) call in the parser, "+
+			"or delete the line from .env.example (issue #478).",
+			strings.Join(stale, ", "))
 	}
 }
