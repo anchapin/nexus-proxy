@@ -288,6 +288,34 @@ func TestSLMDecideTolerantShapes(t *testing.T) {
 	}
 }
 
+// TestNewSLMClientNilDefaultsToDefaultClient exercises the nil-client
+// defaulting branch of NewSLMClient (slm.go:49-51). Every other test passes a
+// custom *http.Client, so the `if client == nil { client = http.DefaultClient }`
+// body was never hit — leaving NewSLMClient at 66.7% coverage (issue #604).
+// This test closes that branch and guards against a refactor that silently
+// breaks the nil-defaulting contract.
+func TestNewSLMClientNilDefaultsToDefaultClient(t *testing.T) {
+	c := NewSLMClient("http://x", "m", time.Second, nil)
+	if c.Client != http.DefaultClient {
+		t.Errorf("NewSLMClient(nil).Client = %p, want http.DefaultClient (%p)",
+			c.Client, http.DefaultClient)
+	}
+}
+
+// TestNewSLMClientPreservesCustomClient confirms the non-nil arm of
+// NewSLMClient passes the supplied client through unchanged (pointer
+// identity). The Decide-based tests verify it indirectly via a Do call, but
+// never assert the exact client object is retained. Together with the
+// nil-defaulting test this brings NewSLMClient to 100% branch coverage and
+// directly pins both arms of the client-assignment logic.
+func TestNewSLMClientPreservesCustomClient(t *testing.T) {
+	custom := &http.Client{}
+	c := NewSLMClient("http://x", "m", time.Second, custom)
+	if c.Client != custom {
+		t.Errorf("NewSLMClient(custom).Client = %p, want %p", c.Client, custom)
+	}
+}
+
 // TestSLMDecideAlwaysPerformsHTTP verifies the issue #489 fix: the SLMClient
 // no longer maintains an internal decision cache, so every Decide call for
 // the same prompt performs a fresh HTTP round-trip. This makes the
