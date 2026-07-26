@@ -107,6 +107,13 @@ const (
 	// 8-12 GiB VRAM, where the formula yields ~32k-48k tokens
 	// of safe headroom.
 	DefaultBytesPerToken = 256 * 1024
+	// DefaultThermalThreshold is the GPU junction temperature
+	// (degrees Celsius) above which the probe treats the GPU as
+	// VRAM-starved (issue #597). 90 °C is the typical AMD Radeon
+	// thermal-throttle ceiling; better-cooled cards can raise the
+	// knob via NEXUS_PROBE_THERMAL_THRESHOLD, and 0 disables the
+	// check entirely.
+	DefaultThermalThreshold = 90
 )
 
 // Manager owns the lifetime of the periodic probe. It performs an
