@@ -1040,7 +1040,12 @@ func PanelStreaming(
 		}
 	}
 
-	arbiterCtx, cancelArbiter := context.WithTimeout(context.Background(), withDefaultArbiterTimeout(arbiterTimeout))
+	// Issue #488: derive arbiterCtx from the request ctx (not
+	// context.Background()) so a client disconnect mid-stream cancels
+	// the in-flight arbiter synthesis instead of stranding it on its
+	// own timeout. The panel fetches already derive from gCtx (which
+	// descends from ctx); this was an isolated inconsistency.
+	arbiterCtx, cancelArbiter := context.WithTimeout(ctx, withDefaultArbiterTimeout(arbiterTimeout))
 	defer cancelArbiter()
 
 	// Use StreamWithContext for SSE passthrough. This preserves the original
