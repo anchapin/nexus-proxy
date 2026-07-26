@@ -20,11 +20,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // DefaultSysfsRoot is the conventional /sys/class/dri mount point.
@@ -40,6 +42,18 @@ type OllamaProbe struct {
 	Client        *http.Client // nil falls back to http.DefaultClient
 	SysfsRoot     string       // root for /sys/class/dri lookups (default DefaultSysfsRoot)
 	BytesPerToken int          // VRAM->token conversion factor; 0 falls back to DefaultBytesPerToken
+	// ChatModel, when non-empty, restricts fetchModelContext to the
+	// loaded model matching this name (typically cfg.LocalModel). This
+	// prevents a resident embedding model (e.g. nomic-embed-text with an
+	// 8192 context) from shrinking the chat-route guardrail below the
+	// chat model's real window. When empty, fetchModelContext keeps the
+	// legacy "smallest context across all loaded models" behaviour.
+	ChatModel string
+
+	// chatModelWarnOnce guards the one-shot "chat model not resident"
+	// warning so a missing chat model does not spam the log on every
+	// poll cycle. The zero value is ready to use.
+	chatModelWarnOnce sync.Once
 }
 
 // NewOllamaProbe constructs a probe with safe defaults. Pass nil for
@@ -118,12 +132,22 @@ func (p *OllamaProbe) Budget(ctx context.Context) (Budget, error) {
 	}
 }
 
-// fetchModelContext calls Ollama /api/ps and returns the smallest
-// context_length reported across all loaded models. The conservative
-// "minimum across loaded models" rule keeps the guardrail honest when
-// the operator has multiple models resident (KV cache is per-model and
-// fragmenting VRAM across more than one model shrinks each one's safe
-// headroom).
+// fetchModelContext calls Ollama /api/ps and returns the context
+// window of the loaded chat model.
+//
+// When OllamaProbe.ChatModel is non-empty the result is restricted to
+// loaded models whose name matches ChatModel (issue #490). This avoids
+// a resident embedding model (nomic-embed-text, 8192 context) shrinking
+// the chat-route guardrail below the chat model's real window. When no
+// resident model matches ChatModel, (0, "", err) is returned so Budget
+// falls through to the static fallback rather than silently adopting an
+// embedder's context.
+//
+// When ChatModel is empty the legacy "smallest context across all loaded
+// models" rule applies — the conservative minimum keeps the guardrail
+// honest when the operator has multiple chat models resident (KV cache
+// is per-model and fragmenting VRAM across more than one model shrinks
+// each one's safe headroom).
 //
 // Returns the context size and (0, "", nil) when no model is loaded,
 // or (0, "", err) on transport / decode failure.
@@ -159,7 +183,38 @@ func (p *OllamaProbe) fetchModelContext(ctx context.Context) (int, string, error
 	if len(raw.Models) == 0 {
 		return 0, "", nil
 	}
-	// Pick the smallest context_length so the budget is the worst case.
+	// When a chat model is pinned, only consider loaded models that
+	// match it; embedding models are intentionally excluded so they
+	// cannot shrink the chat guardrail (issue #490). Matching is a
+	// strict full-name equality — broader family matching is
+	// intentionally out of scope to keep the filter predictable.
+	if p.ChatModel != "" {
+		minCtx := 0
+		var minName string
+		for _, m := range raw.Models {
+			if !modelMatchesChat(m.Name, p.ChatModel) {
+				continue
+			}
+			if m.ContextLength <= 0 {
+				continue
+			}
+			if minCtx == 0 || m.ContextLength < minCtx {
+				minCtx = m.ContextLength
+				minName = m.Name
+			}
+		}
+		if minCtx == 0 {
+			p.chatModelWarnOnce.Do(func() {
+				slog.Warn("vram probe: configured chat model not resident; budget falls back to static guardrail",
+					slog.String("chat_model", p.ChatModel),
+				)
+			})
+			return 0, "", fmt.Errorf("probe: chat model %q not resident in /api/ps", p.ChatModel)
+		}
+		return minCtx, minName, nil
+	}
+	// Legacy path: pick the smallest context_length so the budget is
+	// the worst case across every loaded model.
 	minCtx := 0
 	var minName string
 	for _, m := range raw.Models {
@@ -172,6 +227,18 @@ func (p *OllamaProbe) fetchModelContext(ctx context.Context) (int, string, error
 		}
 	}
 	return minCtx, minName, nil
+}
+
+// modelMatchesChat reports whether a resident model name corresponds
+// to the configured chat model. The match is strict full equality:
+// the configured NEXUS_LOCAL_MODEL must exactly equal the name
+// Ollama reports in /api/ps. Broader prefix, base-name, or family
+// matching is intentionally out of scope (issue #490) to keep the
+// filter predictable and avoid silently adopting a sibling model's
+// context. Operators running a quantisation variant should set
+// NEXUS_LOCAL_MODEL to the exact resident tag.
+func modelMatchesChat(loaded, chat string) bool {
+	return loaded != "" && chat != "" && loaded == chat
 }
 
 // readFreeVRAMBytes walks the sysfs DRI tree for amdgpu nodes and

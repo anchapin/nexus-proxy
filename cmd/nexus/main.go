@@ -202,6 +202,17 @@ func main() {
 	// back to the static value when it produces no budget.
 	probeImpl := probe.NewOllamaProbe(cfg.OllamaURL, httpClient)
 	probeImpl.BytesPerToken = cfg.ProbeBytesPerToken
+	// Restrict the VRAM probe's context signal to the configured chat
+	// model so a resident embedding model (e.g. nomic-embed-text, 8192
+	// context) cannot shrink the chat-route guardrail below the chat
+	// model's real window (issue #490). When LocalModel is empty the
+	// probe keeps the legacy smallest-across-all behaviour.
+	probeImpl.ChatModel = cfg.LocalModel
+	if cfg.LocalModel != "" {
+		slog.Info("vram probe scoped to chat model",
+			slog.String("chat_model", cfg.LocalModel),
+		)
+	}
 	probeMgr := probe.NewManager(probeImpl, cfg.ProbePollInterval, cfg.ProbeTimeout)
 	go probeMgr.Run(context.Background())
 	defer func() {
