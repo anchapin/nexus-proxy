@@ -19,7 +19,7 @@ jobs:
       # churning existing PRs. Raise as coverage improves.
       COVERAGE_THRESHOLD: "70"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -86,7 +86,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -112,7 +112,7 @@ jobs:
     name: golangci-lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # golangci-lint v2.12.2 supports Go 1.25+ and replaces the old v1.x
       # series. The old comment about Go 1.24 is retained for context but
