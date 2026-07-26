@@ -26,12 +26,15 @@ package judge
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -149,6 +152,28 @@ type Evaluator struct {
 	onDrop func(uint64)
 }
 
+// newSeededRand returns a *rand.Rand seeded from a cryptographic
+// entropy source. Seeding exclusively from time.Now().UnixNano()
+// collapses to identical streams when multiple evaluators are
+// constructed within the same nanosecond, biasing the sample rate
+// (issue #589). crypto/rand supplies 64 bits of entropy; if it fails
+// (extremely rare — e.g. /dev/urandom unavailable) the fallback mixes
+// the nanosecond clock with the PID so a same-nanosecond pair of
+// evaluators on the same host still diverge.
+//
+// The seed is drawn once at construction; Sample() remains a single
+// mutex-guarded Float64() draw, so this change is latency-neutral.
+func newSeededRand() *rand.Rand {
+	var seed int64
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err == nil {
+		seed = int64(binary.LittleEndian.Uint64(b[:]))
+	} else {
+		seed = time.Now().UnixNano() ^ (int64(os.Getpid()) << 32)
+	}
+	return rand.New(rand.NewSource(seed))
+}
+
 // NewEvaluator wires the evaluator and starts its worker pool. The
 // workers live until Close is called.
 //
@@ -168,7 +193,7 @@ func NewEvaluator(cfg Config, client HTTPClient, storage Storage) *Evaluator {
 		client:  client,
 		storage: storage,
 		queue:   make(chan Sample, cfg.QueueDepth),
-		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
+		rng:     newSeededRand(),
 		closed:  make(chan struct{}),
 	}
 	if cfg.SampleRate <= 0 {
