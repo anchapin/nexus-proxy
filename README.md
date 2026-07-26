@@ -375,6 +375,7 @@ Every semver tag (`v1.0.0`, `v1.2.3`, …) triggers the
   `*-darwin-arm64.spdx.json`), so binary-only operators have a component
   inventory without pulling the container image
 - **SHA256 checksums** — `checksums-sha256.txt` (covers binaries + SBOMs)
+- **SLSA provenance attestation** — `.intoto.jsonl` for each binary
 - **GHCR multi-arch image** — `ghcr.io/anchapin/nexus-proxy:<tag>`
   (amd64 + arm64), also tagged `latest`
 - **Source-level SBOM** — SPDX JSON attached to the release
@@ -392,6 +393,34 @@ sha256sum -c checksums-sha256.txt
 chmod +x nexus-*-linux-amd64
 ./nexus-*-linux-amd64 --version
 ```
+
+### Verify binary provenance
+
+Each release includes an SLSA Level 3 provenance attestation (`.intoto.jsonl`) that
+cryptographically verifies the binary was built from the exact source commit by GitHub
+Actions. Install the [slsa-verifier](https://github.com/slsa-framework/slsa-verifier):
+
+```bash
+go install github.com/slsa-framework/slsa-verifier/cli/slsa-verifier@latest
+```
+
+Then verify a binary against its provenance attestation:
+
+```bash
+# Replace <tag> with the release version (e.g. v1.0.0)
+TAG="<tag>"
+PLATFORM="linux-amd64"   # or linux-arm64, darwin-arm64
+BINARY="nexus-${TAG}-${PLATFORM}"
+ATTESTATION="${BINARY}.intoto.jsonl"
+
+slsa-verifier verify-artifact "${BINARY}" \
+  --provenance-path "${ATTESTATION}" \
+  --source-repo "https://github.com/anchapin/nexus-proxy" \
+  --tag "${TAG}"
+```
+
+A successful verification confirms the binary's supply-chain integrity. If verification
+fails, the binary may have been tampered with.
 
 ### Pull the container image
 

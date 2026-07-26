@@ -85,11 +85,13 @@ jobs:
           version: v2.12.2
           args: --timeout=5m
 
-  # ── Cross-compile binaries + checksums ──────────────────────────
+  # ── Cross-compile binaries + checksums + SLSA provenance ───────
   build-binaries:
     name: Build binaries
     needs: [prereq]
     runs-on: ubuntu-latest
+    outputs:
+      binaries-matrix: ${{ steps.meta.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
 
@@ -101,9 +103,12 @@ jobs:
 
       - name: Determine version
         id: ver
-        # inputs.version is set on workflow_dispatch; empty (falsy) on
-        # tag push, so we fall through to GITHUB_REF_NAME (the tag).
         run: echo "version=${{ inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate build matrix
+        id: meta
+        run: |
+          echo "matrix=[\"linux-amd64\",\"linux-arm64\",\"darwin-arm64\"]" >> "$GITHUB_OUTPUT"
 
       - name: Build binaries
         env:
@@ -113,7 +118,6 @@ jobs:
           mkdir -p dist
           LDFLAGS="-s -w -X main.version=${VERSION}"
 
-          # Targets: OS/ARCH -> output filename
           build_one() {
             local goos="$1" goarch="$2" name="$3"
             echo "::group::Building ${goos}/${goarch}"
@@ -160,6 +164,13 @@ jobs:
           sha256sum nexus-* > checksums-sha256.txt
           echo "Checksums:"
           cat checksums-sha256.txt
+
+      - name: Generate SLSA provenance
+        uses: slsa-framework/slsa-github-generator/actions/create-action@main
+        with:
+          artifact-name: release-binaries
+          artifact-path: dist
+          retention-days: 7
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -386,6 +397,12 @@ jobs:
           name: sbom
           path: dist/
 
+      - name: Download SLSA provenance attestation
+        uses: actions/download-artifact@v8
+        with:
+          name: release-binaries-attestation
+          path: dist/
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -398,6 +415,7 @@ jobs:
             dist/nexus-*
             dist/checksums-sha256.txt
             dist/*.spdx.json
+            dist/*.intoto.jsonl
           body: |
             ## Artifacts
 
@@ -412,12 +430,32 @@ jobs:
             | `nexus-*-darwin-arm64.spdx.json` | Per-binary SBOM (SPDX JSON) — macOS Apple Silicon |
             | `checksums-sha256.txt` | SHA256 checksums for binaries + SBOMs |
             | `*-sbom.spdx.json` | Source-level SPDX SBOM |
+            | `*.intoto.jsonl` | SLSA provenance attestation |
 
-            ## Verify
+            ## Verify checksums
 
             ```bash
             sha256sum -c checksums-sha256.txt
             ```
+
+            ## Verify binary SLSA provenance
+
+            Install the [slsa-verifier](https://github.com/slsa-framework/slsa-verifier) and verify provenance for each binary:
+
+            ```bash
+            # Example for linux/amd64 — repeat for each platform
+            PLATFORM="linux-amd64"
+            TAG="${{ steps.ver.outputs.version }}"
+            BINARY="nexus-${TAG}-${PLATFORM}"
+            ATTESTATION="${BINARY}.intoto.jsonl"
+
+            slsa-verifier verify-artifact "${BINARY}" \
+              --provenance-path "${ATTESTATION}" \
+              --source-repo "https://github.com/${{ github.repository }}" \
+              --tag "${TAG}"
+            ```
+
+            The provenance attestation cryptographically verifies that the binary was built from the exact source commit by GitHub Actions.
 
             ## Docker image
 
