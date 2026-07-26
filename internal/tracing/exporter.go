@@ -50,6 +50,14 @@ type Exporter struct {
 	// full. Useful for /metrics gauges and tests that assert
 	// non-blocking behaviour under back-pressure.
 	dropped atomic.Uint64
+	// flushFailures is the count of batches that failed to POST to
+	// the collector (4xx/5xx, timeout, connection error). Each
+	// failure drops up to batchCap spans, so this is a per-batch
+	// counter — distinct from dropped, which counts per-span
+	// buffer-full sheds at Submit-time. Surfaced as
+	// nexus_tracing_flush_failures_total so operators can alert on
+	// silent trace loss that dropped does not capture (issue #484).
+	flushFailures atomic.Uint64
 }
 
 // ExporterConfig is the input to NewExporter.
@@ -149,6 +157,20 @@ func (e *Exporter) Dropped() uint64 {
 	return e.dropped.Load()
 }
 
+// FlushFailures returns the cumulative count of batches that failed
+// to POST to the collector (HTTP 4xx/5xx, timeout, or transport
+// error). Each failure silently drops up to batchCap spans, so this
+// counter is the operator-visible signal for trace loss that Dropped
+// does not capture — Dropped only counts per-span buffer-full sheds
+// at Submit-time. Surfaced as nexus_tracing_flush_failures_total
+// (issue #484).
+func (e *Exporter) FlushFailures() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.flushFailures.Load()
+}
+
 // QueueDepth returns the current number of spans waiting in the export
 // queue. Useful for /metrics gauges to observe back-pressure.
 func (e *Exporter) QueueDepth() int {
@@ -241,6 +263,7 @@ func (e *Exporter) run() {
 			return
 		}
 		if err := e.flush(batch); err != nil {
+			e.flushFailures.Add(1)
 			slog.Warn("tracing flush failed",
 				slog.String("endpoint", e.endpoint),
 				slog.Int("count", len(batch)),
