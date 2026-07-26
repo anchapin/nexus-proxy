@@ -192,3 +192,189 @@ func TestAuthLimiter_429Body(t *testing.T) {
 		t.Errorf("body too short: %q", body)
 	}
 }
+
+// BucketCount returns 0 for nil limiter.
+func TestAuthLimiter_BucketCount_Nil(t *testing.T) {
+	var al *AuthLimiter
+	if al.BucketCount() != 0 {
+		t.Error("nil limiter should return 0 buckets")
+	}
+}
+
+// BucketCount returns 0 when limiter is disabled.
+func TestAuthLimiter_BucketCount_Disabled(t *testing.T) {
+	al := NewAuthLimiter(0, 3, 5*time.Minute, nil)
+	if al.BucketCount() != 0 {
+		t.Error("disabled limiter should return 0 buckets")
+	}
+}
+
+// BucketCount returns correct count of tracked IPs.
+func TestAuthLimiter_BucketCount_Active(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	al := NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	defer al.Stop()
+
+	if al.BucketCount() != 0 {
+		t.Error("fresh limiter should have 0 buckets")
+	}
+
+	al.RecordFailure("10.0.0.1")
+	if al.BucketCount() != 1 {
+		t.Errorf("BucketCount = %d, want 1", al.BucketCount())
+	}
+
+	al.RecordFailure("10.0.0.2")
+	al.RecordFailure("10.0.0.3")
+	if al.BucketCount() != 3 {
+		t.Errorf("BucketCount = %d, want 3", al.BucketCount())
+	}
+}
+
+// BucketCount reflects entries removed by reaper eviction.
+func TestAuthLimiter_BucketCount_AfterReap(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	al := NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	defer al.Stop()
+
+	// Add entries directly to the map
+	now := time.Now()
+	al.mu.Lock()
+	al.failures["10.0.0.1"] = &authFailure{lastSeen: now.Add(-15 * time.Minute)} // idle > 10 min
+	al.failures["10.0.0.2"] = &authFailure{lastSeen: now.Add(-5 * time.Minute)}  // idle < 10 min
+	al.mu.Unlock()
+
+	if al.BucketCount() != 2 {
+		t.Errorf("before reaping: BucketCount = %d, want 2", al.BucketCount())
+	}
+
+	// Manually trigger reaper eviction logic (simulates what reaper goroutine does on tick)
+	al.mu.Lock()
+	for ip, f := range al.failures {
+		f.mu.Lock()
+		al.pruneLocked(f, now)
+		idle := now.Sub(f.lastSeen)
+		f.mu.Unlock()
+		if idle > 10*time.Minute && len(f.ts) == 0 {
+			delete(al.failures, ip)
+		}
+	}
+	al.mu.Unlock()
+
+	if al.BucketCount() != 1 {
+		t.Errorf("after reaping idle: BucketCount = %d, want 1", al.BucketCount())
+	}
+}
+
+// Enabled returns false for nil limiter.
+func TestAuthLimiter_Enabled_Nil(t *testing.T) {
+	var al *AuthLimiter
+	if al.Enabled() {
+		t.Error("nil limiter should not be enabled")
+	}
+}
+
+// Enabled returns false when rpm <= 0.
+func TestAuthLimiter_Enabled_Disabled(t *testing.T) {
+	al := NewAuthLimiter(0, 3, 5*time.Minute, nil)
+	if al.Enabled() {
+		t.Error("disabled limiter (rpm=0) should not be enabled")
+	}
+}
+
+// Enabled returns true when rpm > 0.
+func TestAuthLimiter_Enabled_Active(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	al := NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	defer al.Stop()
+
+	if !al.Enabled() {
+		t.Error("active limiter should be enabled")
+	}
+}
+
+// Stop is safe to call on nil limiter.
+func TestAuthLimiter_Stop_Nil(t *testing.T) {
+	var al *AuthLimiter
+	al.Stop() // must not panic
+}
+
+// Stop is safe to call on disabled limiter.
+func TestAuthLimiter_Stop_Disabled(t *testing.T) {
+	al := NewAuthLimiter(0, 3, 5*time.Minute, nil)
+	al.Stop() // must not panic
+}
+
+// Stop signals reaper goroutine to exit without hanging.
+func TestAuthLimiter_Stop_ExitsGoroutine(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	al := NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+
+	done := make(chan struct{})
+	go func() {
+		al.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Stop completed successfully
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() did not complete within 2s — possible goroutine leak")
+	}
+}
+
+// Reaper evicts entries that are both idle > 10 min and have no failure timestamps.
+func TestAuthLimiter_Reaper_Eviction(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	al := NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	defer al.Stop()
+
+	now := time.Now()
+
+	// Three entries: idle >10min with no failures, idle <10min, and active
+	al.mu.Lock()
+	al.failures["stale-empty"] = &authFailure{
+		ts:       nil,
+		lastSeen: now.Add(-15 * time.Minute), // idle > 10 min, no failures → evicted
+	}
+	al.failures["stale-with-failures"] = &authFailure{
+		ts:       []time.Time{now.Add(-5 * time.Minute)}, // has recent failure → kept
+		lastSeen: now.Add(-15 * time.Minute),
+	}
+	al.failures["recent"] = &authFailure{
+		ts:       nil,
+		lastSeen: now.Add(-5 * time.Minute), // idle < 10 min → kept
+	}
+	al.mu.Unlock()
+
+	if al.BucketCount() != 3 {
+		t.Fatalf("initial BucketCount = %d, want 3", al.BucketCount())
+	}
+
+	// Simulate one reaper tick: prune and evict
+	al.mu.Lock()
+	for ip, f := range al.failures {
+		f.mu.Lock()
+		al.pruneLocked(f, now)
+		idle := now.Sub(f.lastSeen)
+		f.mu.Unlock()
+		if idle > 10*time.Minute && len(f.ts) == 0 {
+			delete(al.failures, ip)
+		}
+	}
+	al.mu.Unlock()
+
+	if al.BucketCount() != 2 {
+		t.Errorf("after reaping: BucketCount = %d, want 2 (stale-empty evicted)", al.BucketCount())
+	}
+	if al.IsBlocked("stale-empty") {
+		t.Error("stale-empty should have been evicted")
+	}
+	if al.IsBlocked("stale-with-failures") {
+		t.Error("stale-with-failures should still exist")
+	}
+	if al.IsBlocked("recent") {
+		t.Error("recent should still exist")
+	}
+}

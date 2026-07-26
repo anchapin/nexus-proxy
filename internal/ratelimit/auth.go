@@ -24,6 +24,7 @@ type AuthLimiter struct {
 
 	mu       sync.Mutex
 	failures map[string]*authFailure // keyed by resolved client IP
+	stopCh   chan struct{}           // closed when reaper should exit
 }
 
 // authFailure tracks failure timestamps for one client IP.
@@ -51,6 +52,7 @@ func NewAuthLimiter(rpm, burst int, window time.Duration, resolver *ClientIPReso
 		burst:    burst,
 		window:   window,
 		failures: make(map[string]*authFailure),
+		stopCh:   make(chan struct{}),
 	}
 	go al.reaper()
 	return al
@@ -131,20 +133,35 @@ func (al *AuthLimiter) pruneLocked(f *authFailure, now time.Time) {
 func (al *AuthLimiter) reaper() {
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
-	for range t.C {
-		al.mu.Lock()
-		now := time.Now()
-		for ip, f := range al.failures {
-			f.mu.Lock()
-			al.pruneLocked(f, now)
-			idle := now.Sub(f.lastSeen)
-			f.mu.Unlock()
-			if idle > 10*time.Minute && len(f.ts) == 0 {
-				delete(al.failures, ip)
+	for {
+		select {
+		case <-t.C:
+			al.mu.Lock()
+			now := time.Now()
+			for ip, f := range al.failures {
+				f.mu.Lock()
+				al.pruneLocked(f, now)
+				idle := now.Sub(f.lastSeen)
+				f.mu.Unlock()
+				if idle > 10*time.Minute && len(f.ts) == 0 {
+					delete(al.failures, ip)
+				}
 			}
+			al.mu.Unlock()
+		case <-al.stopCh:
+			return
 		}
-		al.mu.Unlock()
 	}
+}
+
+// Stop signals the reaper goroutine to exit. It is safe to call on
+// a disabled limiter (rpm <= 0) or nil limiter; it is a no-op in those
+// cases.
+func (al *AuthLimiter) Stop() {
+	if al == nil || al.rpm <= 0 {
+		return
+	}
+	close(al.stopCh)
 }
 
 // BucketCount returns the number of tracked client IPs. Exposed for tests.
