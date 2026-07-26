@@ -281,6 +281,12 @@ trusted_proxies: "10.0.0.0/8, 172.16.0.0/12"
 	if len(cfg.TrustedProxies) != 2 {
 		t.Errorf("TrustedProxies len = %d, want 2", len(cfg.TrustedProxies))
 	}
+	// TrustedProxiesRaw is consumed by the rate_limit_proxy_config
+	// diagnostic check (issue #603) — assert it is populated so the
+	// field stays wired through the YAML loader.
+	if cfg.TrustedProxiesRaw == "" {
+		t.Error("TrustedProxiesRaw should be populated from YAML trusted_proxies")
+	}
 }
 
 func TestLoadYAMLRAGSettings(t *testing.T) {

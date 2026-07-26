@@ -735,16 +735,29 @@ func checkRateLimitProxyConfigFn(cfg config.Config) Check {
 		}
 	}
 	if !cfg.TrustedProxiesConfigured() {
+		detail := "NEXUS_RATE_LIMIT_RPM > 0 but no NEXUS_TRUSTED_PROXIES configured — spoofing vulnerability: a client behind a NAT gateway shares rate-limit bucket with other clients"
+		// Raw was set but parsed to zero CIDRs — almost certainly a
+		// malformed CIDR list that the YAML loader swallowed (the env
+		// path fails boot on parse error). Surface the offending value
+		// via TrustedProxiesRaw so the operator can see what `nexus
+		// check` actually evaluated.
+		if cfg.TrustedProxiesRaw != "" {
+			detail = fmt.Sprintf("%s (raw value %q parsed to 0 CIDRs)", detail, cfg.TrustedProxiesRaw)
+		}
 		return Check{
 			Name:   checkRateLimitProxyConfig,
 			Status: StatusFail,
-			Detail: "NEXUS_RATE_LIMIT_RPM > 0 but no NEXUS_TRUSTED_PROXIES configured — spoofing vulnerability: a client behind a NAT gateway shares rate-limit bucket with other clients",
+			Detail: detail,
 		}
+	}
+	detail := fmt.Sprintf("rate limit=%d RPM, %d trusted proxy CIDR(s)", cfg.RateLimitRPM, len(cfg.TrustedProxies))
+	if cfg.TrustedProxiesRaw != "" {
+		detail = fmt.Sprintf("%s: %s", detail, cfg.TrustedProxiesRaw)
 	}
 	return Check{
 		Name:   checkRateLimitProxyConfig,
 		Status: StatusPass,
-		Detail: fmt.Sprintf("rate limit=%d RPM, %d trusted proxy CIDR(s)", cfg.RateLimitRPM, len(cfg.TrustedProxies)),
+		Detail: detail,
 	}
 }
 

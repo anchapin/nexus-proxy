@@ -425,7 +425,9 @@ type Config struct {
 	// the direct peer IP is always used and forwarded headers are
 	// ignored, so attackers who can reach the proxy directly cannot
 	// spoof per-client rate-limit buckets. TrustedProxiesRaw preserves
-	// the raw env value for diagnostics (boot warning echo).
+	// the raw source value (env or YAML) and is surfaced in the
+	// rate_limit_proxy_config diagnostic check so operators can see
+	// the exact CIDR list `nexus check` evaluated.
 	//
 	// RateLimitRPM is the per-client request ceiling in requests per
 	// minute; zero or negative disables rate limiting entirely so a
