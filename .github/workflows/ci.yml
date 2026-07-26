@@ -128,3 +128,20 @@ jobs:
         with:
           version: v2.12.2
           args: --timeout=5m
+
+  # ── Docker image smoke build (issue #541) ───────────────────────
+  # Builds the container image on every PR so a Dockerfile / go.mod Go
+  # version drift can never again slip past CI undetected. Build only —
+  # no push, no multi-arch, no signing. Release publishing stays in
+  # release.yml. The Go-test guard (cmd/nexus/docker_build_test.go)
+  # catches the version drift cheaply in every `go test` run; this job
+  # catches Dockerfile-level breakage (syntax, missing COPY sources,
+  # toolchain rejection) that the version comparison cannot.
+  docker:
+    name: docker build (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: docker build
+        run: make docker-build

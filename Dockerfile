@@ -2,7 +2,8 @@
 #
 # Multi-stage build for Nexus Proxy.
 #
-# Stage 1: compile a fully static binary in golang:1.21-alpine.
+# Stage 1: compile a fully static binary in golang:${GO_VERSION}-alpine
+#   (defaults to 1.26, matching CI and release.yml — issue #541).
 # Stage 2: copy the binary into distroless/static-debian12:nonroot.
 #
 # Final image has no shell, no package manager, and runs as UID 65532
@@ -11,7 +12,11 @@
 # writable path for that UID in a read-only-root container.
 
 # ---------- Stage 1: build ------------------------------------------------
-FROM golang:1.21-alpine AS build
+# GO_VERSION mirrors release.yml's GO_VERSION env so the container
+# toolchain always satisfies go.mod's `go` directive. Override with
+# `docker build --build-arg GO_VERSION=1.26 .`. Defaults to the CI pin.
+ARG GO_VERSION=1.26
+FROM golang:${GO_VERSION}-alpine AS build
 
 # Build version injected via -ldflags. The release workflow passes the
 # git tag here (e.g. --build-arg VERSION=v1.0.0). Defaults to "dev" for
