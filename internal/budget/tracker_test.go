@@ -178,3 +178,21 @@ func TestBudgetAccessor(t *testing.T) {
 		t.Errorf("Budget = %v, want 42.5", got)
 	}
 }
+
+// TestBudgetNilReceiver verifies Budget() returns 0 on a nil receiver
+// (disabled tracker).
+func TestBudgetNilReceiver(t *testing.T) {
+	var st *SpendTracker
+	if got := st.Budget(); got != 0 {
+		t.Errorf("Budget on nil = %v, want 0", got)
+	}
+}
+
+// TestRetryAfterNilReceiver verifies RetryAfter() returns 0 on a nil
+// receiver (disabled tracker).
+func TestRetryAfterNilReceiver(t *testing.T) {
+	var st *SpendTracker
+	if got := st.RetryAfter(); got != 0 {
+		t.Errorf("RetryAfter on nil = %v, want 0", got)
+	}
+}
