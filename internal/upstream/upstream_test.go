@@ -2128,3 +2128,150 @@ func TestPanelCacheHitNonStream_SetsJSONContentType(t *testing.T) {
 		t.Errorf("arbiter called %d times, want 0 (cache hit)", arbiterCalled)
 	}
 }
+
+// failWriteRW is an http.ResponseWriter whose Write returns err (a
+// non-client-abort error) on the failOn-th call. Earlier calls succeed
+// and append to body. It implements http.Flusher so the flush branch in
+// streamPanelResultAsSSE is exercised on the success path.
+type failWriteRW struct {
+	header  http.Header
+	status  int
+	body    strings.Builder
+	calls   int
+	failOn  int
+	err     error
+	flushed bool
+}
+
+func newFailWriteRW(failOn int, err error) *failWriteRW {
+	return &failWriteRW{header: http.Header{}, failOn: failOn, err: err}
+}
+
+func (r *failWriteRW) Header() http.Header { return r.header }
+func (r *failWriteRW) Write(b []byte) (int, error) {
+	r.calls++
+	if r.calls == r.failOn {
+		return 0, r.err
+	}
+	return r.body.Write(b)
+}
+func (r *failWriteRW) WriteHeader(s int) { r.status = s }
+func (r *failWriteRW) Flush()            { r.flushed = true }
+
+// TestStreamPanelResultAsSSESlowClientWriteError exercises the three
+// untested non-IsClientAbort error branches in streamPanelResultAsSSE
+// (content delta path). Each subtest fails a different w.Write call
+// with io.ErrShortWrite — a plain error that is NOT a client abort —
+// and asserts the error propagates verbatim rather than being converted
+// to ErrClientAbort.
+func TestStreamPanelResultAsSSESlowClientWriteError(t *testing.T) {
+	r := PanelResult{Source: "local", Content: "hello"}
+	for _, failOn := range []int{1, 2, 3} {
+		w := newFailWriteRW(failOn, io.ErrShortWrite)
+		err := streamPanelResultAsSSE(w, r)
+		if !errors.Is(err, io.ErrShortWrite) {
+			t.Errorf("write %d: err = %v, want io.ErrShortWrite", failOn, err)
+		}
+		if errors.Is(err, ErrClientAbort) {
+			t.Errorf("write %d: err is ErrClientAbort, want plain error", failOn)
+		}
+		if w.calls != failOn {
+			t.Errorf("write %d: calls = %d, want %d", failOn, w.calls, failOn)
+		}
+	}
+}
+
+// TestStreamPanelResultAsSSEToolCallsSlowClientWriteError is the
+// tool_calls delta counterpart: it drives the len(r.ToolCalls) > 0
+// branch and fails each of the three w.Write calls with io.ErrShortWrite.
+func TestStreamPanelResultAsSSEToolCallsSlowClientWriteError(t *testing.T) {
+	var tc ToolCall
+	tc.ID = "call_1"
+	tc.Type = "function"
+	tc.Function.Name = "get_weather"
+	tc.Function.Arguments = `{"loc":"sf"}`
+	r := PanelResult{Source: "local", Content: "", ToolCalls: []ToolCall{tc}}
+	for _, failOn := range []int{1, 2, 3} {
+		w := newFailWriteRW(failOn, io.ErrShortWrite)
+		err := streamPanelResultAsSSE(w, r)
+		if !errors.Is(err, io.ErrShortWrite) {
+			t.Errorf("write %d: err = %v, want io.ErrShortWrite", failOn, err)
+		}
+		if errors.Is(err, ErrClientAbort) {
+			t.Errorf("write %d: err is ErrClientAbort, want plain error", failOn)
+		}
+	}
+}
+
+// TestStreamPanelResultAsSSEClientAbortContentPath covers the
+// IsClientAbort branch for each write: an EPIPE error must surface as
+// ErrClientAbort, not the raw syscall error.
+func TestStreamPanelResultAsSSEClientAbortContentPath(t *testing.T) {
+	r := PanelResult{Source: "frontier", Content: "hi"}
+	for _, failOn := range []int{1, 2, 3} {
+		w := newFailWriteRW(failOn, syscall.EPIPE)
+		err := streamPanelResultAsSSE(w, r)
+		if !errors.Is(err, ErrClientAbort) {
+			t.Errorf("write %d: err = %v, want ErrClientAbort", failOn, err)
+		}
+	}
+}
+
+// TestStreamPanelResultAsSSEHappyPath covers the success path for both
+// the content-only and tool_calls delta shapes, asserting the emitted
+// SSE framing and that a flush is performed.
+func TestStreamPanelResultAsSSEHappyPath(t *testing.T) {
+	t.Run("content", func(t *testing.T) {
+		r := PanelResult{Source: "local", Content: "answer"}
+		w := newRW()
+		if err := streamPanelResultAsSSE(w, r); err != nil {
+			t.Fatalf("streamPanelResultAsSSE: %v", err)
+		}
+		if !strings.HasPrefix(w.body.String(), "data: ") {
+			t.Errorf("body missing data prefix: %q", w.body.String())
+		}
+		if !strings.HasSuffix(w.body.String(), "\n\n") {
+			t.Errorf("body missing SSE terminator: %q", w.body.String())
+		}
+		if !strings.Contains(w.body.String(), `"source":"local"`) {
+			t.Errorf("body missing nexus source: %q", w.body.String())
+		}
+		if !strings.Contains(w.body.String(), `"finish_reason":"stop"`) {
+			t.Errorf("body missing finish_reason stop: %q", w.body.String())
+		}
+		if w.flushes < 1 {
+			t.Errorf("expected flush, got %d", w.flushes)
+		}
+	})
+	t.Run("tool_calls", func(t *testing.T) {
+		var tc ToolCall
+		tc.ID = "call_9"
+		tc.Type = "function"
+		tc.Function.Name = "search"
+		tc.Function.Arguments = "{}"
+		r := PanelResult{Source: "frontier", ToolCalls: []ToolCall{tc}}
+		w := newRW()
+		if err := streamPanelResultAsSSE(w, r); err != nil {
+			t.Fatalf("streamPanelResultAsSSE: %v", err)
+		}
+		if !strings.Contains(w.body.String(), `"tool_calls"`) {
+			t.Errorf("body missing tool_calls delta: %q", w.body.String())
+		}
+		if !strings.Contains(w.body.String(), `"finish_reason":"tool_calls"`) {
+			t.Errorf("body missing finish_reason tool_calls: %q", w.body.String())
+		}
+	})
+}
+
+// TestStreamPanelResultAsSSEErrResultSkipped covers the r.Err != nil
+// early-return guard: an error-flagged winner is silently skipped.
+func TestStreamPanelResultAsSSEErrResultSkipped(t *testing.T) {
+	r := PanelResult{Source: "local", Err: errors.New("boom")}
+	w := newRW()
+	if err := streamPanelResultAsSSE(w, r); err != nil {
+		t.Errorf("expected nil for err-flagged result, got %v", err)
+	}
+	if w.body.Len() != 0 {
+		t.Errorf("expected no body for err-flagged result, got %q", w.body.String())
+	}
+}
