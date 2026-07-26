@@ -19,6 +19,7 @@ package rag
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"sync"
@@ -497,137 +498,118 @@ func (m *minHeap) siftDown(i int) {
 	}
 }
 
-// --- Serialization for persistence (gob-based) ---
+// --- Serialization for persistence (binary format) ---
+//
+// Serialized index layout (all integers little-endian):
+//
+//	[M: u32][efConstruction: u32][efSearch: u32][seed: u64][numEntries: u32]
+//	repeated numEntries times:
+//	  [id: u32][vecLen: u32][vecData: f64 × vecLen]
+//
+// Only layer-0 entries are stored because every vector lives in layer 0
+// exactly once in insertion order.  Higher-layer slices hold pointers to
+// the same *hnswEntry values, so iterating them would duplicate data.
+// DeserializeHNSWIndex rebuilds the full multi-layer graph by re-running
+// the construction algorithm with the same seed, producing a structurally
+// identical index.
 
-// HNSWIndexBlob is the persisted form of an HNSWIndex.
-type HNSWIndexBlob struct {
-	Entries  []HNSWEntryBlob
-	Layers   int
-	MaxLayer int
-}
-
-// HNSWEntryBlob is the persisted form of an hnswEntry.
-type HNSWEntryBlob struct {
-	ID    int
-	Vec   []float64
-	Layer int
-}
+// serializeHeaderSize is the fixed-size prefix: M + efC + efS + seed + count.
+const serializeHeaderSize = 4 + 4 + 4 + 8 + 4 // 24 bytes
 
 // Serialize returns a binary representation of the index for persistence.
+// The blob stores the build configuration and every (id, vector) pair so
+// that DeserializeHNSWIndex can faithfully rebuild an identical graph.
 func (h *HNSWIndex) Serialize() ([]byte, error) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	// Collect all entries.
-	var entries []HNSWEntryBlob
-	for layer := 0; layer <= h.maxLayer; layer++ {
-		for _, e := range h.layers[layer] {
-			entries = append(entries, HNSWEntryBlob{
-				ID:    e.id,
-				Vec:   e.vec,
-				Layer: e.layer,
-			})
-		}
-	}
+	layer0 := h.layers[0]
 
-	// Simple binary format: [num_entries][entries...]
-	// Each entry: [id(4bytes)][vec_len(4bytes)][vec_data(8bytes*len)][layer(4bytes)]
-	buf := make([]byte, 0, 1024)
-	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(entries)))
-	buf = binary.LittleEndian.AppendUint32(buf, uint32(h.maxLayer))
-	for _, e := range entries {
-		buf = binary.LittleEndian.AppendUint32(buf, uint32(e.ID))
-		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(e.Vec)))
-		for _, v := range e.Vec {
+	buf := make([]byte, 0, serializeHeaderSize+16*len(layer0))
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(h.cfg.M))
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(h.cfg.efConstruction))
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(h.cfg.efSearch))
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(h.cfg.seed))
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(layer0)))
+
+	for _, e := range layer0 {
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(e.id))
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(e.vec)))
+		for _, v := range e.vec {
 			buf = binary.LittleEndian.AppendUint64(buf, math.Float64bits(v))
 		}
-		buf = binary.LittleEndian.AppendUint32(buf, uint32(e.Layer))
 	}
 	return buf, nil
 }
 
-// Deserialize rebuilds an HNSW index from serialized data.
-// The index will be functionally identical to the original.
+// DeserializeHNSWIndex rebuilds an HNSW index from data produced by Serialize.
+//
+// The graph is reconstructed by re-inserting every vector through the normal
+// construction path (addImpl), so neighbour connections, layer assignments,
+// and entry points are all correct — unlike the previous implementation
+// which skipped neighbour rebuild entirely (issue #592).
+//
+// When the same HNSWConfig (including seed) is used the deserialized index
+// is structurally identical to the original and Search returns the same
+// results.
+//
+// The caller-supplied cfg takes precedence for any non-zero field; fields
+// left at zero fall back to the values stored in the blob.  This lets a
+// caller override efSearch at load time without needing the original build
+// parameters.
 func DeserializeHNSWIndex(data []byte, cfg HNSWConfig) (*HNSWIndex, error) {
-	if len(data) < 8 {
+	if len(data) < serializeHeaderSize {
 		return nil, errors.New("rag: hnsw index data too short")
 	}
-	r := data
 
-	numEntries := int(binary.LittleEndian.Uint32(r[:4]))
-	r = r[4:]
-	maxLayer := int(binary.LittleEndian.Uint32(r[:4]))
-	r = r[4:]
+	m := int(binary.LittleEndian.Uint32(data[0:4]))
+	efConstruction := int(binary.LittleEndian.Uint32(data[4:8]))
+	efSearch := int(binary.LittleEndian.Uint32(data[8:12]))
+	seed := int64(binary.LittleEndian.Uint64(data[12:20]))
+	numEntries := int(binary.LittleEndian.Uint32(data[20:24]))
+	r := data[24:]
+
+	// Prefer caller-supplied config; fall back to serialized values.
+	if cfg.M <= 0 {
+		cfg.M = m
+	}
+	if cfg.efConstruction <= 0 {
+		cfg.efConstruction = efConstruction
+	}
+	if cfg.efSearch <= 0 {
+		cfg.efSearch = efSearch
+	}
+	if cfg.seed == 0 {
+		cfg.seed = seed
+	}
 
 	idx := NewHNSWIndex(cfg)
-	idx.maxLayer = maxLayer
-	idx.layers = make([][]*hnswEntry, maxLayer+1)
-	idx.entryPoints = make(map[int]*hnswEntry)
-
-	// We'll store entries temporarily to link up neighbors.
-	type tempEntry struct {
-		id    int
-		vec   []float64
-		layer int
-	}
-	tempEntries := make([]tempEntry, 0, numEntries)
 
 	for i := 0; i < numEntries; i++ {
 		if len(r) < 4 {
-			return nil, errors.New("rag: hnsw index data truncated")
+			return nil, fmt.Errorf("rag: hnsw index data truncated at entry %d (reading id)", i)
 		}
 		id := int(binary.LittleEndian.Uint32(r[:4]))
 		r = r[4:]
+
 		if len(r) < 4 {
-			return nil, errors.New("rag: hnsw index data truncated")
+			return nil, fmt.Errorf("rag: hnsw index data truncated at entry %d (reading vec_len)", i)
 		}
 		vecLen := int(binary.LittleEndian.Uint32(r[:4]))
 		r = r[4:]
+
+		// Guard against corrupted/huge vecLen before allocating.
+		if vecLen > len(r)/8 {
+			return nil, fmt.Errorf("rag: hnsw index data truncated at entry %d (vec len %d, remaining %d bytes)", i, vecLen, len(r))
+		}
 		vec := make([]float64, vecLen)
 		for j := 0; j < vecLen; j++ {
-			if len(r) < 8 {
-				return nil, errors.New("rag: hnsw index data truncated")
-			}
 			vec[j] = math.Float64frombits(binary.LittleEndian.Uint64(r[:8]))
 			r = r[8:]
 		}
-		if len(r) < 4 {
-			return nil, errors.New("rag: hnsw index data truncated")
-		}
-		layer := int(binary.LittleEndian.Uint32(r[:4]))
-		r = r[4:]
 
-		tempEntries = append(tempEntries, tempEntry{id: id, vec: vec, layer: layer})
-		idx.size++
+		idx.addImpl(id, vec)
 	}
-
-	// Rebuild entries and layers.
-	entryMap := make(map[int]*hnswEntry, numEntries)
-	for _, te := range tempEntries {
-		entry := &hnswEntry{
-			vec:   te.vec,
-			id:    te.id,
-			layer: te.layer,
-		}
-		entry.neigh = make([][]neighbor, te.layer+1)
-		for layer := 0; layer <= te.layer; layer++ {
-			entry.neigh[layer] = make([]neighbor, 0, cfg.M*2)
-		}
-		idx.layers[te.layer] = append(idx.layers[te.layer], entry)
-		entryMap[te.id] = entry
-	}
-
-	// Set entry points.
-	for layer := 0; layer <= maxLayer; layer++ {
-		if len(idx.layers[layer]) > 0 {
-			idx.entryPoints[layer] = idx.layers[layer][0]
-		}
-	}
-
-	// Note: We don't rebuild neighbor connections from serialized data
-	// because they can be reconstructed during the first Search call
-	// by rebuilding the index from the vectors. For the RAG use case,
-	// we rebuild the index from the examples slice on startup anyway.
 
 	return idx, nil
 }
