@@ -283,6 +283,26 @@ func TestFetchPanelNon200(t *testing.T) {
 	}
 }
 
+func TestFetchPanelRespectsMaxResponseBytesLimit(t *testing.T) {
+	ConfigureMaxResponseBytes(1024)
+	defer ResetMaxResponseBytesForTest()
+
+	largeBody := strings.Repeat("x", 2048)
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader(largeBody)),
+		}, nil
+	})}
+	_, err := FetchPanel(context.Background(), client, "http://x", "", "m", nil)
+	if err == nil {
+		t.Fatal("expected error when response exceeds MaxResponseBytes limit")
+	}
+	if !strings.Contains(err.Error(), "read response") {
+		t.Errorf("error = %v, want error mentioning 'read response'", err)
+	}
+}
+
 func TestSynthesisPrompt(t *testing.T) {
 	prompt := SynthesisPrompt("the user said",
 		PanelResult{Source: "local", Content: "L1"},
@@ -689,6 +709,30 @@ func TestBufferedFetchTransportError(t *testing.T) {
 	})}
 	if err := BufferedFetch(newJSONRW(), client, "http://x", "", nil); err == nil {
 		t.Error("expected error")
+	}
+}
+
+func TestBufferedFetchWithContextRespectsMaxResponseBytesLimit(t *testing.T) {
+	ConfigureMaxResponseBytes(1024)
+	defer ResetMaxResponseBytesForTest()
+
+	largeBody := strings.Repeat("x", 2048)
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader(largeBody)),
+		}, nil
+	})}
+	rw := newJSONRW()
+	err := BufferedFetch(rw, client, "http://x", "", map[string]interface{}{"model": "m"})
+	if err == nil {
+		t.Fatal("expected error when response exceeds MaxResponseBytes limit")
+	}
+	if !strings.Contains(err.Error(), "read response") {
+		t.Errorf("error = %v, want error mentioning 'read response'", err)
+	}
+	if rw.status != 0 {
+		t.Errorf("status written before limit error: %d", rw.status)
 	}
 }
 

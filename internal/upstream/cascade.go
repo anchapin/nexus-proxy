@@ -47,8 +47,9 @@ type Provider interface {
 // Cascade is stateless; build a fresh one per request so it picks up env
 // changes without restarting the process (issue #14 acceptance criteria).
 type Cascade struct {
-	Steps   []CascadeStep
-	Timeout time.Duration // per-attempt; <=0 falls back to cascadeDefaultTimeout
+	Steps            []CascadeStep
+	Timeout          time.Duration // per-attempt; <=0 falls back to cascadeDefaultTimeout
+	MaxResponseBytes int           // per-response cap; <=0 falls back to defaultMaxResponseBytes (64 MiB)
 }
 
 // CascadeResult is the per-request outcome suitable for telemetry.
@@ -167,7 +168,7 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 		res.RouteAttempted = joinStepNames(c.Steps[:i+1])
 
 		ctx, cancel := context.WithTimeout(ctx, timeout)
-		msg, servedModel, err := fetchCascadeStep(ctx, client, step, payload)
+		msg, servedModel, err := c.fetchCascadeStep(ctx, client, step, payload)
 		cancel()
 		if err == nil {
 			slog.Info("cascade served",
@@ -257,7 +258,7 @@ func joinStepNames(steps []CascadeStep) string {
 // the response, and returns the assistant message + the model name echoed
 // back by the upstream (used in the SSE response). All returned errors are
 // tagged via newCascadeErr so the runner knows whether to fall back.
-func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payload map[string]interface{}) (AssistantMessage, string, error) {
+func (c *Cascade) fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payload map[string]interface{}) (AssistantMessage, string, error) {
 	body := make(map[string]interface{}, len(payload)+2)
 	for k, v := range payload {
 		body[k] = v
@@ -292,7 +293,11 @@ func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payl
 		return AssistantMessage{}, "", newCascadeErr(true, reason, "transport: %v", dErr)
 	}
 	defer resp.Body.Close()
-	respBody, _ := ioutils.ReadAllLimited(resp.Body, defaultMaxResponseBytes)
+	maxBytes := c.MaxResponseBytes
+	if maxBytes <= 0 {
+		maxBytes = defaultMaxResponseBytes
+	}
+	respBody, _ := ioutils.ReadAllLimited(resp.Body, maxBytes)
 
 	if ShouldRetry(resp.StatusCode, nil) {
 		return AssistantMessage{}, "", newCascadeErr(true, "transport_error", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))

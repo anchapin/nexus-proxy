@@ -94,12 +94,31 @@ func copyAllowedHeaders(dst, src http.Header) {
 }
 
 // DefaultMaxUpstreamResponseBytes is the default cap on buffered upstream
-// responses. It is used by BufferedFetchWithContext, FetchPanel, and
-// fetchCascadeStep when no explicit limit is passed. The value (10 MiB)
-// accommodates multi-turn conversations with long contexts while preventing
-// a malicious or misbehaving upstream from exhausting proxy memory
-// (issue #386). Tests can override it via SetMaxUpstreamResponseBytes.
+// responses. It is used as the initial value of maxResponseBytes before
+// ConfigureMaxResponseBytes is called. The value (10 MiB) accommodates
+// multi-turn conversations with long contexts while preventing a malicious
+// or misbehaving upstream from exhausting proxy memory (issue #386).
 var DefaultMaxUpstreamResponseBytes int64 = 10 << 20 // 10 MiB
+
+// maxResponseBytes is the currently-configured cap on buffered upstream
+// responses. It is consulted by BufferedFetchWithContext and FetchPanel
+// instead of the bare DefaultMaxUpstreamResponseBytes constant.
+var maxResponseBytes int64 = DefaultMaxUpstreamResponseBytes
+
+// ConfigureMaxResponseBytes sets the cap on buffered upstream response
+// bodies. Called once at startup from cmd/nexus/main.go so the configured
+// NEXUS_MAX_RESPONSE_BYTES value (or its default) is authoritative for
+// the upstream package. Issue #533.
+func ConfigureMaxResponseBytes(n int64) {
+	maxResponseBytes = n
+}
+
+// ResetMaxResponseBytesForTest resets maxResponseBytes to the default
+// so tests do not bleed state into each other. Called at the end of each
+// test that calls ConfigureMaxResponseBytes.
+func ResetMaxResponseBytesForTest() {
+	maxResponseBytes = DefaultMaxUpstreamResponseBytes
+}
 
 // Client is the minimal interface used by the stream and fusion helpers. The
 // default http.Client satisfies it; tests can pass a stub.
@@ -329,13 +348,13 @@ func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client
 		return fmt.Errorf("upstream: do: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, DefaultMaxUpstreamResponseBytes))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	// err may be nil even when the limit was hit: io.LimitReader returns
 	// io.EOF (not an error) when the limit is reached but all requested
 	// bytes were returned. To detect this truncation we also check whether
 	// the body length equals the limit — if so, the upstream may have
 	// had more data we did not receive.
-	if err != nil || int64(len(respBody)) >= DefaultMaxUpstreamResponseBytes {
+	if err != nil || int64(len(respBody)) >= maxResponseBytes {
 		return fmt.Errorf("upstream: read response: %w", err)
 	}
 
@@ -393,8 +412,8 @@ func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName
 		return AssistantMessage{}, fmt.Errorf("fusion: do: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, DefaultMaxUpstreamResponseBytes))
-	if err != nil || int64(len(respBody)) >= DefaultMaxUpstreamResponseBytes {
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if err != nil || int64(len(respBody)) >= maxResponseBytes {
 		return AssistantMessage{}, fmt.Errorf("fusion: read response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
