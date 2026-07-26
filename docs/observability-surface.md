@@ -25,12 +25,14 @@ snake_case naming.
 | `nexus_slm_cache_evictions_total` | counter | `reason` | 2 (`ttl`, `lru`) | `routemetrics.go` |
 | `nexus_slm_cache_entries` | gauge | *(none)* | 1 | `prometheus.go` (issue #531) |
 | `nexus_slm_cache_max_entries` | gauge | *(none)* | 1 | `prometheus.go` (issue #531) |
+| `nexus_local_cooldown_active` | gauge | *(none)* | 1 | `prometheus.go` (issue #530) |
+| `nexus_local_cooldown_triggers_total` | counter | *(none)* | 1 | `routemetrics.go` (issue #530) |
 | `nexus_requests_rejected_total` | counter | `reason` | 4 | `routemetrics.go` |
 | `nexus_cascade_fallback_total` | counter | `reason` | 5 (`timeout`, `transport_error`, `http_error`, `malformed_toolcall`, `malformed_response`) | `routemetrics.go` |
 | `nexus_rag_retrieval_total` | counter | `hit`, `reason` (miss only) | 1 + 3 = 4 | `routemetrics.go` |
 | `nexus_judge_dropped_total` | counter | *(none)* | 1 | `routemetrics.go` |
 
-**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 4 + 5 + 4 + 1 = 138 series.
+**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 1 + 1 + 4 + 5 + 4 + 1 = 140 series.
 
 > **Note (issue #486):** `nexus_rag_retrieval_total` previously carried
 > a `filename` label whose value was the raw RAG source filename, which
@@ -171,6 +173,7 @@ extended in #497, #534):
 | `hit` (RAG retrieval) | Yes | 2 | `true`, `false` (issue #186, #486) |
 | `reason` (RAG retrieval miss) | Yes | 3 | `empty_store`, `threshold`, `embed_error` — closed set emitted only when `hit="false"` |
 | SLM cache gauges (issue #531) | N/A | 2 | `nexus_slm_cache_entries` and `nexus_slm_cache_max_entries` are unlabelled gauges (cardinality 1 each); no label cardinality concerns. |
+| Local-route cooldown (issue #530) | N/A | 2 | `nexus_local_cooldown_active` (gauge, cardinality 1) and `nexus_local_cooldown_triggers_total` (counter, cardinality 1) are both unlabelled; no label cardinality concerns. |
 
 **No unbounded cardinality labels exist.** All label values are
 short, pre-defined strings with no user-controlled input. The
@@ -346,6 +349,47 @@ concrete `*router.SLMCache` instance. When the cache is disabled
 (`NEXUS_SLM_CACHE_TTL=0`) the provider returns `nil` so neither
 series appears in a fresh scrape. Operators can compute the fill ratio
 directly in PromQL: `nexus_slm_cache_entries / nexus_slm_cache_max_entries`.
+
+## Local-route cooldown (issue #530)
+
+The local-route cooldown circuit (`internal/circuit/cooldown.go`, issue #80)
+arms a short window after the cascade detects an Ollama failure, skipping the
+local arm on subsequent `route=local` and `route=fusion` requests until the
+window expires. Without it, every subsequent request pays the full upstream
+timeout before falling back — a window of repeated slow local attempts.
+
+Two Prometheus signals (issue #530) let operators observe the cooldown
+arm/fire cycle directly from `/metrics` without correlating logs:
+
+| Metric | Type | Backing source | Meaning |
+|--------|------|----------------|---------|
+| `nexus_local_cooldown_active` | gauge | `circuit.Cooldown.Active()` | `1` when the cooldown window is active; `0` otherwise. Absent from `/metrics` when the cooldown is disabled (`NEXUS_LOCAL_COOLDOWN<=0`). |
+| `nexus_local_cooldown_triggers_total` | counter | `routeCounters.IncLocalCooldownTriggers()` | Cumulative cooldown arm events — each increment corresponds to one cascade failure that armed the cooldown. |
+
+The gauge is wired as a `GaugeProvider` closure in `cmd/nexus/main.go`,
+reading `localCooldown.Active()` at scrape time. The counter is incremented
+via a failure observer callback (`circuit.Cooldown.SetFailureObserver`)
+that forwards to `routeCounters.IncLocalCooldownTriggers()` — the circuit
+package does not import observability, preserving the existing dependency
+direction.
+
+The `/status` endpoint also surfaces a `local_cooldown` sub-object:
+
+```json
+{
+  "local_cooldown": {
+    "enabled": true,
+    "active": true,
+    "expires_at": "2024-01-01T00:00:10Z"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `enabled` | bool | Whether the cooldown circuit is wired (`NEXUS_LOCAL_COOLDOWN > 0`) |
+| `active` | bool | Whether the cooldown window is currently in effect |
+| `expires_at` | time | Wall-clock time when the active window ends (zero if inactive or disabled) |
 
 ## Observer wiring
 
