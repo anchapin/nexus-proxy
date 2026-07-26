@@ -44,17 +44,17 @@ func NewArbiterCache(ttl time.Duration) *ArbiterCache {
 }
 
 // cacheKey computes a deterministic FNV-64a hash of the two panel-member
-// contents. The order does not matter (r1 vs r2 swapped produces the
-// same key) so cache lookups are symmetric.
+// contents using XOR-combining. Each content is hashed independently and
+// the two 64-bit hashes are XORed together, making the key provably
+// order-independent (commutative): cacheKey(a, b) == cacheKey(b, a).
+// This is critical because panel members write to a shared channel in
+// non-deterministic goroutine-arrival order.
 func cacheKey(r1Content, r2Content string) uint64 {
-	h := fnv.New64a()
-	// Sort the two contents so swapping r1/r2 yields the same key.
-	if r1Content > r2Content {
-		r1Content, r2Content = r2Content, r1Content
-	}
-	h.Write([]byte(r1Content))
-	h.Write([]byte(r2Content))
-	return h.Sum64()
+	h1 := fnv.New64a()
+	h1.Write([]byte(r1Content))
+	h2 := fnv.New64a()
+	h2.Write([]byte(r2Content))
+	return h1.Sum64() ^ h2.Sum64()
 }
 
 // Get returns the cached synthesis text and true if the entry exists
