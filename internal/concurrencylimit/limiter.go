@@ -209,17 +209,25 @@ func (l *Limiter) Acquire(ctx context.Context) (func(), error) {
 	return l.release, nil
 }
 
-// release decrements the in-flight counter and wakes one blocked
-// acquirer. It is the function returned by a successful Acquire.
+// release decrements the in-flight counter and wakes blocked
+// acquirers. It is the function returned by a successful Acquire.
 func (l *Limiter) release() {
 	l.mu.Lock()
+	prevEff := l.effectiveLocked()
 	if l.inFlight > 0 {
 		l.inFlight--
 	}
-	// Broadcast rather than Signal so that, when the effective count
-	// has grown (probe reported more VRAM), multiple waiters can
-	// proceed at once. Signal would only wake one.
-	l.cond.Broadcast()
+	// Broadcast only when the effective count has grown (probe
+	// reported more VRAM) so that multiple waiters can proceed at
+	// once. In the normal single-slot-release case the effective
+	// count is unchanged; Signal is sufficient and avoids waking
+	// every waiter when only one slot is available.
+	newEff := l.effectiveLocked()
+	if newEff > prevEff {
+		l.cond.Broadcast()
+	} else {
+		l.cond.Signal()
+	}
 	l.mu.Unlock()
 }
 
