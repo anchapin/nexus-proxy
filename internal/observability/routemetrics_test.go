@@ -824,6 +824,56 @@ func TestSLMCacheEvictionsNilAndEmptySafe(t *testing.T) {
 	}
 }
 
+// TestLocalCooldownTriggersCounter (issue #530) verifies that
+// IncLocalCooldownTriggers increments the counter and that WriteTo
+// renders the counter with correct HELP/TYPE headers.
+func TestLocalCooldownTriggersCounter(t *testing.T) {
+	rc := NewRouteCounters()
+
+	rc.IncLocalCooldownTriggers()
+	rc.IncLocalCooldownTriggers()
+	rc.IncLocalCooldownTriggers()
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []string{
+		"# HELP nexus_local_cooldown_triggers_total",
+		"# TYPE nexus_local_cooldown_triggers_total counter",
+		"nexus_local_cooldown_triggers_total 3",
+	}
+	for _, want := range checks {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q\ngot:\n%s", want, out)
+		}
+	}
+}
+
+// TestLocalCooldownTriggersCounterNil verifies that IncLocalCooldownTriggers
+// on a nil receiver is a safe no-op.
+func TestLocalCooldownTriggersCounterNil(t *testing.T) {
+	var rc *RouteCounters
+	rc.IncLocalCooldownTriggers() // must not panic
+}
+
+// TestLocalCooldownTriggersCounterAbsentWhenZero verifies the counter
+// series is still emitted (with value 0) so scrapers can discover the
+// family even before the first trigger fires.
+func TestLocalCooldownTriggersCounterAbsentWhenZero(t *testing.T) {
+	rc := NewRouteCounters()
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+	if !strings.Contains(out, "# HELP nexus_local_cooldown_triggers_total") {
+		t.Errorf("counter should be emitted even when zero\ngot:\n%s", out)
+	}
+}
+
 // TestHandlerEmitsCircuitBreakerGauges (issue #443) wires a real
 // Collector into the production RouteCounters.Handler() and confirms
 // that a recorded RAG failure surfaces in /metrics as the three

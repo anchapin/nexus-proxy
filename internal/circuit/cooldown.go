@@ -46,6 +46,13 @@ type Cooldown struct {
 	// loaded atomically so concurrent RecordFailure / Active calls
 	// never tear.
 	failedAt atomic.Int64
+
+	// onFailure is an optional callback invoked (if non-nil) each time
+	// RecordFailure stores a new timestamp. It is called after the
+	// atomic store, on the same goroutine that called RecordFailure.
+	// Used to notify the observability collector without the circuit
+	// package importing the observability package (issue #530).
+	onFailure func()
 }
 
 // New constructs a Cooldown with the given duration. A non-positive
@@ -74,6 +81,23 @@ func (c *Cooldown) RecordFailure() {
 		return
 	}
 	c.failedAt.Store(c.now().UnixNano())
+	if c.onFailure != nil {
+		c.onFailure()
+	}
+}
+
+// SetFailureObserver registers a callback that is invoked (if non-nil)
+// each time RecordFailure stores a new timestamp (issue #530). Pass nil
+// to clear the observer. The callback runs on the same goroutine that
+// called RecordFailure, after the atomic store. Callers that want to
+// record into observability.RouteCounters should pass a closure that
+// forwards to IncLocalCooldownTriggers; the closure will execute
+// without re-entering the cooldown logic.
+func (c *Cooldown) SetFailureObserver(fn func()) {
+	if c == nil {
+		return
+	}
+	c.onFailure = fn
 }
 
 // Active reports whether the cooldown window is still in effect — i.e.

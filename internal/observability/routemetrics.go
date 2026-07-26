@@ -182,6 +182,11 @@ type RouteCounters struct {
 	// Labelled by mux route template to bound cardinality.
 	handlerPanics map[string]*uint64
 
+	// localCooldownTriggers counts how many times the local-route
+	// cooldown was armed (issue #530). Protected by sync.Mutex like
+	// the other map-based counters.
+	localCooldownTriggers uint64
+
 	// collector is an optional Collector whose CircuitBreakerGauges()
 	// are merged into the /metrics output when non-nil.
 	collector *Collector
@@ -442,6 +447,16 @@ func (rc *RouteCounters) ObserveSLMCacheEviction(reason string) {
 		return
 	}
 	atomic.AddUint64(rc.slmCacheEvictionSlot(reason), 1)
+}
+
+// IncLocalCooldownTriggers increments the cooldown-triggers counter
+// (issue #530). Called when the local-route cooldown is armed after
+// a cascade failure. Nil receivers are safe — no-op.
+func (rc *RouteCounters) IncLocalCooldownTriggers() {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(&rc.localCooldownTriggers, 1)
 }
 
 // slmCacheEvictionSlot returns the *uint64 for the SLM cache eviction
@@ -776,6 +791,13 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 		return total, err
 	} else {
 		total += n
+	}
+	// Local-route cooldown triggers (issue #530).
+	cooldownTriggers := atomic.LoadUint64(&rc.localCooldownTriggers)
+	if n, err := fmt.Fprintf(w, "# HELP nexus_local_cooldown_triggers_total Total local-route cooldown arm events.\n# TYPE nexus_local_cooldown_triggers_total counter\nnexus_local_cooldown_triggers_total %d\n", cooldownTriggers); err != nil {
+		return total, err
+	} else {
+		total += int64(n)
 	}
 	if n, err := writeRejectionSeries(w, "nexus_requests_rejected_total",
 		"Requests the proxy rejected before they reached an upstream.",

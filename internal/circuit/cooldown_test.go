@@ -148,3 +148,65 @@ func TestCooldown_Concurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestCooldown_FailureObserverCalled(t *testing.T) {
+	t.Parallel()
+	clk := newFakeClock()
+	c := NewWithClock(10*time.Second, clk.Now)
+
+	var calls atomic.Int64
+	c.SetFailureObserver(func() {
+		calls.Add(1)
+	})
+
+	c.RecordFailure()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("observer called %d times after one RecordFailure, want 1", got)
+	}
+
+	// Second failure should call observer again.
+	c.RecordFailure()
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("observer called %d times after two RecordFailure calls, want 2", got)
+	}
+}
+
+func TestCooldown_FailureObserverNotCalledWhenDisabled(t *testing.T) {
+	t.Parallel()
+	c := New(0) // disabled
+
+	var calls atomic.Int64
+	c.SetFailureObserver(func() {
+		calls.Add(1)
+	})
+
+	c.RecordFailure()
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("observer called %d times when cooldown is disabled, want 0", got)
+	}
+}
+
+func TestCooldown_FailureObserverNilClearsObserver(t *testing.T) {
+	t.Parallel()
+	clk := newFakeClock()
+	c := NewWithClock(10*time.Second, clk.Now)
+
+	var calls atomic.Int64
+	c.SetFailureObserver(func() {
+		calls.Add(1)
+	})
+
+	c.RecordFailure()
+	c.SetFailureObserver(nil) // clear
+
+	c.RecordFailure()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("observer called %d times after clear, want 1", got)
+	}
+}
+
+func TestCooldown_FailureObserverNilSafe(t *testing.T) {
+	t.Parallel()
+	var c *Cooldown
+	c.SetFailureObserver(func() {}) // must not panic
+}

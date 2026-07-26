@@ -181,6 +181,11 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Configured maximum entry capacity of the SLM decision cache (issue #531).",
 		typ:  "gauge",
 	},
+	// Local-route cooldown gauge (issue #530).
+	"nexus_local_cooldown_active": {
+		help: "1 when the local-route cooldown is active (a cascade failure was recorded and the window has not expired); 0 otherwise (issue #530). Absent from /metrics when the cooldown is disabled (NEXUS_LOCAL_COOLDOWN<=0).",
+		typ:  "gauge",
+	},
 }
 
 // RenderPrometheus writes the full /metrics body in Prometheus

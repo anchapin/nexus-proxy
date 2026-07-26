@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
 	"github.com/anchapin/nexus-proxy/internal/router"
 )
@@ -597,5 +598,94 @@ func TestRenderPrometheusSLMCacheGaugesAbsentWhenDisabled(t *testing.T) {
 	}
 	if strings.Contains(out, "nexus_slm_cache_max_entries") {
 		t.Errorf("nexus_slm_cache_max_entries should not appear when cache is nil\n--- output ---\n%s", out)
+	}
+}
+
+// TestRenderPrometheusLocalCooldownGauge (issue #530) drives a real
+// circuit.Cooldown to an active state and asserts the
+// nexus_local_cooldown_active gauge renders with value 1 and correct
+// HELP/TYPE headers.
+func TestRenderPrometheusLocalCooldownGauge(t *testing.T) {
+	c := NewCollector()
+	clk := circuit.NewWithClock(10*time.Second, func() time.Time {
+		return time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	})
+	clk.RecordFailure()
+
+	provider := GaugeProviderFunc(func() []GaugeSample {
+		var v float64
+		if clk.Active() {
+			v = 1
+		}
+		return []GaugeSample{{Name: "nexus_local_cooldown_active", Value: v}}
+	})
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c, provider)
+	out := sb.String()
+
+	checks := []string{
+		"# HELP nexus_local_cooldown_active",
+		"# TYPE nexus_local_cooldown_active gauge",
+		"nexus_local_cooldown_active 1",
+	}
+	for _, want := range checks {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+}
+
+// TestRenderPrometheusLocalCooldownGaugeZeroWhenInactive verifies the gauge
+// renders as 0 when the cooldown is not active.
+func TestRenderPrometheusLocalCooldownGaugeZeroWhenInactive(t *testing.T) {
+	c := NewCollector()
+	clk := circuit.NewWithClock(10*time.Second, func() time.Time {
+		return time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	})
+	// No failure recorded — cooldown is inactive.
+
+	provider := GaugeProviderFunc(func() []GaugeSample {
+		var v float64
+		if clk.Active() {
+			v = 1
+		}
+		return []GaugeSample{{Name: "nexus_local_cooldown_active", Value: v}}
+	})
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c, provider)
+	out := sb.String()
+
+	if !strings.Contains(out, "nexus_local_cooldown_active 0") {
+		t.Errorf("expected nexus_local_cooldown_active 0\ngot:\n%s", out)
+	}
+}
+
+// TestRenderPrometheusLocalCooldownGaugeAbsentWhenDisabled (issue #530)
+// verifies that when the cooldown is nil the gauge provider returns nil
+// so the series does not appear in a fresh scrape.
+func TestRenderPrometheusLocalCooldownGaugeAbsentWhenDisabled(t *testing.T) {
+	c := NewCollector()
+
+	var nilCooldown *circuit.Cooldown
+
+	provider := GaugeProviderFunc(func() []GaugeSample {
+		if nilCooldown == nil {
+			return nil
+		}
+		var v float64
+		if nilCooldown.Active() {
+			v = 1
+		}
+		return []GaugeSample{{Name: "nexus_local_cooldown_active", Value: v}}
+	})
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c, provider)
+	out := sb.String()
+
+	if strings.Contains(out, "nexus_local_cooldown_active") {
+		t.Errorf("nexus_local_cooldown_active should not appear when cooldown is nil\n--- output ---\n%s", out)
 	}
 }

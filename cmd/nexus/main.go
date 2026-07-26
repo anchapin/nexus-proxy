@@ -361,6 +361,14 @@ func main() {
 	// Handler() call stay in the late-setup block below.
 	routeCounters := observability.NewRouteCounters()
 
+	// Wire the local-route cooldown failure observer into the route
+	// counters after both are initialised (issue #530).
+	if localCooldown != nil {
+		localCooldown.SetFailureObserver(func() {
+			routeCounters.IncLocalCooldownTriggers()
+		})
+	}
+
 	// Circuit breaker metrics collector (issue #304). Created early so it
 	// is available for wiring into the chat handler Deps.
 	circuitCollector := observability.NewCollector()
@@ -695,6 +703,20 @@ func main() {
 				{Name: "nexus_local_concurrency_effective_slots", Value: float64(localConcLimiter.Effective())},
 				{Name: "nexus_local_concurrency_in_flight", Value: float64(localConcLimiter.InFlight())},
 			}
+		}),
+		// Local-route cooldown gauge (issue #530).
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			if localCooldown == nil {
+				return nil
+			}
+			var v float64
+			if localCooldown.Active() {
+				v = 1
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_local_cooldown_active",
+				Value: v,
+			}}
 		}),
 	)
 
