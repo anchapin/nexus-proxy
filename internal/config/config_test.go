@@ -1073,3 +1073,186 @@ func TestReadinessModeValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestEffectiveMaxBodyBytes covers the EffectiveMaxBodyBytes DoS-protection
+// cap constructor: positive overrides are honoured, while zero/negative
+// values fall back to DefaultMaxBodyBytes so a zero-value Config still gets
+// a sane cap (issue #539).
+func TestEffectiveMaxBodyBytes(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{"zero value falls back to default", 0, DefaultMaxBodyBytes},
+		{"negative falls back to default", -1, DefaultMaxBodyBytes},
+		{"large negative falls back to default", -1 << 30, DefaultMaxBodyBytes},
+		{"positive override honoured", 2 << 20, 2 << 20},
+		{"one byte minimum honoured", 1, 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{MaxBodyBytes: tc.in}
+			if got := cfg.EffectiveMaxBodyBytes(); got != tc.want {
+				t.Errorf("EffectiveMaxBodyBytes() with MaxBodyBytes=%d = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEffectiveMaxResponseBytes covers the upstream response-body cap
+// constructor (issue #539). Same branch matrix as EffectiveMaxBodyBytes,
+// anchored against DefaultMaxResponseBytes.
+func TestEffectiveMaxResponseBytes(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{"zero value falls back to default", 0, DefaultMaxResponseBytes},
+		{"negative falls back to default", -1, DefaultMaxResponseBytes},
+		{"large negative falls back to default", -1 << 30, DefaultMaxResponseBytes},
+		{"positive override honoured", 128 << 20, 128 << 20},
+		{"one byte minimum honoured", 1, 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{MaxResponseBytes: tc.in}
+			if got := cfg.EffectiveMaxResponseBytes(); got != tc.want {
+				t.Errorf("EffectiveMaxResponseBytes() with MaxResponseBytes=%d = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEffectiveDebugBodyBytes covers the debug-trace body preview cap
+// constructor (issue #539). Anchored against DefaultDebugBodyBytes so the
+// defining package owns the contract; the parity assertion in
+// internal/handlers/debug_test.go stays as defence-in-depth.
+func TestEffectiveDebugBodyBytes(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{"zero value falls back to default", 0, DefaultDebugBodyBytes},
+		{"negative falls back to default", -1, DefaultDebugBodyBytes},
+		{"large negative falls back to default", -1 << 30, DefaultDebugBodyBytes},
+		{"positive override honoured", 2048, 2048},
+		{"one byte minimum honoured", 1, 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{DebugBodyBytes: tc.in}
+			if got := cfg.EffectiveDebugBodyBytes(); got != tc.want {
+				t.Errorf("EffectiveDebugBodyBytes() with DebugBodyBytes=%d = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFrontierProviders covers the security-sensitive provider list
+// constructor (issue #539). Providers with an empty API key are omitted so a
+// half-configured deployment cannot proxy to an unauthenticated endpoint, and
+// the declaration order is frontier-then-zai.
+func TestFrontierProviders(t *testing.T) {
+	const (
+		frontierKey   = "fk-123"
+		frontierURL   = "https://api.openai.com/v1/chat/completions"
+		frontierModel = "gpt-4o"
+		frontierCost  = 0.01
+
+		zaiKey   = "zk-456"
+		zaiURL   = "https://api.z.ai/v1/chat/completions"
+		zaiModel = "glm-4.6"
+		zaiCost  = 0.002
+	)
+
+	tests := []struct {
+		name      string
+		cfg       Config
+		wantNames []string // declaration order
+		wantKey   []string // parallel slice of API keys
+	}{
+		{
+			name:      "both keys set returns two providers in frontier-then-zai order",
+			cfg:       Config{FrontierURL: frontierURL, FrontierModel: frontierModel, FrontierKey: frontierKey, FrontierCostPer1K: frontierCost, ZAIURL: zaiURL, ZAIModel: zaiModel, ZAIKey: zaiKey, ZAICostPer1K: zaiCost},
+			wantNames: []string{"frontier", "zai"},
+			wantKey:   []string{frontierKey, zaiKey},
+		},
+		{
+			name:      "only frontier key set returns one frontier provider",
+			cfg:       Config{FrontierURL: frontierURL, FrontierModel: frontierModel, FrontierKey: frontierKey, FrontierCostPer1K: frontierCost, ZAIURL: zaiURL, ZAIModel: zaiModel, ZAIKey: ""},
+			wantNames: []string{"frontier"},
+			wantKey:   []string{frontierKey},
+		},
+		{
+			name:      "only zai key set returns one zai provider",
+			cfg:       Config{FrontierURL: frontierURL, FrontierModel: frontierModel, FrontierKey: "", ZAIURL: zaiURL, ZAIModel: zaiModel, ZAIKey: zaiKey, ZAICostPer1K: zaiCost},
+			wantNames: []string{"zai"},
+			wantKey:   []string{zaiKey},
+		},
+		{
+			name:      "neither key set returns empty slice (no unauthenticated providers)",
+			cfg:       Config{FrontierURL: frontierURL, FrontierModel: frontierModel, FrontierKey: "", ZAIURL: zaiURL, ZAIModel: zaiModel, ZAIKey: ""},
+			wantNames: nil,
+			wantKey:   nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.cfg.FrontierProviders()
+			if len(got) != len(tc.wantNames) {
+				t.Fatalf("FrontierProviders() returned %d providers, want %d (%v)", len(got), len(tc.wantNames), tc.wantNames)
+			}
+			for i, p := range got {
+				if p.Name != tc.wantNames[i] {
+					t.Errorf("provider[%d].Name = %q, want %q", i, p.Name, tc.wantNames[i])
+				}
+				if p.APIKey != tc.wantKey[i] {
+					t.Errorf("provider[%d].APIKey = %q, want %q", i, p.APIKey, tc.wantKey[i])
+				}
+				if p.APIKey == "" {
+					t.Errorf("provider[%d] (%s) has empty APIKey — security regression: unauthenticated provider must be omitted", i, p.Name)
+				}
+			}
+
+			// Assert the field wiring for the populated cases so a
+			// silent field-swap (URL/Model/Cost) is caught.
+			if len(got) > 0 && tc.cfg.FrontierKey != "" {
+				f := got[0]
+				if f.URL != tc.cfg.FrontierURL {
+					t.Errorf("frontier provider URL = %q, want %q", f.URL, tc.cfg.FrontierURL)
+				}
+				if f.Model != tc.cfg.FrontierModel {
+					t.Errorf("frontier provider Model = %q, want %q", f.Model, tc.cfg.FrontierModel)
+				}
+				if f.CostPer1KUSD != tc.cfg.FrontierCostPer1K {
+					t.Errorf("frontier provider CostPer1KUSD = %v, want %v", f.CostPer1KUSD, tc.cfg.FrontierCostPer1K)
+				}
+			}
+			if len(got) == 2 {
+				z := got[1]
+				if z.URL != tc.cfg.ZAIURL {
+					t.Errorf("zai provider URL = %q, want %q", z.URL, tc.cfg.ZAIURL)
+				}
+				if z.Model != tc.cfg.ZAIModel {
+					t.Errorf("zai provider Model = %q, want %q", z.Model, tc.cfg.ZAIModel)
+				}
+				if z.CostPer1KUSD != tc.cfg.ZAICostPer1K {
+					t.Errorf("zai provider CostPer1KUSD = %v, want %v", z.CostPer1KUSD, tc.cfg.ZAICostPer1K)
+				}
+			}
+		})
+	}
+
+	// Explicit zero-value Config guard: a fresh deployment with no keys
+	// configured must not surface any provider.
+	t.Run("zero value Config returns empty provider list", func(t *testing.T) {
+		got := Config{}.FrontierProviders()
+		if len(got) != 0 {
+			t.Fatalf("zero-value Config FrontierProviders() = %v, want empty", got)
+		}
+	})
+}
