@@ -43,9 +43,10 @@ type Watcher struct {
 	mu    sync.Mutex
 	known map[string]fileSnapshot
 
-	stopCh chan struct{}
-	doneCh chan struct{}
-	once   sync.Once
+	stopCh       chan struct{}
+	doneCh       chan struct{}
+	once         sync.Once
+	newWatcherFn func() (*fsnotify.Watcher, error) // injectable for tests
 }
 
 // NewWatcher constructs a Watcher; call Start to spawn the watcher
@@ -62,12 +63,13 @@ func NewWatcher(store *PersistentStore, dir string, interval time.Duration) *Wat
 		interval = 60 * time.Second // fallback poll for fsnotify-unavailable cases
 	}
 	return &Watcher{
-		store:    store,
-		dir:      dir,
-		interval: interval,
-		known:    make(map[string]fileSnapshot),
-		stopCh:   make(chan struct{}),
-		doneCh:   make(chan struct{}),
+		store:        store,
+		dir:          dir,
+		interval:     interval,
+		known:        make(map[string]fileSnapshot),
+		stopCh:       make(chan struct{}),
+		doneCh:       make(chan struct{}),
+		newWatcherFn: fsnotify.NewWatcher,
 	}
 }
 
@@ -104,7 +106,7 @@ func (w *Watcher) run(parent context.Context) {
 
 	// Attempt to open an fsnotify watcher. If it fails (e.g.,
 	// network mount with no inotify support), fall back to polling-only.
-	fw, err := fsnotify.NewWatcher()
+	fw, err := w.newWatcherFn()
 	if err != nil {
 		slog.Warn("rag: fsnotify unavailable, using fallback polling",
 			slog.String("component", "rag"),
@@ -122,7 +124,11 @@ func (w *Watcher) run(parent context.Context) {
 			_ = fw.Close()
 			fw = nil
 		} else {
-			defer func() { _ = fw.Close() }()
+			// Capture the pointer in a local so the deferred func
+			// always sees the original value, even after fw is
+			// set to nil in the channel-closed degradation branch.
+			fsNotifier := fw
+			defer func() { _ = fsNotifier.Close() }()
 		}
 	}
 
