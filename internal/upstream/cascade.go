@@ -80,9 +80,10 @@ type CascadeResult struct {
 	// FallbackReason is the reason label for the cascade_fallback_total
 	// metric (issue #205). It is set whenever a retryable step failure
 	// causes the cascade to fall back to the next step. The value is one
-	// of "timeout", "transport_error", or "malformed_toolcall". Empty
-	// when no fallback occurred (cascade succeeded on first step or all
-	// steps failed without retryable errors).
+	// of "timeout", "transport_error", "malformed_toolcall", or
+	// "malformed_response". Empty when no fallback occurred (cascade
+	// succeeded on first step or all steps failed without retryable
+	// errors).
 	FallbackReason string
 }
 
@@ -100,8 +101,9 @@ var ErrSSEPartialWrite = errors.New("cascade: SSE partial write after headers co
 // cascadeErr tags a per-step failure so the runner knows whether to fall
 // back (retry=true) or surface the error immediately (retry=false — e.g.
 // upstream returned 401, retrying won't help). The reason field carries
-// one of three values used for cascade_fallback_total{reason} metrics:
-// "timeout", "transport_error", or "malformed_toolcall".
+// one of four values used for cascade_fallback_total{reason} metrics:
+// "timeout", "transport_error", "malformed_toolcall", or
+// "malformed_response".
 type cascadeErr struct {
 	retry  bool
 	reason string // "" when non-retryable
@@ -112,7 +114,8 @@ func (e *cascadeErr) Error() string { return e.msg }
 
 // newCascadeErr creates a cascadeErr. reason is the label for the
 // cascade_fallback_total metric: "timeout", "transport_error",
-// "malformed_toolcall", or "" for non-retryable errors.
+// "malformed_toolcall", "malformed_response", or "" for non-retryable
+// errors.
 func newCascadeErr(retry bool, reason, format string, args ...interface{}) error {
 	return &cascadeErr{retry: retry, reason: reason, msg: fmt.Sprintf(format, args...)}
 }
@@ -228,8 +231,9 @@ func classifyFailure(err error) bool {
 
 // CascadeFallbackReason extracts the reason label from err if it is a
 // cascadeErr with a non-empty reason field. The returned string is one
-// of "timeout", "transport_error", or "malformed_toolcall". Empty string
-// is returned when err is nil or the error carries no fallback reason.
+// of "timeout", "transport_error", "malformed_toolcall", or
+// "malformed_response". Empty string is returned when err is nil or the
+// error carries no fallback reason.
 func CascadeFallbackReason(err error) string {
 	if err == nil {
 		return ""
@@ -364,10 +368,10 @@ func (m AssistantMessage) HasToolCalls() bool { return len(m.ToolCalls) > 0 }
 func extractAssistantMessage(body []byte) (AssistantMessage, string, error) {
 	var raw assistantResponse
 	if uErr := json.Unmarshal(body, &raw); uErr != nil {
-		return AssistantMessage{}, "", newCascadeErr(true, "transport_error", "decode: %v", uErr)
+		return AssistantMessage{}, "", newCascadeErr(true, "malformed_response", "decode: %v", uErr)
 	}
 	if len(raw.Choices) == 0 {
-		return AssistantMessage{}, "", newCascadeErr(true, "transport_error", "empty choices")
+		return AssistantMessage{}, "", newCascadeErr(true, "malformed_response", "empty choices")
 	}
 	msg := raw.Choices[0].Message
 	for i, tc := range msg.ToolCalls {

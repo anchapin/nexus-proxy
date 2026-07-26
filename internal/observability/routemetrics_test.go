@@ -286,6 +286,8 @@ func TestObserveCascadeFallback(t *testing.T) {
 	rc.ObserveCascadeFallback("malformed_toolcall")
 	rc.ObserveCascadeFallback("malformed_toolcall")
 	rc.ObserveCascadeFallback("malformed_toolcall")
+	rc.ObserveCascadeFallback("malformed_response")
+	rc.ObserveCascadeFallback("malformed_response")
 
 	var sb2 strings.Builder
 	if _, err := rc.WriteTo(&sb2); err != nil {
@@ -302,6 +304,7 @@ func TestObserveCascadeFallback(t *testing.T) {
 		{`nexus_cascade_fallback_total{reason="timeout"} 2`, "timeout counted twice"},
 		{`nexus_cascade_fallback_total{reason="transport_error"} 1`, "transport_error counted once"},
 		{`nexus_cascade_fallback_total{reason="malformed_toolcall"} 3`, "malformed_toolcall counted three times"},
+		{`nexus_cascade_fallback_total{reason="malformed_response"} 2`, "malformed_response counted twice"},
 	}
 	for _, c := range checks2 {
 		if !strings.Contains(out2, c.fragment) {
@@ -528,6 +531,7 @@ func TestObserveCascadeFallbackDeterministicOrder(t *testing.T) {
 	rc.ObserveCascadeFallback("transport_error")
 	rc.ObserveCascadeFallback("timeout")
 	rc.ObserveCascadeFallback("malformed_toolcall")
+	rc.ObserveCascadeFallback("malformed_response")
 
 	var first, second strings.Builder
 	_, _ = rc.WriteTo(&first)

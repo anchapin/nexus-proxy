@@ -330,10 +330,10 @@ func (f RAGObserverFunc) ObserveRAG(e RAGEvent) { f(e) }
 // CascadeFallbackEvent carries the reason for a cascade fallback (issue #205).
 // The handler dispatches one when a retryable step failure causes the cascade
 // to fall back to the next step. The reason is one of "timeout",
-// "transport_error", or "malformed_toolcall".
+// "transport_error", "malformed_toolcall", or "malformed_response".
 type CascadeFallbackEvent struct {
 	RequestID string
-	Reason    string // "timeout", "transport_error", or "malformed_toolcall"
+	Reason    string // "timeout", "transport_error", "malformed_toolcall", or "malformed_response"
 }
 
 // CascadeFallbackObserver is the hook invoked when the cascade falls back
@@ -713,8 +713,8 @@ type Deps struct {
 	// later step due to a retryable error (issue #205). The handler
 	// dispatches exactly one event per request when FallbackReason is
 	// non-empty (i.e., the cascade fell back at least once). The
-	// reason is one of "timeout", "transport_error", or
-	// "malformed_toolcall". Implementations must be safe for concurrent
+	// reason is one of "timeout", "transport_error",
+	// "malformed_toolcall", or "malformed_response". Implementations must be safe for concurrent
 	// use and must not block. Nil means "no observer"; the hot path is
 	// unaffected. The handler does not import the observability package —
 	// main.go wires a closure that forwards to

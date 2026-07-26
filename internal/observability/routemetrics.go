@@ -140,8 +140,8 @@ type counterKey struct {
 //
 // 腔   - nexus_cascade_fallback_total{reason}
 //
-// The reason label values are "timeout", "transport_error", or
-// "malformed_toolcall".
+// The reason label values are "timeout", "transport_error",
+// "malformed_toolcall", or "malformed_response".
 type RouteCounters struct {
 	mu sync.Mutex
 
@@ -464,7 +464,8 @@ func (rc *RouteCounters) slmCacheEvictionSlot(reason string) *uint64 {
 // partitioned by reason (issue #205). Call this after Cascade.Run
 // returns when FallbackReason is non-empty. The method is safe for
 // concurrent use and never blocks; nil receivers are a no-op.
-// reason is one of "timeout", "transport_error", or "malformed_toolcall".
+// reason is one of "timeout", "transport_error", "malformed_toolcall",
+// or "malformed_response".
 func (rc *RouteCounters) ObserveCascadeFallback(reason string) {
 	if rc == nil || reason == "" {
 		return
@@ -825,7 +826,7 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	}
 
 	if n, err := writeRejectionSeries(w, "nexus_cascade_fallback_total",
-		"Cascade fallback events partitioned by reason (timeout, transport_error, malformed_toolcall).",
+		"Cascade fallback events partitioned by reason (timeout, transport_error, malformed_toolcall, malformed_response).",
 		rc.cascadeFallbacks); err != nil {
 		return total, err
 	} else {
