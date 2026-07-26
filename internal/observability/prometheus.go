@@ -108,6 +108,10 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total telemetry records dropped because the JSONL write buffer was full.",
 		typ:  "counter",
 	},
+	"nexus_telemetry_rotations_total": {
+		help: "Total telemetry file rotations triggered by the NEXUS_TELEMETRY_MAX_BYTES size cap.",
+		typ:  "counter",
+	},
 	"nexus_tracing_dropped_total": {
 		help: "Total trace spans dropped because the exporter buffer was full.",
 		typ:  "counter",

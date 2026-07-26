@@ -644,6 +644,16 @@ func main() {
 			}}
 		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var v uint64
+			if r, ok := recorder.(interface{ Rotations() uint64 }); ok {
+				v = r.Rotations()
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_telemetry_rotations_total",
+				Value: float64(v),
+			}}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
 			return []observability.GaugeSample{{
 				Name:  "nexus_tracing_dropped_total",
 				Value: float64(tracing.GlobalExporter().Dropped()),
@@ -1388,12 +1398,20 @@ func buildRecorder(cfg config.Config) telemetry.Recorder {
 		slog.Info("telemetry disabled (NEXUS_TELEMETRY_PATH is empty)")
 		return telemetry.Noop{}
 	}
-	r, err := telemetry.NewJSONLRecorder(cfg.TelemetryPath)
+	r, err := telemetry.NewJSONLRecorder(cfg.TelemetryPath, int64(cfg.TelemetryMaxBytes), cfg.TelemetryMaxFiles)
 	if err != nil {
 		slog.Error("telemetry recorder init failed, falling back to Noop", slog.Any("err", err))
 		return telemetry.Noop{}
 	}
-	slog.Info("telemetry recording", slog.String("path", r.Path()))
+	if cfg.TelemetryMaxBytes > 0 {
+		slog.Info("telemetry rotation enabled",
+			slog.Int("max_bytes", cfg.TelemetryMaxBytes),
+			slog.Int("max_files", cfg.TelemetryMaxFiles),
+			slog.String("path", r.Path()),
+		)
+	} else {
+		slog.Info("telemetry recording", slog.String("path", r.Path()))
+	}
 	return r
 }
 
