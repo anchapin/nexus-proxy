@@ -67,7 +67,7 @@ func TestNewMiddleware(t *testing.T) {
 
 func TestRAGMiddleware_Name(t *testing.T) {
 	store := &mockStore{}
-	r := NewRAGMiddleware(store, 0.5).(*ragMiddleware)
+	r := NewRAGMiddleware(store).(*ragMiddleware)
 	if r.Name() != "rag" {
 		t.Errorf("Name() = %q, want %q", r.Name(), "rag")
 	}
@@ -75,7 +75,7 @@ func TestRAGMiddleware_Name(t *testing.T) {
 
 func TestRAGMiddleware_Transform_ReturnsInput(t *testing.T) {
 	store := &mockStore{}
-	r := NewRAGMiddleware(store, 0.5)
+	r := NewRAGMiddleware(store)
 	msgs := []interface{}{"hello"}
 	got, err := r.Transform(msgs)
 	if err != nil {
@@ -93,7 +93,7 @@ func TestRAGMiddleware_TransformContext_NoMatch(t *testing.T) {
 			return nil, 0, "", nil
 		},
 	}
-	r := NewRAGMiddleware(store, 0.5)
+	r := NewRAGMiddleware(store)
 	msgs := []interface{}{"hello"}
 	got, err := r.TransformContext(context.Background(), msgs)
 	if err != nil {
@@ -115,7 +115,7 @@ func TestRAGMiddleware_TransformContext_WithMatch(t *testing.T) {
 			}, 0.9, rag.IndexPathBruteForce, nil
 		},
 	}
-	r := NewRAGMiddleware(store, 0.5)
+	r := NewRAGMiddleware(store)
 	// InjectRAG looks for a user-role message with a string content field
 	msgs := []interface{}{
 		map[string]interface{}{"role": "user", "content": "hello"},
@@ -142,7 +142,7 @@ func TestRAGMiddleware_TransformContext_WithMatch(t *testing.T) {
 
 func TestNewRAGMiddleware(t *testing.T) {
 	store := &mockStore{}
-	mw := NewRAGMiddleware(store, 0.7)
+	mw := NewRAGMiddleware(store)
 	if mw.Name() != "rag" {
 		t.Errorf("Name() = %q, want %q", mw.Name(), "rag")
 	}
