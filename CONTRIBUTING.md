@@ -23,7 +23,7 @@ We use GitHub Issues to track bugs and requested features. Please use the provid
 - **Dependency Rule**: Follow the architecture outlined in `Nexus Proxy PRD and Architecture.md`. Avoid circular dependencies between `internal/` packages.
 
 ### Local Setup
-- **Prerequisites**: Install Go 1.21+ and ensure Ollama is running locally.
+- **Prerequisites**: Install Go 1.25+ (1.26 recommended, matching CI) and ensure Ollama is running locally.
 - **Build**: Run `make build`.
 - **Verify**: Run `./bin/nexus check` (alias `./bin/nexus doctor`) to
   validate boot-time configuration before serving traffic. Exits `0`

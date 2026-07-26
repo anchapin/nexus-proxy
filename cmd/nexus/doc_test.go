@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -217,4 +218,126 @@ func TestReadmeCLIReferenceTableShape(t *testing.T) {
 	if rows < 5 {
 		t.Errorf("CLI reference table must list at least 5 subcommand rows (got %d). See cmd/nexus/main.go:67-99 for the actual surface.", rows)
 	}
+}
+
+// TestContributingGoVersionMatchesGoMod guards issue #492: the Go
+// version documented in CONTRIBUTING.md's Prerequisites must be >= the
+// `go` directive in go.mod (which is itself a strict subset of the CI
+// pin). A contributor who installs the documented minimum must be able
+// to build the tree. Without a test the docs drift the moment go.mod
+// is bumped — exactly the regression the issue is trying to prevent.
+//
+// The documented line is tolerant of suffixes, e.g.
+//
+//	Install Go 1.25+ (1.26 recommended, matching CI)
+//
+// We extract the leading "1.<minor>" token and compare it numerically
+// against the go.mod `go` directive major.minor. Both are major 1, so
+// only the minor is compared.
+func TestContributingGoVersionMatchesGoMod(t *testing.T) {
+	goModMinor := parseGoDirectiveMinor(t, readDoc(t, "go.mod"))
+
+	doc := readDoc(t, "CONTRIBUTING.md")
+
+	// Locate the Prerequisites line inside Local Setup. Match the
+	// documented "Install Go 1.<n>" token specifically.
+	setupStart := strings.Index(doc, "### Local Setup")
+	if setupStart < 0 {
+		t.Fatal("CONTRIBUTING.md has no `### Local Setup` heading")
+	}
+	setup := doc[setupStart:]
+	if next := strings.Index(setup, "\n## "); next >= 0 {
+		setup = setup[:next]
+	}
+
+	preIdx := strings.Index(setup, "**Prerequisites**")
+	if preIdx < 0 {
+		t.Fatal("CONTRIBUTING.md Local Setup has no Prerequisites bullet")
+	}
+	preLine := setup[preIdx:]
+	if nl := strings.Index(preLine, "\n"); nl >= 0 {
+		preLine = preLine[:nl]
+	}
+
+	docMinor, ok := parseDocGoMinor(preLine)
+	if !ok {
+		t.Fatalf("CONTRIBUTING.md Prerequisites does not quote a Go version: %q", preLine)
+	}
+
+	if docMinor < goModMinor {
+		t.Errorf("CONTRIBUTING.md documents Go 1.%d but go.mod requires 1.%d — a contributor installing the documented minimum cannot build (issue #492)", docMinor, goModMinor)
+	}
+}
+
+// parseGoDirectiveMinor extracts the minor version from the `go` line
+// of go.mod, e.g. "go 1.25.0" -> 25. A missing or malformed directive
+// fails the test rather than silently passing.
+func parseGoDirectiveMinor(t *testing.T, goMod string) int {
+	t.Helper()
+	for _, line := range strings.Split(goMod, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "go ") {
+			ver := strings.TrimSpace(strings.TrimPrefix(line, "go "))
+			major, minor, ok := splitMajorMinor(ver)
+			if !ok || major != 1 {
+				t.Fatalf("go.mod `go` directive %q is not a recognised 1.x version", ver)
+			}
+			return minor
+		}
+	}
+	t.Fatal("go.mod has no `go` directive")
+	return 0
+}
+
+// parseDocGoMinor extracts the minor version from a documented Go
+// version line, tolerating suffixes such as "+" or
+// "(1.26 recommended, matching CI)". Returns the minor of the FIRST
+// "1.<minor>" token encountered (the documented minimum).
+func parseDocGoMinor(line string) (int, bool) {
+	// Scan for the first "1.<digits>" run.
+	runes := []rune(line)
+	for i := 0; i < len(runes); i++ {
+		if runes[i] != '1' {
+			continue
+		}
+		if i+1 >= len(runes) || runes[i+1] != '.' {
+			continue
+		}
+		// Collect digits after the dot.
+		j := i + 2
+		for j < len(runes) && runes[j] >= '0' && runes[j] <= '9' {
+			j++
+		}
+		if j == i+2 {
+			continue // no digits after dot
+		}
+		minor, err := strconv.Atoi(string(runes[i+2 : j]))
+		if err != nil {
+			continue
+		}
+		return minor, true
+	}
+	return 0, false
+}
+
+// splitMajorMinor splits "1.25.0" / "1.25" into (1, 25, true).
+func splitMajorMinor(ver string) (int, int, bool) {
+	ver = strings.TrimSpace(ver)
+	// Trim any toolchain-style suffix.
+	if sp := strings.IndexAny(ver, " \t"); sp >= 0 {
+		ver = ver[:sp]
+	}
+	parts := strings.Split(ver, ".")
+	if len(parts) < 2 {
+		return 0, 0, false
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, false
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, false
+	}
+	return major, minor, true
 }
