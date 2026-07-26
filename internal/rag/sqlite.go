@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +18,8 @@ import (
 	// importing it here registers the "sqlite" driver name. See
 	// modernc.org/sqlite.
 	_ "modernc.org/sqlite"
+
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // ragSchema is the v2 schema for the few-shot cache table. One row
@@ -66,18 +67,84 @@ const ragSelectAllSQL = `SELECT filename, content, embedding, indexed_at, embedd
 // pathological disk stall.
 const ragOpTimeout = 5 * time.Second
 
+const ragSchemaVersionSQL = `CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)`
+
+const currentSchemaVersion = 2
+
 var ragMigrations = []string{
 	`ALTER TABLE rag_examples ADD COLUMN embedder_model TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE rag_examples ADD COLUMN dims INTEGER NOT NULL DEFAULT 0`,
 }
 
 func runRAGMigrations(ctx context.Context, db *sql.DB) error {
-	for _, stmt := range ragMigrations {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			if strings.Contains(err.Error(), "duplicate column name") {
-				continue
+	if _, err := db.ExecContext(ctx, ragSchemaVersionSQL); err != nil {
+		return fmt.Errorf("rag: create schema_version table: %w", err)
+	}
+
+	var version int
+	err := db.QueryRowContext(ctx, "SELECT version FROM schema_version LIMIT 1").Scan(&version)
+	if err == sql.ErrNoRows {
+		var count int
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM rag_examples").Scan(&count); err != nil {
+			version = currentSchemaVersion
+		} else if count == 0 {
+			version = currentSchemaVersion
+		} else {
+			version = 0
+		}
+		// Use INSERT OR IGNORE: if another concurrent init already inserted the row
+		// (e.g., parallel t.Parallel() tests each opening their own :memory: connection
+		// share the same in-process DB), this is not an error.
+		if _, err := db.ExecContext(ctx, "INSERT OR IGNORE INTO schema_version (version) VALUES (?)", version); err != nil {
+			return fmt.Errorf("rag: init schema version: %w", err)
+		}
+		if version == 0 {
+			goto runMigrations
+		}
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("rag: read schema version: %w", err)
+	}
+
+	if version >= currentSchemaVersion {
+		return nil
+	}
+
+runMigrations:
+
+	if version >= currentSchemaVersion {
+		return nil
+	}
+
+	for i := version; i < currentSchemaVersion; i++ {
+		migration := ragMigrations[i]
+		const maxRetries = 3
+		var migrationErr error
+	retry:
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			_, err := db.ExecContext(ctx, migration)
+			if err == nil {
+				break retry
+			}
+			migrationErr = err
+			var sqErr interface{ Code() int }
+			if errors.As(err, &sqErr) {
+				switch sqErr.Code() {
+				case sqlite3.SQLITE_BUSY:
+					time.Sleep(time.Millisecond * 100 * time.Duration(attempt+1))
+					continue
+				case sqlite3.SQLITE_FULL:
+					return fmt.Errorf("rag: disk full during migration (free up disk space and retry): %w", err)
+				}
 			}
 			return fmt.Errorf("rag: migrate: %w", err)
+		}
+		if migrationErr != nil {
+			return fmt.Errorf("rag: migrate: SQLITE_BUSY exceeded max retries for: %s", migration)
+		}
+		version = i + 1
+		if _, err := db.ExecContext(ctx, "UPDATE schema_version SET version = ?", version); err != nil {
+			return fmt.Errorf("rag: record schema version: %w", err)
 		}
 	}
 	return nil
