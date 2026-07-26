@@ -159,10 +159,9 @@ func main() {
 	// router defaults, so this is safe even when the feature is off.
 	slm.ConfidenceFloor = cfg.RoutingConfidenceFloor
 	slm.ConfidenceCeiling = cfg.RoutingConfidenceCeiling
-	// SLM routing decision cache (issue #162). Zero values fall back
-	// to the NewSLMClient defaults (5m TTL, 512 max entries).
-	slm.CacheTTL = cfg.SLMCacheTTL
-	slm.CacheMaxEntries = cfg.SLMCacheMaxEntries
+	// SLMClient no longer has its own internal decision cache (issue #489).
+	// The planner-level SLMCache wired below is the sole caching layer and
+	// honours NEXUS_SLM_CACHE_TTL=0 as a true kill-switch.
 
 	// Ollama health poller (issue #8). When NEXUS_HEALTH_POLL_INTERVAL
 	// is zero the handler treats Ollama as always healthy (useful for

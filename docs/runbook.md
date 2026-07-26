@@ -306,3 +306,29 @@ nexus check 2>&1 | grep -i dsl
 curl -s http://localhost:8000/healthz
 curl -s http://localhost:8000/metrics | grep nexus_route_decisions_total
 ```
+
+## Migration notes
+
+### SLMClient internal cache removed (issue #489)
+
+The SLMClient previously carried its own internal LRU decision cache
+(`cacheList`/`cacheMap`/`evictStale`/`CacheStats`), constructed
+independently of the planner-level `SLMCache`. That internal cache ignored
+`NEXUS_SLM_CACHE_TTL=0` and silently fell back to a 5-minute TTL, so the
+documented kill-switch did not actually disable all routing stickiness.
+
+The internal cache has been retired. The planner-level `SLMCache`
+(`internal/router/slm_cache.go`) is now the **sole** caching layer and
+honours `NEXUS_SLM_CACHE_TTL=0` as a true disable.
+
+Operator-visible changes:
+
+- `SLMClient.CacheStats()` is gone. There is no per-client hit/miss surface
+  any more; use the planner cache's `Stats()` via `/status`
+  (`slm_cache.enabled`) and `nexus_slm_cache_evictions_total` in `/metrics`.
+- `NEXUS_SLM_CACHE_TTL=0` now fully disables SLM decision caching: every
+  SLM-eligible prompt performs a fresh Ollama round-trip.
+- No configuration migration is required — the same env vars
+  (`NEXUS_SLM_CACHE_TTL`, `NEXUS_SLM_CACHE_MAX_ENTRIES`,
+  `NEXUS_SLMCACHE_SIMILARITY_THRESHOLD`) now control the only remaining
+  cache.
