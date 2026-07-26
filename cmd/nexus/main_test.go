@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/handlers"
@@ -69,8 +70,120 @@ func TestBuildMetrics(t *testing.T) {
 	}
 }
 
+// mockCollector records calls to circuit-breaker and embedder methods for
+// testing the circuitBreakerAdapter.
+type mockCollector struct {
+	RecordCircuitFailureArg    string
+	RecordCircuitRecoveryArg   string
+	IncEmbedderFailureArg      string
+	RecordCircuitFailureCalls  int
+	RecordCircuitRecoveryCalls int
+	IncEmbedderFailureCalls    int
+}
+
+func (m *mockCollector) RecordCircuitFailure(circuit string) {
+	m.RecordCircuitFailureArg = circuit
+	m.RecordCircuitFailureCalls++
+}
+
+func (m *mockCollector) RecordCircuitRecovery(circuit string) {
+	m.RecordCircuitRecoveryArg = circuit
+	m.RecordCircuitRecoveryCalls++
+}
+
+func (m *mockCollector) IncEmbedderFailure(kind string) {
+	m.IncEmbedderFailureArg = kind
+	m.IncEmbedderFailureCalls++
+}
+
+// TestCircuitBreakerAdapterCalls verifies the circuitBreakerAdapter correctly
+// forwards each method call to the underlying collector with the correct
+// argument. This was the 0%-covered symbol described in issue #575 — a
+// one-line swap (e.g. RecordCircuitFailure ↔ RecordCircuitRecovery) would
+// silently corrupt circuit-breaker metrics on the Prometheus /metrics endpoint
+// without any unit-test catching it.
+func TestCircuitBreakerAdapterCalls(t *testing.T) {
+	t.Run("RecordCircuitFailure", func(t *testing.T) {
+		mock := &mockCollector{}
+		adapter := circuitBreakerAdapter{
+			recordFailure: mock.RecordCircuitFailure,
+		}
+		adapter.RecordCircuitFailure("rag")
+		if mock.RecordCircuitFailureArg != "rag" {
+			t.Errorf("RecordCircuitFailure arg = %q, want %q", mock.RecordCircuitFailureArg, "rag")
+		}
+		if mock.RecordCircuitFailureCalls != 1 {
+			t.Errorf("RecordCircuitFailure calls = %d, want 1", mock.RecordCircuitFailureCalls)
+		}
+	})
+
+	t.Run("RecordCircuitRecovery", func(t *testing.T) {
+		mock := &mockCollector{}
+		adapter := circuitBreakerAdapter{
+			recordRecovery: mock.RecordCircuitRecovery,
+		}
+		adapter.RecordCircuitRecovery("ollama")
+		if mock.RecordCircuitRecoveryArg != "ollama" {
+			t.Errorf("RecordCircuitRecovery arg = %q, want %q", mock.RecordCircuitRecoveryArg, "ollama")
+		}
+		if mock.RecordCircuitRecoveryCalls != 1 {
+			t.Errorf("RecordCircuitRecovery calls = %d, want 1", mock.RecordCircuitRecoveryCalls)
+		}
+	})
+
+	t.Run("IncEmbedderFailure", func(t *testing.T) {
+		mock := &mockCollector{}
+		adapter := circuitBreakerAdapter{
+			incEmbedderFailure: mock.IncEmbedderFailure,
+		}
+		adapter.IncEmbedderFailure("cohere")
+		if mock.IncEmbedderFailureArg != "cohere" {
+			t.Errorf("IncEmbedderFailure arg = %q, want %q", mock.IncEmbedderFailureArg, "cohere")
+		}
+		if mock.IncEmbedderFailureCalls != 1 {
+			t.Errorf("IncEmbedderFailure calls = %d, want 1", mock.IncEmbedderFailureCalls)
+		}
+	})
+
+	t.Run("AllMethodsTogether", func(t *testing.T) {
+		mock := &mockCollector{}
+		adapter := circuitBreakerAdapter{
+			recordFailure:      mock.RecordCircuitFailure,
+			recordRecovery:     mock.RecordCircuitRecovery,
+			incEmbedderFailure: mock.IncEmbedderFailure,
+		}
+		adapter.RecordCircuitFailure("local")
+		adapter.RecordCircuitRecovery("fusion")
+		adapter.IncEmbedderFailure("openai")
+
+		if mock.RecordCircuitFailureArg != "local" {
+			t.Errorf("RecordCircuitFailure arg = %q, want %q", mock.RecordCircuitFailureArg, "local")
+		}
+		if mock.RecordCircuitRecoveryArg != "fusion" {
+			t.Errorf("RecordCircuitRecovery arg = %q, want %q", mock.RecordCircuitRecoveryArg, "fusion")
+		}
+		if mock.IncEmbedderFailureArg != "openai" {
+			t.Errorf("IncEmbedderFailure arg = %q, want %q", mock.IncEmbedderFailureArg, "openai")
+		}
+		if mock.RecordCircuitFailureCalls != 1 || mock.RecordCircuitRecoveryCalls != 1 || mock.IncEmbedderFailureCalls != 1 {
+			t.Errorf("call counts: failures=%d, recoveries=%d, embedder=%d; want all 1",
+				mock.RecordCircuitFailureCalls, mock.RecordCircuitRecoveryCalls, mock.IncEmbedderFailureCalls)
+		}
+	})
+}
+
+// stubProbe is a minimal Probe implementation for testing budgetObserver.
+type stubProbe struct {
+	budget probe.Budget
+}
+
+func (s *stubProbe) Budget(_ context.Context) (probe.Budget, error) {
+	return s.budget, nil
+}
+
 // TestBudgetObserver verifies the budget observer returns safe defaults
-// when the probe manager is nil.
+// when the probe manager is nil, and correctly reflects the manager's
+// current budget otherwise (issue #6).
 func TestBudgetObserver(t *testing.T) {
 	t.Run("NilManager", func(t *testing.T) {
 		obs := budgetObserver(nil)
@@ -79,6 +192,36 @@ func TestBudgetObserver(t *testing.T) {
 		}
 		if obs.BudgetSource() != string(probe.SourceStatic) {
 			t.Errorf("expected static source for nil manager, got %q", obs.BudgetSource())
+		}
+	})
+
+	t.Run("ValidManager", func(t *testing.T) {
+		stub := &stubProbe{budget: probe.Budget{Tokens: 8192, Source: probe.SourceOllamaPS}}
+		mgr := probe.NewManager(stub, time.Hour, time.Second)
+		mgr.Run(context.Background())
+		defer mgr.Close()
+
+		obs := budgetObserver(mgr)
+		if obs.BudgetTokens() != 8192 {
+			t.Errorf("BudgetTokens() = %d, want %d", obs.BudgetTokens(), 8192)
+		}
+		if obs.BudgetSource() != string(probe.SourceOllamaPS) {
+			t.Errorf("BudgetSource() = %q, want %q", obs.BudgetSource(), probe.SourceOllamaPS)
+		}
+	})
+
+	t.Run("EmptySourceFallback", func(t *testing.T) {
+		stub := &stubProbe{budget: probe.Budget{Tokens: 4096, Source: ""}}
+		mgr := probe.NewManager(stub, time.Hour, time.Second)
+		mgr.Run(context.Background())
+		defer mgr.Close()
+
+		obs := budgetObserver(mgr)
+		if obs.BudgetTokens() != 4096 {
+			t.Errorf("BudgetTokens() = %d, want %d", obs.BudgetTokens(), 4096)
+		}
+		if obs.BudgetSource() != string(probe.SourceStatic) {
+			t.Errorf("BudgetSource() with empty source = %q, want %q", obs.BudgetSource(), probe.SourceStatic)
 		}
 	})
 }
