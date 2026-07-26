@@ -192,6 +192,68 @@ misses and `"reason":"slm-escalation"` when the SLM escalates to frontier.
 
 ---
 
+## Scenario 5 — Progressive fusion returns the speculative answer even when the other panel member was better
+
+### Symptoms
+
+- `route=fusion` responses carry the `X-Nexus-Fusion-Progressive: true` header
+  (the progressive delivery path is active) and the user sees the faster
+  panel member's answer verbatim — even when the slower member would have
+  been higher quality.
+- The arbiter's synthesis never appears as appended SSE chunks after the
+  speculative answer.
+- `nexus_fusion_arbiter_total{outcome="skipped"}` is climbing while
+  `{outcome="invoked"}` stays flat — the arbiter is consistently bypassed.
+- No `X-Nexus-Degraded` header is present, so this is not the Ollama-down
+  Scenario 1 path.
+
+### Root causes
+
+| Cause | Details |
+| ----- | ------- |
+| **Agreement threshold too high** | `NEXUS_FUSION_AGREEMENT_THRESHOLD` (default 0.85) is the Jaccard token-overlap ratio above which the arbiter is skipped. At the default, two answers that share 85% of tokens are treated as agreeing and the faster one wins outright — even when the slower answer is substantively better. |
+| **Speculative winner chosen by speed, not quality** | Progressive delivery (`NEXUS_FUSION_PROGRESSIVE=true`, the default) streams the *first* member to complete. A warm local Ollama frequently wins the race for simple prompts even when the frontier answer is more thorough. A member carrying tool calls also wins outright regardless of arrival order (issue #72). |
+| **One-member degraded race** | When one panel member errors or only one returns content, `PanelStreaming` streams the survivor as-is and skips the arbiter. This is correct behaviour, but if it coincides with intermittent Ollama slowness (pre-breaker) the survivor is always frontier/local and quality regresses without a `X-Nexus-Degraded` signal. |
+
+### Diagnosis
+
+```bash
+# Primary signal — the progressive path is active on the response:
+curl -s -D - http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"architectural design for a cache"}],"stream":true}' \
+  -o /dev/null | grep -i 'X-Nexus-Fusion-Progressive'
+
+# Arbiter skip-vs-invoke ratio — skipped should not dominate:
+curl -s http://localhost:8000/metrics | grep nexus_fusion_arbiter_total
+
+# Confirm fusion is still being routed (route label = fusion):
+curl -s http://localhost:8000/metrics | grep 'nexus_route_decisions_total.*route="fusion"'
+
+# Structured log: fires whenever the arbiter is skipped. Carries the
+# speculative winner's "source" (local|frontier) and the Jaccard
+# "similarity" that was compared against the threshold:
+# (grep your log sink for)
+#   fusion arbiter skipped
+```
+
+The `fusion arbiter skipped` log line (emitted at info level by the chat
+handler) reports `source` (`local` or `frontier`) and `similarity` (the
+Jaccard ratio). If `similarity` hovers just above
+`NEXUS_FUSION_AGREEMENT_THRESHOLD`, the threshold is the lever — small
+wording differences are being treated as agreement.
+
+### Recovery
+
+| Action | Step |
+| ------- | ---- |
+| **Lower the agreement threshold** | Set `NEXUS_FUSION_AGREEMENT_THRESHOLD=0.7` (or lower) so only near-identical answers skip the arbiter; more disagreements will trigger arbiter synthesis at the cost of extra frontier arbiter calls. This var is NOT hot-reloadable — restart the proxy to apply. |
+| **Disable progressive delivery** | Set `NEXUS_FUSION_PROGRESSIVE=false` to fall back to the legacy blocking Panel path, where both members are fetched fully and the arbiter is always invoked (issue #48). Higher latency and arbiter cost, but no speculative-answer quality risk. Restart required. |
+| **Verify the change took effect** | After restart, confirm the `X-Nexus-Fusion-Progressive` header is absent on fusion responses and `nexus_fusion_arbiter_total{outcome="invoked"}` begins climbing. |
+| **Rule out a one-member race** | If the `fusion arbiter skipped` log line shows `source=frontier` on nearly every fusion request, investigate Ollama latency/health (Scenario 1) rather than tuning the threshold — the arbiter is being skipped because only one member returned content, not because of agreement. |
+
+---
+
 ## Prompt-injection hardening
 
 The proxy can isolate its own policy text from user-supplied content and
