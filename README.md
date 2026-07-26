@@ -191,7 +191,14 @@ client behind the proxy shares one bucket).
 
 ### Point your agent at the proxy
 
-In OpenCode's `~/.config/opencode/config.toml`:
+Nexus Proxy exposes an OpenAI-compatible `/v1` endpoint. Every supported
+agent points at the same base URL — `http://localhost:8000/v1` — and
+supplies any non-empty API key (the proxy authenticates inbound traffic
+via `NEXUS_PROXY_API_KEY`, not the provider key the agent sends).
+
+#### OpenCode
+
+In `~/.config/opencode/config.toml`:
 
 ```toml
 [provider.openai]
@@ -199,7 +206,37 @@ baseURL = "http://localhost:8000/v1"
 apiKey = "any-non-empty-string"
 ```
 
-Replace `baseURL` with whatever your agent uses for the OpenAI provider.
+#### Aider
+
+Aider reads the endpoint from environment variables (or `--openai-api-base`):
+
+```bash
+export OPENAI_API_BASE=http://localhost:8000/v1
+export OPENAI_API_KEY=any-non-empty-string
+aider --model gpt-4o
+```
+
+To persist it, drop the same keys into `~/.aider.conf.yml`:
+
+```yaml
+openai-api-base: http://localhost:8000/v1
+openai-api-key: any-non-empty-string
+```
+
+The `--model` value is passed straight through to the proxy; Nexus routes
+it based on the routing pipeline, so any frontier model name works.
+
+#### OpenHands
+
+OpenHands honours `LLM_BASE_URL` / `LLM_API_KEY`:
+
+```bash
+export LLM_BASE_URL=http://localhost:8000/v1
+export LLM_API_KEY=any-non-empty-string
+```
+
+For other OpenAI-compatible agents, set their respective base-URL / API-key
+option to the same `http://localhost:8000/v1` value and any non-empty key.
 
 ### Add few-shot examples
 
