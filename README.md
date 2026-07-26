@@ -53,7 +53,7 @@ complexity.
 
 ### Prerequisites
 
-- Go 1.21+
+- Go 1.25+ (1.26 recommended, matching CI)
 - [Ollama](https://ollama.com) running locally on `:11434`
 - The following models pulled:
   ```bash
