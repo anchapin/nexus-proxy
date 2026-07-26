@@ -210,6 +210,32 @@ they are intentionally excluded from hot-reload.
 | `nexus_telemetry_rotations_total` | `JSONLRecorder.Rotations()` | Counter; always 0 when rotation is disabled. Confirm operators can see this climbing to verify rotation is firing. |
 | `nexus_telemetry_dropped_total` | `JSONLRecorder.Dropped()` | Counter; buffer-full drops (unchanged by #485). |
 
+## Response headers (`X-Nexus-Route-*`)
+
+Every `/v1/chat/completions` response carries four routing-decision
+headers (set in `internal/handlers/chat.go`, issue #74) so clients and
+intermediate proxies can reason about routing without scraping logs:
+
+| Header | Source | Example |
+|--------|--------|---------|
+| `X-Nexus-Route` | `decision.Route` | `local`, `frontier`, `fusion` |
+| `X-Nexus-Route-Source` | `decision.Source` | `guardrail`, `dsl`, `slm`, `slm-error`, `escalation` |
+| `X-Nexus-Route-Reason` | `decision.Reason` | short reason string; may echo SLM error text |
+| `X-Nexus-Route-Confidence` | `formatConfidence(decision.Confidence)` | `0.85` |
+
+Each value passes through `SanitizeHeaderValue`
+(`internal/handlers/sanitize.go`), which strips CR/LF (header
+injection prevention), collapses other control characters to spaces,
+trims whitespace, and caps the value at **`MaxHeaderValue` = 128
+runes**. Values that exceed 128 runes after cleaning are truncated and
+a trailing **`...(+N)`** marker is appended, where *N* is the count of
+dropped runes (issue #494) — for example a 200-rune reason becomes the
+first 128 runes followed by `...(+72)`. The marker is consistent with
+the `TruncateForDebug` precedent in `debug.go`. Clean values and values
+exactly 128 runes long are returned unchanged (no false positive at the
+boundary). The marker adds at most a few bytes, keeping total header
+value length well under HTTP sane bounds.
+
 ## Distributed tracing (`internal/tracing`)
 
 Referenced in AGENTS.md as an OTLP/JSON exporter (#41). **Not yet
