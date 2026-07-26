@@ -124,6 +124,10 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total trace spans dropped because the exporter buffer was full.",
 		typ:  "counter",
 	},
+	"nexus_tracing_flush_failures_total": {
+		help: "Total trace batches that failed to POST to the collector (HTTP 4xx/5xx, timeout, or transport error). Each failure drops up to 64 spans — distinct from nexus_tracing_dropped_total, which counts per-span buffer-full sheds at submit time (issue #484).",
+		typ:  "counter",
+	},
 	// Issue #70: live middleware gauges. These come from backing
 	// sources (rate-limit bucket count, budget running total) at
 	// scrape time rather than from per-request events, so they are

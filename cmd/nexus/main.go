@@ -679,6 +679,12 @@ func main() {
 				Value: float64(tracing.GlobalExporter().Dropped()),
 			}}
 		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			return []observability.GaugeSample{{
+				Name:  "nexus_tracing_flush_failures_total",
+				Value: float64(tracing.GlobalExporter().FlushFailures()),
+			}}
+		}),
 	)
 
 	// Middleware chain (issue #224). Initialize the middleware registry

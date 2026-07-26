@@ -315,6 +315,64 @@ func TestExporterErrorPropagatesFromCollector(t *testing.T) {
 	}
 }
 
+func TestExporterFlushFailuresIncrementOn503(t *testing.T) {
+	// Issue #484: a collector returning 503 must surface as a
+	// flush-failure counter increment, not vanish silently. The
+	// counter increments once per failed batch (not per span).
+	var batches atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		batches.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{Endpoint: srv.URL})
+	if e == nil {
+		t.Fatal("NewExporter returned nil")
+	}
+
+	// Submit enough spans to force at least one full batch flush
+	// (batchCap=64) plus trailing spans drained on Close.
+	for i := 0; i < batchCap+5; i++ {
+		_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "op")
+		s.End()
+	}
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if got := e.FlushFailures(); got == 0 {
+		t.Errorf("FlushFailures() = 0, want > 0 (batches=%d)", batches.Load())
+	}
+	// Flush failures must not be counted as buffer-full drops —
+	// the two counters measure distinct loss modes.
+	if e.Dropped() != 0 {
+		t.Errorf("Dropped() = %d, want 0 (flush failure must not inflate buffer-full counter)", e.Dropped())
+	}
+}
+
+func TestExporterFlushFailuresUnchangedOnSuccess(t *testing.T) {
+	// A healthy collector must never increment flush failures.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{Endpoint: srv.URL})
+	defer e.Close()
+	for i := 0; i < 10; i++ {
+		_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "op")
+		s.End()
+	}
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := e.FlushFailures(); got != 0 {
+		t.Errorf("FlushFailures() = %d, want 0 on healthy collector", got)
+	}
+}
+
 func TestExporterCloseIdempotent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -365,6 +423,9 @@ func TestExporterNoopExports(t *testing.T) {
 	e.Submit(&Span{Name: "x"})
 	if e.Dropped() != 0 {
 		t.Errorf("nil exporter Dropped() = %d", e.Dropped())
+	}
+	if e.FlushFailures() != 0 {
+		t.Errorf("nil exporter FlushFailures() = %d", e.FlushFailures())
 	}
 }
 
@@ -507,5 +568,8 @@ func TestExporterNilQueueDepthAndDropped(t *testing.T) {
 	}
 	if e.Dropped() != 0 {
 		t.Errorf("nil exporter Dropped() = %d, want 0", e.Dropped())
+	}
+	if e.FlushFailures() != 0 {
+		t.Errorf("nil exporter FlushFailures() = %d, want 0", e.FlushFailures())
 	}
 }

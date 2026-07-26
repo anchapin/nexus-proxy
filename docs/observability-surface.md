@@ -238,9 +238,27 @@ value length well under HTTP sane bounds.
 
 ## Distributed tracing (`internal/tracing`)
 
-Referenced in AGENTS.md as an OTLP/JSON exporter (#41). **Not yet
-implemented in the current codebase** — the `internal/tracing` package
-does not exist. The span/metric pairing will be:
+The OTLP/JSON exporter (#41) buffers spans and POSTs them as a single
+batch to the configured collector endpoint. Two counters expose
+distinct modes of silent span loss so operators can tell buffer
+pressure apart from collector trouble:
+
+| Metric | Backing source | Meaning |
+|--------|----------------|---------|
+| `nexus_tracing_dropped_total` | `Exporter.Dropped()` | Per-span count of spans shed at `Submit` time because the in-memory buffer was full (back-pressure). |
+| `nexus_tracing_flush_failures_total` | `Exporter.FlushFailures()` | Per-batch count of flushes that failed to POST (HTTP 4xx/5xx, timeout, or transport error). Each failure drops up to 64 spans (#484). |
+
+**Distinguishing the two:** `nexus_tracing_dropped_total` rising with
+`nexus_tracing_flush_failures_total` flat indicates the proxy is
+producing spans faster than the background loop drains them (raise
+`NEXUS_TRACING_QUEUE_SIZE`). `nexus_tracing_flush_failures_total`
+rising on its own indicates the collector is unreachable or rejecting
+batches (check `NEXUS_TRACING_ENDPOINT`, collector health, network);
+the proxy will not retry — the dropped batch is gone. A flat
+`nexus_tracing_dropped_total` while traces silently disappear is the
+exact symptom #484 fixed: flush failures previously had no metric.
+
+The span/metric attribute pairing is:
 
 | Span attribute | Prometheus metric/label | Notes |
 |----------------|------------------------|-------|
@@ -250,9 +268,8 @@ does not exist. The span/metric pairing will be:
 | `nexus.task_type` | `nexus_slm_decisions_total{task_type}` | Task category |
 | `nexus.rejection_reason` | `nexus_requests_rejected_total{reason}` | Rejection reason |
 
-When the tracing package is implemented, span attributes should use
-the same values as the Prometheus labels so cross-referencing is
-trivial.
+Span attributes use the same values as the Prometheus labels so
+cross-referencing is trivial.
 
 ## Observer wiring
 
