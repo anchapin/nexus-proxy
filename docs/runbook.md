@@ -254,6 +254,72 @@ wording differences are being treated as agreement.
 
 ---
 
+## Scenario 6 — Persistent stores filling disk
+
+### Symptoms
+
+- Disk usage on the volume hosting `NEXUS_METRICS_DB`,
+  `NEXUS_JUDGE_DB`, and/or `NEXUS_TELEMETRY_PATH` climbs steadily
+  without a corresponding increase in traffic.
+- One or more of the early-warning counters is non-zero in `/metrics`:
+  `nexus_metrics_dropped_total`, `nexus_telemetry_dropped_total`
+  (and `nexus_tracing_dropped_total` if tracing is enabled — tracing
+  itself is network-sent, not disk-backed, but the counter firing means
+  the proxy is under write pressure).
+- Graceful shutdown takes longer than `NEXUS_SHUTDOWN_TIMEOUT` or logs
+  `telemetry flush` / `metrics drain` warnings — the writer goroutines
+  are flushing large WAL buffers during drain.
+- `DailySummary` / `/status` provider-stats queries become slow as the
+  `requests` table grows past millions of rows (the indexed range scan
+  stays cheap, but a near-full disk inflates fsync latency).
+
+### Root causes
+
+| Cause | Details |
+| ----- | ------- |
+| **Metrics SQLite store** | `NEXUS_METRICS_DB` (writer: `internal/metrics`, `SQLiteStore`) appends one row per proxied request. At ~100 req/min the `requests` table grows ~52M rows/year. The default `NEXUS_METRICS_RETENTION_DAYS=0` disables the prune loop, so the table grows without bound. WAL journal mode also keeps a `-wal` sidecar that can reach several hundred MiB on a busy writer. |
+| **Judge SQLite store** | `NEXUS_JUDGE_DB` (writer: `internal/judge`, `SQLiteStore`) appends one row per sampled local-route completion (~10% by default via `NEXUS_JUDGE_SAMPLE_RATE`). Lower volume than metrics, but still unbounded — there is **no retention knob for this store yet**. |
+| **Telemetry JSON-lines log** | `NEXUS_TELEMETRY_PATH` (writer: `internal/telemetry`, `JSONLRecorder`) appends one JSON object per line per request (~1 KB/row). The default `NEXUS_TELEMETRY_MAX_BYTES=0` disables rotation, so the file grows without bound. |
+| **WAL / `-shm` sidecars** | Both SQLite stores use `journal_mode(WAL)`. A proxy that was killed (SIGKILL, OOM) without draining leaves the `-wal` file behind; it is replayed and may keep growing until the next clean open. |
+
+### Diagnosis
+
+```bash
+# 1. Find the on-disk footprint of each persistent store:
+ls -lh ~/.cache/nexus-proxy/           # metrics.db, judge.db
+ls -lh ./nexus-telemetry.jsonl*
+
+# 2. Row counts for the SQLite stores (stop the proxy first for a
+#    consistent read, or use a read-only sqlite3 against the WAL):
+sqlite3 ~/.cache/nexus-proxy/metrics.db \
+  'SELECT COUNT(*) AS rows, MIN(timestamp) AS oldest FROM requests;'
+sqlite3 ~/.cache/nexus-proxy/judge.db \
+  'SELECT COUNT(*) AS rows, MIN(timestamp) AS oldest FROM judge_scores;'
+
+# 3. Early-warning dropped counters (non-zero = writer is saturated):
+curl -s http://localhost:8000/metrics | \
+  grep -E 'nexus_(metrics|telemetry|tracing)_dropped_total'
+
+# 4. Confirm whether metrics retention is even running:
+curl -s http://localhost:8000/metrics | \
+  grep -E 'nexus_metrics_prune_(last_rows|last_timestamp_seconds)'
+#    ^ last_timestamp_seconds == 0 means the prune goroutine never ran
+#      (i.e. NEXUS_METRICS_RETENTION_DAYS is 0).
+```
+
+### Recovery
+
+| Action | Command / Step |
+| ------- | --------------- |
+| **Short-term — move the file aside** | Stop the proxy, move the offending file(s) out of the volume (`mv metrics.db metrics.db.bak`), and restart. The store re-creates an empty database on open. You lose dashboard history but regain disk headroom immediately. Do the same for `judge.db` and the telemetry JSONL if needed. |
+| **Short-term — reclaim WAL space** | If the `-wal` file is large but the main DB is small, a clean shutdown already checkpoints the WAL. If the proxy was killed, run `sqlite3 <db> 'PRAGMA wal_checkpoint(TRUNCATE);'` while the proxy is stopped to fold the WAL back into the main file and truncate it. |
+| **Long-term — enable metrics retention** | Set `NEXUS_METRICS_RETENTION_DAYS=30` (or your window). A background goroutine DELETEs rows older than the window roughly every hour and runs `PRAGMA incremental_vacuum(100)` when a pass removes ≥1000 rows. Requires a restart (the prune goroutine lifecycle is bound to the store). |
+| **Long-term — enable telemetry rotation** | Set `NEXUS_TELEMETRY_MAX_BYTES=104857600` (100 MiB) and `NEXUS_TELEMETRY_MAX_FILES=5`. The active file is rotated (timestamp-suffixed rename) once the next record would cross the cap, and the oldest rotated file is evicted beyond the cap. Requires a restart (the file handle is swapped at boot). |
+| **Judge store** | There is no retention env var for `NEXUS_JUDGE_DB` yet. If the judge volume is a concern, either disable the judge (`NEXUS_JUDGE_SAMPLE_RATE=0`) or periodically archive + truncate the file offline (stop → `mv judge.db judge.db.archive` → restart). |
+| **Reduce input volume** | Lower `NEXUS_JUDGE_SAMPLE_RATE` (default 0.1) so fewer judge rows land, and disable telemetry (`NEXUS_TELEMETRY_PATH=`) if the JSONL log is not consumed downstream. |
+
+---
+
 ## Prompt-injection hardening
 
 The proxy can isolate its own policy text from user-supplied content and
@@ -327,6 +393,11 @@ trusted.
 | `nexus_circuit_breaker_failures_total{circuit="rag"}` | counter | Consecutive embedder failures |
 | `nexus_rag_hits_total` | counter | Successful RAG injections |
 | `nexus_ollama_healthy` | gauge | Ollama health probe result (1 or 0) |
+| `nexus_metrics_dropped_total` | counter | Metrics rows dropped because the SQLite write buffer was full (early warning — see Scenario 6) |
+| `nexus_telemetry_dropped_total` | counter | Telemetry records dropped because the JSONL write buffer was full (early warning — see Scenario 6) |
+| `nexus_tracing_dropped_total` | counter | Trace spans dropped because the exporter buffer was full (early warning — see Scenario 6) |
+| `nexus_metrics_prune_last_rows` | gauge | Rows removed by the most recent metrics retention prune pass (0 until `NEXUS_METRICS_RETENTION_DAYS > 0`) |
+| `nexus_telemetry_rotations_total` | counter | Telemetry file rotations triggered by the `NEXUS_TELEMETRY_MAX_BYTES` size cap |
 
 ### `/status` RAG block fields (issue #446)
 
