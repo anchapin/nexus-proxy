@@ -424,3 +424,78 @@ func TestMiddleware_NilSafeSetBurst(t *testing.T) {
 	var m *Middleware
 	m.SetBurst(10) // must not panic
 }
+
+// TestMiddleware_RPM_Disabled verifies RPM() returns 0 when the middleware is disabled.
+func TestMiddleware_RPM_Disabled(t *testing.T) {
+	m := NewMiddleware(0, 0, nil)
+	if got := m.RPM(); got != 0 {
+		t.Errorf("RPM() on disabled middleware = %d, want 0", got)
+	}
+}
+
+// TestMiddleware_RPM_Enabled verifies RPM() returns the configured value when enabled.
+func TestMiddleware_RPM_Enabled(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(120, 10, resolver)
+	if got := m.RPM(); got != 120 {
+		t.Errorf("RPM() = %d, want 120", got)
+	}
+}
+
+// TestMiddleware_RPM_NilSafe verifies RPM() on a nil receiver does not panic and returns 0.
+func TestMiddleware_RPM_NilSafe(t *testing.T) {
+	var m *Middleware
+	if got := m.RPM(); got != 0 {
+		t.Errorf("RPM() on nil = %d, want 0", got)
+	}
+}
+
+// TestMiddleware_Burst_Disabled verifies Burst() returns 0 when the middleware is disabled.
+func TestMiddleware_Burst_Disabled(t *testing.T) {
+	m := NewMiddleware(0, 0, nil)
+	if got := m.Burst(); got != 0 {
+		t.Errorf("Burst() on disabled middleware = %d, want 0", got)
+	}
+}
+
+// TestMiddleware_Burst_Enabled verifies Burst() returns the configured value when enabled.
+func TestMiddleware_Burst_Enabled(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(60, 5, resolver)
+	if got := m.Burst(); got != 5 {
+		t.Errorf("Burst() = %d, want 5", got)
+	}
+}
+
+// TestMiddleware_Burst_NilSafe verifies Burst() on a nil receiver does not panic and returns 0.
+func TestMiddleware_Burst_NilSafe(t *testing.T) {
+	var m *Middleware
+	if got := m.Burst(); got != 0 {
+		t.Errorf("Burst() on nil = %d, want 0", got)
+	}
+}
+
+// TestMiddleware_Enabled_FalseWhenDisabled verifies Enabled() returns false when rpm <= 0.
+func TestMiddleware_Enabled_FalseWhenDisabled(t *testing.T) {
+	m := NewMiddleware(0, 0, nil)
+	if got := m.Enabled(); got != false {
+		t.Errorf("Enabled() on disabled middleware = %v, want false", got)
+	}
+}
+
+// TestMiddleware_Enabled_TrueWhenEnabled verifies Enabled() returns true when rpm > 0.
+func TestMiddleware_Enabled_TrueWhenEnabled(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(60, 1, resolver)
+	if got := m.Enabled(); got != true {
+		t.Errorf("Enabled() on enabled middleware = %v, want true", got)
+	}
+}
+
+// TestMiddleware_Enabled_NilSafe verifies Enabled() on a nil receiver does not panic and returns false.
+func TestMiddleware_Enabled_NilSafe(t *testing.T) {
+	var m *Middleware
+	if got := m.Enabled(); got != false {
+		t.Errorf("Enabled() on nil = %v, want false", got)
+	}
+}
