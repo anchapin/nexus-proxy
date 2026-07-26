@@ -235,17 +235,15 @@ const (
 // configured threshold the cached route is returned. Semantic matching
 // requires an HTTP call to the embedder and may add latency.
 func (c *SLMCache) Get(ctx context.Context, prompt string) (Route, bool, CacheHitKind) {
-	// Fast path: exact string match. Hold RLock for the duration of the
-	// map read so we don't race with Set (which holds a Mutex).
 	c.mu.RLock()
 	entry, ok := c.entries[prompt]
-	expired := !ok || time.Since(entry.stamp) > c.ttl
-	c.mu.RUnlock()
-	if ok && !expired {
-		return entry.Route, true, CacheHitExact
+	if ok && time.Since(entry.stamp) <= c.ttl {
+		route := entry.Route
+		c.mu.RUnlock()
+		return route, true, CacheHitExact
 	}
+	c.mu.RUnlock()
 
-	// Semantic fallback: requires embedder.
 	if c.embedder == nil {
 		return "", false, ""
 	}
