@@ -141,3 +141,92 @@ func TestEnvExampleCoverage(t *testing.T) {
 			strings.Join(stale, ", "))
 	}
 }
+
+// TestEnvExampleHotReloadAnnotations (issue #491) asserts that the env vars
+// annotated `# hot-reloadable via SIGHUP` in .env.example exactly match the
+// vars re-read by ReloadHotReloadable in config.go. The canonical set is
+// derived directly from the source (the code region between the
+// "// Hot-reloadable settings." marker and the function return), so renaming
+// or removing a reloadable var without updating .env.example fails the test.
+func TestEnvExampleHotReloadAnnotations(t *testing.T) {
+	_, here, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller: cannot locate test file")
+	}
+	repoRoot := filepath.Join(filepath.Dir(here), "..", "..")
+
+	// Derive the canonical reloadable set from ReloadHotReloadable's body.
+	// The hot-reloadable reads live between the "// Hot-reloadable settings."
+	// comment and the "return next, result" statement.
+	configPath := filepath.Join(repoRoot, "internal", "config", "config.go")
+	configSrc, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config.go: %v", err)
+	}
+	src := string(configSrc)
+	const reloadMarker = "// Hot-reloadable settings."
+	markIdx := strings.Index(src, reloadMarker)
+	if markIdx < 0 {
+		t.Fatal("cannot find '// Hot-reloadable settings.' marker in config.go")
+	}
+	const returnStmt = "\n\treturn next, result"
+	retIdx := strings.Index(src[markIdx:], returnStmt)
+	if retIdx < 0 {
+		t.Fatal("cannot find 'return next, result' after hot-reloadable marker in config.go")
+	}
+	reloadRegion := src[markIdx : markIdx+retIdx]
+
+	nexusRe := regexp.MustCompile(`NEXUS_[A-Z][A-Z0-9_]{1,}`)
+	codeReloadable := make(map[string]bool)
+	for _, m := range nexusRe.FindAllString(reloadRegion, -1) {
+		codeReloadable[m] = true
+	}
+
+	// Collect annotated entries from .env.example: uncommented assignment lines
+	// carrying the trailing "# hot-reloadable via SIGHUP" marker.
+	envExamplePath := filepath.Join(repoRoot, ".env.example")
+	exampleBytes, err := os.ReadFile(envExamplePath)
+	if err != nil {
+		t.Fatalf("read .env.example: %v", err)
+	}
+	const annotation = "# hot-reloadable via SIGHUP"
+	docReloadable := make(map[string]bool)
+	for _, line := range strings.Split(string(exampleBytes), "\n") {
+		if !strings.Contains(line, annotation) {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		// Skip comment-only lines (e.g. the header enumeration block).
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		for _, m := range nexusRe.FindAllString(trimmed, -1) {
+			docReloadable[m] = true
+		}
+	}
+
+	// Code → docs: every reloadable var must carry the annotation.
+	var missing []string
+	for v := range codeReloadable {
+		if !docReloadable[v] {
+			missing = append(missing, v)
+		}
+	}
+	if len(missing) > 0 {
+		t.Errorf("reloadable vars in ReloadHotReloadable lacking `# hot-reloadable via SIGHUP` in .env.example: %s\n"+
+			"Add the trailing annotation (issue #491).", strings.Join(missing, ", "))
+	}
+
+	// Docs → code: no annotation should decorate a var that is not reloadable.
+	var extra []string
+	for v := range docReloadable {
+		if !codeReloadable[v] {
+			extra = append(extra, v)
+		}
+	}
+	if len(extra) > 0 {
+		t.Errorf("vars annotated `# hot-reloadable via SIGHUP` in .env.example but not re-read by ReloadHotReloadable: %s\n"+
+			"Either add the var to ReloadHotReloadable or remove the annotation (issue #491).",
+			strings.Join(extra, ", "))
+	}
+}

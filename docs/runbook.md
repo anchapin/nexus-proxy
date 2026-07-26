@@ -94,7 +94,7 @@ curl -s http://localhost:8000/metrics | grep nexus_budget
 | Action | Step |
 | ------- | ---- |
 | **Wait** | The budget window is a rolling 24 h sliding window. Wait for it to roll past the accumulated spend. |
-| **Increase the limit** | Set `NEXUS_BUDGET_DAILY_LIMIT=<higher value>` and `SIGHUP` or restart the proxy. |
+| **Increase the limit** | Set `NEXUS_BUDGET_DAILY_LIMIT=<higher value>` and restart the proxy (this var is NOT hot-reloadable via SIGHUP). |
 | **Disable the guard** | Set `NEXUS_BUDGET_DAILY_LIMIT=0` to disable the budget guard entirely. |
 | **Enable alerting before it happens** | Set `NEXUS_BUDGET_ALERT_ENABLED=true` and optionally `NEXUS_BUDGET_ALERT_WEBHOOK_URL=<url>` to get a webhook when spend crosses 80 % of the limit (`NEXUS_BUDGET_ALERT_THRESHOLD=0.8`). |
 
@@ -168,7 +168,7 @@ request escalates to frontier.
 
 ```bash
 # Enable debug tracing to see routing decision reasons:
-NEXUS_DEBUG=true  # restart proxy with this set
+NEXUS_DEBUG=true  # hot-reloadable via SIGHUP (no restart needed)
 
 # Then inspect the "routing" trace group in structured logs:
 # Look for fields: route, source, confidence_bucket, task_type
