@@ -2,7 +2,8 @@
 #
 # Triggered by semver tags (v*) or manually via workflow_dispatch.
 # Produces:
-#   - Cross-compiled binaries (linux/amd64, linux/arm64, darwin/arm64)
+#   - Cross-compiled binaries (linux/amd64, linux/arm64, darwin/arm64,
+#     windows/amd64)
 #   - SHA256 checksums file
 #   - GitHub Release with all artifacts attached
 #   - Multi-arch (amd64 + arm64) GHCR image
@@ -123,6 +124,7 @@ jobs:
           build_one linux   amd64 "nexus-${VERSION}-linux-amd64"
           build_one linux   arm64 "nexus-${VERSION}-linux-arm64"
           build_one darwin  arm64 "nexus-${VERSION}-darwin-arm64"
+          build_one windows amd64 "nexus-${VERSION}-windows-amd64.exe"
 
       - name: Generate SHA256 checksums
         working-directory: dist
@@ -319,6 +321,7 @@ jobs:
             | `nexus-*-linux-amd64` | Linux x86_64 binary |
             | `nexus-*-linux-arm64` | Linux ARM64 binary |
             | `nexus-*-darwin-arm64` | macOS Apple Silicon binary |
+            | `nexus-*-windows-amd64.exe` | Windows x86_64 binary |
             | `checksums-sha256.txt` | SHA256 checksums for all binaries |
             | `*-sbom.spdx.json` | SPDX SBOM |
 

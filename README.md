@@ -361,7 +361,7 @@ Every semver tag (`v1.0.0`, `v1.2.3`, …) triggers the
 [release workflow](.github/workflows/release.yml), which publishes:
 
 - **Cross-compiled binaries** — `linux/amd64`, `linux/arm64`,
-  `darwin/arm64`
+  `darwin/arm64`, `windows/amd64`
 - **SHA256 checksums** — `checksums-sha256.txt`
 - **GHCR multi-arch image** — `ghcr.io/anchapin/nexus-proxy:<tag>`
   (amd64 + arm64), also tagged `latest`
