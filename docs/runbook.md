@@ -366,7 +366,42 @@ trusted.
 
 ---
 
+## Security response headers
 
+`handlers.SecurityHeaders` (`internal/handlers/security.go`) is the single
+source of truth for response hardening. It is wired as the outermost
+middleware layer so every response — including `/healthz`, `/status`, and
+`/metrics` — carries the full header set.
+
+| Header | Value | Purpose |
+| ------ | ----- | ------- |
+| `X-Content-Type-Options` | `nosniff` | Blocks MIME sniffing (issue #39). |
+| `X-Frame-Options` | `DENY` | Blocks clickjacking via framing (issue #39). |
+| `Referrer-Policy` | `no-referrer` | Strips the `Referer` header so the proxy URL is not leaked (issue #39). |
+| `Cross-Origin-Opener-Policy` | `same-origin` | Isolates the browsing context group; cross-origin documents cannot manipulate the proxy's window (issue #605). |
+| `Cross-Origin-Embedder-Policy` | `require-corp` | Opts the context into cross-origin isolation; subresource loads are gated on CORP (issue #605). |
+| `Cross-Origin-Resource-Policy` | `same-origin` | Blocks cross-origin `no-cors` requests from reading the response (issue #605). |
+| `Permissions-Policy` | all features locked down | Disables privacy-sensitive browser features (camera, microphone, geolocation, payment, etc.) the API never uses (issue #605). |
+| `Strict-Transport-Security` | `max-age=31536000` | HSTS — **only emitted when TLS is active**. Omitted over plaintext (spec compliance). |
+
+### Operational notes
+
+- **Not configurable.** The header set is fixed at compile time; there
+  are no env-var knobs. This is intentional — security headers should be
+  on by default with no easy way to disable them.
+- **COEP `require-corp` caveat.** This value enables cross-origin
+  isolation. Because the proxy serves JSON/SSE API responses (not
+  browser documents that load cross-origin subresources), this is a safe
+  defense-in-depth default. If a future UI is served from the proxy,
+  review whether `credentialless` is more appropriate.
+- **HSTS and TLS.** HSTS is suppressed unless `NEXUS_TLS_ENABLED=true`.
+  Emitting HSTS over plaintext is a spec violation that browsers ignore.
+- **Verification.** Inspect headers with:
+  ```bash
+  curl -sI http://localhost:8000/healthz | grep -iE 'cross-origin|permissions-policy'
+  ```
+
+---
 
 ### Useful endpoints
 
