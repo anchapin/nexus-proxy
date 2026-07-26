@@ -737,6 +737,15 @@ type Deps struct {
 	// hot path is unaffected.
 	PanelPanicObserver func()
 
+	// InjectionHitObserver is invoked once per request that produced at
+	// least one suspicious prompt-injection pattern hit (issue #482).
+	// mode is "warn" or "strict" depending on the configured injection
+	// mode. The handler does not import the observability package —
+	// main.go wires a closure that forwards to
+	// RouteCounters.ObservePromptInjectionHit. Safe for concurrent use;
+	// nil is "no observer" so boot and tests without metrics still pass.
+	InjectionHitObserver func(mode string)
+
 	// ArbiterCache is the optional in-memory cache for fusion arbiter
 	// synthesis responses (issue #232). When non-nil and
 	// Config.ArbiterCacheTTL > 0, identical panel-member content
@@ -956,6 +965,18 @@ func Chat(d Deps) http.Handler {
 		if d.Config.PromptInjectionIsolated() {
 			hits := middleware.DetectSuspiciousRoles(rawMessages, d.Config.InjectionScanRoles)
 			if len(hits) > 0 {
+				// Increment the prompt-injection counter once per
+				// suspicious request (issue #482). The mode label is
+				// "warn" or "strict" so operators can alert on volume
+				// by enforcement policy. Called before the mode-specific
+				// handling so the counter fires for both paths.
+				if d.InjectionHitObserver != nil {
+					mode := "warn"
+					if d.Config.PromptInjectionMode == middleware.InjectionModeStrict {
+						mode = "strict"
+					}
+					d.InjectionHitObserver(mode)
+				}
 				if d.Config.PromptInjectionMode == middleware.InjectionModeStrict {
 					recordRejection(RejectionBadRequest)
 					writeJSONError(w, http.StatusBadRequest, ErrTypeInvalidRequest,

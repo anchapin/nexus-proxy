@@ -233,9 +233,14 @@ func AppendSystemNoteIsolated(messages []interface{}, notice string) []interface
 // patterns. Called by the chat handler in warn mode. Keeping the log
 // formatting here ensures consistency between the middleware-level
 // tests and the handler.
+//
+// The regex source strings in hits are static detection rules defined
+// in this package — they are never user-supplied text — so logging
+// them leaks no payload content (issue #482).
 func LogSuspicious(hits []string, requestID string) {
 	slog.Warn("suspicious prompt-injection patterns in system message",
 		slog.Int("patterns", len(hits)),
+		slog.Any("patterns_matched", hits),
 		slog.String("request_id", requestID),
 	)
 }

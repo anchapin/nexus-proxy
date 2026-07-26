@@ -917,3 +917,78 @@ func TestHandlerNilCollectorSafe(t *testing.T) {
 		t.Errorf("circuit_breaker_state should be absent without a collector\n%s", body)
 	}
 }
+
+// TestObservePromptInjectionHit verifies the issue #482 prompt-injection
+// counter family: ObservePromptInjectionHit increments a per-mode counter
+// and WriteTo emits nexus_prompt_injection_hits_total{mode} lines. The
+// counter increments once per call regardless of how many individual
+// patterns matched in the request (the handler calls it once per
+// suspicious request, not once per hit).
+func TestObservePromptInjectionHit(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObservePromptInjectionHit("warn")
+	rc.ObservePromptInjectionHit("warn")
+	rc.ObservePromptInjectionHit("warn")
+	rc.ObservePromptInjectionHit("strict")
+	rc.ObservePromptInjectionHit("strict")
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_prompt_injection_hits_total", "metric family header"},
+		{`# TYPE nexus_prompt_injection_hits_total counter`, "counter type line"},
+		{`nexus_prompt_injection_hits_total{mode="warn"} 3`, "warn counted three times"},
+		{`nexus_prompt_injection_hits_total{mode="strict"} 2`, "strict counted twice"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+}
+
+// TestObservePromptInjectionHitNilSafe verifies nil receivers and empty
+// mode are no-ops so callers can invoke unconditionally.
+func TestObservePromptInjectionHitNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObservePromptInjectionHit("warn") // must not panic
+
+	rc2 := NewRouteCounters()
+	rc2.ObservePromptInjectionHit("") // must not panic, must not create a label
+	var sb strings.Builder
+	if _, err := rc2.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	if strings.Contains(sb.String(), `mode=""`) {
+		t.Errorf("empty mode should not produce a sample line:\n%s", sb.String())
+	}
+}
+
+// TestObservePromptInjectionHitCleanRequest verifies a freshly-created
+// RouteCounters with no ObservePromptInjectionHit calls emits only the
+// HELP/TYPE header for the family (no sample lines). This matches
+// acceptance criterion (c): clean requests leave the counter unchanged.
+func TestObservePromptInjectionHitCleanRequest(t *testing.T) {
+	rc := NewRouteCounters()
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	if !strings.Contains(out, "nexus_prompt_injection_hits_total") {
+		t.Errorf("HELP/TYPE header should still be present:\n%s", out)
+	}
+	// No sample lines (no {mode=...} entries).
+	if strings.Contains(out, `nexus_prompt_injection_hits_total{mode=`) {
+		t.Errorf("clean counters should have no sample lines:\n%s", out)
+	}
+}

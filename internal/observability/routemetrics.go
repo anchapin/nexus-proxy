@@ -171,6 +171,12 @@ type RouteCounters struct {
 	// recovers from a panic and returns a panic error.
 	panelPanics uint64 // atomic
 
+	// Prompt-injection hit counter (issue #482). Bumped once per request
+	// that produced >=1 suspicious-pattern hit, labelled by injection
+	// mode ("warn" or "strict"). Lets operators alert on injection-attempt
+	// volume spikes without enabling full debug tracing.
+	promptInjectionHits map[string]*uint64
+
 	// collector is an optional Collector whose CircuitBreakerGauges()
 	// are merged into the /metrics output when non-nil.
 	collector *Collector
@@ -201,6 +207,7 @@ func NewRouteCounters() *RouteCounters {
 		slmEscalations:           make(map[string]*uint64),
 		ragCacheHits:             &cHits,
 		ragCacheMisses:           &cMisses,
+		promptInjectionHits:      make(map[string]*uint64),
 	}
 }
 
@@ -511,6 +518,34 @@ func (rc *RouteCounters) ObservePanelPanic() {
 	atomic.AddUint64(&rc.panelPanics, 1)
 }
 
+// ObservePromptInjectionHit records one request that produced at least
+// one suspicious prompt-injection pattern hit (issue #482). mode is the
+// injection mode in effect: "warn" or "strict". The counter increments
+// once per suspicious request regardless of how many individual patterns
+// matched, so operators can alert on injection-attempt volume. Safe for
+// concurrent use; nil receivers and empty mode are no-ops.
+func (rc *RouteCounters) ObservePromptInjectionHit(mode string) {
+	if rc == nil || mode == "" {
+		return
+	}
+	atomic.AddUint64(rc.promptInjectionSlot(mode), 1)
+}
+
+// promptInjectionSlot returns the *uint64 for the mode label, creating
+// it if absent. Same lock-then-atomic pattern as reasonSlot: the mutex
+// guards the map mutation only, the increment happens lock-free.
+func (rc *RouteCounters) promptInjectionSlot(mode string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.promptInjectionHits[mode]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.promptInjectionHits[mode] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
 // reasonSlot returns the *uint64 for reason, creating it if absent.
 // Same lock-then-atomic pattern as slot: the mutex guards the map
 // mutation only, the increment happens lock-free.
@@ -793,6 +828,13 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += n
 	}
+	if n, err := writeLabelledSeries(w, "nexus_prompt_injection_hits_total",
+		"Requests that produced suspicious prompt-injection pattern hits, by injection mode (issue #482).",
+		"mode", rc.promptInjectionHits); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
 	return total, nil
 }
 
@@ -1031,6 +1073,35 @@ func writeOverflowSeries(w io.Writer, name, help string, counter *uint64) (int64
 		return int64(n), err
 	}
 	return int64(n), nil
+}
+
+// writeLabelledSeries emits a counter family with one string-keyed
+// label dimension (issue #482). Each map entry becomes its own sample
+// line. Output is sorted by label value for deterministic scrape diffs.
+func writeLabelledSeries(w io.Writer, name, help, label string, m map[string]*uint64) (int64, error) {
+	var total int64
+	n, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", name, help, name)
+	if err != nil {
+		return total + int64(n), err
+	}
+	total += int64(n)
+	if len(m) == 0 {
+		return total, nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := atomic.LoadUint64(m[k])
+		n, err := fmt.Fprintf(w, "%s{%s=%q} %d\n", name, label, sanitizeLabel(k), v)
+		if err != nil {
+			return total + int64(n), err
+		}
+		total += int64(n)
+	}
+	return total, nil
 }
 
 // keyLess reports whether k1 < k2 considering only the fields named
