@@ -138,19 +138,48 @@ func TestReadFreeVRAMBytesLegacyNames(t *testing.T) {
 
 func TestReadFreeVRAMBytesNoGPUs(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := readFreeVRAMBytes(dir); err == nil {
-		t.Fatal("expected error when no AMD nodes are present")
+	free, err := readFreeVRAMBytes(dir)
+	if err != nil {
+		t.Fatalf("expected no error when no AMD nodes are present, got: %v", err)
+	}
+	if free != 0 {
+		t.Errorf("got %d free, want 0", free)
 	}
 }
 
 func TestReadFreeVRAMBytesIgnoresConnectors(t *testing.T) {
 	dir := t.TempDir()
-	// card0-DP-1 should be ignored (it is a connector node, not a GPU).
 	if err := os.MkdirAll(filepath.Join(dir, "card0-DP-1", "device"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readFreeVRAMBytes(dir); err == nil {
-		t.Fatal("expected error: connector paths must not be counted as GPUs")
+	// card0-DP-1 is a connector (not a GPU) and has no VRAM files,
+	// so it is skipped and no AMD GPU is found.
+	free, err := readFreeVRAMBytes(dir)
+	if err != nil {
+		t.Fatalf("expected no error when no AMD nodes are present, got: %v", err)
+	}
+	if free != 0 {
+		t.Errorf("got %d free, want 0", free)
+	}
+}
+
+// TestReadFreeVRAMBytesNoAmdNodes synthesises a sysfs tree with card0
+// present but having no VRAM files — the Intel iGPU path (issue #608).
+// The function should return (0, nil) and log an info-level message so
+// operators can distinguish "no AMD GPU" from "sysfs probe failed".
+func TestReadFreeVRAMBytesNoAmdNodes(t *testing.T) {
+	dir := t.TempDir()
+	card := filepath.Join(dir, "card0")
+	// card0 exists but has no VRAM files (Intel iGPU or unrecognised GPU).
+	if err := os.MkdirAll(card, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	free, err := readFreeVRAMBytes(dir)
+	if err != nil {
+		t.Fatalf("expected no error when card exists but has no AMD VRAM files, got: %v", err)
+	}
+	if free != 0 {
+		t.Errorf("got %d free, want 0", free)
 	}
 }
 
@@ -335,13 +364,17 @@ func TestOllamaProbeOllamaDownFallsBackToSysfs(t *testing.T) {
 	}
 }
 
-func TestOllamaProbeBothDownReturnsErrNoSignal(t *testing.T) {
+func TestOllamaProbeBothDownButSysfsAccessibleNoAmdNodesReturnsNil(t *testing.T) {
+	// When sysfs is accessible (empty temp dir) but no AMD nodes found,
+	// readFreeVRAMBytes returns (0, nil) and logs an info message.
+	// Budget() then falls through to the Ollama-only path and returns
+	// nil error (issue #608).
 	p := NewOllamaProbe("http://127.0.0.1:1", &http.Client{Timeout: 100 * time.Millisecond})
 	p.SysfsRoot = t.TempDir()
 
 	_, err := p.Budget(context.Background())
-	if !errors.Is(err, ErrNoSignal) {
-		t.Errorf("got %v, want ErrNoSignal", err)
+	if err != nil {
+		t.Errorf("expected nil error when sysfs accessible but no AMD nodes, got: %v", err)
 	}
 }
 
@@ -690,22 +723,22 @@ func TestOllamaProbeChatModelNotResidentReturnsError(t *testing.T) {
 	}
 }
 
-// TestOllamaProbeChatModelNotResidentBothDownIsErrNoSignal confirms
-// that when ChatModel is set, no matching model is resident, AND sysfs
-// is also unavailable, Budget returns ErrNoSignal so the caller falls
-// all the way back to the static guardrail.
-func TestOllamaProbeChatModelNotResidentBothDownIsErrNoSignal(t *testing.T) {
+// TestOllamaProbeChatModelNotResidentSysfsNoAmdNodesReturnsNil
+// confirms that when ChatModel is set, no matching model is resident,
+// but sysfs is accessible (empty, no AMD nodes), Budget returns nil
+// (issue #608 — operators see the info log instead of a cryptic error).
+func TestOllamaProbeChatModelNotResidentSysfsNoAmdNodesReturnsNil(t *testing.T) {
 	srv := psServer(t, 0, []psModel{
 		{name: "nomic-embed-text", contextLength: 8192},
 	})
 	defer srv.Close()
 	p := NewOllamaProbe(srv.URL, srv.Client())
-	p.SysfsRoot = t.TempDir() // no sysfs nodes
+	p.SysfsRoot = t.TempDir()
 	p.ChatModel = "qwen3-coder:4b"
 
 	_, err := p.Budget(context.Background())
-	if !errors.Is(err, ErrNoSignal) {
-		t.Errorf("got %v, want ErrNoSignal", err)
+	if err != nil {
+		t.Errorf("expected nil error when sysfs accessible but no AMD nodes, got: %v", err)
 	}
 }
 
