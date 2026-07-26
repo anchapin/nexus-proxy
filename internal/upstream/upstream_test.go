@@ -1090,6 +1090,68 @@ func TestPanelStreamingDisagreementRunsArbiter(t *testing.T) {
 	}
 }
 
+// TestPanelStreamingArbiterCtxFromRequest is the regression test for
+// issue #488: the arbiter HTTP call must derive its context from the
+// request ctx passed into PanelStreaming, not from context.Background().
+// When the parent context is cancelled (simulating a client disconnect
+// mid-stream after the speculative chunk), the arbiter request must
+// observe the cancellation on r.Context() instead of stranding until
+// its own timeout.
+func TestPanelStreamingArbiterCtxFromRequest(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"the quick brown fox"}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"switch the entire database schema migrate everything now"}}]}`)
+	})
+
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+
+	// arbiter handler: once the arbiter request lands, cancel the
+	// parent request context (simulating a client disconnect) and
+	// assert the request observes it via r.Context().Err(). The
+	// handler runs synchronously inside fakeTransport.RoundTrip on the
+	// same goroutine as PanelStreaming, so the plain bool is race-free.
+	var observed bool
+	ft.on(arbiterURL, func(w http.ResponseWriter, r *http.Request) {
+		cancelParent() // simulate client disconnect mid-arbiter
+		select {
+		case <-r.Context().Done():
+			observed = true
+		case <-time.After(250 * time.Millisecond):
+		}
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	_, _ = PanelStreaming(
+		parentCtx, rw, client,
+		"http://local.local", "local-m",
+		frontierURL, "", "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		5*time.Second,
+		5*time.Second,
+		false,
+		0.85,
+		"test-request-id",
+		nil, 0*time.Second,
+	)
+	if !observed {
+		t.Fatal("arbiter did not observe request-context cancellation within 250ms; arbiterCtx not derived from request ctx (issue #488)")
+	}
+}
+
 // TestPanelStreamingDegradedSkipLocal mirrors the issue #8 graceful-
 // degradation contract: when skipLocal=true, only the frontier panel
 // member is fetched. Its content streams as the (only) speculative
