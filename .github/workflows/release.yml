@@ -197,6 +197,63 @@ jobs:
         # `digest` output is populated regardless and used for cosign
         # signing below.
 
+      # ── Post-build smoke test (issue #582) ──────────────────────
+      # The image is already pushed by build-push-action above. Pull
+      # the amd64 variant back onto the runner and prove the container
+      # actually runs BEFORE cosign signs it and the release job
+      # advertises it. A broken image (bad entrypoint, missing binary,
+      # wrong UID) fails here and marks the docker job failed, which
+      # blocks both the cosign step below and the `release` job
+      # (`needs: [build-binaries, docker, sbom]`). This stops broken
+      # images from being cosign-signed and attached to the GitHub
+      # Release.
+      - name: Smoke test image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.version }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          echo "Pulling ${IMAGE} (amd64) for smoke test..."
+          docker pull --platform linux/amd64 "${IMAGE}"
+
+          # Verify the binary runs and reports the version injected at
+          # build time. The distroless ENTRYPOINT is /nexus, so the
+          # flag is passed as the sole argument.
+          echo "::group::nexus --version"
+          docker run --rm "${IMAGE}" --version | tee /tmp/version.out
+          grep -F "nexus ${VERSION}" /tmp/version.out
+          echo "::endgroup::"
+
+          # Verify /healthz responds 200 once the HTTP server is up.
+          # Distroless has no shell or wget, so the check runs from the
+          # runner against the host-mapped port. /healthz is auth-exempt
+          # and always returns 200 while the binary is alive.
+          echo "::group::/healthz responds 200"
+          CID=$(docker run -d --rm -p 18000:8000 "${IMAGE}")
+          trap 'docker stop "${CID}" >/dev/null 2>&1 || true' EXIT
+
+          CODE=""
+          for i in $(seq 1 30); do
+            CODE=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+              --max-time 2 http://localhost:18000/healthz || true)
+            if [ "${CODE}" = "200" ]; then
+              echo "/healthz returned 200 on attempt ${i}"
+              break
+            fi
+            echo "attempt ${i}: status=${CODE}, retrying..."
+            sleep 1
+          done
+
+          if [ "${CODE}" != "200" ]; then
+            echo "::error::/healthz did not return 200 within 30s (last=${CODE})"
+            docker logs "${CID}" || true
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "Smoke test passed."
+
       # ── Keyless cosign signing (requires id-token: write) ───────
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
