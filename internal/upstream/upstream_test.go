@@ -1031,7 +1031,7 @@ func TestPanelStreamingAgreementCancelsSlowMember(t *testing.T) {
 		5*time.Second, // arbiterTimeout
 		false,         // skipLocal
 		0.85,          // agreementThreshold
-		"testing-" + t.Name() + "-unique",
+		"testing-"+t.Name()+"-unique",
 		nil, 0*time.Second,
 	)
 	if err != nil {
