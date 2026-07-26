@@ -61,8 +61,7 @@ func (r *RecordingTransport) RoundTrip(req *http.Request) (*http.Response, error
 	}
 	// Snapshot the body so the handler can still read it.
 	if req.Body != nil {
-		body, _ := readAndRestoreBody(req)
-		_ = body
+		_, _ = readAndRestoreBody(req) // side-effect only: req.Body is restored for the handler
 	}
 	r.calls = append(r.calls, RecordedCall{URL: req.URL.String(), Req: req})
 	r.mu.Unlock()
