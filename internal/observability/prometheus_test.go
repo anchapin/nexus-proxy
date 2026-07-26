@@ -4,8 +4,10 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
+	"github.com/anchapin/nexus-proxy/internal/router"
 )
 
 // TestRenderPrometheusHasRequiredMetrics asserts every metric named in
@@ -528,5 +530,72 @@ func TestRenderPrometheusLocalConcurrencyGauges(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q\n--- output ---\n%s", want, out)
 		}
+	}
+}
+
+// TestRenderPrometheusSLMCacheGauges (issue #531) drives a real
+// router.SLMCache to a known state and asserts both SLM cache gauges
+// render with correct HELP/TYPE headers and values.
+func TestRenderPrometheusSLMCacheGauges(t *testing.T) {
+	c := NewCollector()
+	cache := router.NewSLMCache(time.Hour, 10)
+	ctx := context.Background()
+
+	cache.Set(ctx, "prompt-a", router.RouteLocal)
+	cache.Set(ctx, "prompt-b", router.RouteFrontier)
+
+	provider := GaugeProviderFunc(func() []GaugeSample {
+		return []GaugeSample{
+			{Name: "nexus_slm_cache_entries", Value: float64(cache.Len())},
+			{Name: "nexus_slm_cache_max_entries", Value: float64(cache.MaxEntries())},
+		}
+	})
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c, provider)
+	out := sb.String()
+
+	wantLines := []string{
+		"# HELP nexus_slm_cache_entries",
+		"# TYPE nexus_slm_cache_entries gauge",
+		"nexus_slm_cache_entries 2",
+		"# HELP nexus_slm_cache_max_entries",
+		"# TYPE nexus_slm_cache_max_entries gauge",
+		"nexus_slm_cache_max_entries 10",
+	}
+	for _, want := range wantLines {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+}
+
+// TestRenderPrometheusSLMCacheGaugesAbsentWhenDisabled (issue #531)
+// verifies that when the cache is nil the gauge provider returns nil
+// so neither series appears in a fresh scrape.
+func TestRenderPrometheusSLMCacheGaugesAbsentWhenDisabled(t *testing.T) {
+	c := NewCollector()
+
+	var nilCache *router.SLMCache
+
+	provider := GaugeProviderFunc(func() []GaugeSample {
+		if nilCache == nil {
+			return nil
+		}
+		return []GaugeSample{
+			{Name: "nexus_slm_cache_entries", Value: float64(nilCache.Len())},
+			{Name: "nexus_slm_cache_max_entries", Value: float64(nilCache.MaxEntries())},
+		}
+	})
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c, provider)
+	out := sb.String()
+
+	if strings.Contains(out, "nexus_slm_cache_entries") {
+		t.Errorf("nexus_slm_cache_entries should not appear when cache is nil\n--- output ---\n%s", out)
+	}
+	if strings.Contains(out, "nexus_slm_cache_max_entries") {
+		t.Errorf("nexus_slm_cache_max_entries should not appear when cache is nil\n--- output ---\n%s", out)
 	}
 }

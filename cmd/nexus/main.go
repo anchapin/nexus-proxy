@@ -884,6 +884,19 @@ func main() {
 		slog.Info("slm decision cache disabled (NEXUS_SLMCACHE_TTL<=0)")
 	}
 
+	// SLM decision cache gauges (issue #531).
+	routeCounters.SetGaugeProviders(
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			if slmCache == nil {
+				return nil
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_slm_cache_entries", Value: float64(slmCache.Len())},
+				{Name: "nexus_slm_cache_max_entries", Value: float64(slmCache.MaxEntries())},
+			}
+		}),
+	)
+
 	// Wire circuit breaker metrics into the /metrics output (issue #304).
 	routeCounters.SetCollector(circuitCollector)
 

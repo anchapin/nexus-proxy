@@ -172,6 +172,15 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total number of circuit breaker trip events for embedder kinds (issue #423).",
 		typ:  "counter",
 	},
+	// SLM decision cache gauges (issue #531).
+	"nexus_slm_cache_entries": {
+		help: "Current number of entries in the SLM decision cache (issue #531).",
+		typ:  "gauge",
+	},
+	"nexus_slm_cache_max_entries": {
+		help: "Configured maximum entry capacity of the SLM decision cache (issue #531).",
+		typ:  "gauge",
+	},
 }
 
 // RenderPrometheus writes the full /metrics body in Prometheus
