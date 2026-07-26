@@ -1176,9 +1176,13 @@ func streamPanelResultAsSSE(w http.ResponseWriter, r PanelResult) error {
 // streamCachedArbiterSynthesis streams a cached arbiter synthesis text as
 // SSE chunks (issue #232). This mimics the output of StreamWithContext
 // for the arbiter, but serves from cache instead. The synthesis is
-// streamed as a single delta chunk followed by [DONE]. Headers must
-// already be committed (WriteHeader called) when this runs.
+// streamed as a single delta chunk followed by [DONE]. This function
+// sets SSE headers and commits WriteHeader itself (issue #532) so it
+// is safe to call from any code path that has not yet written headers.
 func streamCachedArbiterSynthesis(w http.ResponseWriter, synthesis string) error {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
 	chunk := map[string]interface{}{
 		"object": "chat.completion.chunk",
 		"nexus":  map[string]string{"source": "arbiter-cached"},

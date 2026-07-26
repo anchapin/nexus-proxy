@@ -48,7 +48,10 @@ func NewArbiterCache(ttl time.Duration) *ArbiterCache {
 // same key) so cache lookups are symmetric.
 func cacheKey(r1Content, r2Content string) uint64 {
 	h := fnv.New64a()
-	// XOR the two contents so swapping r1/r2 yields the same key.
+	// Sort the two contents so swapping r1/r2 yields the same key.
+	if r1Content > r2Content {
+		r1Content, r2Content = r2Content, r1Content
+	}
 	h.Write([]byte(r1Content))
 	h.Write([]byte(r2Content))
 	return h.Sum64()
