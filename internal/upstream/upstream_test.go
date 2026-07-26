@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -2273,5 +2274,52 @@ func TestStreamPanelResultAsSSEErrResultSkipped(t *testing.T) {
 	}
 	if w.body.Len() != 0 {
 		t.Errorf("expected no body for err-flagged result, got %q", w.body.String())
+	}
+}
+
+// --- issue #564: IncPanelPanics + PanelPanicsTotal coverage ---------------
+
+func TestIncPanelPanicsIncrementsCounter(t *testing.T) {
+	before := PanelPanicsTotal()
+	IncPanelPanics()
+	after := PanelPanicsTotal()
+	if after != before+1 {
+		t.Errorf("PanelPanicsTotal() = %d, want %d", after, before+1)
+	}
+}
+
+func TestPanelPanicsTotalIsAtomic(t *testing.T) {
+	before := PanelPanicsTotal()
+	const n = 100
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			IncPanelPanics()
+		}()
+	}
+	wg.Wait()
+	got := PanelPanicsTotal()
+	want := before + uint64(n)
+	if got != want {
+		t.Errorf("PanelPanicsTotal() = %d, want %d", got, want)
+	}
+}
+
+func TestPanelGoroutinePanicIncrementsCounter(t *testing.T) {
+	before := PanelPanicsTotal()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				IncPanelPanics()
+			}
+		}()
+		panic("test panic")
+	}()
+	time.Sleep(10 * time.Millisecond)
+	after := PanelPanicsTotal()
+	if after != before+1 {
+		t.Errorf("PanelPanicsTotal() = %d, want %d", after, before+1)
 	}
 }
