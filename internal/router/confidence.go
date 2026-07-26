@@ -53,6 +53,9 @@ const (
 	CategoryCSS           = "css"
 	CategoryRefactoring   = "refactoring"
 	CategoryDebugging     = "debugging"
+	CategoryTesting       = "testing"
+	CategorySecurity      = "security"
+	CategoryData          = "data"
 	CategoryArchitecture  = "architecture"
 	CategoryBoilerplate   = "boilerplate"
 	CategoryDocumentation = "documentation"
@@ -98,6 +101,18 @@ var categoryKeywords = []struct {
 		"debug", "bug", "stack trace", "stacktrace", "traceback", "exception",
 		"panic", "segfault", "crash", "error message", "why does", "not working",
 		"fails", "failing", "broken",
+	}},
+	{CategoryTesting, []string{
+		"test", "unit test", "integration test", "generate tests", "test case",
+		"mock", "fixture", "coverage", "benchmark", "assert", "pytest", "jest",
+	}},
+	{CategorySecurity, []string{
+		"security scan", "vulnerability", "injection", "xss", "csrf", "sanitize",
+		"auth check", "owasp", "cve", "exploit", "pen test", "sast", "hardening",
+	}},
+	{CategoryData, []string{
+		"sql query", "database", "migration", "schema", "query optimization",
+		"parse json", "data model", "etl", "analytics", "pipeline",
 	}},
 	{CategoryRefactoring, []string{
 		"refactor", "restructure", "extract method", "rename", "clean up",
