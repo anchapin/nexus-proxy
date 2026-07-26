@@ -61,9 +61,10 @@ func NewMiddleware(name string, fn func([]interface{}) ([]interface{}, error)) M
 }
 
 // ragMiddleware implements ContextMiddleware for RAG retrieval.
+// The retrieval threshold lives on the rag.RAGStore (the single source of
+// truth); the middleware never applies one itself.
 type ragMiddleware struct {
-	rag       rag.RAGStore
-	threshold float64
+	rag rag.RAGStore
 }
 
 func (r ragMiddleware) Name() string { return "rag" }
@@ -82,8 +83,9 @@ func (r ragMiddleware) TransformContext(ctx context.Context, msgs []interface{})
 }
 
 // NewRAGMiddleware creates a RAG middleware that uses the provided store.
-func NewRAGMiddleware(store rag.RAGStore, threshold float64) ContextMiddleware {
-	return &ragMiddleware{store, threshold}
+// The store is the sole owner of the retrieval threshold.
+func NewRAGMiddleware(store rag.RAGStore) ContextMiddleware {
+	return &ragMiddleware{store}
 }
 
 // Named middleware registry. Built-in transforms are registered at

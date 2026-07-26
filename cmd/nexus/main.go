@@ -718,7 +718,7 @@ func main() {
 	// Nil when the chain doesn't contain "rag" (operator removed it).
 	var ctxAwareRAG middleware.ContextMiddleware
 	if len(mwChain) > 0 || cfg.MiddlewareChain == "" {
-		ctxAwareRAG = middleware.NewRAGMiddleware(store, cfg.RAGThreshold)
+		ctxAwareRAG = middleware.NewRAGMiddleware(store)
 	}
 
 	mux := http.NewServeMux()
