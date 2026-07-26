@@ -1165,8 +1165,10 @@ func main() {
 	// streaming) instead of a TCP reset with no body. Zero overhead on
 	// the happy path.
 	srv := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           handlers.SecurityHeaders(cfg.TLSEnabled)(handlers.Recover()(rootHandler)),
+		Addr: cfg.Addr,
+		Handler: handlers.SecurityHeaders(cfg.TLSEnabled)(handlers.Recover(func(path string) {
+			routeCounters.ObserveHandlerPanic(path)
+		})(rootHandler)),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,

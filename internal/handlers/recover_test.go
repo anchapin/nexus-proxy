@@ -32,7 +32,7 @@ func panicHandler(t *testing.T, startStream bool, v any) http.HandlerFunc {
 // before any response bytes are written is surfaced as a clean 500 with
 // the OpenAI-compatible JSON error envelope — not a TCP reset.
 func TestRecover_PanicBeforeHeaderReturns500(t *testing.T) {
-	h := Recover()(http.HandlerFunc(panicHandler(t, false, "boom in middleware")))
+	h := Recover(nil)(http.HandlerFunc(panicHandler(t, false, "boom in middleware")))
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
@@ -66,7 +66,7 @@ func TestRecover_PanicBeforeHeaderReturns500(t *testing.T) {
 // trailing SSE error frame and a [DONE] sentinel rather than attempting
 // an impossible status-code change.
 func TestRecover_PanicAfterStreamWritesSSEErrorFrame(t *testing.T) {
-	h := Recover()(http.HandlerFunc(panicHandler(t, true, "stream blew up")))
+	h := Recover(nil)(http.HandlerFunc(panicHandler(t, true, "stream blew up")))
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
@@ -96,7 +96,7 @@ func TestRecover_NoPanicPassThrough(t *testing.T) {
 		w.WriteHeader(http.StatusTeapot)
 		_, _ = w.Write([]byte("ok"))
 	})
-	h := Recover()(inner)
+	h := Recover(nil)(inner)
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
@@ -120,7 +120,7 @@ func TestRecover_LogsStructuredPanic(t *testing.T) {
 
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	r.Header.Set("X-Request-Id", "req-test-123")
-	h := Recover()(http.HandlerFunc(panicHandler(t, false, 42)))
+	h := Recover(nil)(http.HandlerFunc(panicHandler(t, false, 42)))
 
 	h.ServeHTTP(httptest.NewRecorder(), r)
 
@@ -135,5 +135,65 @@ func TestRecover_LogsStructuredPanic(t *testing.T) {
 		if !strings.Contains(logged, want) {
 			t.Errorf("log missing %q\nfull log:\n%s", want, logged)
 		}
+	}
+}
+
+// TestRecover_ObserverInvokedOnPanic verifies that the HandlerPanicObserver
+// is invoked exactly once when a panic is recovered, receiving the request
+// URL path (issue #480).
+func TestRecover_ObserverInvokedOnPanic(t *testing.T) {
+	var paths []string
+	obs := HandlerPanicObserver(func(path string) {
+		paths = append(paths, path)
+	})
+	h := Recover(obs)(http.HandlerFunc(panicHandler(t, false, "kaboom")))
+
+	h.ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+
+	if len(paths) != 1 {
+		t.Fatalf("observer called %d times, want 1", len(paths))
+	}
+	if paths[0] != "/v1/chat/completions" {
+		t.Errorf("observer path = %q, want %q", paths[0], "/v1/chat/completions")
+	}
+}
+
+// TestRecover_ObserverNotInvokedOnHappyPath verifies the observer is not
+// called when the handler returns normally (issue #480).
+func TestRecover_ObserverNotInvokedOnHappyPath(t *testing.T) {
+	called := 0
+	obs := HandlerPanicObserver(func(string) { called++ })
+	h := Recover(obs)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	h.ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodGet, "/healthz", nil))
+
+	if called != 0 {
+		t.Fatalf("observer called %d times on happy path, want 0", called)
+	}
+}
+
+// TestRecover_ObserverReceivesRouteTemplate verifies that when Recover
+// wraps a ServeMux, the observer receives the mux route template (not the
+// raw URL) so the Prometheus label cardinality stays bounded (issue #480).
+func TestRecover_ObserverReceivesRouteTemplate(t *testing.T) {
+	var observedPath string
+	obs := HandlerPanicObserver(func(path string) { observedPath = path })
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		panic("template test")
+	})
+	h := Recover(obs)(mux)
+
+	h.ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+
+	if observedPath != "/v1/chat/completions" {
+		t.Errorf("observer path = %q, want route template %q",
+			observedPath, "/v1/chat/completions")
 	}
 }

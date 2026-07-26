@@ -187,8 +187,8 @@ func TestSecurityHeadersWiringBothPostures(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Reproduce the exact wiring main.go uses (issue #444):
 			//   Server.Handler = handlers.SecurityHeaders(tlsEnabled)(
-			//                       handlers.Recover()(rootHandler))
-			handler := handlers.SecurityHeaders(tt.tlsEnabled)(handlers.Recover()(inner))
+			//                       handlers.Recover(nil)(rootHandler))
+			handler := handlers.SecurityHeaders(tt.tlsEnabled)(handlers.Recover(nil)(inner))
 
 			srv := httptest.NewServer(handler)
 			defer srv.Close()
@@ -237,7 +237,7 @@ func TestConfigTLSEnabledGatesHSTS(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := config.Config{TLSEnabled: tc.tls}
-			h := handlers.SecurityHeaders(cfg.TLSEnabled)(handlers.Recover()(
+			h := handlers.SecurityHeaders(cfg.TLSEnabled)(handlers.Recover(nil)(
 				http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 					w.WriteHeader(http.StatusOK)
 				}),

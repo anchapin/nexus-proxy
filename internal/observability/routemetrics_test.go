@@ -992,3 +992,59 @@ func TestObservePromptInjectionHitCleanRequest(t *testing.T) {
 		t.Errorf("clean counters should have no sample lines:\n%s", out)
 	}
 }
+
+// TestRouteCountersHandlerPanics verifies the issue #480 handler-panic
+// counter family: ObserveHandlerPanic increments a per-path counter and
+// WriteTo emits nexus_handler_panics_total{path} lines.
+func TestRouteCountersHandlerPanics(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveHandlerPanic("/v1/chat/completions")
+	rc.ObserveHandlerPanic("/v1/chat/completions")
+	rc.ObserveHandlerPanic("/healthz")
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_handler_panics_total", "metric family header"},
+		{"# TYPE nexus_handler_panics_total counter", "counter type line"},
+		{`nexus_handler_panics_total{path="/v1/chat/completions"} 2`, "chat completions counted twice"},
+		{`nexus_handler_panics_total{path="/healthz"} 1`, "healthz counted once"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\n", c.desc, c.fragment)
+		}
+	}
+}
+
+// TestRouteCountersHandlerPanicNilSafe verifies ObserveHandlerPanic on a
+// nil receiver is a no-op (issue #480).
+func TestRouteCountersHandlerPanicNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveHandlerPanic("/v1/chat/completions") // must not panic
+}
+
+// TestHandlerPanicMetricInScrapeOutput verifies the full /metrics scrape
+// handler emits the handler-panic series after a forced panic (issue #480
+// acceptance criterion).
+func TestHandlerPanicMetricInScrapeOutput(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveHandlerPanic("/v1/chat/completions")
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	rec := httptest.NewRecorder()
+	rc.Handler().ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	want := `nexus_handler_panics_total{path="/v1/chat/completions"} 1`
+	if !strings.Contains(body, want) {
+		t.Errorf("/metrics output missing %q\nfull output:\n%s", want, body)
+	}
+}

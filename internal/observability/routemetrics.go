@@ -177,6 +177,11 @@ type RouteCounters struct {
 	// volume spikes without enabling full debug tracing.
 	promptInjectionHits map[string]*uint64
 
+	// Handler-path panic counter (issue #480). Bumped when the
+	// Recover middleware catches a panic in the request hot path.
+	// Labelled by mux route template to bound cardinality.
+	handlerPanics map[string]*uint64
+
 	// collector is an optional Collector whose CircuitBreakerGauges()
 	// are merged into the /metrics output when non-nil.
 	collector *Collector
@@ -205,6 +210,7 @@ func NewRouteCounters() *RouteCounters {
 		cascadeFallbacks:         make(map[string]*uint64),
 		arbiterCache:             make(map[string]*uint64),
 		slmEscalations:           make(map[string]*uint64),
+		handlerPanics:            make(map[string]*uint64),
 		ragCacheHits:             &cHits,
 		ragCacheMisses:           &cMisses,
 		promptInjectionHits:      make(map[string]*uint64),
@@ -546,6 +552,31 @@ func (rc *RouteCounters) promptInjectionSlot(mode string) *uint64 {
 	return p
 }
 
+// ObserveHandlerPanic records one handler-path panic recovery (issue #480).
+// path is the mux route template (not the raw URL) to keep label cardinality
+// bounded. Safe for concurrent use; nil receivers are a no-op so the Recover
+// middleware can invoke it unconditionally.
+func (rc *RouteCounters) ObserveHandlerPanic(path string) {
+	if rc == nil || path == "" {
+		return
+	}
+	atomic.AddUint64(rc.handlerPanicSlot(path), 1)
+}
+
+// handlerPanicSlot returns the *uint64 for the given route template, creating
+// it if absent. Same lock-then-atomic pattern as reasonSlot.
+func (rc *RouteCounters) handlerPanicSlot(path string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.handlerPanics[path]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.handlerPanics[path] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
 // reasonSlot returns the *uint64 for reason, creating it if absent.
 // Same lock-then-atomic pattern as slot: the mutex guards the map
 // mutation only, the increment happens lock-free.
@@ -835,6 +866,13 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += n
 	}
+	if n, err := writeStringKeySeries(w, "nexus_handler_panics_total",
+		"Handler-path panic recoveries by mux route template (issue #480).",
+		"path", rc.handlerPanics); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
 	return total, nil
 }
 
@@ -873,12 +911,18 @@ func writeSeries(w io.Writer, name, help string, m map[counterKey]*uint64, label
 	return total, nil
 }
 
-// writeRejectionSeries emits the nexus_requests_rejected_total
-// family. It is a String-keyed variant of writeSeries so the
-// rejection counters (keyed only by reason) do not need to reuse the
-// multi-field counterKey struct. Output is sorted by reason for
-// deterministic scrape diffs.
+// writeRejectionSeries emits a string-keyed counter family using the
+// "reason" label. It is a thin wrapper around writeStringKeySeries kept
+// for call-site readability. Output is sorted by key for deterministic
+// scrape diffs.
 func writeRejectionSeries(w io.Writer, name, help string, m map[string]*uint64) (int64, error) {
+	return writeStringKeySeries(w, name, help, "reason", m)
+}
+
+// writeStringKeySeries emits a string-keyed counter family with a single
+// label dimension whose name is given by label. Output is sorted by key
+// for deterministic scrape diffs.
+func writeStringKeySeries(w io.Writer, name, help, label string, m map[string]*uint64) (int64, error) {
 	var total int64
 	n, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", name, help, name)
 	if err != nil {
@@ -895,7 +939,7 @@ func writeRejectionSeries(w io.Writer, name, help string, m map[string]*uint64) 
 	sort.Strings(keys)
 	for _, k := range keys {
 		v := atomic.LoadUint64(m[k])
-		n, err := fmt.Fprintf(w, "%s{reason=\"%s\"} %d\n", name, sanitizeLabel(k), v)
+		n, err := fmt.Fprintf(w, "%s{%s=\"%s\"} %d\n", name, label, sanitizeLabel(k), v)
 		if err != nil {
 			return total + int64(n), err
 		}
