@@ -530,6 +530,54 @@ func TestManagerNilIsNoop(t *testing.T) {
 	}
 }
 
+func TestManagerProbeSingleShot(t *testing.T) {
+	stub := &stubProbe{}
+	stub.push(Budget{Tokens: 8192, ModelContext: 8192, Source: SourceOllamaPS}, nil)
+	m := NewManager(stub, time.Hour, time.Second)
+
+	ctx := context.Background()
+	b, err := m.Probe(ctx)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if b.Tokens != 8192 {
+		t.Errorf("tokens = %d, want 8192", b.Tokens)
+	}
+	if b.Source != SourceOllamaPS {
+		t.Errorf("source = %q, want %q", b.Source, SourceOllamaPS)
+	}
+	if stub.callCount() != 1 {
+		t.Errorf("stub called %d times, want 1", stub.callCount())
+	}
+}
+
+func TestManagerProbeReturnsError(t *testing.T) {
+	stub := &stubProbe{}
+	stub.push(Budget{}, errors.New("simulated upstream failure"))
+	m := NewManager(stub, time.Hour, time.Second)
+
+	ctx := context.Background()
+	_, err := m.Probe(ctx)
+	if err == nil {
+		t.Fatal("expected error from Probe, got nil")
+	}
+	if stub.callCount() != 1 {
+		t.Errorf("stub called %d times, want 1", stub.callCount())
+	}
+}
+
+func TestManagerProbeOnNilManager(t *testing.T) {
+	var m *Manager
+	ctx := context.Background()
+	b, err := m.Probe(ctx)
+	if err == nil {
+		t.Fatal("expected error from nil.Probe, got nil")
+	}
+	if b.Source != SourceStatic {
+		t.Errorf("source = %q, want %q", b.Source, SourceStatic)
+	}
+}
+
 func TestStaticBudgetHelper(t *testing.T) {
 	b := StaticBudget(6000)
 	if b.Tokens != 6000 || b.Source != SourceStatic {
