@@ -1112,7 +1112,7 @@ func Chat(d Deps) http.Handler {
 		// (see internal/telemetry.EstimateTokens).
 		preCompressionChars := totalMessageChars(messages)
 		trace.Transforms.TOONBytesBefore = preCompressionChars
-		toonCompressionMethod := middleware.CompressJSONBlocks(messages)
+		toonCompressionMethod := middleware.CompressJSONBlocks(messages, d.Config.TOONUnfenced)
 		if toonCompressionMethod != "" {
 			if d.Config.PromptInjectionIsolated() {
 				messages = middleware.AppendSystemNoteIsolated(messages, d.Config.TOONNotice)

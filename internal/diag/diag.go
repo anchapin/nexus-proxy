@@ -784,7 +784,7 @@ func checkMiddlewareChainFn(cfg config.Config) Check {
 	// Re-init the middleware registry with the defaults so BuildChain
 	// has the canonical set available. This mirrors what main.go does
 	// before building the chain.
-	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.PromptInjectionIsolated())
+	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.TOONUnfenced, cfg.PromptInjectionIsolated())
 	if _, err := middleware.BuildChain(cfg.MiddlewareChain); err != nil {
 		return Check{
 			Name:   checkMiddlewareChain,

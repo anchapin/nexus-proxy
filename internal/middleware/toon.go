@@ -59,14 +59,15 @@ const (
 // for {"files": [...]} object-nested arrays, "unfenced" for standalone
 // [...] arrays, or "" when no compression was applied. Schema is inferred
 // from the first object's keys (sorted lexicographically for stable column order).
+// When unfenced is false, the unfenced array pass is skipped entirely.
 //
 // Gotchas to be aware of when re-parsing TOON output downstream:
 //   - Commas inside string values are replaced with the full-width U+FF0C
 //     so they cannot collide with the column separator.
 //   - Newlines inside string values are replaced with spaces — multi-line
 //     strings round-trip lossy.
-func CompressJSONBlocks(messages []interface{}) CompressionMethod {
-	fenced, nested, unfenced := false, false, false
+func CompressJSONBlocks(messages []interface{}, unfenced bool) CompressionMethod {
+	fenced, nested, didUnfenced := false, false, false
 	for _, raw := range messages {
 		msg, ok := raw.(map[string]interface{})
 		if !ok {
@@ -124,29 +125,32 @@ func CompressJSONBlocks(messages []interface{}) CompressionMethod {
 		}
 
 		// Handle unfenced standalone JSON arrays (no code fences).
-		unfencedMatches := UnfencedArrayBlock.FindAllStringSubmatchIndex(content, -1)
-		for _, m := range unfencedMatches {
-			if len(m) < 4 {
-				continue
+		// Skip when unfenced=false (operators want fenced-only TOON).
+		if unfenced {
+			unfencedMatches := UnfencedArrayBlock.FindAllStringSubmatchIndex(content, -1)
+			for _, m := range unfencedMatches {
+				if len(m) < 4 {
+					continue
+				}
+				// m[0], m[1]: full match (leading context + array + optional trailing ws)
+				// m[2], m[3]: captured group (the array itself)
+				arrayMatch := content[m[2]:m[3]]
+				toon, err := SerializeToTOON([]byte(arrayMatch))
+				if err != nil {
+					continue
+				}
+				// Preserve leading context (newline/whitespace) by replacing only
+				// from end of leading context to end of full match with the TOON block.
+				// m[1] is the end of leading context (start of captured array).
+				leadingContext := content[m[0]:m[2]] // e.g., "\n"
+				replacement := leadingContext + toon
+				fullMatch := content[m[0]:m[1]]
+				content = strings.Replace(content, fullMatch, replacement, 1)
+				didUnfenced = true
 			}
-			// m[0], m[1]: full match (leading context + array + optional trailing ws)
-			// m[2], m[3]: captured group (the array itself)
-			arrayMatch := content[m[2]:m[3]]
-			toon, err := SerializeToTOON([]byte(arrayMatch))
-			if err != nil {
-				continue
-			}
-			// Preserve leading context (newline/whitespace) by replacing only
-			// from end of leading context to end of full match with the TOON block.
-			// m[1] is the end of leading context (start of captured array).
-			leadingContext := content[m[0]:m[2]] // e.g., "\n"
-			replacement := leadingContext + toon
-			fullMatch := content[m[0]:m[1]]
-			content = strings.Replace(content, fullMatch, replacement, 1)
-			unfenced = true
 		}
 
-		if fenced || nested || unfenced {
+		if fenced || nested || didUnfenced {
 			msg["content"] = content
 		}
 	}
@@ -156,7 +160,7 @@ func CompressJSONBlocks(messages []interface{}) CompressionMethod {
 	if nested {
 		return CompressionMethodNested
 	}
-	if unfenced {
+	if didUnfenced {
 		return CompressionMethodUnfenced
 	}
 	return CompressionMethodNone

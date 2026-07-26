@@ -140,8 +140,9 @@ type YAMLConfig struct {
 	QualityStderrCap   int    `yaml:"quality_stderr_cap"`
 
 	// Middleware
-	MetaPrompt string `yaml:"meta_prompt"`
-	TOONNotice string `yaml:"toon_notice"`
+	MetaPrompt   string `yaml:"meta_prompt"`
+	TOONNotice   string `yaml:"toon_notice"`
+	TOONUnfenced bool   `yaml:"toon_unfenced"`
 
 	// Prompt injection
 	PromptInjectionMode string `yaml:"prompt_injection_mode"`
@@ -759,6 +760,9 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_TOON_NOTICE"); v != "" {
 		cfg.TOONNotice = v
 	}
+	if v := os.Getenv("NEXUS_TOON_UNFENCED"); v != "" {
+		cfg.TOONUnfenced = parseBoolEnvStr(v, true)
+	}
 
 	// Prompt injection
 	if v := os.Getenv("NEXUS_PROMPT_INJECTION_MODE"); v != "" {
@@ -858,6 +862,7 @@ func (yc YAMLConfig) toConfig() Config {
 		ExamplesDir:          yc.stringDefault(yc.ExamplesDir, "./few_shot_examples"),
 		MetaPrompt:           yc.stringDefault(yc.MetaPrompt, defaultMetaPrompt),
 		TOONNotice:           yc.stringDefault(yc.TOONNotice, defaultTOONNotice),
+		TOONUnfenced:         yc.boolFieldDefault(yc.TOONUnfenced, true),
 		TelemetryPath:        yc.stringDefault(yc.TelemetryPath, "./nexus-telemetry.jsonl"),
 		TelemetryMaxBytes:    yc.intDefault(yc.TelemetryMaxBytes, 0),
 		TelemetryMaxFiles:    yc.intDefault(yc.TelemetryMaxFiles, 5),
