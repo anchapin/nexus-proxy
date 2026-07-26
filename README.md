@@ -247,7 +247,9 @@ above `NEXUS_RAG_THRESHOLD` (default 0.55).
 ## Docker
 
 A multi-stage `Dockerfile` ships at the repo root: stage 1 builds a static
-binary in `golang:1.21-alpine` and stage 2 copies it into
+binary in `golang:${GO_VERSION}-alpine` (Dockerfile `ARG GO_VERSION`, default
+`1.26` matching CI — override with `--build-arg GO_VERSION=1.26`) and stage 2
+copies it into
 [`gcr.io/distroless/static-debian12:nonroot`](https://github.com/GoogleContainerTools/distroless).
 The final image runs as UID 65532 with no shell and no package manager,
 uses env-only configuration, and listens on `:8000`. Final image size is
@@ -276,6 +278,12 @@ docker build -t nexus-proxy:dev .
 docker run --rm -p 8000:8000 \
   -e NEXUS_FRONTIER_API_KEY=sk-... \
   nexus-proxy:dev
+```
+
+Smoke-test the built image to confirm the binary reports the expected version:
+
+```bash
+docker run --rm nexus-proxy:dev --version
 ```
 
 ### Compose (proxy + Ollama)
