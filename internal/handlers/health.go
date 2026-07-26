@@ -345,6 +345,7 @@ type HealthStatusDeps struct {
 	Config        config.Config
 	ReadinessMode string
 	StartTime     time.Time
+	Version       string
 }
 
 // StatusHandler returns the /status handler. The handler returns a
@@ -379,6 +380,7 @@ func StatusHandler(deps HealthStatusDeps) http.HandlerFunc {
 		}
 
 		resp := statusResponse{
+			Version: deps.Version,
 			Ollama: statusOllama{
 				Healthy:      healthy,
 				FailureCount: failures,
@@ -420,6 +422,7 @@ func StatusHandler(deps HealthStatusDeps) http.HandlerFunc {
 // on fields that would be noisy when absent (e.g. dropped == 0
 // for a verifier that never overflowed its queue).
 type statusResponse struct {
+	Version       string              `json:"version"`
 	Ollama        statusOllama        `json:"ollama"`
 	Frontier      statusFrontier      `json:"frontier"`
 	VRAMProbe     statusProbe         `json:"vram_probe"`

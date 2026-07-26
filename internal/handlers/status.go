@@ -149,6 +149,9 @@ type StatusDeps struct {
 	// ArbiterCache reports the fusion arbiter synthesis cache state.
 	ArbiterCacheEnabled    func() bool
 	ArbiterCacheTTLSeconds func() int
+
+	// Version returns the build version string (issue #529).
+	Version func() string
 }
 
 // Status returns an http.Handler that serves a JSON diagnostic snapshot of
@@ -201,6 +204,7 @@ func Status(d StatusDeps) http.Handler {
 		}
 
 		resp := struct {
+			Version      string             `json:"version"`
 			Judge        JudgeStatus        `json:"judge"`
 			Quality      QualityStatus      `json:"quality"`
 			RAG          RAGStatus          `json:"rag"`
@@ -212,6 +216,7 @@ func Status(d StatusDeps) http.Handler {
 			SLMCache     SLMCacheStatus     `json:"slm_cache"`
 			ArbiterCache ArbiterCacheStatus `json:"arbiter_cache"`
 		}{
+			Version: stringOrZero(d.Version),
 			Judge: JudgeStatus{
 				Enabled:  d.JudgeEnabled != nil && d.JudgeEnabled(),
 				Depth:    intOrZero(d.JudgeDepth),

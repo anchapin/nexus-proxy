@@ -240,6 +240,7 @@ func TestStatusShape(t *testing.T) {
 		Config:        cfg,
 		ReadinessMode: ReadinessModeStrict,
 		StartTime:     start,
+		Version:       "v1.2.3-test",
 	})
 
 	rec := httptest.NewRecorder()
@@ -268,6 +269,7 @@ func TestStatusShape(t *testing.T) {
 			t.Errorf("top-level key %q is nil (want %s)", key, wantType)
 		}
 	}
+	check("version", "string")
 	check("ollama", "object")
 	check("frontier", "object")
 	check("vram_probe", "object")
@@ -279,6 +281,11 @@ func TestStatusShape(t *testing.T) {
 
 	if body["readiness_mode"] != ReadinessModeStrict {
 		t.Errorf("readiness_mode = %v, want %q", body["readiness_mode"], ReadinessModeStrict)
+	}
+
+	// Version field (issue #529).
+	if body["version"] != "v1.2.3-test" {
+		t.Errorf("version = %v, want %q", body["version"], "v1.2.3-test")
 	}
 
 	// Uptime is reported in seconds; the handler rounds toward zero

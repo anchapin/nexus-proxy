@@ -186,6 +186,11 @@ var gaugeMeta = map[string]metricMeta{
 		help: "1 when the local-route cooldown is active (a cascade failure was recorded and the window has not expired); 0 otherwise (issue #530). Absent from /metrics when the cooldown is disabled (NEXUS_LOCAL_COOLDOWN<=0).",
 		typ:  "gauge",
 	},
+	// Build info gauge (issue #529). Static metadata — value is always 1.
+	"nexus_build_info": {
+		help: "Build metadata for the running nexus-proxy binary (issue #529). Always 1.",
+		typ:  "gauge",
+	},
 }
 
 // RenderPrometheus writes the full /metrics body in Prometheus
