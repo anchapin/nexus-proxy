@@ -218,6 +218,13 @@ func newSQLiteStore(path string, retentionDays int, lg Logger) (*SQLiteStore, er
 		return nil, fmt.Errorf("metrics: migrate route-source: %w", err)
 	}
 
+	// Issue #595: ensure auto_vacuum=INCREMENTAL so that
+	// incremental_vacuum in pruneOnce actually reclaims pages.
+	// The DSN pragma handles fresh databases; this is the safety
+	// net for databases upgraded from a pre-fix build. Errors are
+	// logged as warnings and do not prevent the store from opening.
+	migrateAutoVacuum(context.Background(), db, lg)
+
 	s := &SQLiteStore{
 		db:     db,
 		logger: lg,
@@ -264,6 +271,46 @@ func migrateSchema(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// autoVacuumIncremental is the integer value SQLite stores in the
+// database header for auto_vacuum=INCREMENTAL (0=NONE, 1=FULL, 2=INCREMENTAL).
+const autoVacuumIncremental = 2
+
+// migrateAutoVacuum ensures the database is in auto_vacuum=INCREMENTAL
+// mode so that incremental_vacuum in pruneOnce actually reclaims freed
+// pages (issue #595).
+//
+// The DSN _pragma=auto_vacuum(INCREMENTAL) handles fresh databases by
+// setting the mode before any tables exist. This function is the safety
+// net for databases created by a pre-fix build (auto_vacuum=NONE): it
+// checks the current mode and, if not already INCREMENTAL, sets the
+// pragma and runs VACUUM to rebuild the file with the new mode. On
+// SQLite, setting auto_vacuum on an existing database with tables is
+// silently ignored unless followed by VACUUM.
+//
+// Errors are logged as warnings and do NOT prevent the store from
+// opening — a failed migration simply means incremental_vacuum remains
+// a no-op until the operator runs a manual VACUUM.
+func migrateAutoVacuum(ctx context.Context, db *sql.DB, lg Logger) {
+	var mode int
+	if err := db.QueryRowContext(ctx, "PRAGMA auto_vacuum").Scan(&mode); err != nil {
+		lg("WARN: metrics: check auto_vacuum mode: %v", err)
+		return
+	}
+	if mode == autoVacuumIncremental {
+		return
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA auto_vacuum=INCREMENTAL"); err != nil {
+		lg("WARN: metrics: set auto_vacuum=INCREMENTAL: %v", err)
+		return
+	}
+	if _, err := db.ExecContext(ctx, "VACUUM"); err != nil {
+		lg("WARN: metrics: VACUUM for auto_vacuum migration: %v"+
+			" (incremental_vacuum will remain a no-op until manual VACUUM)", err)
+		return
+	}
+	lg("metrics: migrated auto_vacuum to INCREMENTAL (was mode=%d)", mode)
+}
+
 // buildDSN maps a plain path or ":memory:" into the URI form modernc
 // expects. The _pragma pair flips the connection to WAL and sets a
 // short busy timeout — both are recommended for hot-path append-only
@@ -283,8 +330,13 @@ func buildDSN(path string) string {
 	//                                    best-effort metrics log.
 	// _pragma=foreign_keys(ON)         — future-proof for relational
 	//                                    extensions.
+	// _pragma=auto_vacuum(INCREMENTAL) — set before any tables exist
+	//                                    on a fresh database so
+	//                                    incremental_vacuum in
+	//                                    pruneOnce actually reclaims
+	//                                    pages (issue #595).
 	return fmt.Sprintf(
-		"file:%s?mode=rwc&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)",
+		"file:%s?mode=rwc&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=auto_vacuum(INCREMENTAL)",
 		path,
 	)
 }
@@ -401,8 +453,8 @@ const pruneTimeout = 30 * time.Second
 
 // pruneVacuumThreshold is the minimum DELETE row count that triggers an
 // incremental_vacuum pass for best-effort space reclamation. Below this
-// the overhead outweighs the benefit. incremental_vacuum is a no-op on
-// databases created without auto_vacuum=INCREMENTAL (the default).
+// the overhead outweighs the benefit. Requires auto_vacuum=INCREMENTAL,
+// which is set at database creation time via the DSN pragma (issue #595).
 const pruneVacuumThreshold = 1000
 
 // pruneSQL deletes every row whose timestamp is strictly older than
@@ -458,8 +510,8 @@ func (s *SQLiteStore) pruneOnce(retentionDays int) {
 	s.pruneLastRows.Store(n)
 	s.pruneLastTimestamp.Store(time.Now().Unix())
 
-	// Best-effort space reclamation. No-op on databases created
-	// without auto_vacuum=INCREMENTAL (the modernc default).
+	// Best-effort space reclamation. Effective on databases created
+	// with auto_vacuum=INCREMENTAL (the default since issue #595).
 	if n >= pruneVacuumThreshold {
 		if _, err := s.db.ExecContext(ctx, "PRAGMA incremental_vacuum(100)"); err != nil {
 			s.logger("WARN: incremental_vacuum after prune: %v", err)
