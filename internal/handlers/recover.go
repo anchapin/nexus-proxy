@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"runtime/debug"
+	"strings"
 )
 
 // HandlerPanicObserver is the hook handlers.Recover invokes when it
@@ -47,14 +49,26 @@ func Recover(obs HandlerPanicObserver) func(http.Handler) http.Handler {
 				}
 				reqID := requestID(r)
 				route := routePattern(r)
-				slog.Error("panic recovered",
-					slog.String("component", "recovery"),
-					slog.Any("panic", rv),
-					slog.String("request_id", reqID),
-					slog.String("method", r.Method),
-					slog.String("path", r.URL.Path),
-					slog.String("stack", string(debug.Stack())),
-				)
+				redacted, wasRedacted := redactPanicValue(rv)
+				if wasRedacted {
+					slog.Warn("panic contained secrets — redacted before logging",
+						slog.String("component", "recovery"),
+						slog.String("panic", redacted),
+						slog.String("request_id", reqID),
+						slog.String("method", r.Method),
+						slog.String("path", r.URL.Path),
+						slog.String("stack", string(debug.Stack())),
+					)
+				} else {
+					slog.Error("panic recovered",
+						slog.String("component", "recovery"),
+						slog.String("panic", redacted),
+						slog.String("request_id", reqID),
+						slog.String("method", r.Method),
+						slog.String("path", r.URL.Path),
+						slog.String("stack", string(debug.Stack())),
+					)
+				}
 				if obs != nil {
 					obs(route)
 				}
@@ -90,6 +104,73 @@ func Recover(obs HandlerPanicObserver) func(http.Handler) http.Handler {
 			next.ServeHTTP(rw, r)
 		})
 	}
+}
+
+var (
+	bearerTokenRe   = regexp.MustCompile(`(?i)(Bearer\s+)[a-zA-Z0-9\-_.~+/]+`)
+	apiKeyRe        = regexp.MustCompile(`(?i)(api[_-]?key|apikey|api[_-]?secret|api[_-]?token|secret[_-]?key|auth[_-]?token|access[_-]?token)\s*[:=]\s*["']?[a-zA-Z0-9\-_.~+/]+["']?`)
+	awsKeyRe        = regexp.MustCompile(`(?i)(aws[_-]?access[_-]?key[_-]?id|aws[_-]?secret[_-]?access[_-]?key)\s*[:=]\s*["']?[A-Z0-9]{20}["']?`)
+	awsSecretRe     = regexp.MustCompile(`(?i)(aws[_-]?secret)\s*[:=]\s*["']?[a-zA-Z0-9/+=]{40}["']?`)
+	passwordURLRe   = regexp.MustCompile(`(?i)://[^:]+:[^@]+@`)
+	genericSecretRe = regexp.MustCompile(`(?i)(password|passwd|pwd|token|credential|private[_-]?key)\s*[:=]\s*["']?[^\s"']+["']?`)
+)
+
+func redactPanicValue(rv any) (string, bool) {
+	var raw string
+	switch v := rv.(type) {
+	case string:
+		raw = v
+	case error:
+		raw = v.Error()
+	default:
+		raw = fmt.Sprintf("%v", v)
+	}
+
+	redacted := raw
+	redacted = bearerTokenRe.ReplaceAllString(redacted, "${1}****")
+	redacted = apiKeyRe.ReplaceAllStringFunc(redacted, func(s string) string {
+		i := strings.Index(s, ":")
+		if i < 0 {
+			i = strings.Index(s, "=")
+		}
+		if i < 0 {
+			return "****"
+		}
+		return s[:i+1] + "****"
+	})
+	redacted = awsKeyRe.ReplaceAllStringFunc(redacted, func(s string) string {
+		i := strings.Index(s, ":")
+		if i < 0 {
+			i = strings.Index(s, "=")
+		}
+		if i < 0 {
+			return "****"
+		}
+		return s[:i+1] + "****"
+	})
+	redacted = awsSecretRe.ReplaceAllStringFunc(redacted, func(s string) string {
+		i := strings.Index(s, ":")
+		if i < 0 {
+			i = strings.Index(s, "=")
+		}
+		if i < 0 {
+			return "****"
+		}
+		return s[:i+1] + "****"
+	})
+	redacted = passwordURLRe.ReplaceAllString(redacted, "://****:****@")
+	redacted = genericSecretRe.ReplaceAllStringFunc(redacted, func(s string) string {
+		i := strings.Index(s, ":")
+		if i < 0 {
+			i = strings.Index(s, "=")
+		}
+		if i < 0 {
+			return "****"
+		}
+		return s[:i+1] + "****"
+	})
+
+	return redacted, redacted != raw
 }
 
 // panicRecorder wraps the underlying http.ResponseWriter to track whether

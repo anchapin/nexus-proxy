@@ -22,6 +22,7 @@ paths = [
 description = "False positive files for generic-api-key rule"
 paths = [
   "internal/handlers/chat.go",
+  "internal/handlers/recover_test.go",
   "internal/config/file_integration_test.go",
   "internal/config/file_test.go",
 ]

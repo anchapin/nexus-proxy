@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -195,5 +196,131 @@ func TestRecover_ObserverReceivesRouteTemplate(t *testing.T) {
 	if observedPath != "/v1/chat/completions" {
 		t.Errorf("observer path = %q, want route template %q",
 			observedPath, "/v1/chat/completions")
+	}
+}
+
+func TestRedactPanicValue(t *testing.T) {
+	tests := []struct {
+		name       string
+		panics     any
+		wantRedact bool
+	}{
+		{
+			name:       "string without secrets",
+			panics:     "something went wrong",
+			wantRedact: false,
+		},
+		{
+			name:       "integer",
+			panics:     42,
+			wantRedact: false,
+		},
+		{
+			name:       "Bearer token",
+			panics:     "failed to parse Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+			wantRedact: true,
+		},
+		{
+			name:       "api_key pattern",
+			panics:     "api_key=sk-12345abcdef",
+			wantRedact: true,
+		},
+		{
+			name:       "password pattern",
+			panics:     "password=supersecret",
+			wantRedact: true,
+		},
+		{
+			name:       "AWS access key",
+			panics:     "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+			wantRedact: true,
+		},
+		{
+			name:       "generic secret key pattern",
+			panics:     "secret_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+			wantRedact: true,
+		},
+		{
+			name:       "URL with password",
+			panics:     "https://user:password123@example.com/api",
+			wantRedact: true,
+		},
+		{
+			name:       "auth token pattern",
+			panics:     "auth_token=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+			wantRedact: true,
+		},
+		{
+			name:       "error type with secret",
+			panics:     testError{msg: "token=abc123secret"},
+			wantRedact: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			redacted, wasRedacted := redactPanicValue(tt.panics)
+			if wasRedacted != tt.wantRedact {
+				t.Errorf("redactPanicValue(%v) wasRedacted=%v, want %v", tt.panics, wasRedacted, tt.wantRedact)
+			}
+			if wasRedacted {
+				if redacted == fmt.Sprintf("%v", tt.panics) {
+					t.Errorf("redactPanicValue(%v) did not redact, got same value back", tt.panics)
+				}
+				if strings.Contains(redacted, "abc123") || strings.Contains(redacted, "eyJ") || strings.Contains(redacted, "supersecret") {
+					t.Errorf("redactPanicValue(%v) = %q, still contains secret", tt.panics, redacted)
+				}
+			}
+		})
+	}
+}
+
+type testError struct {
+	msg string
+}
+
+func (e testError) Error() string {
+	return e.msg
+}
+
+func TestRecover_LogsRedactedPanicWithWarning(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	h := Recover(nil)(http.HandlerFunc(panicHandler(t, false, "Bearer sk-12345abcdef")))
+
+	h.ServeHTTP(httptest.NewRecorder(), r)
+
+	logged := buf.String()
+	if !strings.Contains(logged, "level=WARN") {
+		t.Errorf("log missing level=WARN, got:\n%s", logged)
+	}
+	if !strings.Contains(logged, "redacted before logging") {
+		t.Errorf("log missing redaction notice, got:\n%s", logged)
+	}
+	if strings.Contains(logged, "sk-12345") {
+		t.Errorf("log contains unreduced secret:\n%s", logged)
+	}
+}
+
+func TestRecover_LogsNonRedactedPanicWithError(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	h := Recover(nil)(http.HandlerFunc(panicHandler(t, false, "something went wrong")))
+
+	h.ServeHTTP(httptest.NewRecorder(), r)
+
+	logged := buf.String()
+	if !strings.Contains(logged, "level=ERROR") {
+		t.Errorf("log missing level=ERROR for non-secret panic, got:\n%s", logged)
+	}
+	if !strings.Contains(logged, "panic recovered") {
+		t.Errorf("log missing panic recovered message, got:\n%s", logged)
 	}
 }
