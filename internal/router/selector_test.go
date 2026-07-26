@@ -3,6 +3,8 @@ package router
 import (
 	"context"
 	"errors"
+	"runtime"
+	"sync"
 	"testing"
 	"time"
 )
@@ -486,4 +488,257 @@ func TestProviderStatsCache_Defaults(t *testing.T) {
 	if cache.refresh != DefaultSelectorRefreshInterval {
 		t.Errorf("refresh = %v, want %v", cache.refresh, DefaultSelectorRefreshInterval)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// ProviderStatsCache.Run lifecycle coverage (issue #590)
+//
+// Run drives Refresh on a fixed cadence from a background goroutine. The
+// tests below exercise every branch: the nil-source early return, the
+// synchronous prime before the ticker loop, periodic ticker refresh, and
+// clean termination on context cancellation. They also guard against
+// goroutine leaks using runtime.NumGoroutine.
+// ---------------------------------------------------------------------------
+
+// countingSource is a thread-safe ProviderStatsSource for Run lifecycle
+// tests. Run calls ProviderStats from a background goroutine while the
+// test goroutine reads the call counter, so all access must be
+// synchronized (the existing stubProviderSource is not safe for this).
+type countingSource struct {
+	mu    sync.Mutex
+	calls int
+	stats []ProviderStats
+	err   error
+	delay time.Duration // optional: blocks each call for this duration
+}
+
+func (s *countingSource) ProviderStats(_ context.Context, _ time.Time) ([]ProviderStats, error) {
+	s.mu.Lock()
+	s.calls++
+	stats := s.stats
+	err := s.err
+	delay := s.delay
+	s.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return stats, nil
+}
+
+func (s *countingSource) Calls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// runWaitFor polls cond until it returns true or d elapses, failing the
+// test on timeout so deadlocks surface immediately.
+func runWaitFor(t *testing.T, cond func() bool, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("condition not met within %v", d)
+}
+
+// TestProviderStatsCache_Run_PrimesSynchronouslyBeforeTicker verifies
+// that the immediate synchronous Refresh fires before Run enters the
+// ticker loop. With a 1h refresh interval no ticker event can fire
+// during the test, so any call observed is the synchronous prime.
+func TestProviderStatsCache_Run_PrimesSynchronouslyBeforeTicker(t *testing.T) {
+	src := &countingSource{stats: []ProviderStats{
+		{Name: "frontier", SampleCount: 10, P50LatencyMs: 800, AvgCostUSD: 0.005},
+	}}
+	cache := NewProviderStatsCache(NewProviderSelector(), src, time.Hour, time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		cache.Run(ctx)
+		close(done)
+	}()
+
+	runWaitFor(t, func() bool { return src.Calls() >= 1 }, 2*time.Second)
+
+	if got := src.Calls(); got != 1 {
+		t.Fatalf("source calls = %d, want exactly 1 (synchronous prime; ticker interval is 1h)", got)
+	}
+	// The snapshot must already reflect the primed data before the
+	// first ticker event could ever fire.
+	if snap := cache.Snapshot(); len(snap) != 1 || snap[0].Name != "frontier" {
+		t.Errorf("Snapshot after prime = %+v, want single 'frontier' entry", snap)
+	}
+
+	cancel()
+	<-done
+}
+
+// TestProviderStatsCache_Run_TerminatesWithinTwoSecondsOfCancel
+// verifies that Run returns promptly after context cancellation.
+func TestProviderStatsCache_Run_TerminatesWithinTwoSecondsOfCancel(t *testing.T) {
+	src := &countingSource{stats: []ProviderStats{
+		{Name: "x", SampleCount: 10, P50LatencyMs: 500, AvgCostUSD: 0.001},
+	}}
+	cache := NewProviderStatsCache(NewProviderSelector(), src, time.Hour, 50*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		cache.Run(ctx)
+		close(done)
+	}()
+
+	// Wait for the goroutine to start and reach the select loop.
+	runWaitFor(t, func() bool { return src.Calls() >= 1 }, 2*time.Second)
+
+	cancel()
+
+	select {
+	case <-done:
+		// goroutine terminated promptly after cancellation
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return within 2s of context cancellation")
+	}
+}
+
+// TestProviderStatsCache_Run_NoGoroutineLeak verifies that Run exits
+// cleanly on cancellation using a runtime.NumGoroutine delta. Each
+// iteration starts Run, lets it prime and tick, cancels, and waits for
+// the goroutine to return. A leak (e.g. a ticker or blocking Refresh
+// that never observes cancellation) accumulates across iterations.
+func TestProviderStatsCache_Run_NoGoroutineLeak(t *testing.T) {
+	const iterations = 5
+
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	for i := 0; i < iterations; i++ {
+		src := &countingSource{stats: []ProviderStats{
+			{Name: "x", SampleCount: 10, P50LatencyMs: 500, AvgCostUSD: 0.001},
+		}}
+		cache := NewProviderStatsCache(NewProviderSelector(), src, time.Hour, 20*time.Millisecond)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			cache.Run(ctx)
+			close(done)
+		}()
+
+		// Wait for the prime plus at least one ticker so the
+		// goroutine is well inside the select loop before cancel.
+		runWaitFor(t, func() bool { return src.Calls() >= 2 }, 2*time.Second)
+
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d: Run did not return within 2s of cancel", i)
+		}
+	}
+
+	// Allow the runtime to reap exited goroutines.
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+	runtime.GC()
+
+	after := runtime.NumGoroutine()
+	// A leak of `iterations` goroutines would push `after` well
+	// above before+1. The +1 margin absorbs runtime background
+	// variance without masking a real leak.
+	if delta := after - before; delta > 1 {
+		t.Errorf("goroutine leak: before=%d after=%d (delta=%d, iterations=%d)", before, after, delta, iterations)
+	}
+}
+
+// TestProviderStatsCache_Run_PeriodicRefreshViaTicker verifies that the
+// background ticker drives Refresh after the synchronous prime. With a
+// short interval the call count climbs past the initial prime.
+func TestProviderStatsCache_Run_PeriodicRefreshViaTicker(t *testing.T) {
+	src := &countingSource{stats: []ProviderStats{
+		{Name: "x", SampleCount: 10, P50LatencyMs: 500, AvgCostUSD: 0.001},
+	}}
+	cache := NewProviderStatsCache(NewProviderSelector(), src, time.Hour, 20*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		cache.Run(ctx)
+		close(done)
+	}()
+
+	// Wait for the synchronous prime plus at least two ticker
+	// refreshes. With a 20ms interval this completes well under 1s.
+	runWaitFor(t, func() bool { return src.Calls() >= 3 }, 2*time.Second)
+
+	if got := src.Calls(); got < 3 {
+		t.Errorf("source calls = %d, want >= 3 (prime + at least 2 ticker refreshes)", got)
+	}
+
+	cancel()
+	<-done
+}
+
+// TestProviderStatsCache_Run_NilSourceReturnsImmediately verifies that
+// Run returns without blocking when no source is wired (the cache is
+// disabled).
+func TestProviderStatsCache_Run_NilSourceReturnsImmediately(t *testing.T) {
+	cache := NewProviderStatsCache(NewProviderSelector(), nil, time.Hour, 50*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		cache.Run(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Run returned immediately without needing cancellation.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run with nil source did not return within 2s (should return immediately)")
+	}
+}
+
+// TestProviderStatsCache_Run_RefreshErrorKeepsLoopAlive verifies that a
+// source that returns errors does not stall or crash the refresh loop;
+// subsequent ticker events continue to call Refresh.
+func TestProviderStatsCache_Run_RefreshErrorKeepsLoopAlive(t *testing.T) {
+	src := &countingSource{err: errors.New("db down")}
+	cache := NewProviderStatsCache(NewProviderSelector(), src, time.Hour, 20*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		cache.Run(ctx)
+		close(done)
+	}()
+
+	// The loop must keep ticking despite every Refresh erroring.
+	runWaitFor(t, func() bool { return src.Calls() >= 3 }, 2*time.Second)
+
+	if got := src.Calls(); got < 3 {
+		t.Errorf("source calls = %d, want >= 3 (loop must continue past Refresh errors)", got)
+	}
+	if cache.LastError() == nil {
+		t.Error("LastError nil after erroring Refresh inside Run")
+	}
+
+	cancel()
+	<-done
 }
