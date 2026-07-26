@@ -44,10 +44,11 @@ type State struct {
 // valid but always returns Exhausted=false from Check (no limit enforcement)
 // until a positive Limit is configured.
 type Guard struct {
-	mu      sync.Mutex
-	limit   float64
-	window  []Entry // sorted by At, oldest first
-	alerter Alerter
+	mu              sync.Mutex
+	limit           float64
+	window          []Entry // sorted by At, oldest first
+	alerter         Alerter
+	approachingSent bool // tracks whether the 80% alert has fired; protected by g.mu
 }
 
 // Alerter is invoked by Guard when spend events occur (issue #201).
@@ -72,10 +73,6 @@ func (g *Guard) SetAlerter(a Alerter) {
 	g.alerter = a
 	g.mu.Unlock()
 }
-
-// approachingSent tracks whether we've already sent an "approaching" alert
-// since the last reset. It is protected by g.mu.
-var alreadySent = false
 
 // NewGuard returns a Guard with the configured daily limit in USD.
 // A zero or negative limit disables enforcement (Check always returns false).
@@ -154,15 +151,15 @@ func (g *Guard) CheckApproaching(ctx context.Context) bool {
 	}
 	spent := g.currentSpentLocked()
 	threshold := g.limit * 0.8
-	if spent >= threshold && !alreadySent {
-		alreadySent = true
+	if spent >= threshold && !g.approachingSent {
+		g.approachingSent = true
 		if g.alerter != nil {
 			g.alerter.OnApproaching(ctx, g.copyStateLocked())
 		}
 		return true
 	}
 	if spent < threshold {
-		alreadySent = false
+		g.approachingSent = false
 	}
 	return false
 }
@@ -190,7 +187,7 @@ func (g *Guard) Limit() float64 {
 func (g *Guard) SetLimit(limitUSD float64) {
 	g.mu.Lock()
 	g.limit = limitLimit(limitUSD)
-	alreadySent = false
+	g.approachingSent = false
 	g.mu.Unlock()
 }
 
