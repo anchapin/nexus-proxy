@@ -254,3 +254,134 @@ func TestConfigTLSEnabledGatesHSTS(t *testing.T) {
 		})
 	}
 }
+
+// TestPublicPathExempt (issue #538) is the regression guard for the
+// auth-bypass predicate wired into the inbound auth middleware
+// (cmd/nexus/main.go:1179 → auth.NewMiddleware). publicPathExempt is the
+// single function an attacker would target to silently disable
+// authentication on protected surfaces — this test pins its four branches
+// (always-exempt paths, status-public-on, status-public-off, fallthrough)
+// and documents the real path-normalization behavior so a refactor that
+// flips a case or drops cfg.StatusPublic cannot ship unnoticed.
+//
+// Security posture documented here (and asserted below): the predicate is
+// deliberately conservative — it returns false for anything that is not an
+// EXACT match for an exempt path. Trailing slashes, case variants, double
+// slashes, and traversal sequences (/healthz/../etc) all fall through to
+// the default branch and therefore REQUIRE auth. There is no path
+// normalisation, so there is no traversal bypass surface.
+func TestPublicPathExempt(t *testing.T) {
+	// alwaysExempt are hard-coded bypass paths (issue #109). They must be
+	// exempt regardless of StatusPublic so K8s probes and Prometheus
+	// scrapers work without credentials — dropping one would lock out
+	// liveness probes.
+	alwaysExempt := []string{"/healthz", "/metrics", "/readyz"}
+
+	tests := []struct {
+		name         string
+		statusPublic bool
+		method       string
+		path         string // raw request target (path[?query])
+		want         bool
+	}{
+		// --- Branch 1: always-exempt paths, StatusPublic=false (default) ---
+		{"healthz exempt default", false, http.MethodGet, "/healthz", true},
+		{"metrics exempt default", false, http.MethodGet, "/metrics", true},
+		{"readyz exempt default", false, http.MethodGet, "/readyz", true},
+		// --- Branch 1b: always-exempt paths also exempt when StatusPublic=true ---
+		{"healthz exempt status-public", true, http.MethodGet, "/healthz", true},
+		{"metrics exempt status-public", true, http.MethodGet, "/metrics", true},
+		{"readyz exempt status-public", true, http.MethodGet, "/readyz", true},
+
+		// --- Branch 2: /status exempt ONLY when StatusPublic=true ---
+		{"status exempt when public", true, http.MethodGet, "/status", true},
+		// --- Branch 3: /status NOT exempt when StatusPublic=false (security-critical default) ---
+		// A regression here re-exposes the diagnostics surface (frontier
+		// config, judge state, VRAM) without auth — the exact bug #109 fixed.
+		{"status gated by default", false, http.MethodGet, "/status", false},
+
+		// --- Branch 4: fallthrough — protected paths never exempt ---
+		{"chat completions protected", false, http.MethodPost, "/v1/chat/completions", false},
+		{"chat completions protected status-public", true, http.MethodPost, "/v1/chat/completions", false},
+		{"root protected", false, http.MethodGet, "/", false},
+		{"unknown path protected", false, http.MethodGet, "/admin/users", false},
+		{"near-miss statusz protected", false, http.MethodGet, "/statusz", false},
+		{"empty-ish path protected", false, http.MethodGet, "/status/", false},
+
+		// --- Path-normalisation edges (all REQUIRE auth — safe direction) ---
+		// Query strings are stripped from URL.Path, so /healthz?x=1 → /healthz
+		// remains exempt. This is the ONLY normalisation that occurs and it is
+		// harmless (query params don't change the protectedness of a path).
+		{"healthz with query exempt", false, http.MethodGet, "/healthz?probe=ready", true},
+		{"status with query gated", false, http.MethodGet, "/status?detail=1", false},
+		// Trailing slash is NOT exempt — exact-match only.
+		{"healthz trailing slash gated", false, http.MethodGet, "/healthz/", false},
+		{"metrics trailing slash gated", false, http.MethodGet, "/metrics/", false},
+		// Case sensitivity: /HEALTHZ does not match.
+		{"uppercase healthz gated", false, http.MethodGet, "/HEALTHZ", false},
+		{"mixed case status gated", true, http.MethodGet, "/Status", false},
+		// Double slashes are NOT exempt.
+		{"double-leading slash gated", false, http.MethodGet, "//healthz", false},
+		{"double-trailing slash gated", false, http.MethodGet, "/healthz//", false},
+		// Path traversal: url.Parse does NOT clean the path, so
+		// /healthz/../v1/chat/completions stays as-is, misses the exact match,
+		// and falls through to default (false) → requires auth. Safe.
+		{"traversal to healthz gated", false, http.MethodGet, "/healthz/../etc", false},
+		{"traversal from protected gated", false, http.MethodGet, "/v1/chat/completions/../healthz", false},
+		// Encoded slash (%2f) is decoded into URL.Path by the server, but the
+		// decoded form is not an exact exempt match either way.
+		{"encoded slash healthz gated", false, http.MethodGet, "/healthz%2f", false},
+
+		// --- Method insensitivity ---
+		// The predicate reads only r.URL.Path; method is never consulted. A
+		// POST to /healthz is therefore exempt too. This is acceptable: the
+		// healthz handler only answers GET, and exempt == "skip bearer check",
+		// not "grant access to data". Assert the method-agnostic behaviour so
+		// a future change is intentional.
+		{"healthz POST exempt", false, http.MethodPost, "/healthz", true},
+		{"healthz PUT exempt", false, http.MethodPut, "/healthz", true},
+		{"healthz DELETE exempt", false, http.MethodDelete, "/healthz", true},
+		{"status POST gated by default", false, http.MethodPost, "/status", false},
+		{"status POST exempt when public", true, http.MethodPost, "/status", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Config{StatusPublic: tt.statusPublic}
+			exempt := publicPathExempt(cfg)
+
+			req := httptest.NewRequest(tt.method, tt.path, nil)
+			got := exempt(req)
+			if got != tt.want {
+				t.Errorf("publicPathExempt(StatusPublic=%v)(%s %q) = %v, want %v",
+					tt.statusPublic, tt.method, tt.path, got, tt.want)
+			}
+		})
+	}
+
+	// Sanity: exhaustively assert every always-exempt path is exempt under
+	// BOTH StatusPublic postures, so a dropped case entry cannot slip past.
+	for _, public := range []bool{false, true} {
+		for _, p := range alwaysExempt {
+			if !publicPathExempt(config.Config{StatusPublic: public})(httptest.NewRequest(http.MethodGet, p, nil)) {
+				t.Errorf("always-exempt path %q must bypass auth under StatusPublic=%v", p, public)
+			}
+		}
+	}
+
+	// cfg is captured by value: the decision is fixed at construction time,
+	// so mutating the original struct after building the predicate must NOT
+	// flip /status from gated to exempt. (This guards against an accidental
+	// pointer-capture refactor.)
+	cfg := config.Config{StatusPublic: false}
+	exempt := publicPathExempt(cfg)
+	cfg.StatusPublic = true // mutate the caller's copy
+	if exempt(httptest.NewRequest(http.MethodGet, "/status", nil)) {
+		t.Error("mutating caller cfg after predicate construction affected /status; cfg must be captured by value")
+	}
+	// And the converse: a freshly-built predicate with StatusPublic=true
+	// immediately exempts /status.
+	if !publicPathExempt(config.Config{StatusPublic: true})(httptest.NewRequest(http.MethodGet, "/status", nil)) {
+		t.Error("predicate built with StatusPublic=true must exempt /status")
+	}
+}
