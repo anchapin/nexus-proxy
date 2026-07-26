@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -51,6 +52,10 @@ const (
 // workflow. The default "dev" lets `nexus --version` work from a
 // local `make build` without any special setup.
 var version = "dev"
+
+// commit is the git commit SHA. Overridden at compile time via
+// -ldflags "-X main.commit=$(git rev-parse HEAD)". Default "unknown".
+var commit = "unknown"
 
 // circuitBreakerAdapter bridges the chat handler's CircuitBreakerObserver
 // calls into the observability Collector (issue #304).
@@ -718,6 +723,18 @@ func main() {
 				Value: v,
 			}}
 		}),
+		// Build info gauge (issue #529). Static metadata — always 1.
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			return []observability.GaugeSample{{
+				Name: "nexus_build_info",
+				Labels: map[string]string{
+					"version":    version,
+					"commit":     commit,
+					"go_version": runtime.Version(),
+				},
+				Value: 1,
+			}}
+		}),
 	)
 
 	// Middleware chain (issue #224). Initialize the middleware registry
@@ -1167,6 +1184,7 @@ func main() {
 			}
 			return arbiterCache.TTLSeconds()
 		},
+		Version: func() string { return version },
 	}))
 	slog.Info("status endpoint serves async subsystem diagnostics")
 

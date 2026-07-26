@@ -31,8 +31,9 @@ snake_case naming.
 | `nexus_cascade_fallback_total` | counter | `reason` | 5 (`timeout`, `transport_error`, `http_error`, `malformed_toolcall`, `malformed_response`) | `routemetrics.go` |
 | `nexus_rag_retrieval_total` | counter | `hit`, `reason` (miss only) | 1 + 3 = 4 | `routemetrics.go` |
 | `nexus_judge_dropped_total` | counter | *(none)* | 1 | `routemetrics.go` |
+| `nexus_build_info` | gauge | `version`, `commit`, `go_version` | 1 | `prometheus.go` (issue #529) |
 
-**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 1 + 1 + 4 + 5 + 4 + 1 = 140 series.
+**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 1 + 1 + 4 + 5 + 4 + 1 + 1 = 141 series.
 
 > **Note (issue #486):** `nexus_rag_retrieval_total` previously carried
 > a `filename` label whose value was the raw RAG source filename, which
@@ -416,6 +417,7 @@ health) **plus** a `judge` sub-object (always present):
 
 ```json
 {
+  "version": "v1.2.3",
   "frontier": { ... },
   "judge": {
     "enabled": true,
@@ -428,9 +430,8 @@ health) **plus** a `judge` sub-object (always present):
 }
 ```
 
+Top-level fields:
+
 | Field | Type | Description |
 |-------|------|-------------|
-| `enabled` | bool | Whether the judge evaluator is active (`NEXUS_JUDGE_SAMPLE_RATE > 0`) |
-| `queue_depth` | int | Buffered channel capacity (`NEXUS_JUDGE_QUEUE`) |
-| `dropped` | uint64 | Cumulative samples rejected because the queue was full |
-| `concurrency` | int | Number of worker goroutines (`NEXUS_JUDGE_CONCURRENCY`)
+| `version` | string | Build version string injected via `-ldflags "-X main.version=..."` at compile time (issue #529); `"dev"` when built without ldflags. |

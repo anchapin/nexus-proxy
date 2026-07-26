@@ -689,3 +689,41 @@ func TestRenderPrometheusLocalCooldownGaugeAbsentWhenDisabled(t *testing.T) {
 		t.Errorf("nexus_local_cooldown_active should not appear when cooldown is nil\n--- output ---\n%s", out)
 	}
 }
+
+// TestBuildInfoGauge (issue #529) verifies the nexus_build_info gauge
+// renders with the correct HELP/TYPE headers, labels (version, commit,
+// go_version), and a constant value of 1.
+func TestBuildInfoGauge(t *testing.T) {
+	c := NewCollector()
+	provider := GaugeProviderFunc(func() []GaugeSample {
+		return []GaugeSample{{
+			Name: "nexus_build_info",
+			Labels: map[string]string{
+				"version":    "v1.2.3",
+				"commit":     "abc1234",
+				"go_version": "go1.22.0",
+			},
+			Value: 1,
+		}}
+	})
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c, provider)
+	out := sb.String()
+
+	checks := []string{
+		"# HELP nexus_build_info Build metadata for the running nexus-proxy binary (issue #529). Always 1.",
+		"# TYPE nexus_build_info gauge",
+		`nexus_build_info{commit="abc1234",go_version="go1.22.0",version="v1.2.3"} 1`,
+	}
+	for _, want := range checks {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+
+	// Value must be exactly 1 (Prometheus build-info convention).
+	if !strings.Contains(out, `nexus_build_info{`) || !strings.Contains(out, " 1") {
+		t.Errorf("build_info value should be 1\ngot:\n%s", out)
+	}
+}
