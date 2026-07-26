@@ -561,6 +561,33 @@ func TestExporterQueueDepth(t *testing.T) {
 	}
 }
 
+func TestExporterNilRespNetworkError(t *testing.T) {
+	// Issue #565: network-level errors (DNS failure, connection refused)
+	// cause e.client.Do(req) to return (nil, err). The deferred
+	// resp.Body.Close() must not panic when resp is nil.
+	e := NewExporter(ExporterConfig{Endpoint: "http://127.0.0.1:1"})
+	e.client.Transport = &errorTransport{err: context.DeadlineExceeded}
+	defer e.Close()
+
+	_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "op")
+	s.End()
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if e.FlushFailures() == 0 {
+		t.Error("FlushFailures() = 0, want > 0 after network error")
+	}
+}
+
+type errorTransport struct {
+	err error
+}
+
+func (t *errorTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, t.err
+}
+
 func TestExporterNilQueueDepthAndDropped(t *testing.T) {
 	var e *Exporter
 	if e.QueueDepth() != 0 {
