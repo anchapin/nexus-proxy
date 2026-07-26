@@ -304,7 +304,9 @@ func (e *Exporter) flush(batch []*Span) error {
 	if err != nil {
 		return fmt.Errorf("tracing: do: %w", err)
 	}
-	defer resp.Body.Close()
+	if resp != nil {
+		defer resp.Body.Close()
+	}
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("tracing: collector status %d", resp.StatusCode)
 	}
