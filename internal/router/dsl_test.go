@@ -15,10 +15,11 @@ func TestGuardrail(t *testing.T) {
 		wantHit   bool
 	}{
 		{"small prompt", "hello world", 6000, "", false},
-		// tiktoken BPE compresses repeated 'a's: 48000 'a' chars = 6000 tokens.
-		{"exactly at limit", strings.Repeat("a", 48000), 6000, "", false},
-		// 49000 'a' chars = 6125 tokens > 6000 budget.
-		{"over limit", strings.Repeat("a", 49000), 6000, RouteFrontier, true},
+		// Inputs > maxAccurateEncodeLen (8192) use the len(s)/4 heuristic:
+		// 24000 chars / 4 = 6000 tokens — exactly at the limit, NOT over it.
+		{"exactly at limit", strings.Repeat("a", 24000), 6000, "", false},
+		// 24004 chars / 4 = 6001 tokens > 6000 budget — just over the limit.
+		{"over limit", strings.Repeat("a", 24004), 6000, RouteFrontier, true},
 		{"zero maxTokens means no guardrail", "anything", 0, "", false},
 		{"negative maxTokens means no guardrail", "anything", -1, "", false},
 	}
