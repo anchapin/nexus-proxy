@@ -257,6 +257,71 @@ func TestCascadeFallsBackOnTransportError(t *testing.T) {
 	}
 }
 
+// TestCascadeFallbackReasonHTTPError verifies issue #534: HTTP 5xx/408/429
+// responses from the upstream are labeled "http_error", not "transport_error".
+// transport_error is reserved for real transport-layer failures (DNS, connection
+// refused, etc.).
+func TestCascadeFallbackReasonHTTPError(t *testing.T) {
+	cases := []struct {
+		statusCode int
+		name       string
+	}{
+		{503, "503 Service Unavailable"},
+		{504, "504 Gateway Timeout"},
+		{429, "429 Too Many Requests"},
+		{408, "408 Request Timeout"},
+		{500, "500 Internal Server Error"},
+		{502, "502 Bad Gateway"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ft := newFakeTransport()
+			ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.statusCode)
+				_, _ = io.WriteString(w, "upstream error")
+			})
+			ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(200)
+				_, _ = io.WriteString(w, chatBody200)
+			})
+			res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if res.ServedBy != "frontier" {
+				t.Errorf("ServedBy=%q, want frontier", res.ServedBy)
+			}
+			if res.FallbackReason != "http_error" {
+				t.Errorf("FallbackReason=%q, want http_error for status %d", res.FallbackReason, tc.statusCode)
+			}
+		})
+	}
+}
+
+// TestCascadeFallbackReasonTransportError verifies issue #534: a true
+// transport error (no handler registered = connection refused at client.Do)
+// is still labeled "transport_error", distinct from "http_error".
+func TestCascadeFallbackReasonTransportError(t *testing.T) {
+	ft := newFakeTransport()
+	// nil handler = client.Do gets a connection-refused-style error
+	ft.handlers["http://primary.local/v1/chat/completions"] = nil
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.ServedBy != "frontier" {
+		t.Errorf("ServedBy=%q, want frontier", res.ServedBy)
+	}
+	if res.FallbackReason != "transport_error" {
+		t.Errorf("FallbackReason=%q, want transport_error for true transport error", res.FallbackReason)
+	}
+}
+
 func TestCascadeFallsBackOnTimeout(t *testing.T) {
 	// Primary hangs; cascade timeout short-circuits it.
 	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
