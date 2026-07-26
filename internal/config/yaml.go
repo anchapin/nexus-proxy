@@ -106,9 +106,10 @@ type YAMLConfig struct {
 	HealthProbeTimeout     string `yaml:"health_probe_timeout"`
 
 	// Probe
-	ProbeInterval      string `yaml:"probe_interval"`
-	ProbeTimeout       string `yaml:"probe_timeout"`
-	ProbeBytesPerToken int    `yaml:"probe_bytes_per_token"`
+	ProbeInterval         string `yaml:"probe_interval"`
+	ProbeTimeout          string `yaml:"probe_timeout"`
+	ProbeBytesPerToken    int    `yaml:"probe_bytes_per_token"`
+	ProbeThermalThreshold int    `yaml:"probe_thermal_threshold"`
 
 	// Local concurrency
 	LocalMaxConcurrent    int    `yaml:"local_max_concurrent"`
@@ -606,6 +607,16 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.ProbeBytesPerToken = n
 	}
+	if v := os.Getenv("NEXUS_PROBE_THERMAL_THRESHOLD"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_PROBE_THERMAL_THRESHOLD: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.ProbeThermalThreshold = n
+	}
 
 	// Local concurrency
 	if v := os.Getenv("NEXUS_LOCAL_MAX_CONCURRENT"); v != "" {
@@ -906,9 +917,10 @@ func (yc YAMLConfig) toConfig() Config {
 		HealthBreakerThreshold: yc.intDefault(yc.HealthBreakerThreshold, 3),
 		HealthProbeTimeout:     yc.durationDefault(yc.HealthProbeTimeout, 5*time.Second),
 
-		ProbePollInterval:  yc.durationDefault(yc.ProbeInterval, 60*time.Second),
-		ProbeTimeout:       yc.durationDefault(yc.ProbeTimeout, 5*time.Second),
-		ProbeBytesPerToken: yc.intDefault(yc.ProbeBytesPerToken, 256*1024),
+		ProbePollInterval:     yc.durationDefault(yc.ProbeInterval, 60*time.Second),
+		ProbeTimeout:          yc.durationDefault(yc.ProbeTimeout, 5*time.Second),
+		ProbeBytesPerToken:    yc.intDefault(yc.ProbeBytesPerToken, 256*1024),
+		ProbeThermalThreshold: yc.intDefault(yc.ProbeThermalThreshold, 90),
 
 		LocalMaxConcurrent:    yc.intDefault(yc.LocalMaxConcurrent, 0),
 		LocalVRAMBytesPerSlot: yc.int64Default(yc.LocalVRAMBytesPerSlot, DefaultLocalVRAMBytesPerSlot),

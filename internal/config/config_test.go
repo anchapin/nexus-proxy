@@ -38,6 +38,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ProbeBytesPerToken != 256*1024 {
 		t.Errorf("ProbeBytesPerToken = %d, want 262144", cfg.ProbeBytesPerToken)
 	}
+	if cfg.ProbeThermalThreshold != 90 {
+		t.Errorf("ProbeThermalThreshold = %d, want 90", cfg.ProbeThermalThreshold)
+	}
 	if !cfg.ProbeEnabled {
 		t.Error("ProbeEnabled = false, want true with default interval")
 	}
@@ -135,6 +138,7 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("NEXUS_PROBE_INTERVAL", "120s")
 	t.Setenv("NEXUS_PROBE_TIMEOUT", "2s")
 	t.Setenv("NEXUS_PROBE_BYTES_PER_TOKEN", "131072")
+	t.Setenv("NEXUS_PROBE_THERMAL_THRESHOLD", "75")
 	t.Setenv("NEXUS_PROVIDER_TAIL_WEIGHT", "0.25")
 
 	cfg, err := Load()
@@ -176,6 +180,9 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if cfg.ProbeBytesPerToken != 131072 {
 		t.Errorf("ProbeBytesPerToken = %d, want 131072", cfg.ProbeBytesPerToken)
+	}
+	if cfg.ProbeThermalThreshold != 75 {
+		t.Errorf("ProbeThermalThreshold = %d, want 75", cfg.ProbeThermalThreshold)
 	}
 	if cfg.ProviderTailWeight != 0.25 {
 		t.Errorf("ProviderTailWeight = %v, want 0.25", cfg.ProviderTailWeight)
@@ -370,6 +377,7 @@ func TestLoadProbeInvalidValues(t *testing.T) {
 		{"bad interval", "NEXUS_PROBE_INTERVAL", "forever"},
 		{"bad timeout", "NEXUS_PROBE_TIMEOUT", "ten seconds"},
 		{"bad bytes per token", "NEXUS_PROBE_BYTES_PER_TOKEN", "lots"},
+		{"bad thermal threshold", "NEXUS_PROBE_THERMAL_THRESHOLD", "hot"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

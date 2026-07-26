@@ -251,6 +251,10 @@ type Config struct {
 	ProbePollInterval  time.Duration // background re-probe cadence (60s); 0 disables polling
 	ProbeTimeout       time.Duration // per-probe HTTP timeout (5s)
 	ProbeBytesPerToken int           // VRAM->token heuristic (256 KiB per token)
+	// ProbeThermalThreshold is the GPU junction temperature (°C) above
+	// which the probe treats free VRAM as 0 and forces the static
+	// guardrail (issue #597). 0 disables the thermal check.
+	ProbeThermalThreshold int // GPU temp (°C) threshold; default 90, 0 disables
 
 	// Local-route concurrency ceiling (issue #81). The limiter bounds
 	// in-flight local-route requests so a small GPU does not OOM under
@@ -1036,6 +1040,21 @@ func Load() (Config, error) {
 	}
 	cfg.ProbeBytesPerToken = probeBytes
 	cfg.ProbeEnabled = cfg.ProbePollInterval > 0
+
+	// Thermal throttle threshold (issue #597). When the GPU junction
+	// temperature read from AMD hwmon temp1_input exceeds this value,
+	// the probe collapses the VRAM budget to zero so the router falls
+	// back to the static guardrail instead of routing heavy prompts to
+	// a thermally-clamped GPU. Default 90 °C (typical AMD Radeon
+	// throttle ceiling); 0 disables the check.
+	probeThermal, err := getEnvInt("NEXUS_PROBE_THERMAL_THRESHOLD", 90)
+	if err != nil {
+		return cfg, err
+	}
+	if probeThermal < 0 {
+		probeThermal = 0
+	}
+	cfg.ProbeThermalThreshold = probeThermal
 
 	// Local-route concurrency ceiling (issue #81). The limiter is
 	// dormant unless the operator sets NEXUS_LOCAL_MAX_CONCURRENT

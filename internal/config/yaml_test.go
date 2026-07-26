@@ -49,6 +49,9 @@ func TestLoadYAMLDefaults(t *testing.T) {
 	if !cfg.ProbeEnabled {
 		t.Error("ProbeEnabled = false, want true")
 	}
+	if cfg.ProbeThermalThreshold != 90 {
+		t.Errorf("ProbeThermalThreshold = %d, want 90", cfg.ProbeThermalThreshold)
+	}
 	if cfg.LocalCooldown != 10*time.Second {
 		t.Errorf("LocalCooldown = %v, want 10s", cfg.LocalCooldown)
 	}
@@ -77,6 +80,7 @@ rag_threshold: 0.75
 probe_interval: "90s"
 probe_timeout: "3s"
 probe_bytes_per_token: 131072
+probe_thermal_threshold: 75
 local_max_concurrent: 4
 local_vram_bytes_per_slot: 1073741824
 local_cooldown: "20s"
@@ -149,6 +153,9 @@ trusted_proxies: "10.0.0.0/8"
 	}
 	if cfg.ProbeBytesPerToken != 131072 {
 		t.Errorf("ProbeBytesPerToken = %d", cfg.ProbeBytesPerToken)
+	}
+	if cfg.ProbeThermalThreshold != 75 {
+		t.Errorf("ProbeThermalThreshold = %d, want 75", cfg.ProbeThermalThreshold)
 	}
 	if cfg.LocalMaxConcurrent != 4 {
 		t.Errorf("LocalMaxConcurrent = %d", cfg.LocalMaxConcurrent)

@@ -207,6 +207,12 @@ func main() {
 	// back to the static value when it produces no budget.
 	probeImpl := probe.NewOllamaProbe(cfg.OllamaURL, httpClient)
 	probeImpl.BytesPerToken = cfg.ProbeBytesPerToken
+	// Thermal throttle threshold (issue #597): when the GPU junction
+	// temperature exceeds this value the probe collapses the budget so
+	// the router falls back to the static guardrail instead of routing
+	// heavy prompts to a thermally-clamped GPU. A zero config value
+	// disables the check inside the probe.
+	probeImpl.ThermalThreshold = cfg.ProbeThermalThreshold
 	// Restrict the VRAM probe's context signal to the configured chat
 	// model so a resident embedding model (e.g. nomic-embed-text, 8192
 	// context) cannot shrink the chat-route guardrail below the chat
