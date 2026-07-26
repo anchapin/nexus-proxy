@@ -104,6 +104,14 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total metrics records dropped because the SQLite write buffer was full.",
 		typ:  "counter",
 	},
+	"nexus_metrics_prune_last_rows": {
+		help: "Rows removed by the most recent metrics retention prune pass (issue #483).",
+		typ:  "gauge",
+	},
+	"nexus_metrics_prune_last_timestamp_seconds": {
+		help: "Unix timestamp of the most recent metrics retention prune pass (issue #483).",
+		typ:  "gauge",
+	},
 	"nexus_telemetry_dropped_total": {
 		help: "Total telemetry records dropped because the JSONL write buffer was full.",
 		typ:  "counter",

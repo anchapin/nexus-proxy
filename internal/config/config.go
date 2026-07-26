@@ -377,6 +377,14 @@ type Config struct {
 	TelemetryMaxFiles int
 	MetricsDBPath     string
 
+	// MetricsRetentionDays is the TTL for the metrics requests table
+	// (issue #483). When > 0, a background goroutine DELETEs rows whose
+	// timestamp is older than this many days, waking roughly once per
+	// hour. 0 (default) disables retention entirely — the table grows
+	// without bound, matching pre-#483 behaviour. Not hot-reloadable:
+	// the prune goroutine lifecycle is bound to the store's lifetime.
+	MetricsRetentionDays int
+
 	// Structured logging (issue #3). LogLevel maps NEXUS_LOG_LEVEL
 	// ("debug" | "info" | "warn" | "error") to a slog.Level. LogFormat
 	// maps NEXUS_LOG_FORMAT ("json" | "text") to a slog.Handler; json
@@ -637,6 +645,15 @@ func Load() (Config, error) {
 	}
 	cfg.TelemetryMaxFiles = telemetryMaxFiles
 	cfg.MetricsDBPath = getFileString("metrics_db", "NEXUS_METRICS_DB", DefaultMetricsDBPath())
+
+	retentionDays, err := getEnvInt("NEXUS_METRICS_RETENTION_DAYS", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if retentionDays < 0 {
+		retentionDays = 0
+	}
+	cfg.MetricsRetentionDays = retentionDays
 
 	threshold, err := getEnvFloat("NEXUS_RAG_THRESHOLD", 0.55)
 	if err != nil {
@@ -1733,6 +1750,11 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 	}
 	if v := os.Getenv("NEXUS_METRICS_DB"); v != "" && v != prev.MetricsDBPath {
 		result.NeedsRestart = append(result.NeedsRestart, "NEXUS_METRICS_DB")
+	}
+	if v := os.Getenv("NEXUS_METRICS_RETENTION_DAYS"); v != "" {
+		if n, perr := strconv.Atoi(v); perr == nil && n != prev.MetricsRetentionDays {
+			result.NeedsRestart = append(result.NeedsRestart, "NEXUS_METRICS_RETENTION_DAYS")
+		}
 	}
 
 	// Hot-reloadable settings.

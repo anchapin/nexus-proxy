@@ -633,6 +633,16 @@ func main() {
 			}}
 		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			ms, ok := metricsStore.(*metrics.SQLiteStore)
+			if !ok || cfg.MetricsRetentionDays <= 0 {
+				return nil
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_metrics_prune_last_rows", Value: float64(ms.PruneLastRows())},
+				{Name: "nexus_metrics_prune_last_timestamp_seconds", Value: float64(ms.PruneLastTimestamp())},
+			}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
 			var v uint64
 			if d, ok := recorder.(interface{ Dropped() uint64 }); ok {
 				v = d.Dropped()
@@ -1427,13 +1437,16 @@ func buildMetrics(cfg config.Config) (metrics.Store, handlers.MetricsObserver) {
 		slog.Info("metrics disabled (NEXUS_METRICS_DB is empty)")
 		return nil, nil
 	}
-	store, err := metrics.Open(cfg.MetricsDBPath)
+	store, err := metrics.OpenWithRetention(cfg.MetricsDBPath, cfg.MetricsRetentionDays, nil)
 	if err != nil {
 		slog.Error("metrics open failed, metrics disabled", slog.Any("err", err))
 		return nil, nil
 	}
 	if ss, ok := store.(*metrics.SQLiteStore); ok {
-		slog.Info("metrics recording", slog.String("path", ss.Path()))
+		slog.Info("metrics recording",
+			slog.String("path", ss.Path()),
+			slog.Int("retention_days", cfg.MetricsRetentionDays),
+		)
 	}
 	obs := handlers.MetricsObserverFunc(func(e handlers.MetricsEvent) {
 		// The adapter does its own error handling — RecordRequest
