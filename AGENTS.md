@@ -25,7 +25,7 @@ make ci             # vet + build + test + test-race + lint + bench-short
 runs three separate jobs — `test` (`go vet ./...` → `go build ./cmd/nexus`
 → `go test -race -coverprofile=coverage.txt -covermode=atomic ./...` then
 the coverage gate), `bench` (non-blocking `make bench-short`, smoke only),
-and `lint` (`golangci-lint-action@v7`). It does **not** invoke `make ci`;
+and `lint` (`golangci-lint-action@v9`). It does **not** invoke `make ci`;
 that target is a local convenience wrapper that runs the same steps plus
 bench-short on one machine.
 
@@ -43,9 +43,15 @@ this to verify Ollama reachability, model availability, frontier key
 validity, VRAM probe budget, and RAG directory state before routing
 any traffic (issue #32). The README Quickstart intentionally puts this
 *before* `Build and run` — guarded by `cmd/nexus/doc_test.go` (issue #455).
+`nexus check [--json]` exits **0 when every check passes** (warn/skip are
+fine) and **1 when at least one fails** — scriptable in CI/pre-deploy;
+`--json` emits a machine-readable result array.
 
-**Runtime dependency only:** `modernc.org/sqlite` (metrics store).
-Everything else is stdlib.
+**Runtime deps are pure-Go / CGO-free** (no DB server, no CGO toolchain
+needed for `go build` or `docker build`): `modernc.org/sqlite` (metrics
++ RAG persistence), `fsnotify` (RAG watcher), `tiktoken-go` (tokenizer),
+`golang.org/x/sync`, `gopkg.in/yaml.v3` (config file). Everything else
+is stdlib.
 
 ## Package layout
 
@@ -266,6 +272,10 @@ Config env vars are split across two files. New vars need **both**:
    field, snake_case) + an env-overrides-yaml branch in `LoadYAML()` so
    file-based config users get the same knob.
 
+   Config file is searched at `$XDG_CONFIG_HOME/nexus-proxy/config.yaml`
+   (or `~/.config/nexus-proxy/...`), else `./config.yaml`. Env vars
+   always override file values.
+
 No central registry — but `internal/config/env_example_audit_test.go`
 enforces the `.env.example` ↔ parser contract in **both directions**
 (issue #478):
@@ -281,9 +291,11 @@ a var, delete or update its `.env.example` line in the same change. The
 eight skip prefixes (`NEXUS_PROVIDER_`, `NEXUS_FRONTIER_`, `NEXUS_ZAI_`,
 `NEXUS_HTTP_`, etc.) exempt dynamic-construction vars symmetrically.
 
-For hot-reloadable knobs (rate limit, log level, log format, debug) add
-the field to `ReloadHotReloadable()` in `config.go` — knobs not in that
-list require a server restart.
+For hot-reloadable knobs add the field to `ReloadHotReloadable()` in
+`config.go`. Sending **SIGHUP** to a running nexus process re-reads
+exactly these vars (issue #306) without a restart: log level, log
+format, debug, rate-limit RPM, rate-limit burst. Any other var requires
+a full process restart.
 
 ## Branch conventions
 
