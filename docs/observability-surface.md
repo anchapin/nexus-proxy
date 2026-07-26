@@ -23,6 +23,8 @@ snake_case naming.
 | `nexus_slm_cache_hits_total` | counter | `kind` | 2 (`exact`, `semantic`) | `routemetrics.go` |
 | `nexus_slm_cache_misses_total` | counter | *(none)* | 1 | `routemetrics.go` |
 | `nexus_slm_cache_evictions_total` | counter | `reason` | 2 (`ttl`, `lru`) | `routemetrics.go` |
+| `nexus_slm_cache_entries` | gauge | *(none)* | 1 | `prometheus.go` (issue #531) |
+| `nexus_slm_cache_max_entries` | gauge | *(none)* | 1 | `prometheus.go` (issue #531) |
 | `nexus_requests_rejected_total` | counter | `reason` | 4 | `routemetrics.go` |
 | `nexus_cascade_fallback_total` | counter | `reason` | 5 (`timeout`, `transport_error`, `http_error`, `malformed_toolcall`, `malformed_response`) | `routemetrics.go` |
 | `nexus_rag_retrieval_total` | counter | `hit`, `reason` (miss only) | 1 + 3 = 4 | `routemetrics.go` |
@@ -168,6 +170,7 @@ extended in #497, #534):
 | `kind` (SLM cache hits) | Yes | 2 | `exact`, `semantic` |
 | `hit` (RAG retrieval) | Yes | 2 | `true`, `false` (issue #186, #486) |
 | `reason` (RAG retrieval miss) | Yes | 3 | `empty_store`, `threshold`, `embed_error` — closed set emitted only when `hit="false"` |
+| SLM cache gauges (issue #531) | N/A | 2 | `nexus_slm_cache_entries` and `nexus_slm_cache_max_entries` are unlabelled gauges (cardinality 1 each); no label cardinality concerns. |
 
 **No unbounded cardinality labels exist.** All label values are
 short, pre-defined strings with no user-controlled input. The
@@ -320,6 +323,29 @@ Both gauges are unlabelled (cardinality 1 each) and are wired as
 concrete `*concurrencylimit.Limiter` instance. When the limiter is
 disabled the provider returns `nil` so neither series appears in a
 fresh scrape.
+
+## SLM cache fill ratio (issue #531)
+
+The SLM decision cache (`internal/router/slm_cache.go`, issue #206)
+holds prompt → route mappings for the configured TTL window to reduce
+SLM call frequency for duplicate prompts. Without a live entry count,
+operators cannot see cache pressure building until LRU evictions appear.
+Two gauges (issue #531) let operators chart the fill ratio
+`nexus_slm_cache_entries / nexus_slm_cache_max_entries` and raise
+`NEXUS_SLM_CACHE_MAX_ENTRIES` before LRU churn degrades cache
+effectiveness:
+
+| Metric | Type | Backing source | Meaning |
+|--------|------|----------------|---------|
+| `nexus_slm_cache_entries` | gauge | `SLMCache.Len()` | Current number of entries in the cache (including expired entries not yet evicted). |
+| `nexus_slm_cache_max_entries` | gauge | `SLMCache.MaxEntries()` | Configured maximum entry capacity. |
+
+Both gauges are unlabelled (cardinality 1 each) and are wired as
+`GaugeProvider` closures in `cmd/nexus/main.go`, reading from the
+concrete `*router.SLMCache` instance. When the cache is disabled
+(`NEXUS_SLM_CACHE_TTL=0`) the provider returns `nil` so neither
+series appears in a fresh scrape. Operators can compute the fill ratio
+directly in PromQL: `nexus_slm_cache_entries / nexus_slm_cache_max_entries`.
 
 ## Observer wiring
 
