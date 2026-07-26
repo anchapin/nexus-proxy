@@ -73,8 +73,10 @@ type ConfidenceStore interface {
 	// RecordOutcome persists one judged outcome. route is the route that
 	// produced the scored output (only RouteLocal outcomes influence
 	// LocalConfidence). judgeScore is the 1..5 judge rating; scores
-	// outside that range are ignored.
-	RecordOutcome(category string, route Route, judgeScore int)
+	// outside that range are ignored. An empty category returns an error
+	// so upstream callers that fail to categorize a prompt are surfaced
+	// rather than silently polluting the "other" bucket (issue #591).
+	RecordOutcome(category string, route Route, judgeScore int) error
 
 	// LocalConfidence returns the fraction of recent local outcomes for
 	// category that scored acceptably (0.0..1.0). It returns

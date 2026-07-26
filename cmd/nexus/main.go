@@ -1402,7 +1402,12 @@ func (b *confidenceBridge) Record(s judge.JudgeScore) error {
 	delete(b.cats, s.RequestID)
 	b.mu.Unlock()
 	if ok && s.Err == nil && s.Score >= 1 {
-		b.conf.RecordOutcome(cat, router.RouteLocal, s.Score)
+		if err := b.conf.RecordOutcome(cat, router.RouteLocal, s.Score); err != nil {
+			slog.Warn("confidence: record outcome rejected",
+				slog.String("request_id", s.RequestID),
+				slog.Any("err", err),
+			)
+		}
 	}
 	return b.inner.Record(s)
 }

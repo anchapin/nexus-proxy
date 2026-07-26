@@ -160,3 +160,23 @@ func TestOpenConfidenceStoreRejectsEmptyPath(t *testing.T) {
 		t.Fatal("expected error for empty path")
 	}
 }
+
+// TestConfidenceRecordOutcomeRejectsEmptyCategory verifies that an empty
+// category is surfaced as an error rather than silently coerced to
+// CategoryOther (issue #591). This makes upstream RecordOutcome bugs
+// visible instead of polluting the "other" bucket.
+func TestConfidenceRecordOutcomeRejectsEmptyCategory(t *testing.T) {
+	cs := newTestConfidenceStore(t, 5, time.Hour)
+	if err := cs.RecordOutcome("", RouteLocal, 3); err == nil {
+		t.Fatal("RecordOutcome with empty category: expected non-nil error, got nil")
+	}
+}
+
+// TestConfidenceRecordAtRejectsEmptyCategory covers the test-helper
+// recordAt path with the same guard.
+func TestConfidenceRecordAtRejectsEmptyCategory(t *testing.T) {
+	cs := newTestConfidenceStore(t, 5, time.Hour)
+	if err := cs.recordAt("", RouteLocal, 3, time.Now().UTC()); err == nil {
+		t.Fatal("recordAt with empty category: expected non-nil error, got nil")
+	}
+}
