@@ -1,6 +1,9 @@
 package router
 
 import (
+	"bytes"
+	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"testing"
@@ -130,5 +133,129 @@ func TestToUnicodeLower(t *testing.T) {
 		if got := toUnicodeLower(in); got != want {
 			t.Errorf("toUnicodeLower(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestCompileDefaultPattern verifies that an invalid default DSL pattern
+// surfaces as a descriptive error rather than a panic (issue #588). The
+// boot guard (mustCompileDefaultPattern) calls log.Fatalf on this error;
+// here we exercise the testable core directly.
+func TestCompileDefaultPattern(t *testing.T) {
+	t.Run("valid pattern compiles", func(t *testing.T) {
+		re, err := compileDefaultPattern("formatting", `(?i)\b(css|format)\b`)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if re == nil {
+			t.Fatal("expected non-nil regexp")
+		}
+		if !re.MatchString("fix the css") {
+			t.Error("compiled regexp should match")
+		}
+	})
+
+	invalidCases := []struct {
+		name string
+		// group is the DSL pattern group name passed to compileDefaultPattern.
+		group string
+	}{
+		{"formatting", "formatting"},
+		{"fusion", "fusion"},
+		{"local", "local"},
+		{"unicode", "unicode"},
+	}
+	for _, tc := range invalidCases {
+		t.Run("invalid "+tc.name+" pattern returns error without panic", func(t *testing.T) {
+			re, err := compileDefaultPattern(tc.group, "[invalid")
+			if err == nil {
+				t.Fatal("expected error for invalid pattern, got nil")
+			}
+			if re != nil {
+				t.Errorf("expected nil regexp on error, got %v", re)
+			}
+			msg := err.Error()
+			// Error message must identify the specific pattern group.
+			if !strings.Contains(msg, tc.group) {
+				t.Errorf("error %q should identify pattern group %q", msg, tc.group)
+			}
+			// Error message must echo the offending expression so the
+			// operator can locate the bad pattern.
+			if !strings.Contains(msg, "[invalid") {
+				t.Errorf("error %q should contain the invalid expression", msg)
+			}
+		})
+	}
+}
+
+// TestDefaultPatternsCompiled verifies the package-level defaults are
+// populated and functional after the move off regexp.MustCompile (issue #588).
+// This is a regression guard: if a default silently failed to compile the
+// slice would be empty and these assertions would catch it.
+func TestDefaultPatternsCompiled(t *testing.T) {
+	checks := []struct {
+		name string
+		re   []*regexp.Regexp
+	}{
+		{"DefaultFormattingPatterns", DefaultFormattingPatterns},
+		{"DefaultFusionPatterns", DefaultFusionPatterns},
+		{"DefaultLocalPatterns", DefaultLocalPatterns},
+		{"DefaultUnicodePatterns", DefaultUnicodePatterns},
+	}
+	for _, c := range checks {
+		if len(c.re) == 0 {
+			t.Errorf("%s is empty; package init failed", c.name)
+		}
+		for i, re := range c.re {
+			if re == nil {
+				t.Errorf("%s[%d] is nil; package init failed", c.name, i)
+			}
+		}
+	}
+}
+
+// TestMustCompileDefaultPatternFatal verifies the boot guard's runtime
+// behaviour (issue #588): an invalid default pattern causes the process to
+// exit non-zero with a descriptive logged message, NOT a panic. The test
+// re-invokes its own binary with DSL_FATAL_PATTERN_GROUP set; the child
+// triggers mustCompileDefaultPattern on an invalid expression.
+func TestMustCompileDefaultPatternFatal(t *testing.T) {
+	group := os.Getenv("DSL_FATAL_PATTERN_GROUP")
+	if group != "" {
+		// Child process: trigger the boot guard. log.Fatalf will os.Exit(1).
+		_ = mustCompileDefaultPattern(group, "[invalid")
+		return
+	}
+
+	groups := []string{"formatting", "fusion", "local", "unicode"}
+	for _, g := range groups {
+		t.Run("fatal "+g, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=TestMustCompileDefaultPatternFatal")
+			cmd.Env = append(os.Environ(), "DSL_FATAL_PATTERN_GROUP="+g)
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			err := cmd.Run()
+
+			// Must exit non-zero (log.Fatalf → os.Exit(1)).
+			if err == nil {
+				t.Fatal("expected non-zero exit from log.Fatalf, got nil")
+			}
+			exitErr, ok := err.(*exec.ExitError)
+			if !ok {
+				t.Fatalf("expected *exec.ExitError, got %T: %v", err, err)
+			}
+			if exitErr.Success() {
+				t.Fatalf("expected non-zero exit code, got %v", exitErr)
+			}
+
+			msg := stderr.String()
+			// The fatal log line must identify the offending pattern group.
+			if !strings.Contains(msg, g) {
+				t.Errorf("stderr %q should mention pattern group %q", msg, g)
+			}
+			// It must echo the offending expression.
+			if !strings.Contains(msg, "[invalid") {
+				t.Errorf("stderr %q should contain the invalid expression", msg)
+			}
+		})
 	}
 }
