@@ -783,3 +783,52 @@ func TestEvaluatorDroppedNilSafe(t *testing.T) {
 		t.Errorf("nil Dropped = %d, want 0", got)
 	}
 }
+
+// TestSamplerEntropyAcrossEvaluators verifies that evaluators constructed
+// in a tight loop do not collapse to identical RNG streams (issue #589).
+// We build 1000 evaluators back-to-back — the scenario where the old
+// time.Now().UnixNano() seed would collide — and confirm the first
+// Sample() from each yields a non-trivial mix of hits and misses.
+func TestSamplerEntropyAcrossEvaluators(t *testing.T) {
+	const (
+		n    = 1000
+		rate = 0.5 // 50% so variance is easy to observe
+	)
+	hits := 0
+	for i := 0; i < n; i++ {
+		e := NewEvaluator(Config{SampleRate: rate}, nil, nil)
+		if e.Sample() {
+			hits++
+		}
+		_ = e.Close()
+	}
+	// If every evaluator collapsed to the same seed at rate=0.5, the
+	// first Float64() draw would be identical across all of them,
+	// producing either 0 or n hits. With a crypto-seeded source, both
+	// outcomes have probability ~2 * 0.5^1000 → effectively zero.
+	if hits == 0 {
+		t.Fatal("all 1000 first-Sample() calls missed — RNG stream collapsed (seed entropy failure, issue #589)")
+	}
+	if hits == n {
+		t.Fatal("all 1000 first-Sample() calls hit — RNG stream collapsed (seed entropy failure, issue #589)")
+	}
+	// Loose sanity bound: at 50% over 1000 trials the count should sit
+	// comfortably in the middle, not pinned to either edge.
+	if hits < 50 || hits > n-50 {
+		t.Errorf("hit count = %d/%d, unexpectedly skewed — seed may be weak", hits, n)
+	}
+}
+
+// TestNewSeededRandDistinct confirms that two back-to-back calls to
+// newSeededRand produce sources whose first draws differ — the direct
+// regression guard for the issue #589 root cause.
+func TestNewSeededRandDistinct(t *testing.T) {
+	const tries = 100
+	for i := 0; i < tries; i++ {
+		r1 := newSeededRand()
+		r2 := newSeededRand()
+		if r1.Float64() == r2.Float64() {
+			t.Fatalf("identical first draw on iteration %d — seeds collided (issue #589)", i)
+		}
+	}
+}
