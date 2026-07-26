@@ -541,7 +541,7 @@ func Panel(
 					results <- PanelResult{Source: "local", Err: fmt.Errorf("panic: %v", r)}
 				}
 			}()
-			ctx, cancel := context.WithTimeout(ctx, withDefault(perFetchTimeout))
+			ctx, cancel := context.WithTimeout(ctx, perFetchTimeout)
 			defer cancel()
 			msg, err := FetchPanel(ctx, client,
 				localBaseURL+"/v1/chat/completions", "", localModel, body)
@@ -555,7 +555,7 @@ func Panel(
 				results <- PanelResult{Source: "frontier", Err: fmt.Errorf("panic: %v", r)}
 			}
 		}()
-		ctx, cancel := context.WithTimeout(ctx, withDefault(perFetchTimeout))
+		ctx, cancel := context.WithTimeout(ctx, perFetchTimeout)
 		defer cancel()
 		msg, err := FetchPanel(ctx, client,
 			frontierURL, frontierKey, frontierModel, body)
@@ -577,7 +577,7 @@ func Panel(
 	// above already enforce perFetchTimeout via FetchPanel's context,
 	// so we leave them alone and only the arbiter stream picks up the
 	// new arbiterTimeout knob.
-	arbiterCtx, cancelArbiter := context.WithTimeout(ctx, withDefaultArbiterTimeout(arbiterTimeout))
+	arbiterCtx, cancelArbiter := context.WithTimeout(ctx, arbiterTimeout)
 	defer cancelArbiter()
 	// Honor the harness's stream flag (issue #10). Panel members
 	// already force stream=false on the wire (FetchPanel needs the
@@ -659,30 +659,6 @@ func Panel(
 	return false, writeCachedArbiterJSON(w, synthesis, arbiterModel)
 }
 
-// arbiterDefaultTimeout is the per-call arbiter timeout used when
-// Panel's arbiterTimeout argument is <= 0. Mirrors the issue default
-// ("configurable, default 60s"). Configured via ConfigureTimeouts.
-var arbiterDefaultTimeout = 60 * time.Second
-
-// perFetchDefaultTimeout is the per-fetch timeout used when Panel's
-// perFetchTimeout argument is <= 0. Configured via ConfigureTimeouts.
-var perFetchDefaultTimeout = 120 * time.Second
-
-// ConfigureTimeouts sets the upstream package-level timeout defaults from
-// config values. Called once at startup from cmd/nexus/main.go after
-// loading config. Issue #385.
-func ConfigureTimeouts(arbiterTimeout, perFetchTimeout time.Duration) {
-	arbiterDefaultTimeout = arbiterTimeout
-	perFetchDefaultTimeout = perFetchTimeout
-}
-
-func withDefaultArbiterTimeout(d time.Duration) time.Duration {
-	if d <= 0 {
-		return arbiterDefaultTimeout
-	}
-	return d
-}
-
 // SynthesisPrompt formats the arbiter prompt. Exported so the handler and
 // any future CLI dashboard can render the same template.
 func SynthesisPrompt(userPrompt string, local, frontier PanelResult) string {
@@ -702,13 +678,6 @@ func formatCandidate(r PanelResult) string {
 		return fmt.Sprintf("[%s failed: %v]", r.Source, r.Err)
 	}
 	return r.Content
-}
-
-func withDefault(d time.Duration) time.Duration {
-	if d <= 0 {
-		return perFetchDefaultTimeout
-	}
-	return d
 }
 
 // PanelOutcome describes the runtime path PanelStreaming took. The chat
@@ -845,7 +814,7 @@ func PanelStreaming(
 					results <- PanelResult{Source: "local", Err: fmt.Errorf("panic: %v", r)}
 				}
 			}()
-			ctxLocal, cancel := context.WithTimeout(gCtx, withDefault(perFetchTimeout))
+			ctxLocal, cancel := context.WithTimeout(gCtx, perFetchTimeout)
 			cancelLocal = cancel
 			defer cancel()
 			msg, err := FetchPanel(ctxLocal, client,
@@ -861,7 +830,7 @@ func PanelStreaming(
 				results <- PanelResult{Source: "frontier", Err: fmt.Errorf("panic: %v", r)}
 			}
 		}()
-		ctxFrontier, cancel := context.WithTimeout(gCtx, withDefault(perFetchTimeout))
+		ctxFrontier, cancel := context.WithTimeout(gCtx, perFetchTimeout)
 		cancelFrontier = cancel
 		defer cancel()
 		msg, err := FetchPanel(ctxFrontier, client,
@@ -1064,7 +1033,7 @@ func PanelStreaming(
 	// the in-flight arbiter synthesis instead of stranding it on its
 	// own timeout. The panel fetches already derive from gCtx (which
 	// descends from ctx); this was an isolated inconsistency.
-	arbiterCtx, cancelArbiter := context.WithTimeout(ctx, withDefaultArbiterTimeout(arbiterTimeout))
+	arbiterCtx, cancelArbiter := context.WithTimeout(ctx, arbiterTimeout)
 	defer cancelArbiter()
 
 	// Use StreamWithContext for SSE passthrough. This preserves the original
