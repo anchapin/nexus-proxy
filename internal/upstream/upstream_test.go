@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -1889,5 +1890,241 @@ func TestPanelStreamingForwardsFrontierBearerToken(t *testing.T) {
 	}
 	if arbiterAuth != "Bearer sk-arbiter-key" {
 		t.Errorf("arbiter bearer token = %q, want %q", arbiterAuth, "Bearer sk-arbiter-key")
+	}
+}
+
+// --- issue #232 / #532: Arbiter cache-hit streaming --------------
+
+func TestStreamCachedArbiterSynthesis_SetsSSEHeaders(t *testing.T) {
+	rw := newSSERW()
+	err := streamCachedArbiterSynthesis(rw, "cached synthesis text")
+	if err != nil {
+		t.Fatalf("streamCachedArbiterSynthesis: %v", err)
+	}
+	if rw.status != 200 {
+		t.Errorf("status = %d, want 200", rw.status)
+	}
+	if ct := rw.header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+	if cc := rw.header.Get("Cache-Control"); cc != "no-cache" {
+		t.Errorf("Cache-Control = %q, want no-cache", cc)
+	}
+}
+
+func TestStreamCachedArbiterSynthesis_EmitsSSEChunkAndDone(t *testing.T) {
+	rw := newSSERW()
+	err := streamCachedArbiterSynthesis(rw, "synthesized answer")
+	if err != nil {
+		t.Fatalf("streamCachedArbiterSynthesis: %v", err)
+	}
+	body := rw.body.String()
+	if !strings.Contains(body, `"content":"synthesized answer"`) {
+		t.Errorf("body missing synthesis text: %q", body)
+	}
+	if !strings.HasSuffix(body, "data: [DONE]\n\n") {
+		t.Errorf("body does not end with SSE done: %q", body)
+	}
+	if !rw.flushed {
+		t.Errorf("expected at least one flush")
+	}
+}
+
+func TestWriteCachedArbiterJSON_SetsJSONHeaders(t *testing.T) {
+	rw := newJSONRW()
+	err := writeCachedArbiterJSON(rw, "cached synthesis", "test-model")
+	if err != nil {
+		t.Fatalf("writeCachedArbiterJSON: %v", err)
+	}
+	if rw.status != 200 {
+		t.Errorf("status = %d, want 200", rw.status)
+	}
+	if ct := rw.header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	if !strings.Contains(rw.body.String(), `"content":"cached synthesis"`) {
+		t.Errorf("body missing synthesis text: %q", rw.body.String())
+	}
+}
+
+func TestPanelCacheHitStream_SetsSSEContentType(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local divergent"}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier divergent"}}]}`)
+	})
+	var arbiterCalled int32
+	ft.on(arbiterURL, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&arbiterCalled, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"live synthesis\"}}]}\n\n")
+	})
+	client := &http.Client{Transport: ft}
+
+	cache := NewArbiterCache(5 * time.Minute)
+	cache.Set("local divergent", "frontier divergent", "cached arbiter synthesis", 5*time.Minute)
+
+	rw := newSSERW()
+	cacheHit, err := Panel(
+		context.Background(), rw, client,
+		"http://local.local", "local-m",
+		"http://frontier.local", "", "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}, "stream": true},
+		"test prompt",
+		5*time.Second, 5*time.Second,
+		false,
+		cache, 5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("Panel: %v", err)
+	}
+	if !cacheHit {
+		t.Errorf("cacheHit = false, want true")
+	}
+	if rw.status != 200 {
+		t.Errorf("status = %d, want 200", rw.status)
+	}
+	if ct := rw.header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+	if cc := rw.header.Get("Cache-Control"); cc != "no-cache" {
+		t.Errorf("Cache-Control = %q, want no-cache", cc)
+	}
+	body := rw.body.String()
+	if !strings.Contains(body, `"content":"cached arbiter synthesis"`) {
+		t.Errorf("body missing cached synthesis: %q", body)
+	}
+	if !strings.HasSuffix(body, "data: [DONE]\n\n") {
+		t.Errorf("body does not end with SSE done: %q", body)
+	}
+	if arbiterCalled > 0 {
+		t.Errorf("arbiter was called %d times, want 0 (cache hit)", arbiterCalled)
+	}
+}
+
+func TestPanelCacheMissWithExpiredEntry_FallsBackToFetch(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local/v1/chat/completions"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local divergent"}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier divergent"}}]}`)
+	})
+	var arbiterCalled int32
+	ft.on(arbiterURL, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&arbiterCalled, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"live arbiter synthesis\"}}]}\n\n")
+	})
+
+	cache := NewArbiterCache(1 * time.Millisecond)
+	cache.Set("local divergent", "frontier divergent", "stale cached synthesis", 1*time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+
+	client := &http.Client{Transport: ft}
+	rw := newSSERW()
+	cacheHit, err := Panel(
+		context.Background(), rw, client,
+		"http://local.local", "local-m",
+		"http://frontier.local", "", "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}, "stream": true},
+		"test prompt",
+		5*time.Second, 5*time.Second,
+		false,
+		cache, 1*time.Millisecond,
+	)
+	if err != nil {
+		t.Fatalf("Panel: %v", err)
+	}
+	if cacheHit {
+		t.Errorf("cacheHit = true, want false (entry expired)")
+	}
+	if arbiterCalled != 1 {
+		t.Errorf("arbiter called %d times, want 1", arbiterCalled)
+	}
+	if rw.status != 200 {
+		t.Errorf("status = %d, want 200", rw.status)
+	}
+	if ct := rw.header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+}
+
+func TestPanelCacheHitNonStream_SetsJSONContentType(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local divergent"}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier divergent"}}]}`)
+	})
+	var arbiterCalled int32
+	ft.on(arbiterURL, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&arbiterCalled, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"arbiter synthesis"}}]}`)
+	})
+	client := &http.Client{Transport: ft}
+
+	cache := NewArbiterCache(5 * time.Minute)
+	cache.Set("local divergent", "frontier divergent", "cached synthesis", 5*time.Minute)
+
+	rw := newJSONRW()
+	cacheHit, err := Panel(
+		context.Background(), rw, client,
+		"http://local.local", "local-m",
+		"http://frontier.local", "", "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}, "stream": false},
+		"test prompt",
+		5*time.Second, 5*time.Second,
+		false,
+		cache, 5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("Panel: %v", err)
+	}
+	if !cacheHit {
+		t.Errorf("cacheHit = false, want true")
+	}
+	if rw.status != 200 {
+		t.Errorf("status = %d, want 200", rw.status)
+	}
+	if ct := rw.header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	if !strings.Contains(rw.body.String(), `"content":"cached synthesis"`) {
+		t.Errorf("body missing cached synthesis: %q", rw.body.String())
+	}
+	if arbiterCalled > 0 {
+		t.Errorf("arbiter called %d times, want 0 (cache hit)", arbiterCalled)
 	}
 }
