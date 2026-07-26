@@ -14,7 +14,7 @@ LINT        ?= golangci-lint
 VERSION     ?= dev
 LDFLAGS     := -s -w -X main.version=$(VERSION)
 
-.PHONY: help build run test test-race bench bench-short vet fmt lint tidy ci clean
+.PHONY: help build run test test-race bench bench-short vet fmt lint tidy ci clean docker-build
 
 help:
 	@echo "Targets:"
@@ -29,6 +29,7 @@ help:
 	@echo "  lint        - golangci-lint run"
 	@echo "  tidy        - go mod tidy"
 	@echo "  ci          - vet + build + test + test-race + lint (what CI runs)"
+	@echo "  docker-build - build the container image (smoke; needs Docker)"
 	@echo "  clean       - remove ./bin/ and coverage files"
 
 build:
@@ -76,6 +77,12 @@ tidy:
 # (transport, metrics, budget tracker, VRAM limiter) are easy to miss in
 # manual testing and can hide in CI for weeks before surfacing in prod.
 ci: vet build test test-race lint bench-short
+
+# docker-build smoke-builds the container image. Used by the ci.yml
+# `docker` job (issue #541) so Dockerfile / go.mod Go-version drift is
+# caught on every PR. Build only — never pushes. Requires Docker.
+docker-build:
+	docker build .
 
 clean:
 	rm -rf bin/ coverage.txt coverage.html
