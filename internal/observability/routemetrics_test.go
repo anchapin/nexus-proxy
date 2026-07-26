@@ -283,6 +283,9 @@ func TestObserveCascadeFallback(t *testing.T) {
 	rc.ObserveCascadeFallback("timeout")
 	rc.ObserveCascadeFallback("timeout")
 	rc.ObserveCascadeFallback("transport_error")
+	rc.ObserveCascadeFallback("http_error")
+	rc.ObserveCascadeFallback("http_error")
+	rc.ObserveCascadeFallback("http_error")
 	rc.ObserveCascadeFallback("malformed_toolcall")
 	rc.ObserveCascadeFallback("malformed_toolcall")
 	rc.ObserveCascadeFallback("malformed_toolcall")
@@ -303,6 +306,7 @@ func TestObserveCascadeFallback(t *testing.T) {
 		{`# TYPE nexus_cascade_fallback_total counter`, "counter type line"},
 		{`nexus_cascade_fallback_total{reason="timeout"} 2`, "timeout counted twice"},
 		{`nexus_cascade_fallback_total{reason="transport_error"} 1`, "transport_error counted once"},
+		{`nexus_cascade_fallback_total{reason="http_error"} 3`, "http_error counted three times"},
 		{`nexus_cascade_fallback_total{reason="malformed_toolcall"} 3`, "malformed_toolcall counted three times"},
 		{`nexus_cascade_fallback_total{reason="malformed_response"} 2`, "malformed_response counted twice"},
 	}

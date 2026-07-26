@@ -80,8 +80,8 @@ type CascadeResult struct {
 	// FallbackReason is the reason label for the cascade_fallback_total
 	// metric (issue #205). It is set whenever a retryable step failure
 	// causes the cascade to fall back to the next step. The value is one
-	// of "timeout", "transport_error", "malformed_toolcall", or
-	// "malformed_response". Empty when no fallback occurred (cascade
+	// of "timeout", "transport_error", "http_error", "malformed_toolcall",
+	// or "malformed_response". Empty when no fallback occurred (cascade
 	// succeeded on first step or all steps failed without retryable
 	// errors).
 	FallbackReason string
@@ -101,8 +101,8 @@ var ErrSSEPartialWrite = errors.New("cascade: SSE partial write after headers co
 // cascadeErr tags a per-step failure so the runner knows whether to fall
 // back (retry=true) or surface the error immediately (retry=false — e.g.
 // upstream returned 401, retrying won't help). The reason field carries
-// one of four values used for cascade_fallback_total{reason} metrics:
-// "timeout", "transport_error", "malformed_toolcall", or
+// one of five values used for cascade_fallback_total{reason} metrics:
+// "timeout", "transport_error", "http_error", "malformed_toolcall", or
 // "malformed_response".
 type cascadeErr struct {
 	retry  bool
@@ -114,8 +114,8 @@ func (e *cascadeErr) Error() string { return e.msg }
 
 // newCascadeErr creates a cascadeErr. reason is the label for the
 // cascade_fallback_total metric: "timeout", "transport_error",
-// "malformed_toolcall", "malformed_response", or "" for non-retryable
-// errors.
+// "http_error", "malformed_toolcall", "malformed_response", or "" for
+// non-retryable errors.
 func newCascadeErr(retry bool, reason, format string, args ...interface{}) error {
 	return &cascadeErr{retry: retry, reason: reason, msg: fmt.Sprintf(format, args...)}
 }
@@ -231,9 +231,9 @@ func classifyFailure(err error) bool {
 
 // CascadeFallbackReason extracts the reason label from err if it is a
 // cascadeErr with a non-empty reason field. The returned string is one
-// of "timeout", "transport_error", "malformed_toolcall", or
-// "malformed_response". Empty string is returned when err is nil or the
-// error carries no fallback reason.
+// of "timeout", "transport_error", "http_error", "malformed_toolcall",
+// or "malformed_response". Empty string is returned when err is nil or
+// the error carries no fallback reason.
 func CascadeFallbackReason(err error) string {
 	if err == nil {
 		return ""
@@ -295,7 +295,7 @@ func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payl
 	respBody, _ := ioutils.ReadAllLimited(resp.Body, defaultMaxResponseBytes)
 
 	if ShouldRetry(resp.StatusCode, nil) {
-		return AssistantMessage{}, "", newCascadeErr(true, "transport_error", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
+		return AssistantMessage{}, "", newCascadeErr(true, "http_error", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
 	}
 	// Issue #438: A 404 from the local step means the model is missing or
 	// not pulled. Treat as retryable so the cascade falls through to the

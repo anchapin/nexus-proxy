@@ -24,11 +24,11 @@ snake_case naming.
 | `nexus_slm_cache_misses_total` | counter | *(none)* | 1 | `routemetrics.go` |
 | `nexus_slm_cache_evictions_total` | counter | `reason` | 2 (`ttl`, `lru`) | `routemetrics.go` |
 | `nexus_requests_rejected_total` | counter | `reason` | 4 | `routemetrics.go` |
-| `nexus_cascade_fallback_total` | counter | `reason` | 4 (`timeout`, `transport_error`, `malformed_toolcall`, `malformed_response`) | `routemetrics.go` |
+| `nexus_cascade_fallback_total` | counter | `reason` | 5 (`timeout`, `transport_error`, `http_error`, `malformed_toolcall`, `malformed_response`) | `routemetrics.go` |
 | `nexus_rag_retrieval_total` | counter | `hit`, `reason` (miss only) | 1 + 3 = 4 | `routemetrics.go` |
 | `nexus_judge_dropped_total` | counter | *(none)* | 1 | `routemetrics.go` |
 
-**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 4 + 4 + 4 + 1 = 137 series.
+**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 4 + 5 + 4 + 1 = 138 series.
 
 > **Note (issue #486):** `nexus_rag_retrieval_total` previously carried
 > a `filename` label whose value was the raw RAG source filename, which
@@ -116,19 +116,29 @@ a high `lru / (ttl + lru)` ratio points at capacity pressure.
 
 For the `nexus_cascade_fallback_total` family, `reason` is a separate
 bounded label set defined in `internal/upstream/cascade.go` (issue #205,
-extended in #497):
+extended in #497, #534):
 
 | Value | Meaning |
 |-------|---------|
 | `timeout` | Per-attempt context deadline exceeded (`context.DeadlineExceeded`) |
-| `transport_error` | Real transport error from `client.Do`, or retryable HTTP status (5xx / 408 / 429) |
+| `transport_error` | Real transport error from `client.Do` (DNS failure, connection refused, TCP reset, TLS handshake) |
+| `http_error` | Upstream returned a retryable HTTP status (408, 429, 500, 502, 503, 504) — the upstream is present but overloaded, rate-limiting, or buggy |
 | `malformed_toolcall` | Upstream returned a `tool_calls` entry with missing required fields or invalid JSON arguments |
 | `malformed_response` | Upstream returned a 200 but the body could not be JSON-decoded, or the `choices` array was empty |
 
-> **Dashboard impact (issue #497):** `malformed_response` was previously
-> conflated with `transport_error`. Dashboards or alerts that aggregate
+> **Dashboard impact (issue #534):** `http_error` was previously conflated
+> with `transport_error`. Dashboards or alerts that aggregate
 > `nexus_cascade_fallback_total{reason="transport_error"}` will see its
-> value drop after this change (the decode-failure and empty-choices
+> value drop after this change (the 5xx/408/429 counts move to
+> `http_error`). Splitting the two lets operators distinguish a broken
+> network (`transport_error`) from an overloaded upstream (`http_error`)
+> — these have completely different remediations. Update any PromQL panels
+> that keyed on the old four-value closed set.
+
+> **Prior dashboard impact (issue #497):** `malformed_response` was
+> previously conflated with `transport_error`. Dashboards or alerts that
+> aggregate `nexus_cascade_fallback_total{reason="transport_error"}` will
+> see its value drop after this change (the decode-failure and empty-choices
 > counts move to `malformed_response`). Splitting the two lets operators
 > distinguish a broken network (`transport_error`) from an upstream that
 > returns invalid responses (`malformed_response`) — these have
