@@ -152,6 +152,9 @@ type YAMLConfig struct {
 	TelemetryMaxBytes int    `yaml:"telemetry_max_bytes"`
 	TelemetryMaxFiles int    `yaml:"telemetry_max_files"`
 	MetricsDBPath     string `yaml:"metrics_db_path"`
+	// MetricsRetentionDays (issue #483) sets a TTL on the requests
+	// table. 0 = disabled (grow without bound). Not hot-reloadable.
+	MetricsRetentionDays int `yaml:"metrics_retention_days"`
 
 	// Models
 	ModelsEndpointEnabled bool   `yaml:"models_endpoint_enabled"`
@@ -782,6 +785,11 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_METRICS_DB"); v != "" {
 		cfg.MetricsDBPath = v
 	}
+	if v := os.Getenv("NEXUS_METRICS_RETENTION_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.MetricsRetentionDays = n
+		}
+	}
 
 	// Models
 	if v := os.Getenv("NEXUS_MODELS_ENDPOINT"); v != "" {
@@ -834,26 +842,27 @@ func LoadYAML(path string) (Config, error) {
 // defaults that Load() uses for fields not set in the YAML.
 func (yc YAMLConfig) toConfig() Config {
 	cfg := Config{
-		Addr:              yc.stringDefault(yc.Addr, ":8000"),
-		OllamaURL:         strings.TrimRight(yc.stringDefault(yc.OllamaURL, "http://localhost:11434"), "/"),
-		RouterModel:       yc.stringDefault(yc.RouterModel, "qwen3-coder:4b"),
-		LocalModel:        yc.stringDefault(yc.LocalModel, "qwen3-coder:8b"),
-		EmbeddingModel:    yc.stringDefault(yc.EmbeddingModel, "nomic-embed-text"),
-		FrontierURL:       yc.stringDefault(yc.FrontierURL, "https://api.openai.com/v1/chat/completions"),
-		FrontierModel:     yc.stringDefault(yc.FrontierModel, "gpt-4o"),
-		FrontierKey:       yc.FrontierKey,
-		ZAIURL:            yc.stringDefault(yc.ZAIURL, "https://api.z.ai/v1/chat/completions"),
-		ZAIModel:          yc.stringDefault(yc.ZAIModel, "glm-4.6"),
-		ZAIKey:            yc.ZAIKey,
-		ProxyAPIKey:       yc.ProxyAPIKey,
-		StatusPublic:      yc.StatusPublic,
-		ExamplesDir:       yc.stringDefault(yc.ExamplesDir, "./few_shot_examples"),
-		MetaPrompt:        yc.stringDefault(yc.MetaPrompt, defaultMetaPrompt),
-		TOONNotice:        yc.stringDefault(yc.TOONNotice, defaultTOONNotice),
-		TelemetryPath:     yc.stringDefault(yc.TelemetryPath, "./nexus-telemetry.jsonl"),
-		TelemetryMaxBytes: yc.intDefault(yc.TelemetryMaxBytes, 0),
-		TelemetryMaxFiles: yc.intDefault(yc.TelemetryMaxFiles, 5),
-		MetricsDBPath:     yc.stringDefault(yc.MetricsDBPath, DefaultMetricsDBPath()),
+		Addr:                 yc.stringDefault(yc.Addr, ":8000"),
+		OllamaURL:            strings.TrimRight(yc.stringDefault(yc.OllamaURL, "http://localhost:11434"), "/"),
+		RouterModel:          yc.stringDefault(yc.RouterModel, "qwen3-coder:4b"),
+		LocalModel:           yc.stringDefault(yc.LocalModel, "qwen3-coder:8b"),
+		EmbeddingModel:       yc.stringDefault(yc.EmbeddingModel, "nomic-embed-text"),
+		FrontierURL:          yc.stringDefault(yc.FrontierURL, "https://api.openai.com/v1/chat/completions"),
+		FrontierModel:        yc.stringDefault(yc.FrontierModel, "gpt-4o"),
+		FrontierKey:          yc.FrontierKey,
+		ZAIURL:               yc.stringDefault(yc.ZAIURL, "https://api.z.ai/v1/chat/completions"),
+		ZAIModel:             yc.stringDefault(yc.ZAIModel, "glm-4.6"),
+		ZAIKey:               yc.ZAIKey,
+		ProxyAPIKey:          yc.ProxyAPIKey,
+		StatusPublic:         yc.StatusPublic,
+		ExamplesDir:          yc.stringDefault(yc.ExamplesDir, "./few_shot_examples"),
+		MetaPrompt:           yc.stringDefault(yc.MetaPrompt, defaultMetaPrompt),
+		TOONNotice:           yc.stringDefault(yc.TOONNotice, defaultTOONNotice),
+		TelemetryPath:        yc.stringDefault(yc.TelemetryPath, "./nexus-telemetry.jsonl"),
+		TelemetryMaxBytes:    yc.intDefault(yc.TelemetryMaxBytes, 0),
+		TelemetryMaxFiles:    yc.intDefault(yc.TelemetryMaxFiles, 5),
+		MetricsDBPath:        yc.stringDefault(yc.MetricsDBPath, DefaultMetricsDBPath()),
+		MetricsRetentionDays: yc.intDefault(yc.MetricsRetentionDays, 0),
 
 		// Non-string fields with defaults
 		RAGThreshold:              yc.floatDefault(yc.RAGThreshold, 0.55),

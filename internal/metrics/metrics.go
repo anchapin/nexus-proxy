@@ -185,14 +185,24 @@ var stdLogger Logger = func(format string, args ...any) {
 
 // Open creates a Store backed by a SQLite database at path. The parent
 // directory is created on demand. An empty path is rejected; ":memory:"
-// is allowed for tests.
+// is allowed for tests. Retention is disabled (pre-#483 behaviour).
 func Open(path string) (Store, error) {
-	return OpenWithLogger(path, stdLogger)
+	return OpenWithRetention(path, 0, stdLogger)
 }
 
 // OpenWithLogger is Open with a custom logger. Pass a no-op Logger to
-// silence the package in tests; pass nil to use the default.
+// silence the package in tests; pass nil to use the default. Retention
+// is disabled.
 func OpenWithLogger(path string, lg Logger) (Store, error) {
+	return OpenWithRetention(path, 0, lg)
+}
+
+// OpenWithRetention creates a Store with an optional retention window
+// (issue #483). When retentionDays > 0 a background goroutine DELETEs
+// rows older than that many days roughly once per hour. retentionDays
+// <= 0 disables retention (identical to OpenWithLogger). The parent
+// directory is created on demand. An empty path is rejected.
+func OpenWithRetention(path string, retentionDays int, lg Logger) (Store, error) {
 	if path == "" {
 		return nil, fmt.Errorf("metrics: empty path")
 	}
@@ -206,7 +216,7 @@ func OpenWithLogger(path string, lg Logger) (Store, error) {
 			}
 		}
 	}
-	s, err := newSQLiteStore(path, lg)
+	s, err := newSQLiteStore(path, retentionDays, lg)
 	if err != nil {
 		return nil, err
 	}
