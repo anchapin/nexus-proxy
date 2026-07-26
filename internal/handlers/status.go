@@ -42,6 +42,10 @@ type ragRetrievalStatus struct {
 	ThresholdMisses  uint64            `json:"threshold_misses"`
 	EmbedErrors      uint64            `json:"embed_errors"`
 	MissesByReason   map[string]uint64 `json:"misses_by_reason"`
+	// InjectionSkippedSizeLimit counts RAG injections aborted because the
+	// retrieved context block would have exceeded NEXUS_MAX_BODY_BYTES
+	// (issue #594).
+	InjectionSkippedSizeLimit uint64 `json:"last_injection_skipped_size_limit"`
 }
 
 // ragCacheStatus reports the LRU embed-cache hit/miss counters plus

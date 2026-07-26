@@ -44,14 +44,15 @@ func TestStatusHandler(t *testing.T) {
 				},
 				LastIndexAt: resetAt,
 				Retrieval: ragRetrievalStatus{
-					Attempts:         20,
-					Hits:             12,
-					Misses:           8,
-					HitRate:          0.6,
-					EmptyStoreMisses: 2,
-					ThresholdMisses:  5,
-					EmbedErrors:      1,
-					MissesByReason:   map[string]uint64{"empty_store": 2, "threshold": 5, "embed_error": 1},
+					Attempts:                  20,
+					Hits:                      12,
+					Misses:                    8,
+					HitRate:                   0.6,
+					EmptyStoreMisses:          2,
+					ThresholdMisses:           5,
+					EmbedErrors:               1,
+					MissesByReason:            map[string]uint64{"empty_store": 2, "threshold": 5, "embed_error": 1},
+					InjectionSkippedSizeLimit: 3,
 				},
 				Cache: ragCacheStatus{Enabled: true, Hits: 7, Misses: 13, HitRate: 0.35},
 			}
@@ -166,6 +167,9 @@ func TestStatusHandler(t *testing.T) {
 	}
 	if resp.RAG.Retrieval.HitRate != 0.6 {
 		t.Errorf("rag.retrieval.hit_rate = %f, want 0.6", resp.RAG.Retrieval.HitRate)
+	}
+	if resp.RAG.Retrieval.InjectionSkippedSizeLimit != 3 {
+		t.Errorf("rag.retrieval.last_injection_skipped_size_limit = %d, want 3", resp.RAG.Retrieval.InjectionSkippedSizeLimit)
 	}
 	if resp.RAG.Cache.Hits != 7 || resp.RAG.Cache.Misses != 13 {
 		t.Errorf("rag.cache = %+v, want hits=7 misses=13", resp.RAG.Cache)
@@ -466,6 +470,9 @@ func TestStatusHandlerRAGFieldsJSON(t *testing.T) {
 		Cache     struct {
 			HitRate float64 `json:"hit_rate"`
 		} `json:"cache"`
+		Retrieval struct {
+			Skipped uint64 `json:"last_injection_skipped_size_limit"`
+		} `json:"retrieval"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &rag); err != nil {
 		t.Fatalf("json.Unmarshal: %v", err)
@@ -476,4 +483,5 @@ func TestStatusHandlerRAGFieldsJSON(t *testing.T) {
 	// truth assertions on Store.IndexMode().
 	_ = rag.IndexMode
 	_ = rag.Cache.HitRate
+	_ = rag.Retrieval.Skipped // issue #594: key must be present (zero-value).
 }

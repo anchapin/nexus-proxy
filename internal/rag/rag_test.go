@@ -213,6 +213,23 @@ func TestStoreStats(t *testing.T) {
 	}
 }
 
+// TestStoreInjectionSkippedCounter covers issue #594: the
+// InjectionSkippedSizeLimit counter is bumped by
+// IncInjectionSkippedSizeLimit and surfaced via Stats().
+func TestStoreInjectionSkippedCounter(t *testing.T) {
+	emb := &stubEmbedder{vecs: map[string][]float64{"prompt": {1, 0, 0}}}
+	store := NewStore(emb, 0.55)
+
+	if got := store.Stats().InjectionSkippedSizeLimit; got != 0 {
+		t.Fatalf("initial InjectionSkippedSizeLimit = %d, want 0", got)
+	}
+	store.IncInjectionSkippedSizeLimit()
+	store.IncInjectionSkippedSizeLimit()
+	if got := store.Stats().InjectionSkippedSizeLimit; got != 2 {
+		t.Errorf("InjectionSkippedSizeLimit = %d, want 2", got)
+	}
+}
+
 // TestRetrieveReturnsHNSWPath verifies that when the store has at
 // least indexThreshold snippets, Retrieve reports IndexPathHNSW so the
 // observability layer can partition the similarity histogram by index

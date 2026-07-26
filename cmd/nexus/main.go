@@ -1106,6 +1106,7 @@ func main() {
 			status.Retrieval.EmptyStoreMisses = stats.EmptyStoreMisses
 			status.Retrieval.ThresholdMisses = stats.ThresholdMisses
 			status.Retrieval.EmbedErrors = stats.EmbedErrors
+			status.Retrieval.InjectionSkippedSizeLimit = stats.InjectionSkippedSizeLimit
 			status.Retrieval.MissesByReason = map[string]uint64{
 				"empty_store": stats.EmptyStoreMisses,
 				"threshold":   stats.ThresholdMisses,

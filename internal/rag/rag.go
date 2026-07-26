@@ -336,6 +336,16 @@ type RAGCacheStatsProvider interface {
 	EmbedHitCount() int64
 }
 
+// InjectionSkipRecorder is optionally implemented by RAGStore backends
+// (both *Store and *PersistentStore) so the chat handler can bump the
+// counter when a RAG injection is aborted by the NEXUS_MAX_BODY_BYTES
+// size guard (issue #594). The handler type-asserts d.RAG to this
+// interface; a nil-safe no-op happens when the backend does not
+// implement it.
+type InjectionSkipRecorder interface {
+	IncInjectionSkippedSizeLimit()
+}
+
 type StoreStats struct {
 	LastIndexAt       time.Time
 	RetrievalAttempts uint64
@@ -346,6 +356,11 @@ type StoreStats struct {
 	EmbedErrors       uint64
 	CacheHits         uint64
 	CacheMisses       uint64
+	// InjectionSkippedSizeLimit counts RAG injections that were aborted
+	// because the retrieved context block would have exceeded the
+	// NEXUS_MAX_BODY_BYTES guard (issue #594). Surfaced on /status as
+	// rag.retrieval.last_injection_skipped_size_limit.
+	InjectionSkippedSizeLimit uint64
 }
 
 // Store holds the indexed few-shot examples.
@@ -357,13 +372,14 @@ type Store struct {
 	index       *HNSWIndex
 	indexConfig HNSWConfig
 
-	lastIndexAt       int64
-	retrievalAttempts uint64
-	retrievalHits     uint64
-	retrievalMisses   uint64
-	emptyStoreMisses  uint64
-	thresholdMisses   uint64
-	embedErrors       uint64
+	lastIndexAt               int64
+	retrievalAttempts         uint64
+	retrievalHits             uint64
+	retrievalMisses           uint64
+	emptyStoreMisses          uint64
+	thresholdMisses           uint64
+	embedErrors               uint64
+	injectionSkippedSizeLimit uint64
 }
 
 // indexThreshold is the minimum store size before the HNSW index is used.
@@ -471,12 +487,13 @@ func (s *Store) Stats() StoreStats {
 	misses := atomic.LoadUint64(&s.retrievalMisses)
 	cacheHits, cacheMisses := s.CacheStats()
 	stats := StoreStats{
-		RetrievalAttempts: attempts,
-		RetrievalHits:     hits,
-		RetrievalMisses:   misses,
-		EmptyStoreMisses:  atomic.LoadUint64(&s.emptyStoreMisses),
-		ThresholdMisses:   atomic.LoadUint64(&s.thresholdMisses),
-		EmbedErrors:       atomic.LoadUint64(&s.embedErrors),
+		RetrievalAttempts:         attempts,
+		RetrievalHits:             hits,
+		RetrievalMisses:           misses,
+		EmptyStoreMisses:          atomic.LoadUint64(&s.emptyStoreMisses),
+		ThresholdMisses:           atomic.LoadUint64(&s.thresholdMisses),
+		EmbedErrors:               atomic.LoadUint64(&s.embedErrors),
+		InjectionSkippedSizeLimit: atomic.LoadUint64(&s.injectionSkippedSizeLimit),
 	}
 	if cacheHits > 0 {
 		stats.CacheHits = uint64(cacheHits)
@@ -495,6 +512,13 @@ func (s *Store) markIndexed(at time.Time) {
 		at = time.Now().UTC()
 	}
 	atomic.StoreInt64(&s.lastIndexAt, at.UnixNano())
+}
+
+// IncInjectionSkippedSizeLimit bumps the counter for RAG injections that
+// were aborted by the NEXUS_MAX_BODY_BYTES size guard (issue #594). Safe
+// for concurrent use. Promoted to *PersistentStore via embedding.
+func (s *Store) IncInjectionSkippedSizeLimit() {
+	atomic.AddUint64(&s.injectionSkippedSizeLimit, 1)
 }
 
 // isSymlink reports whether a DirEntry represents a symbolic link.

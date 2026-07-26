@@ -1042,28 +1042,50 @@ func Chat(d Deps) http.Handler {
 				}
 			}
 		case ragEx != nil:
-			messages = middleware.InjectRAG(messages, rag.FormatInjection(ragEx))
-			slog.Info("rag hit",
-				slog.String("filename", ragEx.Filename),
-				slog.Float64("score", ragScore),
-				slog.String("index_path", string(ragIndexPath)),
-				slog.String("request_id", reqID),
+			// Size guard (issue #594): a retrieved few-shot example can
+			// be large enough to overflow the model's context window.
+			// InjectRAGWithLimit skips the context block when appending it
+			// would push the latest user message past NEXUS_MAX_BODY_BYTES.
+			contextBlock := rag.FormatInjection(ragEx)
+			messages, ragInjected = middleware.InjectRAGWithLimit(
+				messages, contextBlock, d.Config.EffectiveMaxBodyBytes(),
 			)
-			ragInjected = true
-			ragFilename = ragEx.Filename
-			if d.RAGObserver != nil {
-				d.RAGObserver.ObserveRAG(RAGEvent{
-					Hit:       true,
-					Filename:  ragEx.Filename,
-					Score:     ragScore,
-					IndexPath: string(ragIndexPath),
-				})
+			if ragInjected {
+				slog.Info("rag hit",
+					slog.String("filename", ragEx.Filename),
+					slog.Float64("score", ragScore),
+					slog.String("index_path", string(ragIndexPath)),
+					slog.String("request_id", reqID),
+				)
+				ragFilename = ragEx.Filename
+				if d.RAGObserver != nil {
+					d.RAGObserver.ObserveRAG(RAGEvent{
+						Hit:       true,
+						Filename:  ragEx.Filename,
+						Score:     ragScore,
+						IndexPath: string(ragIndexPath),
+					})
+				}
+			} else {
+				slog.Warn("rag injection skipped: context block exceeds size guard",
+					slog.String("filename", ragEx.Filename),
+					slog.Int("context_block_bytes", len(contextBlock)),
+					slog.Int("max_body_bytes", d.Config.EffectiveMaxBodyBytes()),
+					slog.String("request_id", reqID),
+				)
+				if rec, ok := d.RAG.(rag.InjectionSkipRecorder); ok {
+					rec.IncInjectionSkippedSizeLimit()
+				}
+				if d.RAGObserver != nil {
+					d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "size_limit"})
+				}
 			}
+			// Retrieval itself succeeded regardless of whether the
+			// context block was injected, so reset the RAG embedder's
+			// circuit-breaker state (issue #304).
 			if d.CircuitBreakerObserver != nil {
 				d.CircuitBreakerObserver.RecordCircuitRecovery("rag")
 			}
-			// Reset the RAG embedder's circuit breaker failure counter on
-			// a successful retrieval (issue #304).
 			if s, ok := d.RAG.(interface{ RecordBreakerSuccess() }); ok {
 				s.RecordBreakerSuccess()
 			}
