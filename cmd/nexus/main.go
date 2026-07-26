@@ -788,6 +788,16 @@ func main() {
 	injectionHitObs := func(mode string) {
 		routeCounters.ObservePromptInjectionHit(mode)
 	}
+	// Upstream response body cap (issue #533). Configure once at startup
+	// so the configured NEXUS_MAX_RESPONSE_BYTES value is authoritative
+	// for BufferedFetchWithContext, FetchPanel, and fetchCascadeStep.
+	upstream.ConfigureMaxResponseBytes(int64(cfg.EffectiveMaxResponseBytes()))
+	if cfg.EffectiveMaxResponseBytes() < config.DefaultMaxResponseBytes {
+		slog.Warn("upstream response body cap is below the 64 MiB default",
+			slog.Int("max_response_bytes", cfg.EffectiveMaxResponseBytes()),
+			slog.String("hint", "operator is tightening the cap; confirm this is intentional"),
+		)
+	}
 	// Arbiter synthesis cache (issue #232). Created when TTL > 0;
 	// nil means caching is disabled.
 	var arbiterCache *upstream.ArbiterCache

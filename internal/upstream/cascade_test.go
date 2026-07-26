@@ -452,6 +452,33 @@ func TestCascadeDefaultTimeoutWhenZero(t *testing.T) {
 	}
 }
 
+func TestCascadeMaxResponseBytesTriggersBoundedRead(t *testing.T) {
+	ft := newFakeTransport()
+	largeBody := `{"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"` + strings.Repeat("x", 1024) + `"}}]}`
+	ft.on("http://x/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, largeBody)
+	})
+	cas := &Cascade{
+		Timeout:          2 * time.Second,
+		MaxResponseBytes: 512,
+		Steps: []CascadeStep{
+			{Name: "local", URL: "http://x/v1/chat/completions", Model: "m"},
+		},
+	}
+	rw := newSSERW()
+	res, err := cas.Run(context.Background(), rw, &http.Client{Transport: ft}, nil)
+	if err == nil {
+		t.Fatal("expected error when response exceeds MaxResponseBytes")
+	}
+	if res.Succeeded {
+		t.Error("Succeeded = true, want false")
+	}
+	if rw.status != 0 {
+		t.Errorf("status written before error: %d", rw.status)
+	}
+}
+
 func TestBuildLocalCascadeOnlyLocal(t *testing.T) {
 	cas := BuildLocalCascade(CascadeConfig{
 		LocalURL:   "http://localhost:11434/",
