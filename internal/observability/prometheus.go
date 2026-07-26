@@ -155,6 +155,18 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Unix timestamp of the last failure recorded for this circuit breaker (issue #304).",
 		typ:  "gauge",
 	},
+	// Local-route concurrency limiter gauges (issue #487). The VRAM-aware
+	// limiter shrinks its effective slot count dynamically from the latest
+	// probe snapshot; these gauges let operators see the ceiling, how many
+	// slots are in use, and whether requests are saturating the local path.
+	"nexus_local_concurrency_effective_slots": {
+		help: "Current effective slot count for the VRAM-aware local-route concurrency limiter (issue #487).",
+		typ:  "gauge",
+	},
+	"nexus_local_concurrency_in_flight": {
+		help: "Number of held slots in the local-route concurrency limiter (issue #487).",
+		typ:  "gauge",
+	},
 	// Embedder circuit breaker failures (issue #423).
 	"nexus_embedder_failures_total": {
 		help: "Total number of circuit breaker trip events for embedder kinds (issue #423).",

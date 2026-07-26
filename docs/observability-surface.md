@@ -271,6 +271,24 @@ The span/metric attribute pairing is:
 Span attributes use the same values as the Prometheus labels so
 cross-referencing is trivial.
 
+## Concurrency / VRAM
+
+The VRAM-aware local-route concurrency limiter (`internal/concurrencylimit`,
+issue #81) shrinks its effective slot count dynamically from the latest
+probe snapshot. Two gauges (issue #487) let operators see whether
+requests are saturating the local path and how low the ceiling dropped:
+
+| Metric | Type | Backing source | Meaning |
+|--------|------|----------------|---------|
+| `nexus_local_concurrency_effective_slots` | gauge | `Limiter.Effective()` | Current slot count the limiter honours: `min(Ceiling, freeVRAM / BytesPerSlot)`. 0 when the limiter is disabled (`NEXUS_LOCAL_MAX_CONCURRENT<=0`). |
+| `nexus_local_concurrency_in_flight` | gauge | `Limiter.InFlight()` | Number of currently held slots. Equals `effective_slots` under saturation. |
+
+Both gauges are unlabelled (cardinality 1 each) and are wired as
+`GaugeProvider` closures in `cmd/nexus/main.go`, reading from the
+concrete `*concurrencylimit.Limiter` instance. When the limiter is
+disabled the provider returns `nil` so neither series appears in a
+fresh scrape.
+
 ## Observer wiring
 
 The chat handler never imports `internal/observability` directly
