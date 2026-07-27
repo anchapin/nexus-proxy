@@ -508,6 +508,9 @@ func checkZAIKeyFn(cfg config.Config) Check {
 // pass; zero budget (no signal) is warn — the handler falls back to
 // the static NEXUS_TOKEN_GUARDRAIL in that case, which still serves
 // traffic but loses the dynamic-aware behaviour the PRD promises.
+//
+// When NVIDIA GPUs are detected (issue #775), per-GPU VRAM status is
+// included in the detail line: "GPU 0: 8.2 GiB free, GPU 1: 8.2 GiB free".
 func checkVRAMProbeFn(ctx context.Context, cfg config.Config, opts Options) Check {
 	p := probe.NewOllamaProbe(opts.OllamaURL, opts.HTTPClient)
 	p.BytesPerToken = cfg.ProbeBytesPerToken
@@ -531,10 +534,20 @@ func checkVRAMProbeFn(ctx context.Context, cfg config.Config, opts Options) Chec
 			Detail: fmt.Sprintf("budget disabled (source=%s) — falling back to NEXUS_TOKEN_GUARDRAIL=%d", b.Source, cfg.TokenGuardrail),
 		}
 	}
+	detail := fmt.Sprintf("budget: %d tokens (source: %s)", b.Tokens, b.Source)
+	if gpus, gerr := probe.ReadPerGPUVRAM(); gerr == nil && len(gpus) > 0 {
+		var parts []string
+		for _, g := range gpus {
+			parts = append(parts, fmt.Sprintf("GPU %d: %.1f GiB free", g.Index, float64(g.MemoryFree)/(1024*1024*1024)))
+		}
+		if len(parts) > 0 {
+			detail += "; " + strings.Join(parts, ", ")
+		}
+	}
 	return Check{
 		Name:   checkVRAMProbe,
 		Status: StatusPass,
-		Detail: fmt.Sprintf("budget: %d tokens (source: %s)", b.Tokens, b.Source),
+		Detail: detail,
 	}
 }
 

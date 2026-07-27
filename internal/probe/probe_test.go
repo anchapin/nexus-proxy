@@ -1081,3 +1081,38 @@ func TestOllamaProbeThermalBoundaryExactThreshold(t *testing.T) {
 		t.Errorf("budget disabled at exactly the threshold: %+v, want no throttle (strict exceeds)", b)
 	}
 }
+
+// TestReadPerGPUVRAMOnNoNvidiaSMI verifies ReadPerGPUVRAM and GPUCount
+// do not panic when nvidia-smi is unavailable (expected on most dev
+// machines). Both return nil/0 gracefully.
+func TestReadPerGPUVRAMOnNoNvidiaSMI(t *testing.T) {
+	gpus, err := ReadPerGPUVRAM()
+	if err != nil {
+		t.Fatalf("ReadPerGPUVRAM err = %v, want nil when nvidia-smi unavailable", err)
+	}
+	if gpus != nil {
+		t.Errorf("ReadPerGPUVRAM on machine without NVIDIA GPU = %v, want nil", gpus)
+	}
+	if n := GPUCount(); n != 0 {
+		t.Errorf("GPUCount on machine without NVIDIA GPU = %d, want 0", n)
+	}
+}
+
+// TestGPUInfoFields verifies the GPUInfo struct fields are set correctly.
+func TestGPUInfoFields(t *testing.T) {
+	info := GPUInfo{
+		Index:       1,
+		Name:        "NVIDIA GeForce RTX 3090",
+		MemoryFree:  8 << 30,
+		MemoryTotal: 24 << 30,
+	}
+	if info.Index != 1 {
+		t.Errorf("Index = %d, want 1", info.Index)
+	}
+	if info.MemoryFree != 8<<30 {
+		t.Errorf("MemoryFree = %d, want 8 GiB", info.MemoryFree)
+	}
+	if info.MemoryTotal != 24<<30 {
+		t.Errorf("MemoryTotal = %d, want 24 GiB", info.MemoryTotal)
+	}
+}
