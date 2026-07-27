@@ -1,0 +1,65 @@
+{
+  "cli_version": "0.9.0",
+  "checkpoint_id": "01KYJQYTA1MW5FVN518J8RD547",
+  "session_id": "ses_05a83f538ffeIjAq2kEk7QDc7f",
+  "strategy": "manual-commit",
+  "created_at": "2026-07-27T21:33:40.282761869Z",
+  "branch": "docs/update-agents-md",
+  "checkpoints_count": 1,
+  "save_step_count": 1,
+  "files_touched": [
+    "AGENTS.md"
+  ],
+  "agent": "OpenCode",
+  "model": "MiniMax-M2.7",
+  "turn_id": "f13499b827f6",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 49093,
+    "cache_creation_tokens": 250064,
+    "cache_read_tokens": 1589468,
+    "output_tokens": 4777,
+    "api_call_count": 20
+  },
+  "session_metrics": {
+    "turn_count": 1
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-07-27T21:33:40.254321493Z",
+    "agent_lines": 5,
+    "agent_removed": 7,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 5,
+    "total_lines_changed": 12,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 435,
+      "user_lines_removed": 151,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".opencode/plugins/entire.ts": 272,
+        "docs/internal/issue-discovery-prompt.md": 163
+      },
+      "user_removed_per_file": {
+        "docs/internal/issue-discovery-prompt.md": 151
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 272,
+      "user_lines_removed": 0,
+      "agent_lines_added": 168,
+      "agent_lines_removed": 158,
+      "user_added_per_file": {
+        ".opencode/plugins/entire.ts": 272
+      }
+    }
+  ]
+}
