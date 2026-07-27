@@ -5,6 +5,7 @@ module github.com/anchapin/nexus-proxy
 go 1.25.0
 
 require (
+	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/pkoukk/tiktoken-go v0.1.8
 	golang.org/x/sync v0.22.0
