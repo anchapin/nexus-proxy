@@ -526,12 +526,17 @@ func BuildLocalCascade(cfg CascadeConfig) *Cascade {
 	return &Cascade{Steps: steps, Timeout: cfg.Timeout}
 }
 
+const truncateSuffix = "...(truncated)"
+
 // truncateForLog clamps a response body for log/error messages. Bodies
 // from upstream providers can include full chat dumps; 200 bytes is enough
 // to identify the failure mode without spamming logs.
 func truncateForLog(b []byte, max int) string {
+	if max <= len(truncateSuffix) {
+		return ""
+	}
 	if len(b) <= max {
 		return string(b)
 	}
-	return string(b[:max]) + "...(truncated)"
+	return string(b[:max-len(truncateSuffix)]) + truncateSuffix
 }

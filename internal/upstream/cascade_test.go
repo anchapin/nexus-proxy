@@ -1071,3 +1071,64 @@ func TestExtractAssistantMessageToolCalls(t *testing.T) {
 		t.Errorf("Name = %q", msg.ToolCalls[0].Function.Name)
 	}
 }
+
+// --- Issue #667: truncateForLog off-by-one tests -----------------------------
+
+func TestTruncateForLogTruncates(t *testing.T) {
+	// Acceptance criterion: truncateForLog(make([]byte, 300), 200) returns
+	// exactly 200 bytes + "...(truncated)".
+	got := truncateForLog(make([]byte, 300), 200)
+	if len(got) != 200 {
+		t.Errorf("len(got) = %d, want 200", len(got))
+	}
+	if !strings.HasSuffix(got, "...(truncated)") {
+		t.Errorf("got does not end with \"...(truncated)\": %q", got)
+	}
+}
+
+func TestTruncateForLogExactFit(t *testing.T) {
+	// Acceptance criterion: truncateForLog(make([]byte, 200), 200) returns
+	// exactly 200 bytes with no suffix.
+	got := truncateForLog(make([]byte, 200), 200)
+	if len(got) != 200 {
+		t.Errorf("len(got) = %d, want 200", len(got))
+	}
+	if strings.Contains(got, "...(truncated)") {
+		t.Errorf("got should not contain suffix: %q", got)
+	}
+}
+
+func TestTruncateForLogEmpty(t *testing.T) {
+	// Acceptance criterion: truncateForLog(nil, 200) returns empty string.
+	got := truncateForLog(nil, 200)
+	if got != "" {
+		t.Errorf("got = %q, want empty string", got)
+	}
+}
+
+func TestTruncateForLogMaxTooSmall(t *testing.T) {
+	// When max is <= len("...(truncated)"), the function must not panic
+	// and must return an empty string.
+	got := truncateForLog(make([]byte, 100), 5)
+	if got != "" {
+		t.Errorf("got = %q, want empty string when max <= suffix len", got)
+	}
+}
+
+func TestTruncateForLogBoundary(t *testing.T) {
+	// At the boundary: max = 20, suffix = 13, so 20-13 = 7 bytes of content fit.
+	// len(b) == 7: exactly fits within max, no suffix appended.
+	got := truncateForLog(make([]byte, 7), 20)
+	if len(got) != 7 {
+		t.Errorf("len(got) = %d, want 7 (no truncation needed)", len(got))
+	}
+	// len(b) == 21: exceeds max, so suffix is appended.
+	// Result = 21-13 = 8 content bytes + 13 suffix = 20 total.
+	got = truncateForLog(make([]byte, 21), 20)
+	if len(got) != 20 {
+		t.Errorf("len(got) = %d, want 20 (8 content + 13 suffix)", len(got))
+	}
+	if !strings.HasSuffix(got, "...(truncated)") {
+		t.Errorf("got does not end with suffix: %q", got)
+	}
+}
