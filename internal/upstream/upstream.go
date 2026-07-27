@@ -1164,12 +1164,21 @@ func streamCachedArbiterSynthesis(w http.ResponseWriter, synthesis string) error
 		return fmt.Errorf("fusion: marshal cached arbiter chunk: %w", err)
 	}
 	if _, err := w.Write([]byte("data: ")); err != nil {
+		if IsClientAbort(err) {
+			return ErrClientAbort
+		}
 		return err
 	}
 	if _, err := w.Write(b); err != nil {
+		if IsClientAbort(err) {
+			return ErrClientAbort
+		}
 		return err
 	}
 	if _, err := w.Write([]byte("\n\n")); err != nil {
+		if IsClientAbort(err) {
+			return ErrClientAbort
+		}
 		return err
 	}
 	if f, ok := w.(http.Flusher); ok {
@@ -1216,6 +1225,9 @@ func writeCachedArbiterJSON(w http.ResponseWriter, synthesis, modelName string) 
 // stream completed).
 func writeSSEDone(w http.ResponseWriter) error {
 	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+		if IsClientAbort(err) {
+			return ErrClientAbort
+		}
 		return err
 	}
 	if f, ok := w.(http.Flusher); ok {
