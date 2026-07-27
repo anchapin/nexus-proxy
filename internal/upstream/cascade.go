@@ -92,9 +92,9 @@ var ErrSSEPartialWrite = errors.New("cascade: SSE partial write after headers co
 // cascadeErr tags a per-step failure so the runner knows whether to fall
 // back (retry=true) or surface the error immediately (retry=false — e.g.
 // upstream returned 401, retrying won't help). The reason field carries
-// one of five values used for cascade_fallback_total{reason} metrics:
-// "timeout", "transport_error", "http_error", "malformed_toolcall", or
-// "malformed_response".
+// one of six values used for cascade_fallback_total{reason} metrics:
+// "timeout", "transport_error", "rate_limited", "http_error",
+// "malformed_toolcall", or "malformed_response".
 type cascadeErr struct {
 	retry  bool
 	reason string // "" when non-retryable
@@ -105,8 +105,8 @@ func (e *cascadeErr) Error() string { return e.msg }
 
 // newCascadeErr creates a cascadeErr. reason is the label for the
 // cascade_fallback_total metric: "timeout", "transport_error",
-// "http_error", "malformed_toolcall", "malformed_response", or "" for
-// non-retryable errors.
+// "rate_limited", "http_error", "malformed_toolcall", "malformed_response",
+// or "" for non-retryable errors.
 func newCascadeErr(retry bool, reason, format string, args ...interface{}) error {
 	return &cascadeErr{retry: retry, reason: reason, msg: fmt.Sprintf(format, args...)}
 }
@@ -294,7 +294,11 @@ func (c *Cascade) fetchCascadeStep(ctx context.Context, client Client, step Casc
 	respBody, _ := ioutils.ReadAllLimited(resp.Body, maxBytes)
 
 	if ShouldRetry(resp.StatusCode, nil) {
-		return AssistantMessage{}, "", newCascadeErr(true, "http_error", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
+		reason := "http_error"
+		if resp.StatusCode == http.StatusTooManyRequests {
+			reason = "rate_limited"
+		}
+		return AssistantMessage{}, "", newCascadeErr(true, reason, "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
 	}
 	// Issue #438: A 404 from the local step means the model is missing or
 	// not pulled. Treat as retryable so the cascade falls through to the

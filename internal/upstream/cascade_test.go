@@ -257,10 +257,10 @@ func TestCascadeFallsBackOnTransportError(t *testing.T) {
 	}
 }
 
-// TestCascadeFallbackReasonHTTPError verifies issue #534: HTTP 5xx/408/429
+// TestCascadeFallbackReasonHTTPError verifies issue #534: HTTP 5xx/408
 // responses from the upstream are labeled "http_error", not "transport_error".
 // transport_error is reserved for real transport-layer failures (DNS, connection
-// refused, etc.).
+// refused, etc.). HTTP 429 is tested separately in TestCascadeFallbackReasonRateLimited.
 func TestCascadeFallbackReasonHTTPError(t *testing.T) {
 	cases := []struct {
 		statusCode int
@@ -268,7 +268,6 @@ func TestCascadeFallbackReasonHTTPError(t *testing.T) {
 	}{
 		{503, "503 Service Unavailable"},
 		{504, "504 Gateway Timeout"},
-		{429, "429 Too Many Requests"},
 		{408, "408 Request Timeout"},
 		{500, "500 Internal Server Error"},
 		{502, "502 Bad Gateway"},
@@ -296,6 +295,32 @@ func TestCascadeFallbackReasonHTTPError(t *testing.T) {
 				t.Errorf("FallbackReason=%q, want http_error for status %d", res.FallbackReason, tc.statusCode)
 			}
 		})
+	}
+}
+
+// TestCascadeFallbackReasonRateLimited verifies issue #750: HTTP 429 responses
+// from the upstream are labeled "rate_limited", not "http_error", so operators
+// can distinguish rate-limiting (transient, likely to resolve quickly) from
+// server errors (may not resolve on their own).
+func TestCascadeFallbackReasonRateLimited(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(429)
+		_, _ = io.WriteString(w, "rate limited")
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.ServedBy != "frontier" {
+		t.Errorf("ServedBy=%q, want frontier", res.ServedBy)
+	}
+	if res.FallbackReason != "rate_limited" {
+		t.Errorf("FallbackReason=%q, want rate_limited for status 429", res.FallbackReason)
 	}
 }
 
