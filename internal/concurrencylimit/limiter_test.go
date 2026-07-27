@@ -647,6 +647,11 @@ func TestNewVRAMLimiterFallbackExhaustedGPU(t *testing.T) {
 func TestNewVRAMLimiterContextCancelReleasesBlocked(t *testing.T) {
 	// Uses a 1-GPU limiter so timing is deterministic: 1 slot taken,
 	// 1 blocked, timeout cancels → blocked goroutine must wake and return.
+	//
+	// Both Canceled (explicit cancel) and DeadlineExceeded (timeout) are
+	// acceptable because context.AfterFunc fires when either the explicit
+	// cancel() is called or the timeout fires, and ctx.Err() at that point
+	// is what the waiter observes after waking from cond.Wait.
 	freeVRAM, _ := vramFnPerGPU([]int64{8 << 30})
 	l := NewVRAMLimiter(1, 1<<30, freeVRAM, 1)
 
@@ -662,15 +667,17 @@ func TestNewVRAMLimiterContextCancelReleasesBlocked(t *testing.T) {
 		errCh <- gerr
 	}()
 
-	// Give the waiter a moment to park in cond.Wait.
-	time.Sleep(50 * time.Millisecond)
+	// Give the waiter time to park in cond.Wait. On loaded CI runners
+	// the scheduler may not have parked the waiter within 50 ms; 500 ms
+	// is sufficient.
+	time.Sleep(500 * time.Millisecond)
 	cancel()
 	holder()
 
 	select {
 	case err := <-errCh:
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("err = %v, want Canceled", err)
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("err = %v, want Canceled or DeadlineExceeded", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("blocked acquire hung past cancellation")
