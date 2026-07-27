@@ -165,32 +165,6 @@ func hasUpperUnicode(s string) bool {
 	return false
 }
 
-// toLowerASCII lowercases ASCII letters only. Kept for backward compatibility
-// with confidence.go. Use toUnicodeLower for Unicode-aware lowercasing.
-func toLowerASCII(s string) string {
-	if !hasUpperASCII(s) {
-		return s
-	}
-	b := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		b[i] = c
-	}
-	return string(b)
-}
-
-func hasUpperASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] >= 'A' && s[i] <= 'Z' {
-			return true
-		}
-	}
-	return false
-}
-
 func stringsContains(s, substr string) bool {
 	return len(substr) == 0 || (len(s) >= len(substr) && indexOf(s, substr) >= 0)
 }

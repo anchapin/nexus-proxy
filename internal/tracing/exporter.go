@@ -100,7 +100,7 @@ const (
 
 // Retry constants for OTLP POST retries with exponential backoff.
 const (
-	maxRetries     = 3                  // retry attempts after the initial attempt
+	maxRetries     = 3 // retry attempts after the initial attempt
 	retryBaseDelay = 100 * time.Millisecond
 	maxRetryDelay  = 2 * time.Second
 )
