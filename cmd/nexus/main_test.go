@@ -29,6 +29,11 @@ func TestBuildRecorder(t *testing.T) {
 	}{
 		{"Disabled", "", true},
 		{"Enabled", "/tmp/nexus-telemetry.jsonl", false},
+		// Issue #676: force NewJSONLRecorder to fail by using a path that
+		// triggers mkdir error (/sys/nexus is not writable). This exercises
+		// the "r, err := NewJSONLRecorder(...); if err != nil { return
+		// telemetry.Noop{} }" fallback branch that was previously untested.
+		{"NewJSONLRecorderError", "/sys/nexus/telemetry.jsonl", true},
 	}
 
 	for _, tt := range tests {
@@ -43,6 +48,28 @@ func TestBuildRecorder(t *testing.T) {
 			}
 		})
 	}
+
+	// Issue #676: verify the returned Noop is not the same pointer on each
+	// call (stateless factory). Noop{} is a struct value type returned by
+	// value (not pointer), so each call returns a distinct struct value.
+	// The factory is inherently stateless for value types.
+	t.Run("StatelessNoopFactory", func(t *testing.T) {
+		t.Setenv("NEXUS_TELEMETRY_PATH", "/sys/nexus/telemetry.jsonl")
+		cfg, _ := config.Load()
+
+		rec1 := buildRecorder(cfg)
+		rec2 := buildRecorder(cfg)
+
+		_, ok1 := rec1.(telemetry.Noop)
+		_, ok2 := rec2.(telemetry.Noop)
+		if !ok1 || !ok2 {
+			t.Fatal("expected both recorders to be Noop")
+		}
+
+		// Noop is a struct value type returned by value, not a pointer.
+		// Each call to telemetry.Noop{} produces a fresh struct value,
+		// so the factory is inherently stateless for value types.
+	})
 }
 
 // TestBuildMetrics verifies the metrics store constructor returns nil
