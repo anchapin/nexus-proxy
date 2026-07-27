@@ -503,3 +503,35 @@ func TestAcquireCancelRaceStopReturns(t *testing.T) {
 	}
 	rel2()
 }
+
+// --- Benchmark: Effective() with disabled limiter ---------------------
+
+// BenchmarkEffectiveDisabled verifies that Effective() returns 0 without
+// calling FreeVRAM when the limiter is disabled (Ceiling <= 0), satisfying
+// the acceptance criterion for issue #688.
+func BenchmarkEffectiveDisabled(b *testing.B) {
+	l := New(0, DefaultBytesPerSlot, func() int64 {
+		b.Fatalf("FreeVRAM should not be called when limiter is disabled")
+		return 0
+	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got := l.Effective(); got != 0 {
+			b.Fatalf("Effective() = %d, want 0 for disabled limiter", got)
+		}
+	}
+}
+
+// BenchmarkEffectiveEnabled measures Effective() overhead when the limiter
+// is enabled, for comparison against the disabled-path benchmark.
+func BenchmarkEffectiveEnabled(b *testing.B) {
+	v := atomic.Int64{}
+	v.Store(8 << 30)
+	l := New(4, 1<<30, v.Load)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got := l.Effective(); got <= 0 {
+			b.Fatalf("Effective() = %d, want > 0 for enabled limiter", got)
+		}
+	}
+}
