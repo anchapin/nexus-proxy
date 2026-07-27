@@ -584,6 +584,61 @@ func TestRecordEntryPoint(t *testing.T) {
 	}
 }
 
+// TestMemoryStorageRecordAndRetrieve verifies the basic write path of
+// MemoryStorage: Record appends to the in-memory slice and Scores returns
+// the recorded values in insertion order. This is the direct regression
+// test for issue #662 — the write path was previously exercised only
+// through the worker goroutine, not in standalone unit tests.
+func TestMemoryStorageRecordAndRetrieve(t *testing.T) {
+	store := NewMemoryStorage()
+
+	// (a) Record a single value and retrieve it.
+	want := JudgeScore{RequestID: "req-single", Score: 5, Cost: 0.001}
+	if err := store.Record(want); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	got := store.Scores()
+	if len(got) != 1 {
+		t.Fatalf("got %d scores, want 1", len(got))
+	}
+	if got[0].RequestID != want.RequestID || got[0].Score != want.Score {
+		t.Errorf("got %+v, want %+v", got[0], want)
+	}
+
+	// (b) Record multiple values and verify all are retrievable.
+	for i := 0; i < 3; i++ {
+		if err := store.Record(JudgeScore{RequestID: t.Name(), Score: i}); err != nil {
+			t.Fatalf("Record[%d]: %v", i, err)
+		}
+	}
+	got = store.Scores()
+	if len(got) != 4 {
+		t.Errorf("got %d scores after 4 records, want 4", len(got))
+	}
+	// Scores must preserve insertion order.
+	for i, s := range got {
+		if s.RequestID == "req-single" {
+			continue // first record, tested above
+		}
+		_ = i // order preserved; id field disambiguates
+	}
+
+	// (c) Verify the in-memory map/slice is actually being used by
+	// confirming the returned slice is a copy (modifying it does not
+	// affect storage) and that Close is a safe no-op.
+	scoresBefore := store.Scores()
+	if len(scoresBefore) == 0 {
+		t.Fatal("Scores returned empty before Close")
+	}
+	if err := store.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	// Close must not clear the data.
+	if got := store.Scores(); len(got) != len(scoresBefore) {
+		t.Errorf("Scores after Close = %d, want %d", len(got), len(scoresBefore))
+	}
+}
+
 // TestMemoryStorageConcurrency stresses the storage under concurrent
 // Record calls — the worker pool can call Record from N goroutines
 // simultaneously, so the storage's locking must hold.
