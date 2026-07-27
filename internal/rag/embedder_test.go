@@ -479,3 +479,111 @@ func TestCohereEmbedder_BoundsResponseBody(t *testing.T) {
 		t.Error("breaker should not be open after a single failure (threshold=5)")
 	}
 }
+
+// TestOpenAIEmbedder_IsHealthy_BreakerOpen verifies that IsHealthy returns false
+// immediately when the circuit breaker is open, without making an HTTP call.
+func TestOpenAIEmbedder_IsHealthy_BreakerOpen(t *testing.T) {
+	var calls atomic.Int32
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer svr.Close()
+
+	emb := NewOpenAIEmbedder(svr.URL, "text-embedding-3-small", "sk-testkey", svr.Client(),
+		BreakerConfig{Threshold: 1, Cooldown: 10 * time.Second})
+
+	ctx := context.Background()
+	// First call trips the breaker.
+	_, _ = emb.Embed(ctx, "trigger")
+	if !emb.IsBreakerOpen() {
+		t.Fatal("breaker should be open after one failure")
+	}
+	// Reset call counter after the triggering call.
+	calls.Store(0)
+
+	// IsHealthy should return false without calling the server.
+	if emb.IsHealthy(ctx) {
+		t.Error("IsHealthy: expected false when breaker is open")
+	}
+	if calls.Load() != 0 {
+		t.Error("IsHealthy: server should not be called when breaker is open")
+	}
+}
+
+// TestOpenAIEmbedder_IsHealthy_ServerError verifies that IsHealthy returns false
+// when the breaker is closed but the server responds with an error.
+func TestOpenAIEmbedder_IsHealthy_ServerError(t *testing.T) {
+	var calls atomic.Int32
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer svr.Close()
+
+	emb := NewOpenAIEmbedder(svr.URL, "text-embedding-3-small", "sk-testkey", svr.Client(),
+		BreakerConfig{Threshold: 3, Cooldown: 10 * time.Second})
+
+	ctx := context.Background()
+	// IsHealthy should call the server, get an error, and return false.
+	if emb.IsHealthy(ctx) {
+		t.Error("IsHealthy: expected false when server returns error")
+	}
+	if calls.Load() != 1 {
+		t.Errorf("IsHealthy: expected 1 server call, got %d", calls.Load())
+	}
+}
+
+// TestCohereEmbedder_IsHealthy_BreakerOpen verifies that IsHealthy returns false
+// immediately when the circuit breaker is open, without making an HTTP call.
+func TestCohereEmbedder_IsHealthy_BreakerOpen(t *testing.T) {
+	var calls atomic.Int32
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer svr.Close()
+
+	emb := NewCohereEmbedder(svr.URL, "embed-english-v3.0", "cohere-key-123", svr.Client(),
+		BreakerConfig{Threshold: 1, Cooldown: 10 * time.Second})
+
+	ctx := context.Background()
+	// First call trips the breaker.
+	_, _ = emb.Embed(ctx, "trigger")
+	if !emb.IsBreakerOpen() {
+		t.Fatal("breaker should be open after one failure")
+	}
+	// Reset call counter after the triggering call.
+	calls.Store(0)
+
+	// IsHealthy should return false without calling the server.
+	if emb.IsHealthy(ctx) {
+		t.Error("IsHealthy: expected false when breaker is open")
+	}
+	if calls.Load() != 0 {
+		t.Error("IsHealthy: server should not be called when breaker is open")
+	}
+}
+
+// TestCohereEmbedder_IsHealthy_ServerError verifies that IsHealthy returns false
+// when the breaker is closed but the server responds with an error.
+func TestCohereEmbedder_IsHealthy_ServerError(t *testing.T) {
+	var calls atomic.Int32
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer svr.Close()
+
+	emb := NewCohereEmbedder(svr.URL, "embed-english-v3.0", "cohere-key-123", svr.Client(),
+		BreakerConfig{Threshold: 3, Cooldown: 10 * time.Second})
+
+	ctx := context.Background()
+	// IsHealthy should call the server, get an error, and return false.
+	if emb.IsHealthy(ctx) {
+		t.Error("IsHealthy: expected false when server returns error")
+	}
+	if calls.Load() != 1 {
+		t.Errorf("IsHealthy: expected 1 server call, got %d", calls.Load())
+	}
+}
