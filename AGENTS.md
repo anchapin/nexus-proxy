@@ -24,15 +24,24 @@ make ci             # vet + build + test + test-race + lint + bench-short
 **Coverage floor is 70%** — CI fails if total drops below `COVERAGE_THRESHOLD`.
 Per-package numbers print for visibility; only the total gates.
 
-**CI gate runs three separate jobs** (`ci.yml`): `test` (vet → build →
+**CI runs four jobs** (`.github/workflows/ci.yml`): `test` (vet → build →
 `go test -race -coverprofile=coverage.txt -covermode=atomic ./...` + coverage
-gate), `bench` (non-blocking `bench-short`), `lint` (`golangci-lint-action@v9`).
-`make ci` is a local convenience wrapper; CI does not invoke it.
+gate), `bench` (non-blocking `bench-short`, `continue-on-error: true`),
+`lint` (`golangci-lint-action@v9`, golangci-lint **v2.12.2**), and `docker`
+(smoke `make docker-build` — catches Dockerfile↔go.mod Go-version drift,
+issue #541). `make ci` is a local convenience wrapper; CI does not invoke it.
 
-**Startup diagnostics:** `nexus check` (alias `nexus doctor`) runs the
-boot-time diagnostic suite and exits. Exits **0 when every check passes**
-(warn/skip are fine), **1 when at least one fails**. Use `--json` for
-machine-readable output. Guarded by `cmd/nexus/doc_test.go` (issue #455).
+**Subcommands** (`cmd/nexus/main.go` dispatches on `os.Args[1]`; no args =
+start the proxy):
+- `nexus check` (alias `nexus doctor`) — boot-time diagnostic suite. Exits
+  **0 when every check passes** (warn/skip are fine), **1 when at least one
+  fails**. `--json` for machine-readable output. Guarded by
+  `cmd/nexus/doc_test.go` (issue #455).
+- `nexus config validate <file>` — parse + validate a YAML config against
+  the same rules as `Load()`. Exits 0/1.
+- `nexus dashboard` — daily savings summary view.
+- `nexus --version` (`-v` / `version`) — build version (`dev` unless
+  `-ldflags -X main.version=...` overrides it; Makefile + release.yml set it).
 
 **Runtime deps are pure-Go / CGO-free:** `modernc.org/sqlite`,
 `fsnotify`, `tiktoken-go`, `golang.org/x/sync`, `gopkg.in/yaml.v3`.
@@ -223,9 +232,10 @@ file values.
 
 `internal/config/env_example_audit_test.go` enforces the `.env.example` ↔
 parser contract bidirectionally (issue #478): code vars must have a
-canonical `.env.example` entry, and vice versa. Eight skip prefixes
+canonical `.env.example` entry, and vice versa. Four skip prefixes
 exempt dynamic-construction vars (`NEXUS_PROVIDER_`, `NEXUS_FRONTIER_`,
-`NEXUS_ZAI_`, `NEXUS_HTTP_`, etc.).
+`NEXUS_ZAI_`, `NEXUS_HTTP_`), plus one exact-match skip
+(`NEXUS_QUALITY_TEST_HOOK`, test-only).
 
 For hot-reloadable knobs add the field to `ReloadHotReloadable()` in
 `config.go`. Sending **SIGHUP** re-reads exactly: log level, log format,
