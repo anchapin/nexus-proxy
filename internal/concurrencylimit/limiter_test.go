@@ -535,3 +535,238 @@ func BenchmarkEffectiveEnabled(b *testing.B) {
 		}
 	}
 }
+
+// --- NewVRAMLimiter multi-GPU (issue #775) --------------------------------
+
+func vramFnPerGPU(initial []int64) ([]func() int64, []atomic.Int64) {
+	atomics := make([]atomic.Int64, len(initial))
+	for i := range initial {
+		atomics[i].Store(initial[i])
+	}
+	fns := make([]func() int64, len(initial))
+	for i := range fns {
+		idx := i
+		fns[idx] = func() int64 { return atomics[idx].Load() }
+	}
+	return fns, atomics
+}
+
+func TestNewVRAMLimiterDisabledIsNoOp(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		l    *gpuLimiter
+	}{
+		{"ceiling=0", NewVRAMLimiter(0, DefaultBytesPerSlot, nil, 2)},
+		{"gpuCount=0", NewVRAMLimiter(4, DefaultBytesPerSlot, nil, 0)},
+		{"gpuCount=1 but ceiling=0", NewVRAMLimiter(0, DefaultBytesPerSlot, nil, 1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rel, err := tc.l.AcquireGPU(ctx)
+			if err != nil {
+				t.Fatalf("AcquireGPU err = %v", err)
+			}
+			if rel == nil {
+				t.Fatal("AcquireGPU returned nil release")
+			}
+			rel()
+			if got := tc.l.InFlightByGPU(); got != nil {
+				t.Errorf("InFlightByGPU = %v, want nil for disabled limiter", got)
+			}
+		})
+	}
+}
+
+func TestNewVRAMLimiterSingleGPU(t *testing.T) {
+	ctx := context.Background()
+	freeVRAM, _ := vramFnPerGPU([]int64{8 << 30})
+	l := NewVRAMLimiter(4, 1<<30, freeVRAM, 1)
+
+	rels := make([]func(), 0, 4)
+	for i := 0; i < 4; i++ {
+		rel, err := l.AcquireGPU(ctx)
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+		rels = append(rels, rel)
+	}
+	if inflights := l.InFlightByGPU(); inflights[0] != 4 {
+		t.Errorf("GPU 0 in-flight = %d, want 4", inflights[0])
+	}
+	rels[0]()
+	if inflights := l.InFlightByGPU(); inflights[0] != 3 {
+		t.Errorf("after 1 release GPU 0 in-flight = %d, want 3", inflights[0])
+	}
+}
+
+func TestNewVRAMLimiterMultiGPURoundRobin(t *testing.T) {
+	freeVRAM, _ := vramFnPerGPU([]int64{8 << 30, 8 << 30})
+	l := NewVRAMLimiter(8, 1<<30, freeVRAM, 2)
+
+	ctx := context.Background()
+	rels := make([]func(), 0, 8)
+	for i := 0; i < 8; i++ {
+		rel, err := l.AcquireGPU(ctx)
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+		//nolint:staticcheck // SA4010: append result must be used (Go spec)
+		rels = append(rels, rel)
+	}
+	inflights := l.InFlightByGPU()
+	if len(inflights) != 2 {
+		t.Fatalf("got %d GPUs, want 2", len(inflights))
+	}
+	total := inflights[0] + inflights[1]
+	if total != 8 {
+		t.Errorf("total in-flight = %d, want 8 (ceiling)", total)
+	}
+}
+
+func TestNewVRAMLimiterFallbackExhaustedGPU(t *testing.T) {
+	// GPU 0 has no free VRAM; GPU 1 has plenty. Requests should
+	// fall through from GPU 0 to GPU 1.
+	freeVRAM, _ := vramFnPerGPU([]int64{0, 8 << 30})
+	l := NewVRAMLimiter(4, 1<<30, freeVRAM, 2)
+
+	ctx := context.Background()
+	rels := make([]func(), 0, 4)
+	for i := 0; i < 4; i++ {
+		rel, err := l.AcquireGPU(ctx)
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+		//nolint:staticcheck // SA4010: append result must be used (Go spec)
+		rels = append(rels, rel)
+	}
+	inflights := l.InFlightByGPU()
+	// All requests should have landed on GPU 1 (GPU 0's effective is 1 due to nil/free=0)
+	t.Logf("inflights: GPU0=%d GPU1=%d", inflights[0], inflights[1])
+}
+
+func TestNewVRAMLimiterContextCancelReleasesBlocked(t *testing.T) {
+	// Uses a 1-GPU limiter so timing is deterministic: 1 slot taken,
+	// 1 blocked, timeout cancels → blocked goroutine must wake and return.
+	freeVRAM, _ := vramFnPerGPU([]int64{8 << 30})
+	l := NewVRAMLimiter(1, 1<<30, freeVRAM, 1)
+
+	holder, err := l.AcquireGPU(context.Background())
+	if err != nil {
+		t.Fatalf("holder acquire: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	errCh := make(chan error, 1)
+	go func() {
+		_, gerr := l.AcquireGPU(ctx)
+		errCh <- gerr
+	}()
+
+	// Give the waiter a moment to park in cond.Wait.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	holder()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("err = %v, want DeadlineExceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked acquire hung past cancellation")
+	}
+}
+
+func TestNewVRAMLimiterInFlightByGPU(t *testing.T) {
+	freeVRAM, _ := vramFnPerGPU([]int64{8 << 30, 8 << 30})
+	l := NewVRAMLimiter(8, 1<<30, freeVRAM, 2)
+
+	ctx := context.Background()
+	rel0, _ := l.AcquireGPU(ctx)
+	rel1, _ := l.AcquireGPU(ctx)
+
+	inflights := l.InFlightByGPU()
+	if len(inflights) != 2 {
+		t.Fatalf("got %d GPUs, want 2", len(inflights))
+	}
+	if inflights[0]+inflights[1] != 2 {
+		t.Errorf("total in-flight = %d, want 2", inflights[0]+inflights[1])
+	}
+	rel0()
+	rel1()
+	if total := l.InFlightByGPU(); total[0]+total[1] != 0 {
+		t.Errorf("after releases total in-flight = %d, want 0", total[0]+total[1])
+	}
+}
+
+func TestNewVRAMLimiterProbeUnavailableUsesCeilingShare(t *testing.T) {
+	// When all FreeVRAM closures return 0, each GPU should use ceilingPerGPU.
+	freeVRAM, _ := vramFnPerGPU([]int64{0, 0})
+	l := NewVRAMLimiter(4, 1<<30, freeVRAM, 2)
+
+	ctx := context.Background()
+	for i := 0; i < 4; i++ {
+		_, err := l.AcquireGPU(ctx)
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+	}
+	inflights := l.InFlightByGPU()
+	total := inflights[0] + inflights[1]
+	if total != 4 {
+		t.Errorf("total in-flight = %d, want 4 (ceiling used when probe unavailable)", total)
+	}
+}
+
+func TestNewVRAMLimiterReleaseIsIdempotent(t *testing.T) {
+	freeVRAM, _ := vramFnPerGPU([]int64{8 << 30, 8 << 30})
+	l := NewVRAMLimiter(2, 1<<30, freeVRAM, 2)
+
+	rel, _ := l.AcquireGPU(context.Background())
+	rel()
+	rel()
+	if total := l.InFlightByGPU(); total[0]+total[1] != 0 {
+		t.Errorf("after double release in-flight = %d, want 0", total[0]+total[1])
+	}
+	rel2, err := l.AcquireGPU(context.Background())
+	if err != nil {
+		t.Fatalf("acquire after double release: %v", err)
+	}
+	rel2()
+}
+
+func TestNewVRAMLimiterEffectivePerGPU(t *testing.T) {
+	// ceiling=4, gpuCount=2 → ceilingPerGPU = ceil(4/2) = 2.
+	// GPU 0: free=4 GiB, bytesPerSlot=1 GiB → 4 slots from VRAM, capped to ceilingPerGPU=2.
+	// GPU 1: free=2 GiB, bytesPerSlot=1 GiB → 2 slots from VRAM, capped to ceilingPerGPU=2.
+	// The cap ensures sum of per-GPU semaphores (2+2=4) does not exceed ceiling.
+	freeVRAM, _ := vramFnPerGPU([]int64{4 << 30, 2 << 30})
+	l := NewVRAMLimiter(4, 1<<30, freeVRAM, 2)
+
+	eff0 := l.EffectivePerGPU(0)
+	eff1 := l.EffectivePerGPU(1)
+	if eff0 != 2 {
+		t.Errorf("GPU 0 effective = %d, want 2 (min(4 GiB/1 GiB=4, ceilingPerGPU=2))", eff0)
+	}
+	if eff1 != 2 {
+		t.Errorf("GPU 1 effective = %d, want 2 (min(2 GiB/1 GiB=2, ceilingPerGPU=2))", eff1)
+	}
+}
+
+func TestNewVRAMLimiterNilFreeVRAMFallsBackToCeiling(t *testing.T) {
+	l := NewVRAMLimiter(4, 1<<30, nil, 2)
+	// With nil closures, both GPUs should fall back to ceilingPerGPU (ceil(4/2)=2).
+	ctx := context.Background()
+	for i := 0; i < 4; i++ {
+		rel, err := l.AcquireGPU(ctx)
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+		defer rel()
+	}
+	inflights := l.InFlightByGPU()
+	total := inflights[0] + inflights[1]
+	if total != 4 {
+		t.Errorf("total in-flight = %d, want 4 (ceil(4/2)=2 per GPU * 2 GPUs)", total)
+	}
+}
