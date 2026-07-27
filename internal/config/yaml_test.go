@@ -790,3 +790,57 @@ func TestClampFloatBoundaryConditions(t *testing.T) {
 		})
 	}
 }
+
+func TestParseBoolEnvStr(t *testing.T) {
+	// Tests verify that recognized boolean strings return the correct value,
+	// and that unrecognized strings (typos) return the default.
+	tests := []struct {
+		name    string
+		val     string
+		def     bool
+		want    bool
+		isTypo  bool // if true, this is a typo that should fall through to default
+	}{
+		// Recognized true values
+		{"true_lower", "true", false, true, false},
+		{"TRUE_UPPER", "TRUE", false, true, false},
+		{"True_Mixed", "True", false, true, false},
+		{"one", "1", false, true, false},
+		{"yes_lower", "yes", false, true, false},
+		{"YES_UPPER", "YES", false, true, false},
+		{"on_lower", "on", false, true, false},
+		{"ON_UPPER", "ON", false, true, false},
+		// Recognized false values
+		{"false_lower", "false", true, false, false},
+		{"FALSE_UPPER", "FALSE", true, false, false},
+		{"False_Mixed", "False", true, false, false},
+		{"zero", "0", true, false, false},
+		{"no_lower", "no", true, false, false},
+		{"NO_UPPER", "NO", true, false, false},
+		{"off_lower", "off", true, false, false},
+		{"OFF_UPPER", "OFF", true, false, false},
+		// Whitespace trimming
+		{"spaces_around", "  true  ", false, true, false},
+		{"tab_prefix", "\ton", false, true, false},
+		// Default-return branch (typos / unrecognized values — should return default)
+		{"typo_ture", "ture", false, false, true},
+		{"typo_faalse", "faalse", true, true, true},
+		{"typo_yess", "yess", false, false, true},
+		{"typo_onn", "onn", true, true, true},
+		{"random_string", "random", false, false, true},
+		{"empty_string", "", false, false, true},
+		{"non_boolean_number", "123", false, false, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseBoolEnvStr(tc.val, tc.def)
+			want := tc.def
+			if !tc.isTypo {
+				want = tc.want
+			}
+			if got != want {
+				t.Errorf("parseBoolEnvStr(%q, %v) = %v, want %v", tc.val, tc.def, got, want)
+			}
+		})
+	}
+}
