@@ -714,6 +714,55 @@ func TestBufferedFetchTransportError(t *testing.T) {
 	}
 }
 
+// TestBufferedFetchWithContextMarshalError exercises the json.Marshal
+// failure path in BufferedFetchWithContext (issue #669). A payload
+// containing a chan int cannot be serialized and triggers the
+// "upstream: marshal" error. The response writer must not receive any
+// WriteHeader call on this early error.
+func TestBufferedFetchWithContextMarshalError(t *testing.T) {
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		t.Fatal("transport should not be called on marshal error")
+		return nil, nil
+	})}
+	rw := newJSONRW()
+	// chan int is not JSON-serializable.
+	payload := map[string]interface{}{"model": "m", "unmarshalable": make(chan int)}
+	err := BufferedFetchWithContext(context.Background(), rw, client, "http://x", "", payload)
+	if err == nil {
+		t.Fatal("expected marshal error")
+	}
+	if !strings.Contains(err.Error(), "marshal") {
+		t.Errorf("error = %v, want error mentioning 'marshal'", err)
+	}
+	if rw.status != 0 {
+		t.Errorf("WriteHeader called with status %d on marshal error; expected no WriteHeader", rw.status)
+	}
+}
+
+// TestBufferedFetchWithContextInvalidURL exercises the
+// http.NewRequestWithContext failure path in BufferedFetchWithContext
+// (issue #669). An malformed URL triggers the "upstream: build request"
+// error. The response writer must not receive any WriteHeader call on
+// this early error.
+func TestBufferedFetchWithContextInvalidURL(t *testing.T) {
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		t.Fatal("transport should not be called on invalid URL")
+		return nil, nil
+	})}
+	rw := newJSONRW()
+	// ": invalid URL" causes http.NewRequestWithContext to fail.
+	err := BufferedFetchWithContext(context.Background(), rw, client, ":", "", map[string]interface{}{"model": "m"})
+	if err == nil {
+		t.Fatal("expected build request error")
+	}
+	if !strings.Contains(err.Error(), "build request") {
+		t.Errorf("error = %v, want error mentioning 'build request'", err)
+	}
+	if rw.status != 0 {
+		t.Errorf("WriteHeader called with status %d on build request error; expected no WriteHeader", rw.status)
+	}
+}
+
 func TestBufferedFetchWithContextRespectsMaxResponseBytesLimit(t *testing.T) {
 	ConfigureMaxResponseBytes(1024)
 	defer ResetMaxResponseBytesForTest()
