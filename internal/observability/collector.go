@@ -42,6 +42,12 @@ var ConfidenceBuckets = []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1
 // cosine but defends against a buggy embedder emitting >1).
 var RAGSimilarityBuckets = []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0}
 
+// RateLimitUtilizationBuckets are the histogram bucket upper bounds for
+// per-client rate-limit bucket utilization fractions (issue #746).
+// Quartiles [0.25, 0.50, 0.75, 1.0] let operators see how close each
+// bucket is to its burst limit at the moment of acquisition.
+var RateLimitUtilizationBuckets = []float64{0.25, 0.50, 0.75, 1.0}
+
 // ragSimilarityLabels are the fixed low-cardinality (path, outcome)
 // label pairs used for the RAG similarity histogram (issue #447).
 // Both axes are bounded at construction:
@@ -231,6 +237,16 @@ type Collector struct {
 	// read lock to find the histogram; Histogram.Observe is lock-free.
 	ragSimilarityMu         sync.RWMutex
 	ragSimilarityHistograms map[string]*Histogram // keyed by "path|outcome"
+
+	// --- Rate-limit bucket utilization histogram (issue #746) --------
+	//
+	// Per-bucket-ID utilization histograms. Each histogram records the
+	// fractional token utilization (tokens/burst) at the moment of
+	// acquisition. Histograms are created lazily per bucket so the
+	// hot path is a single read-lock + map lookup; Histogram.Observe
+	// itself is lock-free.
+	rateLimitUtilizationMu         sync.RWMutex
+	rateLimitUtilizationHistograms map[string]*Histogram // keyed by bucketID (hashed IP)
 
 	// --- Embedder circuit breaker instrumentation (issue #423) -----
 	//
@@ -768,6 +784,52 @@ func (c *Collector) RAGSimilarityHistograms() map[string]*Histogram {
 	c.ragSimilarityMu.RLock()
 	defer c.ragSimilarityMu.RUnlock()
 	return c.ragSimilarityHistograms
+}
+
+// --- Rate-limit bucket utilization histogram (issue #746) ---------------
+//
+// ObserveRateLimitUtilization records one utilization observation for the
+// given bucket ID. The utilization value is clamped to [0, 1] so a
+// buggy caller cannot push an observation past the +Inf bucket
+// spuriously. Histograms are created lazily per bucket ID.
+func (c *Collector) ObserveRateLimitUtilization(bucketID string, utilizationPct float64) {
+	if bucketID == "" || c == nil {
+		return
+	}
+	if utilizationPct < 0 {
+		utilizationPct = 0
+	} else if utilizationPct > 1 {
+		utilizationPct = 1
+	}
+	c.rateLimitUtilizationMu.RLock()
+	h, ok := c.rateLimitUtilizationHistograms[bucketID]
+	c.rateLimitUtilizationMu.RUnlock()
+	if !ok || h == nil {
+		c.rateLimitUtilizationMu.Lock()
+		if h, ok = c.rateLimitUtilizationHistograms[bucketID]; !ok || h == nil {
+			h = NewHistogram(RateLimitUtilizationBuckets)
+			if c.rateLimitUtilizationHistograms == nil {
+				c.rateLimitUtilizationHistograms = make(map[string]*Histogram)
+			}
+			c.rateLimitUtilizationHistograms[bucketID] = h
+		}
+		c.rateLimitUtilizationMu.Unlock()
+	}
+	h.Observe(utilizationPct)
+}
+
+// RateLimitUtilizationHistograms returns the per-bucket-ID utilization
+// histograms for rendering. The map is keyed by bucket ID (hashed IP).
+//
+// Returns nil when the collector is not yet initialized. Safe to call
+// from multiple goroutines.
+func (c *Collector) RateLimitUtilizationHistograms() map[string]*Histogram {
+	if c == nil {
+		return nil
+	}
+	c.rateLimitUtilizationMu.RLock()
+	defer c.rateLimitUtilizationMu.RUnlock()
+	return c.rateLimitUtilizationHistograms
 }
 
 // Histogram}

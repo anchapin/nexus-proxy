@@ -265,6 +265,111 @@ func TestMiddleware_SetRejectionHookRemoves(t *testing.T) {
 	}
 }
 
+// TestMiddleware_AllowHookFires verifies that the SetAllowHook
+// callback is invoked once per allowed request (issue #746), before the
+// token is consumed. With burst=2, the first two requests are allowed;
+// the hook must fire exactly twice with a non-empty bucketID and a
+// utilization value in (0, 1].
+func TestMiddleware_AllowHookFires(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 2, resolver) // huge rpm, burst 2
+	var calls []struct {
+		bucketID       string
+		utilizationPct float64
+	}
+	m.SetAllowHook(func(bucketID string, utilizationPct float64) {
+		calls = append(calls, struct {
+			bucketID       string
+			utilizationPct float64
+		}{bucketID, utilizationPct})
+	})
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	for i := 0; i < 4; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", nil)
+		req.RemoteAddr = "10.0.0.1:1000"
+		h.ServeHTTP(rec, req)
+	}
+	if len(calls) != 2 {
+		t.Errorf("allow hook fired %d times, want 2", len(calls))
+	}
+	for i, call := range calls {
+		if call.bucketID == "" {
+			t.Errorf("call %d: bucketID is empty, want non-empty", i)
+		}
+		if call.utilizationPct <= 0 || call.utilizationPct > 1 {
+			t.Errorf("call %d: utilizationPct = %v, want (0, 1]", i, call.utilizationPct)
+		}
+	}
+	// The first allowed request sees a full bucket (tokens=2, burst=2 → 1.0).
+	if calls[0].utilizationPct != 1.0 {
+		t.Errorf("first call utilizationPct = %v, want 1.0", calls[0].utilizationPct)
+	}
+	// The second allowed request sees ~1 token after the first decrement;
+	// a tiny refill may have occurred between the two ServeHTTP calls so we
+	// check the value is approximately 0.5 rather than exact.
+	if calls[1].utilizationPct < 0.49 || calls[1].utilizationPct > 0.51 {
+		t.Errorf("second call utilizationPct = %v, want ~0.5", calls[1].utilizationPct)
+	}
+}
+
+// TestMiddleware_AllowHookNilSafe confirms a middleware with no hook
+// installed still works (no nil-panic on the allow path).
+func TestMiddleware_AllowHookNilSafe(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 1, resolver) // burst 1
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+	h.ServeHTTP(httptest.NewRecorder(), req) // allowed — must not panic
+}
+
+// TestMiddleware_SetAllowHookRemoves confirms passing nil clears a
+// previously installed hook.
+func TestMiddleware_SetAllowHookRemoves(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 1, resolver)
+	var fired int64
+	m.SetAllowHook(func(bucketID string, utilizationPct float64) {
+		atomic.AddInt64(&fired, 1)
+	})
+	m.SetAllowHook(nil)
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if fired != 0 {
+		t.Errorf("hook fired %d after nil removal, want 0", fired)
+	}
+}
+
+// TestMiddleware_AllowHookNotFiredOnRejection verifies the allow hook
+// does NOT fire when a request is rejected (tokens < 1).
+func TestMiddleware_AllowHookNotFiredOnRejection(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 1, resolver) // burst 1
+	var allowed int64
+	m.SetAllowHook(func(bucketID string, utilizationPct float64) {
+		atomic.AddInt64(&allowed, 1)
+	})
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+	h.ServeHTTP(httptest.NewRecorder(), req) // allowed
+	h.ServeHTTP(httptest.NewRecorder(), req) // rejected (429)
+	if allowed != 1 {
+		t.Errorf("allow hook fired %d times on rejected request, want 1", allowed)
+	}
+}
+
 // TestMiddleware_BucketRaceConcurrencyFix verifies issue #248: many
 // concurrent goroutines requesting the same previously-unseen IP must
 // result in exactly one bucket, not one per goroutine.

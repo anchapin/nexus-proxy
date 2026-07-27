@@ -1019,6 +1019,11 @@ func main() {
 		rateLimiter.SetRejectionHook(func() {
 			routeCounters.ObserveRejection(handlers.RejectionRateLimit)
 		})
+		// Issue #746: install the allow hook so bucket utilization is
+		// recorded before the token is consumed.
+		rateLimiter.SetAllowHook(func(bucketID string, utilizationPct float64) {
+			circuitCollector.ObserveRateLimitUtilization(bucketID, utilizationPct)
+		})
 		chatHandler = rateLimiter.Wrap(chatHandler)
 	}
 	mux.Handle("/v1/chat/completions", chatHandler)
