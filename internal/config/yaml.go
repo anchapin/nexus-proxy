@@ -196,7 +196,10 @@ func LoadYAML(path string) (Config, error) {
 	}
 
 	// Seed from YAML values (these are the "soft defaults").
-	cfg := yc.toConfig()
+	cfg, err := yc.toConfig()
+	if err != nil {
+		return Config{}, err
+	}
 
 	// Now apply env overrides on top of the YAML seed.
 	// The logic mirrors Load() but reads from os.Getenv directly
@@ -272,7 +275,11 @@ func LoadYAML(path string) (Config, error) {
 
 	// Logging
 	if v := os.Getenv("NEXUS_LOG_LEVEL"); v != "" {
-		cfg.LogLevel = parseLogLevel(v)
+		logLevel, logLevelErr := parseLogLevel(v)
+		if logLevelErr != nil {
+			return cfg, logLevelErr
+		}
+		cfg.LogLevel = logLevel
 	}
 	if v := os.Getenv("NEXUS_LOG_FORMAT"); v != "" {
 		cfg.LogFormat = parseLogFormat(v)
@@ -867,7 +874,13 @@ func LoadYAML(path string) (Config, error) {
 
 // toConfig converts a YAMLConfig into a Config by applying the same
 // defaults that Load() uses for fields not set in the YAML.
-func (yc YAMLConfig) toConfig() Config {
+func (yc YAMLConfig) toConfig() (Config, error) {
+	// Validate log level early so we can return error if invalid.
+	logLevel, logLevelErr := parseLogLevel(yc.LogLevel)
+	if logLevelErr != nil {
+		return Config{}, logLevelErr
+	}
+
 	cfg := Config{
 		Addr:                   yc.stringDefault(yc.Addr, ":8000"),
 		OllamaURL:              strings.TrimRight(yc.stringDefault(yc.OllamaURL, "http://localhost:11434"), "/"),
@@ -973,7 +986,7 @@ func (yc YAMLConfig) toConfig() Config {
 		PromptInjectionMode: middleware.ParseInjectionMode(yc.PromptInjectionMode),
 		InjectionScanRoles:  parseInjectionScanRoles(yc.stringDefault(yc.InjectionScanRoles, "system")),
 
-		LogLevel:  parseLogLevel(yc.LogLevel),
+		LogLevel:  logLevel,
 		LogFormat: parseLogFormat(yc.LogFormat),
 
 		Debug:          yc.Debug, // defaults to false in toConfig if not set
@@ -1033,7 +1046,7 @@ func (yc YAMLConfig) toConfig() Config {
 		cfg.TrustedProxiesRaw = yc.TrustedProxies
 	}
 
-	return cfg
+	return cfg, nil
 }
 
 // boolFieldDefault applies a default when the YAML field was the zero value.

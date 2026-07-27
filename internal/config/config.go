@@ -1298,7 +1298,11 @@ func Load() (Config, error) {
 	// expectation: JSON to stderr at info level. Operators flip on
 	// debug by setting NEXUS_LOG_LEVEL=debug, and switch to a
 	// human-friendly text handler with NEXUS_LOG_FORMAT=text.
-	cfg.LogLevel = parseLogLevel(os.Getenv("NEXUS_LOG_LEVEL"))
+	logLevel, logLevelErr := parseLogLevel(os.Getenv("NEXUS_LOG_LEVEL"))
+	if logLevelErr != nil {
+		slog.Warn("invalid NEXUS_LOG_LEVEL, using info level", slog.String("reason", logLevelErr.Error()))
+	}
+	cfg.LogLevel = logLevel
 	cfg.LogFormat = parseLogFormat(os.Getenv("NEXUS_LOG_FORMAT"))
 
 	// Debug tracing (issue #33). Off by default so production has
@@ -1826,7 +1830,11 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 	}
 	next.RateLimitBurst = rateBurst
 
-	next.LogLevel = parseLogLevel(os.Getenv("NEXUS_LOG_LEVEL"))
+	logLevel, logLevelErr := parseLogLevel(os.Getenv("NEXUS_LOG_LEVEL"))
+	if logLevelErr != nil {
+		slog.Warn("invalid NEXUS_LOG_LEVEL, using info level", slog.String("reason", logLevelErr.Error()))
+	}
+	next.LogLevel = logLevel
 	next.LogFormat = parseLogFormat(os.Getenv("NEXUS_LOG_FORMAT"))
 	next.Debug = parseBoolEnv("NEXUS_DEBUG", prev.Debug)
 
@@ -1999,19 +2007,20 @@ func (f LogFormat) String() string {
 
 // parseLogLevel maps NEXUS_LOG_LEVEL to a slog.Level. Unknown / unset
 // values fall back to slog.LevelInfo so a stock `.env.example` boots at
-// the same verbosity as before (issue #3).
-func parseLogLevel(raw string) slog.Level {
+// the same verbosity as before (issue #3). Invalid values return
+// slog.LevelInfo with an error so callers can log the misconfiguration.
+func parseLogLevel(raw string) (slog.Level, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "debug":
-		return slog.LevelDebug
+		return slog.LevelDebug, nil
 	case "warn", "warning":
-		return slog.LevelWarn
+		return slog.LevelWarn, nil
 	case "error", "err":
-		return slog.LevelError
+		return slog.LevelError, nil
 	case "", "info":
-		return slog.LevelInfo
+		return slog.LevelInfo, nil
 	default:
-		return slog.LevelInfo
+		return slog.LevelInfo, fmt.Errorf("config: invalid NEXUS_LOG_LEVEL %q", raw)
 	}
 }
 
