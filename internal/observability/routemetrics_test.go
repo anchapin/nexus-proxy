@@ -1106,3 +1106,147 @@ func TestHandlerPanicMetricInScrapeOutput(t *testing.T) {
 		t.Errorf("/metrics output missing %q\nfull output:\n%s", want, body)
 	}
 }
+
+// TestRouteCountersPanelPanic verifies ObservePanelPanic increments the
+// nexus_panel_panics_total counter (issue #309). The method is wired as a
+// closure from the chat-handler hot path (main.go) into panel goroutine
+// panic recovery, so exercising it directly is the only unit-level
+// coverage path.
+func TestRouteCountersPanelPanic(t *testing.T) {
+	rc := NewRouteCounters()
+
+	// Zero-state: HELP/TYPE present, zero value.
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+	for _, frag := range []string{
+		"nexus_panel_panics_total",
+		"# TYPE nexus_panel_panics_total counter",
+		"nexus_panel_panics_total 0\n",
+	} {
+		if !strings.Contains(out, frag) {
+			t.Errorf("zero-state output missing %q\nfull output:\n%s", frag, out)
+		}
+	}
+
+	// Increment and verify the counter reflects the new value.
+	rc.ObservePanelPanic()
+	rc.ObservePanelPanic()
+	rc.ObservePanelPanic()
+
+	sb.Reset()
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo after increments: %v", err)
+	}
+	out = sb.String()
+	if !strings.Contains(out, "nexus_panel_panics_total 3\n") {
+		t.Errorf("expected panel panics counter == 3 in output:\n%s", out)
+	}
+}
+
+// TestRouteCountersPanelPanicNilSafe verifies ObservePanelPanic on a nil
+// receiver is a no-op (must not panic).
+func TestRouteCountersPanelPanicNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObservePanelPanic() // must not panic
+	n, err := rc.WriteTo(&strings.Builder{})
+	if err != nil || n != 0 {
+		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
+	}
+}
+
+// TestRouteCountersArbiterCacheHit verifies ObserveArbiterCacheHit
+// increments the nexus_fusion_arbiter_cache_total family with hit/miss
+// labels (issue #232). The method is wired into the chat-handler hot
+// path via a closure; this is the only direct unit-level coverage.
+func TestRouteCountersArbiterCacheHit(t *testing.T) {
+	rc := NewRouteCounters()
+
+	rc.ObserveArbiterCacheHit(true)  // cache hit
+	rc.ObserveArbiterCacheHit(true)  // cache hit
+	rc.ObserveArbiterCacheHit(false) // cache miss → arbiter invoked
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_fusion_arbiter_cache_total", "metric family header"},
+		{"# TYPE nexus_fusion_arbiter_cache_total counter", "TYPE line"},
+		{`nexus_fusion_arbiter_cache_total{reason="true"} 2`, "two cache hits"},
+		{`nexus_fusion_arbiter_cache_total{reason="false"} 1`, "one cache miss"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+}
+
+// TestRouteCountersArbiterCacheHitNilSafe verifies ObserveArbiterCacheHit
+// on a nil receiver is a no-op (must not panic).
+func TestRouteCountersArbiterCacheHitNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveArbiterCacheHit(true)
+	rc.ObserveArbiterCacheHit(false)
+	n, err := rc.WriteTo(&strings.Builder{})
+	if err != nil || n != 0 {
+		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
+	}
+}
+
+// TestRouteCountersSLMCacheMiss verifies ObserveSLMCacheMiss increments
+// the nexus_slm_cache_misses_total counter (issue #206). The method is
+// invoked from the chat-handler hot path via a closure when the SLM
+// decision cache lookup misses; this is the only direct unit-level
+// coverage path.
+func TestRouteCountersSLMCacheMiss(t *testing.T) {
+	rc := NewRouteCounters()
+
+	// Zero-state: HELP/TYPE present, zero value.
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+	for _, frag := range []string{
+		"nexus_slm_cache_misses_total",
+		"# TYPE nexus_slm_cache_misses_total counter",
+		"nexus_slm_cache_misses_total 0\n",
+	} {
+		if !strings.Contains(out, frag) {
+			t.Errorf("zero-state output missing %q\nfull output:\n%s", frag, out)
+		}
+	}
+
+	// Increment and verify the counter reflects the new value.
+	rc.ObserveSLMCacheMiss()
+	rc.ObserveSLMCacheMiss()
+
+	sb.Reset()
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo after increments: %v", err)
+	}
+	out = sb.String()
+	if !strings.Contains(out, "nexus_slm_cache_misses_total 2\n") {
+		t.Errorf("expected slm cache misses counter == 2 in output:\n%s", out)
+	}
+}
+
+// TestRouteCountersSLMCacheMissNilSafe verifies ObserveSLMCacheMiss on a
+// nil receiver is a no-op (must not panic).
+func TestRouteCountersSLMCacheMissNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveSLMCacheMiss() // must not panic
+	n, err := rc.WriteTo(&strings.Builder{})
+	if err != nil || n != 0 {
+		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
+	}
+}
