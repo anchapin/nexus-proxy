@@ -207,9 +207,14 @@ jobs:
           build_one darwin  arm64 "nexus-${VERSION}-darwin-arm64"
           build_one windows amd64 "nexus-${VERSION}-windows-amd64.exe"
 
+      # ── SBOM generation ─────────────────────────────────────────────
+      # syft is version-pinned to avoid supply-chain risk from main-branch
+      # installs (issue #689). Update to a new release tag periodically,
+      # e.g. after each quarterly syft release, and verify the SBOM
+      # generation step still succeeds before merging.
       - name: Install syft
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.20.0/install.sh \
             | sh -s -- -b /usr/local/bin
 
       - name: Generate per-binary SBOM (SPDX JSON)
