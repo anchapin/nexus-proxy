@@ -282,6 +282,54 @@ func (e testError) Error() string {
 	return e.msg
 }
 
+// TestRedactPanicValue_PartialSecretRedaction verifies that genericSecretRe
+// only redacts up to the first whitespace when a secret value contains spaces.
+// This is a known limitation: regex cannot distinguish between a space that
+// terminates a secret value and a space that is part of an error message
+// containing multiple tokens. See issue #687.
+func TestRedactPanicValue_PartialSecretRedaction(t *testing.T) {
+	tests := []struct {
+		name          string
+		panics        any
+		wantRedact    bool
+		wantRemaining string // substring that should remain after redaction
+		wantRedacted  string // substring that should be redacted
+	}{
+		{
+			name:          "token with space-separated trailing text",
+			panics:        "token=sk-abc def",
+			wantRedact:    true,
+			wantRemaining: "def",    // trailing content after space
+			wantRedacted:  "sk-abc", // only the non-space part is redacted
+		},
+		{
+			name:          "auth_token with space-separated trailing text",
+			panics:        "auth_token=ghp_xxx yyy",
+			wantRedact:    true,
+			wantRemaining: "yyy",     // trailing content after space
+			wantRedacted:  "ghp_xxx", // only the non-space part is redacted
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			redacted, wasRedacted := redactPanicValue(tt.panics)
+			if wasRedacted != tt.wantRedact {
+				t.Errorf("redactPanicValue(%v) wasRedacted=%v, want %v", tt.panics, wasRedacted, tt.wantRedact)
+			}
+			if wasRedacted {
+				// The secret portion should be redacted
+				if strings.Contains(redacted, tt.wantRedacted) {
+					t.Errorf("redactPanicValue(%v) = %q, still contains redacted portion %q", tt.panics, redacted, tt.wantRedacted)
+				}
+				// The non-secret trailing portion should remain
+				if !strings.Contains(redacted, tt.wantRemaining) {
+					t.Errorf("redactPanicValue(%v) = %q, should contain remaining portion %q", tt.panics, redacted, tt.wantRemaining)
+				}
+			}
+		})
+	}
+}
+
 func TestRecover_LogsRedactedPanicWithWarning(t *testing.T) {
 	var buf bytes.Buffer
 	prev := slog.Default()
