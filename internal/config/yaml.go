@@ -173,6 +173,9 @@ type YAMLConfig struct {
 	RateLimitRPM      int    `yaml:"rate_limit_rpm"`
 	RateLimitBurst    int    `yaml:"rate_limit_burst"`
 	RateLimitByAPIKey bool   `yaml:"rate_limit_by_api_key"`
+
+	// Distributed tracing
+	TracingTimeout string `yaml:"tracing_timeout"`
 }
 
 // LoadYAML reads configuration from a YAML file at path, then overlays
@@ -273,6 +276,19 @@ func LoadYAML(path string) (Config, error) {
 			d = DefaultShutdownTimeout
 		}
 		cfg.ShutdownTimeout = d
+	}
+	if v := os.Getenv("NEXUS_TRACING_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT: %w", err)
+		}
+		if d < 0 {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT must not be negative, got %s", d)
+		}
+		if d == 0 {
+			d = DefaultTracingTimeout
+		}
+		cfg.TracingTimeout = d
 	}
 	if v := os.Getenv("NEXUS_TLS_ENABLED"); v != "" {
 		cfg.TLSEnabled = parseBoolEnvStr(v, false)
@@ -1039,6 +1055,8 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		RateLimitRPM:      yc.intDefault(yc.RateLimitRPM, 0),
 		RateLimitBurst:    yc.intDefault(yc.RateLimitBurst, 0),
 		RateLimitByAPIKey: yc.RateLimitByAPIKey,
+
+		TracingTimeout: yc.durationDefault(yc.TracingTimeout, DefaultTracingTimeout),
 	}
 
 	// Embedder type
