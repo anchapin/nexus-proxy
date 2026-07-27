@@ -44,6 +44,24 @@ func TestRejectsWithoutToken(t *testing.T) {
 	}
 }
 
+func TestAuthMissingToken(t *testing.T) {
+	m := NewMiddleware("secret-key", nil, nil, nil)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("no token: status = %d, want 401", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", ct, "application/json")
+	}
+	if rr.Body.String() != `{"error":"missing or malformed Authorization header"}` {
+		t.Errorf("body = %q, want %q", rr.Body.String(), `{"error":"missing or malformed Authorization header"}`)
+	}
+}
+
 func TestRejectsWrongToken(t *testing.T) {
 	m := NewMiddleware("secret-key", nil, nil, nil)
 
@@ -54,6 +72,25 @@ func TestRejectsWrongToken(t *testing.T) {
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Errorf("wrong token: status = %d, want 401", rr.Code)
+	}
+}
+
+func TestAuthInvalidToken(t *testing.T) {
+	m := NewMiddleware("secret-key", nil, nil, nil)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer wrong-key")
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("invalid token: status = %d, want 401", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", ct, "application/json")
+	}
+	if rr.Body.String() != `{"error":"invalid API key"}` {
+		t.Errorf("body = %q, want %q", rr.Body.String(), `{"error":"invalid API key"}`)
 	}
 }
 
