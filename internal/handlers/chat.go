@@ -1574,18 +1574,18 @@ func Chat(d Deps) http.Handler {
 			} else {
 				// Legacy path: build cascade from config (frontier + z.ai).
 				cas = upstream.BuildLocalCascade(upstream.CascadeConfig{
-					LocalURL:      d.Config.OllamaURL,
-					LocalModel:    d.Config.LocalModel,
-					FrontierURL:   d.Config.FrontierURL,
-					FrontierModel: d.Config.FrontierModel,
-					FrontierKey:   d.Config.FrontierKey,
-					ZAIURL:        d.Config.ZAIURL,
-					ZAIModel:      d.Config.ZAIModel,
-					ZAIKey:        d.Config.ZAIKey,
-					Timeout:       d.Config.CascadeTimeout,
-					SkipLocal:     skipLocal,
+					LocalURL:         d.Config.OllamaURL,
+					LocalModel:       d.Config.LocalModel,
+					FrontierURL:      d.Config.FrontierURL,
+					FrontierModel:    d.Config.FrontierModel,
+					FrontierKey:      d.Config.FrontierKey,
+					ZAIURL:           d.Config.ZAIURL,
+					ZAIModel:         d.Config.ZAIModel,
+					ZAIKey:           d.Config.ZAIKey,
+					Timeout:          d.Config.CascadeTimeout,
+					MaxResponseBytes: d.Config.EffectiveCascadeMaxResponseBytes(),
+					SkipLocal:        skipLocal,
 				})
-				cas.MaxResponseBytes = d.Config.EffectiveMaxResponseBytes()
 			}
 
 			// Writer chain (outermost first):

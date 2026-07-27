@@ -71,10 +71,10 @@ type CascadeResult struct {
 	// FallbackReason is the reason label for the cascade_fallback_total
 	// metric (issue #205). It is set whenever a retryable step failure
 	// causes the cascade to fall back to the next step. The value is one
-	// of "timeout", "transport_error", "http_error", "malformed_toolcall",
-	// or "malformed_response". Empty when no fallback occurred (cascade
-	// succeeded on first step or all steps failed without retryable
-	// errors).
+	// of "timeout", "transport_error", "http_error", "rate_limited",
+	// "malformed_toolcall", or "malformed_response". Empty when no
+	// fallback occurred (cascade succeeded on first step or all steps
+	// failed without retryable errors).
 	FallbackReason string
 }
 
@@ -207,6 +207,7 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 	if lastErr == nil {
 		lastErr = errors.New("cascade: no steps attempted")
 	}
+	res.FallbackReason = CascadeFallbackReason(lastErr)
 	return res, fmt.Errorf("cascade: all %d steps failed; last error: %w", len(c.Steps), lastErr)
 }
 
@@ -222,10 +223,11 @@ func classifyFailure(err error) bool {
 
 // CascadeFallbackReason extracts the reason label from err if it is a
 // cascadeErr with a non-empty reason field. The returned string is one
-// of "timeout", "transport_error", "http_error", "malformed_toolcall",
-// "malformed_response", or "unknown". "unknown" is returned when err is
-// nil or the error carries no fallback reason, preventing empty-string
-// label collisions in cascade_fallback_total{reason=""} metrics (issue #664).
+// of "timeout", "transport_error", "http_error", "rate_limited",
+// "malformed_toolcall", "malformed_response", or "unknown". "unknown"
+// is returned when err is nil or the error carries no fallback reason,
+// preventing empty-string label collisions in
+// cascade_fallback_total{reason=""} metrics (issue #664).
 func CascadeFallbackReason(err error) string {
 	if err == nil {
 		return "unknown"
@@ -293,12 +295,11 @@ func (c *Cascade) fetchCascadeStep(ctx context.Context, client Client, step Casc
 	}
 	respBody, _ := ioutils.ReadAllLimited(resp.Body, maxBytes)
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return AssistantMessage{}, "", newCascadeErr(true, "rate_limited", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
+	}
 	if ShouldRetry(resp.StatusCode, nil) {
-		reason := "http_error"
-		if resp.StatusCode == http.StatusTooManyRequests {
-			reason = "rate_limited"
-		}
-		return AssistantMessage{}, "", newCascadeErr(true, reason, "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
+		return AssistantMessage{}, "", newCascadeErr(true, "http_error", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
 	}
 	// Issue #438: A 404 from the local step means the model is missing or
 	// not pulled. Treat as retryable so the cascade falls through to the
@@ -488,6 +489,10 @@ type CascadeConfig struct {
 	ZAIKey        string
 	Timeout       time.Duration
 
+	// MaxResponseBytes caps per-response bodies in the cascade. Zero or
+	// negative falls back to defaultMaxResponseBytes (64 MiB).
+	MaxResponseBytes int
+
 	// SkipLocal removes the local Ollama step from the cascade.
 	// The chat handler sets this when internal/health reports
 	// Ollama is unreachable (issue #8): callers still get the
@@ -531,7 +536,7 @@ func BuildLocalCascade(cfg CascadeConfig) *Cascade {
 			Model:  cfg.ZAIModel,
 		})
 	}
-	return &Cascade{Steps: steps, Timeout: cfg.Timeout}
+	return &Cascade{Steps: steps, Timeout: cfg.Timeout, MaxResponseBytes: cfg.MaxResponseBytes}
 }
 
 const truncateSuffix = "...(truncated)"

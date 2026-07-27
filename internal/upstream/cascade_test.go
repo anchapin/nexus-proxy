@@ -225,6 +225,9 @@ func TestCascadeFallsBackOn429(t *testing.T) {
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
 	}
+	if res.FallbackReason != "rate_limited" {
+		t.Errorf("FallbackReason=%q, want rate_limited", res.FallbackReason)
+	}
 }
 
 func TestCascadeFallsBackOn408(t *testing.T) {
@@ -258,7 +261,8 @@ func TestCascadeFallsBackOnTransportError(t *testing.T) {
 }
 
 // TestCascadeFallbackReasonHTTPError verifies issue #534: HTTP 5xx/408
-// responses from the upstream are labeled "http_error", not "transport_error".
+// (but not 429) responses from the upstream are labeled "http_error", not
+// "transport_error". 429 is labeled "rate_limited" (issue #750).
 // transport_error is reserved for real transport-layer failures (DNS, connection
 // refused, etc.). HTTP 429 is tested separately in TestCascadeFallbackReasonRateLimited.
 func TestCascadeFallbackReasonHTTPError(t *testing.T) {
@@ -305,7 +309,7 @@ func TestCascadeFallbackReasonHTTPError(t *testing.T) {
 func TestCascadeFallbackReasonRateLimited(t *testing.T) {
 	ft := newFakeTransport()
 	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(429)
+		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = io.WriteString(w, "rate limited")
 	})
 	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
@@ -522,6 +526,30 @@ func TestCascadeAllFailReturnsLastError(t *testing.T) {
 	}
 }
 
+func TestCascadeAllFailSetsFallbackReason(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(500)
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(502)
+	})
+	rw := newSSERW()
+	res, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if res.Succeeded {
+		t.Fatal("Succeeded should be false")
+	}
+	if res.FallbackReason == "" {
+		t.Fatal("FallbackReason should be non-empty when all steps fail with retryable errors (issue #740)")
+	}
+	if res.FallbackReason != "http_error" {
+		t.Errorf("FallbackReason=%q, want http_error", res.FallbackReason)
+	}
+}
+
 func TestCascadeNonRetryableStopsImmediately(t *testing.T) {
 	// Primary returns 401 — retrying won't help, so cascade should not
 	// call the fallback.
@@ -672,6 +700,17 @@ func TestBuildLocalCascadeSkipsMissingKeys(t *testing.T) {
 	})
 	if len(cas.Steps) != 1 {
 		t.Errorf("Steps = %d, want 1 (only local)", len(cas.Steps))
+	}
+}
+
+func TestBuildLocalCascadeRespectsMaxResponseBytes(t *testing.T) {
+	cas := BuildLocalCascade(CascadeConfig{
+		LocalURL:         "http://localhost:11434",
+		LocalModel:       "qwen3-coder:8b",
+		MaxResponseBytes: 12345,
+	})
+	if cas.MaxResponseBytes != 12345 {
+		t.Errorf("MaxResponseBytes = %d, want 12345", cas.MaxResponseBytes)
 	}
 }
 

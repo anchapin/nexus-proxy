@@ -4,6 +4,8 @@
 package ratelimit
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -33,6 +35,7 @@ type Middleware struct {
 	rpm      int           // steady-state requests per minute
 	burst    int           // bucket capacity
 	ttl      time.Duration // idle bucket retention before reaping
+	stopCh   chan struct{} // closed when reaper should exit
 
 	// onReject, when non-nil, is invoked once for each request the
 	// middleware rejects with 429 (issue #119). It is intended for
@@ -40,6 +43,13 @@ type Middleware struct {
 	// request goroutine calls it inline. Set via SetRejectionHook
 	// after construction so NewMiddleware stays a pure constructor.
 	onReject func()
+
+	// onAllow, when non-nil, is invoked once for each request the
+	// middleware allows (issue #746). It receives the hashed bucket ID
+	// and the fractional token utilization (tokens/burst) at the moment
+	// of acquisition, before the token is consumed. Intended for the
+	// rate-limit bucket utilization histogram. Must not block.
+	onAllow func(bucketID string, utilizationPct float64)
 
 	mu      sync.Mutex
 	buckets map[string]*bucket
@@ -75,6 +85,7 @@ func NewMiddleware(rpm, burst int, resolver *ClientIPResolver) *Middleware {
 		rpm:      rpm,
 		burst:    burst,
 		ttl:      10 * time.Minute, // reap buckets idle for 10 min
+		stopCh:   make(chan struct{}),
 		buckets:  make(map[string]*bucket),
 	}
 }
@@ -91,6 +102,25 @@ func (m *Middleware) SetRejectionHook(fn func()) {
 	m.onReject = fn
 }
 
+// SetAllowHook installs a callback invoked once per allowed request
+// before the token is consumed (issue #746). fn receives the hashed
+// bucket ID and the fractional token utilization (tokens/burst) at the
+// moment of acquisition. Pass nil to remove a previously installed hook.
+func (m *Middleware) SetAllowHook(fn func(bucketID string, utilizationPct float64)) {
+	if m == nil {
+		return
+	}
+	m.onAllow = fn
+}
+
+// bucketID returns a SHA256 hash of ip truncated to 8 hex characters,
+// suitable for use as a high-cardinality-safe bucket identifier in
+// telemetry labels.
+func bucketID(ip string) string {
+	h := sha256.Sum256([]byte(ip))
+	return hex.EncodeToString(h[:4])
+}
+
 // Wrap returns an http.Handler that applies the rate limit before
 // delegating to next. A disabled middleware (rpm <= 0) returns next
 // unchanged so the hot path is zero-cost when rate limiting is off.
@@ -98,9 +128,9 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 	if m == nil || m.rpm <= 0 {
 		return next
 	}
-	// Kick off the idle-bucket reaper once. It stops itself when the
-	// process exits; there is no Close because the middleware lives for
-	// the lifetime of the server.
+	// Kick off the idle-bucket reaper once. It exits when Close() / Stop()
+	// is called (issue #739). The middleware lives for the lifetime of the
+	// server, so Wrap is called exactly once per middleware instance.
 	go m.reaper()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ip := m.resolver.Resolve(r)
@@ -152,6 +182,9 @@ func (m *Middleware) allow(ip string, now time.Time) bool {
 	b.lastSeen = now
 
 	if b.tokens >= 1 {
+		if m.onAllow != nil {
+			m.onAllow(bucketID(ip), float64(b.tokens)/float64(m.burst))
+		}
 		b.tokens--
 		return true
 	}
@@ -188,8 +221,13 @@ func (m *Middleware) bucketFor(ip string, now time.Time) *bucket {
 func (m *Middleware) reaper() {
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
-	for range t.C {
-		m.reap(time.Now())
+	for {
+		select {
+		case <-t.C:
+			m.reap(time.Now())
+		case <-m.stopCh:
+			return
+		}
 	}
 }
 
@@ -207,6 +245,22 @@ func (m *Middleware) reap(now time.Time) {
 			delete(m.buckets, ip)
 		}
 	}
+}
+
+// Stop signals the reaper goroutine to exit. It is safe to call on
+// a disabled limiter (rpm <= 0) or nil limiter; it is a no-op in those
+// cases.
+func (m *Middleware) Stop() {
+	if m == nil || m.rpm <= 0 {
+		return
+	}
+	close(m.stopCh)
+}
+
+// Close is an alias for Stop, provided to mirror the closer interface
+// pattern used by other shutdown-aware components.
+func (m *Middleware) Close() {
+	m.Stop()
 }
 
 // SetRPM updates the steady-state requests per minute. A value <= 0
