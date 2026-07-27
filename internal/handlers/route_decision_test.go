@@ -263,6 +263,7 @@ func (r *recordingRecorder) Record(rec telemetry.Record) {
 	r.mu.Unlock()
 }
 func (r *recordingRecorder) Close() error { return nil }
+func (r *recordingRecorder) Sync()        {}
 func (r *recordingRecorder) snapshot() []telemetry.Record {
 	r.mu.Lock()
 	defer r.mu.Unlock()

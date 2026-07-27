@@ -1522,7 +1522,7 @@ func buildRecorder(cfg config.Config) telemetry.Recorder {
 		slog.Info("telemetry disabled (NEXUS_TELEMETRY_PATH is empty)")
 		return telemetry.Noop{}
 	}
-	r, err := telemetry.NewJSONLRecorder(cfg.TelemetryPath, int64(cfg.TelemetryMaxBytes), cfg.TelemetryMaxFiles)
+	r, err := telemetry.NewJSONLRecorder(cfg.TelemetryPath, int64(cfg.TelemetryMaxBytes), cfg.TelemetryMaxFiles, cfg.TelemetryBufferSize, cfg.TelemetryFlushInterval)
 	if err != nil {
 		slog.Error("telemetry recorder init failed, falling back to Noop", slog.Any("err", err))
 		return telemetry.Noop{}
@@ -1531,10 +1531,16 @@ func buildRecorder(cfg config.Config) telemetry.Recorder {
 		slog.Info("telemetry rotation enabled",
 			slog.Int("max_bytes", cfg.TelemetryMaxBytes),
 			slog.Int("max_files", cfg.TelemetryMaxFiles),
+			slog.Int("buffer_size", cfg.TelemetryBufferSize),
+			slog.Duration("flush_interval", cfg.TelemetryFlushInterval),
 			slog.String("path", r.Path()),
 		)
 	} else {
-		slog.Info("telemetry recording", slog.String("path", r.Path()))
+		slog.Info("telemetry recording",
+			slog.Int("buffer_size", cfg.TelemetryBufferSize),
+			slog.Duration("flush_interval", cfg.TelemetryFlushInterval),
+			slog.String("path", r.Path()),
+		)
 	}
 	return r
 }

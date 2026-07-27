@@ -75,7 +75,7 @@ func approxEqual(a, b, eps float64) bool {
 func TestNewJSONLRecorderCreatesFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nested", "tel.jsonl")
-	r, err := NewJSONLRecorder(path, 0, 0)
+	r, err := NewJSONLRecorder(path, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestNewJSONLRecorderCreatesFile(t *testing.T) {
 func TestJSONLRecorderFilePerms0600(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "tel.jsonl")
-	r, err := NewJSONLRecorder(path, 0, 0)
+	r, err := NewJSONLRecorder(path, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestJSONLRecorderTightensExistingFilePerms(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	r, err := NewJSONLRecorder(path, 0, 0)
+	r, err := NewJSONLRecorder(path, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestJSONLRecorderTightensExistingFilePerms(t *testing.T) {
 func TestJSONLRecorderParentDirPerms0700(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sub", "tel.jsonl")
-	r, err := NewJSONLRecorder(path, 0, 0)
+	r, err := NewJSONLRecorder(path, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}
@@ -145,14 +145,14 @@ func TestJSONLRecorderParentDirPerms0700(t *testing.T) {
 }
 
 func TestNewJSONLRecorderEmptyPathErrors(t *testing.T) {
-	if _, err := NewJSONLRecorder("", 0, 0); err == nil {
+	if _, err := NewJSONLRecorder("", 0, 0, 0, 0); err == nil {
 		t.Error("expected error for empty path")
 	}
 }
 
 func TestJSONLRecorderWritesRow(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tel.jsonl")
-	r, err := NewJSONLRecorder(path, 0, 0)
+	r, err := NewJSONLRecorder(path, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestJSONLRecorderWritesRow(t *testing.T) {
 
 func TestJSONLRecorderAppendsAcrossCalls(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tel.jsonl")
-	r, err := NewJSONLRecorder(path, 0, 0)
+	r, err := NewJSONLRecorder(path, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestJSONLRecorderDoesNotBlockOnFullBuffer(t *testing.T) {
 	// consumer. We achieve this by closing the recorder channel under the
 	// recorder's feet via a small, dedicated stress test.
 	path := filepath.Join(t.TempDir(), "tel.jsonl")
-	r, err := NewJSONLRecorder(path, 0, 0)
+	r, err := NewJSONLRecorder(path, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestJSONLRecorderDropsWhenChannelFull(t *testing.T) {
 	// Hold the consumer busy so the buffer fills, then verify Record drops
 	// (rather than blocking) when the channel is saturated.
 	path := filepath.Join(t.TempDir(), "tel.jsonl")
-	r, err := NewJSONLRecorder(path, 0, 0)
+	r, err := NewJSONLRecorder(path, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}
@@ -463,7 +463,7 @@ func TestNoopRotationsZero(t *testing.T) {
 // rotation counter pinned at zero.
 func TestJSONLRecorderRotationDisabledByDefault(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tel.jsonl")
-	r, err := NewJSONLRecorder(path, 0, 0)
+	r, err := NewJSONLRecorder(path, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}
@@ -491,7 +491,10 @@ func TestJSONLRecorderRotatesAtThreshold(t *testing.T) {
 	lineLen := sampleLineLen(t)
 	path := filepath.Join(t.TempDir(), "tel.jsonl")
 	// Two records fit exactly (2*lineLen); the third crosses the cap.
-	r, err := NewJSONLRecorder(path, int64(2*lineLen), 5)
+	// bufferSize=1 ensures each record is flushed before the next is
+	// processed, which is required for the rotation logic to observe
+	// r.written > 0 and trigger correctly.
+	r, err := NewJSONLRecorder(path, int64(2*lineLen), 5, 1, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}
@@ -522,7 +525,9 @@ func TestJSONLRecorderRotatesAtThreshold(t *testing.T) {
 func TestJSONLRecorderEvictsOldestAtCap(t *testing.T) {
 	lineLen := sampleLineLen(t)
 	path := filepath.Join(t.TempDir(), "tel.jsonl")
-	r, err := NewJSONLRecorder(path, int64(2*lineLen), 2)
+	// bufferSize=1 ensures immediate per-record flush, which is required
+	// for rotation to trigger correctly with small maxBytes thresholds.
+	r, err := NewJSONLRecorder(path, int64(2*lineLen), 2, 1, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}
@@ -564,7 +569,9 @@ func TestJSONLRecorderRotationAcceptance(t *testing.T) {
 	numRecords := 12
 
 	path := filepath.Join(t.TempDir(), "tel.jsonl")
-	r, err := NewJSONLRecorder(path, maxBytes, maxFiles)
+	// bufferSize=1 ensures immediate per-record flush, which is required
+	// for rotation to trigger correctly with small maxBytes thresholds.
+	r, err := NewJSONLRecorder(path, maxBytes, maxFiles, 1, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}
@@ -599,7 +606,7 @@ func TestJSONLRecorderRotatesPreExistingOversizedFile(t *testing.T) {
 	if err := os.WriteFile(path, bytes.Repeat([]byte("a"), 3*lineLen), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	r, err := NewJSONLRecorder(path, int64(2*lineLen), 5)
+	r, err := NewJSONLRecorder(path, int64(2*lineLen), 5, 0, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}
@@ -638,7 +645,7 @@ func TestJSONLRecorderRotationConcurrentSafe(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tel.jsonl")
 	// Large enough cap that the consumer stays fast (few rotations) but
 	// small enough that at least one rotation fires under load.
-	r, err := NewJSONLRecorder(path, int64(400*lineLen), 2)
+	r, err := NewJSONLRecorder(path, int64(400*lineLen), 2, 0, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}
