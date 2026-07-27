@@ -378,11 +378,14 @@ func (h *Health) recordFailure(err error) {
 	wasHealthy := h.healthy.Load()
 	if count >= h.breakerThreshold {
 		if wasHealthy {
-			slog.Warn("ollama health: breaker tripped",
+			args := []any{
 				slog.Int("failures", int(count)),
 				slog.Int("threshold", int(h.breakerThreshold)),
-				slog.Any("err", err),
-			)
+			}
+			if err != nil {
+				args = append(args, slog.Any("err", err))
+			}
+			slog.Warn("ollama health: breaker tripped", args...)
 		}
 		h.healthy.Store(false)
 		// Update currentInterval based on failure count tier.
@@ -400,11 +403,14 @@ func (h *Health) recordFailure(err error) {
 		return
 	}
 	if wasHealthy {
-		slog.Debug("ollama probe failed (below threshold)",
+		args := []any{
 			slog.Int("failures", int(count)),
 			slog.Int("threshold", int(h.breakerThreshold)),
-			slog.Any("err", err),
-		)
+		}
+		if err != nil {
+			args = append(args, slog.Any("err", err))
+		}
+		slog.Debug("ollama probe failed (below threshold)", args...)
 	}
 }
 
