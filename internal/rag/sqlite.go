@@ -76,6 +76,21 @@ var ragMigrations = []string{
 	`ALTER TABLE rag_examples ADD COLUMN dims INTEGER NOT NULL DEFAULT 0`,
 }
 
+// wrapCorruptErr wraps sqlite3 errors with a descriptive message when the
+// error code indicates database corruption (SQLITE_CORRUPT, SQLITE_NOTADB) or
+// an interrupted operation (SQLITE_INTERRUPT), guiding operators toward the
+// correct recovery action instead of an opaque error.
+func wrapCorruptErr(ctx string, err error) error {
+	var sqErr interface{ Code() int }
+	if errors.As(err, &sqErr) {
+		switch sqErr.Code() {
+		case sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_INTERRUPT:
+			return fmt.Errorf("%s: database may be corrupted — backup and re-index: %w", ctx, err)
+		}
+	}
+	return fmt.Errorf("%s: %w", ctx, err)
+}
+
 func runRAGMigrations(ctx context.Context, db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, ragSchemaVersionSQL); err != nil {
 		return fmt.Errorf("rag: create schema_version table: %w", err)
@@ -104,6 +119,10 @@ func runRAGMigrations(ctx context.Context, db *sql.DB) error {
 		return nil
 	} else if err != nil {
 		return fmt.Errorf("rag: read schema version: %w", err)
+	}
+
+	if version > currentSchemaVersion {
+		return fmt.Errorf("rag: schema_version is at %d, which is higher than currentSchemaVersion %d: database may be corrupted or was created by a newer version; backup and re-index", version, currentSchemaVersion)
 	}
 
 	if version >= currentSchemaVersion {
@@ -135,6 +154,8 @@ runMigrations:
 					continue
 				case sqlite3.SQLITE_FULL:
 					return fmt.Errorf("rag: disk full during migration (free up disk space and retry): %w", err)
+				case sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_INTERRUPT:
+					return fmt.Errorf("rag: database may be corrupted — backup and re-index: %w", err)
 				}
 			}
 			return fmt.Errorf("rag: migrate: %w", err)
@@ -204,7 +225,7 @@ func OpenPersistentStore(path string, embedder Embedder, threshold float64) (*Pe
 
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("rag: ping %q: %w", path, err)
+		return nil, wrapCorruptErr(fmt.Sprintf("rag: ping %q", path), err)
 	}
 	// Tighten permissions on the SQLite DB file so an upgrade from a
 	// pre-fix binary locks it down (issue #108).
@@ -213,7 +234,7 @@ func OpenPersistentStore(path string, embedder Embedder, threshold float64) (*Pe
 	}
 	if _, err := db.ExecContext(context.Background(), ragSchema); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("rag: create schema: %w", err)
+		return nil, wrapCorruptErr("rag: create schema", err)
 	}
 	if err := runRAGMigrations(context.Background(), db); err != nil {
 		_ = db.Close()

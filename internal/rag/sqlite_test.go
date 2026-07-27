@@ -529,6 +529,118 @@ func (d *dimEmbedder) IsBreakerOpen() bool            { return false }
 func (d *dimEmbedder) RecordBreakerSuccess()          {}
 func (d *dimEmbedder) Model() string                  { return d.model }
 
+// TestRunRAGMigrations_SchemaVersionIntegrity checks that if schema_version
+// is higher than currentSchemaVersion (e.g., mid-migration crash left an
+// intermediate value), the store refuses to open with a descriptive error
+// instead of trying to re-run the failed migration (issue #672).
+func TestRunRAGMigrations_SchemaVersionIntegrity(t *testing.T) {
+	t.Parallel()
+	dbPath := filepath.Join(t.TempDir(), "rag_future_version.db")
+
+	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=rwc", dbPath))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	// Create v1 schema without running migrations
+	_, err = db.Exec(`
+		CREATE TABLE rag_examples (
+			filename TEXT PRIMARY KEY,
+			content TEXT NOT NULL,
+			embedding BLOB NOT NULL,
+			indexed_at DATETIME NOT NULL
+		)`)
+	if err != nil {
+		t.Fatalf("create v1 schema: %v", err)
+	}
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)`)
+	if err != nil {
+		t.Fatalf("create schema_version: %v", err)
+	}
+	// Set version to currentSchemaVersion + 1 to simulate a mid-migration crash
+	// that left schema_version at a version we don't know how to migrate from.
+	_, err = db.Exec(`INSERT INTO schema_version (version) VALUES (?)`, currentSchemaVersion+1)
+	if err != nil {
+		t.Fatalf("insert future version: %v", err)
+	}
+	db.Close()
+
+	_, err = OpenPersistentStore(dbPath, &stubEmbedder{}, 0.55)
+	if err == nil {
+		t.Fatal("expected error when schema_version > currentSchemaVersion")
+	}
+	if !strings.Contains(err.Error(), "schema_version is at") {
+		t.Errorf("error = %q, want descriptive 'schema_version is at' message", err)
+	}
+	if !strings.Contains(err.Error(), "database may be corrupted") {
+		t.Errorf("error = %q, want 'database may be corrupted' hint", err)
+	}
+	if !strings.Contains(err.Error(), "backup and re-index") {
+		t.Errorf("error = %q, want 'backup and re-index' recovery hint", err)
+	}
+}
+
+// TestRunRAGMigrations_CORRUPTHandling verifies that SQLITE_CORRUPT
+// during migration returns a descriptive error rather than a generic one
+// (issue #672).
+func TestRunRAGMigrations_CORRUPTHandling(t *testing.T) {
+	t.Parallel()
+	dbPath := filepath.Join(t.TempDir(), "rag_corrupt.db")
+
+	// Create a valid v1 database with an intermediate schema_version (1)
+	// so the next migration will try to ADD COLUMN dims, then corrupt the
+	// file so that SQLITE_CORRUPT fires on the next write.
+	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=rwc", dbPath))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE rag_examples (
+			filename TEXT PRIMARY KEY,
+			content TEXT NOT NULL,
+			embedding BLOB NOT NULL,
+			indexed_at DATETIME NOT NULL
+		)`)
+	if err != nil {
+		t.Fatalf("create v1 schema: %v", err)
+	}
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)`)
+	if err != nil {
+		t.Fatalf("create schema_version: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO schema_version (version) VALUES (1)`)
+	if err != nil {
+		t.Fatalf("insert version 1: %v", err)
+	}
+	db.Close()
+
+	// Corrupt the file header at offset 50: this is still within the
+	// 100-byte SQLite header but corrupting a non-magic-byte offset
+	// may allow the open to succeed while causing SQLITE_CORRUPT on
+	// subsequent operations.
+	f, err := os.OpenFile(dbPath, os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open for corruption: %v", err)
+	}
+	_, err = f.WriteAt([]byte("garbage"), 50)
+	f.Close()
+	if err != nil {
+		t.Fatalf("write corrupt bytes: %v", err)
+	}
+
+	_, err = OpenPersistentStore(dbPath, &stubEmbedder{}, 0.55)
+	if err == nil {
+		t.Fatal("expected error when opening a corrupted database")
+	}
+	// The error may come from the initial schema create or from runRAGMigrations.
+	// Either way it should be descriptive about corruption.
+	if !strings.Contains(err.Error(), "database may be corrupted") {
+		t.Errorf("error = %q, want 'database may be corrupted' message", err)
+	}
+	if !strings.Contains(err.Error(), "backup and re-index") {
+		t.Errorf("error = %q, want 'backup and re-index' recovery hint", err)
+	}
+}
+
 func TestPersistentStore_AlterTableMigration(t *testing.T) {
 	t.Parallel()
 	dbPath := filepath.Join(t.TempDir(), "rag_migration.db")
