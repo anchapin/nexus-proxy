@@ -244,3 +244,33 @@ func TestSpanConcurrentAttributes(t *testing.T) {
 type errFake string
 
 func (e errFake) Error() string { return string(e) }
+
+func TestStatusString(t *testing.T) {
+	if StatusOK.String() != "OK" {
+		t.Errorf("StatusOK.String() = %q, want %q", StatusOK.String(), "OK")
+	}
+	if StatusError.String() != "ERROR" {
+		t.Errorf("StatusError.String() = %q, want %q", StatusError.String(), "ERROR")
+	}
+	if StatusUnset.String() != "UNSET" {
+		t.Errorf("StatusUnset.String() = %q, want %q", StatusUnset.String(), "UNSET")
+	}
+}
+
+func TestStatusValues(t *testing.T) {
+	if StatusUnset != 0 {
+		t.Errorf("StatusUnset = %d, want %d", StatusUnset, 0)
+	}
+	if StatusOK != 1 {
+		t.Errorf("StatusOK = %d, want %d", StatusOK, 1)
+	}
+	if StatusError != 2 {
+		t.Errorf("StatusError = %d, want %d", StatusError, 2)
+	}
+	if StatusUnset >= StatusOK {
+		t.Errorf("StatusUnset >= StatusOK, want StatusUnset < StatusOK")
+	}
+	if StatusOK >= StatusError {
+		t.Errorf("StatusOK >= StatusError, want StatusOK < StatusError")
+	}
+}
