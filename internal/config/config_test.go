@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"log/slog"
 	"testing"
 	"time"
@@ -1263,4 +1264,150 @@ func TestFrontierProviders(t *testing.T) {
 			t.Fatalf("zero-value Config FrontierProviders() = %v, want empty", got)
 		}
 	})
+}
+
+// TestNewLogger_TextFormat verifies that LogFormatText produces a *slog.TextHandler.
+func TestNewLogger_TextFormat(t *testing.T) {
+	cfg := Config{LogFormat: LogFormatText, LogLevel: slog.LevelInfo}
+	logger := cfg.NewLogger()
+	if logger == nil {
+		t.Fatal("NewLogger returned nil")
+	}
+	h := logger.Handler()
+	textHandler, ok := h.(*slog.TextHandler)
+	if !ok {
+		t.Fatalf("handler type = %T, want *slog.TextHandler", h)
+	}
+	if textHandler == nil {
+		t.Error("textHandler is nil")
+	}
+}
+
+// TestNewLogger_JSONFormat verifies that LogFormatJSON produces a *slog.JSONHandler.
+func TestNewLogger_JSONFormat(t *testing.T) {
+	cfg := Config{LogFormat: LogFormatJSON, LogLevel: slog.LevelInfo}
+	logger := cfg.NewLogger()
+	if logger == nil {
+		t.Fatal("NewLogger returned nil")
+	}
+	h := logger.Handler()
+	jsonHandler, ok := h.(*slog.JSONHandler)
+	if !ok {
+		t.Fatalf("handler type = %T, want *slog.JSONHandler", h)
+	}
+	if jsonHandler == nil {
+		t.Error("jsonHandler is nil")
+	}
+}
+
+// TestNewLogger_UnknownFormatFallsBackToJSON verifies that an unknown LogFormat
+// value falls back to JSON handler.
+func TestNewLogger_UnknownFormatFallsBackToJSON(t *testing.T) {
+	// Invalid format value (iota starts at 0 = LogFormatJSON, so 99 is invalid).
+	cfg := Config{LogFormat: LogFormat(99), LogLevel: slog.LevelInfo}
+	logger := cfg.NewLogger()
+	if logger == nil {
+		t.Fatal("NewLogger returned nil")
+	}
+	h := logger.Handler()
+	if _, ok := h.(*slog.JSONHandler); !ok {
+		t.Fatalf("handler type = %T, want *slog.JSONHandler (fallback)", h)
+	}
+}
+
+// TestNewLogger_LevelDebug verifies that LogLevel=Debug is respected.
+// A Debug logger logs everything (all levels >= Debug).
+func TestNewLogger_LevelDebug(t *testing.T) {
+	cfg := Config{LogFormat: LogFormatText, LogLevel: slog.LevelDebug}
+	logger := cfg.NewLogger()
+	if logger == nil {
+		t.Fatal("NewLogger returned nil")
+	}
+	ctx := context.Background()
+	if !logger.Enabled(ctx, slog.LevelDebug) {
+		t.Error("Enabled(LevelDebug) = false, want true")
+	}
+	// A Debug logger (level -4) also logs Info, Warn, Error (all >= -4).
+	if !logger.Enabled(ctx, slog.LevelInfo) {
+		t.Error("Enabled(LevelInfo) = false, want true for Debug logger")
+	}
+	if !logger.Enabled(ctx, slog.LevelWarn) {
+		t.Error("Enabled(LevelWarn) = false, want true for Debug logger")
+	}
+}
+
+// TestNewLogger_LevelWarn verifies that LogLevel=Warn is respected.
+// A Warn logger logs Warn and Error but not Debug or Info.
+func TestNewLogger_LevelWarn(t *testing.T) {
+	cfg := Config{LogFormat: LogFormatJSON, LogLevel: slog.LevelWarn}
+	logger := cfg.NewLogger()
+	if logger == nil {
+		t.Fatal("NewLogger returned nil")
+	}
+	ctx := context.Background()
+	if !logger.Enabled(ctx, slog.LevelWarn) {
+		t.Error("Enabled(LevelWarn) = false, want true")
+	}
+	if !logger.Enabled(ctx, slog.LevelError) {
+		t.Error("Enabled(LevelError) = false, want true for Warn logger")
+	}
+	// Debug (-4) and Info (0) are less severe than Warn (4), so not enabled.
+	if logger.Enabled(ctx, slog.LevelDebug) {
+		t.Error("Enabled(LevelDebug) = true, want false for Warn logger")
+	}
+	if logger.Enabled(ctx, slog.LevelInfo) {
+		t.Error("Enabled(LevelInfo) = true, want false for Warn logger")
+	}
+}
+
+// TestNewLogger_LevelError verifies that LogLevel=Error is respected.
+// An Error logger logs only Error messages.
+func TestNewLogger_LevelError(t *testing.T) {
+	cfg := Config{LogFormat: LogFormatText, LogLevel: slog.LevelError}
+	logger := cfg.NewLogger()
+	if logger == nil {
+		t.Fatal("NewLogger returned nil")
+	}
+	ctx := context.Background()
+	if !logger.Enabled(ctx, slog.LevelError) {
+		t.Error("Enabled(LevelError) = false, want true")
+	}
+	// Warn (4) is less severe than Error (8), so not enabled.
+	if logger.Enabled(ctx, slog.LevelWarn) {
+		t.Error("Enabled(LevelWarn) = true, want false for Error logger")
+	}
+}
+
+// TestNewLogger_TextFormatLevelCombination verifies both format and level together.
+func TestNewLogger_TextFormatLevelCombination(t *testing.T) {
+	cfg := Config{LogFormat: LogFormatText, LogLevel: slog.LevelWarn}
+	logger := cfg.NewLogger()
+	if logger == nil {
+		t.Fatal("NewLogger returned nil")
+	}
+	h := logger.Handler()
+	if _, ok := h.(*slog.TextHandler); !ok {
+		t.Fatalf("handler type = %T, want *slog.TextHandler", h)
+	}
+	ctx := context.Background()
+	if !logger.Enabled(ctx, slog.LevelWarn) {
+		t.Error("Enabled(LevelWarn) = false, want true")
+	}
+}
+
+// TestNewLogger_JSONFormatLevelCombination verifies both format and level together.
+func TestNewLogger_JSONFormatLevelCombination(t *testing.T) {
+	cfg := Config{LogFormat: LogFormatJSON, LogLevel: slog.LevelDebug}
+	logger := cfg.NewLogger()
+	if logger == nil {
+		t.Fatal("NewLogger returned nil")
+	}
+	h := logger.Handler()
+	if _, ok := h.(*slog.JSONHandler); !ok {
+		t.Fatalf("handler type = %T, want *slog.JSONHandler", h)
+	}
+	ctx := context.Background()
+	if !logger.Enabled(ctx, slog.LevelDebug) {
+		t.Error("Enabled(LevelDebug) = false, want true")
+	}
 }
