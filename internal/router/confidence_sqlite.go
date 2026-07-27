@@ -230,6 +230,78 @@ func (s *SQLiteConfidenceStore) LocalConfidence(category string) float64 {
 	return frac
 }
 
+// CategoryStats holds the raw aggregate for one task category in the
+// sliding window. It is the unfiltered view used by the stats CLI —
+// the minSamples gate that LocalConfidence applies internally is NOT
+// enforced here so operators can see whether a category has any data
+// at all.
+type CategoryStats struct {
+	Category   string
+	Samples    int
+	Confidence float64 // fraction of samples scoring >= successScore; 0 if no samples
+}
+
+// WindowStats returns per-category aggregates for every fixed Category*
+// constant in the sliding window. Empty categories (no rows) are returned
+// with Samples=0 and Confidence=0 so the stats table can show them with
+// a "—" placeholder. Errors are logged and skipped — a corrupt row does
+// not poison the whole table.
+func (s *SQLiteConfidenceStore) WindowStats() []CategoryStats {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	cutoff := time.Now().UTC().Add(-s.window)
+
+	ctx, cancel := context.WithTimeout(context.Background(), confidenceOpTimeout)
+	defer cancel()
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT
+		    category,
+		    COUNT(*) AS samples,
+		    COALESCE(AVG(CASE WHEN score >= ? THEN 1.0 ELSE 0.0 END), 0) AS confidence
+		FROM routing_outcomes
+		WHERE route = ? AND timestamp > ?
+		GROUP BY category`,
+		s.successScore, string(RouteLocal), cutoff)
+	if err != nil {
+		slog.Warn("confidence: window stats query", slog.Any("err", err))
+		return nil
+	}
+	defer rows.Close()
+
+	// Map from category name → stats. Missing categories get zeroed entries.
+	stats := make(map[string]CategoryStats)
+	for rows.Next() {
+		var cs CategoryStats
+		if err := rows.Scan(&cs.Category, &cs.Samples, &cs.Confidence); err != nil {
+			slog.Warn("confidence: window stats scan", slog.Any("err", err))
+			continue
+		}
+		stats[cs.Category] = cs
+	}
+	if err := rows.Err(); err != nil {
+		slog.Warn("confidence: window stats rows", slog.Any("err", err))
+	}
+
+	// Emit every fixed category so empty ones appear with 0 samples.
+	all := make([]CategoryStats, 0, len(categoryKeywords)+1)
+	for _, kw := range categoryKeywords {
+		if cs, ok := stats[kw.category]; ok {
+			all = append(all, cs)
+		} else {
+			all = append(all, CategoryStats{Category: kw.category})
+		}
+	}
+	// "other" is the fallback; include it last.
+	if cs, ok := stats[CategoryOther]; ok {
+		all = append(all, cs)
+	} else {
+		all = append(all, CategoryStats{Category: CategoryOther})
+	}
+	return all
+}
+
 // Close closes the underlying database. Safe to call multiple times.
 func (s *SQLiteConfidenceStore) Close() error {
 	if s == nil {
