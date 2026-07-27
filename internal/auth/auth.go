@@ -14,6 +14,7 @@ package auth
 
 import (
 	"crypto/subtle"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -67,7 +68,9 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		token := BearerToken(r)
 		if token == "" {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="nexus-proxy"`)
-			http.Error(w, `{"error":"missing or malformed Authorization header"}`, http.StatusUnauthorized)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = fmt.Fprint(w, `{"error":"missing or malformed Authorization header"}`)
 			if m.observer != nil {
 				m.observer.IncAuthRejectedMissing()
 			}
@@ -77,7 +80,9 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		// (issue #228). The == 0 return value means the strings differ.
 		if subtle.ConstantTimeCompare([]byte(token), []byte(m.key)) == 0 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="nexus-proxy", error="invalid_token"`)
-			http.Error(w, `{"error":"invalid API key"}`, http.StatusUnauthorized)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = fmt.Fprint(w, `{"error":"invalid API key"}`)
 			if m.observer != nil {
 				m.observer.IncAuthRejectedInvalid()
 			}
