@@ -462,6 +462,12 @@ type Config struct {
 	// Zero or negative falls back to DefaultMaxResponseBytes.
 	MaxResponseBytes int
 
+	// CascadeMaxResponseBytes caps cascade response bodies. Default 64 MiB.
+	// Independent from MaxResponseBytes so operators can tune cascade
+	// bounds separately (issue #742). Zero or negative falls back to
+	// DefaultMaxResponseBytes.
+	CascadeMaxResponseBytes int
+
 	// Auth brute-force protection (issue #296). Tracks per-client-IP
 	// auth failures and blocks the client after AuthRateLimitBurst
 	// consecutive failures within a sliding AuthRateLimitWindow
@@ -1421,6 +1427,15 @@ func Load() (Config, error) {
 	}
 	cfg.MaxResponseBytes = maxRespBytes
 
+	// CascadeMaxResponseBytes caps cascade response bodies (issue #742).
+	// Independent from MaxResponseBytes so operators can tune cascade bounds
+	// separately. Default 64 MiB. Zero or negative falls back to DefaultMaxResponseBytes.
+	cascadeMaxRespBytes, err := getEnvInt("NEXUS_CASCADE_MAX_RESPONSE_BYTES", DefaultMaxResponseBytes)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.CascadeMaxResponseBytes = cascadeMaxRespBytes
+
 	// Auth brute-force protection (issue #296). Defaults: RPM 5, burst 3,
 	// window 5 min. When RPM <= 0 the limiter is disabled so a stock
 	// deployment with no NEXUS_AUTH_RATE_LIMIT_RPM is byte-for-byte
@@ -1578,6 +1593,16 @@ func (c Config) EffectiveMaxBodyBytes() int {
 func (c Config) EffectiveMaxResponseBytes() int {
 	if c.MaxResponseBytes > 0 {
 		return c.MaxResponseBytes
+	}
+	return DefaultMaxResponseBytes
+}
+
+// EffectiveCascadeMaxResponseBytes returns the cascade response-body cap.
+// Zero or negative values fall back to DefaultMaxResponseBytes so a
+// zero-value Config (e.g. inside unit tests) still gets a sane cap.
+func (c Config) EffectiveCascadeMaxResponseBytes() int {
+	if c.CascadeMaxResponseBytes > 0 {
+		return c.CascadeMaxResponseBytes
 	}
 	return DefaultMaxResponseBytes
 }

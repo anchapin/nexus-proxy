@@ -484,6 +484,10 @@ type CascadeConfig struct {
 	ZAIKey        string
 	Timeout       time.Duration
 
+	// MaxResponseBytes caps per-response bodies in the cascade. Zero or
+	// negative falls back to defaultMaxResponseBytes (64 MiB).
+	MaxResponseBytes int
+
 	// SkipLocal removes the local Ollama step from the cascade.
 	// The chat handler sets this when internal/health reports
 	// Ollama is unreachable (issue #8): callers still get the
@@ -527,7 +531,7 @@ func BuildLocalCascade(cfg CascadeConfig) *Cascade {
 			Model:  cfg.ZAIModel,
 		})
 	}
-	return &Cascade{Steps: steps, Timeout: cfg.Timeout}
+	return &Cascade{Steps: steps, Timeout: cfg.Timeout, MaxResponseBytes: cfg.MaxResponseBytes}
 }
 
 const truncateSuffix = "...(truncated)"
