@@ -4,6 +4,8 @@
 package ratelimit
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -40,6 +42,13 @@ type Middleware struct {
 	// request goroutine calls it inline. Set via SetRejectionHook
 	// after construction so NewMiddleware stays a pure constructor.
 	onReject func()
+
+	// onAllow, when non-nil, is invoked once for each request the
+	// middleware allows (issue #746). It receives the hashed bucket ID
+	// and the fractional token utilization (tokens/burst) at the moment
+	// of acquisition, before the token is consumed. Intended for the
+	// rate-limit bucket utilization histogram. Must not block.
+	onAllow func(bucketID string, utilizationPct float64)
 
 	mu      sync.Mutex
 	buckets map[string]*bucket
@@ -89,6 +98,25 @@ func (m *Middleware) SetRejectionHook(fn func()) {
 		return
 	}
 	m.onReject = fn
+}
+
+// SetAllowHook installs a callback invoked once per allowed request
+// before the token is consumed (issue #746). fn receives the hashed
+// bucket ID and the fractional token utilization (tokens/burst) at the
+// moment of acquisition. Pass nil to remove a previously installed hook.
+func (m *Middleware) SetAllowHook(fn func(bucketID string, utilizationPct float64)) {
+	if m == nil {
+		return
+	}
+	m.onAllow = fn
+}
+
+// bucketID returns a SHA256 hash of ip truncated to 8 hex characters,
+// suitable for use as a high-cardinality-safe bucket identifier in
+// telemetry labels.
+func bucketID(ip string) string {
+	h := sha256.Sum256([]byte(ip))
+	return hex.EncodeToString(h[:4])
 }
 
 // Wrap returns an http.Handler that applies the rate limit before
@@ -152,6 +180,9 @@ func (m *Middleware) allow(ip string, now time.Time) bool {
 	b.lastSeen = now
 
 	if b.tokens >= 1 {
+		if m.onAllow != nil {
+			m.onAllow(bucketID(ip), float64(b.tokens)/float64(m.burst))
+		}
 		b.tokens--
 		return true
 	}

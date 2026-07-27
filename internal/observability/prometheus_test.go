@@ -854,3 +854,65 @@ func TestBuildInfoGauge(t *testing.T) {
 		t.Errorf("build_info value should be 1\ngot:\n%s", out)
 	}
 }
+
+// TestRenderPrometheusRateLimitUtilizationHistogram (issue #746) asserts
+// that the nexus_rate_limit_bucket_utilization histogram is rendered with
+// the correct HELP/TYPE headers and bucket lines when observations have
+// been recorded. Empty histograms must be omitted from the output.
+func TestRenderPrometheusRateLimitUtilizationHistogram(t *testing.T) {
+	c := NewCollector()
+	c.ObserveRateLimitUtilization("abc123", 0.9) // 75-100% quartile
+	c.ObserveRateLimitUtilization("abc123", 0.6) // 50-75% quartile
+	c.ObserveRateLimitUtilization("abc123", 0.3) // 25-50% quartile
+	c.ObserveRateLimitUtilization("def456", 0.1) // 0-25% quartile
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c)
+	out := sb.String()
+
+	wantHeaders := []string{
+		"# HELP nexus_rate_limit_bucket_utilization",
+		"# TYPE nexus_rate_limit_bucket_utilization histogram",
+	}
+	for _, want := range wantHeaders {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+
+	// Bucket lines for abc123 (3 observations: 0.9, 0.6, 0.3).
+	// Cumulative: le=0.25: 0, le=0.5: 1, le=0.75: 2, le=1: 3, +Inf: 3
+	wantBuckets := []string{
+		`nexus_rate_limit_bucket_utilization_bucket{bucket_id="abc123",le="0.25"} 0`,
+		`nexus_rate_limit_bucket_utilization_bucket{bucket_id="abc123",le="0.5"} 1`,
+		`nexus_rate_limit_bucket_utilization_bucket{bucket_id="abc123",le="0.75"} 2`,
+		`nexus_rate_limit_bucket_utilization_bucket{bucket_id="abc123",le="1"} 3`,
+		`nexus_rate_limit_bucket_utilization_bucket{bucket_id="abc123",le="+Inf"} 3`,
+		`nexus_rate_limit_bucket_utilization_sum{bucket_id="abc123"} 1.8`,
+		`nexus_rate_limit_bucket_utilization_count{bucket_id="abc123"} 3`,
+		// def456 has only 1 observation (0.1 <= 0.25).
+		`nexus_rate_limit_bucket_utilization_bucket{bucket_id="def456",le="0.25"} 1`,
+		`nexus_rate_limit_bucket_utilization_bucket{bucket_id="def456",le="0.5"} 1`,
+		`nexus_rate_limit_bucket_utilization_bucket{bucket_id="def456",le="0.75"} 1`,
+		`nexus_rate_limit_bucket_utilization_bucket{bucket_id="def456",le="1"} 1`,
+		`nexus_rate_limit_bucket_utilization_count{bucket_id="def456"} 1`,
+	}
+	for _, want := range wantBuckets {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+}
+
+// TestRenderPrometheusRateLimitUtilizationEmpty verifies that when no
+// observations have been recorded, the renderer must NOT emit the
+// HELP/TYPE header for nexus_rate_limit_bucket_utilization.
+func TestRenderPrometheusRateLimitUtilizationEmpty(t *testing.T) {
+	c := NewCollector()
+	var sb strings.Builder
+	RenderPrometheus(&sb, c)
+	out := sb.String()
+	if strings.Contains(out, "nexus_rate_limit_bucket_utilization") {
+		t.Errorf("fresh collector should not emit nexus_rate_limit_bucket_utilization; got:\n%s", out)
+	}
+}
