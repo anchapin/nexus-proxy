@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -288,6 +289,29 @@ func TestHealthzHandler(t *testing.T) {
 	}
 }
 
+// testStubEmbedder is a minimal rag.Embedder implementation for unit testing
+// buildRAGStore without hitting a live Ollama endpoint.
+type testStubEmbedder struct {
+	vec   []float64
+	err   error
+	calls atomic.Int64
+}
+
+func (s *testStubEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
+	s.calls.Add(1)
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.vec != nil {
+		return s.vec, nil
+	}
+	return []float64{0, 0, 0}, nil
+}
+
+func (s *testStubEmbedder) IsHealthy(context.Context) bool { return true }
+func (s *testStubEmbedder) IsBreakerOpen() bool            { return false }
+func (s *testStubEmbedder) RecordBreakerSuccess()          {}
+
 // TestBuildRAGStore verifies the RAG store constructor falls back to an
 // in-memory store when persistence is disabled.
 func TestBuildRAGStore(t *testing.T) {
@@ -310,6 +334,140 @@ func TestBuildRAGStore(t *testing.T) {
 	store, ps, watcher := buildRAGStore(cfg, emb, ctx)
 	if ps != nil || watcher != nil {
 		t.Error("expected nil persistentStore and watcher for in-memory store")
+	}
+	if store == nil {
+		t.Error("expected non-nil store")
+	}
+}
+
+// TestBuildRAGStore_InvalidDBPath verifies buildRAGStore falls back to an
+// in-memory store and returns nil persistentStore and watcher when the
+// configured RAGDBPath is invalid (non-existent, unreadable parent directory).
+func TestBuildRAGStore_InvalidDBPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	exampleDir := tmpDir + "/examples"
+	if err := os.MkdirAll(exampleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exampleDir+"/example1.txt", []byte("test example"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Use a path in a directory that does not exist and cannot be created
+	// (slash in filename makes it invalid on POSIX).
+	invalidPath := "/proc/fake-dir-that-does-not-exist-for-testing/rag.db"
+
+	emb := &testStubEmbedder{vec: []float64{0, 0, 0}}
+	ctx := context.Background()
+	cfg := config.Config{
+		ExamplesDir:  exampleDir,
+		RAGThreshold: 0.55,
+		RAGDBPath:    invalidPath,
+	}
+
+	store, ps, watcher := buildRAGStore(cfg, emb, ctx)
+	if ps != nil {
+		t.Error("expected nil persistentStore for invalid DB path")
+	}
+	if watcher != nil {
+		t.Error("expected nil watcher for invalid DB path")
+	}
+	if store == nil {
+		t.Error("expected non-nil in-memory store as fallback")
+	}
+}
+
+// TestBuildRAGStore_LoadOrIndexFails verifies buildRAGStore falls back to an
+// in-memory store when LoadOrIndex fails (e.g., ExamplesDir is a file, not a
+// directory, causing ReadDir to fail).
+func TestBuildRAGStore_LoadOrIndexFails(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Create a file (not a directory) to use as ExamplesDir.
+	// IndexDir will succeed opening it via os.Stat, but os.ReadDir will fail
+	// because it is not a directory — this propagates as an error from
+	// IndexDir → LoadOrIndex, triggering the fallback path.
+	examplesFile := tmpDir + "/not-a-directory.txt"
+	if err := os.WriteFile(examplesFile, []byte("I am not a directory"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := tmpDir + "/rag.db"
+	emb := &testStubEmbedder{vec: []float64{0, 0, 0}}
+	ctx := context.Background()
+	cfg := config.Config{
+		ExamplesDir:  examplesFile,
+		RAGThreshold: 0.55,
+		RAGDBPath:    dbPath,
+	}
+
+	store, ps, watcher := buildRAGStore(cfg, emb, ctx)
+	if ps != nil {
+		t.Error("expected nil persistentStore after LoadOrIndex failure")
+	}
+	if watcher != nil {
+		t.Error("expected nil watcher after LoadOrIndex failure")
+	}
+	if store == nil {
+		t.Error("expected non-nil in-memory store as fallback after LoadOrIndex failure")
+	}
+}
+
+// TestBuildRAGStore_WatcherEnabled verifies that when RAGWatcherEnabled() is
+// true (RAGDBPath is set and RAGPollInterval > 0), buildRAGStore returns a
+// non-nil watcher.
+func TestBuildRAGStore_WatcherEnabled(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(tmpDir+"/example1.txt", []byte("test example"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := tmpDir + "/rag.db"
+	emb := &testStubEmbedder{vec: []float64{0, 0, 0}}
+	ctx := context.Background()
+	cfg := config.Config{
+		ExamplesDir:     tmpDir,
+		RAGThreshold:    0.55,
+		RAGDBPath:       dbPath,
+		RAGPollInterval: 1 * time.Second,
+	}
+
+	store, ps, watcher := buildRAGStore(cfg, emb, ctx)
+	if ps == nil {
+		t.Error("expected non-nil persistentStore when watcher is enabled")
+	}
+	if watcher == nil {
+		t.Error("expected non-nil watcher when RAGWatcherEnabled() is true")
+	}
+	if store == nil {
+		t.Error("expected non-nil store")
+	}
+}
+
+// TestBuildRAGStore_WatcherDisabled verifies that when RAGWatcherEnabled() is
+// false (RAGDBPath is set but RAGPollInterval is 0), buildRAGStore returns a
+// nil watcher even though persistence is enabled.
+func TestBuildRAGStore_WatcherDisabled(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(tmpDir+"/example1.txt", []byte("test example"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := tmpDir + "/rag.db"
+	emb := &testStubEmbedder{vec: []float64{0, 0, 0}}
+	ctx := context.Background()
+	cfg := config.Config{
+		ExamplesDir:     tmpDir,
+		RAGThreshold:    0.55,
+		RAGDBPath:       dbPath,
+		RAGPollInterval: 0, // disabled
+	}
+
+	store, ps, watcher := buildRAGStore(cfg, emb, ctx)
+	if ps == nil {
+		t.Error("expected non-nil persistentStore when persistence is enabled")
+	}
+	if watcher != nil {
+		t.Error("expected nil watcher when RAGPollInterval is 0")
 	}
 	if store == nil {
 		t.Error("expected non-nil store")
