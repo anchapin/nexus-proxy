@@ -922,3 +922,118 @@ func TestSLMCache_SetEmbedding_NoSortBelowCapacity(t *testing.T) {
 		}
 	}
 }
+
+func TestSLMCache_EmbedErrorCounter_Set(t *testing.T) {
+	// When Set's embedder returns an error, the embed error counter
+	// must be incremented and the entry stored with nil embedding
+	// (issue #741).
+	errEmbed := &vectorEmbedder{err: errors.New("embedder unavailable")}
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+	ctx := context.Background()
+
+	if got := c.Stats().EmbedErrors; got != 0 {
+		t.Fatalf("initial EmbedErrors = %d, want 0", got)
+	}
+
+	c.Set(ctx, "write a fibonacci function", RouteLocal)
+
+	stats := c.Stats()
+	if stats.EmbedErrors != 1 {
+		t.Errorf("EmbedErrors after Set with embed error = %d, want 1", stats.EmbedErrors)
+	}
+	// Exact match must still work.
+	got, ok, kind := c.Get(ctx, "write a fibonacci function")
+	if !ok || got != RouteLocal || kind != CacheHitExact {
+		t.Errorf("exact match failed after embed error: got (%v, %v, %v), want (RouteLocal, true, CacheHitExact)", got, ok, kind)
+	}
+}
+
+func TestSLMCache_EmbedErrorCounter_Set_Observer(t *testing.T) {
+	// When Set's embedder returns an error, the embed-error observer
+	// must be called (issue #741).
+	errEmbed := &vectorEmbedder{err: errors.New("embedder unavailable")}
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+	ctx := context.Background()
+
+	var called int
+	c.SetEmbedErrorObserver(func() {
+		called++
+	})
+
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteLocal) // another embed error
+
+	if called != 2 {
+		t.Errorf("observer called %d times, want 2", called)
+	}
+}
+
+func TestSLMCache_EmbedErrorCounter_GetSemantic(t *testing.T) {
+	// When getSemantic's embedder returns an error, the embed error
+	// counter must be incremented (issue #741). Use SetEmbedding to
+	// store a pre-computed embedding so Set itself does not call the
+	// failing embedder.
+	errEmbed := &vectorEmbedder{err: errors.New("embedder unavailable")}
+	ctx := context.Background()
+
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+
+	if got := c.Stats().EmbedErrors; got != 0 {
+		t.Fatalf("initial EmbedErrors = %d, want 0", got)
+	}
+
+	// Use SetEmbedding to store entry without triggering embedder.
+	c.SetEmbedding("write a fibonacci function", RouteLocal, []float64{1, 0, 0, 0})
+
+	// Force a semantic get that will fail on the embedding call.
+	_, ok, kind := c.Get(ctx, "different prompt") // triggers getSemantic which errors
+	if ok || kind != "" {
+		t.Errorf("expected miss after embed error, got (ok=%v, kind=%v)", ok, kind)
+	}
+
+	stats := c.Stats()
+	if stats.EmbedErrors != 1 {
+		t.Errorf("EmbedErrors after getSemantic error = %d, want 1", stats.EmbedErrors)
+	}
+}
+
+func TestSLMCache_EmbedErrorCounter_GetSemantic_Observer(t *testing.T) {
+	// When getSemantic's embedder returns an error, the embed-error
+	// observer must be called (issue #741). Use SetEmbedding to store
+	// a pre-computed embedding so Set itself does not call the embedder.
+	errEmbed := &vectorEmbedder{err: errors.New("embedder unavailable")}
+	ctx := context.Background()
+
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+
+	var called int
+	c.SetEmbedErrorObserver(func() {
+		called++
+	})
+
+	// Use SetEmbedding to store entry without triggering embedder.
+	c.SetEmbedding("x", RouteLocal, []float64{1, 0, 0, 0})
+
+	// Now Get triggers getSemantic which calls the failing embedder.
+	_, _, _ = c.Get(ctx, "different prompt")
+
+	if called != 1 {
+		t.Errorf("observer called %d times, want 1", called)
+	}
+}
+
+func TestSLMCache_EmbedErrorObserver_NilSafe(t *testing.T) {
+	// Without an observer registered, Set must still succeed when the
+	// embedder errors (nil observer must not panic).
+	errEmbed := &vectorEmbedder{err: errors.New("embedder unavailable")}
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+	ctx := context.Background()
+
+	c.Set(ctx, "a", RouteLocal) // must not panic
+
+	stats := c.Stats()
+	if stats.EmbedErrors != 1 {
+		t.Errorf("EmbedErrors = %d, want 1", stats.EmbedErrors)
+>>>>>>> 011802c (feat: resolve #741 — add nexus_slm_cache_embedding_errors_total counter)
+	}
+}
