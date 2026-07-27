@@ -503,7 +503,7 @@ func (rc *RouteCounters) ObserveCascadeFallback(reason string) {
 }
 
 // ObserveArbiterCacheHit records an arbiter cache lookup result
-// (issue #232). hit=true means the synthesis was served from cache;
+// (issue #232, #773). hit=true means the synthesis was served from cache;
 // hit=false means the cache missed and the arbiter was invoked.
 // The method is safe for concurrent use and never blocks; nil
 // receivers are a no-op.
@@ -511,9 +511,9 @@ func (rc *RouteCounters) ObserveArbiterCacheHit(hit bool) {
 	if rc == nil {
 		return
 	}
-	label := "false"
+	label := "cache_miss"
 	if hit {
-		label = "true"
+		label = "cache_hit"
 	}
 	rc.mu.Lock()
 	p, ok := rc.arbiterCache[label]

@@ -200,13 +200,14 @@ type Config struct {
 	FusionProgressiveDelivery bool    // true iff NEXUS_FUSION_PROGRESSIVE is unset or "true" (default true)
 	FusionAgreementThreshold  float64 // Jaccard ratio [0,1] above which arbiter is skipped (default 0.85)
 
-	// Fusion arbiter synthesis cache (issue #232). When ArbiterCacheTTL > 0,
-	// arbiter synthesis responses are cached keyed by a hash of
+	// Fusion arbiter synthesis cache (issue #232, #773). When ArbiterCacheTTL > 0,
+	// arbiter synthesis responses are cached keyed by SHA-256 of
 	// (first.Content, second.Content). Subsequent requests with identical
 	// panel-member content return the cached synthesis text instead of
-	// invoking the expensive frontier arbiter call. Set to 0 to disable
-	// the cache (all arbiter calls are made, no caching).
-	ArbiterCacheTTL time.Duration // NEXUS_ARBITER_CACHE_TTL; 0 disables
+	// invoking the expensive frontier arbiter call. ArbiterCacheMaxEntries
+	// caps memory at a fixed entry count with LRU eviction.
+	ArbiterCacheTTL        time.Duration // NEXUS_ARBITER_CACHE_TTL; default 5m (0 disables)
+	ArbiterCacheMaxEntries int           // NEXUS_ARBITER_CACHE_MAX_ENTRIES; default 512
 
 	// Judge-guided adaptive routing (issue #47). Historical judge
 	// scores are aggregated by task category in a SQLite table and fed
@@ -963,16 +964,27 @@ func Load() (Config, error) {
 	}
 	cfg.FusionAgreementThreshold = agreementThreshold
 
-	// Fusion arbiter synthesis cache (issue #232). NEXUS_ARBITER_CACHE_TTL=0
-	// (the default) disables the cache entirely — every disagreement
-	// calls the arbiter. When set to a positive duration, identical
-	// panel-member content within the TTL window returns the cached
-	// synthesis text without calling the arbiter.
-	arbiterCacheTTL, err := getEnvDuration("NEXUS_ARBITER_CACHE_TTL", 0)
+	// Fusion arbiter synthesis cache (issue #232, #773). NEXUS_ARBITER_CACHE_TTL=0
+	// disables the cache entirely — every disagreement calls the arbiter.
+	// When set to a positive duration (default 5m), identical panel-member
+	// content within the TTL window returns the cached synthesis text
+	// without calling the arbiter.
+	arbiterCacheTTL, err := getEnvDuration("NEXUS_ARBITER_CACHE_TTL", 5*time.Minute)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.ArbiterCacheTTL = arbiterCacheTTL
+
+	// Arbiter cache max entries (issue #773). Caps memory at ~512 entries
+	// with simple LRU eviction when the cap is reached.
+	arbiterCacheMax, err := getEnvInt("NEXUS_ARBITER_CACHE_MAX_ENTRIES", 512)
+	if err != nil {
+		return cfg, err
+	}
+	if arbiterCacheMax < 0 {
+		arbiterCacheMax = 0
+	}
+	cfg.ArbiterCacheMaxEntries = arbiterCacheMax
 
 	// Judge-guided adaptive routing (issue #47). Defaults keep the
 	// feature dormant unless the judge is enabled and a DB path is

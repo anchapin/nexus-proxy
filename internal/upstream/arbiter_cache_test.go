@@ -31,7 +31,7 @@ func TestCacheKeySymmetric(t *testing.T) {
 }
 
 func TestArbiterCacheGetSetOrderIndependent(t *testing.T) {
-	cache := NewArbiterCache(5 * time.Minute)
+	cache := NewArbiterCache(5*time.Minute, 0)
 	ttl := 5 * time.Minute
 
 	cache.Set("alpha", "beta", "synthesis result", ttl)
@@ -46,7 +46,7 @@ func TestArbiterCacheGetSetOrderIndependent(t *testing.T) {
 }
 
 func TestArbiterCacheGetSetBasic(t *testing.T) {
-	cache := NewArbiterCache(5 * time.Minute)
+	cache := NewArbiterCache(5*time.Minute, 0)
 	ttl := 5 * time.Minute
 
 	cache.Set("local", "frontier", "arbiter synthesis", ttl)
@@ -61,7 +61,7 @@ func TestArbiterCacheGetSetBasic(t *testing.T) {
 }
 
 func TestArbiterCacheMiss(t *testing.T) {
-	cache := NewArbiterCache(5 * time.Minute)
+	cache := NewArbiterCache(5*time.Minute, 0)
 
 	_, ok := cache.Get("nonexistent", "key")
 	if ok {
@@ -71,7 +71,7 @@ func TestArbiterCacheMiss(t *testing.T) {
 
 func TestArbiterCacheExpiry(t *testing.T) {
 	now := time.Now().UTC()
-	cache := NewArbiterCache(100 * time.Millisecond)
+	cache := NewArbiterCache(100*time.Millisecond, 0)
 	cache.NowFunc = func() time.Time { return now }
 
 	cache.Set("a", "b", "expired synthesis", 50*time.Millisecond)
@@ -90,7 +90,7 @@ func TestArbiterCacheExpiry(t *testing.T) {
 }
 
 func TestArbiterCacheOverwrite(t *testing.T) {
-	cache := NewArbiterCache(5 * time.Minute)
+	cache := NewArbiterCache(5*time.Minute, 0)
 	ttl := 5 * time.Minute
 
 	cache.Set("a", "b", "first", ttl)
@@ -124,19 +124,19 @@ func TestArbiterCacheNil(t *testing.T) {
 }
 
 func TestArbiterCacheEnabled(t *testing.T) {
-	cacheDisabled := NewArbiterCache(0)
+	cacheDisabled := NewArbiterCache(0, 0)
 	if cacheDisabled.Enabled() {
 		t.Error("cache with ttl=0 is enabled, want disabled")
 	}
 
-	cacheEnabled := NewArbiterCache(time.Minute)
+	cacheEnabled := NewArbiterCache(time.Minute, 0)
 	if !cacheEnabled.Enabled() {
 		t.Error("cache with ttl>0 is disabled, want enabled")
 	}
 }
 
 func TestArbiterCacheDelete(t *testing.T) {
-	cache := NewArbiterCache(5 * time.Minute)
+	cache := NewArbiterCache(5*time.Minute, 0)
 	ttl := 5 * time.Minute
 
 	cache.Set("a", "b", "value", ttl)
@@ -155,7 +155,7 @@ func TestArbiterCacheDelete(t *testing.T) {
 }
 
 func TestArbiterCacheLen(t *testing.T) {
-	cache := NewArbiterCache(5 * time.Minute)
+	cache := NewArbiterCache(5*time.Minute, 0)
 	ttl := 5 * time.Minute
 
 	if cache.Len() != 0 {
@@ -179,7 +179,7 @@ func TestArbiterCacheLen(t *testing.T) {
 }
 
 func TestArbiterCachePurge(t *testing.T) {
-	cache := NewArbiterCache(5 * time.Minute)
+	cache := NewArbiterCache(5*time.Minute, 0)
 	ttl := 5 * time.Minute
 
 	cache.Set("a", "b", "v1", ttl)
@@ -203,7 +203,7 @@ func TestArbiterCachePurge(t *testing.T) {
 }
 
 func TestArbiterCacheTTLSeconds(t *testing.T) {
-	cache := NewArbiterCache(300 * time.Second)
+	cache := NewArbiterCache(300*time.Second, 0)
 
 	if cache.TTLSeconds() != 300 {
 		t.Errorf("cache.TTLSeconds() = %d, want 300", cache.TTLSeconds())
@@ -212,5 +212,97 @@ func TestArbiterCacheTTLSeconds(t *testing.T) {
 	nilCache := (*ArbiterCache)(nil)
 	if nilCache.TTLSeconds() != 0 {
 		t.Error("nilCache.TTLSeconds() = nonzero, want 0")
+	}
+}
+
+func TestArbiterCacheMaxEntriesDefault(t *testing.T) {
+	cache := NewArbiterCache(time.Hour, 0)
+	if cache.maxEntries != DefaultArbiterCacheMaxEntries {
+		t.Errorf("maxEntries = %d, want %d", cache.maxEntries, DefaultArbiterCacheMaxEntries)
+	}
+	if cache.MaxEntries() != DefaultArbiterCacheMaxEntries {
+		t.Errorf("MaxEntries() = %d, want %d", cache.MaxEntries(), DefaultArbiterCacheMaxEntries)
+	}
+}
+
+func TestArbiterCacheMaxEntriesEviction(t *testing.T) {
+	cache := NewArbiterCache(time.Hour, 3)
+	ttl := time.Hour
+
+	cache.Set("a", "b", "v1", ttl)
+	cache.Set("c", "d", "v2", ttl)
+	cache.Set("e", "f", "v3", ttl)
+
+	if cache.Len() != 3 {
+		t.Fatalf("setup: cache.Len() = %d, want 3", cache.Len())
+	}
+
+	_, ok := cache.Get("a", "b")
+	if !ok {
+		t.Fatal("setup: cache miss for 'a', 'b' before eviction")
+	}
+
+	cache.Set("g", "h", "v4", ttl)
+
+	if cache.Len() != 3 {
+		t.Errorf("cache.Len() after eviction = %d, want 3", cache.Len())
+	}
+
+	_, ok = cache.Get("a", "b")
+	if !ok {
+		t.Error("cache.Get miss for 'a', 'b' after Set g,h, want hit (a,b was touched via Get, c,d is LRU)")
+	}
+
+	_, ok = cache.Get("c", "d")
+	if ok {
+		t.Error("cache.Get hit for 'c', 'd' after LRU eviction, want miss")
+	}
+
+	_, ok = cache.Get("e", "f")
+	if !ok {
+		t.Error("cache.Get miss for 'e', 'f', want hit")
+	}
+
+	_, ok = cache.Get("g", "h")
+	if !ok {
+		t.Error("cache.Get miss for 'g', 'h' after insertion, want hit")
+	}
+}
+
+func TestArbiterCacheDeleteRemovesFromLRU(t *testing.T) {
+	cache := NewArbiterCache(time.Hour, 3)
+	ttl := time.Hour
+
+	cache.Set("a", "b", "v1", ttl)
+	cache.Set("c", "d", "v2", ttl)
+	cache.Set("e", "f", "v3", ttl)
+
+	cache.Delete("c", "d")
+
+	// Delete removes from items, so after Set g,h (len=2 < maxEntries=3, no eviction)
+	// items = {e,f,g,h} with lru = [e,f,g,h]
+	cache.Set("g", "h", "v4", ttl)
+
+	_, ok := cache.Get("a", "b")
+	if !ok {
+		t.Error("cache.Get miss for 'a', 'b', want hit")
+	}
+
+	// c,d was deleted, should be miss
+	_, ok = cache.Get("c", "d")
+	if ok {
+		t.Error("cache.Get hit for 'c', 'd' after Delete, want miss")
+	}
+
+	// e,f was never evicted
+	_, ok = cache.Get("e", "f")
+	if !ok {
+		t.Error("cache.Get miss for 'e', 'f', want hit")
+	}
+
+	// g,h was just added
+	_, ok = cache.Get("g", "h")
+	if !ok {
+		t.Error("cache.Get miss for 'g', 'h', want hit")
 	}
 }

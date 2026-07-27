@@ -2020,7 +2020,7 @@ func TestPanelCacheHitStream_SetsSSEContentType(t *testing.T) {
 	})
 	client := &http.Client{Transport: ft}
 
-	cache := NewArbiterCache(5 * time.Minute)
+	cache := NewArbiterCache(5*time.Minute, 0)
 	cache.Set("local divergent", "frontier divergent", "cached arbiter synthesis", 5*time.Minute)
 
 	rw := newSSERW()
@@ -2085,7 +2085,7 @@ func TestPanelCacheMissWithExpiredEntry_FallsBackToFetch(t *testing.T) {
 		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"live arbiter synthesis\"}}]}\n\n")
 	})
 
-	cache := NewArbiterCache(1 * time.Millisecond)
+	cache := NewArbiterCache(1*time.Millisecond, 0)
 	cache.Set("local divergent", "frontier divergent", "stale cached synthesis", 1*time.Millisecond)
 	time.Sleep(5 * time.Millisecond)
 
@@ -2143,7 +2143,7 @@ func TestPanelCacheHitNonStream_SetsJSONContentType(t *testing.T) {
 	})
 	client := &http.Client{Transport: ft}
 
-	cache := NewArbiterCache(5 * time.Minute)
+	cache := NewArbiterCache(5*time.Minute, 0)
 	cache.Set("local divergent", "frontier divergent", "cached synthesis", 5*time.Minute)
 
 	rw := newJSONRW()
