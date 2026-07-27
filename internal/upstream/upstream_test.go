@@ -2368,3 +2368,37 @@ func TestStreamCachedArbiterSynthesisNonAbortError(t *testing.T) {
 		}
 	}
 }
+
+// TestStreamCachedArbiterSynthesisNonFlusher verifies the non-flusher path
+// in streamCachedArbiterSynthesis and writeSSEDone. When w does not implement
+// http.Flusher, Flush() is skipped silently and the function completes
+// without panicking (issue #668).
+func TestStreamCachedArbiterSynthesisNonFlusher(t *testing.T) {
+	w := newJSONRW()
+	err := streamCachedArbiterSynthesis(w, "test synthesis")
+	if err != nil {
+		t.Fatalf("streamCachedArbiterSynthesis: %v", err)
+	}
+	body := w.body.String()
+	if !strings.Contains(body, `"content":"test synthesis"`) {
+		t.Errorf("body missing synthesis text: %q", body)
+	}
+	if !strings.HasSuffix(body, "data: [DONE]\n\n") {
+		t.Errorf("body does not end with SSE done: %q", body)
+	}
+}
+
+// TestStreamCachedArbiterSynthesisSecondWriteClientAbort verifies that when
+// the second Write call (the JSON chunk) fails with a non-EPIPE error,
+// ErrClientAbort is NOT returned — only IsClientAbort EPIPE should return
+// the sentinel (issue #668).
+func TestStreamCachedArbiterSynthesisSecondWriteClientAbort(t *testing.T) {
+	w := newFailWriteRW(2, io.ErrUnexpectedEOF)
+	err := streamCachedArbiterSynthesis(w, "test synthesis")
+	if errors.Is(err, ErrClientAbort) {
+		t.Errorf("err = ErrClientAbort, want io.ErrUnexpectedEOF")
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("err = %v, want io.ErrUnexpectedEOF", err)
+	}
+}
