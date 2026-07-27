@@ -677,3 +677,56 @@ func TestSLMCache_EvictionReasonConstants(t *testing.T) {
 		t.Errorf("EvictionReasonLRU = %q, want %q", EvictionReasonLRU, "lru")
 	}
 }
+
+// --- Nil-guard accessor tests (issue #663) ---
+
+func TestSLMCache_Enabled_NilReceiver(t *testing.T) {
+	// Enabled must not panic on a nil *SLMCache pointer (issue #663).
+	var c *SLMCache
+	if got := c.Enabled(); got != false {
+		t.Errorf("Enabled() on nil = %v, want false", got)
+	}
+}
+
+func TestSLMCache_TTLSeconds_NilReceiver(t *testing.T) {
+	// TTLSeconds must not panic on a nil *SLMCache pointer (issue #663).
+	var c *SLMCache
+	if got := c.TTLSeconds(); got != 0 {
+		t.Errorf("TTLSeconds() on nil = %v, want 0", got)
+	}
+}
+
+func TestSLMCache_MaxEntries_NilReceiver(t *testing.T) {
+	// MaxEntries must not panic on a nil *SLMCache pointer (issue #663).
+	var c *SLMCache
+	if got := c.MaxEntries(); got != 0 {
+		t.Errorf("MaxEntries() on nil = %v, want 0", got)
+	}
+}
+
+func TestSLMCache_Accessors_NormalCache(t *testing.T) {
+	// Verify accessors return the configured values on a real cache.
+	c := NewSLMCache(60*time.Second, 128)
+
+	if got := c.Enabled(); !got {
+		t.Errorf("Enabled() = %v, want true (TTL=60s)", got)
+	}
+	if got := c.TTLSeconds(); got != 60 {
+		t.Errorf("TTLSeconds() = %v, want 60", got)
+	}
+	if got := c.MaxEntries(); got != 128 {
+		t.Errorf("MaxEntries() = %v, want 128", got)
+	}
+}
+
+func TestSLMCache_Enabled_ZeroTTLDisabled(t *testing.T) {
+	// When TTL is zero (kill-switch via NEXUS_SLM_CACHE_TTL=0),
+	// Enabled must return false even on a real cache.
+	c := NewSLMCache(0, 0) // uses DefaultSLMCacheTTL, so Enabled=true by default
+	// Override ttl to 0 to simulate disabled cache.
+	c.ttl = 0
+
+	if got := c.Enabled(); got != false {
+		t.Errorf("Enabled() with ttl=0 = %v, want false", got)
+	}
+}
