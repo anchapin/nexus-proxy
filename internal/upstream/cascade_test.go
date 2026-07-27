@@ -1161,3 +1161,81 @@ func TestTruncateForLogBoundary(t *testing.T) {
 		t.Errorf("got does not end with suffix: %q", got)
 	}
 }
+
+// --- Issue #665: classifyFailure retry=false branch tests ---------------------
+
+// TestCascadeClassifyFailureNonRetryable verifies that classifyFailure returns
+// false when err is a cascadeErr tagged with retry=false (e.g. 401/403 auth
+// failures). This is the previously untested branch.
+func TestCascadeClassifyFailureNonRetryable(t *testing.T) {
+	cases := []struct {
+		name  string
+		retry bool
+	}{
+		{"retry=false cascadeErr", false},
+		{"retry=false cascadeErr with reason", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var err error
+			if tc.retry {
+				err = newCascadeErr(true, "http_error", "status 500: internal error")
+			} else {
+				err = newCascadeErr(false, "", "status 401: unauthorized")
+			}
+			got := classifyFailure(err)
+			if got != tc.retry {
+				t.Errorf("classifyFailure(_) = %v, want %v", got, tc.retry)
+			}
+		})
+	}
+}
+
+// TestCascadeClassifyFailureRetryable verifies that classifyFailure returns
+// true for both a retryable cascadeErr and a plain error (unknown error).
+func TestCascadeClassifyFailureRetryable(t *testing.T) {
+	// retry=true cascadeErr → classifyFailure returns true
+	retryableErr := newCascadeErr(true, "http_error", "status 503: service unavailable")
+	if got := classifyFailure(retryableErr); !got {
+		t.Errorf("classifyFailure(retryableErr) = %v, want true", got)
+	}
+
+	// plain error (not a cascadeErr) → classifyFailure defaults to true
+	plainErr := errors.New("some network glitch")
+	if got := classifyFailure(plainErr); !got {
+		t.Errorf("classifyFailure(plainErr) = %v, want true", got)
+	}
+
+	// nil error → classifyFailure defaults to true
+	if got := classifyFailure(nil); !got {
+		t.Errorf("classifyFailure(nil) = %v, want true", got)
+	}
+}
+
+// TestCascadeRunAuthErrorSurfacesToCallerWithoutRetry exercises the full Run
+// path with a 401 step and asserts that no retry attempt is made (fallback is
+// never called). This distinguishes non-retryable errors from retryable ones.
+func TestCascadeRunAuthErrorSurfacesToCallerWithoutRetry(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, "unauthorized")
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("fallback should NOT have been called for non-retryable 401")
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	_, err := twoStepCascade().Run(context.Background(), rw, client, map[string]interface{}{"messages": []interface{}{}})
+	if err == nil {
+		t.Fatal("expected error for 401, got nil")
+	}
+	if !strings.Contains(err.Error(), "401") {
+		t.Errorf("err should mention 401: %v", err)
+	}
+	// Primary counter should be exactly 1 — no retry of the primary step.
+	if *ft.counter("http://primary.local/v1/chat/completions") != 1 {
+		t.Errorf("primary counter = %d, want 1 (no retry for auth error)", *ft.counter("http://primary.local/v1/chat/completions"))
+	}
+}
