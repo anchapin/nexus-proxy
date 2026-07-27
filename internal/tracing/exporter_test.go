@@ -600,25 +600,3 @@ func TestExporterNilQueueDepthAndDropped(t *testing.T) {
 		t.Errorf("nil exporter FlushFailures() = %d, want 0", e.FlushFailures())
 	}
 }
-
-// statusCodeTransport is a round-tripper that cycles through a list of status
-// codes for issue #566 retry tests.
-type statusCodeTransport struct {
-	codes   []int
-	cur     atomic.Int32
-	requests atomic.Int32
-}
-
-func (t *statusCodeTransport) RoundTrip(_ *http.Request) (*http.Response, error) {
-	idx := int(t.cur.Add(1)) - 1 // fetchAdd semantics: 0-indexed
-	code := t.codes[idx%len(t.codes)]
-	t.requests.Add(1)
-	return &http.Response{
-		StatusCode: code,
-		Body:       io.NopCloser(strings.NewReader("")),
-	}, nil
-}
-
-func (t *statusCodeTransport) Requests() int { return int(t.requests.Load()) }
-
-

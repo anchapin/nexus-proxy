@@ -795,11 +795,11 @@ func TestParseBoolEnvStr(t *testing.T) {
 	// Tests verify that recognized boolean strings return the correct value,
 	// and that unrecognized strings (typos) return the default.
 	tests := []struct {
-		name    string
-		val     string
-		def     bool
-		want    bool
-		isTypo  bool // if true, this is a typo that should fall through to default
+		name   string
+		val    string
+		def    bool
+		want   bool
+		isTypo bool // if true, this is a typo that should fall through to default
 	}{
 		// Recognized true values
 		{"true_lower", "true", false, true, false},
