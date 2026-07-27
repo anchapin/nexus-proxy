@@ -223,17 +223,21 @@ func classifyFailure(err error) bool {
 // CascadeFallbackReason extracts the reason label from err if it is a
 // cascadeErr with a non-empty reason field. The returned string is one
 // of "timeout", "transport_error", "http_error", "malformed_toolcall",
-// or "malformed_response". Empty string is returned when err is nil or
-// the error carries no fallback reason.
+// "malformed_response", or "unknown". "unknown" is returned when err is
+// nil or the error carries no fallback reason, preventing empty-string
+// label collisions in cascade_fallback_total{reason=""} metrics (issue #664).
 func CascadeFallbackReason(err error) string {
 	if err == nil {
-		return ""
+		return "unknown"
 	}
 	var cf *cascadeErr
 	if errors.As(err, &cf) {
+		if cf.reason == "" {
+			return "unknown"
+		}
 		return cf.reason
 	}
-	return ""
+	return "unknown"
 }
 
 func joinStepNames(steps []CascadeStep) string {

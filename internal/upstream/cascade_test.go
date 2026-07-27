@@ -322,6 +322,35 @@ func TestCascadeFallbackReasonTransportError(t *testing.T) {
 	}
 }
 
+// TestCascadeFallbackReasonUnknown verifies issue #664: CascadeFallbackReason
+// returns "unknown" instead of "" when err is nil, not a cascadeErr, or when
+// the cascadeErr carries an empty reason. Empty-string reason labels cause
+// cascade_fallback_total{reason=""} metric collision in Prometheus.
+func TestCascadeFallbackReasonUnknown(t *testing.T) {
+	// nil error → "unknown"
+	if got := CascadeFallbackReason(nil); got != "unknown" {
+		t.Errorf("CascadeFallbackReason(nil) = %q, want unknown", got)
+	}
+
+	// plain error (not a cascadeErr) → "unknown"
+	plainErr := errors.New("some network glitch")
+	if got := CascadeFallbackReason(plainErr); got != "unknown" {
+		t.Errorf("CascadeFallbackReason(plainErr) = %q, want unknown", got)
+	}
+
+	// cascadeErr with empty reason (non-retryable, e.g. 401 auth failure) → "unknown"
+	nonRetryableErr := newCascadeErr(false, "", "status 401: unauthorized")
+	if got := CascadeFallbackReason(nonRetryableErr); got != "unknown" {
+		t.Errorf("CascadeFallbackReason(nonRetryableErr) = %q, want unknown", got)
+	}
+
+	// cascadeErr with known reason → that reason unchanged
+	retryableErr := newCascadeErr(true, "timeout", "context deadline exceeded")
+	if got := CascadeFallbackReason(retryableErr); got != "timeout" {
+		t.Errorf("CascadeFallbackReason(retryableErr) = %q, want timeout", got)
+	}
+}
+
 func TestCascadeFallsBackOnTimeout(t *testing.T) {
 	// Primary hangs; cascade timeout short-circuits it.
 	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
