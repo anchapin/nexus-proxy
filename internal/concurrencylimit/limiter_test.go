@@ -669,8 +669,8 @@ func TestNewVRAMLimiterContextCancelReleasesBlocked(t *testing.T) {
 
 	select {
 	case err := <-errCh:
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("err = %v, want DeadlineExceeded", err)
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v, want Canceled", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("blocked acquire hung past cancellation")
