@@ -88,14 +88,17 @@ func main() {
 			os.Exit(runConfig(os.Args[2:], os.Stdout, os.Stderr))
 		case "judge":
 			os.Exit(runJudgeStats(os.Args[2:], os.Stdout, os.Stderr))
+		case "routing-preview":
+			os.Exit(runRoutingPreview(os.Args[2:], os.Stdout, os.Stderr))
 		case "-h", "--help", "help":
-			fmt.Fprintln(os.Stderr, "Usage: nexus [check|doctor|config|dashboard|judge]")
+			fmt.Fprintln(os.Stderr, "Usage: nexus [check|doctor|config|dashboard|judge|routing-preview]")
 			fmt.Fprintln(os.Stderr, "")
 			fmt.Fprintln(os.Stderr, "Run with no arguments to start the proxy.")
 			fmt.Fprintln(os.Stderr, "Run `nexus check` to validate boot-time configuration.")
 			fmt.Fprintln(os.Stderr, "Run `nexus dashboard` to view the daily savings summary.")
 			fmt.Fprintln(os.Stderr, "Run `nexus config validate <file>` to validate a config file.")
 			fmt.Fprintln(os.Stderr, "Run `nexus judge stats` to view adaptive routing confidence.")
+			fmt.Fprintln(os.Stderr, "Run `nexus routing-preview \"prompt\"` to preview routing decisions.")
 			fmt.Fprintln(os.Stderr, "Run `nexus --version` to print the build version.")
 			os.Exit(0)
 		case "-v", "--version", "version":
@@ -103,7 +106,7 @@ func main() {
 			os.Exit(0)
 		default:
 			fmt.Fprintf(os.Stderr, "nexus: unknown subcommand %q\n\n", os.Args[1])
-			fmt.Fprintln(os.Stderr, "Usage: nexus [check|doctor|config|dashboard|judge]")
+			fmt.Fprintln(os.Stderr, "Usage: nexus [check|doctor|config|dashboard|judge|routing-preview]")
 			os.Exit(2)
 		}
 	}
