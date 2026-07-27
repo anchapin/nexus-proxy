@@ -1,11 +1,14 @@
 package health
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -504,4 +507,54 @@ func TestRecordFailureBackoffCapsAtMax(t *testing.T) {
 	if got := h.PollingInterval(); got != maxInterval {
 		t.Errorf("PollingInterval after 29 failures = %v, want %v (still capped 15x)", got, maxInterval)
 	}
+}
+
+// TestRecordFailureNilErrOmitsErrField ensures recordFailure(nil) does
+// not render a "<nil>" placeholder in its structured logs. Both the
+// below-threshold debug log and the breaker-tripped warn log must omit
+// the err field entirely when err is nil (issue #697).
+func TestRecordFailureNilErrOmitsErrField(t *testing.T) {
+	// Redirect the default slog logger into an in-memory buffer so we
+	// can assert on the rendered output, then restore the original at
+	// exit to avoid leaking state into sibling tests.
+	orig := slog.Default()
+	defer slog.SetDefault(orig)
+
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	srv := newFlakyServer()
+	defer srv.Close()
+
+	// Below-threshold failure (count < threshold) → debug log path.
+	t.Run("below_threshold_debug", func(t *testing.T) {
+		buf.Reset()
+		// threshold 3 → first failure stays below threshold; wasHealthy=true.
+		h := New(srv.URL, "qwen3-coder:8b", 100*time.Millisecond, 3, time.Second, nil)
+		h.recordFailure(nil) // would previously render err=<nil>
+
+		out := buf.String()
+		if strings.Contains(out, "<nil>") {
+			t.Errorf("below-threshold debug log contains <nil>:\n%s", out)
+		}
+		if !strings.Contains(out, "ollama probe failed (below threshold)") {
+			t.Errorf("expected debug log line, got:\n%s", out)
+		}
+	})
+
+	// Threshold-reaching failure (count >= threshold) → warn log path.
+	t.Run("breaker_tripped_warn", func(t *testing.T) {
+		buf.Reset()
+		// threshold 1 → first failure trips the breaker; wasHealthy=true.
+		h := New(srv.URL, "qwen3-coder:8b", 100*time.Millisecond, 1, time.Second, nil)
+		h.recordFailure(nil) // would previously render err=<nil>
+
+		out := buf.String()
+		if strings.Contains(out, "<nil>") {
+			t.Errorf("breaker-tripped warn log contains <nil>:\n%s", out)
+		}
+		if !strings.Contains(out, "ollama health: breaker tripped") {
+			t.Errorf("expected warn log line, got:\n%s", out)
+		}
+	})
 }
