@@ -54,6 +54,22 @@ func (s *stubEmbedder) Embed(_ context.Context, text string) ([]float64, error) 
 	return []float64{0, 0, 0}, nil
 }
 
+func (s *stubEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float64, error) {
+	atomic.AddInt64(&s.callCount, int64(len(texts)))
+	if s.err != nil {
+		return nil, s.err
+	}
+	result := make([][]float64, len(texts))
+	for i, text := range texts {
+		if v, ok := s.vecs[text]; ok {
+			result[i] = v
+		} else {
+			result[i] = []float64{0, 0, 0}
+		}
+	}
+	return result, nil
+}
+
 func (s *stubEmbedder) IsHealthy(context.Context) bool { return true }
 func (s *stubEmbedder) IsBreakerOpen() bool            { return false }
 func (s *stubEmbedder) RecordBreakerSuccess()          {}
@@ -373,6 +389,118 @@ func TestIndexDirRejectsEscapingSymlinks(t *testing.T) {
 		t.Errorf("expected 1 indexed file, got %d", store.Size())
 	}
 }
+
+// TestIndexDirBatchesFiles verifies that when batchSize > 0, IndexDir
+// calls EmbedBatch with files grouped into batches.
+func TestIndexDirBatchesFiles(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 5; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("file%d.txt", i)), []byte(fmt.Sprintf("content%d", i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var batchCalls int
+	var lastBatchLen int
+	emb := &batchCountingEmbedder{
+		vecs: map[string][]float64{},
+		onBatch: func(texts []string) {
+			batchCalls++
+			lastBatchLen = len(texts)
+		},
+	}
+
+	store := NewStore(emb, 0.0, WithBatchSize(2))
+	if err := store.IndexDir(context.Background(), dir); err != nil {
+		t.Fatalf("IndexDir: %v", err)
+	}
+
+	// 5 files with batch size 2: batches should be [2, 2, 1]
+	if batchCalls != 3 {
+		t.Errorf("batchCalls = %d, want 3", batchCalls)
+	}
+	if lastBatchLen != 1 {
+		t.Errorf("lastBatchLen = %d, want 1", lastBatchLen)
+	}
+	if store.Size() != 5 {
+		t.Errorf("store.Size() = %d, want 5", store.Size())
+	}
+}
+
+// TestIndexDirNoBatching verifies that batchSize=0 disables batching
+// and calls Embed once per file.
+func TestIndexDirNoBatching(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 3; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("file%d.txt", i)), []byte(fmt.Sprintf("content%d", i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var singleCalls int
+	emb := &batchCountingEmbedder{
+		vecs: map[string][]float64{},
+		onSingle: func(string) {
+			singleCalls++
+		},
+	}
+
+	store := NewStore(emb, 0.0, WithBatchSize(0)) // batching disabled
+	if err := store.IndexDir(context.Background(), dir); err != nil {
+		t.Fatalf("IndexDir: %v", err)
+	}
+
+	if singleCalls != 3 {
+		t.Errorf("singleCalls = %d, want 3", singleCalls)
+	}
+	if store.Size() != 3 {
+		t.Errorf("store.Size() = %d, want 3", store.Size())
+	}
+}
+
+// batchCountingEmbedder tracks whether Embed or EmbedBatch is called.
+type batchCountingEmbedder struct {
+	vecs      map[string][]float64
+	onBatch   func([]string)
+	onSingle  func(string)
+	batchUsed bool
+}
+
+func (e *batchCountingEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
+	e.batchUsed = false
+	if e.onSingle != nil {
+		e.onSingle(text)
+	}
+	if e.vecs == nil {
+		e.vecs = map[string][]float64{}
+	}
+	if _, ok := e.vecs[text]; !ok {
+		e.vecs[text] = []float64{0, 0, 0}
+	}
+	return e.vecs[text], nil
+}
+
+func (e *batchCountingEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float64, error) {
+	e.batchUsed = true
+	if e.onBatch != nil {
+		e.onBatch(texts)
+	}
+	result := make([][]float64, len(texts))
+	for i, text := range texts {
+		if e.vecs == nil {
+			e.vecs = map[string][]float64{}
+		}
+		if _, ok := e.vecs[text]; !ok {
+			e.vecs[text] = []float64{0, 0, 0}
+		}
+		result[i] = e.vecs[text]
+	}
+	return result, nil
+}
+
+func (e *batchCountingEmbedder) IsHealthy(context.Context) bool { return true }
+func (e *batchCountingEmbedder) IsBreakerOpen() bool            { return false }
+func (e *batchCountingEmbedder) RecordBreakerSuccess()          {}
 
 // Tests for EmbedCache (issue #227).
 
@@ -729,6 +857,10 @@ type breakerStub struct {
 
 func (b *breakerStub) Embed(context.Context, string) ([]float64, error) {
 	return []float64{1, 0, 0}, nil
+}
+
+func (b *breakerStub) EmbedBatch(context.Context, []string) ([][]float64, error) {
+	return [][]float64{{1, 0, 0}}, nil
 }
 
 func (b *breakerStub) IsHealthy(context.Context) bool {

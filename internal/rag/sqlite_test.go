@@ -437,6 +437,14 @@ func (c *countingErrEmbedder) Embed(_ context.Context, _ string) ([]float64, err
 	return nil, err
 }
 
+func (c *countingErrEmbedder) EmbedBatch(_ context.Context, _ []string) ([][]float64, error) {
+	c.mu.Lock()
+	c.calls++
+	err := c.err
+	c.mu.Unlock()
+	return nil, err
+}
+
 func (c *countingErrEmbedder) IsHealthy(context.Context) bool { return true }
 func (c *countingErrEmbedder) IsBreakerOpen() bool            { return false }
 func (c *countingErrEmbedder) RecordBreakerSuccess()          {}
@@ -472,6 +480,25 @@ func (v *vectorEmbedder) Embed(_ context.Context, text string) ([]float64, error
 	return []float64{0, 0, 0}, nil
 }
 
+func (v *vectorEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float64, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.err != nil {
+		return nil, v.err
+	}
+	result := make([][]float64, len(texts))
+	for i, text := range texts {
+		if x, ok := v.vecs[text]; ok {
+			out := make([]float64, len(x))
+			copy(out, x)
+			result[i] = out
+		} else {
+			result[i] = []float64{0, 0, 0}
+		}
+	}
+	return result, nil
+}
+
 func (v *vectorEmbedder) IsHealthy(context.Context) bool { return true }
 func (v *vectorEmbedder) IsBreakerOpen() bool            { return false }
 func (v *vectorEmbedder) RecordBreakerSuccess()          {}
@@ -499,6 +526,23 @@ func (c *indexedCallCounter) Embed(_ context.Context, text string) ([]float64, e
 	return []float64{0, 0, 0}, nil
 }
 
+func (c *indexedCallCounter) EmbedBatch(_ context.Context, texts []string) ([][]float64, error) {
+	c.mu.Lock()
+	c.calls += len(texts)
+	c.mu.Unlock()
+	result := make([][]float64, len(texts))
+	for i, text := range texts {
+		if v, ok := c.vecs[text]; ok {
+			out := make([]float64, len(v))
+			copy(out, v)
+			result[i] = out
+		} else {
+			result[i] = []float64{0, 0, 0}
+		}
+	}
+	return result, nil
+}
+
 func (c *indexedCallCounter) IsHealthy(context.Context) bool { return true }
 func (c *indexedCallCounter) IsBreakerOpen() bool            { return false }
 func (c *indexedCallCounter) Model() string                  { return c.model }
@@ -524,6 +568,21 @@ func (d *dimEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
 	}
 	return make([]float64, d.dims), nil
 }
+
+func (d *dimEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float64, error) {
+	result := make([][]float64, len(texts))
+	for i, text := range texts {
+		if v, ok := d.vecs[text]; ok {
+			out := make([]float64, len(v))
+			copy(out, v)
+			result[i] = out
+		} else {
+			result[i] = make([]float64, d.dims)
+		}
+	}
+	return result, nil
+}
+
 func (d *dimEmbedder) IsHealthy(context.Context) bool { return true }
 func (d *dimEmbedder) IsBreakerOpen() bool            { return false }
 func (d *dimEmbedder) RecordBreakerSuccess()          {}
@@ -758,6 +817,11 @@ type modelErrEmbedder struct {
 func (m *modelErrEmbedder) Embed(context.Context, string) ([]float64, error) {
 	return nil, m.err
 }
+
+func (m *modelErrEmbedder) EmbedBatch(context.Context, []string) ([][]float64, error) {
+	return nil, m.err
+}
+
 func (m *modelErrEmbedder) IsHealthy(context.Context) bool { return false }
 func (m *modelErrEmbedder) IsBreakerOpen() bool            { return false }
 func (m *modelErrEmbedder) RecordBreakerSuccess()          {}

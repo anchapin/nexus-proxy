@@ -308,6 +308,17 @@ func (s *testStubEmbedder) Embed(_ context.Context, _ string) ([]float64, error)
 	return []float64{0, 0, 0}, nil
 }
 
+func (s *testStubEmbedder) EmbedBatch(_ context.Context, _ []string) ([][]float64, error) {
+	s.calls.Add(1)
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.vec != nil {
+		return [][]float64{s.vec}, nil
+	}
+	return [][]float64{{0, 0, 0}}, nil
+}
+
 func (s *testStubEmbedder) IsHealthy(context.Context) bool { return true }
 func (s *testStubEmbedder) IsBreakerOpen() bool            { return false }
 func (s *testStubEmbedder) RecordBreakerSuccess()          {}

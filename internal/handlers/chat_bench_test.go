@@ -36,6 +36,10 @@ func (benchEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
 	return []float64{1.0}, nil
 }
 
+func (benchEmbedder) EmbedBatch(_ context.Context, _ []string) ([][]float64, error) {
+	return [][]float64{{1.0}}, nil
+}
+
 func (benchEmbedder) IsHealthy(context.Context) bool { return true }
 func (benchEmbedder) IsBreakerOpen() bool            { return false }
 func (benchEmbedder) RecordBreakerSuccess()          {}

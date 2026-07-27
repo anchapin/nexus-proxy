@@ -587,3 +587,115 @@ func TestCohereEmbedder_IsHealthy_ServerError(t *testing.T) {
 		t.Errorf("IsHealthy: expected 1 server call, got %d", calls.Load())
 	}
 }
+
+// TestOllamaEmbedder_EmbedBatch verifies that EmbedBatch correctly unpacks
+// the batch response and returns vectors in the same order as input texts.
+func TestOllamaEmbedder_EmbedBatch(t *testing.T) {
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model   string   `json:"model"`
+			Prompts []string `json:"prompts"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if len(req.Prompts) != 3 {
+			t.Fatalf("expected 3 prompts, got %d", len(req.Prompts))
+		}
+		resp := map[string]any{
+			"embeddings": [][]float64{
+				{0.1, 0.2, 0.3},
+				{0.4, 0.5, 0.6},
+				{0.7, 0.8, 0.9},
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer svr.Close()
+
+	emb := NewOllamaEmbedder(svr.URL, "nomic-embed-text", svr.Client(), BreakerConfig{})
+	vecs, err := emb.EmbedBatch(context.Background(), []string{"a", "b", "c"})
+	if err != nil {
+		t.Fatalf("EmbedBatch: %v", err)
+	}
+	if len(vecs) != 3 {
+		t.Fatalf("expected 3 vectors, got %d", len(vecs))
+	}
+	if vecs[0][0] != 0.1 || vecs[1][1] != 0.5 || vecs[2][2] != 0.9 {
+		t.Errorf("unexpected vector values: %v", vecs)
+	}
+}
+
+// TestOpenAIEmbedder_EmbedBatch verifies that EmbedBatch correctly sends
+// an array input and unpacks the batch response.
+func TestOpenAIEmbedder_EmbedBatch(t *testing.T) {
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string   `json:"model"`
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if len(req.Input) != 2 {
+			t.Fatalf("expected 2 inputs, got %d", len(req.Input))
+		}
+		resp := map[string]any{
+			"data": []map[string]any{
+				{"embedding": []float64{0.1, 0.2}},
+				{"embedding": []float64{0.3, 0.4}},
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer svr.Close()
+
+	emb := NewOpenAIEmbedder(svr.URL, "text-embedding-3-small", "sk-test", svr.Client(), BreakerConfig{})
+	vecs, err := emb.EmbedBatch(context.Background(), []string{"hello", "world"})
+	if err != nil {
+		t.Fatalf("EmbedBatch: %v", err)
+	}
+	if len(vecs) != 2 {
+		t.Fatalf("expected 2 vectors, got %d", len(vecs))
+	}
+	if vecs[0][0] != 0.1 || vecs[1][1] != 0.4 {
+		t.Errorf("unexpected vector values: %v", vecs)
+	}
+}
+
+// TestCohereEmbedder_EmbedBatch verifies that EmbedBatch correctly sends
+// a texts array and unpacks the batch response.
+func TestCohereEmbedder_EmbedBatch(t *testing.T) {
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string   `json:"model"`
+			Texts []string `json:"texts"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if len(req.Texts) != 2 {
+			t.Fatalf("expected 2 texts, got %d", len(req.Texts))
+		}
+		resp := map[string]any{
+			"embeddings": [][]float64{
+				{0.1, 0.2, 0.3},
+				{0.4, 0.5, 0.6},
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer svr.Close()
+
+	emb := NewCohereEmbedder(svr.URL, "embed-english-v3.0", "cohere-key", svr.Client(), BreakerConfig{})
+	vecs, err := emb.EmbedBatch(context.Background(), []string{"hello", "world"})
+	if err != nil {
+		t.Fatalf("EmbedBatch: %v", err)
+	}
+	if len(vecs) != 2 {
+		t.Fatalf("expected 2 vectors, got %d", len(vecs))
+	}
+	if vecs[0][0] != 0.1 || vecs[1][2] != 0.6 {
+		t.Errorf("unexpected vector values: %v", vecs)
+	}
+}

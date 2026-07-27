@@ -128,6 +128,11 @@ type Config struct {
 	RAGCircuitBreakerThreshold int           // consecutive failures to trip; 0 = disabled
 	RAGCircuitBreakerCooldown  time.Duration // cooldown duration after trip
 
+	// RAG batch embedding (issue #771). When > 0, IndexDir batches files
+	// in groups of this size and calls EmbedBatch to reduce HTTP round-trips.
+	// Set to 0 to disable batching (backward compatible with existing tests).
+	RAGBatchSize int
+
 	// Routing
 	TokenGuardrail            int           // estimated tokens above this force frontier (6000)
 	SLMTimeout                time.Duration // Qwen3-Coder routing timeout (8s)
@@ -775,6 +780,15 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.RAGCircuitBreakerCooldown = cbCooldown
+
+	ragBatchSize, err := getEnvInt("NEXUS_RAG_BATCH_SIZE", 32)
+	if err != nil {
+		return cfg, err
+	}
+	if ragBatchSize < 0 {
+		ragBatchSize = 0
+	}
+	cfg.RAGBatchSize = ragBatchSize
 
 	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
 	if err != nil {

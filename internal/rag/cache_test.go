@@ -28,6 +28,19 @@ func (c *countingEmbedder) Embed(_ context.Context, text string) ([]float64, err
 	return []float64{float64(len(text)), 0, 0}, nil
 }
 
+func (c *countingEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, text := range texts {
+		c.calls[text]++
+	}
+	result := make([][]float64, len(texts))
+	for i, text := range texts {
+		result[i] = []float64{float64(len(text)), 0, 0}
+	}
+	return result, nil
+}
+
 func (c *countingEmbedder) IsHealthy(context.Context) bool { return true }
 func (c *countingEmbedder) IsBreakerOpen() bool            { return false }
 func (c *countingEmbedder) RecordBreakerSuccess()          {}

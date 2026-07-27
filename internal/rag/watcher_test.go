@@ -30,6 +30,17 @@ func (r *recordingEmbedder) Embed(_ context.Context, text string) ([]float64, er
 	return hashVector(text), nil
 }
 
+func (r *recordingEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, texts...)
+	result := make([][]float64, len(texts))
+	for i, text := range texts {
+		result[i] = hashVector(text)
+	}
+	return result, nil
+}
+
 func (r *recordingEmbedder) IsHealthy(context.Context) bool { return true }
 func (r *recordingEmbedder) IsBreakerOpen() bool            { return false }
 func (r *recordingEmbedder) RecordBreakerSuccess()          {}
