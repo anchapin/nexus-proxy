@@ -16,6 +16,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -38,6 +39,12 @@ const bufferedChannelSize = 1024
 // Larger than a single record so most rows flush via the background loop's
 // explicit Flush call rather than the bufio auto-flush threshold.
 const writeBufferSize = 16 << 10
+
+// defaultBufferSize is the default write buffer before forced flush.
+const defaultBufferSize = 64 << 10 // 64 KiB
+
+// defaultFlushInterval is the default time-based flush interval.
+const defaultFlushInterval = 5 * time.Second
 
 // Record is the row written for every proxied request.
 //
@@ -147,6 +154,7 @@ func ComputeTPS(outputTokens int, ttftMs int64, totalMs float64) float64 {
 type Recorder interface {
 	Record(r Record)
 	Close() error
+	Sync()
 }
 
 // Compile-time interface compliance checks.
@@ -171,6 +179,9 @@ func (Noop) Dropped() uint64 { return 0 }
 // Rotations returns 0. Noop never rotates.
 func (Noop) Rotations() uint64 { return 0 }
 
+// Sync is a no-op for Noop.
+func (Noop) Sync() {}
+
 // JSONLRecorder appends one JSON object per line to a file. The file is
 // opened in append mode and the parent directory is created on demand.
 //
@@ -182,19 +193,29 @@ func (Noop) Rotations() uint64 { return 0 }
 // so the rename-and-reopen path is race-free against concurrent Record
 // callers (which only push onto the buffered channel). maxBytes == 0
 // preserves the pre-#485 append-only behaviour.
+//
+// Batch writes (issue #681): records are accumulated in a memory buffer
+// and flushed to disk when the buffer reaches bufferSize bytes or when
+// flushInterval has elapsed since the last flush. This amortises disk I/O
+// over many records rather than writing each record individually. The
+// Sync() method forces an immediate flush; Close() flushes any remaining
+// buffered records before exiting.
 type JSONLRecorder struct {
-	ch        chan Record
-	path      string
-	file      *os.File
-	bw        *bufio.Writer
-	wg        sync.WaitGroup
-	dropped   atomic.Uint64
-	closed    atomic.Bool
-	done      chan struct{} // closed by run() on exit
-	maxBytes  int64         // 0 = rotation disabled (append-only)
-	maxFiles  int           // rotated-file cap (only when maxBytes > 0)
-	written   int64         // bytes committed to the active file via bw
-	rotations atomic.Uint64
+	ch            chan Record
+	path          string
+	file          *os.File
+	bw            *bufio.Writer
+	wg            sync.WaitGroup
+	dropped       atomic.Uint64
+	closed        atomic.Bool
+	done          chan struct{} // closed by run() on exit
+	maxBytes      int64         // 0 = rotation disabled (append-only)
+	maxFiles      int           // rotated-file cap (only when maxBytes > 0)
+	written       int64         // bytes committed to the active file via bw
+	rotations     atomic.Uint64
+	syncCh        chan struct{} // signals immediate flush
+	flushInterval time.Duration // time-based flush trigger
+	bufferSize    int           // size-based flush threshold
 }
 
 // NewJSONLRecorder opens path (creating the parent directory if needed)
@@ -205,7 +226,15 @@ type JSONLRecorder struct {
 // cap. maxFiles bounds the number of rotated files retained; it is
 // clamped to a minimum of 1 and only consulted when maxBytes > 0. Pass
 // maxBytes 0 to select the legacy append-only, never-rotate behaviour.
-func NewJSONLRecorder(path string, maxBytes int64, maxFiles int) (*JSONLRecorder, error) {
+//
+// bufferSize is the maximum bytes to accumulate before flushing to disk.
+// Defaults to 64 KiB when 0. A single record larger than bufferSize is
+// flushed immediately regardless.
+//
+// flushInterval is the maximum time between flushes. Defaults to 5s when
+// 0. A tick fires at this interval and triggers a flush if there is any
+// buffered data.
+func NewJSONLRecorder(path string, maxBytes int64, maxFiles int, bufferSize int, flushInterval time.Duration) (*JSONLRecorder, error) {
 	if path == "" {
 		return nil, fmt.Errorf("telemetry: empty path")
 	}
@@ -231,15 +260,24 @@ func NewJSONLRecorder(path string, maxBytes int64, maxFiles int) (*JSONLRecorder
 	if maxBytes > 0 && maxFiles < 1 {
 		maxFiles = 1
 	}
+	if bufferSize <= 0 {
+		bufferSize = defaultBufferSize
+	}
+	if flushInterval <= 0 {
+		flushInterval = defaultFlushInterval
+	}
 	r := &JSONLRecorder{
-		ch:       make(chan Record, bufferedChannelSize),
-		path:     path,
-		file:     f,
-		bw:       bufio.NewWriterSize(f, writeBufferSize),
-		done:     make(chan struct{}),
-		maxBytes: maxBytes,
-		maxFiles: maxFiles,
-		written:  initial,
+		ch:            make(chan Record, bufferedChannelSize),
+		path:          path,
+		file:          f,
+		bw:            bufio.NewWriterSize(f, writeBufferSize),
+		done:          make(chan struct{}),
+		maxBytes:      maxBytes,
+		maxFiles:      maxFiles,
+		written:       initial,
+		syncCh:        make(chan struct{}, 1),
+		flushInterval: flushInterval,
+		bufferSize:    bufferSize,
 	}
 	r.wg.Add(1)
 	go r.run()
@@ -259,6 +297,22 @@ func (r *JSONLRecorder) Dropped() uint64 { return r.dropped.Load() }
 // rotation is disabled (maxBytes == 0).
 func (r *JSONLRecorder) Rotations() uint64 { return r.rotations.Load() }
 
+// Sync signals the background goroutine to flush any buffered writes to
+// disk immediately. It is called by callers who need guaranteed persistence
+// (e.g. during graceful shutdown). It is a no-op when the recorder is
+// already closed.
+func (r *JSONLRecorder) Sync() {
+	if r.closed.Load() {
+		return
+	}
+	select {
+	case r.syncCh <- struct{}{}:
+	default:
+		// sync channel already has a pending signal; the background
+		// loop will flush on the next iteration anyway
+	}
+}
+
 // run is the background consumer. It exits cleanly when Close signals
 // shutdown; queued records are drained before the file is closed. All
 // file-handle mutation (writes, flush, close, rotation) happens here, so
@@ -267,54 +321,138 @@ func (r *JSONLRecorder) Rotations() uint64 { return r.rotations.Load() }
 func (r *JSONLRecorder) run() {
 	defer r.wg.Done()
 	defer close(r.done)
-	for rec := range r.ch {
-		b, err := json.Marshal(rec)
-		if err != nil {
-			slog.Error("telemetry marshal",
-				slog.String("path", r.path),
-				slog.Any("err", err),
-			)
-			continue
+
+	var buf []byte // accumulated serialized records (each line ends with \n)
+
+	// flush writes buf to disk and resets it. Called when buffer is full,
+	// on tick, on sync signal, and on channel close.
+	flush := func() {
+		if len(buf) == 0 {
+			return
 		}
-		lineLen := int64(len(b)) + 1 // +1 for trailing newline
-		// Rotate before writing when the next line would cross the cap.
-		// The written > 0 guard guarantees every file (including one
-		// opened against a pre-existing oversized file) receives at
-		// least one record, avoiding pathological empty-file rotations
-		// when a single record is larger than maxBytes.
-		if r.maxBytes > 0 && r.written > 0 && r.written+lineLen > r.maxBytes {
-			if rotErr := r.rotate(); rotErr != nil {
-				slog.Error("telemetry rotate",
-					slog.String("path", r.path),
-					slog.Any("err", rotErr),
-				)
-			}
-		}
-		if _, err := r.bw.Write(b); err != nil {
+		if _, err := r.bw.Write(buf); err != nil {
 			slog.Error("telemetry write",
 				slog.String("path", r.path),
 				slog.Any("err", err),
 			)
+			// On write error, drop all buffered records.
+			droppedCount := 0
+			for i := 0; i < len(buf); i++ {
+				if buf[i] == '\n' {
+					droppedCount++
+				}
+			}
+			r.dropped.Add(uint64(droppedCount))
+			slog.Warn("telemetry: dropped records due to write failure",
+				slog.Int("count", droppedCount),
+				slog.String("path", r.path),
+			)
+			buf = nil
+			// Try to recover by rotating the file.
+			if r.maxBytes > 0 {
+				if rotErr := r.rotate(); rotErr != nil {
+					slog.Error("telemetry rotate after write failure",
+						slog.String("path", r.path),
+						slog.Any("err", rotErr),
+					)
+				}
+			}
+			return
 		}
-		if err := r.bw.WriteByte('\n'); err != nil {
-			slog.Error("telemetry write newline",
+		if err := r.bw.Flush(); err != nil {
+			slog.Error("telemetry flush",
 				slog.String("path", r.path),
 				slog.Any("err", err),
 			)
+			// On flush failure, try to recover via rotation.
+			if r.maxBytes > 0 {
+				if rotErr := r.rotate(); rotErr != nil {
+					slog.Error("telemetry rotate after flush failure",
+						slog.String("path", r.path),
+						slog.Any("err", rotErr),
+					)
+				}
+			}
+			buf = nil
+			return
 		}
-		r.written += lineLen
+		r.written += int64(len(buf))
+		buf = nil
 	}
-	if err := r.bw.Flush(); err != nil {
-		slog.Error("telemetry flush",
-			slog.String("path", r.path),
-			slog.Any("err", err),
-		)
-	}
-	if err := r.file.Close(); err != nil {
-		slog.Error("telemetry close",
-			slog.String("path", r.path),
-			slog.Any("err", err),
-		)
+
+	ticker := time.NewTicker(r.flushInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			flush()
+		case <-r.syncCh:
+			flush()
+		case rec, ok := <-r.ch:
+			if !ok {
+				// Channel closed; drain remaining buffered records and exit.
+				flush()
+				if r.bw != nil {
+					if err := r.bw.Flush(); err != nil {
+						slog.Error("telemetry final flush",
+							slog.String("path", r.path),
+							slog.Any("err", err),
+						)
+					}
+				}
+				if r.file != nil {
+					if err := r.file.Close(); err != nil {
+						slog.Error("telemetry close",
+							slog.String("path", r.path),
+							slog.Any("err", err),
+						)
+					}
+				}
+				return
+			}
+			b, err := json.Marshal(rec)
+			if err != nil {
+				slog.Error("telemetry marshal",
+					slog.String("path", r.path),
+					slog.Any("err", err),
+				)
+				continue
+			}
+			lineLen := int64(len(b)) + 1 // +1 for trailing newline
+
+			// Rotate before writing when the next line would cross the cap.
+			// The written > 0 guard guarantees every file (including one
+			// opened against a pre-existing oversized file) receives at
+			// least one record, avoiding pathological empty-file rotations
+			// when a single record is larger than maxBytes.
+			// We must account for buffered bytes (len(buf)) since they
+			// will be written together with this record.
+			if r.maxBytes > 0 && r.written > 0 && r.written+int64(len(buf))+lineLen > r.maxBytes {
+				flush()
+				if rotErr := r.rotate(); rotErr != nil {
+					slog.Error("telemetry rotate",
+						slog.String("path", r.path),
+						slog.Any("err", rotErr),
+					)
+				}
+			}
+
+			// If a single record exceeds the buffer size, flush immediately
+			// before adding it.
+			if int64(len(buf))+lineLen > int64(r.bufferSize) {
+				flush()
+			}
+
+			// Accumulate the record into buf.
+			buf = append(buf, b...)
+			buf = append(buf, '\n')
+
+			// Flush when buffer reaches the threshold.
+			if len(buf) >= r.bufferSize {
+				flush()
+			}
+		}
 	}
 }
 
@@ -327,11 +465,15 @@ func (r *JSONLRecorder) run() {
 // reopen failure the recorder is left with a stale (closed) writer whose
 // subsequent Writes surface as logged errors rather than panics.
 func (r *JSONLRecorder) rotate() error {
-	if err := r.bw.Flush(); err != nil {
-		return fmt.Errorf("flush: %w", err)
+	if r.bw != nil {
+		if err := r.bw.Flush(); err != nil && !errors.Is(err, os.ErrClosed) {
+			return fmt.Errorf("flush: %w", err)
+		}
 	}
-	if err := r.file.Close(); err != nil {
-		return fmt.Errorf("close: %w", err)
+	if r.file != nil {
+		if err := r.file.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			return fmt.Errorf("close: %w", err)
+		}
 	}
 	rotated := fmt.Sprintf("%s.%d", r.path, time.Now().UnixNano())
 	if err := os.Rename(r.path, rotated); err != nil {

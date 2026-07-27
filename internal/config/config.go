@@ -370,16 +370,29 @@ type Config struct {
 	// the cap is exceeded; the oldest is evicted. Only consulted when
 	// TelemetryMaxBytes > 0. Not hot-reloadable.
 	//
+	// TelemetryBufferSize (issue #681) is the write buffer threshold in
+	// bytes. Records are batched in memory and flushed to disk when the
+	// buffer reaches this size. Defaults to 64 KiB. A single record
+	// larger than this value triggers an immediate flush.
+	//
+	// TelemetryFlushInterval (issue #681) is the maximum time between
+	// flushes. A background tick fires at this interval and flushes any
+	// buffered records. Defaults to 5s. Together with TelemetryBufferSize
+	// this amortises disk I/O over many records rather than writing each
+	// record individually.
+	//
 	// MetricsDBPath is the on-disk SQLite database written by
 	// internal/metrics (issue #4). An empty value disables the
 	// metrics store (the handler treats a nil store as "skip me").
 	// Parent directories are created on demand. The default lives
 	// under the user's XDG-style cache directory so multiple checkouts
 	// don't trample each other.
-	TelemetryPath     string
-	TelemetryMaxBytes int
-	TelemetryMaxFiles int
-	MetricsDBPath     string
+	TelemetryPath          string
+	TelemetryMaxBytes      int
+	TelemetryMaxFiles      int
+	TelemetryBufferSize    int
+	TelemetryFlushInterval time.Duration
+	MetricsDBPath          string
 
 	// MetricsRetentionDays is the TTL for the metrics requests table
 	// (issue #483). When > 0, a background goroutine DELETEs rows whose
@@ -650,6 +663,28 @@ func Load() (Config, error) {
 		telemetryMaxFiles = 1
 	}
 	cfg.TelemetryMaxFiles = telemetryMaxFiles
+
+	// Telemetry buffering (issue #681). BUFFER_SIZE defaults to 64 KiB
+	// and FLUSH_INTERVAL to 5s. A single record larger than the buffer
+	// triggers an immediate flush. Both require a restart to take effect.
+	telemetryBufferSize, err := getEnvInt("NEXUS_JSONL_BUFFER_SIZE", 64<<10)
+	if err != nil {
+		return cfg, err
+	}
+	if telemetryBufferSize < 0 {
+		telemetryBufferSize = 64 << 10
+	}
+	cfg.TelemetryBufferSize = telemetryBufferSize
+
+	telemetryFlushInterval, err := getEnvDuration("NEXUS_JSONL_FLUSH_INTERVAL", 5*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	if telemetryFlushInterval < 0 {
+		telemetryFlushInterval = 5 * time.Second
+	}
+	cfg.TelemetryFlushInterval = telemetryFlushInterval
+
 	cfg.MetricsDBPath = getFileString("metrics_db", "NEXUS_METRICS_DB", DefaultMetricsDBPath())
 
 	retentionDays, err := getEnvInt("NEXUS_METRICS_RETENTION_DAYS", 0)

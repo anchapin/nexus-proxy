@@ -757,6 +757,11 @@ func (s *SQLiteStore) Close() error {
 	})
 }
 
+// Sync is a no-op for SQLiteStore because the database engine handles
+// durability internally via its write-ahead log (WAL). This method
+// satisfies the telemetry.Recorder interface.
+func (s *SQLiteStore) Sync() {}
+
 // Writable checks whether the database is currently reachable by attempting
 // a Ping. Returns false when the database is closed or inaccessible.
 func (s *SQLiteStore) Writable() bool {
