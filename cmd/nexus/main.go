@@ -1243,8 +1243,8 @@ func main() {
 	// when NEXUS_STATUS_PUBLIC=true. When the key is empty the
 	// middleware is a pass-through (zero overhead).
 	var rootHandler http.Handler = mux
+	var authLimiter *ratelimit.AuthLimiter
 	if cfg.AuthEnabled() {
-		var authLimiter *ratelimit.AuthLimiter
 		if cfg.AuthRateLimitEnabled() {
 			authLimiter = ratelimit.NewAuthLimiter(
 				cfg.AuthRateLimitRPM,
@@ -1317,6 +1317,12 @@ func main() {
 			if err := judgeEval.Close(); err != nil {
 				slog.Warn("judge close", slog.Any("err", err))
 			}
+		}
+		if rateLimiter != nil {
+			rateLimiter.Close()
+		}
+		if authLimiter != nil {
+			authLimiter.Stop()
 		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
