@@ -662,9 +662,16 @@ func TestManagerProbeFailureKeepsPreviousBudget(t *testing.T) {
 	stub.push(Budget{Tokens: 4096, Source: SourceOllamaPS}, nil)
 	stub.push(Budget{}, errors.New("simulated transport down"))
 
-	m := NewManager(stub, 5*time.Minute, time.Second)
-	m.Run(context.Background())
+	m := NewManager(stub, 0, time.Second) // interval=0: boot snapshot only, no ticker
+	m.Run(context.Background())           // initial probe consumes + stores budget #1
 	defer m.Close()
+
+	// Drive a second probe that returns an error — the transport-down
+	// early-return path in doProbe. The 5-minute ticker used previously
+	// never fired during the test, so the error budget was never
+	// consumed; calling doProbe directly exercises the path
+	// deterministically (issue #696).
+	m.doProbe(context.Background())
 
 	if got := m.Get(); got.Tokens != 4096 {
 		t.Errorf("after error Get.Tokens = %d, want 4096 (previous value retained)", got.Tokens)
@@ -682,6 +689,38 @@ func TestManagerProbeErrNoSignalKeepsPreviousBudget(t *testing.T) {
 
 	if got := m.Get(); got.Tokens != 4096 {
 		t.Errorf("after ErrNoSignal Get.Tokens = %d, want 4096 (previous retained)", got.Tokens)
+	}
+}
+
+// TestManagerProbeDisabledBudgetKeepsPreviousBudget exercises the
+// disabled-budget early-return path in doProbe (issue #696). When the
+// probe returns (Budget{Tokens: 0, Source: SourceStatic}, nil) — the
+// thermal-throttle collapse route where the GPU overheats and the
+// budget collapses to zero without the probe itself reporting an
+// error — doProbe must NOT overwrite the previously stored budget.
+// It should log a warning and keep the last-known good value so the
+// router continues serving traffic at the old budget instead of
+// falling back to the static guardrail.
+func TestManagerProbeDisabledBudgetKeepsPreviousBudget(t *testing.T) {
+	stub := &stubProbe{}
+	stub.push(Budget{Tokens: 4096, Source: SourceOllamaPS}, nil)
+	stub.push(Budget{Tokens: 0, Source: SourceStatic}, nil)
+
+	m := NewManager(stub, 0, time.Second) // interval=0: boot snapshot only, no ticker
+	m.Run(context.Background())           // initial probe consumes + stores budget #1
+	defer m.Close()
+
+	// Drive a second probe synchronously. The disabled-budget path
+	// does not call signalTick, so WaitForProbes cannot observe it;
+	// calling doProbe directly is deterministic and avoids a timed
+	// ticker whose fire would race the assertion.
+	m.doProbe(context.Background())
+
+	if got := m.Get(); got.Tokens != 4096 {
+		t.Errorf("after disabled budget Get.Tokens = %d, want 4096 (previous retained)", got.Tokens)
+	}
+	if got := m.Get(); got.Source != SourceOllamaPS {
+		t.Errorf("after disabled budget Get.Source = %q, want %q (previous retained)", got.Source, SourceOllamaPS)
 	}
 }
 
