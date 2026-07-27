@@ -61,7 +61,8 @@ func (b *Breaker) IsOpen() bool {
 		return false
 	}
 	for {
-		switch b.state.Load() {
+		state := b.state.Load()
+		switch state {
 		case breakerStateClosed:
 			return false
 		case breakerStateHalfOpen:
@@ -78,6 +79,7 @@ func (b *Breaker) IsOpen() bool {
 			b.cooldownUntil.Store(0)
 			return false
 		default:
+			slog.Error("breaker: invalid state, treating as open", slog.Int("state", int(state)))
 			return true
 		}
 	}

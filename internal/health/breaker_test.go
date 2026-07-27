@@ -306,3 +306,16 @@ func TestBreakerExactThresholdTrips(t *testing.T) {
 		t.Fatalf("state = %d, want open at threshold=1 after 1 failure", b.State())
 	}
 }
+
+// TestBreakerIsOpenInvalidState verifies that an invalid state (e.g., 99)
+// is treated as open and emits a log error rather than silently corrupting.
+func TestBreakerIsOpenInvalidState(t *testing.T) {
+	b := newTestBreaker(3, time.Second)
+
+	// Corrupt the state with an invalid value.
+	b.state.Store(99)
+
+	if !b.IsOpen() {
+		t.Fatal("IsOpen must return true for invalid state 99")
+	}
+}
