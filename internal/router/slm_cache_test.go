@@ -163,6 +163,16 @@ func (s *stubEmbedder) Embed(_ context.Context, text string) ([]float64, error) 
 	return emb, nil
 }
 
+func (s *stubEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float64, error) {
+	s.calls = append(s.calls, texts...)
+	result := make([][]float64, len(texts))
+	for i, text := range texts {
+		emb, _ := s.Embed(context.Background(), text)
+		result[i] = emb
+	}
+	return result, nil
+}
+
 // vectorEmbedder returns a fixed embedding for all inputs; useful for
 // testing that semantically different prompts do NOT match.
 type vectorEmbedder struct {
@@ -174,6 +184,16 @@ func (v *vectorEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
 	out := make([]float64, len(v.vec))
 	copy(out, v.vec)
 	return out, v.err
+}
+
+func (v *vectorEmbedder) EmbedBatch(_ context.Context, _ []string) ([][]float64, error) {
+	if v.err != nil {
+		return nil, v.err
+	}
+	result := make([][]float64, 1)
+	result[0] = make([]float64, len(v.vec))
+	copy(result[0], v.vec)
+	return result, nil
 }
 
 func TestSLMCache_SemanticExactMatch(t *testing.T) {

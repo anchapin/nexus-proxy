@@ -34,6 +34,10 @@ func (s stubEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
 	return s.vec, nil
 }
 
+func (s stubEmbedder) EmbedBatch(_ context.Context, _ []string) ([][]float64, error) {
+	return [][]float64{s.vec}, nil
+}
+
 func (s stubEmbedder) IsHealthy(context.Context) bool { return true }
 func (s stubEmbedder) IsBreakerOpen() bool            { return false }
 func (s stubEmbedder) RecordBreakerSuccess()          {}

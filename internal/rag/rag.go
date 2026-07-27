@@ -95,6 +95,7 @@ type FewShotExample struct {
 // concurrent use; the store calls them concurrently during indexing.
 type Embedder interface {
 	Embed(ctx context.Context, text string) ([]float64, error)
+	EmbedBatch(ctx context.Context, texts []string) ([][]float64, error)
 	IsHealthy(ctx context.Context) bool
 	// IsBreakerOpen is implemented by OllamaEmbedder to expose circuit
 	// breaker state. It returns false for embedders that do not have a
@@ -260,6 +261,81 @@ func (c *EmbedCache) Embed(ctx context.Context, text string) ([]float64, error) 
 	return out, nil
 }
 
+// EmbedBatch returns cached embeddings for texts that are already in the cache,
+// then delegates to the inner EmbedBatch for any missing texts and caches those
+// results. The returned slice is in the same order as the input texts.
+func (c *EmbedCache) EmbedBatch(ctx context.Context, texts []string) ([][]float64, error) {
+	if c.max <= 0 || c.ttl <= 0 {
+		return c.inner.EmbedBatch(ctx, texts)
+	}
+
+	// Partition texts into cached and uncached.
+	c.mu.Lock()
+	var uncachedIdx []int
+	result := make([][]float64, len(texts))
+	now := time.Now()
+	for i, text := range texts {
+		if el, ok := c.index[text]; ok {
+			ent := el.Value.(embedCacheEntry)
+			if now.Before(ent.expire) {
+				c.lru.MoveToFront(el)
+				vec := ent.vec
+				result[i] = vec
+				continue
+			}
+			c.lru.Remove(el)
+			delete(c.index, text)
+		}
+		uncachedIdx = append(uncachedIdx, i)
+	}
+	c.mu.Unlock()
+
+	if len(uncachedIdx) == 0 {
+		atomic.AddInt64(&c.hits, int64(len(texts)))
+		atomic.AddInt64(&c.hitCount, int64(len(texts)))
+		return result, nil
+	}
+
+	// Extract uncached texts.
+	uncachedTexts := make([]string, len(uncachedIdx))
+	for i, idx := range uncachedIdx {
+		uncachedTexts[i] = texts[idx]
+	}
+
+	// Call the inner embedder in batch.
+	uncachedVecs, err := c.inner.EmbedBatch(ctx, uncachedTexts)
+	if err != nil {
+		atomic.AddInt64(&c.misses, int64(len(uncachedIdx)))
+		return nil, err
+	}
+
+	// Populate uncached results and insert into cache.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, idx := range uncachedIdx {
+		vec := uncachedVecs[i]
+		result[idx] = vec
+		ent := embedCacheEntry{
+			key:    texts[idx],
+			vec:    vec,
+			expire: now.Add(c.ttl),
+		}
+		el := c.lru.PushFront(ent)
+		c.index[texts[idx]] = el
+		if c.lru.Len() > c.max {
+			oldest := c.lru.Back()
+			if oldest != nil {
+				evictKey := oldest.Value.(embedCacheEntry).key
+				delete(c.index, evictKey)
+				c.lru.Remove(oldest)
+			}
+		}
+	}
+	atomic.AddInt64(&c.misses, int64(len(uncachedIdx)))
+
+	return result, nil
+}
+
 // CacheStats returns the cumulative hit and miss counts since the cache was
 // created. Used for observability; not thread-safe with concurrent access.
 func (c *EmbedCache) CacheStats() (hits, misses int64) {
@@ -378,6 +454,7 @@ type Store struct {
 	thresholdOverrides map[string]float64 // dir -> threshold; unspecified dirs use global threshold
 	index              *HNSWIndex
 	indexConfig        HNSWConfig
+	batchSize          int // number of files to embed per batch; 0 disables batching
 
 	lastIndexAt               int64
 	retrievalAttempts         uint64
@@ -387,6 +464,15 @@ type Store struct {
 	thresholdMisses           uint64
 	embedErrors               uint64
 	injectionSkippedSizeLimit uint64
+}
+
+// StoreOption configures a Store.
+type StoreOption func(*Store)
+
+// WithBatchSize sets the number of files embedded per batch in IndexDir.
+// A value of 0 disables batching (each file is embedded individually).
+func WithBatchSize(n int) StoreOption {
+	return func(s *Store) { s.batchSize = n }
 }
 
 // indexThreshold is the minimum store size before the HNSW index is used.
@@ -503,14 +589,18 @@ func (s *Store) IndexMode() string {
 
 // NewStore constructs an empty store. dir is the on-disk location of the
 // snippets; threshold is the cosine similarity floor (0..1) for retrieval.
-func NewStore(embedder Embedder, threshold float64) *Store {
+func NewStore(embedder Embedder, threshold float64, opts ...StoreOption) *Store {
 	cfg := DefaultHNSWConfig()
-	return &Store{
+	s := &Store{
 		embedder:    embedder,
 		threshold:   threshold,
 		index:       NewHNSWIndex(cfg),
 		indexConfig: cfg,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Size returns the number of indexed examples. Acquires the RLock
@@ -663,6 +753,12 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 		return fmt.Errorf("rag: read examples dir %q: %w", dir, err)
 	}
 
+	type fileInfo struct {
+		name    string
+		content string
+	}
+	var validFiles []fileInfo
+
 	for _, f := range files {
 		if f.IsDir() {
 			continue
@@ -696,21 +792,56 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 			slog.Error("rag read file", slog.String("filename", f.Name()), slog.Any("err", err))
 			continue
 		}
-		emb, err := s.embedder.Embed(ctx, string(content))
-		if err != nil {
-			slog.Error("rag embed file", slog.String("filename", f.Name()), slog.Any("err", err))
-			continue
+		validFiles = append(validFiles, fileInfo{name: f.Name(), content: string(content)})
+	}
+
+	if s.batchSize > 0 && len(validFiles) > 0 {
+		for i := 0; i < len(validFiles); i += s.batchSize {
+			end := i + s.batchSize
+			if end > len(validFiles) {
+				end = len(validFiles)
+			}
+			batch := validFiles[i:end]
+			texts := make([]string, len(batch))
+			for j, fi := range batch {
+				texts[j] = fi.content
+			}
+			embs, err := s.embedder.EmbedBatch(ctx, texts)
+			if err != nil {
+				slog.Error("rag embed batch", slog.Any("err", err))
+				continue
+			}
+			s.mu.Lock()
+			for j, fi := range batch {
+				s.examples = append(s.examples, FewShotExample{
+					Filename:  fi.name,
+					Dir:       safeDir,
+					Content:   fi.content,
+					Embedding: embs[j],
+				})
+				s.markIndexed(time.Now().UTC())
+				slog.Info("rag indexed", slog.String("filename", fi.name))
+			}
+			s.mu.Unlock()
 		}
-		s.mu.Lock()
-		s.examples = append(s.examples, FewShotExample{
-			Filename:  f.Name(),
-			Dir:       safeDir,
-			Content:   string(content),
-			Embedding: emb,
-		})
-		s.mu.Unlock()
-		s.markIndexed(time.Now().UTC())
-		slog.Info("rag indexed", slog.String("filename", f.Name()))
+	} else {
+		for _, fi := range validFiles {
+			emb, err := s.embedder.Embed(ctx, fi.content)
+			if err != nil {
+				slog.Error("rag embed file", slog.String("filename", fi.name), slog.Any("err", err))
+				continue
+			}
+			s.mu.Lock()
+			s.examples = append(s.examples, FewShotExample{
+				Filename:  fi.name,
+				Dir:       safeDir,
+				Content:   fi.content,
+				Embedding: emb,
+			})
+			s.mu.Unlock()
+			s.markIndexed(time.Now().UTC())
+			slog.Info("rag indexed", slog.String("filename", fi.name))
+		}
 	}
 	return nil
 }
@@ -1050,6 +1181,60 @@ func (o *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 	return raw.Embedding, nil
 }
 
+// EmbedBatch fetches embedding vectors for multiple texts in a single request.
+// If the circuit breaker is open it returns ErrCircuitOpen without calling Ollama.
+func (o *OllamaEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float64, error) {
+	if o.breaker.IsOpen() {
+		return nil, newCircuitError(circuitKindOllama)
+	}
+	payload, _ := json.Marshal(map[string]any{"model": o.Model, "prompts": texts})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		o.BaseURL+"/api/embeddings", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := o.Client.Do(req)
+	if err != nil {
+		o.breaker.RecordFailure()
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutils.ReadAllLimited(resp.Body, defaultMaxResponseBytes)
+	if err != nil {
+		o.breaker.RecordFailure()
+		return nil, err
+	}
+	if len(body) >= defaultMaxResponseBytes {
+		o.breaker.RecordFailure()
+		return nil, fmt.Errorf("ollama embed batch: response body exceeds %d-byte size limit", defaultMaxResponseBytes)
+	}
+	if resp.StatusCode != http.StatusOK {
+		o.breaker.RecordFailure()
+		return nil, fmt.Errorf("ollama embed batch %s: status %d: %s", o.Model, resp.StatusCode, body)
+	}
+	var raw struct {
+		Embeddings [][]float64 `json:"embeddings"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		o.breaker.RecordFailure()
+		return nil, fmt.Errorf("ollama embed batch: decode: %w", err)
+	}
+	if len(raw.Embeddings) == 0 {
+		o.breaker.RecordFailure()
+		return nil, fmt.Errorf("ollama embed batch: empty embeddings for model %s", o.Model)
+	}
+	for i, emb := range raw.Embeddings {
+		if len(emb) == 0 {
+			o.breaker.RecordFailure()
+			return nil, fmt.Errorf("ollama embed batch: empty embedding at index %d for model %s", i, o.Model)
+		}
+	}
+	o.breaker.RecordSuccess()
+	return raw.Embeddings, nil
+}
+
 // OpenAIEmbedder calls the OpenAI /v1/embeddings endpoint. It is safe for
 // concurrent use via a shared http.Client.
 type OpenAIEmbedder struct {
@@ -1137,6 +1322,70 @@ func (o *OpenAIEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 	}
 	o.breaker.RecordSuccess()
 	return raw.Data[0].Embedding, nil
+}
+
+// EmbedBatch fetches embedding vectors for multiple texts via the OpenAI
+// /v1/embeddings API. If the circuit breaker is open, it returns ErrCircuitOpen
+// without calling OpenAI.
+func (o *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float64, error) {
+	if o.breaker.IsOpen() {
+		return nil, newCircuitError(circuitKindOpenAI)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"model": o.Model,
+		"input": texts,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		o.BaseURL+"/embeddings", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+o.APIKey)
+	if o.Audience != "" {
+		req.Header.Set("ocp-apim-subscription-key", o.Audience)
+	}
+	resp, err := o.Client.Do(req)
+	if err != nil {
+		o.breaker.RecordFailure()
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutils.ReadAllLimited(resp.Body, defaultMaxResponseBytes)
+	if err != nil {
+		o.breaker.RecordFailure()
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		o.breaker.RecordFailure()
+		return nil, fmt.Errorf("openai embed batch %s: status %d: %s", o.Model, resp.StatusCode, body)
+	}
+	var raw struct {
+		Data []struct {
+			Embedding []float64 `json:"embedding"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		o.breaker.RecordFailure()
+		return nil, fmt.Errorf("openai embed batch: decode: %w", err)
+	}
+	if len(raw.Data) == 0 {
+		o.breaker.RecordFailure()
+		return nil, fmt.Errorf("openai embed batch: empty data for model %s", o.Model)
+	}
+	for i, d := range raw.Data {
+		if len(d.Embedding) == 0 {
+			o.breaker.RecordFailure()
+			return nil, fmt.Errorf("openai embed batch: empty embedding at index %d for model %s", i, o.Model)
+		}
+	}
+	o.breaker.RecordSuccess()
+	result := make([][]float64, len(raw.Data))
+	for i, d := range raw.Data {
+		result[i] = d.Embedding
+	}
+	return result, nil
 }
 
 func (o *OpenAIEmbedder) IsHealthy(ctx context.Context) bool {
@@ -1241,6 +1490,65 @@ func (c *CohereEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 	}
 	c.breaker.RecordSuccess()
 	return raw.Embeddings[0], nil
+}
+
+// EmbedBatch fetches embedding vectors for multiple texts via the Cohere
+// /v1/embed API. If the circuit breaker is open, it returns ErrCircuitOpen
+// without calling Cohere.
+func (c *CohereEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float64, error) {
+	if c.breaker.IsOpen() {
+		return nil, newCircuitError(circuitKindCohere)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"model": c.Model,
+		"texts": texts,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.BaseURL+"/embed", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	resp, err := c.Client.Do(req)
+	if err != nil {
+		c.breaker.RecordFailure()
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutils.ReadAllLimited(resp.Body, defaultMaxResponseBytes)
+	if err != nil {
+		c.breaker.RecordFailure()
+		return nil, err
+	}
+	if len(body) >= defaultMaxResponseBytes {
+		c.breaker.RecordFailure()
+		return nil, fmt.Errorf("cohere embed batch: response body exceeds %d-byte size limit", defaultMaxResponseBytes)
+	}
+	if resp.StatusCode != http.StatusOK {
+		c.breaker.RecordFailure()
+		return nil, fmt.Errorf("cohere embed batch %s: status %d: %s", c.Model, resp.StatusCode, body)
+	}
+	var raw struct {
+		Embeddings [][]float64 `json:"embeddings"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		c.breaker.RecordFailure()
+		return nil, fmt.Errorf("cohere embed batch: decode: %w", err)
+	}
+	if len(raw.Embeddings) == 0 {
+		c.breaker.RecordFailure()
+		return nil, fmt.Errorf("cohere embed batch: empty embeddings for model %s", c.Model)
+	}
+	for i, emb := range raw.Embeddings {
+		if len(emb) == 0 {
+			c.breaker.RecordFailure()
+			return nil, fmt.Errorf("cohere embed batch: empty embedding at index %d for model %s", i, c.Model)
+		}
+	}
+	c.breaker.RecordSuccess()
+	return raw.Embeddings, nil
 }
 
 func (c *CohereEmbedder) IsHealthy(ctx context.Context) bool {
