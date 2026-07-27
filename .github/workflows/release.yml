@@ -313,62 +313,100 @@ jobs:
         # `digest` output is populated regardless and used for cosign
         # signing below.
 
-      # ── Post-build smoke test (issue #582) ──────────────────────
+      # ── Post-build smoke test (issue #582, #690) ────────────────
       # The image is already pushed by build-push-action above. Pull
-      # the amd64 variant back onto the runner and prove the container
-      # actually runs BEFORE cosign signs it and the release job
-      # advertises it. A broken image (bad entrypoint, missing binary,
-      # wrong UID) fails here and marks the docker job failed, which
-      # blocks both the cosign step below and the `release` job
-      # (`needs: [build-binaries, docker, sbom]`). This stops broken
-      # images from being cosign-signed and attached to the GitHub
-      # Release.
-      - name: Smoke test image
+      # BOTH pushed variants (amd64 + arm64) back onto the runner and
+      # prove each container actually runs BEFORE cosign signs the
+      # multi-arch digest and the release job advertises it. A broken
+      # image of either architecture (bad entrypoint, missing binary,
+      # wrong UID, ARM-incompatible build flag) fails here and marks
+      # the docker job failed, which blocks both the cosign step below
+      # and the `release` job (`needs: [build-binaries, docker, sbom]`).
+      # This stops broken images from being cosign-signed and attached
+      # to the GitHub Release.
+      #
+      # ARM64 smoke-test constraints (issue #690):
+      # The runner is x86_64, so the arm64 variant executes under the
+      # QEMU user-space emulator set up earlier in this job. QEMU
+      # emulation is markedly slower than native execution — a cold
+      # start of the Go binary can take 10-20s — so the /healthz poll
+      # loop below uses a 60s budget per platform (vs. 30s for the old
+      # amd64-only test). The arm64 test is intentionally NOT marked
+      # continue-on-error: a broken arm64 image must block cosign
+      # signing and the release, matching how amd64 is treated. If a
+      # future change makes QEMU startup exceed the 60s budget, raise
+      # the budget rather than weakening the gate.
+      - name: Smoke test image (amd64 + arm64)
         env:
           IMAGE: ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.version }}
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
 
-          echo "Pulling ${IMAGE} (amd64) for smoke test..."
-          docker pull --platform linux/amd64 "${IMAGE}"
+          # Both platforms are built & pushed above, so both must be
+          # proven to start. amd64 runs natively; arm64 runs under QEMU.
+          PLATFORMS="linux/amd64 linux/arm64"
 
-          # Verify the binary runs and reports the version injected at
-          # build time. The distroless ENTRYPOINT is /nexus, so the
-          # flag is passed as the sole argument.
-          echo "::group::nexus --version"
-          docker run --rm "${IMAGE}" --version | tee /tmp/version.out
-          grep -F "nexus ${VERSION}" /tmp/version.out
-          echo "::endgroup::"
+          smoke_one() {
+            local platform="$1" port="$2"
+            local shortname="${platform//\//-}"
 
-          # Verify /healthz responds 200 once the HTTP server is up.
-          # Distroless has no shell or wget, so the check runs from the
-          # runner against the host-mapped port. /healthz is auth-exempt
-          # and always returns 200 while the binary is alive.
-          echo "::group::/healthz responds 200"
-          CID=$(docker run -d --rm -p 18000:8000 "${IMAGE}")
-          trap 'docker stop "${CID}" >/dev/null 2>&1 || true' EXIT
+            echo "::group::Smoke test ${platform}"
+            echo "Pulling ${IMAGE} (${platform})..."
+            docker pull --platform "${platform}" "${IMAGE}"
 
-          CODE=""
-          for i in $(seq 1 30); do
-            CODE=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-              --max-time 2 http://localhost:18000/healthz || true)
-            if [ "${CODE}" = "200" ]; then
-              echo "/healthz returned 200 on attempt ${i}"
-              break
+            # Verify the binary runs and reports the version injected
+            # at build time. The distroless ENTRYPOINT is /nexus, so
+            # --version is passed as the sole argument.
+            echo "nexus --version (${platform})"
+            docker run --rm --platform "${platform}" "${IMAGE}" --version \
+              | tee "/tmp/version-${shortname}.out"
+            grep -F "nexus ${VERSION}" "/tmp/version-${shortname}.out"
+
+            # Verify /healthz responds 200 once the HTTP server is up.
+            # Distroless has no shell or wget, so the check runs from
+            # the runner against the host-mapped port. /healthz is
+            # auth-exempt and always returns 200 while the binary is
+            # alive. Distinct ports per platform avoid "address already
+            # in use" if a prior container is slow to release its port.
+            echo "/healthz responds 200 (${platform})"
+            local cid
+            cid=$(docker run -d --rm --platform "${platform}" -p "${port}:8000" "${IMAGE}")
+
+            local code=""
+            for i in $(seq 1 60); do
+              code=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+                --max-time 2 "http://localhost:${port}/healthz" || true)
+              if [ "${code}" = "200" ]; then
+                echo "/healthz returned 200 on attempt ${i} (${platform})"
+                break
+              fi
+              echo "attempt ${i}: status=${code}, retrying... (${platform})"
+              sleep 1
+            done
+
+            if [ "${code}" != "200" ]; then
+              echo "::error::/healthz did not return 200 within 60s for ${platform} (last=${code})"
+              docker logs "${cid}" || true
+              docker stop "${cid}" >/dev/null 2>&1 || true
+              exit 1
             fi
-            echo "attempt ${i}: status=${CODE}, retrying..."
-            sleep 1
+            docker stop "${cid}" >/dev/null 2>&1 || true
+            echo "Smoke test passed for ${platform}."
+            echo "::endgroup::"
+          }
+
+          # Run each platform sequentially. A failure in ANY platform
+          # exits the step non-zero, which fails the `docker` job and
+          # blocks both the cosign signing step below and the `release`
+          # job (needs: [build-binaries, docker, sbom]).
+          PORT=18000
+          for platform in ${PLATFORMS}; do
+            smoke_one "${platform}" "${PORT}"
+            PORT=$((PORT + 1))
           done
 
-          if [ "${CODE}" != "200" ]; then
-            echo "::error::/healthz did not return 200 within 30s (last=${CODE})"
-            docker logs "${CID}" || true
-            exit 1
-          fi
-          echo "::endgroup::"
-
-          echo "Smoke test passed."
+          echo "All platform smoke tests passed."
 
       # ── Keyless cosign signing (requires id-token: write) ───────
       - name: Install cosign
