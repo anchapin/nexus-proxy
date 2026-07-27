@@ -12,6 +12,7 @@
 package observability
 
 import (
+	"fmt"
 	"math"
 	"net/http"
 	"sync"
@@ -279,20 +280,23 @@ func NewCollector() *Collector {
 	for _, cat := range slmConfidenceCategories {
 		c.slmConfidenceHistograms[cat] = NewHistogram(ConfidenceBuckets)
 	}
-	// Pre-allocate RAG similarity histograms for each (path, outcome)
-	// pair (issue #447). 4 fixed series — see ragSimilarityLabels.
+	// Pre-allocate RAG similarity histograms for the default (path, outcome)
+	// pairs (issue #447). Additional histograms for per-threshold observations
+	// are created lazily by ObserveRAGSimilarity (issue #671).
 	c.ragSimilarityHistograms = make(map[string]*Histogram, len(ragSimilarityLabels))
 	for _, l := range ragSimilarityLabels {
-		key := ragSimilarityKey(l.path, l.outcome)
+		key := ragSimilarityKey(l.path, l.outcome, 0) // 0 = default/global threshold
 		c.ragSimilarityHistograms[key] = NewHistogram(RAGSimilarityBuckets)
 	}
 	return c
 }
 
-// ragSimilarityKey builds the lookup key for the (path, outcome) pair.
+// ragSimilarityKey builds the lookup key for the (path, outcome, threshold) tuple.
 // Stable across processes so scrape diffs are reproducible.
-func ragSimilarityKey(path, outcome string) string {
-	return path + "|" + outcome
+// The threshold is rounded to 2 decimal places to avoid floating-point
+// key explosion while still providing per-threshold visibility (issue #671).
+func ragSimilarityKey(path, outcome string, threshold float64) string {
+	return fmt.Sprintf("%s|%s|%.2f", path, outcome, threshold)
 }
 
 // Submit records one ObservabilityEvent. Called exactly once per
@@ -706,9 +710,9 @@ func (c *Collector) SLMConfidenceHistograms() map[string]*Histogram {
 // --- RAG similarity histogram (issue #447) ------------------------------
 //
 // ObserveRAGSimilarity records one similarity observation for the
-// given (path, outcome) pair (issue #447). Called from the RAG
-// observer closure in main.go when handlers.RAGEvent carries a
-// non-empty IndexPath.
+// given (path, outcome, threshold) tuple (issue #447, #671).
+// Called from the RAG observer closure in main.go when
+// handlers.RAGEvent carries a non-empty IndexPath.
 //
 // The outcome is "hit" when the retrieval returned a snippet above the
 // configured threshold and "miss" otherwise; both observations land in
@@ -721,25 +725,40 @@ func (c *Collector) SLMConfidenceHistograms() map[string]*Histogram {
 // silently dropped rather than bucketed under a third label, to
 // preserve the bounded-cardinality contract documented for
 // nexus_rag_similarity_histogram.
-func (c *Collector) ObserveRAGSimilarity(path, outcome string, score float64) {
+//
+// effectiveThreshold is the similarity floor that was applied for this
+// retrieval (issue #671). When per-directory overrides are configured,
+// this may differ from the global NEXUS_RAG_THRESHOLD. Operators use
+// the threshold label to tune per-domain thresholds.
+func (c *Collector) ObserveRAGSimilarity(path, outcome string, score, effectiveThreshold float64) {
 	if score < 0 {
 		score = 0
 	} else if score > 1 {
 		score = 1
 	}
-	key := ragSimilarityKey(path, outcome)
+	key := ragSimilarityKey(path, outcome, effectiveThreshold)
 	c.ragSimilarityMu.RLock()
 	h, ok := c.ragSimilarityHistograms[key]
 	c.ragSimilarityMu.RUnlock()
-	if ok && h != nil {
-		h.Observe(score)
+	if !ok || h == nil {
+		// Lazily create histogram for this (path, outcome, threshold) combination
+		// (issue #671). This allows per-directory threshold tuning visibility
+		// without pre-allocating histograms for every possible threshold.
+		c.ragSimilarityMu.Lock()
+		// Double-check after acquiring write lock
+		if h, ok = c.ragSimilarityHistograms[key]; !ok || h == nil {
+			h = NewHistogram(RAGSimilarityBuckets)
+			c.ragSimilarityHistograms[key] = h
+		}
+		c.ragSimilarityMu.Unlock()
 	}
+	h.Observe(score)
 }
 
-// RAGSimilarityHistograms returns the per-(path, outcome) RAG
+// RAGSimilarityHistograms returns the per-(path, outcome, threshold) RAG
 // similarity histograms for rendering. The map is keyed by
-// "path|outcome" (e.g. "hnsw|hit"); callers iterate the keys to
-// emit nexus_rag_similarity_histogram_bucket lines.
+// "path|outcome|threshold" (e.g. "hnsw|hit|0.55"); callers iterate the keys to
+// emit nexus_rag_similarity_histogram_bucket lines (issue #671).
 //
 // Returns nil when the collector is not yet initialised (e.g. when a
 // nil receiver is passed to RenderPrometheus). Safe to call from

@@ -543,22 +543,22 @@ func TestRenderPrometheusTLSCounters(t *testing.T) {
 	}
 }
 
-// TestRenderPrometheusRAGSimilarityHistogram (issue #447) asserts the
+// TestRenderPrometheusRAGSimilarityHistogram (issue #447, #671) asserts the
 // acceptance-criteria line "Score buckets are emitted for both index
 // paths" and "Hits and misses record exactly once" — the renderer must
 // emit nexus_rag_similarity_histogram buckets for each (path,
-// outcome) pair that has at least one observation, with cumulative
-// counts matching the underlying histograms.
+// outcome, threshold) tuple that has at least one observation, with
+// cumulative counts matching the underlying histograms.
 //
 // Empty histograms (no observations) must be omitted from the
 // rendered output so a freshly-booted scraper never sees a
 // misleading 0-count series for an unobserved path.
 func TestRenderPrometheusRAGSimilarityHistogram(t *testing.T) {
 	c := NewCollector()
-	c.ObserveRAGSimilarity("hnsw", "hit", 0.7)
-	c.ObserveRAGSimilarity("hnsw", "hit", 0.9)
-	c.ObserveRAGSimilarity("hnsw", "miss", 0.3)
-	c.ObserveRAGSimilarity("brute_force", "miss", 0.4)
+	c.ObserveRAGSimilarity("hnsw", "hit", 0.7, 0.55)
+	c.ObserveRAGSimilarity("hnsw", "hit", 0.9, 0.55)
+	c.ObserveRAGSimilarity("hnsw", "miss", 0.3, 0.55)
+	c.ObserveRAGSimilarity("brute_force", "miss", 0.4, 0.55)
 
 	var sb strings.Builder
 	RenderPrometheus(&sb, c)
@@ -575,19 +575,19 @@ func TestRenderPrometheusRAGSimilarityHistogram(t *testing.T) {
 		}
 	}
 
-	// Bucket lines for each observed (path, outcome). Unobserved
+	// Bucket lines for each observed (path, outcome, threshold). Unobserved
 	// pairs (e.g. brute_force/hit) must NOT appear in the output —
 	// the renderer skips empty histograms so the scraper never sees
 	// a zero-count series for a path with no data.
 	wantBuckets := []string{
-		`nexus_rag_similarity_histogram_bucket{path="hnsw",outcome="hit",le="0.8"} 1`,
-		`nexus_rag_similarity_histogram_bucket{path="hnsw",outcome="hit",le="1"} 2`,
-		`nexus_rag_similarity_histogram_bucket{path="hnsw",outcome="hit",le="+Inf"} 2`,
-		`nexus_rag_similarity_histogram_sum{path="hnsw",outcome="hit"} 1.6`,
-		`nexus_rag_similarity_histogram_count{path="hnsw",outcome="hit"} 2`,
-		`nexus_rag_similarity_histogram_bucket{path="hnsw",outcome="miss",le="0.4"} 1`,
-		`nexus_rag_similarity_histogram_count{path="hnsw",outcome="miss"} 1`,
-		`nexus_rag_similarity_histogram_count{path="brute_force",outcome="miss"} 1`,
+		`nexus_rag_similarity_histogram_bucket{path="hnsw",outcome="hit",threshold="0.55",le="0.8"} 1`,
+		`nexus_rag_similarity_histogram_bucket{path="hnsw",outcome="hit",threshold="0.55",le="1"} 2`,
+		`nexus_rag_similarity_histogram_bucket{path="hnsw",outcome="hit",threshold="0.55",le="+Inf"} 2`,
+		`nexus_rag_similarity_histogram_sum{path="hnsw",outcome="hit",threshold="0.55"} 1.6`,
+		`nexus_rag_similarity_histogram_count{path="hnsw",outcome="hit",threshold="0.55"} 2`,
+		`nexus_rag_similarity_histogram_bucket{path="hnsw",outcome="miss",threshold="0.55",le="0.4"} 1`,
+		`nexus_rag_similarity_histogram_count{path="hnsw",outcome="miss",threshold="0.55"} 1`,
+		`nexus_rag_similarity_histogram_count{path="brute_force",outcome="miss",threshold="0.55"} 1`,
 	}
 	for _, want := range wantBuckets {
 		if !strings.Contains(out, want) {

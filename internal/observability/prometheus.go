@@ -547,53 +547,61 @@ func writeSLMConfidenceHistogram(w io.Writer, histograms map[string]*Histogram) 
 }
 
 // writeRAGSimilarityHistogram emits the nexus_rag_similarity_histogram
-// histogram family labelled by path and outcome (issue #447).
+// histogram family labelled by path, outcome, and threshold (issue #447, #671).
 //
 // Labels:
-//   - path    ∈ {"hnsw", "brute_force"} — the retrieval algorithm
+//   - path       ∈ {"hnsw", "brute_force"} — the retrieval algorithm
 //     Retrieve actually used; see rag.IndexPath.
-//   - outcome ∈ {"hit", "miss"}         — "hit" when a snippet cleared
+//   - outcome    ∈ {"hit", "miss"}         — "hit" when a snippet cleared
 //     the configured threshold, "miss" when it did not.
+//   - threshold  ∈ (0.0, 1.0]              — the effective similarity floor
+//     applied for this retrieval (global or per-directory override).
 //
-// Cardinality: 4 series (path × outcome), each with RAGSimilarityBuckets
-// (10) + +Inf bucket lines, plus _sum and _count. The map key is
-// "path|outcome" — we split it back into two labels at render time so
-// the Prometheus exposition matches the documented label schema.
+// Cardinality: dynamic — one series per (path × outcome × threshold) tuple.
+// Each series has RAGSimilarityBuckets (10) + +Inf bucket lines, plus _sum
+// and _count. The map key is "path|outcome|threshold"; we split it back
+// into three labels at render time so the Prometheus exposition matches
+// the documented label schema.
 //
-// Series are emitted in a fixed order (hnsw/then brute_force, then
-// hit/then miss) so scrape-to-scrape diffs are stable and friendly to
-// human inspection. Empty histograms (count == 0) are skipped so the
-// scrape output stays clean until the first observation lands — and
-// when ALL four histograms are empty the HELP/TYPE header is omitted
+// Series are emitted in sorted key order so scrape-to-scrape diffs are
+// stable and friendly to human inspection. Empty histograms (count == 0)
+// are skipped so the scrape output stays clean until the first observation
+// lands — and when ALL histograms are empty the HELP/TYPE header is omitted
 // too, so a freshly-booted scraper never sees a misleading zero-count
 // family.
 func writeRAGSimilarityHistogram(w io.Writer, histograms map[string]*Histogram) {
-	order := []struct{ path, outcome string }{
-		{"hnsw", "hit"},
-		{"hnsw", "miss"},
-		{"brute_force", "hit"},
-		{"brute_force", "miss"},
-	}
 	type snapshot struct {
 		path, outcome string
+		threshold     float64
 		cum           []uint64
 		upperBounds   []float64
 		sum           float64
 		count         uint64
 	}
 	var snaps []snapshot
-	for _, l := range order {
-		h, ok := histograms[ragSimilarityKey(l.path, l.outcome)]
-		if !ok || h == nil {
+	for key, h := range histograms {
+		if h == nil {
 			continue
 		}
 		cum, upperBounds, sum, count := h.Snapshot()
 		if count == 0 {
 			continue
 		}
+		// Parse key: "path|outcome|threshold"
+		parts := strings.Split(key, "|")
+		if len(parts) != 3 {
+			continue
+		}
+		path := parts[0]
+		outcome := parts[1]
+		var threshold float64
+		if _, err := fmt.Sscanf(parts[2], "%f", &threshold); err != nil {
+			continue
+		}
 		snaps = append(snaps, snapshot{
-			path:        l.path,
-			outcome:     l.outcome,
+			path:        path,
+			outcome:     outcome,
+			threshold:   threshold,
 			cum:         cum,
 			upperBounds: upperBounds,
 			sum:         sum,
@@ -603,20 +611,31 @@ func writeRAGSimilarityHistogram(w io.Writer, histograms map[string]*Histogram) 
 	if len(snaps) == 0 {
 		return
 	}
+	// Sort for stable output order
+	sort.Slice(snaps, func(i, j int) bool {
+		if snaps[i].path != snaps[j].path {
+			return snaps[i].path < snaps[j].path
+		}
+		if snaps[i].outcome != snaps[j].outcome {
+			return snaps[i].outcome < snaps[j].outcome
+		}
+		return snaps[i].threshold < snaps[j].threshold
+	})
 	writeMeta(w, "nexus_rag_similarity_histogram",
-		"RAG retrieval cosine-similarity score distribution, labelled by index path and outcome (issue #447).",
+		"RAG retrieval cosine-similarity score distribution, labelled by index path, outcome, and effective threshold (issue #447, #671).",
 		"histogram")
 	for _, s := range snaps {
+		thr := fmt.Sprintf("%.2f", s.threshold)
 		for i, ub := range s.upperBounds {
-			fmt.Fprintf(w, "nexus_rag_similarity_histogram_bucket{path=%q,outcome=%q,le=%q} %d\n",
-				s.path, s.outcome, formatFloat(ub), s.cum[i])
+			fmt.Fprintf(w, "nexus_rag_similarity_histogram_bucket{path=%q,outcome=%q,threshold=%q,le=%q} %d\n",
+				s.path, s.outcome, thr, formatFloat(ub), s.cum[i])
 		}
-		fmt.Fprintf(w, "nexus_rag_similarity_histogram_bucket{path=%q,outcome=%q,le=%q} %d\n",
-			s.path, s.outcome, "+Inf", s.cum[len(s.upperBounds)])
-		fmt.Fprintf(w, "nexus_rag_similarity_histogram_sum{path=%q,outcome=%q} %s\n",
-			s.path, s.outcome, formatFloat(s.sum))
-		fmt.Fprintf(w, "nexus_rag_similarity_histogram_count{path=%q,outcome=%q} %d\n",
-			s.path, s.outcome, s.count)
+		fmt.Fprintf(w, "nexus_rag_similarity_histogram_bucket{path=%q,outcome=%q,threshold=%q,le=%q} %d\n",
+			s.path, s.outcome, thr, "+Inf", s.cum[len(s.upperBounds)])
+		fmt.Fprintf(w, "nexus_rag_similarity_histogram_sum{path=%q,outcome=%q,threshold=%q} %s\n",
+			s.path, s.outcome, thr, formatFloat(s.sum))
+		fmt.Fprintf(w, "nexus_rag_similarity_histogram_count{path=%q,outcome=%q,threshold=%q} %d\n",
+			s.path, s.outcome, thr, s.count)
 	}
 }
 

@@ -306,12 +306,19 @@ func (f FusionOutcomeObserverFunc) ObserveFusionOutcome(e FusionOutcomeEvent) { 
 // (empty_store / empty_prompt / embed_error) both fields are zero so
 // the observability layer can partition the similarity histogram by
 // path without polluting it with sentinel values.
+//
+// EffectiveThreshold records the similarity threshold that was applied
+// for this retrieval (issue #671). When per-directory overrides are
+// configured via NEXUS_RAG_THRESHOLD_<DIR>, this may differ from the
+// global NEXUS_RAG_THRESHOLD. Operators use this label to tune
+// per-domain thresholds by observing which thresholds produce hits.
 type RAGEvent struct {
-	Hit        bool
-	Filename   string
-	MissReason string
-	Score      float64
-	IndexPath  string // "" | "hnsw" | "brute_force" (see rag.IndexPath)
+	Hit                bool
+	Filename           string
+	MissReason         string
+	Score              float64
+	IndexPath          string  // "" | "hnsw" | "brute_force" (see rag.IndexPath)
+	EffectiveThreshold float64 // threshold that was applied (global or per-directory override)
 }
 
 // RAGObserver is the hook invoked once per RAG retrieval attempt,
@@ -1060,10 +1067,11 @@ func Chat(d Deps) http.Handler {
 				ragFilename = ragEx.Filename
 				if d.RAGObserver != nil {
 					d.RAGObserver.ObserveRAG(RAGEvent{
-						Hit:       true,
-						Filename:  ragEx.Filename,
-						Score:     ragScore,
-						IndexPath: string(ragIndexPath),
+						Hit:                true,
+						Filename:           ragEx.Filename,
+						Score:              ragScore,
+						IndexPath:          string(ragIndexPath),
+						EffectiveThreshold: d.RAG.ThresholdFor(ragEx.Dir),
 					})
 				}
 			} else {
@@ -1105,11 +1113,15 @@ func Chat(d Deps) http.Handler {
 				slog.String("request_id", reqID),
 			)
 			if d.RAGObserver != nil {
+				// For threshold misses, we don't have access to the best candidate's
+				// directory, so we use the global threshold as an approximation.
+				// This still provides useful visibility into threshold behavior.
 				d.RAGObserver.ObserveRAG(RAGEvent{
-					Hit:        false,
-					MissReason: "threshold",
-					Score:      ragScore,
-					IndexPath:  string(ragIndexPath),
+					Hit:                false,
+					MissReason:         "threshold",
+					Score:              ragScore,
+					IndexPath:          string(ragIndexPath),
+					EffectiveThreshold: d.RAG.Threshold(),
 				})
 			}
 		}
