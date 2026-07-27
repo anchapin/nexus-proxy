@@ -31,6 +31,11 @@ gate), `bench` (non-blocking `bench-short`, `continue-on-error: true`),
 (smoke `make docker-build` — catches Dockerfile↔go.mod Go-version drift,
 issue #541). `make ci` is a local convenience wrapper; CI does not invoke it.
 
+**golangci-lint exclusions** (`.golangci.yml`): `cmd/` and `internal/observability/prometheus.go`
+ignore `errcheck` on `fmt.Fprint*` writes intentionally — write errors cannot be handled
+after headers are committed (issue #276). `resp.Body.Close`, `rows.Close`, `stmt.Close`
+are also excluded in non-critical paths.
+
 **Subcommands** (`cmd/nexus/main.go` dispatches on `os.Args[1]`; no args =
 start the proxy):
 - `nexus check` (alias `nexus doctor`) — boot-time diagnostic suite. Exits
@@ -56,7 +61,7 @@ internal/
   circuit/              # local-route cooldown after cascade failure (issue #80)
   concurrencylimit/     # VRAM-aware local-route semaphore
   config/               # Load() (env parsing) + LoadYAML() (file + env override)
-  diag/                 # boot-time diagnostics (nexus check / nexus doctor)
+  diag/                  # boot-time diagnostics (nexus check / nexus doctor)
   handlers/             # chat.go + health.go + recover/security/sanitize
   health/               # Ollama circuit breaker (separate from internal/circuit)
   ioutils/              # shared io helpers (decompression, etc.)
