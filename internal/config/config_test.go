@@ -912,6 +912,67 @@ func TestReloadHotReloadable_LogLevel(t *testing.T) {
 	}
 }
 
+// TestParseLogLevel_ValidValues verifies that parseLogLevel returns the
+// correct slog.Level for valid log level strings.
+func TestParseLogLevel_ValidValues(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    slog.Level
+		wantErr bool
+	}{
+		{"debug", slog.LevelDebug, false},
+		{"DEBUG", slog.LevelDebug, false},
+		{"Debug", slog.LevelDebug, false},
+		{"warn", slog.LevelWarn, false},
+		{"WARNING", slog.LevelWarn, false},
+		{"warning", slog.LevelWarn, false},
+		{"error", slog.LevelError, false},
+		{"ERROR", slog.LevelError, false},
+		{"err", slog.LevelError, false},
+		{"info", slog.LevelInfo, false},
+		{"INFO", slog.LevelInfo, false},
+		{"", slog.LevelInfo, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := parseLogLevel(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseLogLevel(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("parseLogLevel(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestParseLogLevel_InvalidValues verifies that parseLogLevel returns
+// slog.LevelInfo with an error for invalid log level strings.
+func TestParseLogLevel_InvalidValues(t *testing.T) {
+	invalidValues := []string{
+		"INVALID_GIBBERISH",
+		"trace",
+		"critical",
+		"warnning", // typo of "warning"
+		"infoo",    // typo of "info"
+		"debu",     // typo of "debug"
+	}
+
+	for _, input := range invalidValues {
+		t.Run(input, func(t *testing.T) {
+			got, err := parseLogLevel(input)
+			if err == nil {
+				t.Errorf("parseLogLevel(%q) error = nil, want non-nil error", input)
+			}
+			if got != slog.LevelInfo {
+				t.Errorf("parseLogLevel(%q) = %v, want slog.LevelInfo (fallback)", input, got)
+			}
+		})
+	}
+}
+
 // TestReloadHotReloadable_LogFormat verifies that log format is correctly
 // reloaded from NEXUS_LOG_FORMAT.
 func TestReloadHotReloadable_LogFormat(t *testing.T) {
