@@ -202,6 +202,8 @@ identical to non-adaptive path.
 413 rejection before any allocation — zero overhead on normal traffic.
 
 `NEXUS_MAX_RESPONSE_BYTES` (default 64 MiB) caps upstream response bodies.
+`NEXUS_CASCADE_MAX_RESPONSE_BYTES` (default 64 MiB) caps cascade response bodies
+independently (issue #742).
 
 `NEXUS_SHUTDOWN_TIMEOUT` (default 30s) is the graceful drain window.
 A warning fires at boot if `SHUTDOWN_TIMEOUT < SERVER_READ_TIMEOUT`.
@@ -266,13 +268,6 @@ latency + cost. Tunable via `NEXUS_SELECTOR_WINDOW` (look-back window),
 (P95 blend factor, range 0–1). When multiple providers are registered via
 `NEXUS_PROVIDERS`, the legacy `NEXUS_FRONTIER_*` vars are ignored.
 
-## Debug tracing (issue #33)
-
-`NEXUS_DEBUG=true` emits five structured slog groups per request:
-`request`, `transforms`, `routing`, `upstream`, `response`. Zero
-overhead when off. API keys redacted; body preview capped at
-`NEXUS_DEBUG_BODY_BYTES` (default 512).
-
 ## Adding new env vars
 
 Config env vars are split across two files. New vars need **both**:
@@ -325,6 +320,9 @@ to record/replay HTTP calls. All tests run in <2s with `-race`.
 `make test-race` is required to pass before merging — race conditions in
 transport, metrics, budget tracker, and VRAM limiter are easy to miss
 in manual testing.
+
+**Focused testing:** `go test ./internal/packagename` runs a single package
+(the Makefile only exposes `./...`). Prefix with `-v` for verbose output.
 
 ## Local-route cooldown (issue #80)
 
