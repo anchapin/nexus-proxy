@@ -125,23 +125,10 @@ func (b *Breaker) FailureCount() int32 {
 	return b.failureCount.Load()
 }
 
-// IsEmbedderHealthy reports whether the embedder of the given kind is
-// currently healthy (circuit breaker not open). The kind is one of
-// "ollama", "openai", or "cohere".
-//
-// If no breaker has been registered for the given kind, IsEmbedderHealthy
-// returns true (no circuit breaker means no blocking).
-func IsEmbedderHealthy(kind string) bool {
-	mu.RLock()
-	defer mu.RUnlock()
-	if b, ok := breakers[kind]; ok {
-		return !b.IsOpen()
-	}
-	return true // no breaker registered = assume healthy
-}
-
-// embedderBreakers is the registry of per-kind embedder circuit breakers.
-// Wired from rag.go at construction time.
+// breakers is the internal registry of per-kind embedder circuit breakers.
+// Wired from rag.go at construction time. This map is intentionally not
+// exported — external consumers should use the observability package's
+// Prometheus gauges which are updated via IncEmbedderFailure calls.
 var (
 	breakers = make(map[string]*Breaker)
 	mu       sync.RWMutex
@@ -149,22 +136,9 @@ var (
 
 // RegisterBreaker registers a circuit breaker for the given embedder kind.
 // This is called from rag.go when each embedder is constructed so that
-// IsEmbedderHealthy can be used by observability code without importing
-// the rag package.
+// the collector can track embedder failures via IncEmbedderFailure.
 func RegisterBreaker(kind string, brk *Breaker) {
 	mu.Lock()
 	defer mu.Unlock()
 	breakers[kind] = brk
-}
-
-// EmbedderBreakers returns the current set of registered embedder breakers
-// as a map. Used by the Prometheus renderer to emit per-kind gauges.
-func EmbedderBreakers() map[string]*Breaker {
-	mu.RLock()
-	defer mu.RUnlock()
-	out := make(map[string]*Breaker, len(breakers))
-	for k, v := range breakers {
-		out[k] = v
-	}
-	return out
 }
