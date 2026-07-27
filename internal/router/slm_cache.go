@@ -323,7 +323,6 @@ func (c *SLMCache) Set(ctx context.Context, prompt string, route Route) {
 		emb:   emb,
 	}
 	c.expiry = append(c.expiry, prompt)
-	c.sortExpiry()
 
 	onEvict = c.onEviction
 	c.mu.Unlock()
@@ -356,7 +355,6 @@ func (c *SLMCache) SetEmbedding(prompt string, route Route, emb []float64) {
 		emb:   emb,
 	}
 	c.expiry = append(c.expiry, prompt)
-	c.sortExpiry()
 
 	onEvict = c.onEviction
 	c.mu.Unlock()

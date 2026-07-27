@@ -830,3 +830,95 @@ func TestSLMCache_sortExpiry_OrphanedVsValidOrdering(t *testing.T) {
 		t.Errorf("valid entries not last: expiry = %v, want [a|d, a|d, b, c]", c.expiry)
 	}
 }
+
+// TestSLMCache_Set_NoSortBelowCapacity (issue #745) verifies that when
+// the cache is below maxEntries and no eviction occurs, the cache
+// remains functionally correct. The corollary is that the O(n log n)
+// overhead of sortExpiry is avoided for the common-case small cache.
+func TestSLMCache_Set_NoSortBelowCapacity(t *testing.T) {
+	c := NewSLMCache(time.Hour, 5) // max 5 entries
+	ctx := context.Background()
+
+	// Insert below capacity — no eviction, no sortExpiry call.
+	for i := 0; i < 4; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		c.Set(ctx, key, RouteLocal)
+		if got, ok, _ := c.Get(ctx, key); !ok || got != RouteLocal {
+			t.Errorf("Get(%q) after Set: got (%v, %v), want (RouteLocal, true)", key, got, ok)
+		}
+	}
+	if c.Len() != 4 {
+		t.Errorf("Len = %d, want 4", c.Len())
+	}
+
+	// Insert the 5th entry — still below capacity, no eviction.
+	c.Set(ctx, "key-4", RouteFrontier)
+	if c.Len() != 5 {
+		t.Errorf("after 5th Set: Len = %d, want 5", c.Len())
+	}
+
+	// key-0 should still be present (no eviction below capacity).
+	if got, ok, _ := c.Get(ctx, "key-0"); !ok || got != RouteLocal {
+		t.Errorf("key-0 still present: got (%v, %v), want (RouteLocal, true)", got, ok)
+	}
+
+	// Insert the 6th entry — now at capacity+1, LRU eviction triggers.
+	c.Set(ctx, "key-5", RouteFrontier)
+	if c.Len() != 5 {
+		t.Errorf("after 6th Set (eviction): Len = %d, want 5", c.Len())
+	}
+
+	// key-0 should now be evicted as LRU (oldest stamp).
+	if got, ok, _ := c.Get(ctx, "key-0"); ok || got != "" {
+		t.Errorf("key-0 was evicted: got (%v, %v), want (\"\", false)", got, ok)
+	}
+
+	// Remaining keys should still be present.
+	for i := 1; i <= 5; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		if got, ok, _ := c.Get(ctx, key); !ok || got == "" {
+			t.Errorf("key-%d still present: got (%v, %v), want (Route, true)", i, got, ok)
+		}
+	}
+}
+
+// TestSLMCache_SetEmbedding_NoSortBelowCapacity verifies the same O(1)
+// insertion guarantee for SetEmbedding when the cache is below capacity.
+func TestSLMCache_SetEmbedding_NoSortBelowCapacity(t *testing.T) {
+	emb := newStubEmbedder()
+	c := NewSLMCacheWithEmbedder(time.Hour, 5, emb, 0.5)
+	ctx := context.Background()
+
+	embVec := []float64{1.0, 0.0, 0.0, 0.0}
+
+	// Insert 4 unique keys below capacity — no eviction, no sortExpiry call.
+	for i := 0; i < 4; i++ {
+		key := fmt.Sprintf("prompt-%d", i)
+		c.SetEmbedding(key, RouteLocal, embVec)
+		if got, ok, _ := c.Get(ctx, key); !ok || got != RouteLocal {
+			t.Errorf("Get(%q) after SetEmbedding: got (%v, %v), want (RouteLocal, true)", key, got, ok)
+		}
+	}
+	if c.Len() != 4 {
+		t.Errorf("Len = %d, want 4", c.Len())
+	}
+
+	// 5th insert — still below capacity (4 < 5), no eviction.
+	c.SetEmbedding("prompt-4", RouteLocal, embVec)
+	if c.Len() != 5 {
+		t.Errorf("after 5th SetEmbedding: Len = %d, want 5", c.Len())
+	}
+
+	// prompt-0 should still be present (no eviction below capacity).
+	if got, ok, _ := c.Get(ctx, "prompt-0"); !ok || got != RouteLocal {
+		t.Errorf("prompt-0 still present: got (%v, %v), want (RouteLocal, true)", got, ok)
+	}
+
+	// Verify all 5 entries are retrievable.
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("prompt-%d", i)
+		if got, ok, _ := c.Get(ctx, key); !ok || got != RouteLocal {
+			t.Errorf("prompt-%d still present: got (%v, %v), want (RouteLocal, true)", i, got, ok)
+		}
+	}
+}
