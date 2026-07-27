@@ -636,6 +636,27 @@ func TestManagerRepollsOnTicker(t *testing.T) {
 	}
 }
 
+func TestWaitForProbesZeroOrNegativeClosesImmediately(t *testing.T) {
+	stub := &stubProbe{}
+	stub.push(Budget{Tokens: 100, Source: SourceSysfs}, nil)
+
+	m := NewManager(stub, 10*time.Millisecond, time.Second)
+	m.Run(context.Background())
+	defer m.Close()
+
+	for _, n := range []int{0, -1} {
+		ch := m.WaitForProbes(n)
+		select {
+		case _, ok := <-ch:
+			if ok {
+				t.Errorf("WaitForProbes(%d) returned open channel, want closed", n)
+			}
+		default:
+			t.Errorf("WaitForProbes(%d) returned open channel, want closed", n)
+		}
+	}
+}
+
 func TestManagerProbeFailureKeepsPreviousBudget(t *testing.T) {
 	stub := &stubProbe{}
 	stub.push(Budget{Tokens: 4096, Source: SourceOllamaPS}, nil)
