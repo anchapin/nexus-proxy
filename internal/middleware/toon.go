@@ -8,6 +8,7 @@
 package middleware
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -36,11 +37,120 @@ var ObjectArrayBlock = regexp.MustCompile(
 // paste inline. The leading newline/whitespace guard prevents matching casual
 // bracket pairs in prose. The trailing [\n\r\t ] is captured as part of the
 // match so the replacement can remove trailing context cleanly.
+//
+// Deprecated: replaced by state-machine scanning in scanUnfencedArrays which
+// correctly handles nested objects and bracket-containing strings.
 var UnfencedArrayBlock = regexp.MustCompile(
 	`(?:^|[\n\r\t ])` + // start of string or preceded by whitespace/newline
 		`(\[\s*\{.*?\}(?:\s*,\s*\{.*?\})*\s*\])` + // the array itself
 		`[\n\r\t ]?`, // optional trailing whitespace/newline (consumed to avoid leaving it)
 )
+
+// findArrayEnd scans content[i:] looking for the matching ] that closes the
+// top-level [ at position i. It uses a bracket-depth state machine that tracks
+// { } [ ] and " states, ignoring nested structure. It correctly handles nested
+// objects and strings containing bracket characters. Returns the index of the
+// closing ] (exclusive end), or -1 if no valid array boundary is found.
+func findArrayEnd(content string, i int) int {
+	if i >= len(content) || content[i] != '[' {
+		return -1
+	}
+	depth := 1
+	inString := false
+	i++
+	for i < len(content) {
+		c := content[i]
+		if c == '\\' && i+1 < len(content) {
+			i += 2 // skip escaped character
+			continue
+		}
+		if c == '"' {
+			inString = !inString
+			i++
+			continue
+		}
+		if inString {
+			i++
+			continue
+		}
+		switch c {
+		case '{', '[':
+			depth++
+		case '}', ']':
+			depth--
+			if depth == 0 {
+				return i + 1 // exclusive end
+			}
+		}
+		i++
+	}
+	return -1
+}
+
+// isObjectArray validates that the trimmed content is a JSON array of objects.
+// It returns the array bytes on success (trimmed) or "" on failure.
+func isObjectArray(content []byte) bool {
+	content = bytes.TrimSpace(content)
+	if len(content) < 2 || content[0] != '[' || content[len(content)-1] != ']' {
+		return false
+	}
+	var data []map[string]interface{}
+	if err := json.Unmarshal(content, &data); err != nil {
+		return false
+	}
+	return len(data) >= 2
+}
+
+// scanUnfencedArrays scans content for unfenced JSON arrays of objects using
+// a state-machine bracket counter. It handles nested objects and strings
+// containing brackets. Returns the (possibly modified) content string.
+func scanUnfencedArrays(content string, didUnfenced *bool) string {
+	skipEnd := -1 // last position to skip (exclusive end of a previously replaced array)
+	for i := 0; i < len(content); i++ {
+		if i >= skipEnd {
+			skipEnd = -1
+		}
+		if content[i] != '[' {
+			continue
+		}
+		if skipEnd != -1 && i < skipEnd {
+			continue
+		}
+		if !isValidArrayStart(content, i) {
+			continue
+		}
+		end := findArrayEnd(content, i)
+		if end == -1 {
+			continue
+		}
+		arrayContent := bytes.TrimSpace([]byte(content[i:end]))
+		if !isObjectArray(arrayContent) {
+			continue
+		}
+		toon, err := SerializeToTOON(arrayContent)
+		if err != nil {
+			continue
+		}
+		content = content[:i] + toon + content[end:]
+		*didUnfenced = true
+		// Mark the replaced region so we skip any [ within the TOON output.
+		skipEnd = i + len(toon)
+		// Continue scanning after the TOON output.
+		i = skipEnd - 1
+	}
+	return content
+}
+
+// isValidArrayStart returns true if content[i] is a '[' that could be the
+// start of an unfenced array. It must be at the start of content or preceded
+// by whitespace, and NOT inside a string.
+func isValidArrayStart(content string, i int) bool {
+	if i == 0 {
+		return true
+	}
+	c := content[i-1]
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
 
 // CompressionMethod indicates which TOON compression pattern was applied
 // to a request's messages (issue #247).
@@ -125,29 +235,10 @@ func CompressJSONBlocks(messages []interface{}, unfenced bool) CompressionMethod
 		}
 
 		// Handle unfenced standalone JSON arrays (no code fences).
-		// Skip when unfenced=false (operators want fenced-only TOON).
+		// Uses a state-machine scanner instead of regex to correctly handle
+		// nested objects and strings containing bracket characters.
 		if unfenced {
-			unfencedMatches := UnfencedArrayBlock.FindAllStringSubmatchIndex(content, -1)
-			for _, m := range unfencedMatches {
-				if len(m) < 4 {
-					continue
-				}
-				// m[0], m[1]: full match (leading context + array + optional trailing ws)
-				// m[2], m[3]: captured group (the array itself)
-				arrayMatch := content[m[2]:m[3]]
-				toon, err := SerializeToTOON([]byte(arrayMatch))
-				if err != nil {
-					continue
-				}
-				// Preserve leading context (newline/whitespace) by replacing only
-				// from end of leading context to end of full match with the TOON block.
-				// m[1] is the end of leading context (start of captured array).
-				leadingContext := content[m[0]:m[2]] // e.g., "\n"
-				replacement := leadingContext + toon
-				fullMatch := content[m[0]:m[1]]
-				content = strings.Replace(content, fullMatch, replacement, 1)
-				didUnfenced = true
-			}
+			content = scanUnfencedArrays(content, &didUnfenced)
 		}
 
 		if fenced || nested || didUnfenced {
