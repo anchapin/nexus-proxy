@@ -81,8 +81,10 @@ type ConfidenceStore interface {
 	// LocalConfidence returns the fraction of recent local outcomes for
 	// category that scored acceptably (0.0..1.0). It returns
 	// NeutralConfidence (0.5) when there is insufficient data so the
-	// caller's routing is unchanged.
-	LocalConfidence(category string) float64
+	// caller's routing is unchanged. An empty category returns an error
+	// so upstream callers that fail to categorize a prompt are surfaced
+	// rather than silently coercing to CategoryOther (issue #802).
+	LocalConfidence(category string) (float64, error)
 }
 
 // categoryKeywords maps each category to the substrings that select it.

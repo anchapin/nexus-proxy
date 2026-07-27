@@ -57,9 +57,9 @@ type stubConf struct {
 
 func (s *stubConf) RecordOutcome(_ string, _ Route, _ int) error { return nil }
 
-func (s *stubConf) LocalConfidence(category string) float64 {
+func (s *stubConf) LocalConfidence(category string) (float64, error) {
 	s.queried = append(s.queried, category)
-	return s.value
+	return s.value, nil
 }
 
 // formattingPatterns matches the handler's NEXUS_DSL_FORMATTING_PATTERNS default.

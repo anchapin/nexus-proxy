@@ -76,7 +76,10 @@ func TestConfidenceLowScoresBiasFrontier(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		cs.RecordOutcome(CategoryDebugging, RouteLocal, 1+i%2) // 1s and 2s
 	}
-	got := cs.LocalConfidence(CategoryDebugging)
+	got, err := cs.LocalConfidence(CategoryDebugging)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
 	if got >= DefaultConfidenceFloor {
 		t.Errorf("LocalConfidence = %v, want < %v (floor)", got, DefaultConfidenceFloor)
 	}
@@ -87,7 +90,10 @@ func TestConfidenceHighScoresAboveCeiling(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		cs.RecordOutcome(CategoryCSS, RouteLocal, 4+i%2) // 4s and 5s
 	}
-	got := cs.LocalConfidence(CategoryCSS)
+	got, err := cs.LocalConfidence(CategoryCSS)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
 	if got <= DefaultConfidenceCeiling {
 		t.Errorf("LocalConfidence = %v, want > %v (ceiling)", got, DefaultConfidenceCeiling)
 	}
@@ -99,14 +105,22 @@ func TestConfidenceInsufficientSamplesIsNeutral(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		cs.RecordOutcome(CategoryDebugging, RouteLocal, 1)
 	}
-	if got := cs.LocalConfidence(CategoryDebugging); got != NeutralConfidence {
+	got, err := cs.LocalConfidence(CategoryDebugging)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
+	if got != NeutralConfidence {
 		t.Errorf("LocalConfidence = %v, want %v (neutral)", got, NeutralConfidence)
 	}
 }
 
 func TestConfidenceUnknownCategoryIsNeutral(t *testing.T) {
 	cs := newTestConfidenceStore(t, 5, time.Hour)
-	if got := cs.LocalConfidence(CategoryArchitecture); got != NeutralConfidence {
+	got, err := cs.LocalConfidence(CategoryArchitecture)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
+	if got != NeutralConfidence {
 		t.Errorf("LocalConfidence(no data) = %v, want %v", got, NeutralConfidence)
 	}
 }
@@ -118,14 +132,22 @@ func TestConfidenceSlidingWindowExpiry(t *testing.T) {
 		cs.recordAt(CategoryRefactoring, RouteLocal, 1, old)
 	}
 	// All rows are stale, so the window sees zero samples -> neutral.
-	if got := cs.LocalConfidence(CategoryRefactoring); got != NeutralConfidence {
+	got, err := cs.LocalConfidence(CategoryRefactoring)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
+	if got != NeutralConfidence {
 		t.Errorf("expired-only LocalConfidence = %v, want %v (neutral)", got, NeutralConfidence)
 	}
 	// Adding fresh low scores tips it below the floor once past min-samples.
 	for i := 0; i < 6; i++ {
 		cs.RecordOutcome(CategoryRefactoring, RouteLocal, 1)
 	}
-	if got := cs.LocalConfidence(CategoryRefactoring); got >= DefaultConfidenceFloor {
+	got, err = cs.LocalConfidence(CategoryRefactoring)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
+	if got >= DefaultConfidenceFloor {
 		t.Errorf("fresh LocalConfidence = %v, want < %v", got, DefaultConfidenceFloor)
 	}
 }
@@ -134,7 +156,11 @@ func TestConfidenceIgnoresOutOfRangeScores(t *testing.T) {
 	cs := newTestConfidenceStore(t, 1, time.Hour)
 	cs.RecordOutcome(CategoryOther, RouteLocal, 0) // parse failure, ignored
 	cs.RecordOutcome(CategoryOther, RouteLocal, 9) // out of range, ignored
-	if got := cs.LocalConfidence(CategoryOther); got != NeutralConfidence {
+	got, err := cs.LocalConfidence(CategoryOther)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
+	if got != NeutralConfidence {
 		t.Errorf("LocalConfidence with only invalid scores = %v, want neutral", got)
 	}
 }
@@ -145,7 +171,11 @@ func TestConfidenceOnlyLocalRouteCounts(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		cs.RecordOutcome(CategoryDebugging, RouteFrontier, 5)
 	}
-	if got := cs.LocalConfidence(CategoryDebugging); got != NeutralConfidence {
+	got, err := cs.LocalConfidence(CategoryDebugging)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
+	if got != NeutralConfidence {
 		t.Errorf("LocalConfidence with only frontier rows = %v, want neutral", got)
 	}
 }
@@ -157,7 +187,11 @@ func TestConfidenceMixedScoresFraction(t *testing.T) {
 	cs.RecordOutcome(CategoryOther, RouteLocal, 4)
 	cs.RecordOutcome(CategoryOther, RouteLocal, 2)
 	cs.RecordOutcome(CategoryOther, RouteLocal, 1)
-	if got := cs.LocalConfidence(CategoryOther); got != 0.5 {
+	got, err := cs.LocalConfidence(CategoryOther)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
+	if got != 0.5 {
 		t.Errorf("LocalConfidence mixed = %v, want 0.5", got)
 	}
 }
@@ -185,5 +219,20 @@ func TestConfidenceRecordAtRejectsEmptyCategory(t *testing.T) {
 	cs := newTestConfidenceStore(t, 5, time.Hour)
 	if err := cs.recordAt("", RouteLocal, 3, time.Now().UTC()); err == nil {
 		t.Fatal("recordAt with empty category: expected non-nil error, got nil")
+	}
+}
+
+// TestConfidenceLocalConfidenceRejectsEmptyCategory verifies that an empty
+// category is surfaced as an error rather than silently coerced to
+// CategoryOther (issue #802). This makes upstream LocalConfidence bugs
+// visible instead of silently returning neutral confidence.
+func TestConfidenceLocalConfidenceRejectsEmptyCategory(t *testing.T) {
+	cs := newTestConfidenceStore(t, 5, time.Hour)
+	got, err := cs.LocalConfidence("")
+	if err == nil {
+		t.Fatal("LocalConfidence with empty category: expected non-nil error, got nil")
+	}
+	if got != NeutralConfidence {
+		t.Errorf("LocalConfidence with empty category = %v, want %v (neutral)", got, NeutralConfidence)
 	}
 }
