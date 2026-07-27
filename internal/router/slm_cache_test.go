@@ -678,8 +678,6 @@ func TestSLMCache_EvictionReasonConstants(t *testing.T) {
 	}
 }
 
-// --- Nil-guard accessor tests (issue #663) ---
-
 func TestSLMCache_Enabled_NilReceiver(t *testing.T) {
 	// Enabled must not panic on a nil *SLMCache pointer (issue #663).
 	var c *SLMCache
@@ -728,5 +726,107 @@ func TestSLMCache_Enabled_ZeroTTLDisabled(t *testing.T) {
 
 	if got := c.Enabled(); got != false {
 		t.Errorf("Enabled() with ttl=0 = %v, want false", got)
+	}
+}
+
+// --- sortExpiry !oki branch tests (issue #661) ---
+
+func TestSLMCache_sortExpiry_OrphanedEntry(t *testing.T) {
+	// Test that sortExpiry correctly handles orphaned entries (keys present
+	// in c.expiry but deleted from c.entries). Orphaned entries must sort
+	// before valid entries so they are candidates for immediate eviction.
+	// This exercises the !oki branch at slm_cache.go:154.
+	c := NewSLMCache(time.Hour, 3)
+	ctx := context.Background()
+
+	// Add three entries. After this, c.expiry = [a, b, c].
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteLocal)
+	c.Set(ctx, "c", RouteLocal)
+
+	// Manually delete "a" from c.entries to create an orphaned entry,
+	// but leave it in c.expiry. This simulates the state after evictLru
+	// has removed an entry but before the next sortExpiry call.
+	c.mu.Lock()
+	delete(c.entries, "a") // orphaned: in c.expiry but not in c.entries
+	c.sortExpiry()
+	c.mu.Unlock()
+
+	// c.expiry[0] must be the orphaned key "a" because orphaned entries
+	// should sort first.
+	if len(c.expiry) != 3 {
+		t.Fatalf("expiry len = %d, want 3", len(c.expiry))
+	}
+	if c.expiry[0] != "a" {
+		t.Errorf("expiry[0] = %q, want orphaned key %q", c.expiry[0], "a")
+	}
+}
+
+func TestSLMCache_sortExpiry_MultipleOrphanedEntries(t *testing.T) {
+	// Test that sortExpiry correctly handles multiple orphaned entries.
+	// When c.expiry contains holes (orphaned keys), all orphaned entries
+	// must sort before any valid entry.
+	c := NewSLMCache(time.Hour, 5)
+	ctx := context.Background()
+
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteLocal)
+	c.Set(ctx, "c", RouteLocal)
+
+	c.mu.Lock()
+	// Create two orphaned entries by deleting from c.entries
+	delete(c.entries, "a")
+	delete(c.entries, "b")
+	c.sortExpiry()
+	c.mu.Unlock()
+
+	// Both a and b should sort before c (the only valid entry)
+	if len(c.expiry) != 3 {
+		t.Fatalf("expiry len = %d, want 3", len(c.expiry))
+	}
+	// c should be last since it's the only valid entry
+	if c.expiry[2] != "c" {
+		t.Errorf("expiry[2] = %q, want valid entry %q", c.expiry[2], "c")
+	}
+	// The first two must be the orphaned entries (a and b in some order)
+	orphanCount := 0
+	for i := 0; i < 2; i++ {
+		if c.expiry[i] == "a" || c.expiry[i] == "b" {
+			orphanCount++
+		}
+	}
+	if orphanCount != 2 {
+		t.Errorf("orphanCount = %d, want 2 orphaned entries at start", orphanCount)
+	}
+}
+
+func TestSLMCache_sortExpiry_OrphanedVsValidOrdering(t *testing.T) {
+	// Verify that when sortExpiry is called with a mix of orphaned and
+	// valid entries, the sort order is correct: orphaned entries first
+	// (sorted by their position), then valid entries sorted by stamp.
+	c := NewSLMCache(time.Hour, 4)
+	ctx := context.Background()
+
+	// Set entries with a gap (a deleted, b and c present, d deleted)
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteLocal)
+	c.Set(ctx, "c", RouteLocal)
+	c.Set(ctx, "d", RouteLocal)
+
+	// Wait a bit so b and c have different timestamps
+	time.Sleep(10 * time.Millisecond)
+
+	c.mu.Lock()
+	delete(c.entries, "a")
+	delete(c.entries, "d")
+	// After deletions: expiry = [a, b, c, d], entries = {b, c}
+	c.sortExpiry()
+	c.mu.Unlock()
+
+	// Orphaned entries (a, d) should be sorted before valid entries (b, c)
+	// a and d should be at positions 0 and 1 in some order
+	// b and c should be at positions 2 and 3 in stamp order (b before c)
+	if c.expiry[2] != "b" || c.expiry[3] != "c" {
+		t.Errorf("valid entries not last: expiry = %v, want [a|d, a|d, b, c]", c.expiry)
 	}
 }
