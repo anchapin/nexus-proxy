@@ -110,7 +110,10 @@ func TestAdaptiveRoutingIntegration(t *testing.T) {
 		cs.RecordOutcome(category, RouteLocal, 1+i%2) // consistently 1..2
 	}
 
-	confidence := cs.LocalConfidence(category)
+	confidence, err := cs.LocalConfidence(category)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
 	if confidence >= DefaultConfidenceFloor {
 		t.Fatalf("LocalConfidence = %v, want below floor %v", confidence, DefaultConfidenceFloor)
 	}

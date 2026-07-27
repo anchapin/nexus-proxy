@@ -21,6 +21,12 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
 )
 
+func init() {
+	if Categorize("") == "" {
+		panic("Categorize must never return an empty string")
+	}
+}
+
 // DecisionSource names which stage of the planner produced the route.
 // It is the structured equivalent of the handler's trace "reason"
 // field, with finer granularity for the SLM branch so the planner tests
@@ -320,7 +326,7 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	if p.SLMCache != nil {
 		if cached, hit, hitKind := p.SLMCache.Get(req.Context, req.Prompt); hit {
 			if p.Confidence != nil {
-				confidence = p.Confidence.LocalConfidence(category)
+				confidence, _ = p.Confidence.LocalConfidence(category)
 			}
 			// Hard override: same check as the miss path — a cached
 			// local/fusion decision with low confidence still escalates.
@@ -353,7 +359,7 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	}
 
 	if p.Confidence != nil {
-		confidence = p.Confidence.LocalConfidence(category)
+		confidence, _ = p.Confidence.LocalConfidence(category)
 		dec, err = p.SLM.DecideWithConfidence(req.Context, req.Prompt, confidence)
 	} else {
 		dec, err = p.SLM.Decide(req.Context, req.Prompt)

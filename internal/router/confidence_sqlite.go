@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -198,13 +199,14 @@ func (s *SQLiteConfidenceStore) recordAt(category string, route Route, judgeScor
 
 // LocalConfidence implements ConfidenceStore. Returns NeutralConfidence
 // when fewer than minSamples recent local outcomes exist for the category
-// or when the query fails.
-func (s *SQLiteConfidenceStore) LocalConfidence(category string) float64 {
-	if s == nil || s.db == nil {
-		return NeutralConfidence
-	}
+// or when the query fails. An empty category returns an error so upstream
+// bugs are surfaced rather than silently coercing to CategoryOther.
+func (s *SQLiteConfidenceStore) LocalConfidence(category string) (float64, error) {
 	if category == "" {
-		category = CategoryOther
+		return NeutralConfidence, errors.New("confidence: category is empty")
+	}
+	if s == nil || s.db == nil {
+		return NeutralConfidence, nil
 	}
 	cutoff := time.Now().UTC().Add(-s.window)
 
@@ -222,12 +224,12 @@ func (s *SQLiteConfidenceStore) LocalConfidence(category string) float64 {
 			slog.String("category", category),
 			slog.Any("err", err),
 		)
-		return NeutralConfidence
+		return NeutralConfidence, nil
 	}
 	if count < s.minSamples {
-		return NeutralConfidence
+		return NeutralConfidence, nil
 	}
-	return frac
+	return frac, nil
 }
 
 // CategoryStats holds the raw aggregate for one task category in the
