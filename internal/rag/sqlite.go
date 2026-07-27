@@ -240,10 +240,14 @@ func OpenPersistentStore(path string, embedder Embedder, threshold float64) (*Pe
 		}
 	}
 
+	storePath := path
+	if path == ":memory:" {
+		storePath = ""
+	}
 	return &PersistentStore{
 		Store:         NewStore(embedder, threshold),
 		db:            db,
-		path:          path,
+		path:          storePath,
 		embedderModel: embedderModel,
 		embedderDims:  embedderDims,
 	}, nil

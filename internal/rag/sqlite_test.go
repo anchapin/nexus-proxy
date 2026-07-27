@@ -785,3 +785,32 @@ func TestEmbedderDims_HealthyProbe(t *testing.T) {
 		t.Errorf("EmbedderDims() = (%d, %v), want (768, true)", dims, ok)
 	}
 }
+
+// TestPersistentStore_Path_OnDisk verifies Path() returns the path
+// passed to OpenPersistentStore for an on-disk store.
+func TestPersistentStore_Path_OnDisk(t *testing.T) {
+	t.Parallel()
+	dbPath := filepath.Join(t.TempDir(), "rag_path_test.db")
+	ps, err := OpenPersistentStore(dbPath, &stubEmbedder{}, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+	if got := ps.Path(); got != dbPath {
+		t.Errorf("Path() = %q, want %q", got, dbPath)
+	}
+}
+
+// TestPersistentStore_Path_InMemory verifies Path() returns empty
+// string for a ":memory:" store.
+func TestPersistentStore_Path_InMemory(t *testing.T) {
+	t.Parallel()
+	ps, err := OpenPersistentStore(":memory:", &stubEmbedder{}, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+	if got := ps.Path(); got != "" {
+		t.Errorf("Path() = %q, want empty string for :memory:", got)
+	}
+}
