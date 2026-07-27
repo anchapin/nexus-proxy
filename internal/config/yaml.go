@@ -166,9 +166,10 @@ type YAMLConfig struct {
 	ModelsCacheTTL        string `yaml:"models_cache_ttl"`
 
 	// Trusted proxies
-	TrustedProxies string `yaml:"trusted_proxies"`
-	RateLimitRPM   int    `yaml:"rate_limit_rpm"`
-	RateLimitBurst int    `yaml:"rate_limit_burst"`
+	TrustedProxies    string `yaml:"trusted_proxies"`
+	RateLimitRPM      int    `yaml:"rate_limit_rpm"`
+	RateLimitBurst    int    `yaml:"rate_limit_burst"`
+	RateLimitByAPIKey bool   `yaml:"rate_limit_by_api_key"`
 }
 
 // LoadYAML reads configuration from a YAML file at path, then overlays
@@ -869,6 +870,9 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.RateLimitBurst = n
 	}
+	if v := os.Getenv("NEXUS_RATE_LIMIT_BY_API_KEY"); v != "" {
+		cfg.RateLimitByAPIKey = strings.ToLower(v) == "true" || v == "1"
+	}
 
 	return cfg, nil
 }
@@ -999,8 +1003,9 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 
 		RAGPollInterval: yc.durationDefault(yc.RAGPollInterval, 30*time.Second),
 
-		RateLimitRPM:   yc.intDefault(yc.RateLimitRPM, 0),
-		RateLimitBurst: yc.intDefault(yc.RateLimitBurst, 0),
+		RateLimitRPM:      yc.intDefault(yc.RateLimitRPM, 0),
+		RateLimitBurst:    yc.intDefault(yc.RateLimitBurst, 0),
+		RateLimitByAPIKey: yc.RateLimitByAPIKey,
 	}
 
 	// Embedder type
