@@ -525,6 +525,26 @@ func main() {
 		}
 	}()
 
+	// Distributed tracing OTLP exporter (issue #41, #804). When
+	// NEXUS_TRACING_ENDPOINT is set, start the exporter and register
+	// it as the process-wide tracer so middleware and the chat handler
+	// can guard span creation with tracing.Enabled. The timeout is
+	// configurable via NEXUS_TRACING_TIMEOUT (default 10s) so
+	// high-latency collectors don't cause premature POST failures.
+	if endpoint := os.Getenv("NEXUS_TRACING_ENDPOINT"); endpoint != "" {
+		exp := tracing.NewExporter(tracing.ExporterConfig{
+			Endpoint: endpoint,
+			Timeout:  cfg.TracingTimeout,
+		})
+		if exp != nil {
+			tracing.RegisterExporter(exp)
+			slog.Info("tracing exporter started",
+				slog.String("endpoint", endpoint),
+				slog.Duration("timeout", cfg.TracingTimeout),
+			)
+		}
+	}
+
 	// Frontier provider registry (issue #223). When NEXUS_FRONTIER_PROVIDERS
 	// is set, ParseProvidersFromEnv parses the JSON array and returns a
 	// registry of Provider objects. When nil the chat handler falls back

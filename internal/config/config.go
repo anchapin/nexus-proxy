@@ -486,6 +486,16 @@ type Config struct {
 	AuthRateLimitBurst  int
 	AuthRateLimitWindow time.Duration // window for auth failure tracking (default 5 min)
 
+	// Distributed tracing OTLP exporter timeout (issue #804). Bounds
+	// each POST to the collector; a stalled collector that honours
+	// TCP keepalive but never responds causes the exporter's context
+	// to hang indefinitely without this cap. The default 10s is
+	// conservative for local collectors; operators with high-latency
+	// collectors (e.g. multi-region aggregators, TLS handshake delay)
+	// can increase this via NEXUS_TRACING_TIMEOUT. 0 falls back to
+	// the default.
+	TracingTimeout time.Duration
+
 	// Readiness mode for /readyz (issue #302). Controls whether the
 	// readiness probe returns 503 when Ollama is down (strict) or
 	// always returns 200 while surfacing the degraded flag (degraded,
@@ -1162,6 +1172,21 @@ func Load() (Config, error) {
 	}
 	cfg.LocalCooldown = localCooldown
 
+	// Distributed tracing OTLP exporter timeout (issue #804). Default 10s;
+	// zero falls back to the default so the knob can never accidentally
+	// disable the exporter's timeout.
+	tracingTimeout, err := getEnvDuration("NEXUS_TRACING_TIMEOUT", DefaultTracingTimeout)
+	if err != nil {
+		return cfg, err
+	}
+	if tracingTimeout < 0 {
+		return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT must not be negative, got %s", tracingTimeout)
+	}
+	if tracingTimeout == 0 {
+		tracingTimeout = DefaultTracingTimeout
+	}
+	cfg.TracingTimeout = tracingTimeout
+
 	// Hard request-body cap (issue #11). Default 1 MiB matches typical
 	// OpenAI-compatible request sizes; the chat handler wraps r.Body
 	// with http.MaxBytesReader so an oversized POST is rejected with
@@ -1597,6 +1622,11 @@ const DefaultServerMaxHeaderBytes = 1 << 20 // 1 MiB
 // of 30s. Operators running longer upstreams (or larger
 // terminationGracePeriodSeconds) raise this via NEXUS_SHUTDOWN_TIMEOUT.
 const DefaultShutdownTimeout = 30 * time.Second
+
+// DefaultTracingTimeout is the default OTLP exporter POST timeout (issue #804).
+// 10s is conservative for local collectors; operators with high-latency
+// collectors can increase this via NEXUS_TRACING_TIMEOUT.
+const DefaultTracingTimeout = 10 * time.Second
 
 // DefaultMaxBodyBytes is the fallback request-body cap (issue #11). 1 MiB
 // matches the typical OpenAI chat-completions request envelope; agents that
