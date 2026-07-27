@@ -3,6 +3,7 @@ package tracing
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -457,9 +458,34 @@ func TestEncodeAttrTypes(t *testing.T) {
 				t.Errorf("got %+v", v)
 			}
 		}},
+		{"uint64_within_int63", uint64(1<<63 - 1), func(t *testing.T, v otlpAttrValue) {
+			if v.IntValue == nil || *v.IntValue != 1<<63-1 {
+				t.Errorf("got %+v, want IntValue=%d", v, int64(1<<63-1))
+			}
+		}},
+		{"uint64_overflow", uint64(1 << 63), func(t *testing.T, v otlpAttrValue) {
+			// Values > 1<<63-1 cannot fit in int64; must degrade
+			// to DoubleValue so the OTLP body stays valid.
+			if v.DoubleValue == nil || *v.DoubleValue != float64(1<<63) {
+				t.Errorf("got %+v, want DoubleValue=%f", v, float64(1<<63))
+			}
+		}},
+		{"float32", float32(1.5), func(t *testing.T, v otlpAttrValue) {
+			if v.DoubleValue == nil || *v.DoubleValue != float64(float32(1.5)) {
+				t.Errorf("got %+v, want DoubleValue", v)
+			}
+		}},
 		{"unknown", struct{ X int }{X: 1}, func(t *testing.T, v otlpAttrValue) {
 			if v.StringValue == nil || !strings.Contains(*v.StringValue, "{") {
 				t.Errorf("expected struct fallback to string, got %+v", v)
+			}
+		}},
+		{"unknown_empty_struct", struct{}{}, func(t *testing.T, v otlpAttrValue) {
+			// Default branch must fmt.Sprintf the value into a
+			// StringValue so the collector can still index it.
+			want := fmt.Sprintf("%v", struct{}{})
+			if v.StringValue == nil || *v.StringValue != want {
+				t.Errorf("got %+v, want StringValue=%q", v, want)
 			}
 		}},
 	}
