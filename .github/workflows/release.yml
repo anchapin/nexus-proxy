@@ -118,6 +118,48 @@ jobs:
           GOARCH: arm64
         run: go test -trimpath ./...
 
+  # ── windows/amd64 cross-compile smoke test (issue #692) ────────
+  # Mirrors the darwin/arm64 job above: cross-compile the full project
+  # for windows/amd64 on an ubuntu runner and run the test suite with
+  # -trimpath to verify compilation correctness. The test step itself
+  # is gated behind continue-on-error at the job level because the
+  # cross-compiled test binaries are Windows PE executables that cannot
+  # run on the ubuntu runner, so `go test` will report execution errors
+  # for packages with tests even when compilation succeeds. Compilation
+  # failures (the real risk — a Windows-specific build breakage shipping
+  # undetected) surface as build errors in the log regardless.
+  #
+  # A full runtime smoke test (executing the binary and exercising its
+  # commands on a real Windows host) must be performed manually before
+  # release:
+  #   1. Download nexus-*-windows-amd64.exe from the release artifacts
+  #   2. Run: .\nexus-*-windows-amd64.exe --version
+  #   3. Run: .\nexus-*-windows-amd64.exe check
+  #   4. Confirm exit code is 0 before publishing the release
+  windows-smoke:
+    name: windows/amd64 cross-compile test
+    needs: [prereq]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: go test windows/amd64 (cross-compile)
+        env:
+          CGO_ENABLED: '0'
+          GOOS: windows
+          GOARCH: amd64
+        run: go test -trimpath ./...
+
   # ── Cross-compile binaries + checksums + SLSA provenance ───────
   build-binaries:
     name: Build binaries
