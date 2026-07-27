@@ -200,6 +200,21 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Build metadata for the running nexus-proxy binary (issue #529). Always 1.",
 		typ:  "gauge",
 	},
+	// Per-route latency percentile gauges (issue #774). Computed from a
+	// sliding window ring buffer per route (local/frontier/fusion).
+	// Values are in seconds (ms → s conversion at render time).
+	"nexus_upstream_request_latency_p50_seconds": {
+		help: "p50 request latency in seconds per route (local/frontier/fusion), from sliding window ring buffer (issue #774).",
+		typ:  "gauge",
+	},
+	"nexus_upstream_request_latency_p95_seconds": {
+		help: "p95 request latency in seconds per route (local/frontier/fusion), from sliding window ring buffer (issue #774).",
+		typ:  "gauge",
+	},
+	"nexus_upstream_request_latency_p99_seconds": {
+		help: "p99 request latency in seconds per route (local/frontier/fusion), from sliding window ring buffer (issue #774).",
+		typ:  "gauge",
+	},
 	// Auth limiter gauges (issue #744). Track brute-force protection state.
 	"nexus_auth_limiter_tracked_ips": {
 		help: "Current number of IPs being tracked by the auth brute-force limiter (issue #744).",
