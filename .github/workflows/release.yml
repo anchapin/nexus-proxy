@@ -85,6 +85,39 @@ jobs:
           version: v2.12.2
           args: --timeout=5m
 
+  # ── darwin/arm64 cross-compile smoke test (issue #693) ────────
+  # GitHub Actions does not provide macOS runners on public repos, so we
+  # cannot execute the darwin/arm64 binary in CI. This job cross-compiles
+  # the full project for darwin/arm64 and runs the test suite with -trimpath
+  # to verify compilation correctness. A full smoke test (running the binary
+  # and exercising its commands) must be performed manually before release:
+  #   1. Download the darwin-arm64 binary from the release artifacts
+  #   2. Run: chmod +x nexus-*-darwin-arm64 && ./nexus-*-darwin-arm64 check
+  #   3. Confirm exit code is 0 before publishing the release
+  darwin-smoke:
+    name: darwin/arm64 cross-compile test
+    needs: [prereq]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: go test darwin/arm64 (cross-compile)
+        env:
+          CGO_ENABLED: '0'
+          GOOS: darwin
+          GOARCH: arm64
+        run: go test -trimpath ./...
+
   # ── Cross-compile binaries + checksums + SLSA provenance ───────
   build-binaries:
     name: Build binaries

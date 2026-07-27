@@ -389,9 +389,10 @@ Every semver tag (`v1.0.0`, `v1.2.3`, …) triggers the
 # then verify its checksum:
 sha256sum -c checksums-sha256.txt
 
-# Make it executable and run:
-chmod +x nexus-*-linux-amd64
-./nexus-*-linux-amd64 --version
+# Make it executable and run (replace PLATFORM as needed):
+PLATFORM="linux-amd64"   # or linux-arm64, darwin-arm64
+chmod +x "nexus-*-${PLATFORM}"
+./nexus-*-${PLATFORM} --version
 ```
 
 ### Verify binary provenance
