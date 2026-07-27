@@ -38,6 +38,13 @@ func TestCategorize(t *testing.T) {
 		// Existing uncategorized
 		{"other", "what is the capital of France", CategoryOther},
 		{"empty", "", CategoryOther},
+		// Non-ASCII + uppercase ASCII keyword (issue #587: Unicode-aware lowercasing)
+		{"chinese_with_REFACTOR", "请REFACTOR这个函数", CategoryRefactoring},
+		{"russian_with_DEBUG", "помогите DEBUG", CategoryDebugging},
+		{"greek_with_CSS", "αλλαγή CSS", CategoryCSS},
+		{"arabic_with_DEBUG", "تصحيح DEBUG", CategoryDebugging},
+		{"chinese_no_keyword", "你好世界", CategoryOther},
+		{"russian_no_keyword", "привет мир", CategoryOther},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

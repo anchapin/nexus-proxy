@@ -140,7 +140,7 @@ var categoryKeywords = []struct {
 // call on the request hot path. Unmatched prompts fall through to
 // CategoryOther.
 func Categorize(prompt string) string {
-	lower := toLowerASCII(prompt)
+	lower := toUnicodeLower(prompt)
 	for _, group := range categoryKeywords {
 		for _, kw := range group.keywords {
 			if stringsContains(lower, kw) {
