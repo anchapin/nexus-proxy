@@ -276,7 +276,6 @@ func TestStatusValues(t *testing.T) {
 	}
 }
 
-
 func TestStartSpanFromContextDisabled(t *testing.T) {
 	RegisterExporter(nil)
 	ctx := context.Background()
