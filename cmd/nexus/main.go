@@ -311,11 +311,19 @@ func main() {
 
 	var rateLimiter *ratelimit.Middleware
 	if cfg.RateLimitEnabled() {
-		rateLimiter = ratelimit.NewMiddleware(cfg.RateLimitRPM, cfg.RateLimitBurst, ipResolver)
+		var keyFn func(*http.Request) string
+		if cfg.RateLimitByAPIKey {
+			keyFn = func(r *http.Request) string {
+				ip := ipResolver.Resolve(r)
+				return ratelimit.APIKeyAwareKeyFunc(ip, r)
+			}
+		}
+		rateLimiter = ratelimit.NewMiddleware(cfg.RateLimitRPM, cfg.RateLimitBurst, ipResolver, keyFn)
 		slog.Info("rate limiter enabled",
 			slog.Int("rpm", cfg.RateLimitRPM),
 			slog.Int("burst", cfg.RateLimitBurst),
 			slog.Bool("trusted_proxies", cfg.TrustedProxiesConfigured()),
+			slog.Bool("by_api_key", cfg.RateLimitByAPIKey),
 		)
 	} else {
 		slog.Info("rate limiter disabled (NEXUS_RATE_LIMIT_RPM<=0)")

@@ -455,6 +455,7 @@ type Config struct {
 	TrustedProxiesRaw string
 	RateLimitRPM      int
 	RateLimitBurst    int
+	RateLimitByAPIKey bool // issue #776: bucket on SHA256(IP + ":" + APIKey) when true
 
 	// MaxResponseBytes caps upstream response bodies read into memory
 	// (issue #365). A malicious or misbehaving upstream returning
@@ -1416,6 +1417,10 @@ func Load() (Config, error) {
 		rateBurst = 0
 	}
 	cfg.RateLimitBurst = rateBurst
+
+	// RateLimitByAPIKey (issue #776): when true, the bucket key is
+	// SHA256(IP + ":" + APIKey) instead of just IP.
+	cfg.RateLimitByAPIKey = parseBoolEnv("NEXUS_RATE_LIMIT_BY_API_KEY", false)
 
 	// MaxResponseBytes caps upstream response bodies (issue #365). Default
 	// 64 MiB accommodates large frontier completions; operators who proxy
