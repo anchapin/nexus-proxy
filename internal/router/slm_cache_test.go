@@ -830,3 +830,209 @@ func TestSLMCache_sortExpiry_OrphanedVsValidOrdering(t *testing.T) {
 		t.Errorf("valid entries not last: expiry = %v, want [a|d, a|d, b, c]", c.expiry)
 	}
 }
+
+// TestSLMCache_Set_NoSortBelowCapacity (issue #745) verifies that when
+// the cache is below maxEntries and no eviction occurs, the cache
+// remains functionally correct. The corollary is that the O(n log n)
+// overhead of sortExpiry is avoided for the common-case small cache.
+func TestSLMCache_Set_NoSortBelowCapacity(t *testing.T) {
+	c := NewSLMCache(time.Hour, 5) // max 5 entries
+	ctx := context.Background()
+
+	// Insert below capacity — no eviction, no sortExpiry call.
+	for i := 0; i < 4; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		c.Set(ctx, key, RouteLocal)
+		if got, ok, _ := c.Get(ctx, key); !ok || got != RouteLocal {
+			t.Errorf("Get(%q) after Set: got (%v, %v), want (RouteLocal, true)", key, got, ok)
+		}
+	}
+	if c.Len() != 4 {
+		t.Errorf("Len = %d, want 4", c.Len())
+	}
+
+	// Insert the 5th entry — still below capacity, no eviction.
+	c.Set(ctx, "key-4", RouteFrontier)
+	if c.Len() != 5 {
+		t.Errorf("after 5th Set: Len = %d, want 5", c.Len())
+	}
+
+	// key-0 should still be present (no eviction below capacity).
+	if got, ok, _ := c.Get(ctx, "key-0"); !ok || got != RouteLocal {
+		t.Errorf("key-0 still present: got (%v, %v), want (RouteLocal, true)", got, ok)
+	}
+
+	// Insert the 6th entry — now at capacity+1, LRU eviction triggers.
+	c.Set(ctx, "key-5", RouteFrontier)
+	if c.Len() != 5 {
+		t.Errorf("after 6th Set (eviction): Len = %d, want 5", c.Len())
+	}
+
+	// key-0 should now be evicted as LRU (oldest stamp).
+	if got, ok, _ := c.Get(ctx, "key-0"); ok || got != "" {
+		t.Errorf("key-0 was evicted: got (%v, %v), want (\"\", false)", got, ok)
+	}
+
+	// Remaining keys should still be present.
+	for i := 1; i <= 5; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		if got, ok, _ := c.Get(ctx, key); !ok || got == "" {
+			t.Errorf("key-%d still present: got (%v, %v), want (Route, true)", i, got, ok)
+		}
+	}
+}
+
+// TestSLMCache_SetEmbedding_NoSortBelowCapacity verifies the same O(1)
+// insertion guarantee for SetEmbedding when the cache is below capacity.
+func TestSLMCache_SetEmbedding_NoSortBelowCapacity(t *testing.T) {
+	emb := newStubEmbedder()
+	c := NewSLMCacheWithEmbedder(time.Hour, 5, emb, 0.5)
+	ctx := context.Background()
+
+	embVec := []float64{1.0, 0.0, 0.0, 0.0}
+
+	// Insert 4 unique keys below capacity — no eviction, no sortExpiry call.
+	for i := 0; i < 4; i++ {
+		key := fmt.Sprintf("prompt-%d", i)
+		c.SetEmbedding(key, RouteLocal, embVec)
+		if got, ok, _ := c.Get(ctx, key); !ok || got != RouteLocal {
+			t.Errorf("Get(%q) after SetEmbedding: got (%v, %v), want (RouteLocal, true)", key, got, ok)
+		}
+	}
+	if c.Len() != 4 {
+		t.Errorf("Len = %d, want 4", c.Len())
+	}
+
+	// 5th insert — still below capacity (4 < 5), no eviction.
+	c.SetEmbedding("prompt-4", RouteLocal, embVec)
+	if c.Len() != 5 {
+		t.Errorf("after 5th SetEmbedding: Len = %d, want 5", c.Len())
+	}
+
+	// prompt-0 should still be present (no eviction below capacity).
+	if got, ok, _ := c.Get(ctx, "prompt-0"); !ok || got != RouteLocal {
+		t.Errorf("prompt-0 still present: got (%v, %v), want (RouteLocal, true)", got, ok)
+	}
+
+	// Verify all 5 entries are retrievable.
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("prompt-%d", i)
+		if got, ok, _ := c.Get(ctx, key); !ok || got != RouteLocal {
+			t.Errorf("prompt-%d still present: got (%v, %v), want (RouteLocal, true)", i, got, ok)
+		}
+	}
+}
+
+func TestSLMCache_EmbedErrorCounter_Set(t *testing.T) {
+	// When Set's embedder returns an error, the embed error counter
+	// must be incremented and the entry stored with nil embedding
+	// (issue #741).
+	errEmbed := &vectorEmbedder{err: errors.New("embedder unavailable")}
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+	ctx := context.Background()
+
+	if got := c.Stats().EmbedErrors; got != 0 {
+		t.Fatalf("initial EmbedErrors = %d, want 0", got)
+	}
+
+	c.Set(ctx, "write a fibonacci function", RouteLocal)
+
+	stats := c.Stats()
+	if stats.EmbedErrors != 1 {
+		t.Errorf("EmbedErrors after Set with embed error = %d, want 1", stats.EmbedErrors)
+	}
+	// Exact match must still work.
+	got, ok, kind := c.Get(ctx, "write a fibonacci function")
+	if !ok || got != RouteLocal || kind != CacheHitExact {
+		t.Errorf("exact match failed after embed error: got (%v, %v, %v), want (RouteLocal, true, CacheHitExact)", got, ok, kind)
+	}
+}
+
+func TestSLMCache_EmbedErrorCounter_Set_Observer(t *testing.T) {
+	// When Set's embedder returns an error, the embed-error observer
+	// must be called (issue #741).
+	errEmbed := &vectorEmbedder{err: errors.New("embedder unavailable")}
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+	ctx := context.Background()
+
+	var called int
+	c.SetEmbedErrorObserver(func() {
+		called++
+	})
+
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteLocal) // another embed error
+
+	if called != 2 {
+		t.Errorf("observer called %d times, want 2", called)
+	}
+}
+
+func TestSLMCache_EmbedErrorCounter_GetSemantic(t *testing.T) {
+	// When getSemantic's embedder returns an error, the embed error
+	// counter must be incremented (issue #741). Use SetEmbedding to
+	// store a pre-computed embedding so Set itself does not call the
+	// failing embedder.
+	errEmbed := &vectorEmbedder{err: errors.New("embedder unavailable")}
+	ctx := context.Background()
+
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+
+	if got := c.Stats().EmbedErrors; got != 0 {
+		t.Fatalf("initial EmbedErrors = %d, want 0", got)
+	}
+
+	// Use SetEmbedding to store entry without triggering embedder.
+	c.SetEmbedding("write a fibonacci function", RouteLocal, []float64{1, 0, 0, 0})
+
+	// Force a semantic get that will fail on the embedding call.
+	_, ok, kind := c.Get(ctx, "different prompt") // triggers getSemantic which errors
+	if ok || kind != "" {
+		t.Errorf("expected miss after embed error, got (ok=%v, kind=%v)", ok, kind)
+	}
+
+	stats := c.Stats()
+	if stats.EmbedErrors != 1 {
+		t.Errorf("EmbedErrors after getSemantic error = %d, want 1", stats.EmbedErrors)
+	}
+}
+
+func TestSLMCache_EmbedErrorCounter_GetSemantic_Observer(t *testing.T) {
+	// When getSemantic's embedder returns an error, the embed-error
+	// observer must be called (issue #741). Use SetEmbedding to store
+	// a pre-computed embedding so Set itself does not call the embedder.
+	errEmbed := &vectorEmbedder{err: errors.New("embedder unavailable")}
+	ctx := context.Background()
+
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+
+	var called int
+	c.SetEmbedErrorObserver(func() {
+		called++
+	})
+
+	// Use SetEmbedding to store entry without triggering embedder.
+	c.SetEmbedding("x", RouteLocal, []float64{1, 0, 0, 0})
+
+	// Now Get triggers getSemantic which calls the failing embedder.
+	_, _, _ = c.Get(ctx, "different prompt")
+
+	if called != 1 {
+		t.Errorf("observer called %d times, want 1", called)
+	}
+}
+
+func TestSLMCache_EmbedErrorObserver_NilSafe(t *testing.T) {
+	// Without an observer registered, Set must still succeed when the
+	// embedder errors (nil observer must not panic).
+	errEmbed := &vectorEmbedder{err: errors.New("embedder unavailable")}
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+	ctx := context.Background()
+
+	c.Set(ctx, "a", RouteLocal) // must not panic
+
+	stats := c.Stats()
+	if stats.EmbedErrors != 1 {
+		t.Errorf("EmbedErrors = %d, want 1", stats.EmbedErrors)
+	}
+}

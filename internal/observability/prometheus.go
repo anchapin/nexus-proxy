@@ -140,6 +140,11 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Current number of per-client rate-limit buckets held in memory.",
 		typ:  "gauge",
 	},
+	// Issue #746: per-client rate-limit bucket utilization histogram.
+	"nexus_rate_limit_bucket_utilization": {
+		help: "Fractional token utilization (tokens/burst) at moment of acquisition per client bucket, bucketed by quartile (issue #746).",
+		typ:  "histogram",
+	},
 	"nexus_budget_spend_usd": {
 		help: "Rolling 24-hour spend in USD from the daily frontier budget tracker.",
 		typ:  "gauge",
@@ -193,6 +198,15 @@ var gaugeMeta = map[string]metricMeta{
 	// Build info gauge (issue #529). Static metadata — value is always 1.
 	"nexus_build_info": {
 		help: "Build metadata for the running nexus-proxy binary (issue #529). Always 1.",
+		typ:  "gauge",
+	},
+	// Auth limiter gauges (issue #744). Track brute-force protection state.
+	"nexus_auth_limiter_tracked_ips": {
+		help: "Current number of IPs being tracked by the auth brute-force limiter (issue #744).",
+		typ:  "gauge",
+	},
+	"nexus_auth_limiter_blocked_ips": {
+		help: "Current number of IPs blocked by the auth brute-force limiter (issue #744).",
 		typ:  "gauge",
 	},
 }
@@ -365,6 +379,12 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	// least one (path, outcome) histogram has observations.
 	if hists := c.RAGSimilarityHistograms(); len(hists) > 0 {
 		writeRAGSimilarityHistogram(w, hists)
+	}
+
+	// Rate-limit bucket utilization histogram (issue #746). Written only
+	// when at least one bucket has been observed.
+	if hists := c.RateLimitUtilizationHistograms(); len(hists) > 0 {
+		writeRateLimitUtilizationHistogram(w, hists)
 	}
 
 	// --- Gauges (live readings from providers) --------------------------
@@ -636,6 +656,60 @@ func writeRAGSimilarityHistogram(w io.Writer, histograms map[string]*Histogram) 
 			s.path, s.outcome, thr, formatFloat(s.sum))
 		fmt.Fprintf(w, "nexus_rag_similarity_histogram_count{path=%q,outcome=%q,threshold=%q} %d\n",
 			s.path, s.outcome, thr, s.count)
+	}
+}
+
+// writeRateLimitUtilizationHistogram emits the
+// nexus_rate_limit_bucket_utilization histogram family labelled by
+// bucket_id (hashed IP) and utilization quartile (issue #746).
+// Series are emitted in sorted bucket-ID order for deterministic output.
+// Empty histograms (count == 0) are skipped so a freshly-booted scraper
+// never sees a misleading zero-count family.
+func writeRateLimitUtilizationHistogram(w io.Writer, histograms map[string]*Histogram) {
+	type snapshot struct {
+		bucketID    string
+		cum         []uint64
+		upperBounds []float64
+		sum         float64
+		count       uint64
+	}
+	var snaps []snapshot
+	for bucketID, h := range histograms {
+		if h == nil {
+			continue
+		}
+		cum, upperBounds, sum, count := h.Snapshot()
+		if count == 0 {
+			continue
+		}
+		snaps = append(snaps, snapshot{
+			bucketID:    bucketID,
+			cum:         cum,
+			upperBounds: upperBounds,
+			sum:         sum,
+			count:       count,
+		})
+	}
+	if len(snaps) == 0 {
+		return
+	}
+	sort.Slice(snaps, func(i, j int) bool {
+		return snaps[i].bucketID < snaps[j].bucketID
+	})
+	writeMeta(w, "nexus_rate_limit_bucket_utilization",
+		"Fractional token utilization (tokens/burst) at moment of acquisition per client bucket, bucketed by quartile (issue #746).",
+		"histogram")
+	for _, s := range snaps {
+		for i, ub := range s.upperBounds {
+			fmt.Fprintf(w, "nexus_rate_limit_bucket_utilization_bucket{bucket_id=%q,le=%q} %d\n",
+				s.bucketID, formatFloat(ub), s.cum[i])
+		}
+		fmt.Fprintf(w, "nexus_rate_limit_bucket_utilization_bucket{bucket_id=%q,le=%q} %d\n",
+			s.bucketID, "+Inf", s.cum[len(s.upperBounds)])
+		fmt.Fprintf(w, "nexus_rate_limit_bucket_utilization_sum{bucket_id=%q} %s\n",
+			s.bucketID, formatFloat(s.sum))
+		fmt.Fprintf(w, "nexus_rate_limit_bucket_utilization_count{bucket_id=%q} %d\n",
+			s.bucketID, s.count)
 	}
 }
 

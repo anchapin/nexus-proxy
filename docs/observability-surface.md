@@ -28,12 +28,13 @@ snake_case naming.
 | `nexus_local_cooldown_active` | gauge | *(none)* | 1 | `prometheus.go` (issue #530) |
 | `nexus_local_cooldown_triggers_total` | counter | *(none)* | 1 | `routemetrics.go` (issue #530) |
 | `nexus_requests_rejected_total` | counter | `reason` | 4 | `routemetrics.go` |
-| `nexus_cascade_fallback_total` | counter | `reason` | 5 (`timeout`, `transport_error`, `http_error`, `malformed_toolcall`, `malformed_response`) | `routemetrics.go` |
+| `nexus_cascade_fallback_total` | counter | `reason` | 6 (`timeout`, `transport_error`, `http_error`, `rate_limited`, `malformed_toolcall`, `malformed_response`) | `routemetrics.go` |
 | `nexus_rag_retrieval_total` | counter | `hit`, `reason` (miss only) | 1 + 3 = 4 | `routemetrics.go` |
 | `nexus_judge_dropped_total` | counter | *(none)* | 1 | `routemetrics.go` |
+| `nexus_rate_limit_bucket_utilization` | histogram | `bucket_id` | dynamic (≤ concurrent client IPs) | `prometheus.go` (issue #746) |
 | `nexus_build_info` | gauge | `version`, `commit`, `go_version` | 1 | `prometheus.go` (issue #529) |
 
-**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 1 + 1 + 4 + 5 + 4 + 1 + 1 = 141 series.
+**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 1 + 1 + 4 + 6 + 4 + 1 + 1 + 1 = 143 series.
 
 > **Note (issue #486):** `nexus_rag_retrieval_total` previously carried
 > a `filename` label whose value was the raw RAG source filename, which
@@ -127,7 +128,8 @@ extended in #497, #534):
 |-------|---------|
 | `timeout` | Per-attempt context deadline exceeded (`context.DeadlineExceeded`) |
 | `transport_error` | Real transport error from `client.Do` (DNS failure, connection refused, TCP reset, TLS handshake) |
-| `http_error` | Upstream returned a retryable HTTP status (408, 429, 500, 502, 503, 504) — the upstream is present but overloaded, rate-limiting, or buggy |
+| `http_error` | Upstream returned a retryable HTTP status (408, 500, 502, 503, 504) — the upstream is present but overloaded or buggy |
+| `rate_limited` | Upstream returned HTTP 429 (Too Many Requests) — the upstream is rate-limiting the proxy |
 | `malformed_toolcall` | Upstream returned a `tool_calls` entry with missing required fields or invalid JSON arguments |
 | `malformed_response` | Upstream returned a 200 but the body could not be JSON-decoded, or the `choices` array was empty |
 
@@ -175,6 +177,7 @@ extended in #497, #534):
 | `reason` (RAG retrieval miss) | Yes | 3 | `empty_store`, `threshold`, `embed_error` — closed set emitted only when `hit="false"` |
 | SLM cache gauges (issue #531) | N/A | 2 | `nexus_slm_cache_entries` and `nexus_slm_cache_max_entries` are unlabelled gauges (cardinality 1 each); no label cardinality concerns. |
 | Local-route cooldown (issue #530) | N/A | 2 | `nexus_local_cooldown_active` (gauge, cardinality 1) and `nexus_local_cooldown_triggers_total` (counter, cardinality 1) are both unlabelled; no label cardinality concerns. |
+| `bucket_id` (rate-limit utilization, issue #746) | Yes | ≤ concurrent client IPs | Each distinct bucket ID (SHA256 of client IP, 8 hex chars) creates 6 series (4 quartile buckets + sum + count). Bounded by the number of distinct IPs seen within the bucket TTL window (10 minutes). Operators who need per-IP granularity can hash the `bucket_id` label downstream. |
 
 **No unbounded cardinality labels exist.** All label values are
 short, pre-defined strings with no user-controlled input. The

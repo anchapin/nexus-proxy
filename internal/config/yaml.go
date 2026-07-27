@@ -807,12 +807,12 @@ func LoadYAML(path string) (Config, error) {
 			cfg.TelemetryMaxFiles = n
 		}
 	}
-	if v := os.Getenv("NEXUS_JSONL_BUFFER_SIZE"); v != "" {
+	if v := os.Getenv("NEXUS_TELEMETRY_BUFFER_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.TelemetryBufferSize = n
 		}
 	}
-	if v := os.Getenv("NEXUS_JSONL_FLUSH_INTERVAL"); v != "" {
+	if v := os.Getenv("NEXUS_TELEMETRY_FLUSH_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.TelemetryFlushInterval = d
 		}

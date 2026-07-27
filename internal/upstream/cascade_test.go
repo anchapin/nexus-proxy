@@ -225,6 +225,9 @@ func TestCascadeFallsBackOn429(t *testing.T) {
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
 	}
+	if res.FallbackReason != "rate_limited" {
+		t.Errorf("FallbackReason=%q, want rate_limited", res.FallbackReason)
+	}
 }
 
 func TestCascadeFallsBackOn408(t *testing.T) {
@@ -257,8 +260,9 @@ func TestCascadeFallsBackOnTransportError(t *testing.T) {
 	}
 }
 
-// TestCascadeFallbackReasonHTTPError verifies issue #534: HTTP 5xx/408/429
-// responses from the upstream are labeled "http_error", not "transport_error".
+// TestCascadeFallbackReasonHTTPError verifies issue #534: HTTP 5xx/408
+// (but not 429) responses from the upstream are labeled "http_error", not
+// "transport_error". 429 is labeled "rate_limited" (issue #755).
 // transport_error is reserved for real transport-layer failures (DNS, connection
 // refused, etc.).
 func TestCascadeFallbackReasonHTTPError(t *testing.T) {
@@ -268,7 +272,6 @@ func TestCascadeFallbackReasonHTTPError(t *testing.T) {
 	}{
 		{503, "503 Service Unavailable"},
 		{504, "504 Gateway Timeout"},
-		{429, "429 Too Many Requests"},
 		{408, "408 Request Timeout"},
 		{500, "500 Internal Server Error"},
 		{502, "502 Bad Gateway"},
@@ -296,6 +299,32 @@ func TestCascadeFallbackReasonHTTPError(t *testing.T) {
 				t.Errorf("FallbackReason=%q, want http_error for status %d", res.FallbackReason, tc.statusCode)
 			}
 		})
+	}
+}
+
+// TestCascadeFallbackReasonRateLimited verifies issue #755: HTTP 429
+// responses are labeled "rate_limited" so operators can distinguish a
+// transient rate-limit event from a server error when alerting on
+// cascade fallback rates.
+func TestCascadeFallbackReasonRateLimited(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, "rate limited")
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.ServedBy != "frontier" {
+		t.Errorf("ServedBy=%q, want frontier", res.ServedBy)
+	}
+	if res.FallbackReason != "rate_limited" {
+		t.Errorf("FallbackReason=%q, want rate_limited for status 429", res.FallbackReason)
 	}
 }
 
@@ -494,6 +523,30 @@ func TestCascadeAllFailReturnsLastError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "502") {
 		t.Errorf("err should mention last status: %v", err)
+	}
+}
+
+func TestCascadeAllFailSetsFallbackReason(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(500)
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(502)
+	})
+	rw := newSSERW()
+	res, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if res.Succeeded {
+		t.Fatal("Succeeded should be false")
+	}
+	if res.FallbackReason == "" {
+		t.Fatal("FallbackReason should be non-empty when all steps fail with retryable errors (issue #740)")
+	}
+	if res.FallbackReason != "http_error" {
+		t.Errorf("FallbackReason=%q, want http_error", res.FallbackReason)
 	}
 }
 

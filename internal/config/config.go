@@ -673,20 +673,20 @@ func Load() (Config, error) {
 	// Telemetry buffering (issue #681). BUFFER_SIZE defaults to 64 KiB
 	// and FLUSH_INTERVAL to 5s. A single record larger than the buffer
 	// triggers an immediate flush. Both require a restart to take effect.
-	telemetryBufferSize, err := getEnvInt("NEXUS_JSONL_BUFFER_SIZE", 64<<10)
+	telemetryBufferSize, err := getEnvInt("NEXUS_TELEMETRY_BUFFER_SIZE", 64<<10)
 	if err != nil {
 		return cfg, err
 	}
-	if telemetryBufferSize < 0 {
+	if telemetryBufferSize <= 0 {
 		telemetryBufferSize = 64 << 10
 	}
 	cfg.TelemetryBufferSize = telemetryBufferSize
 
-	telemetryFlushInterval, err := getEnvDuration("NEXUS_JSONL_FLUSH_INTERVAL", 5*time.Second)
+	telemetryFlushInterval, err := getEnvDuration("NEXUS_TELEMETRY_FLUSH_INTERVAL", 5*time.Second)
 	if err != nil {
 		return cfg, err
 	}
-	if telemetryFlushInterval < 0 {
+	if telemetryFlushInterval <= 0 {
 		telemetryFlushInterval = 5 * time.Second
 	}
 	cfg.TelemetryFlushInterval = telemetryFlushInterval

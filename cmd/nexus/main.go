@@ -935,6 +935,12 @@ func main() {
 		slmCache.SetEvictionObserver(func(reason string) {
 			routeCounters.ObserveSLMCacheEviction(reason)
 		})
+		// Wire the embed-error observer so embedder degradation is
+		// observable as nexus_slm_cache_embedding_errors_total instead
+		// of silently appearing as cache misses (issue #741).
+		slmCache.SetEmbedErrorObserver(func() {
+			routeCounters.ObserveSLMCacheEmbedError()
+		})
 	} else {
 		slog.Info("slm decision cache disabled (NEXUS_SLMCACHE_TTL<=0)")
 	}
@@ -1018,6 +1024,11 @@ func main() {
 	if rateLimiter != nil {
 		rateLimiter.SetRejectionHook(func() {
 			routeCounters.ObserveRejection(handlers.RejectionRateLimit)
+		})
+		// Issue #746: install the allow hook so bucket utilization is
+		// recorded before the token is consumed.
+		rateLimiter.SetAllowHook(func(bucketID string, utilizationPct float64) {
+			circuitCollector.ObserveRateLimitUtilization(bucketID, utilizationPct)
 		})
 		chatHandler = rateLimiter.Wrap(chatHandler)
 	}
@@ -1238,8 +1249,8 @@ func main() {
 	// when NEXUS_STATUS_PUBLIC=true. When the key is empty the
 	// middleware is a pass-through (zero overhead).
 	var rootHandler http.Handler = mux
+	var authLimiter *ratelimit.AuthLimiter
 	if cfg.AuthEnabled() {
-		var authLimiter *ratelimit.AuthLimiter
 		if cfg.AuthRateLimitEnabled() {
 			authLimiter = ratelimit.NewAuthLimiter(
 				cfg.AuthRateLimitRPM,
@@ -1254,6 +1265,18 @@ func main() {
 				slog.Int("rpm", cfg.AuthRateLimitRPM),
 				slog.Int("burst", cfg.AuthRateLimitBurst),
 				slog.Duration("window", cfg.AuthRateLimitWindow),
+			)
+			// Auth limiter gauges (issue #744).
+			routeCounters.SetGaugeProviders(
+				observability.GaugeProviderFunc(func() []observability.GaugeSample {
+					if authLimiter == nil {
+						return nil
+					}
+					return []observability.GaugeSample{
+						{Name: "nexus_auth_limiter_tracked_ips", Value: float64(authLimiter.BucketCount())},
+						{Name: "nexus_auth_limiter_blocked_ips", Value: float64(authLimiter.BlockedCount())},
+					}
+				}),
 			)
 		}
 		authMw := auth.NewMiddleware(cfg.ProxyAPIKey, publicPathExempt(cfg), authLimiter, circuitCollector)
@@ -1312,6 +1335,12 @@ func main() {
 			if err := judgeEval.Close(); err != nil {
 				slog.Warn("judge close", slog.Any("err", err))
 			}
+		}
+		if rateLimiter != nil {
+			rateLimiter.Close()
+		}
+		if authLimiter != nil {
+			authLimiter.Stop()
 		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
