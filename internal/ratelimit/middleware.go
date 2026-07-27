@@ -33,6 +33,7 @@ type Middleware struct {
 	rpm      int           // steady-state requests per minute
 	burst    int           // bucket capacity
 	ttl      time.Duration // idle bucket retention before reaping
+	stopCh   chan struct{} // closed when reaper should exit
 
 	// onReject, when non-nil, is invoked once for each request the
 	// middleware rejects with 429 (issue #119). It is intended for
@@ -75,6 +76,7 @@ func NewMiddleware(rpm, burst int, resolver *ClientIPResolver) *Middleware {
 		rpm:      rpm,
 		burst:    burst,
 		ttl:      10 * time.Minute, // reap buckets idle for 10 min
+		stopCh:   make(chan struct{}),
 		buckets:  make(map[string]*bucket),
 	}
 }
@@ -98,9 +100,9 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 	if m == nil || m.rpm <= 0 {
 		return next
 	}
-	// Kick off the idle-bucket reaper once. It stops itself when the
-	// process exits; there is no Close because the middleware lives for
-	// the lifetime of the server.
+	// Kick off the idle-bucket reaper once. It exits when Close() / Stop()
+	// is called (issue #739). The middleware lives for the lifetime of the
+	// server, so Wrap is called exactly once per middleware instance.
 	go m.reaper()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ip := m.resolver.Resolve(r)
@@ -188,8 +190,13 @@ func (m *Middleware) bucketFor(ip string, now time.Time) *bucket {
 func (m *Middleware) reaper() {
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
-	for range t.C {
-		m.reap(time.Now())
+	for {
+		select {
+		case <-t.C:
+			m.reap(time.Now())
+		case <-m.stopCh:
+			return
+		}
 	}
 }
 
@@ -207,6 +214,22 @@ func (m *Middleware) reap(now time.Time) {
 			delete(m.buckets, ip)
 		}
 	}
+}
+
+// Stop signals the reaper goroutine to exit. It is safe to call on
+// a disabled limiter (rpm <= 0) or nil limiter; it is a no-op in those
+// cases.
+func (m *Middleware) Stop() {
+	if m == nil || m.rpm <= 0 {
+		return
+	}
+	close(m.stopCh)
+}
+
+// Close is an alias for Stop, provided to mirror the closer interface
+// pattern used by other shutdown-aware components.
+func (m *Middleware) Close() {
+	m.Stop()
 }
 
 // SetRPM updates the steady-state requests per minute. A value <= 0
