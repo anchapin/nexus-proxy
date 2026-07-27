@@ -1034,6 +1034,5 @@ func TestSLMCache_EmbedErrorObserver_NilSafe(t *testing.T) {
 	stats := c.Stats()
 	if stats.EmbedErrors != 1 {
 		t.Errorf("EmbedErrors = %d, want 1", stats.EmbedErrors)
->>>>>>> 011802c (feat: resolve #741 — add nexus_slm_cache_embedding_errors_total counter)
 	}
 }
