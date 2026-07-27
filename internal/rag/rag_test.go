@@ -536,6 +536,90 @@ func TestEmbedCacheHitCount(t *testing.T) {
 	}
 }
 
+// embedCacheBreakerStub is a stub that tracks breaker calls for testing
+// EmbedCache delegation (issue #670).
+type embedCacheBreakerStub struct {
+	stubEmbedder
+	breakerOpen  bool
+	breakerCalls int
+	successCalls int
+}
+
+func (e *embedCacheBreakerStub) IsBreakerOpen() bool {
+	e.breakerCalls++
+	return e.breakerOpen
+}
+
+func (e *embedCacheBreakerStub) RecordBreakerSuccess() {
+	e.successCalls++
+}
+
+// TestEmbedCacheIsBreakerOpenDelegation tests that EmbedCache.IsBreakerOpen
+// delegates to the inner embedder when it implements IsBreakerOpen and
+// returns the inner's breaker state (issue #670 AC1).
+func TestEmbedCacheIsBreakerOpenDelegation(t *testing.T) {
+	inner := &embedCacheBreakerStub{
+		stubEmbedder: stubEmbedder{vecs: map[string][]float64{"hello": {1, 2, 3}}},
+		breakerOpen:  true,
+	}
+	cache := NewEmbedCache(inner, 100, 5*time.Minute)
+
+	if !cache.IsBreakerOpen() {
+		t.Error("IsBreakerOpen() = false, want true (should propagate inner breaker)")
+	}
+	if inner.breakerCalls != 1 {
+		t.Errorf("inner.breakerCalls = %d, want 1", inner.breakerCalls)
+	}
+
+	inner.breakerOpen = false
+	if cache.IsBreakerOpen() {
+		t.Error("IsBreakerOpen() = true, want false after inner breaker closes")
+	}
+}
+
+// TestEmbedCacheIsBreakerOpenWithoutBreaker tests that EmbedCache.IsBreakerOpen
+// returns false when the inner embedder's breaker reports closed (issue #670).
+// Note: Since Embedder interface requires IsBreakerOpen, we test with an
+// embedder that returns false. The "no panic" case for CachedEmbedder is
+// already covered in cache_test.go; EmbedCache uses the same delegation pattern.
+func TestEmbedCacheIsBreakerOpenWithoutBreaker(t *testing.T) {
+	inner := &stubEmbedder{vecs: map[string][]float64{"hello": {1, 2, 3}}}
+	cache := NewEmbedCache(inner, 100, 5*time.Minute)
+
+	// stubEmbedder.IsBreakerOpen returns false.
+	if cache.IsBreakerOpen() {
+		t.Error("IsBreakerOpen() = true, want false when inner breaker is closed")
+	}
+}
+
+// TestEmbedCacheRecordBreakerSuccessDelegation tests that
+// EmbedCache.RecordBreakerSuccess delegates to the inner embedder's
+// breaker success handler (issue #670 AC3).
+func TestEmbedCacheRecordBreakerSuccessDelegation(t *testing.T) {
+	inner := &embedCacheBreakerStub{
+		stubEmbedder: stubEmbedder{vecs: map[string][]float64{"hello": {1, 2, 3}}},
+	}
+	cache := NewEmbedCache(inner, 100, 5*time.Minute)
+
+	cache.RecordBreakerSuccess()
+	cache.RecordBreakerSuccess()
+
+	if inner.successCalls != 2 {
+		t.Errorf("inner.successCalls = %d, want 2", inner.successCalls)
+	}
+}
+
+// TestEmbedCacheRecordBreakerSuccessWithoutBreaker tests that
+// EmbedCache.RecordBreakerSuccess is safe when called on an
+// embedder whose breaker is not tripped (issue #670).
+func TestEmbedCacheRecordBreakerSuccessWithoutBreaker(t *testing.T) {
+	inner := &stubEmbedder{vecs: map[string][]float64{"hello": {1, 2, 3}}}
+	cache := NewEmbedCache(inner, 100, 5*time.Minute)
+
+	// Should not panic.
+	cache.RecordBreakerSuccess()
+}
+
 func TestStoreWithCachingEmbedder(t *testing.T) {
 	// Verify that Store.EmbedHitCount() delegates to the wrapped *EmbedCache.
 	inner := &stubEmbedder{vecs: map[string][]float64{
