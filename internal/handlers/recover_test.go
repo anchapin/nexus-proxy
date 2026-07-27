@@ -372,3 +372,98 @@ func TestRecover_LogsNonRedactedPanicWithError(t *testing.T) {
 		t.Errorf("log missing panic recovered message, got:\n%s", logged)
 	}
 }
+
+// nonFlusherResponseWriter is an http.ResponseWriter that does NOT implement
+// http.Flusher. It is used to verify that when a panic occurs after streaming
+// has begun but the underlying writer lacks Flusher, the 500 envelope path is
+// used instead of SSE framing (issue #686).
+type nonFlusherResponseWriter struct {
+	headers http.Header
+	code    int
+	written bool
+	body    *bytes.Buffer
+}
+
+func newNonFlusherResponseWriter() *nonFlusherResponseWriter {
+	return &nonFlusherResponseWriter{
+		headers: make(http.Header),
+		code:    200,
+		body:    &bytes.Buffer{},
+	}
+}
+
+func (n *nonFlusherResponseWriter) Header() http.Header { return n.headers }
+func (n *nonFlusherResponseWriter) WriteHeader(code int) {
+	n.code = code
+	n.written = true
+}
+func (n *nonFlusherResponseWriter) Write(b []byte) (int, error) {
+	n.written = true
+	return n.body.Write(b)
+}
+
+// TestRecover_NonFlusherResponseWriterUses500Envelope verifies that when a
+// panic occurs after streaming has begun but the underlying ResponseWriter
+// does NOT implement http.Flusher, the recover middleware uses the 500 JSON
+// envelope path instead of SSE framing (which would silently fail and hang
+// the client). This is the acceptance criterion from issue #686.
+func TestRecover_NonFlusherResponseWriterUses500Envelope(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: partial\n\n"))
+		// Do NOT flush — and the underlying writer has no Flusher.
+		panic("stream panic on non-flusher writer")
+	})
+	h := Recover(nil)(handler)
+
+	// Use nonFlusherResponseWriter directly (no http.Flusher support).
+	nfw := newNonFlusherResponseWriter()
+	h.ServeHTTP(nfw, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+
+	// Must use 500 envelope, not SSE framing.
+	if nfw.code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d (non-flusher should use 500 envelope)", nfw.code, http.StatusInternalServerError)
+	}
+	if ct := nfw.headers.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json (non-flusher should use 500 envelope)", ct)
+	}
+	// Must NOT contain SSE frames since Flusher was not available.
+	body := nfw.body.String()
+	if strings.Contains(body, "data: [DONE]") {
+		t.Errorf("body should not contain SSE [DONE] sentinel for non-flusher writer, got: %s", body)
+	}
+	if strings.Contains(body, "data: {\"error\":") {
+		t.Errorf("body should not contain SSE error frame for non-flusher writer, got: %s", body)
+	}
+	// Must contain the 500 envelope.
+	if !strings.Contains(body, `"message":"internal server error"`) {
+		t.Errorf("body missing 500 envelope, got: %s", body)
+	}
+}
+
+// TestRecover_FlusherResponseWriterUsesSSEPath verifies that when a panic
+// occurs after streaming has begun AND the underlying ResponseWriter
+// implements http.Flusher (e.g. httptest.ResponseRecorder), the recover
+// middleware uses the SSE error frame path as expected.
+func TestRecover_FlusherResponseWriterUsesSSEPath(t *testing.T) {
+	h := Recover(nil)(http.HandlerFunc(panicHandler(t, true, "stream panic with flusher")))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+
+	// Status was already committed by the inner handler.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (already committed)", rec.Code, http.StatusOK)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "data: {\"partial\":true}") {
+		t.Errorf("body missing pre-panic partial frame:\n%s", body)
+	}
+	if !strings.Contains(body, "internal server error") {
+		t.Errorf("body missing SSE error frame:\n%s", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("body missing trailing [DONE] sentinel:\n%s", body)
+	}
+}

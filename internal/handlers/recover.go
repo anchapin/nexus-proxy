@@ -41,7 +41,11 @@ type HandlerPanicObserver func(path string)
 func Recover(obs HandlerPanicObserver) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			rw := &panicRecorder{ResponseWriter: w}
+			var flusher http.Flusher
+			if f, ok := w.(http.Flusher); ok {
+				flusher = f
+			}
+			rw := &panicRecorder{ResponseWriter: w, flusher: flusher}
 			defer func() {
 				rv := recover()
 				if rv == nil {
@@ -78,16 +82,19 @@ func Recover(obs HandlerPanicObserver) func(http.Handler) http.Handler {
 					// change the status code, so emit a trailing SSE
 					// error frame and terminate the stream so the client
 					// gets a parseable ending instead of a TCP reset.
-					payload, _ := json.Marshal(map[string]string{
-						"message": "internal server error",
-						"type":    "internal_error",
-					})
-					_, _ = fmt.Fprintf(rw, "data: {\"error\":%s}\n\n", payload)
-					_, _ = fmt.Fprint(rw, "data: [DONE]\n\n")
-					if f, ok := any(rw).(http.Flusher); ok {
-						f.Flush()
+					// If the underlying writer does not implement
+					// http.Flusher, fall back to the 500 envelope path
+					// to avoid silently hanging the client (issue #686).
+					if rw.flusher != nil {
+						payload, _ := json.Marshal(map[string]string{
+							"message": "internal server error",
+							"type":    "internal_error",
+						})
+						_, _ = fmt.Fprintf(rw, "data: {\"error\":%s}\n\n", payload)
+						_, _ = fmt.Fprint(rw, "data: [DONE]\n\n")
+						rw.Flush()
+						return
 					}
-					return
 				}
 				// Headers not yet written — return a clean 500 envelope
 				// in the OpenAI-compatible error shape so existing
@@ -181,6 +188,7 @@ func redactPanicValue(rv any) (string, bool) {
 type panicRecorder struct {
 	http.ResponseWriter
 	headerWritten bool
+	flusher       http.Flusher // nil if underlying writer does not implement Flusher
 }
 
 // WriteHeader marks the response as started and delegates to the inner
@@ -203,6 +211,15 @@ func (p *panicRecorder) Write(b []byte) (int, error) {
 		p.headerWritten = true
 	}
 	return p.ResponseWriter.Write(b)
+}
+
+// Flush delegates to the stored flusher. If the underlying writer does not
+// implement http.Flusher, this is a no-op and the SSE panic path will use
+// the 500 envelope instead (issue #686).
+func (p *panicRecorder) Flush() {
+	if p.flusher != nil {
+		p.flusher.Flush()
+	}
 }
 
 // routePattern returns the mux route template for r, falling back to the
