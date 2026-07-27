@@ -395,6 +395,10 @@ chmod +x "nexus-*-${PLATFORM}"
 ./nexus-*-${PLATFORM} --version
 ```
 
+> **Windows:** the binary ships as `nexus-<tag>-windows-amd64.exe` and
+> needs no `chmod`. From PowerShell or cmd, run
+> `.\nexus-<tag>-windows-amd64.exe --version` to verify it starts.
+
 ### Verify binary provenance
 
 Each release includes an SLSA Level 3 provenance attestation (`.intoto.jsonl`) that
