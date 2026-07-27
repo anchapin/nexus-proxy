@@ -98,6 +98,13 @@ const (
 	batchCap = 64
 )
 
+// Retry constants for OTLP POST retries with exponential backoff.
+const (
+	maxRetries     = 3                  // retry attempts after the initial attempt
+	retryBaseDelay = 100 * time.Millisecond
+	maxRetryDelay  = 2 * time.Second
+)
+
 // NewExporter starts the background POST loop and returns a ready
 // Exporter. Returns nil (with no goroutine started) when endpoint
 // is empty — the chat handler treats a nil exporter as "tracing
@@ -295,22 +302,52 @@ func (e *Exporter) flush(batch []*Span) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), e.timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("tracing: build request: %w", err)
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			delay := retryBaseDelay * time.Duration(1<<(attempt-1))
+			if delay > maxRetryDelay {
+				delay = maxRetryDelay
+			}
+			select {
+			case <-ctx.Done():
+				return lastErr // return most recent error, not ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("tracing: build request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := e.client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("tracing: do: %w", err)
+			// Do not retry on network errors — they indicate a persistent
+			// problem (unreachable host, TLS handshake failure, etc.) and
+			// the next attempt will likely fail the same way.
+			break
+		}
+		if resp != nil {
+			defer resp.Body.Close()
+		}
+		if resp.StatusCode >= 400 {
+			lastErr = fmt.Errorf("tracing: collector status %d", resp.StatusCode)
+			// 4xx: non-retryable client errors — fail immediately
+			if resp.StatusCode < 500 {
+				return lastErr
+			}
+			// 5xx: retryable collector errors
+			if attempt < maxRetries {
+				continue
+			}
+			break // retries exhausted
+		}
+		return nil // success
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := e.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("tracing: do: %w", err)
-	}
-	if resp != nil {
-		defer resp.Body.Close()
-	}
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("tracing: collector status %d", resp.StatusCode)
-	}
-	return nil
+	return lastErr
 }
 
 // --- OTLP/JSON envelope ----------------------------------------------------
