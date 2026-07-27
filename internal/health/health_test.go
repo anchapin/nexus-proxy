@@ -433,3 +433,75 @@ func TestCalcBackoffInterval(t *testing.T) {
 		}
 	}
 }
+
+// TestCalcBackoffIntervalTier4Plus verifies the 15x ceiling (tier 4+)
+// is enforced. Tier 4 nominally yields a 16x multiplier but is capped
+// at maxBackoffMultiplier (15). This exercises the capping branch in
+// calcBackoffInterval that the tier 0–3 table does not reach.
+func TestCalcBackoffIntervalTier4Plus(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+	pollInterval := 100 * time.Millisecond
+	h := New(srv.URL, "qwen3-coder:8b", pollInterval, 3, time.Second, nil)
+
+	want := pollInterval * maxBackoffMultiplier
+
+	// count=9 → tier (9-1)>>1 = 4 → multiplier 16, capped to 15.
+	if got := h.calcBackoffInterval(9); got != want {
+		t.Errorf("calcBackoffInterval(9) = %v, want %v (capped 15x)", got, want)
+	}
+	// count=100 → tier 49 → multiplier far above cap, still 15x.
+	if got := h.calcBackoffInterval(100); got != want {
+		t.Errorf("calcBackoffInterval(100) = %v, want %v (capped 15x)", got, want)
+	}
+}
+
+// TestCalcBackoffIntervalZeroOrNegative exercises the tier < 0 guard in
+// calcBackoffInterval. A non-positive count yields a negative tier
+// ((count-1)>>1 < 0) which is clamped back to tier 0 (1x multiplier).
+func TestCalcBackoffIntervalZeroOrNegative(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+	pollInterval := 100 * time.Millisecond
+	h := New(srv.URL, "qwen3-coder:8b", pollInterval, 3, time.Second, nil)
+
+	want := pollInterval // tier clamped to 0 → 1x multiplier
+
+	for _, count := range []int{0, -1, -5} {
+		if got := h.calcBackoffInterval(count); got != want {
+			t.Errorf("calcBackoffInterval(%d) = %v, want %v (tier<0 clamped to 1x)", count, got, want)
+		}
+	}
+}
+
+// TestRecordFailureBackoffCapsAtMax drives recordFailure through enough
+// consecutive failures to reach tier 4 inside recordFailure, covering
+// the multiplier > maxBackoffMultiplier capping branch (lines 396–397)
+// and confirming the stored interval never exceeds 15x pollInterval.
+func TestRecordFailureBackoffCapsAtMax(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+	pollInterval := 100 * time.Millisecond
+	// Low threshold so the backoff path runs from the first failure.
+	h := New(srv.URL, "qwen3-coder:8b", pollInterval, 3, time.Second, nil)
+
+	maxInterval := pollInterval * maxBackoffMultiplier
+	err := errors.New("probe failed")
+
+	// 9 failures → tier 4 → multiplier 16, capped to 15.
+	for i := 0; i < 9; i++ {
+		h.recordFailure(err)
+	}
+
+	if got := h.PollingInterval(); got != maxInterval {
+		t.Errorf("PollingInterval after 9 failures = %v, want %v (capped 15x)", got, maxInterval)
+	}
+
+	// Additional failures must not exceed the cap.
+	for i := 0; i < 20; i++ {
+		h.recordFailure(err)
+	}
+	if got := h.PollingInterval(); got != maxInterval {
+		t.Errorf("PollingInterval after 29 failures = %v, want %v (still capped 15x)", got, maxInterval)
+	}
+}
