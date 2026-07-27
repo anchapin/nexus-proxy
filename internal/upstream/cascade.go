@@ -207,6 +207,7 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 	if lastErr == nil {
 		lastErr = errors.New("cascade: no steps attempted")
 	}
+	res.FallbackReason = CascadeFallbackReason(lastErr)
 	return res, fmt.Errorf("cascade: all %d steps failed; last error: %w", len(c.Steps), lastErr)
 }
 
