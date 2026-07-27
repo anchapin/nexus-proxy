@@ -1266,6 +1266,18 @@ func main() {
 				slog.Int("burst", cfg.AuthRateLimitBurst),
 				slog.Duration("window", cfg.AuthRateLimitWindow),
 			)
+			// Auth limiter gauges (issue #744).
+			routeCounters.SetGaugeProviders(
+				observability.GaugeProviderFunc(func() []observability.GaugeSample {
+					if authLimiter == nil {
+						return nil
+					}
+					return []observability.GaugeSample{
+						{Name: "nexus_auth_limiter_tracked_ips", Value: float64(authLimiter.BucketCount())},
+						{Name: "nexus_auth_limiter_blocked_ips", Value: float64(authLimiter.BlockedCount())},
+					}
+				}),
+			)
 		}
 		authMw := auth.NewMiddleware(cfg.ProxyAPIKey, publicPathExempt(cfg), authLimiter, circuitCollector)
 		rootHandler = authMw.Wrap(mux)

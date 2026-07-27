@@ -11,6 +11,7 @@ import (
 
 	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
+	"github.com/anchapin/nexus-proxy/internal/ratelimit"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
@@ -914,5 +915,91 @@ func TestRenderPrometheusRateLimitUtilizationEmpty(t *testing.T) {
 	out := sb.String()
 	if strings.Contains(out, "nexus_rate_limit_bucket_utilization") {
 		t.Errorf("fresh collector should not emit nexus_rate_limit_bucket_utilization; got:\n%s", out)
+	}
+}
+
+// TestRenderPrometheusAuthLimiterGauges (issue #744) drives a real
+// AuthLimiter to known states and asserts both auth limiter gauges render
+// with correct HELP/TYPE headers and values.
+func TestRenderPrometheusAuthLimiterGauges(t *testing.T) {
+	c := NewCollector()
+	resolver := ratelimit.NewClientIPResolver(nil)
+	al := ratelimit.NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	defer al.Stop()
+
+	// No failures tracked yet.
+	provider := GaugeProviderFunc(func() []GaugeSample {
+		return []GaugeSample{
+			{Name: "nexus_auth_limiter_tracked_ips", Value: float64(al.BucketCount())},
+			{Name: "nexus_auth_limiter_blocked_ips", Value: float64(al.BlockedCount())},
+		}
+	})
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c, provider)
+	out := sb.String()
+
+	wantLines := []string{
+		"# HELP nexus_auth_limiter_tracked_ips",
+		"# TYPE nexus_auth_limiter_tracked_ips gauge",
+		"nexus_auth_limiter_tracked_ips 0",
+		"# HELP nexus_auth_limiter_blocked_ips",
+		"# TYPE nexus_auth_limiter_blocked_ips gauge",
+		"nexus_auth_limiter_blocked_ips 0",
+	}
+	for _, want := range wantLines {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+
+	// Record failures for two IPs; one reaches burst threshold.
+	al.RecordFailure("10.0.0.1")
+	al.RecordFailure("10.0.0.1")
+	al.RecordFailure("10.0.0.1") // burst reached → blocked
+	al.RecordFailure("10.0.0.2") // below burst → not blocked
+
+	sb.Reset()
+	RenderPrometheus(&sb, c, provider)
+	out = sb.String()
+
+	trackedWant := []string{
+		"nexus_auth_limiter_tracked_ips 2",
+		"nexus_auth_limiter_blocked_ips 1",
+	}
+	for _, want := range trackedWant {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q after failures\n--- output ---\n%s", want, out)
+		}
+	}
+}
+
+// TestRenderPrometheusAuthLimiterGaugesAbsentWhenDisabled verifies that when
+// the auth limiter is nil (not configured) the gauge provider returns nil so
+// neither series appears in a fresh scrape.
+func TestRenderPrometheusAuthLimiterGaugesAbsentWhenDisabled(t *testing.T) {
+	c := NewCollector()
+
+	var nilAL *ratelimit.AuthLimiter
+
+	provider := GaugeProviderFunc(func() []GaugeSample {
+		if nilAL == nil {
+			return nil
+		}
+		return []GaugeSample{
+			{Name: "nexus_auth_limiter_tracked_ips", Value: float64(nilAL.BucketCount())},
+			{Name: "nexus_auth_limiter_blocked_ips", Value: float64(nilAL.BlockedCount())},
+		}
+	})
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c, provider)
+	out := sb.String()
+
+	if strings.Contains(out, "nexus_auth_limiter_tracked_ips") {
+		t.Errorf("nexus_auth_limiter_tracked_ips should not appear when limiter is nil\n--- output ---\n%s", out)
+	}
+	if strings.Contains(out, "nexus_auth_limiter_blocked_ips") {
+		t.Errorf("nexus_auth_limiter_blocked_ips should not appear when limiter is nil\n--- output ---\n%s", out)
 	}
 }

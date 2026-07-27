@@ -182,6 +182,27 @@ func (al *AuthLimiter) Enabled() bool {
 	return al.rpm > 0
 }
 
+// BlockedCount returns the number of IPs currently blocked (failure count
+// has reached the burst threshold). Exposed for observability gauges.
+func (al *AuthLimiter) BlockedCount() int {
+	if al == nil || al.rpm <= 0 {
+		return 0
+	}
+	al.mu.Lock()
+	defer al.mu.Unlock()
+	now := time.Now()
+	n := 0
+	for _, f := range al.failures {
+		f.mu.Lock()
+		al.pruneLocked(f, now)
+		if len(f.ts) >= al.burst {
+			n++
+		}
+		f.mu.Unlock()
+	}
+	return n
+}
+
 // Wrap returns an http.Handler that applies the auth rate limit before
 // delegating to next. A disabled limiter (rpm <= 0) returns next
 // unchanged so the hot path is zero-cost when auth rate limiting is off.
