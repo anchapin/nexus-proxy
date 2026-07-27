@@ -55,6 +55,11 @@ func TestBuildMetrics(t *testing.T) {
 	}{
 		{"Disabled", "/nonexistent/metrics.db", true},
 		{"Enabled", "metrics.db", false},
+		// Issue #678: force the OpenWithRetention error path by using a
+		// directory that exists but is not writable (/sys/nexus).  This
+		// exercises the "store, err := OpenWithRetention(...); if err != nil
+		// { return nil, nil }" branch that was previously untested.
+		{"OpenError", "/sys/nexus/metrics.db", true},
 	}
 
 	for _, tt := range tests {
