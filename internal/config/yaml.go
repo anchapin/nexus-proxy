@@ -95,6 +95,7 @@ type YAMLConfig struct {
 	FusionTimeout             string  `yaml:"fusion_timeout"`
 	CascadeTimeout            string  `yaml:"cascade_timeout"`
 	ArbiterTimeout            string  `yaml:"arbiter_timeout"`
+	CascadeMaxResponseBytes   int     `yaml:"cascade_max_response_bytes"`
 
 	// Fusion
 	FusionProgressiveDelivery bool    `yaml:"fusion_progressive_delivery"`
@@ -920,6 +921,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		FusionTimeout:             yc.durationDefault(yc.FusionTimeout, 120*time.Second),
 		CascadeTimeout:            yc.durationDefault(yc.CascadeTimeout, 30*time.Second),
 		ArbiterTimeout:            yc.durationDefault(yc.ArbiterTimeout, 60*time.Second),
+		CascadeMaxResponseBytes:   yc.intDefault(yc.CascadeMaxResponseBytes, DefaultMaxResponseBytes),
 
 		FusionProgressiveDelivery: yc.boolFieldDefault(yc.FusionProgressiveDelivery, true),
 		FusionAgreementThreshold:  yc.floatDefault(yc.FusionAgreementThreshold, 0.85),

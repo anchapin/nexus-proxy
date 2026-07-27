@@ -703,6 +703,17 @@ func TestBuildLocalCascadeSkipsMissingKeys(t *testing.T) {
 	}
 }
 
+func TestBuildLocalCascadeRespectsMaxResponseBytes(t *testing.T) {
+	cas := BuildLocalCascade(CascadeConfig{
+		LocalURL:         "http://localhost:11434",
+		LocalModel:       "qwen3-coder:8b",
+		MaxResponseBytes: 12345,
+	})
+	if cas.MaxResponseBytes != 12345 {
+		t.Errorf("MaxResponseBytes = %d, want 12345", cas.MaxResponseBytes)
+	}
+}
+
 func TestCascadeValidatesBeforeWritingBytes(t *testing.T) {
 	// Critical acceptance criterion: the response must NOT be written to
 	// the client if it would later fail validation. Here the primary
