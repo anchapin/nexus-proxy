@@ -93,7 +93,7 @@ var ErrSSEPartialWrite = errors.New("cascade: SSE partial write after headers co
 // back (retry=true) or surface the error immediately (retry=false — e.g.
 // upstream returned 401, retrying won't help). The reason field carries
 // one of six values used for cascade_fallback_total{reason} metrics:
-// "timeout", "transport_error", "http_error", "rate_limited",
+// "timeout", "transport_error", "rate_limited", "http_error",
 // "malformed_toolcall", or "malformed_response".
 type cascadeErr struct {
 	retry  bool
@@ -105,8 +105,8 @@ func (e *cascadeErr) Error() string { return e.msg }
 
 // newCascadeErr creates a cascadeErr. reason is the label for the
 // cascade_fallback_total metric: "timeout", "transport_error",
-// "http_error", "rate_limited", "malformed_toolcall",
-// "malformed_response", or "" for non-retryable errors.
+// "rate_limited", "http_error", "malformed_toolcall", "malformed_response",
+// or "" for non-retryable errors.
 func newCascadeErr(retry bool, reason, format string, args ...interface{}) error {
 	return &cascadeErr{retry: retry, reason: reason, msg: fmt.Sprintf(format, args...)}
 }

@@ -262,9 +262,9 @@ func TestCascadeFallsBackOnTransportError(t *testing.T) {
 
 // TestCascadeFallbackReasonHTTPError verifies issue #534: HTTP 5xx/408
 // (but not 429) responses from the upstream are labeled "http_error", not
-// "transport_error". 429 is labeled "rate_limited" (issue #755).
+// "transport_error". 429 is labeled "rate_limited" (issue #750).
 // transport_error is reserved for real transport-layer failures (DNS, connection
-// refused, etc.).
+// refused, etc.). HTTP 429 is tested separately in TestCascadeFallbackReasonRateLimited.
 func TestCascadeFallbackReasonHTTPError(t *testing.T) {
 	cases := []struct {
 		statusCode int
@@ -302,10 +302,10 @@ func TestCascadeFallbackReasonHTTPError(t *testing.T) {
 	}
 }
 
-// TestCascadeFallbackReasonRateLimited verifies issue #755: HTTP 429
-// responses are labeled "rate_limited" so operators can distinguish a
-// transient rate-limit event from a server error when alerting on
-// cascade fallback rates.
+// TestCascadeFallbackReasonRateLimited verifies issue #750: HTTP 429 responses
+// from the upstream are labeled "rate_limited", not "http_error", so operators
+// can distinguish rate-limiting (transient, likely to resolve quickly) from
+// server errors (may not resolve on their own).
 func TestCascadeFallbackReasonRateLimited(t *testing.T) {
 	ft := newFakeTransport()
 	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
