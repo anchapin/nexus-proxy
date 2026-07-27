@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,7 +85,8 @@ type BreakerConfig struct {
 
 // FewShotExample is one indexed code snippet with its embedding.
 type FewShotExample struct {
-	Filename  string
+	Filename  string // base filename only (no path)
+	Dir       string // directory from which this example was indexed
 	Content   string
 	Embedding []float64
 }
@@ -309,6 +311,10 @@ type RAGStore interface {
 	Add(filename, content string, embedding []float64)
 	Size() int
 	Threshold() float64
+	// ThresholdFor returns the effective threshold for the given directory
+	// (issue #671). When no per-directory override is set, returns the
+	// global threshold.
+	ThresholdFor(dir string) float64
 	// IndexMode reports which retrieval path the next Retrieve call
 	// will take: "none", "brute_force", or "hnsw" (issue #446).
 	IndexMode() string
@@ -365,12 +371,13 @@ type StoreStats struct {
 
 // Store holds the indexed few-shot examples.
 type Store struct {
-	mu          sync.RWMutex
-	examples    []FewShotExample
-	embedder    Embedder
-	threshold   float64
-	index       *HNSWIndex
-	indexConfig HNSWConfig
+	mu                 sync.RWMutex
+	examples           []FewShotExample
+	embedder           Embedder
+	threshold          float64
+	thresholdOverrides map[string]float64 // dir -> threshold; unspecified dirs use global threshold
+	index              *HNSWIndex
+	indexConfig        HNSWConfig
 
 	lastIndexAt               int64
 	retrievalAttempts         uint64
@@ -387,6 +394,45 @@ type Store struct {
 // index build cost. Issue #420 measured ~1ms for 50 snippets brute-force
 // vs ~0.1ms HNSW — the crossover point is around 50-100 snippets.
 const indexThreshold = 50
+
+// ParseThresholdOverrides parses NEXUS_RAG_THRESHOLD_<DIR> env vars and
+// returns a map of directory name -> threshold. The global NEXUS_RAG_THRESHOLD
+// applies to all directories without an explicit override.
+//
+// Directory names are compared case-insensitively. For example,
+// NEXUS_RAG_THRESHOLD_GO_TESTS=0.7 sets threshold 0.7 for the "go_tests"
+// directory. This enables per-domain similarity tuning (issue #671).
+func ParseThresholdOverrides() map[string]float64 {
+	overrides := make(map[string]float64)
+	prefix := "NEXUS_RAG_THRESHOLD_"
+	for _, env := range os.Environ() {
+		if !strings.HasPrefix(env, prefix) {
+			continue
+		}
+		// Split on '=' to get the threshold value
+		idx := strings.Index(env, "=")
+		if idx < 0 {
+			continue
+		}
+		dirPart := env[len(prefix):idx]
+		thresholdStr := env[idx+1:]
+		if dirPart == "" || thresholdStr == "" {
+			continue
+		}
+		threshold, err := strconv.ParseFloat(thresholdStr, 64)
+		if err != nil || threshold < 0 || threshold > 1 {
+			slog.Warn("rag: ignoring invalid threshold override",
+				slog.String("dir", dirPart),
+				slog.String("value", thresholdStr),
+				slog.Any("err", err),
+			)
+			continue
+		}
+		// Normalize directory name to lowercase for case-insensitive matching
+		overrides[strings.ToLower(dirPart)] = threshold
+	}
+	return overrides
+}
 
 // IndexPath identifies which retrieval algorithm Retrieve used to find
 // the best matching example (issue #447). The value is one of HNSWIndexPath
@@ -480,6 +526,27 @@ func (s *Store) Size() int {
 // call concurrently because threshold is set once at
 // construction and never mutated.
 func (s *Store) Threshold() float64 { return s.threshold }
+
+// ThresholdFor returns the effective similarity threshold for the given
+// directory. It returns the global threshold when no per-directory override
+// is configured. The comparison is case-insensitive.
+//
+// NEXUS_RAG_THRESHOLD is global (issue #671): it applies to all indexed
+// files unless a per-directory override is set via
+// NEXUS_RAG_THRESHOLD_<DIR>=<value>. For example,
+// NEXUS_RAG_THRESHOLD_GO_TESTS=0.7 sets threshold 0.7 for files indexed
+// from the "go_tests" directory.
+func (s *Store) ThresholdFor(dir string) float64 {
+	if s.thresholdOverrides == nil {
+		return s.threshold
+	}
+	// Normalize directory name to match parsing convention
+	dirKey := strings.ToLower(filepath.Base(dir))
+	if override, ok := s.thresholdOverrides[dirKey]; ok {
+		return override
+	}
+	return s.threshold
+}
 
 func (s *Store) Stats() StoreStats {
 	attempts := atomic.LoadUint64(&s.retrievalAttempts)
@@ -637,6 +704,7 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 		s.mu.Lock()
 		s.examples = append(s.examples, FewShotExample{
 			Filename:  f.Name(),
+			Dir:       safeDir,
 			Content:   string(content),
 			Embedding: emb,
 		})
@@ -711,7 +779,7 @@ func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, f
 				best = &examples[id]
 			}
 		}
-		if best != nil && bestScore > s.threshold {
+		if best != nil && bestScore > s.ThresholdFor(best.Dir) {
 			atomic.AddUint64(&s.retrievalHits, 1)
 			return best, bestScore, IndexPathHNSW, nil
 		}
@@ -732,7 +800,7 @@ func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, f
 			best = &s.examples[i]
 		}
 	}
-	if best != nil && bestScore > s.threshold {
+	if best != nil && bestScore > s.ThresholdFor(best.Dir) {
 		atomic.AddUint64(&s.retrievalHits, 1)
 		return best, bestScore, IndexPathBruteForce, nil
 	}
