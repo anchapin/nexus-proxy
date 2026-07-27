@@ -485,7 +485,9 @@ type ObservingWriter struct {
 // NewObservingWriter wraps inner. hook may be nil; if so, only byte counts
 // are tracked.
 func NewObservingWriter(inner http.ResponseWriter, hook WriteHook) *ObservingWriter {
-	return &ObservingWriter{ResponseWriter: inner, hook: hook, status: atomic.Int64{}}
+	o := &ObservingWriter{ResponseWriter: inner, hook: hook}
+	o.status.Store(-1)
+	return o
 }
 
 // Write fires the first-write hook (if not yet fired) and updates the

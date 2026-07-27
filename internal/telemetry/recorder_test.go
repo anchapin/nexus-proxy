@@ -377,6 +377,40 @@ func TestObservingWriterPassesBytesThrough(t *testing.T) {
 	}
 }
 
+func TestObservingWriterStatusCodeAfterWriteHeader(t *testing.T) {
+	inner := &recordRW{header: http.Header{}}
+	w := NewObservingWriter(inner, nil)
+	w.WriteHeader(http.StatusCreated)
+	if got := w.StatusCode(); got != http.StatusCreated {
+		t.Errorf("StatusCode() = %d, want %d", got, http.StatusCreated)
+	}
+	if inner.status != http.StatusCreated {
+		t.Errorf("inner status = %d, want %d", inner.status, http.StatusCreated)
+	}
+}
+
+func TestObservingWriterStatusCodeReturns200WhenWriteHeaderNeverCalled(t *testing.T) {
+	inner := &recordRW{header: http.Header{}}
+	w := NewObservingWriter(inner, nil)
+	// WriteHeader never called — Go default is 200
+	if got := w.StatusCode(); got != http.StatusOK {
+		t.Errorf("StatusCode() = %d, want %d (Go default)", got, http.StatusOK)
+	}
+}
+
+func TestObservingWriterWriteHeaderIdempotent(t *testing.T) {
+	inner := &recordRW{header: http.Header{}}
+	w := NewObservingWriter(inner, nil)
+	w.WriteHeader(http.StatusOK)
+	// Second call: recording is CAS-idempotent (first status wins) but the
+	// wrapper still forwards to inner (Go would panic on second call in real
+	// http handlers, so httptest never sees the forward either).
+	w.WriteHeader(http.StatusInternalServerError)
+	if got := w.StatusCode(); got != http.StatusOK {
+		t.Errorf("StatusCode() = %d, want %d (first call wins)", got, http.StatusOK)
+	}
+}
+
 // ---- Rotation (issue #485) -----------------------------------------------
 
 // countJSONLLines returns the number of newline-terminated JSON lines in
