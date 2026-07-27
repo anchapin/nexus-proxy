@@ -924,3 +924,321 @@ func snapshotCount(t *testing.T, h *Histogram) uint64 {
 	_, _, _, count := h.Snapshot()
 	return count
 }
+
+// --- Latency percentile ring buffer (issue #774) -----------------------------
+
+// TestLatencyPercentileBufferBasic exercises the buffer with a uniform
+// distribution and verifies p50/p95/p99 are within 5% tolerance of
+// the true theoretical values for a known distribution.
+func TestLatencyPercentileBufferBasic(t *testing.T) {
+	buf := newLatencyPercentileBuffer(100)
+
+	// Uniform distribution: values 1..100 (mean=50.5)
+	for i := 1; i <= 100; i++ {
+		buf.Observe(float64(i))
+	}
+
+	p50, p95, p99 := buf.Perc()
+
+	// True p50 for 1..100 is 50.5; 5% tolerance → [47.975, 53.025]
+	if p50 < 47.975 || p50 > 53.025 {
+		t.Errorf("p50 = %v, want within 5%% of 50.5 (47.975..53.025)", p50)
+	}
+	// True p95 for 1..100 is 95.5; 5% tolerance → [90.725, 100.275]
+	if p95 < 90.725 || p95 > 100.275 {
+		t.Errorf("p95 = %v, want within 5%% of 95.5 (90.725..100.275)", p95)
+	}
+	// True p99 for 1..100 is 99.5; 5% tolerance → [94.525, 100.0]
+	if p99 < 94.525 || p99 > 100.0 {
+		t.Errorf("p99 = %v, want within 5%% of 99.5 (94.525..100.0)", p99)
+	}
+}
+
+// TestLatencyPercentileBufferRingEviction verifies the buffer evicts
+// oldest samples when capacity is reached.
+func TestLatencyPercentileBufferRingEviction(t *testing.T) {
+	buf := newLatencyPercentileBuffer(10)
+
+	// Fill the buffer
+	for i := 1; i <= 10; i++ {
+		buf.Observe(float64(i))
+	}
+	p50Before, _, _ := buf.Perc()
+
+	// Add 5 more — oldest values (1..5) should be evicted
+	for i := 11; i <= 15; i++ {
+		buf.Observe(float64(i))
+	}
+
+	// p50 should now be from the range 6..15, not including 1..5
+	// The median of 6..15 is 10.5
+	p50After, _, _ := buf.Perc()
+	if p50After <= 5.0 {
+		t.Errorf("p50 after eviction = %v, want > 5 (old values should be evicted)", p50After)
+	}
+	if p50After == p50Before {
+		t.Errorf("p50 did not change after adding new samples: %v", p50After)
+	}
+}
+
+// TestLatencyPercentileBufferZeroValue verifies empty buffer returns 0.
+func TestLatencyPercentileBufferZeroValue(t *testing.T) {
+	buf := newLatencyPercentileBuffer(100)
+	p50, p95, p99 := buf.Perc()
+	if p50 != 0 || p95 != 0 || p99 != 0 {
+		t.Errorf("empty buffer: got p50=%v p95=%v p99=%v, want all 0", p50, p95, p99)
+	}
+}
+
+// TestLatencyPercentileBufferSingleValue verifies buffer with one sample.
+func TestLatencyPercentileBufferSingleValue(t *testing.T) {
+	buf := newLatencyPercentileBuffer(100)
+	buf.Observe(42.0)
+	p50, p95, p99 := buf.Perc()
+	if p50 != 42.0 || p95 != 42.0 || p99 != 42.0 {
+		t.Errorf("single value: got p50=%v p95=%v p99=%v, want all 42.0", p50, p95, p99)
+	}
+}
+
+// TestLatencyPercentileBufferCount verifies Count returns correct sample count.
+func TestLatencyPercentileBufferCount(t *testing.T) {
+	buf := newLatencyPercentileBuffer(5)
+	if got := buf.Count(); got != 0 {
+		t.Errorf("empty count = %d, want 0", got)
+	}
+	for i := 1; i <= 3; i++ {
+		buf.Observe(float64(i))
+	}
+	if got := buf.Count(); got != 3 {
+		t.Errorf("count after 3 = %d, want 3", got)
+	}
+	// Fill beyond capacity
+	for i := 4; i <= 10; i++ {
+		buf.Observe(float64(i))
+	}
+	if got := buf.Count(); got != 5 {
+		t.Errorf("count after overflow = %d, want 5 (capacity)", got)
+	}
+}
+
+// TestLatencyPercentileBufferNegativeCapacity defaults to 1000.
+func TestLatencyPercentileBufferNegativeCapacity(t *testing.T) {
+	buf := newLatencyPercentileBuffer(-5)
+	if buf.capacity != defaultLatencyBufferCapacity {
+		t.Errorf("negative capacity: got %d, want %d", buf.capacity, defaultLatencyBufferCapacity)
+	}
+}
+
+// TestLatencyPercentileBufferConcurrent exercises Observe from many goroutines
+// under the race detector.
+func TestLatencyPercentileBufferConcurrent(t *testing.T) {
+	buf := newLatencyPercentileBuffer(5000) // large enough for all samples
+	const goroutines = 16
+	const iters = 200
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				buf.Observe(float64(id*iters + i + 1))
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	count := buf.Count()
+	want := goroutines * iters
+	if count != want {
+		t.Errorf("count = %d, want %d", count, want)
+	}
+	p50, p95, p99 := buf.Perc()
+	if p50 == 0 || p95 == 0 || p99 == 0 {
+		t.Errorf("percentiles should be non-zero after concurrent writes: p50=%v p95=%v p99=%v", p50, p95, p99)
+	}
+}
+
+// TestObserveLatencyRoutesToCorrectBuffer verifies ObserveLatency
+// creates buffers per route and routes observations correctly.
+func TestObserveLatencyRoutesToCorrectBuffer(t *testing.T) {
+	c := NewCollector()
+	c.ObserveLatency("local", 100)
+	c.ObserveLatency("local", 200)
+	c.ObserveLatency("frontier", 300)
+	c.ObserveLatency("fusion", 400)
+
+	gauges := c.LatencyPercentileGauges()
+	if len(gauges) == 0 {
+		t.Fatal("LatencyPercentileGauges returned empty")
+	}
+
+	// Group by route
+	byRoute := make(map[string]map[string]float64)
+	for _, g := range gauges {
+		route := g.Labels["route"]
+		if byRoute[route] == nil {
+			byRoute[route] = make(map[string]float64)
+		}
+		byRoute[route][g.Name] = g.Value
+	}
+
+	local := byRoute["local"]
+	if local == nil {
+		t.Fatal("missing local route gauges")
+	}
+	// local p50 should be 150 (median of 100, 200)
+	if local["nexus_upstream_request_latency_p50_seconds"] == 0 {
+		t.Errorf("local p50 is 0, want non-zero")
+	}
+
+	frontier := byRoute["frontier"]
+	if frontier == nil {
+		t.Fatal("missing frontier route gauges")
+	}
+
+	fusion := byRoute["fusion"]
+	if fusion == nil {
+		t.Fatal("missing fusion route gauges")
+	}
+}
+
+// TestObserveLatencyNilSafe verifies nil collector does not panic.
+func TestObserveLatencyNilSafe(t *testing.T) {
+	var c *Collector
+	c.ObserveLatency("local", 100) // must not panic
+}
+
+// TestObserveLatencyZeroAndNegativeIgnored verifies non-positive latencies are ignored.
+func TestObserveLatencyZeroAndNegativeIgnored(t *testing.T) {
+	c := NewCollector()
+	c.ObserveLatency("local", 0)
+	c.ObserveLatency("local", -10)
+	c.ObserveLatency("local", 100)
+
+	gauges := c.LatencyPercentileGauges()
+	if len(gauges) == 0 {
+		t.Fatal("expected gauges after valid observation")
+	}
+	// p50 should be from value 100 only
+	for _, g := range gauges {
+		if g.Name == "nexus_upstream_request_latency_p50_seconds" && g.Labels["route"] == "local" {
+			if g.Value != 0.1 { // 100ms / 1000 = 0.1s
+				t.Errorf("local p50 = %v, want 0.1 (100ms in seconds)", g.Value)
+			}
+		}
+	}
+}
+
+// TestLatencyPercentileGaugesNilSafe verifies nil collector returns nil.
+func TestLatencyPercentileGaugesNilSafe(t *testing.T) {
+	var c *Collector
+	if got := c.LatencyPercentileGauges(); got != nil {
+		t.Errorf("nil LatencyPercentileGauges() = %v, want nil", got)
+	}
+}
+
+// TestLatencyPercentileGaugesEmptyBeforeFirstObservation verifies no
+// gauges are emitted before any observation.
+func TestLatencyPercentileGaugesEmptyBeforeFirstObservation(t *testing.T) {
+	c := NewCollector()
+	gauges := c.LatencyPercentileGauges()
+	if len(gauges) != 0 {
+		t.Errorf("empty collector gauges = %d, want 0 before first observation", len(gauges))
+	}
+}
+
+// TestCollectorGaugesIncludeLatencyPercentiles verifies that the full
+// Gauges() output from a collector with latency observations includes
+// the three percentile metric names.
+func TestCollectorGaugesIncludeLatencyPercentiles(t *testing.T) {
+	c := NewCollector()
+	c.ObserveLatency("local", 100)
+	c.ObserveLatency("local", 200)
+	c.ObserveLatency("frontier", 300)
+
+	gauges := c.Gauges()
+
+	wantNames := map[string]bool{
+		"nexus_upstream_request_latency_p50_seconds": false,
+		"nexus_upstream_request_latency_p95_seconds": false,
+		"nexus_upstream_request_latency_p99_seconds": false,
+	}
+	for _, g := range gauges {
+		wantNames[g.Name] = true
+	}
+	for name, seen := range wantNames {
+		if !seen {
+			t.Errorf("expected gauge %q in collector.Gauges()", name)
+		}
+	}
+}
+
+// TestLatencyPercentileGaugesUnitConversion verifies latency values
+// are converted from milliseconds to seconds in the emitted gauges.
+func TestLatencyPercentileGaugesUnitConversion(t *testing.T) {
+	c := NewCollector()
+	c.ObserveLatency("local", 1000) // 1000ms = 1s
+
+	gauges := c.LatencyPercentileGauges()
+	for _, g := range gauges {
+		if g.Name == "nexus_upstream_request_latency_p50_seconds" && g.Labels["route"] == "local" {
+			if g.Value != 1.0 {
+				t.Errorf("p50 gauge value = %v, want 1.0 (1000ms converted to seconds)", g.Value)
+			}
+		}
+	}
+}
+
+// TestLatencyPercentileGaugesSortedOutput verifies the gauges are emitted
+// in a deterministic order (local, frontier, fusion) for stable scrape diffs.
+func TestLatencyPercentileGaugesSortedOutput(t *testing.T) {
+	c := NewCollector()
+	c.ObserveLatency("fusion", 300)
+	c.ObserveLatency("local", 100)
+	c.ObserveLatency("frontier", 200)
+
+	gauges := c.LatencyPercentileGauges()
+	routes := make([]string, 0, len(gauges)/3)
+	seen := make(map[string]bool)
+	for _, g := range gauges {
+		if g.Name == "nexus_upstream_request_latency_p50_seconds" && !seen[g.Labels["route"]] {
+			routes = append(routes, g.Labels["route"])
+			seen[g.Labels["route"]] = true
+		}
+	}
+	if len(routes) != 3 {
+		t.Fatalf("expected 3 routes, got %d: %v", len(routes), routes)
+	}
+	// Must be in order: local, frontier, fusion
+	wantOrder := []string{"local", "frontier", "fusion"}
+	for i, want := range wantOrder {
+		if routes[i] != want {
+			t.Errorf("route order[%d] = %q, want %q", i, routes[i], want)
+		}
+	}
+}
+
+// TestLatencyPercentileBufferPreciseDistribution tests exact percentile
+// values for a known distribution where we can verify mathematically.
+func TestLatencyPercentileBufferPreciseDistribution(t *testing.T) {
+	buf := newLatencyPercentileBuffer(1000)
+
+	// Values 1..1000, mean = 500.5
+	for i := 1; i <= 1000; i++ {
+		buf.Observe(float64(i))
+	}
+
+	p50, p95, p99 := buf.Perc()
+
+	// True values: p50=500.5, p95=950.5, p99=990.5
+	// 5% tolerance: p50 [475.475, 525.525], p95 [902.975, 998.025], p99 [940.975, 1000]
+	if p50 < 475.475 || p50 > 525.525 {
+		t.Errorf("p50 = %v, outside 5%% tolerance of 500.5", p50)
+	}
+	if p95 < 902.975 || p95 > 998.025 {
+		t.Errorf("p95 = %v, outside 5%% tolerance of 950.5", p95)
+	}
+	if p99 < 940.975 || p99 > 1000.0 {
+		t.Errorf("p99 = %v, outside 5%% tolerance of 990.5", p99)
+	}
+}

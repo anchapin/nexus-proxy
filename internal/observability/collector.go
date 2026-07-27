@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -250,10 +251,18 @@ type Collector struct {
 
 	// --- Embedder circuit breaker instrumentation (issue #423) -----
 	//
-	// Tracks failures for each embedder circuit breaker (ollama, openai, cohere).
+	// Tracks failures for each embedder circuit breaker (ollama, rag).
 	// Protected by cbMu for map access; individual counters are atomic.
 	embedderMu       sync.RWMutex
 	embedderFailures map[string]*atomic.Uint64 // keyed by "ollama", "openai", "cohere"
+
+	// --- Per-route latency percentile ring buffers (issue #774) --------
+	//
+	// Per-(route) sliding window ring buffers that store recent latency
+	// samples and maintain running p50/p95/p99 estimates. Keyed by route
+	// string ("local", "frontier", "fusion").
+	latencyPercentilesMu sync.RWMutex
+	latencyPercentiles   map[string]*latencyPercentileBuffer
 }
 
 // circuitBreakerState holds the atomic state for one named circuit.
@@ -441,6 +450,61 @@ func (c *Collector) TTFTFrontier() *Histogram { return c.ttftFrontier }
 // TTFTFusion returns the fusion-route time-to-first-token histogram.
 func (c *Collector) TTFTFusion() *Histogram { return c.ttftFusion }
 
+// ObserveLatency records a latency observation for percentile computation
+// (issue #774). route is the routing decision ("local", "frontier", "fusion").
+// latencyMs is the total request latency in milliseconds. Safe for concurrent use.
+func (c *Collector) ObserveLatency(route string, latencyMs int64) {
+	if c == nil || latencyMs <= 0 {
+		return
+	}
+	c.latencyPercentilesMu.RLock()
+	buf, ok := c.latencyPercentiles[route]
+	c.latencyPercentilesMu.RUnlock()
+	if ok && buf != nil {
+		buf.Observe(float64(latencyMs))
+		return
+	}
+	// Lazily create buffer
+	c.latencyPercentilesMu.Lock()
+	if c.latencyPercentiles == nil {
+		c.latencyPercentiles = make(map[string]*latencyPercentileBuffer)
+	}
+	buf, ok = c.latencyPercentiles[route]
+	if !ok || buf == nil {
+		buf = newLatencyPercentileBuffer(defaultLatencyBufferCapacity)
+		c.latencyPercentiles[route] = buf
+	}
+	c.latencyPercentilesMu.Unlock()
+	buf.Observe(float64(latencyMs))
+}
+
+// LatencyPercentileGauges returns the current p50/p95/p99 latency readings
+// per route as GaugeSamples for the Prometheus renderer. Values are 0 when
+// no samples have been recorded for a route.
+func (c *Collector) LatencyPercentileGauges() []GaugeSample {
+	if c == nil {
+		return nil
+	}
+	c.latencyPercentilesMu.RLock()
+	defer c.latencyPercentilesMu.RUnlock()
+	var out []GaugeSample
+	// Fixed route order for deterministic output
+	for _, route := range []string{"local", "frontier", "fusion"} {
+		buf := c.latencyPercentiles[route]
+		if buf == nil {
+			continue
+		}
+		p50, p95, p99 := buf.Perc()
+		labels := map[string]string{"route": route}
+		out = append(out,
+			GaugeSample{Name: "nexus_upstream_request_latency_p50_seconds", Labels: labels, Value: p50 / 1000}, // ms → s
+			GaugeSample{Name: "nexus_upstream_request_latency_p95_seconds", Labels: labels, Value: p95 / 1000},
+			GaugeSample{Name: "nexus_upstream_request_latency_p99_seconds", Labels: labels, Value: p99 / 1000},
+		)
+	}
+	return out
+}
+
 // --- Middleware instrumentation helpers (issue #70) ----------------------
 //
 // Each helper bumps exactly one atomic counter so the middleware hot
@@ -591,14 +655,18 @@ func (c *Collector) CircuitBreakerGauges() []GaugeSample {
 
 // Gauges implements GaugeProvider so *Collector can be passed
 // directly to RenderPrometheus via the RouteCounters.Handler() chain
-// (issue #443). It returns the circuit-breaker state, failures, and
-// last-failure samples. Safe for a nil receiver — returns nil so the
-// collector can be omitted without panicking during boot or in tests.
+// (issue #443). It returns the circuit-breaker state, failures,
+// last-failure samples, and latency percentile gauges (issue #774).
+// Safe for a nil receiver — returns nil so the collector can be
+// omitted without panicking during boot or in tests.
 func (c *Collector) Gauges() []GaugeSample {
 	if c == nil {
 		return nil
 	}
-	return c.CircuitBreakerGauges()
+	var out []GaugeSample
+	out = append(out, c.CircuitBreakerGauges()...)
+	out = append(out, c.LatencyPercentileGauges()...)
+	return out
 }
 
 // getOrCreateCircuit returns the state for a named circuit, creating
@@ -833,6 +901,103 @@ func (c *Collector) RateLimitUtilizationHistograms() map[string]*Histogram {
 }
 
 // Histogram}
+
+// --- Per-route latency percentile ring buffers (issue #774) -----------
+//
+// latencyPercentileBuffer stores a sliding window of latency samples and
+// maintains running p50/p95/p99 percentile estimates. Updated on each
+// request completion so percentiles are always current at scrape time.
+// The ring buffer has fixed capacity; oldest samples are evicted.
+//
+// Using a ring buffer (not histogram interpolation) gives exact
+// percentile values from actual samples — operators can set precise
+// SLO alerts (e.g. "p95 < 2s") without client-side queries.
+//
+// Capacity of 1000 samples gives ~3–15 min of history depending on
+// request rate, sufficient for stable p95/p99 estimates.
+type latencyPercentileBuffer struct {
+	mu       sync.Mutex
+	samples  []float64 // latency in milliseconds, oldest first
+	capacity int
+	p50Bits  atomic.Uint64 // IEEE-754 bits of p50 value
+	p95Bits  atomic.Uint64
+	p99Bits  atomic.Uint64
+}
+
+const defaultLatencyBufferCapacity = 1000
+
+func newLatencyPercentileBuffer(capacity int) *latencyPercentileBuffer {
+	if capacity <= 0 {
+		capacity = defaultLatencyBufferCapacity
+	}
+	return &latencyPercentileBuffer{
+		samples:  make([]float64, 0, capacity),
+		capacity: capacity,
+	}
+}
+
+func (b *latencyPercentileBuffer) Observe(latencyMs float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(b.samples) < b.capacity {
+		b.samples = append(b.samples, latencyMs)
+	} else {
+		// Ring buffer: overwrite oldest, keep newest
+		copy(b.samples, b.samples[1:])
+		b.samples[b.capacity-1] = latencyMs
+	}
+
+	b.recomputePercentilesLocked()
+}
+
+func (b *latencyPercentileBuffer) recomputePercentilesLocked() {
+	n := len(b.samples)
+	if n == 0 {
+		return
+	}
+	// Sort ascending for percentile computation
+	sorted := make([]float64, n)
+	copy(sorted, b.samples)
+	sort.Float64s(sorted)
+
+	b.p50Bits.Store(math.Float64bits(percentile(sorted, 0.50)))
+	b.p95Bits.Store(math.Float64bits(percentile(sorted, 0.95)))
+	b.p99Bits.Store(math.Float64bits(percentile(sorted, 0.99)))
+}
+
+func percentile(sorted []float64, p float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if len(sorted) == 1 {
+		return sorted[0]
+	}
+	// Linear interpolation between nearest ranks
+	idx := p * float64(len(sorted)-1)
+	lower := int(idx)
+	upper := lower + 1
+	if upper >= len(sorted) {
+		return sorted[len(sorted)-1]
+	}
+	frac := idx - float64(lower)
+	return sorted[lower]*(1-frac) + sorted[upper]*frac
+}
+
+// Perc returns the current p50/p95/p99 readings. Values are 0 when
+// no samples have been recorded yet.
+func (b *latencyPercentileBuffer) Perc() (p50, p95, p99 float64) {
+	return math.Float64frombits(b.p50Bits.Load()),
+		math.Float64frombits(b.p95Bits.Load()),
+		math.Float64frombits(b.p99Bits.Load())
+}
+
+// Count returns the number of samples currently in the buffer.
+func (b *latencyPercentileBuffer) Count() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.samples)
+}
 
 // Histogram is a fixed-bucket cumulative histogram. Buckets are
 // pre-allocated at construction; Observe performs a single linear scan
