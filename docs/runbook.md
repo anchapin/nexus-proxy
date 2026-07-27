@@ -366,6 +366,47 @@ trusted.
 
 ---
 
+## Panic log secret redaction — known limitation (issue #687)
+
+`handlers.Recover` (`internal/handlers/recover.go`) redacts secrets from panic
+values before writing them to structured logs. The `genericSecretRe` regex
+pattern:
+
+```go
+(?i)(password|passwd|pwd|token|credential|private[_-]?key)\s*[:=]\s*["']?\S+["']?
+```
+
+uses non-whitespace (`\S+`) as the secret-value terminator. Because the regex
+must use whitespace as a boundary to avoid over-redacting unrelated tokens in
+the same panic message, **space-containing secret values can only be partially
+redacted**.
+
+### Example
+
+Given a panic whose error message contains `token=sk-abc def`:
+
+| What | Result |
+| ---- | ------ |
+| Matched and redacted | `token=sk-abc` → `token=****` |
+| Trailing content remains | `def` is visible in the log |
+
+Given `auth_token=ghp_xxx yyy`:
+
+| What | Result |
+| ---- | ------ |
+| Matched and redacted | `auth_token=ghp_xxx` → `auth_token=****` |
+| Trailing content remains | `yyy` is visible in the log |
+
+### Operational note
+
+If a panic error message contains a space-containing secret (e.g. a multi-word
+token or a secret pasted with surrounding context), the portion after the first
+whitespace will appear in structured logs. This is a fundamental regex limitation
+— the regex cannot distinguish between a space that terminates a secret value
+and a space that is part of an unrelated error message token.
+
+---
+
 ## Security response headers
 
 `handlers.SecurityHeaders` (`internal/handlers/security.go`) is the single

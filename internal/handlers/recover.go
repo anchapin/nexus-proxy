@@ -112,7 +112,7 @@ var (
 	awsKeyRe        = regexp.MustCompile(`(?i)(aws[_-]?access[_-]?key[_-]?id|aws[_-]?secret[_-]?access[_-]?key)\s*[:=]\s*["']?[A-Z0-9]{20}["']?`)
 	awsSecretRe     = regexp.MustCompile(`(?i)(aws[_-]?secret)\s*[:=]\s*["']?[a-zA-Z0-9/+=]{40}["']?`)
 	passwordURLRe   = regexp.MustCompile(`(?i)://[^:]+:[^@]+@`)
-	genericSecretRe = regexp.MustCompile(`(?i)(password|passwd|pwd|token|credential|private[_-]?key)\s*[:=]\s*["']?[^\s"']+["']?`)
+	genericSecretRe = regexp.MustCompile(`(?i)(password|passwd|pwd|token|credential|private[_-]?key)\s*[:=]\s*["']?\S+["']?`)
 )
 
 func redactPanicValue(rv any) (string, bool) {
