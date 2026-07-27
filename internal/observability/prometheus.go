@@ -195,6 +195,15 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Build metadata for the running nexus-proxy binary (issue #529). Always 1.",
 		typ:  "gauge",
 	},
+	// Auth limiter gauges (issue #744). Track brute-force protection state.
+	"nexus_auth_limiter_tracked_ips": {
+		help: "Current number of IPs being tracked by the auth brute-force limiter (issue #744).",
+		typ:  "gauge",
+	},
+	"nexus_auth_limiter_blocked_ips": {
+		help: "Current number of IPs blocked by the auth brute-force limiter (issue #744).",
+		typ:  "gauge",
+	},
 }
 
 // RenderPrometheus writes the full /metrics body in Prometheus
