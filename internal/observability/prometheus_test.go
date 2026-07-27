@@ -11,6 +11,7 @@ import (
 
 	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/concurrencylimit"
+	"github.com/anchapin/nexus-proxy/internal/ratelimit"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
