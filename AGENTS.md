@@ -85,7 +85,8 @@ internal/
 
 **Critical: `internal/ratelimit` ≠ `internal/middleware`.** Rate limiting
 imports `net/http`; `internal/middleware` intentionally does not — keep it
-that way for unit-testability.
+that way for unit-testability. `internal/middleware` has **zero** `net/http`
+imports.
 
 **Critical dependency rule:** `internal/handlers` and `internal/upstream`
 must **never** import `internal/judge` or `internal/quality`. Both hook
@@ -118,6 +119,10 @@ panels race local + frontier, stream the faster as speculative SSE, and
 only invoke the arbiter when Jaccard similarity < `NEXUS_FUSION_AGREEMENT_THRESHOLD`
 (default 0.85).
 
+**Arbiter synthesis cache** (`NEXUS_ARBITER_CACHE_TTL`): when > 0, arbiter
+responses are cached keyed by a hash of both panel members' content. Set to 0
+(default) to disable — every disagreement triggers a fresh frontier call.
+
 ## Middleware order (do not reorder)
 
 **Inbound HTTP chain** (`cmd/nexus/main.go`, outermost → innermost):
@@ -135,6 +140,11 @@ endpoints are registered on the unprotected mux and are never rate-limited.
 3. `CompressJSONBlocks` + `AppendSystemNote` — TOON compression + system note
 4. Guardrail → DSL → SLM routing
 5. Dispatch: local → Cascade/BufferedFetch; frontier → Stream/BufferedFetch; fusion → Panel
+
+**Middleware chain customization:** `NEXUS_MIDDLEWARE_CHAIN` (default:
+`promptEngineering,rag,compressJSONBlocks,appendSystemNote`) lets operators
+reorder or omit steps. Available names: `promptEngineering`, `rag`,
+`compressJSONBlocks`, `appendSystemNote`.
 
 ## Ollama degradation (issue #8)
 
@@ -213,6 +223,49 @@ stock plaintext bind must not advertise HSTS.
 `internal/middleware` is intentionally net/http-free. Any response-header
 middleware belongs in `internal/handlers`.
 
+## Prompt injection hardening (issue #76)
+
+`NEXUS_PROMPT_INJECTION_MODE` controls policy-text isolation:
+- `off` (default): legacy append behaviour, backward compatible.
+- `warn`: proxy text in `[NEXUS PROXY POLICY]` delimiters in a leading
+  system message; suspicious user patterns are **logged but requests proceed**.
+- `strict`: same as warn, plus requests with suspicious user patterns are
+  rejected with a 400.
+
+`NEXUS_INJECTION_SCAN_ROLES` (default `system`) controls which roles are
+scanned (`system`, or `system,user`). Proxy-injected policy blocks are never
+flagged regardless of this setting.
+
+## Observability
+
+**Prometheus metrics** are served at `GET /metrics` (no auth required):
+- `nexus_tracing_dropped_total` — OTLP spans dropped
+- `nexus_budget_*` — spend/budget guard counters when `NEXUS_BUDGET_ALERT_ENABLED`
+- `nexus_health_circuit_*` — Ollama circuit breaker state transitions
+- `nexus_rag_circuit_*` — RAG embedder circuit breaker state transitions
+- `nexus_upstream_*` — per-route/upstream counters and histograms
+
+See `docs/observability-surface.md` for the full metric reference.
+
+**Structured logging** (`log/slog`): `NEXUS_LOG_LEVEL` (debug/info/warn/error)
+and `NEXUS_LOG_FORMAT` (json/text). Both are hot-reloadable via SIGHUP.
+
+**Debug tracing** (`NEXUS_DEBUG=true`): emits five slog groups per request:
+`request`, `transforms`, `routing`, `upstream`, `response`. API keys redacted;
+body preview capped at `NEXUS_DEBUG_BODY_BYTES` (default 512).
+
+**Distributed tracing** (`NEXUS_TRACING_ENDPOINT`): OTLP/JSON exporter.
+See `docs/tracing.example.md` for setup.
+
+## Provider selector (issue #45)
+
+The multi-provider registry picks the cheapest provider based on observed
+latency + cost. Tunable via `NEXUS_SELECTOR_WINDOW` (look-back window),
+`NEXUS_SELECTOR_MIN_SAMPLES` (observations before a provider is trusted),
+`NEXUS_SELECTOR_REFRESH` (recompute cadence), and `NEXUS_PROVIDER_TAIL_WEIGHT`
+(P95 blend factor, range 0–1). When multiple providers are registered via
+`NEXUS_PROVIDERS`, the legacy `NEXUS_FRONTIER_*` vars are ignored.
+
 ## Debug tracing (issue #33)
 
 `NEXUS_DEBUG=true` emits five structured slog groups per request:
@@ -235,12 +288,11 @@ Config file: `$XDG_CONFIG_HOME/nexus-proxy/config.yaml` or
 `~/.config/nexus-proxy/...` or `./config.yaml`. Env vars always override
 file values.
 
-`internal/config/env_example_audit_test.go` enforces the `.env.example` ↔
-parser contract bidirectionally (issue #478): code vars must have a
-canonical `.env.example` entry, and vice versa. Four skip prefixes
-exempt dynamic-construction vars (`NEXUS_PROVIDER_`, `NEXUS_FRONTIER_`,
-`NEXUS_ZAI_`, `NEXUS_HTTP_`), plus one exact-match skip
-(`NEXUS_QUALITY_TEST_HOOK`, test-only).
+`internal/config/env_example_audit_test.go` **enforces** the `.env.example` ↔
+parser contract bidirectionally (issue #478). Adding a var without both the
+struct field and the `.env.example` entry will fail the test. Four prefixes
+are exempt: `NEXUS_PROVIDER_`, `NEXUS_FRONTIER_`, `NEXUS_ZAI_`, `NEXUS_HTTP_`;
+plus `NEXUS_QUALITY_TEST_HOOK` (test-only).
 
 For hot-reloadable knobs add the field to `ReloadHotReloadable()` in
 `config.go`. Sending **SIGHUP** re-reads exactly: log level, log format,
