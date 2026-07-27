@@ -382,6 +382,29 @@ Every semver tag (`v1.0.0`, `v1.2.3`, …) triggers the
 - **Cosign signature** — keyless (OIDC) signature on the image,
   recorded in the Rekor transparency log
 
+### Install
+
+The fastest way to get `nexus` on your `PATH` is `go install`. Nexus is
+pure Go (CGO-free), so a working Go toolchain is the only prerequisite —
+no `goreleaser.yml` or Homebrew tap is required:
+
+```bash
+go install github.com/anchapin/nexus-proxy/cmd/nexus@latest
+```
+
+This drops the binary into `$(go env GOPATH)/bin` (usually `~/go/bin`).
+Ensure that directory is on your `PATH`, then verify it runs:
+
+```bash
+nexus --version
+```
+
+> **Pin a version.** Replace `@latest` with a semver tag
+> (e.g. `@v1.2.3`) to install a reproducible build. `@latest` always
+> resolves to the most recent tagged release on the default branch.
+
+> **No Go toolchain?** Use the prebuilt binary or container image below.
+
 ### Install a prebuilt binary
 
 ```bash
