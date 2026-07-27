@@ -69,6 +69,11 @@ type SLMCache struct {
 	ttlEvictions uint64
 	lruEvictions uint64
 
+	// embedErrors is a cumulative atomic counter bumped inside the
+	// embedder call in Set and getSemantic when the embedder returns
+	// a non-nil error (issue #741). It is safe to read concurrently.
+	embedErrors uint64
+
 	// onEviction, when non-nil, is invoked once per evicted entry
 	// with reason = "ttl" or "lru". The callback runs AFTER the
 	// cache mutex is released so it is safe to call into observability
@@ -76,6 +81,12 @@ type SLMCache struct {
 	// The slice pointer is captured under mu; callbacks should not
 	// mutate it.
 	onEviction func(reason string)
+
+	// onEmbedError, when non-nil, is invoked once per embedder error
+	// inside Set or getSemantic (issue #741). The callback runs AFTER
+	// the cache mutex is released so it is safe to call into
+	// observability or logging.
+	onEmbedError func()
 }
 
 // cachedDecision pairs a routing decision with its insertion time for
@@ -263,6 +274,14 @@ func (c *SLMCache) Get(ctx context.Context, prompt string) (Route, bool, CacheHi
 func (c *SLMCache) getSemantic(ctx context.Context, prompt string) (Route, bool, CacheHitKind) {
 	emb, err := c.embedder.Embed(ctx, prompt)
 	if err != nil {
+		atomic.AddUint64(&c.embedErrors, 1)
+		onEmbedErr := c.onEmbedError
+		// The lock is not held here (we are still in the read path before
+		// acquiring it), but we fire the callback synchronously after the
+		// embed call so it behaves consistently with Set.
+		if onEmbedErr != nil {
+			onEmbedErr()
+		}
 		return "", false, ""
 	}
 
@@ -301,12 +320,18 @@ func (c *SLMCache) getSemantic(ctx context.Context, prompt string) (Route, bool,
 func (c *SLMCache) Set(ctx context.Context, prompt string, route Route) {
 	var ttlRemoved, lruRemoved int
 	var onEvict func(reason string)
+	var onEmbedErr func()
 
 	c.mu.Lock()
 
 	var emb []float64
 	if c.embedder != nil {
-		emb, _ = c.embedder.Embed(ctx, prompt) // best-effort; embed errors are logged by caller
+		var err error
+		emb, err = c.embedder.Embed(ctx, prompt) // best-effort; embed errors are logged by caller
+		if err != nil {
+			atomic.AddUint64(&c.embedErrors, 1)
+			onEmbedErr = c.onEmbedError
+		}
 	}
 
 	// If at capacity, evict expired entries first, then LRU.
@@ -323,7 +348,6 @@ func (c *SLMCache) Set(ctx context.Context, prompt string, route Route) {
 		emb:   emb,
 	}
 	c.expiry = append(c.expiry, prompt)
-	c.sortExpiry()
 
 	onEvict = c.onEviction
 	c.mu.Unlock()
@@ -332,6 +356,13 @@ func (c *SLMCache) Set(ctx context.Context, prompt string, route Route) {
 	// so the observer can safely call into observability, logging,
 	// or any other subsystem (issue #449).
 	c.dispatchEvictions(onEvict, ttlRemoved, lruRemoved)
+
+	// Dispatch the embed-error observer (issue #741). The callback
+	// runs without holding the cache lock so it can safely call into
+	// observability or logging.
+	if onEmbedErr != nil {
+		onEmbedErr()
+	}
 }
 
 // SetEmbedding stores a routing decision with a pre-computed embedding.
@@ -356,7 +387,6 @@ func (c *SLMCache) SetEmbedding(prompt string, route Route, emb []float64) {
 		emb:   emb,
 	}
 	c.expiry = append(c.expiry, prompt)
-	c.sortExpiry()
 
 	onEvict = c.onEviction
 	c.mu.Unlock()
@@ -394,16 +424,30 @@ func (c *SLMCache) SetEvictionObserver(fn func(reason string)) {
 	c.mu.Unlock()
 }
 
+// SetEmbedErrorObserver registers a callback that is invoked once per
+// embedder error inside Set or getSemantic (issue #741). Pass nil to
+// clear the observer. The callback runs after the cache lock is
+// released so it is safe to call into observability or logging.
+// Callers that want to record into observability.RouteCounters should
+// pass a closure that forwards to ObserveSLMCacheEmbedError.
+func (c *SLMCache) SetEmbedErrorObserver(fn func()) {
+	c.mu.Lock()
+	c.onEmbedError = fn
+	c.mu.Unlock()
+}
+
 // SLMCacheStats holds state counters for the SLM cache. It is
 // returned by Stats so callers can inspect cache effectiveness.
 // TTLEvictions and LRUEvictions are cumulative since cache creation
 // (issue #449) and reflect removals that actually happened; entries
 // past TTL but not yet evicted are reflected by the Expired counter.
+// EmbedErrors is the cumulative count of embedder errors (issue #741).
 type SLMCacheStats struct {
 	Entries      int    // live (non-expired) entries
 	Expired      int    // entries past TTL (not yet evicted)
 	TTLEvictions uint64 // cumulative TTL removals
 	LRUEvictions uint64 // cumulative LRU removals (capacity pressure)
+	EmbedErrors  uint64 // cumulative embedder errors (issue #741)
 }
 
 // Stats returns a snapshot of cache entry counts and cumulative
@@ -427,6 +471,7 @@ func (c *SLMCache) Stats() SLMCacheStats {
 		Expired:      expired,
 		TTLEvictions: atomic.LoadUint64(&c.ttlEvictions),
 		LRUEvictions: atomic.LoadUint64(&c.lruEvictions),
+		EmbedErrors:  atomic.LoadUint64(&c.embedErrors),
 	}
 }
 

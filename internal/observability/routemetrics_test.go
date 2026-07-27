@@ -874,6 +874,56 @@ func TestLocalCooldownTriggersCounterAbsentWhenZero(t *testing.T) {
 	}
 }
 
+// TestSLMCacheEmbedErrorCounter (issue #741) verifies that
+// ObserveSLMCacheEmbedError increments the counter and that WriteTo
+// renders the counter with correct HELP/TYPE headers.
+func TestSLMCacheEmbedErrorCounter(t *testing.T) {
+	rc := NewRouteCounters()
+
+	rc.ObserveSLMCacheEmbedError()
+	rc.ObserveSLMCacheEmbedError()
+	rc.ObserveSLMCacheEmbedError()
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []string{
+		"# HELP nexus_slm_cache_embedding_errors_total",
+		"# TYPE nexus_slm_cache_embedding_errors_total counter",
+		"nexus_slm_cache_embedding_errors_total 3",
+	}
+	for _, want := range checks {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q\ngot:\n%s", want, out)
+		}
+	}
+}
+
+// TestSLMCacheEmbedErrorCounterNil verifies that ObserveSLMCacheEmbedError
+// on a nil receiver is a safe no-op.
+func TestSLMCacheEmbedErrorCounterNil(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveSLMCacheEmbedError() // must not panic
+}
+
+// TestSLMCacheEmbedErrorCounterAbsentWhenZero verifies the counter
+// series is still emitted (with value 0) so scrapers can discover the
+// family even before the first embed error fires.
+func TestSLMCacheEmbedErrorCounterAbsentWhenZero(t *testing.T) {
+	rc := NewRouteCounters()
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+	if !strings.Contains(out, "# HELP nexus_slm_cache_embedding_errors_total") {
+		t.Errorf("counter should be emitted even when zero\ngot:\n%s", out)
+	}
+}
+
 // TestHandlerEmitsCircuitBreakerGauges (issue #443) wires a real
 // Collector into the production RouteCounters.Handler() and confirms
 // that a recorded RAG failure surfaces in /metrics as the three

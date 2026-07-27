@@ -358,6 +358,36 @@ func TestLoadTelemetryPathHonoursOverride(t *testing.T) {
 	}
 }
 
+func TestLoadTelemetryBufferSizeAndFlushIntervalHonoured(t *testing.T) {
+	t.Setenv("NEXUS_TELEMETRY_BUFFER_SIZE", "131072")
+	t.Setenv("NEXUS_TELEMETRY_FLUSH_INTERVAL", "10s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TelemetryBufferSize != 131072 {
+		t.Errorf("TelemetryBufferSize = %d, want 131072", cfg.TelemetryBufferSize)
+	}
+	if cfg.TelemetryFlushInterval != 10*time.Second {
+		t.Errorf("TelemetryFlushInterval = %v, want 10s", cfg.TelemetryFlushInterval)
+	}
+}
+
+func TestLoadTelemetryBufferSizeAndFlushIntervalDefaultOnZero(t *testing.T) {
+	t.Setenv("NEXUS_TELEMETRY_BUFFER_SIZE", "0")
+	t.Setenv("NEXUS_TELEMETRY_FLUSH_INTERVAL", "0")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TelemetryBufferSize != 64<<10 {
+		t.Errorf("TelemetryBufferSize = %d, want 64<<10 (65536)", cfg.TelemetryBufferSize)
+	}
+	if cfg.TelemetryFlushInterval != 5*time.Second {
+		t.Errorf("TelemetryFlushInterval = %v, want 5s", cfg.TelemetryFlushInterval)
+	}
+}
+
 func TestLoadProbeDisabledByZeroInterval(t *testing.T) {
 	t.Setenv("NEXUS_PROBE_INTERVAL", "0")
 	cfg, err := Load()

@@ -813,6 +813,107 @@ func TestObserveRAGSimilarityConcurrent(t *testing.T) {
 	}
 }
 
+// TestObserveRateLimitUtilizationBasic (issue #746) verifies one
+// observation is recorded correctly.
+func TestObserveRateLimitUtilizationBasic(t *testing.T) {
+	c := NewCollector()
+	c.ObserveRateLimitUtilization("abc123", 0.6)
+	hists := c.RateLimitUtilizationHistograms()
+	h := hists["abc123"]
+	if h == nil {
+		t.Fatal("histogram for abc123 is nil")
+	}
+	_, _, sum, count := h.Snapshot()
+	if count != 1 {
+		t.Errorf("count = %d, want 1", count)
+	}
+	if sum != 0.6 {
+		t.Errorf("sum = %v, want 0.6", sum)
+	}
+}
+
+// TestObserveRateLimitUtilizationClamping verifies values outside [0, 1]
+// are clamped to the valid range.
+func TestObserveRateLimitUtilizationClamping(t *testing.T) {
+	c := NewCollector()
+	c.ObserveRateLimitUtilization("client1", -0.5) // clamped to 0
+	c.ObserveRateLimitUtilization("client2", 1.5)  // clamped to 1
+	c.ObserveRateLimitUtilization("client3", 0.75) // unchanged
+
+	hists := c.RateLimitUtilizationHistograms()
+	for _, tc := range []struct {
+		bucketID string
+		want     float64
+	}{
+		{"client1", 0.0},
+		{"client2", 1.0},
+		{"client3", 0.75},
+	} {
+		h := hists[tc.bucketID]
+		if h == nil {
+			t.Fatalf("histogram for %s is nil", tc.bucketID)
+		}
+		_, _, sum, count := h.Snapshot()
+		if count != 1 {
+			t.Errorf("%s: count = %d, want 1", tc.bucketID, count)
+		}
+		if sum != tc.want {
+			t.Errorf("%s: sum = %v, want %v", tc.bucketID, sum, tc.want)
+		}
+	}
+}
+
+// TestObserveRateLimitUtilizationEmptyBucketID verifies an empty bucket
+// ID is silently ignored.
+func TestObserveRateLimitUtilizationEmptyBucketID(t *testing.T) {
+	c := NewCollector()
+	c.ObserveRateLimitUtilization("", 0.5)
+	if h := c.RateLimitUtilizationHistograms(); len(h) != 0 {
+		t.Errorf("empty bucketID created histogram, want none")
+	}
+}
+
+// TestObserveRateLimitUtilizationNilCollector verifies a nil receiver
+// does not panic.
+func TestObserveRateLimitUtilizationNilCollector(t *testing.T) {
+	var c *Collector
+	c.ObserveRateLimitUtilization("abc", 0.5) // must not panic
+}
+
+// TestObserveRateLimitUtilizationHistogramsNilCollector verifies
+// RateLimitUtilizationHistograms returns nil for a nil receiver.
+func TestObserveRateLimitUtilizationHistogramsNilCollector(t *testing.T) {
+	var c *Collector
+	if h := c.RateLimitUtilizationHistograms(); h != nil {
+		t.Errorf("nil collector histograms = %v, want nil", h)
+	}
+}
+
+// TestObserveRateLimitUtilizationConcurrent exercises the histogram under
+// concurrent observations. 100 goroutines × 100 observations = 10,000
+// events; -race catches any data race.
+func TestObserveRateLimitUtilizationConcurrent(t *testing.T) {
+	c := NewCollector()
+	const goroutines, perG = 100, 100
+	done := make(chan struct{}, goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			for i := 0; i < perG; i++ {
+				c.ObserveRateLimitUtilization("concurrent-client", 0.5)
+			}
+		}()
+	}
+	for g := 0; g < goroutines; g++ {
+		<-done
+	}
+	want := uint64(goroutines * perG)
+	h := c.RateLimitUtilizationHistograms()["concurrent-client"]
+	if got := snapshotCount(t, h); got != want {
+		t.Errorf("concurrent count = %d, want %d", got, want)
+	}
+}
+
 // snapshotCount is a tiny helper to keep the table-style tests
 // above compact.
 func snapshotCount(t *testing.T, h *Histogram) uint64 {
