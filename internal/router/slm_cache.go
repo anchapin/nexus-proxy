@@ -147,11 +147,16 @@ func NewSLMCacheWithEmbedder(ttl time.Duration, maxEntries int, embedder Embedde
 
 // sortExpiry sorts the expiry slice by stamp (earliest first).
 // This maintains the invariant that expiry[0] is the entry to evict next.
+// Orphaned entries (present in c.expiry but deleted from c.entries) are
+// sorted first by treating their stamp as the epoch (time.Time{}) so they
+// are always candidates for immediate eviction.
 func (c *SLMCache) sortExpiry() {
 	sort.Slice(c.expiry, func(i, j int) bool {
 		iEntry, oki := c.entries[c.expiry[i]]
 		jEntry, okj := c.entries[c.expiry[j]]
 		if !oki {
+			// Orphaned i sorts before valid j; two orphans use zero time
+			// (consistent, sorts to front of any valid entry).
 			return true
 		}
 		if !okj {
