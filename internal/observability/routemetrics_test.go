@@ -1209,7 +1209,7 @@ func TestRouteCountersPanelPanicNilSafe(t *testing.T) {
 
 // TestRouteCountersArbiterCacheHit verifies ObserveArbiterCacheHit
 // increments the nexus_fusion_arbiter_cache_total family with hit/miss
-// labels (issue #232). The method is wired into the chat-handler hot
+// labels (issue #232, #773). The method is wired into the chat-handler hot
 // path via a closure; this is the only direct unit-level coverage.
 func TestRouteCountersArbiterCacheHit(t *testing.T) {
 	rc := NewRouteCounters()
@@ -1230,8 +1230,8 @@ func TestRouteCountersArbiterCacheHit(t *testing.T) {
 	}{
 		{"nexus_fusion_arbiter_cache_total", "metric family header"},
 		{"# TYPE nexus_fusion_arbiter_cache_total counter", "TYPE line"},
-		{`nexus_fusion_arbiter_cache_total{reason="true"} 2`, "two cache hits"},
-		{`nexus_fusion_arbiter_cache_total{reason="false"} 1`, "one cache miss"},
+		{`nexus_fusion_arbiter_cache_total{reason="cache_hit"} 2`, "two cache hits"},
+		{`nexus_fusion_arbiter_cache_total{reason="cache_miss"} 1`, "one cache miss"},
 	}
 	for _, c := range checks {
 		if !strings.Contains(out, c.fragment) {

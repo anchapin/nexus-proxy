@@ -860,13 +860,14 @@ func main() {
 			slog.String("hint", "operator is tightening the cap; confirm this is intentional"),
 		)
 	}
-	// Arbiter synthesis cache (issue #232). Created when TTL > 0;
+	// Arbiter synthesis cache (issue #232, #773). Created when TTL > 0;
 	// nil means caching is disabled.
 	var arbiterCache *upstream.ArbiterCache
 	if cfg.ArbiterCacheTTL > 0 {
-		arbiterCache = upstream.NewArbiterCache(cfg.ArbiterCacheTTL)
+		arbiterCache = upstream.NewArbiterCache(cfg.ArbiterCacheTTL, cfg.ArbiterCacheMaxEntries)
 		slog.Info("fusion arbiter cache enabled",
 			slog.Duration("ttl", cfg.ArbiterCacheTTL),
+			slog.Int("max_entries", cfg.ArbiterCacheMaxEntries),
 		)
 	}
 	mux.Handle("/metrics", routeCounters.Handler())

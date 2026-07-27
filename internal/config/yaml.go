@@ -100,6 +100,8 @@ type YAMLConfig struct {
 	// Fusion
 	FusionProgressiveDelivery bool    `yaml:"fusion_progressive_delivery"`
 	FusionAgreementThreshold  float64 `yaml:"fusion_agreement_threshold"`
+	ArbiterCacheTTL           string  `yaml:"arbiter_cache_ttl"`
+	ArbiterCacheMaxEntries    int     `yaml:"arbiter_cache_max_entries"`
 
 	// Health
 	HealthPollInterval     string `yaml:"health_poll_interval"`
@@ -568,6 +570,23 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.FusionAgreementThreshold = f
 	}
+	if v := os.Getenv("NEXUS_ARBITER_CACHE_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_ARBITER_CACHE_TTL: %w", err)
+		}
+		cfg.ArbiterCacheTTL = d
+	}
+	if v := os.Getenv("NEXUS_ARBITER_CACHE_MAX_ENTRIES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_ARBITER_CACHE_MAX_ENTRIES: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.ArbiterCacheMaxEntries = n
+	}
 
 	// Health
 	if v := os.Getenv("NEXUS_HEALTH_POLL_INTERVAL"); v != "" {
@@ -929,6 +948,8 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 
 		FusionProgressiveDelivery: yc.boolFieldDefault(yc.FusionProgressiveDelivery, true),
 		FusionAgreementThreshold:  yc.floatDefault(yc.FusionAgreementThreshold, 0.85),
+		ArbiterCacheTTL:           yc.durationDefault(yc.ArbiterCacheTTL, 5*time.Minute),
+		ArbiterCacheMaxEntries:    yc.intDefault(yc.ArbiterCacheMaxEntries, 512),
 
 		JudgeURL:          yc.stringDefault(yc.JudgeURL, "https://api.z.ai/v1/chat/completions"),
 		JudgeModel:        yc.stringDefault(yc.JudgeModel, ""), // Falls back to FrontierModel later
