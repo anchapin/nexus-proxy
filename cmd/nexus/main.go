@@ -935,6 +935,12 @@ func main() {
 		slmCache.SetEvictionObserver(func(reason string) {
 			routeCounters.ObserveSLMCacheEviction(reason)
 		})
+		// Wire the embed-error observer so embedder degradation is
+		// observable as nexus_slm_cache_embedding_errors_total instead
+		// of silently appearing as cache misses (issue #741).
+		slmCache.SetEmbedErrorObserver(func() {
+			routeCounters.ObserveSLMCacheEmbedError()
+		})
 	} else {
 		slog.Info("slm decision cache disabled (NEXUS_SLMCACHE_TTL<=0)")
 	}

@@ -151,6 +151,7 @@ type RouteCounters struct {
 	slmCacheHits             map[string]*uint64 // "exact" | "semantic" (issue #352)
 	slmCacheMisses           *uint64
 	slmCacheEvictions        map[string]*uint64 // "ttl" | "lru" (issue #449)
+	slmCacheEmbedErrors      *uint64            // nexus_slm_cache_embedding_errors_total (issue #741)
 	rejections               map[string]*uint64
 	responseTruncated        uint64 // nexus_upstream_response_truncated_total
 	fusionArbiter            map[string]*uint64
@@ -201,6 +202,7 @@ func NewRouteCounters() *RouteCounters {
 	misses := uint64(0)
 	cHits, cMisses := uint64(0), uint64(0)
 	ragHits := uint64(0)
+	slmEmbedErrs := uint64(0)
 	return &RouteCounters{
 		routeDecisions:           make(map[counterKey]*uint64),
 		slmDecisions:             make(map[counterKey]*uint64),
@@ -208,6 +210,7 @@ func NewRouteCounters() *RouteCounters {
 		slmCacheHits:             make(map[string]*uint64),
 		slmCacheMisses:           &misses,
 		slmCacheEvictions:        make(map[string]*uint64),
+		slmCacheEmbedErrors:      &slmEmbedErrs,
 		rejections:               make(map[string]*uint64),
 		fusionArbiter:            make(map[string]*uint64),
 		rRAGHits:                 &ragHits,
@@ -447,6 +450,17 @@ func (rc *RouteCounters) ObserveSLMCacheEviction(reason string) {
 		return
 	}
 	atomic.AddUint64(rc.slmCacheEvictionSlot(reason), 1)
+}
+
+// ObserveSLMCacheEmbedError records one embedder error inside SLMCache.Set
+// or SLMCache.getSemantic (issue #741). This makes embedder degradation
+// observable instead of silently appearing as cache misses. Safe for
+// concurrent use; nil receivers are a no-op.
+func (rc *RouteCounters) ObserveSLMCacheEmbedError() {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(rc.slmCacheEmbedErrors, 1)
 }
 
 // IncLocalCooldownTriggers increments the cooldown-triggers counter
@@ -791,6 +805,13 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 		return total, err
 	} else {
 		total += n
+	}
+	// SLM cache embedder error counter (issue #741).
+	embedErrs := atomic.LoadUint64(rc.slmCacheEmbedErrors)
+	if n, err := fmt.Fprintf(w, "# HELP nexus_slm_cache_embedding_errors_total Total embedder errors inside SLMCache (issue #741).\n# TYPE nexus_slm_cache_embedding_errors_total counter\nnexus_slm_cache_embedding_errors_total %d\n", embedErrs); err != nil {
+		return total, err
+	} else {
+		total += int64(n)
 	}
 	// Local-route cooldown triggers (issue #530).
 	cooldownTriggers := atomic.LoadUint64(&rc.localCooldownTriggers)
