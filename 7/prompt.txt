@@ -1,0 +1,25 @@
+You are implementing GitHub issue #877 in a dedicated worktree.
+
+**Issue #877: containsWord compiles a new regex on every call — hot-path performance drain**
+
+**Area:** area:router, phase:5-intelligence, performance
+
+**Problem:** `containsWord` (dsl.go:169) builds and calls `regexp.MatchString` with a freshly constructed pattern on every invocation. `Categorize` calls it ~60 times per prompt. On the routing hot path this means ~60 regex compilations + cache lookups per request.
+
+**Acceptance criteria:**
+- `BenchmarkCategorize` shows measurable improvement (aim for >3x faster) vs. current implementation
+- All existing `containsWord` and `Categorize` tests continue to pass with no behavior change
+- No allocation on the hot path for the common case (all-lowercase prompt, no regex compilation)
+
+**Worktree:** `/home/alex/AI/worktrees/issue-877-regex-perf`
+
+**Your task:**
+1. Find `containsWord` in `internal/router/dsl.go` and `Categorize` in `internal/router/planner.go`
+2. Pre-compile `*regexp.Regexp` values at package init and store them alongside the keyword strings
+3. Replace dynamic regex-per-call with pre-compiled pattern matching
+4. Run benchmarks to verify improvement: `go test -bench=BenchmarkCategorize -benchmem ./internal/router`
+5. Run tests to verify no regressions: `go test ./internal/router`
+6. Commit: `fix: resolve #877 — pre-compile regex in containsWord for hot-path performance`
+7. Push: `git push -u origin fix/issue-877-regex-perf`
+8. Create PR targeting `develop`: `Closes #877`
+9. Report PR number
