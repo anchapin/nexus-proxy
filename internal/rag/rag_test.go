@@ -942,3 +942,58 @@ func TestCachedEmbedderNoBreaker(t *testing.T) {
 	}
 	c.RecordBreakerSuccess()
 }
+
+func TestParseThresholdOverridesNonASCII(t *testing.T) {
+	key := "NEXUS_RAG_THRESHOLD_代码"
+	if err := os.Setenv(key, "0.7"); err != nil {
+		t.Fatalf("Setenv(%q): %v", key, err)
+	}
+	defer os.Unsetenv(key)
+
+	overrides := ParseThresholdOverrides()
+	if got, ok := overrides["代码"]; !ok {
+		t.Errorf("overrides[%q] missing; got %v", "代码", overrides)
+	} else if got != 0.7 {
+		t.Errorf("overrides[%q] = %v, want 0.7", "代码", got)
+	}
+}
+
+func TestParseThresholdOverrides(t *testing.T) {
+	cases := []struct {
+		name  string
+		key   string
+		val   string
+		dir   string
+		want  float64
+		valid bool
+	}{
+		{"ASCII override", "NEXUS_RAG_THRESHOLD_代码", "0.7", "代码", 0.7, true},
+		{"empty value", "NEXUS_RAG_THRESHOLD_emptydir", "", "emptydir", 0, false},
+		{"invalid value", "NEXUS_RAG_THRESHOLD_invaliddir", "not_a_float", "invaliddir", 0, false},
+		{"out of range", "NEXUS_RAG_THRESHOLD_oobdir", "1.5", "oobdir", 0, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.valid {
+				if err := os.Setenv(tc.key, tc.val); err != nil {
+					t.Fatalf("Setenv(%q, %q): %v", tc.key, tc.val, err)
+				}
+				defer os.Unsetenv(tc.key)
+			}
+
+			overrides := ParseThresholdOverrides()
+			if tc.valid {
+				if got, ok := overrides[tc.dir]; !ok {
+					t.Errorf("overrides[%q] missing; got %v", tc.dir, overrides)
+				} else if got != tc.want {
+					t.Errorf("overrides[%q] = %v, want %v", tc.dir, got, tc.want)
+				}
+			} else {
+				if _, ok := overrides[tc.dir]; ok {
+					t.Errorf("overrides[%q] unexpectedly present; got %v", tc.dir, overrides)
+				}
+			}
+		})
+	}
+}

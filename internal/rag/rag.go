@@ -495,27 +495,29 @@ func ParseThresholdOverrides() map[string]float64 {
 		if !strings.HasPrefix(env, prefix) {
 			continue
 		}
-		// Split on '=' to get the threshold value
 		idx := strings.Index(env, "=")
 		if idx < 0 {
 			continue
 		}
-		dirPart := env[len(prefix):idx]
-		thresholdStr := env[idx+1:]
-		if dirPart == "" || thresholdStr == "" {
+		rawKey := env[len(prefix):idx]
+		if rawKey == "" {
 			continue
 		}
-		threshold, err := strconv.ParseFloat(thresholdStr, 64)
+		key := prefix + strings.ToValidUTF8(rawKey, "")
+		val := os.Getenv(key)
+		if val == "" {
+			continue
+		}
+		threshold, err := strconv.ParseFloat(val, 64)
 		if err != nil || threshold < 0 || threshold > 1 {
 			slog.Warn("rag: ignoring invalid threshold override",
-				slog.String("dir", dirPart),
-				slog.String("value", thresholdStr),
+				slog.String("dir", rawKey),
+				slog.String("value", val),
 				slog.Any("err", err),
 			)
 			continue
 		}
-		// Normalize directory name to lowercase for case-insensitive matching
-		overrides[strings.ToLower(dirPart)] = threshold
+		overrides[strings.ToLower(strings.ToValidUTF8(rawKey, ""))] = threshold
 	}
 	return overrides
 }
