@@ -531,6 +531,78 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 	})
 }
 
+// TestPlanner_ConfidenceStoreError tests issue #927: when LocalConfidence
+// returns an error, the planner still returns a Decision (falling back to
+// NeutralConfidence) and the error is observable via the hook.
+func TestPlanner_ConfidenceStoreError(t *testing.T) {
+	t.Run("LocalConfidence error still returns Decision and calls hook", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		dbErr := errors.New("db locked")
+		conf := &errorStubConf{err: dbErr}
+		var hookedErr error
+		var hookedCat string
+		p := &Planner{
+			SLM:                slm,
+			Confidence:         conf,
+			FusionPatterns:     fusionPatterns,
+			FormattingRegex:    formattingPatterns,
+			LocalPatternsRegex: localPatterns,
+			ConfidenceErrorHook: func(category string, err error) {
+				hookedCat = category
+				hookedErr = err
+			},
+		}
+		req := PlanRequest{
+			// Prompt that reaches the SLM stage (does not match DSL) and
+			// categorizes as a non-trivial category so the category variable
+			// passed to LocalConfidence is not empty.
+			Prompt:          "simplify this complex function",
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		// A decision must be returned even when confidence lookup fails.
+		if dec.Route != RouteLocal {
+			t.Errorf("Route = %q, want %q", dec.Route, RouteLocal)
+		}
+		// Confidence should be NeutralConfidence on error.
+		if dec.Confidence != NeutralConfidence {
+			t.Errorf("Decision.Confidence = %v, want NeutralConfidence (%v)", dec.Confidence, NeutralConfidence)
+		}
+		// The hook must have been called with the error.
+		if hookedErr == nil {
+			t.Fatal("ConfidenceErrorHook was not called")
+		}
+		if hookedErr != dbErr {
+			t.Errorf("hookedErr = %v, want %v", hookedErr, dbErr)
+		}
+		// Category must be non-empty (issue #441).
+		if hookedCat == "" {
+			t.Error("hookedCat is empty, want non-empty category")
+		}
+		// SLM must have been called with NeutralConfidence.
+		if !slm.calledWithConf {
+			t.Fatal("DecideWithConfidence was not called")
+		}
+		if slm.lastConfidence != NeutralConfidence {
+			t.Errorf("lastConfidence = %v, want NeutralConfidence (%v)", slm.lastConfidence, NeutralConfidence)
+		}
+	})
+}
+
+// errorStubConf is a ConfidenceStore that always returns an error.
+type errorStubConf struct {
+	err error
+}
+
+func (s *errorStubConf) RecordOutcome(_ string, _ Route, _ int) error { return nil }
+
+func (s *errorStubConf) LocalConfidence(category string) (float64, error) {
+	return NeutralConfidence, s.err
+}
+
 // TestPlanner_NilConfidenceTaskType verifies issue #441: every decision
 // reaching the SLM stage must have a non-empty TaskType even when no
 // ConfidenceStore is wired. This ensures Prometheus and JSONL telemetry
