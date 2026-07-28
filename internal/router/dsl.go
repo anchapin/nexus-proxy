@@ -92,14 +92,12 @@ type Route string
 // DSL runs the heuristic fast-pass. Returns one of RouteLocal, RouteFusion,
 // or "" if no rule matched (caller should fall back to the SLM).
 //
-// fusionPatterns matches architecture keywords that warrant fusion (both
-// local and frontier). formattingPatterns matches simple formatting keywords
-// (css, format, docstring, lint, typo, boilerplate). localPatterns matches
-// common coding task keywords (refactor, security scan, generate tests,
-// explain this code, performance analysis, etc.). unicodePatterns matches
-// non-ASCII text categories (e.g. Chinese characters via \p{Han}) via
-// NEXUS_DSL_UNICODE_PATTERNS (issue #422). Each pattern slice may be
-// nil or empty in which case that branch is skipped.
+// fusionPatterns, formattingPatterns, and localPatterns are matched against
+// the lowercase prompt (via toUnicodeLower) so that keywords like "REFACTOR"
+// and "refactor" are treated identically. unicodePatterns is matched against
+// the raw prompt because Unicode property escapes (\p{Han}, \p{Arabic}, etc.)
+// are inherently case-invariant — lowercasing a Chinese or Arabic character
+// is a no-op, and using the raw prompt avoids an unnecessary allocation.
 func DSL(prompt string, fusionPatterns, formattingPatterns, localPatterns, unicodePatterns []*regexp.Regexp) (Route, bool) {
 	lower := toUnicodeLower(prompt)
 
