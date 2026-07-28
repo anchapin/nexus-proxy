@@ -878,10 +878,15 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.QualityStderrCap = n
 	}
+	// Backward-compat alias (issue #924)
 	if v := os.Getenv("NEXUS_QUALITY_DROPED_RING_SIZE"); v != "" {
+		slog.Warn("NEXUS_QUALITY_DROPED_RING_SIZE is deprecated; use NEXUS_QUALITY_DROPPED_RING_SIZE",
+			slog.String("component", "config"))
+	}
+	if v := os.Getenv("NEXUS_QUALITY_DROPPED_RING_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_QUALITY_DROPED_RING_SIZE: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_QUALITY_DROPPED_RING_SIZE: %w", err)
 		}
 		cfg.QualityDroppedRingSize = n
 	}
