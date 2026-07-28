@@ -1,0 +1,37 @@
+You are implementing a fix for GitHub issue #834: [P2] Confidence routing_outcomes table grows unbounded with no vacuum/cleanup
+
+Repository: anchapin/nexus-proxy
+Branch: fix/issue-834-confidence-vacuum (already checked out)
+Workdir: /home/alex/AI/worktrees/issue-834-confidence-vacuum
+
+Steps:
+1. Read the full issue: gh issue view 834
+2. Read the issue comments for additional context: gh issue view 834 --comments
+3. Analyze what code needs to change
+4. Implement the fix/feature with tests
+5. Run local checks if available (make test-fast, make lint)
+6. Commit: git add -A && git commit -m "fix: resolve #834 — add vacuum/cleanup for routing_outcomes table"
+7. Push: git push -u origin fix/issue-834-confidence-vacuum
+8. Open PR with an EXPLICIT body:
+   ```
+   gh pr create --base develop \
+     --title "fix: resolve #834 — add vacuum/cleanup for routing_outcomes table" \
+     --body "$(cat <<'EOF'
+Closes #834
+
+Add periodic vacuum/cleanup for the routing_outcomes table to prevent unbounded growth and maintain performance.
+EOF
+   )"
+   The body must contain exactly one `Closes #N` line.
+9. Verify closingReferences count is exactly 1:
+   ```
+   bash /home/alex/AI/nexus-proxy/scripts/check_pr_closing_refs.sh <PR_NUMBER> 1
+   ```
+   If the check fails, run `gh pr edit <PR> --body "Closes #834\n\n<minimal body>"`
+
+Rules:
+- Work ONLY in your assigned worktree (/home/alex/AI/worktrees/issue-834-confidence-vacuum)
+- Do NOT modify files outside the scope of this issue
+- Include tests for the fix if the repo has a test suite
+- Follow the repo's AGENTS.md and code style conventions
+- Report back: PR number, files changed, any blockers encountered
