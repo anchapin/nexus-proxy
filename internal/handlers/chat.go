@@ -368,6 +368,10 @@ type CircuitBreakerObserver interface {
 	RecordCircuitRecovery(circuit string)
 	// IncEmbedderFailure records a circuit trip for an embedder (issue #423).
 	IncEmbedderFailure(kind string)
+	// IncRAGCircuitTrip records a RAG circuit breaker trip for an embedder kind (issue #886).
+	IncRAGCircuitTrip(kind string)
+	// IncRAGCircuitRecover records a RAG circuit breaker recovery for an embedder kind (issue #886).
+	IncRAGCircuitRecover(kind string)
 }
 
 // CircuitBreakerObserverFunc adapts a plain function to the
@@ -383,6 +387,12 @@ func (f CircuitBreakerObserverFunc) RecordCircuitRecovery(circuit string) { f(ci
 // IncEmbedderFailure implements CircuitBreakerObserver (issue #423).
 // The embedded function is called with the embedder kind (e.g. "openai").
 func (f CircuitBreakerObserverFunc) IncEmbedderFailure(kind string) {}
+
+// IncRAGCircuitTrip implements CircuitBreakerObserver (issue #886).
+func (f CircuitBreakerObserverFunc) IncRAGCircuitTrip(kind string) {}
+
+// IncRAGCircuitRecover implements CircuitBreakerObserver (issue #886).
+func (f CircuitBreakerObserverFunc) IncRAGCircuitRecover(kind string) {}
 
 // MetricsEvent carries the per-request data needed by the savings
 // dashboard (issue #4). Fields track the full round-trip metrics:
@@ -1043,9 +1053,10 @@ func Chat(d Deps) http.Handler {
 			if d.CircuitBreakerObserver != nil {
 				if s, ok := d.RAG.(interface{ IsBreakerOpen() bool }); ok && s.IsBreakerOpen() {
 					d.CircuitBreakerObserver.RecordCircuitFailure("rag")
-					// Also record the embedder-specific failure counter (issue #423).
+					// Also record the embedder-specific failure counter (issue #423, #886).
 					if kind := rag.CircuitKind(ragErr); kind != "" {
 						d.CircuitBreakerObserver.IncEmbedderFailure(kind)
+						d.CircuitBreakerObserver.IncRAGCircuitTrip(kind)
 					}
 				}
 			}
@@ -1097,6 +1108,14 @@ func Chat(d Deps) http.Handler {
 			}
 			if s, ok := d.RAG.(interface{ RecordBreakerSuccess() }); ok {
 				s.RecordBreakerSuccess()
+			}
+			// Track per-embedder recovery for observability (issue #886).
+			if d.CircuitBreakerObserver != nil {
+				if rec, ok := d.RAG.(interface{ LastSuccessfulKind() string }); ok {
+					if kind := rec.LastSuccessfulKind(); kind != "" {
+						d.CircuitBreakerObserver.IncRAGCircuitRecover(kind)
+					}
+				}
 			}
 		case d.RAG.Size() == 0:
 			slog.Info("rag miss",

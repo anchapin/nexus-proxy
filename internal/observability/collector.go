@@ -19,6 +19,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/health"
 )
 
 // DefaultBuckets are the histogram bucket upper bounds (in
@@ -264,6 +266,14 @@ type Collector struct {
 	// Protected by cbMu for map access; individual counters are atomic.
 	embedderMu       sync.RWMutex
 	embedderFailures map[string]*atomic.Uint64 // keyed by "ollama", "openai", "cohere"
+
+	// --- RAG embedder circuit breaker state metrics (issue #886) -----
+	//
+	// Tracks trip/recover events per embedder kind. State and failure count
+	// are read live from health.breakers at scrape time.
+	ragCircuitMu       sync.RWMutex
+	ragCircuitTrips    map[string]*atomic.Uint64 // keyed by "ollama", "openai", "cohere"
+	ragCircuitRecovers map[string]*atomic.Uint64
 
 	// --- Per-route latency percentile ring buffers (issue #774) --------
 	//
@@ -670,10 +680,28 @@ func (c *Collector) CircuitBreakerGauges() []GaugeSample {
 	return out
 }
 
+// RAGCircuitGauges returns live state and failure count readings for all
+// registered RAG embedder circuit breakers (issue #886). State values:
+// 0=closed, 1=half_open, 2=open. Reads directly from health.breakers
+// via health.GetBreakerStates so gauges are always current at scrape time.
+func (c *Collector) RAGCircuitGauges() []GaugeSample {
+	var out []GaugeSample
+	states := health.GetBreakerStates()
+	for kind, st := range states {
+		labels := map[string]string{"service": kind}
+		out = append(out,
+			GaugeSample{Name: "nexus_rag_circuit_state", Labels: labels, Value: float64(st.State)},
+			GaugeSample{Name: "nexus_rag_circuit_failure_count", Labels: labels, Value: float64(st.FailureCount)},
+		)
+	}
+	return out
+}
+
 // Gauges implements GaugeProvider so *Collector can be passed
 // directly to RenderPrometheus via the RouteCounters.Handler() chain
 // (issue #443). It returns the circuit-breaker state, failures,
-// last-failure samples, and latency percentile gauges (issue #774).
+// last-failure samples, RAG circuit breaker state/failure count (issue #886),
+// and latency percentile gauges (issue #774).
 // Safe for a nil receiver — returns nil so the collector can be
 // omitted without panicking during boot or in tests.
 func (c *Collector) Gauges() []GaugeSample {
@@ -682,6 +710,7 @@ func (c *Collector) Gauges() []GaugeSample {
 	}
 	var out []GaugeSample
 	out = append(out, c.CircuitBreakerGauges()...)
+	out = append(out, c.RAGCircuitGauges()...)
 	out = append(out, c.LatencyPercentileGauges()...)
 	return out
 }
@@ -723,6 +752,66 @@ func (c *Collector) EmbedderFailures() map[string]uint64 {
 	defer c.embedderMu.RUnlock()
 	out := make(map[string]uint64, len(c.embedderFailures))
 	for k, v := range c.embedderFailures {
+		out[k] = v.Load()
+	}
+	return out
+}
+
+// IncRAGCircuitTrip increments the trip counter for the given embedder kind
+// (one of "ollama", "openai", "cohere"). Called when a RAG embedder circuit
+// breaker trips (issue #886).
+func (c *Collector) IncRAGCircuitTrip(kind string) {
+	if kind == "" {
+		return
+	}
+	c.ragCircuitMu.Lock()
+	defer c.ragCircuitMu.Unlock()
+	if c.ragCircuitTrips == nil {
+		c.ragCircuitTrips = make(map[string]*atomic.Uint64)
+	}
+	if c.ragCircuitTrips[kind] == nil {
+		c.ragCircuitTrips[kind] = new(atomic.Uint64)
+	}
+	c.ragCircuitTrips[kind].Add(1)
+}
+
+// IncRAGCircuitRecover increments the recovery counter for the given embedder kind
+// (one of "ollama", "openai", "cohere"). Called when a RAG embedder circuit
+// breaker recovers (issue #886).
+func (c *Collector) IncRAGCircuitRecover(kind string) {
+	if kind == "" {
+		return
+	}
+	c.ragCircuitMu.Lock()
+	defer c.ragCircuitMu.Unlock()
+	if c.ragCircuitRecovers == nil {
+		c.ragCircuitRecovers = make(map[string]*atomic.Uint64)
+	}
+	if c.ragCircuitRecovers[kind] == nil {
+		c.ragCircuitRecovers[kind] = new(atomic.Uint64)
+	}
+	c.ragCircuitRecovers[kind].Add(1)
+}
+
+// RAGCircuitTrips returns the current trip counts keyed by embedder kind.
+// Used by the Prometheus renderer (issue #886).
+func (c *Collector) RAGCircuitTrips() map[string]uint64 {
+	c.ragCircuitMu.RLock()
+	defer c.ragCircuitMu.RUnlock()
+	out := make(map[string]uint64, len(c.ragCircuitTrips))
+	for k, v := range c.ragCircuitTrips {
+		out[k] = v.Load()
+	}
+	return out
+}
+
+// RAGCircuitRecovers returns the current recovery counts keyed by embedder kind.
+// Used by the Prometheus renderer (issue #886).
+func (c *Collector) RAGCircuitRecovers() map[string]uint64 {
+	c.ragCircuitMu.RLock()
+	defer c.ragCircuitMu.RUnlock()
+	out := make(map[string]uint64, len(c.ragCircuitRecovers))
+	for k, v := range c.ragCircuitRecovers {
 		out[k] = v.Load()
 	}
 	return out

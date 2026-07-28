@@ -684,6 +684,12 @@ func Panel(
 		return outcome, false, fmt.Errorf("fusion: arbiter fetch: %w", fetchErr)
 	}
 	if synthesis == "" {
+		slog.Debug("fusion arbiter returned empty synthesis",
+			slog.String("request_id", requestID),
+			slog.String("r1_source", r1.Source),
+			slog.String("r2_source", r2.Source),
+			slog.Int("synthesis_len", 0),
+		)
 		slog.Warn("fusion arbiter returned empty synthesis",
 			slog.String("request_id", requestID),
 			slog.String("r1_source", r1.Source),

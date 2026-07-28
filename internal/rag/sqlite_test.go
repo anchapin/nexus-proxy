@@ -1088,3 +1088,51 @@ func TestPersistentStoreIndexDir_UsesBatchEmbedding(t *testing.T) {
 		}
 	})
 }
+
+// TestPersistentStoreIndexDir_BatchUpsertFailureLogsWarning verifies that when
+// EmbedBatch succeeds but Upsert fails, a warning is logged and no panic occurs.
+// This is the regression test for issue #889.
+func TestPersistentStoreIndexDir_BatchUpsertFailureLogsWarning(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	// Write two files so batch size of 2 triggers a single EmbedBatch call.
+	for i := 0; i < 2; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("file%d.go", i)), []byte(fmt.Sprintf("content %d", i)), 0o644); err != nil {
+			t.Fatalf("write file%d: %v", i, err)
+		}
+	}
+
+	emb := &batchCounterEmbedder{}
+	ps, err := OpenPersistentStore(":memory:", emb, 0.55, WithBatchSize(2))
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+
+	// First IndexDir: succeeds and populates the store.
+	if err := ps.IndexDir(context.Background(), dir); err != nil {
+		t.Fatalf("first IndexDir: %v", err)
+	}
+
+	// Close the DB so subsequent Upsert calls fail.
+	if err := ps.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Capture log output.
+	var buf bytes.Buffer
+	prev := logOutput(&buf)
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	// Second IndexDir: EmbedBatch succeeds (embedder doesn't need DB),
+	// but Upsert fails because DB is closed.
+	// The code must not panic and should log a warning.
+	if err := ps.IndexDir(context.Background(), dir); err != nil {
+		t.Fatalf("second IndexDir: %v", err)
+	}
+
+	// Verify a warning containing "upsert" was logged.
+	logOutput := buf.String()
+	if !strings.Contains(logOutput, "upsert") {
+		t.Errorf("expected warning log containing 'upsert', got: %s", logOutput)
+	}
+}

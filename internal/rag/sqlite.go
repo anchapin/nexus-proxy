@@ -511,7 +511,17 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 			}
 			embs, err := p.embedder.EmbedBatch(ctx, texts)
 			if err != nil {
-				slog.Error("rag embed batch", slog.Any("err", err))
+				// Partial batch: entries were upserted to DB but the HNSW
+				// index was not invalidated via upsertExample. Invalidate it
+				// so Retrieve falls back to brute-force.
+				p.mu.Lock()
+				p.index = nil
+				p.mu.Unlock()
+				slog.Warn("rag embed batch failed, HNSW index invalidated",
+					slog.Any("err", err),
+					slog.Int("batchStart", i),
+					slog.Int("batchLen", len(batch)),
+				)
 				continue
 			}
 			for j, fi := range batch {
@@ -520,7 +530,7 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 					Content:   fi.content,
 					Embedding: embs[j],
 				}); err != nil {
-					slog.Error("rag persist file",
+					slog.Warn("rag: embed batch upsert failed",
 						slog.String("filename", fi.name),
 						slog.Any("err", err),
 					)

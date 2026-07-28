@@ -58,16 +58,20 @@ var version = "dev"
 var commit = "unknown"
 
 // circuitBreakerAdapter bridges the chat handler's CircuitBreakerObserver
-// calls into the observability Collector (issue #304).
+// calls into the observability Collector (issue #304, #886).
 type circuitBreakerAdapter struct {
 	recordFailure      func(string)
 	recordRecovery     func(string)
 	incEmbedderFailure func(string)
+	incRAGCircuitTrip  func(string)
+	incRAGCircuitRecov func(string)
 }
 
 func (a circuitBreakerAdapter) RecordCircuitFailure(circuit string)  { a.recordFailure(circuit) }
 func (a circuitBreakerAdapter) RecordCircuitRecovery(circuit string) { a.recordRecovery(circuit) }
 func (a circuitBreakerAdapter) IncEmbedderFailure(kind string)       { a.incEmbedderFailure(kind) }
+func (a circuitBreakerAdapter) IncRAGCircuitTrip(kind string)        { a.incRAGCircuitTrip(kind) }
+func (a circuitBreakerAdapter) IncRAGCircuitRecover(kind string)     { a.incRAGCircuitRecov(kind) }
 
 func main() {
 	startTime := time.Now()
@@ -738,6 +742,17 @@ func main() {
 				{Name: "nexus_judge_concurrency", Value: float64(cc)},
 			}
 		}),
+		// Judge dropped counter (issue #892).
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var v uint64
+			if judgeEval != nil {
+				v = judgeEval.Dropped()
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_judge_dropped_total",
+				Value: float64(v),
+			}}
+		}),
 		// Quality queue-depth and concurrency gauges (issue #890).
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
 			var qd int
@@ -750,6 +765,7 @@ func main() {
 				{Name: "nexus_quality_queue_depth", Value: float64(qd)},
 				{Name: "nexus_quality_concurrency", Value: float64(cc)},
 			}
+		}),
 		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
 			var v uint64
@@ -802,32 +818,48 @@ func main() {
 			}}
 		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			exp := tracing.GlobalExporter()
+			if exp == nil {
+				return nil
+			}
 			return []observability.GaugeSample{{
 				Name:  "nexus_tracing_dropped_total",
-				Value: float64(tracing.GlobalExporter().Dropped()),
+				Value: float64(exp.Dropped()),
 			}}
 		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			exp := tracing.GlobalExporter()
+			if exp == nil {
+				return nil
+			}
 			return []observability.GaugeSample{{
 				Name:  "nexus_tracing_flush_failures_total",
-				Value: float64(tracing.GlobalExporter().FlushFailures()),
+				Value: float64(exp.FlushFailures()),
 			}}
 		}),
 		// Tracing queue-depth gauge (issue #596). Exposes the live
 		// number of spans buffered in the export queue so operators
 		// can alert on exporter saturation before spans are dropped.
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			exp := tracing.GlobalExporter()
+			if exp == nil {
+				return nil
+			}
 			return []observability.GaugeSample{{
 				Name:  "nexus_tracing_queue_depth",
-				Value: float64(tracing.GlobalExporter().QueueDepth()),
+				Value: float64(exp.QueueDepth()),
 			}}
 		}),
 		// Tracing batch-size gauge (issue #826). Exposes the configured
 		// batch cap so operators can see what's set at a glance.
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			exp := tracing.GlobalExporter()
+			if exp == nil {
+				return nil
+			}
 			return []observability.GaugeSample{{
 				Name:  "nexus_tracing_batch_size",
-				Value: float64(tracing.GlobalExporter().BatchCap()),
+				Value: float64(exp.BatchCap()),
 			}}
 		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
@@ -1096,6 +1128,8 @@ func main() {
 		recordFailure:      circuitCollector.RecordCircuitFailure,
 		recordRecovery:     circuitCollector.RecordCircuitRecovery,
 		incEmbedderFailure: circuitCollector.IncEmbedderFailure,
+		incRAGCircuitTrip:  circuitCollector.IncRAGCircuitTrip,
+		incRAGCircuitRecov: circuitCollector.IncRAGCircuitRecover,
 	}
 
 	chatHandler := handlers.Chat(handlers.Deps{
@@ -1504,6 +1538,12 @@ func main() {
 				rateLimiter.SetRPM(newCfg.RateLimitRPM)
 				rateLimiter.SetBurst(newCfg.RateLimitBurst)
 			}
+			// Update auth brute-force limiter (issue #895).
+			if authLimiter != nil {
+				authLimiter.SetRPM(newCfg.AuthRateLimitRPM)
+				authLimiter.SetBurst(newCfg.AuthRateLimitBurst)
+				authLimiter.SetWindow(newCfg.AuthRateLimitWindow)
+			}
 			// Update trusted-proxy allowlist so rate limiter sees the new CIDRs
 			// without requiring a restart (issue #896).
 			ipResolver.SetTrustedProxies(newCfg.TrustedProxies)
@@ -1514,6 +1554,9 @@ func main() {
 			slog.Info("config reloaded via SIGHUP",
 				slog.Int("rate_limit_rpm", newCfg.RateLimitRPM),
 				slog.Int("rate_limit_burst", newCfg.RateLimitBurst),
+				slog.Int("auth_rate_limit_rpm", newCfg.AuthRateLimitRPM),
+				slog.Int("auth_rate_limit_burst", newCfg.AuthRateLimitBurst),
+				slog.Duration("auth_rate_limit_window", newCfg.AuthRateLimitWindow),
 				slog.String("log_level", newCfg.LogLevel.String()),
 				slog.String("log_format", newCfg.LogFormat.String()),
 				slog.Bool("debug", newCfg.Debug),
