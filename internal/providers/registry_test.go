@@ -321,15 +321,13 @@ func TestRegistryConcurrent(t *testing.T) {
 // BenchmarkRegistryByName benchmarks registry lookup performance.
 func BenchmarkRegistryByName(b *testing.B) {
 	reg := NewProviderRegistry()
-	for i := 0; i < 100; i++ {
-		reg.Register(ProviderConfig{
-			NameVal:      "provider",
-			BaseURLVal:   "https://api.test.com",
-			ModelVal:     "m",
-			APIKeyVal:    "",
-			CostPer1KVal: 0.01,
-		})
-	}
+	reg.Register(ProviderConfig{
+		NameVal:      "provider",
+		BaseURLVal:   "https://api.test.com",
+		ModelVal:     "m",
+		APIKeyVal:    "",
+		CostPer1KVal: 0.01,
+	})
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = reg.ByName("provider")
@@ -339,15 +337,13 @@ func BenchmarkRegistryByName(b *testing.B) {
 // BenchmarkRegistryAll benchmarks reg.All() performance.
 func BenchmarkRegistryAll(b *testing.B) {
 	reg := NewProviderRegistry()
-	for i := 0; i < 100; i++ {
-		reg.Register(ProviderConfig{
-			NameVal:      "provider",
-			BaseURLVal:   "https://api.test.com",
-			ModelVal:     "m",
-			APIKeyVal:    "",
-			CostPer1KVal: 0.01,
-		})
-	}
+	reg.Register(ProviderConfig{
+		NameVal:      "provider",
+		BaseURLVal:   "https://api.test.com",
+		ModelVal:     "m",
+		APIKeyVal:    "",
+		CostPer1KVal: 0.01,
+	})
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = reg.All()
