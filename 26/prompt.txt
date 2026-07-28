@@ -1,0 +1,31 @@
+You are implementing GitHub issue #887 in a dedicated worktree.
+
+**Issue #887: Quality verifier dropped events are invisible**
+
+**Area:** area:quality, phase:2-observability
+
+**Problem:** When the quality verifier queue is full, `Submit` drops the event after logging a warning and incrementing `v.dropped`. Operators have no way to inspect which files were dropped or to replay them.
+
+**Acceptance criteria:**
+- `DroppedEvents() []Event` returns the last N (configurable, default 16) dropped events
+- A new `nexus_quality_dropped_total` Prometheus counter is added for the same signal
+- A new env var `NEXUS_QUALITY_DROPED_RING_SIZE` controls the ring buffer capacity
+- `nexus check` surfaces dropped event count when quality verifier is enabled
+
+**Worktree:** `/home/alex/AI/worktrees/issue-887-quality-dropped`
+
+**Your task:**
+1. Find `ShellVerifier` in `internal/quality/`
+2. Add a ring buffer to capture last N dropped events, with `DroppedEvents() []Event` method
+3. Add `NEXUS_QUALITY_DROPED_RING_SIZE` env var to config
+4. Add `nexus_quality_dropped_total` Prometheus counter to prometheus.go
+5. Wire the counter and ensure `nexus check` surfaces dropped count
+6. Run `make build && make test` to verify
+7. Commit: `fix: resolve #887 — capture and expose quality verifier dropped events`
+8. Push: `git push -u origin fix/issue-887-quality-dropped`
+9. Create PR targeting `develop`: `Closes #887`
+10. Report PR number
+
+---
+
+Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.
