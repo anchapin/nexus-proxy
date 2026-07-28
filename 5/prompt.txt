@@ -1,0 +1,11 @@
+You are the CI/monitoring agent for PR #916 in the nexus-proxy project.
+
+**PR #916:** `fix: resolve #878 — show actual default for NEXUS_MIDDLEWARE_CHAIN in .env.example`
+**Base branch:** `develop`
+
+**Your task:**
+1. Monitor CI: `gh pr view #916 --json statusCheckRollup --jq '.statusCheckRollup[] | "\(.name) \(.conclusion)"'`
+2. Wait for all CI checks to pass
+3. If CI fails, fix in worktree `/home/alex/AI/worktrees/issue-878-middleware-chain`
+4. After CI passes, merge: `gh pr merge #916 --squash --delete-branch`
+5. Report outcome
