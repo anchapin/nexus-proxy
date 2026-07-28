@@ -1,0 +1,23 @@
+You are implementing GitHub issue #890 in a dedicated worktree.
+
+**Issue #890: Several Prometheus gauges are defined but never wired in main.go**
+
+**Area:** area:observability, phase:2-observability
+
+**Problem:** `nexus_judge_queue_depth`, `nexus_judge_concurrency`, `nexus_quality_queue_depth`, and `nexus_quality_concurrency` gauges are defined in `prometheus.go` but never wired in `main.go` — they're missing from `/metrics`.
+
+**Acceptance criteria:**
+- All four gauges appear in `/metrics` output when the respective subsystems are enabled
+- `go test -race ./...` passes
+
+**Worktree:** `/home/alex/AI/worktrees/issue-890-prom-gauges`
+
+**Your task:**
+1. Find the four gauge definitions in `internal/observability/prometheus.go`
+2. Find the respective subsystems (judge and quality) and their queue/concurrency counters
+3. Wire all four gauges in `cmd/nexus/main.go`
+4. Run `make build && make test-race` to verify
+5. Commit: `fix: resolve #890 — wire judge and quality queue/concurrency gauges`
+6. Push: `git push -u origin fix/issue-890-prom-gauges`
+7. Create PR targeting `develop`: `Closes #890`
+8. Report PR number
