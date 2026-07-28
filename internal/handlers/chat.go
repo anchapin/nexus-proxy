@@ -27,6 +27,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
 
@@ -1245,6 +1246,12 @@ func Chat(d Deps) http.Handler {
 			d.RouteDecisionObserver.Observe(routeEvent)
 		}
 
+		// Stamp the route attribute on the root span so OTLP backends
+		// can filter traces by route (issue #825).
+		if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
+			rootSpan.SetAttr("route", string(route))
+		}
+
 		// Emit the slog lines the pre-extraction handler produced, so
 		// existing log-scraping tests and operator dashboards keep
 		// working unchanged. The planner is log-free; the handler owns
@@ -1508,6 +1515,9 @@ func Chat(d Deps) http.Handler {
 				d.SpendGuard.Record(r.Context(), frontierCost, "frontier")
 			}
 			model = d.Config.FrontierModel
+			if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
+				rootSpan.SetAttr("ai.model", model)
+			}
 
 		case router.RouteLocal:
 			// VRAM-aware concurrency ceiling (issue #81). Bound the
@@ -1650,6 +1660,7 @@ func Chat(d Deps) http.Handler {
 						slog.Any("err", err),
 						slog.String("request_id", reqID),
 					)
+					model = d.Config.LocalModel
 					upErr = err
 					writeJSONError(w, http.StatusBadGateway, ErrTypeUpstreamError,
 						"Cascade failed; all local and frontier steps errored")
@@ -1760,6 +1771,9 @@ func Chat(d Deps) http.Handler {
 				trace.Upstream.CascadeServedBy = ""
 				trace.Upstream.CascadeSuccess = upErr == nil
 			}
+			if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
+				rootSpan.SetAttr("ai.model", model)
+			}
 
 		default:
 			model = d.Config.FrontierModel
@@ -1819,6 +1833,9 @@ func Chat(d Deps) http.Handler {
 			trace.Upstream.Streaming = streaming
 			trace.Upstream.Model = model
 			trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
+			if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
+				rootSpan.SetAttr("ai.model", model)
+			}
 		}
 
 		// Per-request recording. The metrics observer (issue #4)
