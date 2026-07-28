@@ -392,7 +392,7 @@ func TestPanelArbiterTimeoutBoundsHangingCall(t *testing.T) {
 
 	const arbiterTO = 100 * time.Millisecond
 	start := time.Now()
-	_, err := Panel(
+	_, _, err := Panel(
 		context.Background(), newSSERW(), http.DefaultClient,
 		localSrv.URL, "local-m",
 		frontierSrv.URL, "", "frontier-m",
@@ -448,7 +448,7 @@ func TestPanelArbiterHappyPathNoRegression(t *testing.T) {
 	client := &http.Client{Transport: ft}
 
 	rw := newSSERW()
-	if _, err := Panel(
+	if _, _, err := Panel(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		"http://frontier.local", "", "frontier-m",
@@ -505,7 +505,7 @@ func TestPanelSkipLocalOmitsLocalFetch(t *testing.T) {
 	client := &http.Client{Transport: ft}
 
 	rw := newSSERW()
-	if _, err := Panel(
+	if _, _, err := Panel(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		"http://frontier.local", "", "frontier-m",
@@ -557,7 +557,7 @@ func TestPanelSkipLocalArbiterPromptHasDegradedMarker(t *testing.T) {
 	})
 	client := &http.Client{Transport: ft}
 
-	if _, err := Panel(
+	if _, _, err := Panel(
 		context.Background(), newSSERW(), client,
 		localURL, "local-m",
 		frontierURL, "", "frontier-m",
@@ -821,7 +821,7 @@ func TestPanelArbiterHonorsStreamFlagFalse(t *testing.T) {
 	client := &http.Client{Transport: ft}
 
 	rw := newJSONRW()
-	if _, err := Panel(
+	if _, _, err := Panel(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		"http://frontier.local", "", "frontier-m",
@@ -884,7 +884,7 @@ func TestPanelArbiterHonorsStreamFlagTrueRegression(t *testing.T) {
 
 	// Explicit stream=true to mirror the OpenAI default.
 	rw := newSSERW()
-	if _, err := Panel(
+	if _, _, err := Panel(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		"http://frontier.local", "", "frontier-m",
@@ -933,7 +933,7 @@ func TestPanelForwardsFrontierBearerToken(t *testing.T) {
 	client := &http.Client{Transport: ft}
 
 	rw := newSSERW()
-	if _, err := Panel(
+	if _, _, err := Panel(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		"http://frontier.local", "sk-frontier-key", "frontier-m",
@@ -2030,7 +2030,7 @@ func TestPanelCacheHitStream_SetsSSEContentType(t *testing.T) {
 	cache.Set("local divergent", "frontier divergent", "cached arbiter synthesis", 5*time.Minute)
 
 	rw := newSSERW()
-	cacheHit, err := Panel(
+	_, cacheHit, err := Panel(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		"http://frontier.local", "", "frontier-m",
@@ -2098,7 +2098,7 @@ func TestPanelCacheMissWithExpiredEntry_FallsBackToFetch(t *testing.T) {
 
 	client := &http.Client{Transport: ft}
 	rw := newSSERW()
-	cacheHit, err := Panel(
+	_, cacheHit, err := Panel(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		"http://frontier.local", "", "frontier-m",
@@ -2155,7 +2155,7 @@ func TestPanelCacheHitNonStream_SetsJSONContentType(t *testing.T) {
 	cache.Set("local divergent", "frontier divergent", "cached synthesis", 5*time.Minute)
 
 	rw := newJSONRW()
-	cacheHit, err := Panel(
+	_, cacheHit, err := Panel(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		"http://frontier.local", "", "frontier-m",
@@ -2484,7 +2484,7 @@ func TestPanel_MalformedArbiterEmptyChoices_ReturnsError(t *testing.T) {
 	client := &http.Client{Transport: ft}
 
 	rw := newJSONRW()
-	cacheHit, err := Panel(
+	_, cacheHit, err := Panel(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		"http://frontier.local", "", "frontier-m",
@@ -2531,7 +2531,7 @@ func TestPanel_ValidArbiterResponse_ReturnsNoError(t *testing.T) {
 	client := &http.Client{Transport: ft}
 
 	rw := newJSONRW()
-	cacheHit, err := Panel(
+	_, cacheHit, err := Panel(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		"http://frontier.local", "", "frontier-m",
@@ -2583,7 +2583,7 @@ func TestPanel_CacheHit_ReturnsNoError(t *testing.T) {
 	cache.Set("local divergent", "frontier divergent", "cached synthesis", 5*time.Minute)
 
 	rw := newJSONRW()
-	cacheHit, err := Panel(
+	_, cacheHit, err := Panel(
 		context.Background(), rw, client,
 		"http://local.local", "local-m",
 		"http://frontier.local", "", "frontier-m",
