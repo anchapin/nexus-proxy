@@ -906,6 +906,17 @@ func main() {
 				Value: 1,
 			}}
 		}),
+		// Judge queue depth gauge (issue #881). Reads live queue depth
+		// from the evaluator at scrape time so operators can alert on
+		// saturation before overflow events fire.
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			if judgeEval == nil {
+				return nil
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_judge_queue_depth", Value: float64(judgeEval.QueueDepth())},
+			}
+		}),
 	)
 
 	// Middleware chain (issue #224). Initialize the middleware registry
