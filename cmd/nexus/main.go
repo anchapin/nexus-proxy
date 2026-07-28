@@ -1123,7 +1123,8 @@ func main() {
 		slmCache.SetEmbedErrorObserver(func() {
 			routeCounters.ObserveSLMCacheEmbedError()
 		})
-		slmCache.SetMaxStale(cfg.SLMCacheMaxStale) // issue #835
+		slmCache.SetMaxStale(cfg.SLMCacheMaxStale)                // issue #835
+		slmCache.SetMaxScanEntries(cfg.SLMCacheSemanticScanLimit) // issue #933
 	} else {
 		slog.Info("slm decision cache disabled (NEXUS_SLMCACHE_TTL<=0)")
 	}
@@ -1161,6 +1162,7 @@ func main() {
 		MiddlewareChain:         mwChain,
 		ContextAwareRAG:         ctxAwareRAG,
 		Confidence:              confidenceObs,
+		ConfidenceErrorHook:     func(category string, err error) { circuitCollector.IncConfidenceError() },
 		SLMCache:                slmCache,
 		JudgeObserver:           judgeObs,
 		QualityObserver:         qualityO,

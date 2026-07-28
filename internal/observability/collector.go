@@ -283,6 +283,12 @@ type Collector struct {
 	// string ("local", "frontier", "fusion").
 	latencyPercentilesMu sync.RWMutex
 	latencyPercentiles   map[string]*latencyPercentileBuffer
+
+	// --- ConfidenceStore error counter (issue #927) -----------------
+	//
+	// Tracks LocalConfidence errors so operators can detect DB/locking
+	// issues in the SQLite-backed confidence store.
+	confidenceErrorsTotal atomic.Uint64
 }
 
 // circuitBreakerState holds the atomic state for one named circuit.
@@ -823,6 +829,17 @@ func (c *Collector) RAGCircuitRecovers() map[string]uint64 {
 	}
 	return out
 }
+
+// --- ConfidenceStore error counter (issue #927) --------------------
+
+// IncConfidenceError increments the confidence store error counter.
+// Called when LocalConfidence returns an error so operators can detect
+// DB locking or other SQLite errors in the confidence store path.
+func (c *Collector) IncConfidenceError() { c.confidenceErrorsTotal.Add(1) }
+
+// ConfidenceErrors returns the cumulative confidence store error count.
+// Used by the Prometheus renderer (issue #927).
+func (c *Collector) ConfidenceErrors() uint64 { return c.confidenceErrorsTotal.Load() }
 
 // --- Pipeline stage latency breakdown (issue #300) -------------------
 //

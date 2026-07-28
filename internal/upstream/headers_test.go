@@ -109,7 +109,7 @@ func TestBufferedFetchDropsNonAllowlistedHeaders(t *testing.T) {
 		return &http.Response{
 			StatusCode: 200,
 			Header: http.Header{
-				"Content-Type":  []string{"application/xml"},
+				"Content-Type":  []string{"application/json"},
 				"Server":        []string{"nginx"},
 				"Set-Cookie":    []string{"s=2"},
 				"X-Powered-By":  []string{"Express"},

@@ -69,6 +69,7 @@ func TestStreamSendsBearerWhenKeySet(t *testing.T) {
 		seenAuth = r.Header.Get("Authorization")
 		return &http.Response{
 			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
 			Body:       io.NopCloser(strings.NewReader("ok")),
 		}, nil
 	})}
@@ -86,6 +87,7 @@ func TestStreamOmitsAuthWhenKeyEmpty(t *testing.T) {
 		seenAuth = r.Header.Get("Authorization")
 		return &http.Response{
 			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
 			Body:       io.NopCloser(strings.NewReader("ok")),
 		}, nil
 	})}
@@ -185,6 +187,32 @@ func TestStreamHappyPathDoneTerminatedUnchanged(t *testing.T) {
 	}
 	if got := rw.header.Get("X-Nexus-Truncated"); got != "" {
 		t.Errorf("X-Nexus-Truncated should be unset on happy path, got %q", got)
+	}
+}
+
+// TestStreamRejectsHTMLContentType reproduces issue #934: a 200 response
+// with Content-Type: text/html must be rejected before any data is written
+// to the client, returning ErrUpstreamContentTypeMismatch.
+func TestStreamRejectsHTMLContentType(t *testing.T) {
+	htmlBody := "<html><body>error page</body></html>"
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/html"}},
+			Body:       io.NopCloser(strings.NewReader(htmlBody)),
+		}, nil
+	})}
+	rw := newRW()
+	err := StreamWithContext(context.Background(), rw, client, "http://x", "", map[string]interface{}{"model": "m"})
+	if !errors.Is(err, ErrUpstreamContentTypeMismatch) {
+		t.Fatalf("StreamWithContext error = %v, want ErrUpstreamContentTypeMismatch", err)
+	}
+	// No data must be written to the client before the error is returned.
+	if rw.status != 0 {
+		t.Errorf("status = %d, want 0 (no WriteHeader before error)", rw.status)
+	}
+	if rw.body.Len() != 0 {
+		t.Errorf("body written before error: %q, want empty", rw.body.String())
 	}
 }
 
@@ -675,6 +703,7 @@ func TestBufferedFetchForcesStreamFalseOnWire(t *testing.T) {
 		seenBody = string(b)
 		return &http.Response{
 			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
 			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"ok"}}]}`)),
 		}, nil
 	})}
@@ -696,6 +725,7 @@ func TestBufferedFetchSetsBearerWhenKeySet(t *testing.T) {
 		seenAuth = r.Header.Get("Authorization")
 		return &http.Response{
 			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
 			Body:       io.NopCloser(strings.NewReader(`{}`)),
 		}, nil
 	})}
@@ -742,6 +772,30 @@ func TestBufferedFetchRejectsInvalidJSON(t *testing.T) {
 	}
 	// Status must not have been written — the harness would otherwise
 	// receive a 200 with an HTML body, which is the worst-case mix.
+	if rw.status != 0 {
+		t.Errorf("status written before validation: %d", rw.status)
+	}
+}
+
+// TestBufferedFetchRejectsContentTypeMismatch reproduces issue #930: a 200 OK
+// response with Content-Type: text/html must be rejected before JSON parsing
+// and return ErrUpstreamContentTypeMismatch. The response writer must not
+// receive any WriteHeader call.
+func TestBufferedFetchRejectsContentTypeMismatch(t *testing.T) {
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/html"}},
+			Body:       io.NopCloser(strings.NewReader("<html>oops</html>")),
+		}, nil
+	})}
+	rw := newJSONRW()
+	err := BufferedFetch(rw, client, "http://x", "", nil)
+	if !errors.Is(err, ErrUpstreamContentTypeMismatch) {
+		t.Fatalf("BufferedFetch error = %v, want ErrUpstreamContentTypeMismatch", err)
+	}
+	// Status must not have been written — the harness would otherwise
+	// receive a 200 with an HTML body.
 	if rw.status != 0 {
 		t.Errorf("status written before validation: %d", rw.status)
 	}
@@ -1608,6 +1662,7 @@ func TestPanelStreamingThresholdClamping(t *testing.T) {
 		arbiterCalled := 0
 		ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
 			arbiterCalled++
+			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(200)
 		})
 		client := &http.Client{Transport: ft}
@@ -1657,6 +1712,7 @@ func TestPanelStreamingSpeculativeSourceIdentified(t *testing.T) {
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier answer"}}]}`)
 	})
 	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
 	})
 	client := &http.Client{Transport: ft}
@@ -1706,6 +1762,7 @@ func TestPanelStreamingSetsProgressiveHeader(t *testing.T) {
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier"}}]}`)
 	})
 	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
 	})
 	client := &http.Client{Transport: ft}
