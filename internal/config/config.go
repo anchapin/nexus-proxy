@@ -140,6 +140,7 @@ type Config struct {
 	SLMCacheMaxEntries        int           // max entries in SLM routing decision cache (512)
 	SLMCacheSemanticThreshold float64       // cosine similarity floor for semantic cache hits (0.0..1.0, issue #245)
 	SLMCacheMaxStale          int           // max stale entries before proactive eviction (0 = disabled, issue #835)
+	SLMCacheSemanticScanLimit int           // max entries scanned in getSemantic; 0 = unlimited (issue #933)
 	SLMConfidenceThreshold    float64       // hard escalation threshold: local/fusion decisions below this force frontier (default 0.3, issue #301)
 	FusionTimeout             time.Duration // per-panel-member fetch timeout (120s)
 	CascadeTimeout            time.Duration // per-attempt timeout for cascade fallback (30s)
@@ -1144,6 +1145,18 @@ func Load() (Config, error) {
 		slmCacheMaxStale = 0
 	}
 	cfg.SLMCacheMaxStale = slmCacheMaxStale
+
+	// Semantic scan limit for SLM cache (issue #933). When maxScanEntries > 0,
+	// getSemantic stops scanning after examining maxScanEntries entries. 0 (the
+	// default) means unlimited — all entries are scanned.
+	slmCacheSemanticScanLimit, err := getEnvInt("NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if slmCacheSemanticScanLimit < 0 {
+		slmCacheSemanticScanLimit = 0
+	}
+	cfg.SLMCacheSemanticScanLimit = slmCacheSemanticScanLimit
 
 	// Ollama health poller (issue #8). Defaults: 30s poll cadence,
 	// 3-failure breaker, 5s per-probe HTTP timeout. Set
