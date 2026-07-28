@@ -255,7 +255,7 @@ func TestRenderPrometheusJudgeQueueDepthGauge(t *testing.T) {
 
 	// A non-zero value (queue has samples) must render identically.
 	sb.Reset()
-	provider = GaugeProviderFunc(func() []GaugeSample{
+	provider = GaugeProviderFunc(func() []GaugeSample {
 		return []GaugeSample{{Name: "nexus_judge_queue_depth", Value: 7}}
 	})
 	RenderPrometheus(&sb, c, provider)
