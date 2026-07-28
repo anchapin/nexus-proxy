@@ -1628,7 +1628,7 @@ func Chat(d Deps) http.Handler {
 						APIKey: p.APIKey(),
 					})
 				}
-				cas = &upstream.Cascade{Steps: steps, Timeout: d.Config.CascadeTimeout, MaxResponseBytes: d.Config.EffectiveMaxResponseBytes()}
+				cas = &upstream.Cascade{Steps: steps, Timeout: d.Config.CascadeTimeout, MaxResponseBytes: d.Config.EffectiveCascadeMaxResponseBytes()}
 			} else {
 				// Legacy path: build cascade from config (frontier + z.ai).
 				cas = upstream.BuildLocalCascade(upstream.CascadeConfig{
