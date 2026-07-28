@@ -85,12 +85,14 @@ type ConfidenceStore interface {
 	LocalConfidence(category string) float64
 }
 
-// categoryKeywords maps each category to the substrings that select it.
-// Order matters: earlier entries win when a prompt matches several
-// categories, so the list runs from most-specific/most-complex
-// (architecture, debugging) to least (documentation) before falling
-// through to "other". Keywords are matched against the ASCII-lowercased
-// prompt using the same cheap contains helpers as dsl.go.
+// categoryKeywords maps each category to the word-boundary-matched
+// keywords that select it. Order matters: earlier entries win when a
+// prompt matches several categories, so the list runs from most-
+// specific/most-complex (architecture, debugging) to least
+// (documentation) before falling through to "other". Keywords are
+// matched against the Unicode-lowercased prompt using word-boundary
+// matching (containsWord) so that e.g. "test" does not match inside
+// "contest", ensuring consistent routing with the DSL \b...\b patterns.
 var categoryKeywords = []struct {
 	category string
 	keywords []string
@@ -104,9 +106,14 @@ var categoryKeywords = []struct {
 		"panic", "segfault", "crash", "error message", "why does", "not working",
 		"fails", "failing", "broken",
 	}},
+	{CategoryCSS, []string{
+		"css", "tailwind", "flexbox", "stylesheet", "styling", "responsive",
+		"media query", "padding", "margin", "layout", "scss", "sass",
+	}},
 	{CategoryTesting, []string{
-		"test", "unit test", "integration test", "generate tests", "test case",
-		"mock", "fixture", "coverage", "benchmark", "assert", "pytest", "jest",
+		"test", "unit test", "integration test", "unit-test", "integration-test",
+		"generate tests", "test case", "mock", "fixture", "coverage", "benchmark",
+		"assert", "pytest", "jest",
 	}},
 	{CategorySecurity, []string{
 		"security scan", "vulnerability", "injection", "xss", "csrf", "sanitize",
@@ -117,12 +124,9 @@ var categoryKeywords = []struct {
 		"parse json", "data model", "etl", "analytics", "pipeline",
 	}},
 	{CategoryRefactoring, []string{
-		"refactor", "restructure", "extract method", "rename", "clean up",
-		"cleanup", "simplify", "deduplicate", "move method", "reorganize",
-	}},
-	{CategoryCSS, []string{
-		"css", "tailwind", "flexbox", "stylesheet", "styling", "responsive",
-		"media query", "padding", "margin", "layout", "scss", "sass",
+		"refactor", "re-factor", "re-factoring", "restructure", "extract method",
+		"rename", "clean up", "cleanup", "simplify", "deduplicate", "move method",
+		"reorganize",
 	}},
 	{CategoryBoilerplate, []string{
 		"boilerplate", "scaffold", "template", "getter", "setter", "crud",
@@ -143,7 +147,7 @@ func Categorize(prompt string) string {
 	lower := toUnicodeLower(prompt)
 	for _, group := range categoryKeywords {
 		for _, kw := range group.keywords {
-			if stringsContains(lower, kw) {
+			if containsWord(lower, kw) {
 				return group.category
 			}
 		}

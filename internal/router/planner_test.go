@@ -474,8 +474,10 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 			FormattingRegex:    formattingPatterns,
 			LocalPatternsRegex: localPatterns,
 		}
+		// "bug" is a Debugging keyword but NOT in DSL, so DSL won't match
+		// and Decide will be called. Categorize finds "bug" with word boundaries (issue #797).
 		req := PlanRequest{
-			Prompt:          "analyze why this code keeps crashing",
+			Prompt:          "there is a bug in the code",
 			GuardrailBudget: 6000,
 			GuardrailSource: "static-fallback",
 			Context:         context.Background(),
