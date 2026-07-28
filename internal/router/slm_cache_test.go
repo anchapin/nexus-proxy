@@ -1056,3 +1056,207 @@ func TestSLMCache_EmbedErrorObserver_NilSafe(t *testing.T) {
 		t.Errorf("EmbedErrors = %d, want 1", stats.EmbedErrors)
 	}
 }
+
+// --- Stale entries and proactive eviction (issue #835) ---
+
+func TestSLMCache_Stale_Basic(t *testing.T) {
+	// Stale() must count expired-but-not-yet-evicted entries without
+	// removing them from the cache.
+	c := NewSLMCache(50*time.Millisecond, 0)
+	ctx := context.Background()
+
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteLocal)
+	c.Set(ctx, "c", RouteLocal)
+
+	if stale := c.Stale(); stale != 0 {
+		t.Errorf("Stale = %d immediately after Set, want 0", stale)
+	}
+
+	time.Sleep(120 * time.Millisecond)
+
+	// All three entries are past TTL but not yet evicted.
+	if stale := c.Stale(); stale != 3 {
+		t.Errorf("Stale = %d after TTL expiry, want 3", stale)
+	}
+
+	// Entries are still retrievable (not evicted yet).
+	for _, key := range []string{"a", "b", "c"} {
+		if got, ok, _ := c.Get(ctx, key); ok || got != "" {
+			t.Errorf("Get(%q) after TTL: got (%v, %v), want (\"\", false)", key, got, ok)
+		}
+	}
+}
+
+func TestSLMCache_Stale_Zero(t *testing.T) {
+	// Empty cache returns 0.
+	c := NewSLMCache(time.Hour, 0)
+	if stale := c.Stale(); stale != 0 {
+		t.Errorf("Stale on empty cache = %d, want 0", stale)
+	}
+}
+
+func TestSLMCache_Stale_NilReceiver(t *testing.T) {
+	// Stale must not panic on a nil *SLMCache pointer.
+	var c *SLMCache
+	if stale := c.Stale(); stale != 0 {
+		t.Errorf("Stale() on nil = %d, want 0", stale)
+	}
+}
+
+func TestSLMCache_EvictExpired(t *testing.T) {
+	// EvictExpired must remove all expired entries and return the count.
+	c := NewSLMCache(50*time.Millisecond, 0)
+	ctx := context.Background()
+
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteLocal)
+	time.Sleep(120 * time.Millisecond)
+
+	if removed := c.EvictExpired(); removed != 2 {
+		t.Errorf("EvictExpired removed %d entries, want 2", removed)
+	}
+	if stale := c.Stale(); stale != 0 {
+		t.Errorf("Stale after EvictExpired = %d, want 0", stale)
+	}
+	if c.Len() != 0 {
+		t.Errorf("Len after EvictExpired = %d, want 0", c.Len())
+	}
+}
+
+func TestSLMCache_EvictExpired_NilObserver(t *testing.T) {
+	// EvictExpired must not panic when the eviction observer is nil.
+	c := NewSLMCache(50*time.Millisecond, 0)
+	ctx := context.Background()
+	c.Set(ctx, "a", RouteLocal)
+	time.Sleep(120 * time.Millisecond)
+
+	c.EvictExpired() // must not panic
+
+	if stale := c.Stale(); stale != 0 {
+		t.Errorf("Stale after EvictExpired = %d, want 0", stale)
+	}
+}
+
+func TestSLMCache_EvictExpired_WithObserver(t *testing.T) {
+	// EvictExpired must call the eviction observer for each removed entry.
+	c := NewSLMCache(50*time.Millisecond, 0)
+	ctx := context.Background()
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteLocal)
+	time.Sleep(120 * time.Millisecond)
+
+	var mu sync.Mutex
+	var reasons []string
+	c.SetEvictionObserver(func(reason string) {
+		mu.Lock()
+		reasons = append(reasons, reason)
+		mu.Unlock()
+	})
+
+	c.EvictExpired()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reasons) != 2 {
+		t.Errorf("observer called %d times, want 2; reasons=%v", len(reasons), reasons)
+	}
+	for _, r := range reasons {
+		if r != EvictionReasonTTL {
+			t.Errorf("reason = %q, want %q", r, EvictionReasonTTL)
+		}
+	}
+}
+
+func TestSLMCache_ProactiveEviction_GetSemantic(t *testing.T) {
+	// With maxStale=1, getSemantic must trigger EvictExpired when
+	// stale entries exceed the threshold (issue #835).
+	stub := newStubEmbedder()
+	c := NewSLMCacheWithEmbedder(50*time.Millisecond, 0, stub, 0.5)
+	ctx := context.Background()
+
+	stub.embeddings["a"] = []float64{1.0, 0.0, 0.0, 0.0}
+	stub.embeddings["b"] = []float64{0.9, 0.1, 0.0, 0.0}
+
+	// Set two entries (both expire past TTL).
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteFrontier)
+
+	time.Sleep(120 * time.Millisecond)
+
+	// Stale should be 2.
+	if stale := c.Stale(); stale != 2 {
+		t.Fatalf("Stale = %d before getSemantic, want 2", stale)
+	}
+
+	// Set maxStale=1.
+	c.SetMaxStale(1)
+
+	// Trigger getSemantic with a prompt that would semantic-match "a".
+	// This should trigger proactive eviction because stale(2) > maxStale(1).
+	got, ok, kind := c.Get(ctx, "b") // semantic match with "b"
+	_ = got
+	_ = ok
+	_ = kind
+
+	// Wait briefly for background eviction goroutine to run.
+	time.Sleep(50 * time.Millisecond)
+
+	// Stale should now be 0 after proactive eviction.
+	if stale := c.Stale(); stale != 0 {
+		t.Errorf("Stale after proactive eviction = %d, want 0", stale)
+	}
+}
+
+func TestSLMCache_ProactiveEviction_Disabled(t *testing.T) {
+	// With maxStale=0 (default), no proactive eviction occurs.
+	stub := newStubEmbedder()
+	c := NewSLMCacheWithEmbedder(50*time.Millisecond, 0, stub, 0.5)
+	ctx := context.Background()
+
+	stub.embeddings["a"] = []float64{1.0, 0.0, 0.0, 0.0}
+	stub.embeddings["b"] = []float64{0.9, 0.1, 0.0, 0.0}
+
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteFrontier)
+
+	time.Sleep(120 * time.Millisecond)
+
+	// maxStale=0 by default (proactive eviction disabled).
+	// Trigger getSemantic.
+	c.Get(ctx, "b")
+
+	// Give the background goroutine time to run (if it existed).
+	time.Sleep(50 * time.Millisecond)
+
+	// With maxStale=0, eviction should NOT be triggered by getSemantic
+	// (no background goroutine spawned).
+	// The stale entries should still be there.
+	if stale := c.Stale(); stale != 2 {
+		t.Errorf("Stale with maxStale=0 = %d, want 2 (proactive eviction disabled)", stale)
+	}
+}
+
+func TestSLMCache_ProactiveEviction_ExactlyAtThreshold(t *testing.T) {
+	// Proactive eviction fires when stale > maxStale, not >=.
+	// With maxStale=2 and stale=2, no eviction should fire.
+	ctx := context.Background()
+
+	c := NewSLMCacheWithEmbedder(50*time.Millisecond, 0, &vectorEmbedder{err: errors.New("fail")}, 0.5)
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteLocal)
+	time.Sleep(120 * time.Millisecond)
+	c.SetMaxStale(2)
+	c.Get(ctx, "different") // triggers getSemantic but no stale eviction expected
+	time.Sleep(50 * time.Millisecond)
+	if stale := c.Stale(); stale != 2 {
+		t.Errorf("Stale at exactly threshold = %d, want 2 (no eviction)", stale)
+	}
+}
+
+func TestSLMCache_SetMaxStale(t *testing.T) {
+	c := NewSLMCache(time.Hour, 0)
+	c.SetMaxStale(5)
+	c.SetMaxStale(0)
+	c.SetMaxStale(100) // must not panic
+}

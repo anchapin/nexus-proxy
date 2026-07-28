@@ -139,6 +139,7 @@ type Config struct {
 	SLMTimeout                time.Duration // Qwen3-Coder routing timeout (8s)
 	SLMCacheMaxEntries        int           // max entries in SLM routing decision cache (512)
 	SLMCacheSemanticThreshold float64       // cosine similarity floor for semantic cache hits (0.0..1.0, issue #245)
+	SLMCacheMaxStale          int           // max stale entries before proactive eviction (0 = disabled, issue #835)
 	SLMConfidenceThreshold    float64       // hard escalation threshold: local/fusion decisions below this force frontier (default 0.3, issue #301)
 	FusionTimeout             time.Duration // per-panel-member fetch timeout (120s)
 	CascadeTimeout            time.Duration // per-attempt timeout for cascade fallback (30s)
@@ -1128,6 +1129,19 @@ func Load() (Config, error) {
 		slmCacheSemThreshold = 1.0
 	}
 	cfg.SLMCacheSemanticThreshold = slmCacheSemThreshold
+
+	// Max stale entries before proactive eviction triggers in getSemantic
+	// (issue #835). 0 disables proactive eviction (stale entries accumulate
+	// until the next Set call); a positive value causes getSemantic to spawn
+	// a background eviction goroutine when stale > maxStale.
+	slmCacheMaxStale, err := getEnvInt("NEXUS_SLMCACHE_MAX_STALE", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if slmCacheMaxStale < 0 {
+		slmCacheMaxStale = 0
+	}
+	cfg.SLMCacheMaxStale = slmCacheMaxStale
 
 	// Ollama health poller (issue #8). Defaults: 30s poll cadence,
 	// 3-failure breaker, 5s per-probe HTTP timeout. Set

@@ -94,6 +94,7 @@ type YAMLConfig struct {
 	SLMCacheMaxEntries        int     `yaml:"slm_cache_max_entries"`
 	SLMCacheTTL               string  `yaml:"slm_cache_ttl"`
 	SLMCacheSemanticThreshold float64 `yaml:"slm_cache_similarity_threshold"`
+	SLMCacheMaxStale          int     `yaml:"slm_cache_max_stale"` // issue #835
 	FusionTimeout             string  `yaml:"fusion_timeout"`
 	CascadeTimeout            string  `yaml:"cascade_timeout"`
 	ArbiterTimeout            string  `yaml:"arbiter_timeout"`
@@ -588,6 +589,16 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.SLMCacheSemanticThreshold = clampFloat(f, 0, 1)
 	}
+	if v := os.Getenv("NEXUS_SLMCACHE_MAX_STALE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_SLMCACHE_MAX_STALE: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.SLMCacheMaxStale = n
+	}
 	if v := os.Getenv("NEXUS_FUSION_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -1061,6 +1072,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		SLMCacheMaxEntries:        yc.intDefault(yc.SLMCacheMaxEntries, 512),
 		SLMCacheTTL:               yc.durationDefault(yc.SLMCacheTTL, 30*time.Second),
 		SLMCacheSemanticThreshold: clampFloat(yc.floatDefault(yc.SLMCacheSemanticThreshold, 0.0), 0, 1),
+		SLMCacheMaxStale:          yc.intDefault(yc.SLMCacheMaxStale, 0), // issue #835
 		FusionTimeout:             yc.durationDefault(yc.FusionTimeout, 120*time.Second),
 		CascadeTimeout:            yc.durationDefault(yc.CascadeTimeout, 30*time.Second),
 		ArbiterTimeout:            yc.durationDefault(yc.ArbiterTimeout, 60*time.Second),

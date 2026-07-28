@@ -194,6 +194,10 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Configured maximum entry capacity of the SLM decision cache (issue #531).",
 		typ:  "gauge",
 	},
+	"nexus_slm_cache_stale_entries": {
+		help: "Number of entries in the SLM decision cache that have passed their TTL but have not yet been evicted (issue #835).",
+		typ:  "gauge",
+	},
 	// Local-route cooldown gauge (issue #530).
 	"nexus_local_cooldown_active": {
 		help: "1 when the local-route cooldown is active (a cascade failure was recorded and the window has not expired); 0 otherwise (issue #530). Absent from /metrics when the cooldown is disabled (NEXUS_LOCAL_COOLDOWN<=0).",
