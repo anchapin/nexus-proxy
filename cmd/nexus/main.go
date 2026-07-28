@@ -1478,6 +1478,9 @@ func main() {
 				rateLimiter.SetRPM(newCfg.RateLimitRPM)
 				rateLimiter.SetBurst(newCfg.RateLimitBurst)
 			}
+			// Update trusted-proxy allowlist so rate limiter sees the new CIDRs
+			// without requiring a restart (issue #896).
+			ipResolver.SetTrustedProxies(newCfg.TrustedProxies)
 			// Update structured logger level and format.
 			newLogger := newCfg.NewLogger()
 			slog.SetDefault(newLogger)

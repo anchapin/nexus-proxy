@@ -2023,6 +2023,20 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 		}
 	}
 
+	// Trusted proxies: re-parse from env so the SIGHUP handler can push the
+	// updated list into the live ipResolver without a restart (issue #896).
+	next.TrustedProxiesRaw = strings.TrimSpace(os.Getenv("NEXUS_TRUSTED_PROXIES"))
+	if parsed, err := parseTrustedProxies(next.TrustedProxiesRaw); err != nil {
+		// Bogus value after boot: warn but keep the previous parsed list so
+		// the proxy stays operational rather than silently falling back to
+		// "trust nobody" on a typo.
+		slog.Warn("invalid NEXUS_TRUSTED_PROXIES, keeping previous value",
+			slog.String("reason", err.Error()))
+		next.TrustedProxies = prev.TrustedProxies
+	} else {
+		next.TrustedProxies = parsed
+	}
+
 	// Hot-reloadable settings.
 	rateRPM, _ := getEnvInt("NEXUS_RATE_LIMIT_RPM", prev.RateLimitRPM)
 	if rateRPM < 0 {

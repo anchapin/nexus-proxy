@@ -334,3 +334,33 @@ in manual testing.
 After the cascade detects an Ollama failure and falls back, `circuit.Cooldown`
 arms a short cooldown so subsequent requests skip local and go directly to
 fallback. Set `NEXUS_LOCAL_COOLDOWN=0` to disable (pre-issue-#80 behaviour).
+
+## Newer routing and RAG knobs (verify against `.env.example` for defaults)
+
+These are documented in `.env.example` with full context; key ones to know:
+
+- **`NEXUS_SLM_CONFIDENCE_THRESHOLD`** (default 0.3): hard-escalation floor —
+  SLM decisions below this confidence bypass the DSL/SLM pick and go to frontier.
+- **`NEXUS_SLMCACHE_MAX_STALE`** (default 0): proactive eviction threshold for
+  SLM cache entries; 0 disables (stale entries accumulate until LRU eviction).
+- **`NEXUS_RAG_EMBED_CACHE_SIZE`** (default 256) + **`NEXUS_RAG_EMBED_CACHE_TTL`**
+  (default 24h): LRU cache for prompt embeddings — repeat prompts skip Ollama
+  round-trip entirely.
+- **`NEXUS_RAG_BATCH_SIZE`** (default 32): batch embedding in `IndexDir` to
+  reduce HTTP round-trips by ~60–80%.
+- **`NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD`** (default 3) + **`NEXUS_RAG_CIRCUIT_BREAKER_COOLDOWN`**
+  (default 30s): RAG embedder circuit breaker — trips after N consecutive
+  failures, auto-recloses after cooldown.
+- **`NEXUS_ARBITER_CACHE_MAX_ENTRIES`** (default 512): LRU cap for the arbiter
+  synthesis cache.
+- **`NEXUS_READINESS_MODE`** (`degraded`|`strict`): `/readyz` behavior.
+  `degraded` (default) always returns 200; `strict` returns 503 when Ollama is down.
+
+## `nexus check` exit codes
+
+| Code | Meaning |
+| ---- | ------- |
+| `0`  | Every check passed (warnings/skip are fine) |
+| `1`  | At least one check failed — read `[FAIL]` lines for remediation |
+
+`nexus check --json` emits machine-readable output for CI gates.
