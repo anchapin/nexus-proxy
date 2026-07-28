@@ -1,0 +1,23 @@
+You are implementing GitHub issue #891 in a dedicated worktree.
+
+**Issue #891: Tracing gauge providers dereference nil when NEXUS_TRACING_ENDPOINT is empty**
+
+**Area:** area:observability, phase:5-production
+
+**Problem:** Four tracing gauge providers in `prometheus.go` access fields on the tracing exporter without checking if it's nil first, causing a panic at boot when tracing is disabled (i.e., when `NEXUS_TRACING_ENDPOINT=""`).
+
+**Acceptance criteria:**
+- Boot succeeds with `NEXUS_TRACING_ENDPOINT=""` (no tracing)
+- Boot succeeds with a valid `NEXUS_TRACING_ENDPOINT`
+- `go test -race ./...` passes
+
+**Worktree:** `/home/alex/AI/worktrees/issue-891-tracing-nil`
+
+**Your task:**
+1. Examine `internal/observability/prometheus.go` for tracing gauge provider functions
+2. Add nil checks before accessing the tracing exporter's fields
+3. Run `make build && make test-race` to verify
+4. Commit: `fix: resolve #891 — add nil checks to tracing gauge providers`
+5. Push: `git push -u origin fix/issue-891-tracing-nil`
+6. Create PR targeting `develop`: `Closes #891`
+7. Report PR number
