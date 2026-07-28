@@ -119,7 +119,7 @@ var (
 	awsKeyRe        = regexp.MustCompile(`(?i)(aws[_-]?access[_-]?key[_-]?id|aws[_-]?secret[_-]?access[_-]?key)\s*[:=]\s*["']?[A-Z0-9]{20}["']?`)
 	awsSecretRe     = regexp.MustCompile(`(?i)(aws[_-]?secret)\s*[:=]\s*["']?[a-zA-Z0-9/+=]{40}["']?`)
 	passwordURLRe   = regexp.MustCompile(`(?i)://[^:]+:[^@]+@`)
-	genericSecretRe = regexp.MustCompile(`(?i)(password|passwd|pwd|token|credential|private[_-]?key)\s*[:=]\s*["']?\S+["']?`)
+	genericSecretRe = regexp.MustCompile(`(?i)\b(auth_token|token|password|passwd|pwd|credential|private[_-]?key)\s*[:=]\s*["']?[a-zA-Z0-9\-_.~+/ ]+(?:[ "'/]|$)`)
 )
 
 func redactPanicValue(rv any) (string, bool) {
@@ -135,6 +135,16 @@ func redactPanicValue(rv any) (string, bool) {
 
 	redacted := raw
 	redacted = bearerTokenRe.ReplaceAllString(redacted, "${1}****")
+	redacted = genericSecretRe.ReplaceAllStringFunc(redacted, func(s string) string {
+		i := strings.Index(s, ":")
+		if i < 0 {
+			i = strings.Index(s, "=")
+		}
+		if i < 0 {
+			return "****"
+		}
+		return s[:i+1] + "****"
+	})
 	redacted = apiKeyRe.ReplaceAllStringFunc(redacted, func(s string) string {
 		i := strings.Index(s, ":")
 		if i < 0 {
