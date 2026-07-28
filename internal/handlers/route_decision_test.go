@@ -64,11 +64,9 @@ func TestChatSetsRouteDecisionHeadersForDSLMatch(t *testing.T) {
 	if got := rw.Header().Get("X-Nexus-Route-Source"); got != "dsl" {
 		t.Errorf("X-Nexus-Route-Source = %q, want \"dsl\"", got)
 	}
-	// DSL path leaves Reason empty; the header carries the sanitised
-	// empty value rather than being omitted, so consumers can rely on
-	// the header always being set.
-	if got := rw.Header().Get("X-Nexus-Route-Reason"); got != "" {
-		t.Errorf("X-Nexus-Route-Reason = %q, want \"\"", got)
+	// DSL path sets Reason to the DSL category (issue #875).
+	if got := rw.Header().Get("X-Nexus-Route-Reason"); got != "formatting" {
+		t.Errorf("X-Nexus-Route-Reason = %q, want \"formatting\"", got)
 	}
 	// DSL bypasses the SLM, so the planner emits the neutral
 	// confidence floor (0.50) which surfaces on the header.
@@ -240,8 +238,8 @@ func TestChatMetricsEventCarriesRouteDecisionFields(t *testing.T) {
 	if e.RouteSource != "dsl" {
 		t.Errorf("RouteSource = %q, want \"dsl\"", e.RouteSource)
 	}
-	if e.RouteReason != "" {
-		t.Errorf("RouteReason = %q, want \"\"", e.RouteReason)
+	if e.RouteReason != "formatting" {
+		t.Errorf("RouteReason = %q, want \"formatting\"", e.RouteReason)
 	}
 	if e.SLMConfidence != 0.5 {
 		t.Errorf("SLMConfidence = %v, want 0.5", e.SLMConfidence)

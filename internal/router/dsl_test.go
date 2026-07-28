@@ -104,7 +104,7 @@ func TestDSL(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, hit := DSL(tc.prompt, fusionPatterns, formattingPatterns, localPatterns, unicodePatterns)
+			got, _, hit := DSL(tc.prompt, fusionPatterns, formattingPatterns, localPatterns, unicodePatterns)
 			if got != tc.want || hit != tc.wantHit {
 				t.Errorf("DSL(%q) = (%q,%v), want (%q,%v)",
 					tc.prompt, got, hit, tc.want, tc.wantHit)

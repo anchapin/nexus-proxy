@@ -92,33 +92,36 @@ type Route string
 // DSL runs the heuristic fast-pass. Returns one of RouteLocal, RouteFusion,
 // or "" if no rule matched (caller should fall back to the SLM).
 //
+// The second return value is the reason: "fusion", "formatting", "local",
+// or "unicode" when a rule matched, or "" when no rule matched.
+//
 // fusionPatterns, formattingPatterns, and localPatterns are matched against
 // the lowercase prompt (via toUnicodeLower) so that keywords like "REFACTOR"
 // and "refactor" are treated identically. unicodePatterns is matched against
 // the raw prompt because Unicode property escapes (\p{Han}, \p{Arabic}, etc.)
 // are inherently case-invariant — lowercasing a Chinese or Arabic character
 // is a no-op, and using the raw prompt avoids an unnecessary allocation.
-func DSL(prompt string, fusionPatterns, formattingPatterns, localPatterns, unicodePatterns []*regexp.Regexp) (Route, bool) {
+func DSL(prompt string, fusionPatterns, formattingPatterns, localPatterns, unicodePatterns []*regexp.Regexp) (Route, string, bool) {
 	lower := toUnicodeLower(prompt)
 
 	if len(fusionPatterns) > 0 {
 		for _, re := range fusionPatterns {
 			if re.MatchString(lower) {
-				return RouteFusion, true
+				return RouteFusion, "fusion", true
 			}
 		}
 	}
 	if len(formattingPatterns) > 0 {
 		for _, re := range formattingPatterns {
 			if re.MatchString(lower) {
-				return RouteLocal, true
+				return RouteLocal, "formatting", true
 			}
 		}
 	}
 	if len(localPatterns) > 0 {
 		for _, re := range localPatterns {
 			if re.MatchString(lower) {
-				return RouteLocal, true
+				return RouteLocal, "local", true
 			}
 		}
 	}
@@ -128,11 +131,11 @@ func DSL(prompt string, fusionPatterns, formattingPatterns, localPatterns, unico
 	if len(unicodePatterns) > 0 {
 		for _, re := range unicodePatterns {
 			if re.MatchString(prompt) {
-				return RouteLocal, true
+				return RouteLocal, "unicode", true
 			}
 		}
 	}
-	return "", false
+	return "", "", false
 }
 
 // toUnicodeLower converts s to lowercase using Unicode case-folding rules

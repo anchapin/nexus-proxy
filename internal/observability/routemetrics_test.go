@@ -1374,6 +1374,114 @@ func TestRouteCountersSLMCacheMissNilSafe(t *testing.T) {
 	}
 }
 
+// TestRouteCountersDSLHits verifies ObserveDSLHit increments the
+// nexus_router_dsl_hits_total{reason} counter (issue #875). The method is
+// invoked from the chat-handler hot path via a closure when the DSL
+// fast-pass matches.
+func TestRouteCountersDSLHits(t *testing.T) {
+	rc := NewRouteCounters()
+
+	// Zero-state: HELP/TYPE present, zero values.
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+	for _, frag := range []string{
+		"nexus_router_dsl_hits_total",
+		"# TYPE nexus_router_dsl_hits_total counter",
+		"nexus_router_dsl_misses_total",
+		"# TYPE nexus_router_dsl_misses_total counter",
+	} {
+		if !strings.Contains(out, frag) {
+			t.Errorf("zero-state output missing %q\nfull output:\n%s", frag, out)
+		}
+	}
+
+	// Increment DSL hits by reason.
+	rc.ObserveDSLHit("fusion")
+	rc.ObserveDSLHit("fusion")
+	rc.ObserveDSLHit("formatting")
+	rc.ObserveDSLHit("local")
+	rc.ObserveDSLHit("local")
+	rc.ObserveDSLHit("local")
+	rc.ObserveDSLHit("unicode")
+
+	sb.Reset()
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo after increments: %v", err)
+	}
+	out = sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{`nexus_router_dsl_hits_total{reason="fusion"} 2`, "fusion counted twice"},
+		{`nexus_router_dsl_hits_total{reason="formatting"} 1`, "formatting counted once"},
+		{`nexus_router_dsl_hits_total{reason="local"} 3`, "local counted three times"},
+		{`nexus_router_dsl_hits_total{reason="unicode"} 1`, "unicode counted once"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+}
+
+// TestRouteCountersDSLMiss verifies ObserveDSLMiss increments the
+// nexus_router_dsl_misses_total counter (issue #875).
+func TestRouteCountersDSLMiss(t *testing.T) {
+	rc := NewRouteCounters()
+
+	// Zero-state.
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+	if !strings.Contains(out, "nexus_router_dsl_misses_total 0\n") {
+		t.Errorf("zero-state misses should be 0, output:\n%s", out)
+	}
+
+	// Increment misses.
+	rc.ObserveDSLMiss()
+	rc.ObserveDSLMiss()
+	rc.ObserveDSLMiss()
+
+	sb.Reset()
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo after increments: %v", err)
+	}
+	out = sb.String()
+	if !strings.Contains(out, "nexus_router_dsl_misses_total 3\n") {
+		t.Errorf("expected dsl misses == 3 in output:\n%s", out)
+	}
+}
+
+// TestRouteCountersDSLHitNilSafe verifies ObserveDSLHit on a nil receiver
+// and empty reason are no-ops (must not panic).
+func TestRouteCountersDSLHitNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveDSLHit("fusion") // must not panic on nil
+	rc.ObserveDSLHit("")       // must not panic on empty reason
+	n, err := rc.WriteTo(&strings.Builder{})
+	if err != nil || n != 0 {
+		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
+	}
+}
+
+// TestRouteCountersDSLMissNilSafe verifies ObserveDSLMiss on a nil receiver
+// is a no-op (must not panic).
+func TestRouteCountersDSLMissNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveDSLMiss() // must not panic
+	n, err := rc.WriteTo(&strings.Builder{})
+	if err != nil || n != 0 {
+		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
+	}
+}
+
 // TestRouteCountersQueueDepthGauge verifies QueueDepthGauge returns
 // the value supplied by the gauge function (issue #881).
 func TestRouteCountersQueueDepthGauge(t *testing.T) {

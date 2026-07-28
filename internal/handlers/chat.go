@@ -188,6 +188,12 @@ type RouteDecisionEvent struct {
 	// Valid values are "exact" (exact string match) and "semantic"
 	// (cosine similarity match, issue #245). Empty when CacheHit is false.
 	CacheHitKind string
+
+	// DSLMiss is true when the DSL fast-pass had no opinion (miss)
+	// and the request fell through to the SLM (issue #875). This lets
+	// observers distinguish a direct SLM decision from a DSL-miss → SLM
+	// fallback.
+	DSLMiss bool
 }
 
 // RouteDecisionObserver is the hook invoked once per proxied request
@@ -1263,6 +1269,12 @@ func Chat(d Deps) http.Handler {
 			TaskType:     decision.TaskType,
 			CacheHit:     decision.CacheHit,
 			CacheHitKind: string(decision.CacheHitKind),
+			// DSLMiss is true when the DSL fast-pass had no opinion and the
+			// request fell through to SLM (issue #875). Guardrail and DSL
+			// are the only sources that mean "DSL was evaluated"; everything
+			// else (SLM, SLM-error, escalation, SLM-escalation) means DSL
+			// was bypassed and the request went to SLM.
+			DSLMiss: decision.Source != router.SourceGuardrail && decision.Source != router.SourceDSL,
 		}
 		w.Header().Set("X-Nexus-Route", SanitizeHeaderValue(routeEvent.Route))
 		w.Header().Set("X-Nexus-Route-Source", SanitizeHeaderValue(routeEvent.Source))
