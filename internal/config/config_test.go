@@ -1469,6 +1469,57 @@ func TestNewLogger_LevelError(t *testing.T) {
 	}
 }
 
+// TestParseInjectionScanRoles verifies that parseInjectionScanRoles returns
+// the correct roles and unrecognized tokens (issue #845).
+func TestParseInjectionScanRoles(t *testing.T) {
+	tests := []struct {
+		raw         string
+		wantRoles   []string
+		wantUnrecog []string
+	}{
+		{"system", []string{"system"}, nil},
+		{"user", []string{"user"}, nil},
+		{"system,user", []string{"system", "user"}, nil},
+		{"user,system", []string{"user", "system"}, nil},
+		{"SYSTEM", []string{"system"}, nil},
+		{"USER", []string{"user"}, nil},
+		{"System,User", []string{"system", "user"}, nil},
+		{"system,admin", []string{"system"}, []string{"admin"}},
+		{"system,admin,user", []string{"system", "user"}, []string{"admin"}},
+		{"admin", []string{"system"}, []string{"admin"}},
+		{"admin,user", []string{"user"}, []string{"admin"}},
+		{"", []string{"system"}, nil},
+		{"  system  ", []string{"system"}, nil},
+		{"  system, user  ", []string{"system", "user"}, nil},
+		{"system, ", []string{"system"}, nil},
+		{"system,system", []string{"system"}, nil},
+		{"system,system,user", []string{"system", "user"}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.raw, func(t *testing.T) {
+			roles, unrecognized := parseInjectionScanRoles(tt.raw)
+			if !slicesEqual(roles, tt.wantRoles) {
+				t.Errorf("parseInjectionScanRoles(%q) roles = %v, want %v", tt.raw, roles, tt.wantRoles)
+			}
+			if !slicesEqual(unrecognized, tt.wantUnrecog) {
+				t.Errorf("parseInjectionScanRoles(%q) unrecognized = %v, want %v", tt.raw, unrecognized, tt.wantUnrecog)
+			}
+		})
+	}
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // TestNewLogger_TextFormatLevelCombination verifies both format and level together.
 func TestNewLogger_TextFormatLevelCombination(t *testing.T) {
 	cfg := Config{LogFormat: LogFormatText, LogLevel: slog.LevelWarn}

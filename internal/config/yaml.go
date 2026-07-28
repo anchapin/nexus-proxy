@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -868,7 +869,13 @@ func LoadYAML(path string) (Config, error) {
 		cfg.PromptInjectionMode = middleware.ParseInjectionMode(v)
 	}
 	if v := os.Getenv("NEXUS_INJECTION_SCAN_ROLES"); v != "" {
-		cfg.InjectionScanRoles = parseInjectionScanRoles(v)
+		roles, unrecognized := parseInjectionScanRoles(v)
+		cfg.InjectionScanRoles = roles
+		if len(unrecognized) > 0 && v != "system" {
+			slog.Warn("unrecognised injection scan role(s): falling back to [system]",
+				slog.String("ignored", strings.Join(unrecognized, ",")),
+			)
+		}
 	}
 
 	// Telemetry
@@ -1018,6 +1025,13 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		return Config{}, logLevelErr
 	}
 
+	// InjectionScanRoles for yaml path: compute before composite literal so we can warn
+	yamlRolesRaw := yc.InjectionScanRoles
+	if yamlRolesRaw == "" {
+		yamlRolesRaw = "system"
+	}
+	yamlRoles, yamlUnrecognized := parseInjectionScanRoles(yamlRolesRaw)
+
 	cfg := Config{
 		Addr:                   yc.stringDefault(yc.Addr, ":8000"),
 		OllamaURL:              strings.TrimRight(yc.stringDefault(yc.OllamaURL, "http://localhost:11434"), "/"),
@@ -1132,7 +1146,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		QualityEnabled:     yc.intDefault(yc.QualityConcurrency, 2) > 0,
 
 		PromptInjectionMode: middleware.ParseInjectionMode(yc.PromptInjectionMode),
-		InjectionScanRoles:  parseInjectionScanRoles(yc.stringDefault(yc.InjectionScanRoles, "system")),
+		InjectionScanRoles:  yamlRoles,
 
 		LogLevel:  logLevel,
 		LogFormat: parseLogFormat(yc.LogFormat),
@@ -1153,6 +1167,13 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		TracingTimeout:    yc.durationDefault(yc.TracingTimeout, 10*time.Second),
 		TracingQueueSize:  yc.intDefault(yc.TracingQueueSize, 256),
 		TracingSampleRate: yc.floatDefault(yc.TracingSampleRate, 1.0),
+	}
+
+	// Warn if yaml had unrecognized injection scan roles (issue #845)
+	if len(yamlUnrecognized) > 0 && yamlRolesRaw != "system" {
+		slog.Warn("unrecognised injection scan role(s) in config.yaml: falling back to [system]",
+			slog.String("ignored", strings.Join(yamlUnrecognized, ",")),
+		)
 	}
 
 	// Embedder type
