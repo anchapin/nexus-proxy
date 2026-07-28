@@ -584,6 +584,11 @@ type Deps struct {
 	// judge; main.go bridges JudgeScore -> RecordOutcome.
 	Confidence router.ConfidenceStore
 
+	// ConfidenceErrorHook is invoked when LocalConfidence returns an error
+	// in the planner (issue #927). The hook logs at Warn level and increments
+	// the nexus_confidence_errors_total counter. Nil is a safe no-op.
+	ConfidenceErrorHook func(category string, err error)
+
 	// SLMCache is the optional time-bounded prompt→route cache
 	// (issue #206). When non-nil the planner checks the cache before
 	// calling the SLM; a cache hit returns the cached route without
@@ -1231,14 +1236,15 @@ func Chat(d Deps) http.Handler {
 		}
 
 		planner := &router.Planner{
-			SLM:                  d.SLM,
-			Confidence:           d.Confidence,
+			SLM:                   d.SLM,
+			Confidence:            d.Confidence,
 			FusionPatterns:       d.Config.DSLFusionPatterns,
-			FormattingRegex:      d.Config.DSLFormattingPatterns,
-			LocalPatternsRegex:   d.LocalPatternsRegex,
-			UnicodePatternsRegex: d.Config.DSLUnicodePatterns,
-			SLMCache:             d.SLMCache,
-			ConfidenceThreshold:  d.Config.SLMConfidenceThreshold,
+			FormattingRegex:       d.Config.DSLFormattingPatterns,
+			LocalPatternsRegex:    d.LocalPatternsRegex,
+			UnicodePatternsRegex:  d.Config.DSLUnicodePatterns,
+			SLMCache:              d.SLMCache,
+			ConfidenceThreshold:   d.Config.SLMConfidenceThreshold,
+			ConfidenceErrorHook:   d.ConfidenceErrorHook,
 		}
 		decision := planner.Plan(router.PlanRequest{
 			Prompt:          latestPrompt,
