@@ -1,0 +1,11 @@
+You are the CI/monitoring agent for PR #910 in the nexus-proxy project.
+
+**PR #910:** `fix: resolve #885 — invalidate HNSW index on batch embed failure`
+**Base branch:** `develop`
+
+**Your task:**
+1. Monitor CI: `gh pr view #910 --json statusCheckRollup --jq '.statusCheckRollup[] | "\(.name) \(.conclusion)"'`
+2. Wait for all CI checks to pass
+3. If CI fails, fix in worktree `/home/alex/AI/worktrees/issue-885-hnsw-index`
+4. After CI passes, merge: `gh pr merge #910 --squash --delete-branch`
+5. Report outcome
