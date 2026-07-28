@@ -158,10 +158,12 @@ func APIKeyAwareKeyFunc(ip string, r *http.Request) string {
 	if auth == "" {
 		return ip
 	}
-	// Strip "Bearer " prefix if present.
-	key := strings.TrimPrefix(auth, "Bearer ")
-	if key == auth {
-		// No "Bearer " prefix; use the raw value.
+	// Strip "Bearer " prefix if present (case-insensitive); also normalise
+	// token to lowercase so "bearer MYKEY" and "Bearer mykey" share a bucket.
+	var key string
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		key = strings.ToLower(strings.TrimSpace(auth[7:]))
+	} else {
 		key = auth
 	}
 	h := sha256.Sum256([]byte(ip + ":" + key))

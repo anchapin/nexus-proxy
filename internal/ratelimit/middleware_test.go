@@ -683,6 +683,40 @@ func TestMiddleware_APIKeyAwareKeyFunc_NoAuth(t *testing.T) {
 	}
 }
 
+// TestMiddleware_APIKeyAwareKeyFunc_CaseInsensitiveBearer verifies that Bearer
+// prefix stripping is case-insensitive so the same token in different casings
+// occupies the same rate-limit bucket (issue #838).
+func TestMiddleware_APIKeyAwareKeyFunc_CaseInsensitiveBearer(t *testing.T) {
+	ip := "10.0.0.1"
+
+	reqBearer := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqBearer.Header.Set("Authorization", "Bearer mykey")
+
+	reqBearerLower := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqBearerLower.Header.Set("Authorization", "bearer mykey")
+
+	reqBearerUpper := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqBearerUpper.Header.Set("Authorization", "BEARER MYKEY")
+
+	reqBearerDoubleSpace := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqBearerDoubleSpace.Header.Set("Authorization", "Bearer  mykey")
+
+	keyBearer := APIKeyAwareKeyFunc(ip, reqBearer)
+	keyBearerLower := APIKeyAwareKeyFunc(ip, reqBearerLower)
+	keyBearerUpper := APIKeyAwareKeyFunc(ip, reqBearerUpper)
+	keyBearerDoubleSpace := APIKeyAwareKeyFunc(ip, reqBearerDoubleSpace)
+
+	if keyBearer != keyBearerLower {
+		t.Errorf("Bearer mykey and bearer mykey should produce same key: got %q vs %q", keyBearer, keyBearerLower)
+	}
+	if keyBearer != keyBearerUpper {
+		t.Errorf("Bearer mykey and BEARER MYKEY should produce same key: got %q vs %q", keyBearer, keyBearerUpper)
+	}
+	if keyBearer != keyBearerDoubleSpace {
+		t.Errorf("Bearer mykey and Bearer  mykey (double space) should produce same key: got %q vs %q", keyBearer, keyBearerDoubleSpace)
+	}
+}
+
 // TestMiddleware_APIKeyMode_DifferentBuckets verifies that two different
 // API keys from the same IP occupy separate buckets (issue #776).
 func TestMiddleware_APIKeyMode_DifferentBuckets(t *testing.T) {
