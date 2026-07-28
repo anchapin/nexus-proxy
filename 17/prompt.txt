@@ -1,0 +1,25 @@
+You are implementing GitHub issue #885 in a dedicated worktree.
+
+**Issue #885: Store.IndexDir batch errors leave HNSW index inconsistent**
+
+**Area:** area:rag, phase:5-production
+
+**Problem:** When `EmbedBatch` fails partway through a batch in `Store.IndexDir`, successfully embedded entries have already been appended to `s.examples` but `upsertExample` was never called (which would invalidate the HNSW index). The non-batch path calls `upsertExample` per file which invalidates the index. The batch path never invalidates it.
+
+**Acceptance criteria:**
+- A batch embedding error during `IndexDir` does not produce stale HNSW search results
+- `Retrieve` returns correct results immediately after a partial batch failure (fallback to brute-force is acceptable)
+- A warning is logged when a batch fails with partial progress
+
+**Worktree:** `/home/alex/AI/worktrees/issue-885-hnsw-index`
+
+**Your task:**
+1. Examine `internal/rag/rag.go` — the `Store.IndexDir` batch path (around line 861-889)
+2. When `EmbedBatch` returns an error with partial progress, invalidate the HNSW index by setting `s.index = nil` before the warning log
+3. Add a warning log when batch fails with partial progress
+4. `PersistentStore.IndexDir` has the same problem: partial `Upsert` calls update the DB but the store's `upsertExample` is only called via the batch loop — fix this too
+5. Run `make build && go test -race ./internal/rag` to verify
+6. Commit: `fix: resolve #885 — invalidate HNSW index on batch embed failure`
+7. Push: `git push -u origin fix/issue-885-hnsw-index`
+8. Create PR targeting `develop`: `Closes #885`
+9. Report PR number
