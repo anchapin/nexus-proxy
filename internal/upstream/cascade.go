@@ -92,9 +92,9 @@ var ErrSSEPartialWrite = errors.New("cascade: SSE partial write after headers co
 // cascadeErr tags a per-step failure so the runner knows whether to fall
 // back (retry=true) or surface the error immediately (retry=false — e.g.
 // upstream returned 401, retrying won't help). The reason field carries
-// one of six values used for cascade_fallback_total{reason} metrics:
+// one of seven values used for cascade_fallback_total{reason} metrics:
 // "timeout", "transport_error", "rate_limited", "http_error",
-// "malformed_toolcall", or "malformed_response".
+// "malformed_toolcall", "malformed_response", or "model_unavailable".
 type cascadeErr struct {
 	retry  bool
 	reason string // "" when non-retryable
@@ -106,7 +106,7 @@ func (e *cascadeErr) Error() string { return e.msg }
 // newCascadeErr creates a cascadeErr. reason is the label for the
 // cascade_fallback_total metric: "timeout", "transport_error",
 // "rate_limited", "http_error", "malformed_toolcall", "malformed_response",
-// or "" for non-retryable errors.
+// "model_unavailable", or "" for non-retryable errors.
 func newCascadeErr(retry bool, reason, format string, args ...interface{}) error {
 	return &cascadeErr{retry: retry, reason: reason, msg: fmt.Sprintf(format, args...)}
 }
@@ -224,9 +224,9 @@ func classifyFailure(err error) bool {
 // CascadeFallbackReason extracts the reason label from err if it is a
 // cascadeErr with a non-empty reason field. The returned string is one
 // of "timeout", "transport_error", "http_error", "rate_limited",
-// "malformed_toolcall", "malformed_response", or "unknown". "unknown"
-// is returned when err is nil or the error carries no fallback reason,
-// preventing empty-string label collisions in
+// "malformed_toolcall", "malformed_response", "model_unavailable", or
+// "unknown". "unknown" is returned when err is nil or the error carries no
+// fallback reason, preventing empty-string label collisions in
 // cascade_fallback_total{reason=""} metrics (issue #664).
 func CascadeFallbackReason(err error) string {
 	if err == nil {
@@ -236,6 +236,9 @@ func CascadeFallbackReason(err error) string {
 	if errors.As(err, &cf) {
 		if cf.reason == "" {
 			return "unknown"
+		}
+		if cf.reason == "model_unavailable" {
+			return "model_unavailable"
 		}
 		return cf.reason
 	}
