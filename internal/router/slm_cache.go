@@ -54,6 +54,7 @@ type Embedder interface {
 type SLMCache struct {
 	ttl          time.Duration
 	maxEntries   int
+	maxStale     int // proactive eviction threshold (0 = disabled, issue #835)
 	embedder     Embedder
 	semThreshold float64 // cosine similarity floor for semantic match (0.0..1.0)
 
@@ -286,6 +287,26 @@ func (c *SLMCache) getSemantic(ctx context.Context, prompt string) (Route, bool,
 	}
 
 	c.mu.RLock()
+	var stale int
+	if c.maxStale > 0 {
+		now := time.Now()
+		for _, entry := range c.entries {
+			if now.Sub(entry.stamp) > c.ttl {
+				stale++
+			}
+		}
+	}
+	c.mu.RUnlock()
+
+	// Proactive eviction: if stale entries exceed the threshold (issue #835),
+	// dispatch a background goroutine to remove them without blocking the
+	// read path. The goroutine is fire-and-forget — eviction observers run
+	// after the lock is released so re-entrancy is safe.
+	if stale > c.maxStale {
+		go c.EvictExpired()
+	}
+
+	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	var best Route
@@ -434,6 +455,63 @@ func (c *SLMCache) SetEmbedErrorObserver(fn func()) {
 	c.mu.Lock()
 	c.onEmbedError = fn
 	c.mu.Unlock()
+}
+
+// SetMaxStale sets the threshold of expired-but-not-yet-evicted entries
+// that triggers proactive eviction (issue #835). When maxStale > 0 and
+// Stale() > maxStale, background eviction runs on the next getSemantic
+// call. SetMaxStale is safe to call concurrently with Get/Set.
+func (c *SLMCache) SetMaxStale(maxStale int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.maxStale = maxStale
+	c.mu.Unlock()
+}
+
+// Stale returns the number of entries that have passed their TTL but
+// have not yet been evicted (issue #835). This is the count that
+// accumulates silently when getSemantic is the only reader and Set is
+// not called frequently enough to trigger eviction on write.
+func (c *SLMCache) Stale() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	n := len(c.entries)
+	if n == 0 {
+		return 0
+	}
+	now := time.Now()
+	stale := 0
+	for _, entry := range c.entries {
+		if now.Sub(entry.stamp) > c.ttl {
+			stale++
+		}
+	}
+	return stale
+}
+
+// EvictExpired removes all entries whose TTL has expired and returns
+// the count removed. It acquires a write lock briefly, so it should
+// only be called from a background goroutine spawned by getSemantic
+// (issue #835) to avoid blocking the read path. EvictExpired is
+// safe to call concurrently with Get.
+func (c *SLMCache) EvictExpired() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	removed := c.evictExpired()
+	c.mu.Unlock()
+	if removed > 0 && c.onEviction != nil {
+		for i := 0; i < removed; i++ {
+			c.onEviction(EvictionReasonTTL)
+		}
+	}
+	return removed
 }
 
 // SLMCacheStats holds state counters for the SLM cache. It is

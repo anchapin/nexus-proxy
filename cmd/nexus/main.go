@@ -1022,6 +1022,7 @@ func main() {
 		slmCache.SetEmbedErrorObserver(func() {
 			routeCounters.ObserveSLMCacheEmbedError()
 		})
+		slmCache.SetMaxStale(cfg.SLMCacheMaxStale) // issue #835
 	} else {
 		slog.Info("slm decision cache disabled (NEXUS_SLMCACHE_TTL<=0)")
 	}
@@ -1035,6 +1036,7 @@ func main() {
 			return []observability.GaugeSample{
 				{Name: "nexus_slm_cache_entries", Value: float64(slmCache.Len())},
 				{Name: "nexus_slm_cache_max_entries", Value: float64(slmCache.MaxEntries())},
+				{Name: "nexus_slm_cache_stale_entries", Value: float64(slmCache.Stale())},
 			}
 		}),
 	)
