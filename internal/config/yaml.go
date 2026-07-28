@@ -181,8 +181,11 @@ type YAMLConfig struct {
 	RateLimitBurst    int    `yaml:"rate_limit_burst"`
 	RateLimitByAPIKey bool   `yaml:"rate_limit_by_api_key"`
 
-	// Distributed tracing
-	TracingTimeout string `yaml:"tracing_timeout"`
+	// Tracing
+	TracingEndpoint   string  `yaml:"tracing_endpoint"`
+	TracingTimeout    string  `yaml:"tracing_timeout"`
+	TracingQueueSize  int     `yaml:"tracing_queue_size"`
+	TracingSampleRate float64 `yaml:"tracing_sample_rate"`
 }
 
 // LoadYAML reads configuration from a YAML file at path, then overlays
@@ -965,6 +968,44 @@ func LoadYAML(path string) (Config, error) {
 		cfg.RateLimitByAPIKey = strings.ToLower(v) == "true" || v == "1"
 	}
 
+	// Tracing
+	if v := os.Getenv("NEXUS_TRACING_ENDPOINT"); v != "" {
+		cfg.TracingEndpoint = v
+	}
+	if v := os.Getenv("NEXUS_TRACING_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT: %w", err)
+		}
+		if d < 0 {
+			d = 10 * time.Second
+		}
+		cfg.TracingTimeout = d
+	}
+	if v := os.Getenv("NEXUS_TRACING_QUEUE_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_QUEUE_SIZE: %w", err)
+		}
+		if n < 0 {
+			n = 256
+		}
+		cfg.TracingQueueSize = n
+	}
+	if v := os.Getenv("NEXUS_TRACING_SAMPLE_RATE"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_SAMPLE_RATE: %w", err)
+		}
+		if f < 0 {
+			f = 0
+		}
+		if f > 1 {
+			f = 1
+		}
+		cfg.TracingSampleRate = f
+	}
+
 	return cfg, nil
 }
 
@@ -1108,7 +1149,10 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		RateLimitBurst:    yc.intDefault(yc.RateLimitBurst, 0),
 		RateLimitByAPIKey: yc.RateLimitByAPIKey,
 
-		TracingTimeout: yc.durationDefault(yc.TracingTimeout, DefaultTracingTimeout),
+		TracingEndpoint:   yc.stringDefault(yc.TracingEndpoint, ""),
+		TracingTimeout:    yc.durationDefault(yc.TracingTimeout, 10*time.Second),
+		TracingQueueSize:  yc.intDefault(yc.TracingQueueSize, 256),
+		TracingSampleRate: yc.floatDefault(yc.TracingSampleRate, 1.0),
 	}
 
 	// Embedder type

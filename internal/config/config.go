@@ -521,6 +521,19 @@ type Config struct {
 	// than silently falling back, so a typo in NEXUS_READINESS_MODE
 	// is caught immediately instead of producing an indeterminate state.
 	ReadinessMode string
+
+	// Tracing (issue #787). OTLP/JSON exporter wired via NewExporter +
+	// RegisterExporter in main.go so spans are actually submitted to the
+	// configured collector. All zero/empty values disable tracing.
+	// Endpoint is the full OTLP HTTP URL including /v1/traces path.
+	// Timeout bounds each POST (default 10s). QueueSize is the buffered
+	// channel capacity (default 256). SampleRate is a [0,1] probability
+	// that determines which traces are recorded; 0=never, 1=always,
+	// and values between use a deterministic probability sampler.
+	TracingEndpoint   string
+	TracingTimeout    time.Duration
+	TracingQueueSize  int
+	TracingSampleRate float64
 }
 
 // DefaultMetricsDBPath returns the canonical metrics DB location:
@@ -1589,6 +1602,40 @@ func Load() (Config, error) {
 	// the default). Unrecognised values fail boot rather than silently
 	// falling back.
 	cfg.ReadinessMode = getEnv("NEXUS_READINESS_MODE", "degraded")
+
+	// Tracing (issue #787). Endpoint empty disables tracing entirely
+	// (NewExporter returns nil, RegisterExporter is never called).
+	cfg.TracingEndpoint = getEnvAllowEmpty("NEXUS_TRACING_ENDPOINT", "")
+
+	tracingTimeout, err := getEnvDuration("NEXUS_TRACING_TIMEOUT", 10*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	if tracingTimeout < 0 {
+		tracingTimeout = 10 * time.Second
+	}
+	cfg.TracingTimeout = tracingTimeout
+
+	tracingQueueSize, err := getEnvInt("NEXUS_TRACING_QUEUE_SIZE", 256)
+	if err != nil {
+		return cfg, err
+	}
+	if tracingQueueSize < 0 {
+		tracingQueueSize = 256
+	}
+	cfg.TracingQueueSize = tracingQueueSize
+
+	tracingSampleRate, err := getEnvFloat("NEXUS_TRACING_SAMPLE_RATE", 1.0)
+	if err != nil {
+		return cfg, err
+	}
+	if tracingSampleRate < 0 {
+		tracingSampleRate = 0
+	}
+	if tracingSampleRate > 1 {
+		tracingSampleRate = 1
+	}
+	cfg.TracingSampleRate = tracingSampleRate
 
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
