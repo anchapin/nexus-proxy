@@ -628,6 +628,7 @@ func Panel(
 			cacheHit = true
 			outcome.ArbiterCacheHit = true
 			outcome.ArbiterSkipped = true
+			outcome.SkipReason = "cache_hit"
 			if stream {
 				return outcome, true, streamCachedArbiterSynthesis(w, cached)
 			}
@@ -832,6 +833,7 @@ func PanelStreaming(
 		}
 		outcome.ArbiterCacheHit = cacheHit
 		outcome.ArbiterSkipped = panelOutcome.ArbiterSkipped
+		outcome.SkipReason = panelOutcome.SkipReason
 		return outcome, nil
 	}
 

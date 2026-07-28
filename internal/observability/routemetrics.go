@@ -334,31 +334,30 @@ func (rc *RouteCounters) ObserveResponseTruncated() {
 }
 
 // ObserveFusionOutcome records the outcome of a fusion panel after
-// PanelStreaming returns (issue #187). arbiterSkipped is true when
-// the two panel members agreed (SimilarityRatio >= agreementThreshold)
-// and the arbiter was not invoked; false when disagreement triggered
-// arbiter synthesis. This gives operators the data to compute the
-// fusion agreement rate: skipped/(skipped+invoked).
-func (rc *RouteCounters) ObserveFusionOutcome(arbiterSkipped bool) {
+// PanelStreaming returns (issue #187). skipReason is the reason the
+// arbiter was not invoked: "agreement" when the two panel members
+// agreed (SimilarityRatio >= agreementThreshold), "tool_calls" when
+// the speculative winner carried tool calls, "one_member" when only
+// one panel member returned content, "cache_hit" when the arbiter
+// synthesis was served from cache, or "" when the arbiter was invoked.
+// This gives operators the data to compute the fusion agreement rate
+// per skip reason: reason="agreement"/("agreement"+"invoked").
+func (rc *RouteCounters) ObserveFusionOutcome(skipReason string) {
 	if rc == nil {
 		return
 	}
-	outcome := "invoked"
-	if arbiterSkipped {
-		outcome = "skipped"
-	}
-	atomic.AddUint64(rc.fusionSlot(outcome), 1)
+	atomic.AddUint64(rc.fusionSlot(skipReason), 1)
 }
 
-// fusionSlot returns the *uint64 for the fusion outcome label, creating
+// fusionSlot returns the *uint64 for the fusion reason label, creating
 // it if absent. Same lock-then-atomic pattern as slot.
-func (rc *RouteCounters) fusionSlot(outcome string) *uint64 {
+func (rc *RouteCounters) fusionSlot(reason string) *uint64 {
 	rc.mu.Lock()
-	p, ok := rc.fusionArbiter[outcome]
+	p, ok := rc.fusionArbiter[reason]
 	if !ok {
 		v := uint64(0)
 		p = &v
-		rc.fusionArbiter[outcome] = p
+		rc.fusionArbiter[reason] = p
 	}
 	rc.mu.Unlock()
 	return p
@@ -905,7 +904,7 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	total += int64(n)
 
 	if n, err := writeFusionSeries(w, "nexus_fusion_arbiter_total",
-		"Fusion panel outcomes: arbiter skipped (agreement) or invoked (disagreement).",
+		"Fusion panel outcomes partitioned by reason: agreement, tool_calls, one_member, cache_hit, or empty (arbiter invoked).",
 		rc.fusionArbiter); err != nil {
 		return total, err
 	} else {
@@ -1083,7 +1082,7 @@ func writeFusionSeries(w io.Writer, name, help string, m map[string]*uint64) (in
 	sort.Strings(keys)
 	for _, k := range keys {
 		v := atomic.LoadUint64(m[k])
-		n, err := fmt.Fprintf(w, "%s{outcome=%q} %d\n", name, sanitizeLabel(k), v)
+		n, err := fmt.Fprintf(w, "%s{reason=%q} %d\n", name, sanitizeLabel(k), v)
 		if err != nil {
 			return total + int64(n), err
 		}
