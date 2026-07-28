@@ -12,16 +12,16 @@ func BenchmarkCategorize(b *testing.B) {
 	// All-lowercase so toUnicodeLower returns s unchanged (zero allocation).
 	// Mix of early-exit (first category) and late-exit (CategoryOther) prompts.
 	prompts := []string{
-		"fix the css padding on the header",          // CategoryCSS (early)
-		"debug this memory leak in production",       // CategoryDebugging (early)
-		"what is the capital of france",              // CategoryOther (late - no match)
-		"design the system architecture for payments", // CategoryArchitecture (early)
-		"please refactor this method to be cleaner",  // CategoryRefactoring (early)
-		"explain how goroutines work",                // CategoryOther (late)
+		"fix the css padding on the header",            // CategoryCSS (early)
+		"debug this memory leak in production",         // CategoryDebugging (early)
+		"what is the capital of france",                // CategoryOther (late - no match)
+		"design the system architecture for payments",  // CategoryArchitecture (early)
+		"please refactor this method to be cleaner",    // CategoryRefactoring (early)
+		"explain how goroutines work",                  // CategoryOther (late)
 		"generate the crud boilerplate for this model", // CategoryBoilerplate (early)
-		"write a docstring for this method",          // CategoryDocumentation (early)
-		"check for sql injection vulnerabilities",    // CategorySecurity (early)
-		"optimize this sql query for the users table", // CategoryData (early)
+		"write a docstring for this method",            // CategoryDocumentation (early)
+		"check for sql injection vulnerabilities",      // CategorySecurity (early)
+		"optimize this sql query for the users table",  // CategoryData (early)
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
