@@ -1080,6 +1080,7 @@ func LoadYAML(path string) (Config, error) {
 		cfg.TracingSampleRate = f
 	}
 
+	ValidateShutdownTimeout(cfg)
 	return cfg, nil
 }
 

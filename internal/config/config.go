@@ -1636,6 +1636,7 @@ func Load() (Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}
+	ValidateShutdownTimeout(cfg)
 	return cfg, nil
 }
 
@@ -1651,6 +1652,22 @@ func (c Config) Validate() error {
 		return fmt.Errorf("config: NEXUS_READINESS_MODE value %q is not recognised; want \"strict\" or \"degraded\"", c.ReadinessMode)
 	}
 	return nil
+}
+
+// ValidateShutdownTimeout emits a boot warning when the graceful shutdown drain
+// window is shorter than the inbound read deadline (issue #121). A drain shorter
+// than the read timeout can truncate in-flight request-body uploads mid-read.
+// The warning is emitted via slog so the caller must ensure the logger is wired
+// (slog is initialised before Load / LoadYAML in main.go). Skipped when
+// ReadTimeout is 0 (disabled), since there is no inbound deadline to underrun.
+func ValidateShutdownTimeout(cfg Config) {
+	if cfg.ReadTimeout > 0 && cfg.ShutdownTimeout < cfg.ReadTimeout {
+		slog.Warn("shutdown drain shorter than read timeout: in-flight uploads may be truncated mid-read",
+			slog.Duration("shutdown_timeout", cfg.ShutdownTimeout),
+			slog.Duration("read_timeout", cfg.ReadTimeout),
+			slog.String("hint", "set NEXUS_SHUTDOWN_TIMEOUT >= NEXUS_SERVER_READ_TIMEOUT"),
+		)
+	}
 }
 
 // FrontierEnabled reports whether a frontier API key is configured. The proxy
@@ -2040,6 +2057,15 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 	next.LogLevel = logLevel
 	next.LogFormat = parseLogFormat(os.Getenv("NEXUS_LOG_FORMAT"))
 	next.Debug = parseBoolEnv("NEXUS_DEBUG", prev.Debug)
+
+	shutdownTimeout, _ := getEnvDuration("NEXUS_SHUTDOWN_TIMEOUT", prev.ShutdownTimeout)
+	if shutdownTimeout < 0 {
+		shutdownTimeout = 0
+	}
+	if shutdownTimeout == 0 {
+		shutdownTimeout = DefaultShutdownTimeout
+	}
+	next.ShutdownTimeout = shutdownTimeout
 
 	return next, result
 }
