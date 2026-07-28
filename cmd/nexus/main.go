@@ -1342,6 +1342,9 @@ func main() {
 			authLimiter.SetOnBlock(func() {
 				routeCounters.ObserveRejection(handlers.RejectionAuthRateLimit)
 			})
+			authLimiter.SetOnReap(func() {
+				routeCounters.IncAuthReaperEvictions()
+			})
 			slog.Info("auth brute-force protection enabled",
 				slog.Int("rpm", cfg.AuthRateLimitRPM),
 				slog.Int("burst", cfg.AuthRateLimitBurst),

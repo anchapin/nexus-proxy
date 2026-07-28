@@ -378,3 +378,65 @@ func TestAuthLimiter_Reaper_Eviction(t *testing.T) {
 		t.Error("recent should still exist")
 	}
 }
+
+// SetOnReap callback fires when the reaper evicts an idle IP.
+func TestAuthLimiter_SetOnReap_Fires(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	al := NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	defer al.Stop()
+
+	var evictions int64
+	al.SetOnReap(func() {
+		atomic.AddInt64(&evictions, 1)
+	})
+
+	now := time.Now()
+
+	// Three entries: two will be evicted, one will not
+	al.mu.Lock()
+	al.failures["stale-evict1"] = &authFailure{
+		ts:       nil,
+		lastSeen: now.Add(-15 * time.Minute), // idle > 10 min, no failures → evicted
+	}
+	al.failures["stale-evict2"] = &authFailure{
+		ts:       nil,
+		lastSeen: now.Add(-20 * time.Minute), // idle > 10 min, no failures → evicted
+	}
+	al.failures["stale-kept"] = &authFailure{
+		ts:       []time.Time{now.Add(-1 * time.Minute)}, // has recent failure → kept
+		lastSeen: now.Add(-15 * time.Minute),
+	}
+	al.mu.Unlock()
+
+	if al.BucketCount() != 3 {
+		t.Fatalf("initial BucketCount = %d, want 3", al.BucketCount())
+	}
+
+	// Trigger one reaper tick via Reap()
+	al.Reap()
+
+	if evictions != 2 {
+		t.Errorf("evictions = %d, want 2", evictions)
+	}
+	if al.BucketCount() != 1 {
+		t.Errorf("after Reap: BucketCount = %d, want 1", al.BucketCount())
+	}
+}
+
+// Reap is safe to call on nil limiter.
+func TestAuthLimiter_Reap_Nil(t *testing.T) {
+	var al *AuthLimiter
+	al.Reap() // must not panic
+}
+
+// Reap is safe to call on disabled limiter.
+func TestAuthLimiter_Reap_Disabled(t *testing.T) {
+	al := NewAuthLimiter(0, 3, 5*time.Minute, nil)
+	al.Reap() // must not panic
+}
+
+// SetOnReap is safe to call on nil limiter.
+func TestAuthLimiter_SetOnReap_Nil(t *testing.T) {
+	var al *AuthLimiter
+	al.SetOnReap(func() {}) // must not panic
+}
