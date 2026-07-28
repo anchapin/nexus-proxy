@@ -815,6 +815,16 @@ func main() {
 				Value: v,
 			}}
 		}),
+		// Confidence store rows gauge (issue #834).
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			if confidenceStore == nil {
+				return nil
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_confidence_store_rows_total",
+				Value: float64(confidenceStore.RowsTotal()),
+			}}
+		}),
 		// Build info gauge (issue #529). Static metadata — always 1.
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
 			return []observability.GaugeSample{{

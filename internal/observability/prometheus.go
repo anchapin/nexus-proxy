@@ -100,6 +100,10 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total quality events dropped because the verifier queue was full.",
 		typ:  "counter",
 	},
+	"nexus_confidence_store_rows_total": {
+		help: "Current number of rows in the routing_outcomes confidence store table (issue #834).",
+		typ:  "gauge",
+	},
 	"nexus_metrics_dropped_total": {
 		help: "Total metrics records dropped because the SQLite write buffer was full.",
 		typ:  "counter",
