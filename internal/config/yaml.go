@@ -143,10 +143,11 @@ type YAMLConfig struct {
 	RoutingConfidenceWindow     string  `yaml:"routing_confidence_window"`
 
 	// Quality
-	QualityConcurrency int    `yaml:"quality_concurrency"`
-	QualityQueueDepth  int    `yaml:"quality_queue"`
-	QualityTimeout     string `yaml:"quality_timeout"`
-	QualityStderrCap   int    `yaml:"quality_stderr_cap"`
+	QualityConcurrency     int    `yaml:"quality_concurrency"`
+	QualityQueueDepth      int    `yaml:"quality_queue"`
+	QualityTimeout         string `yaml:"quality_timeout"`
+	QualityStderrCap       int    `yaml:"quality_stderr_cap"`
+	QualityDroppedRingSize int    `yaml:"quality_dropped_ring_size"`
 
 	// Middleware
 	MetaPrompt   string `yaml:"meta_prompt"`
@@ -877,6 +878,13 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.QualityStderrCap = n
 	}
+	if v := os.Getenv("NEXUS_QUALITY_DROPED_RING_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_QUALITY_DROPED_RING_SIZE: %w", err)
+		}
+		cfg.QualityDroppedRingSize = n
+	}
 
 	// Middleware prompts
 	if v := os.Getenv("NEXUS_META_PROMPT"); v != "" {
@@ -896,7 +904,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_INJECTION_SCAN_ROLES"); v != "" {
 		roles, unrecognized := parseInjectionScanRoles(v)
 		cfg.InjectionScanRoles = roles
-		if len(unrecognized) > 0 && v != "system" {
+		if len(unrecognized) > 0 && len(roles) == 1 && roles[0] == "system" {
 			slog.Warn("unrecognised injection scan role(s): falling back to [system]",
 				slog.String("ignored", strings.Join(unrecognized, ",")),
 			)
@@ -1208,11 +1216,12 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		CostBaselineModel:     yc.stringDefault(yc.CostBaselineModel, ""),   // Falls back to FrontierModel later
 		CostBaselineRatePer1K: yc.floatDefault(yc.CostBaselineRatePer1K, 0), // Falls back to FrontierCostPer1K later
 
-		QualityConcurrency: yc.intDefault(yc.QualityConcurrency, 2),
-		QualityQueueDepth:  yc.intDefault(yc.QualityQueueDepth, 64),
-		QualityTimeout:     yc.durationDefault(yc.QualityTimeout, 60*time.Second),
-		QualityStderrCap:   yc.intDefault(yc.QualityStderrCap, 2*1024),
-		QualityEnabled:     yc.intDefault(yc.QualityConcurrency, 2) > 0,
+		QualityConcurrency:     yc.intDefault(yc.QualityConcurrency, 2),
+		QualityQueueDepth:      yc.intDefault(yc.QualityQueueDepth, 64),
+		QualityTimeout:         yc.durationDefault(yc.QualityTimeout, 60*time.Second),
+		QualityStderrCap:       yc.intDefault(yc.QualityStderrCap, 2*1024),
+		QualityDroppedRingSize: yc.intDefault(yc.QualityDroppedRingSize, 16),
+		QualityEnabled:         yc.intDefault(yc.QualityConcurrency, 2) > 0,
 
 		PromptInjectionMode: middleware.ParseInjectionMode(yc.PromptInjectionMode),
 		InjectionScanRoles:  yamlRoles,
@@ -1244,7 +1253,8 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 	}
 
 	// Warn if yaml had unrecognized injection scan roles (issue #845)
-	if len(yamlUnrecognized) > 0 && yamlRolesRaw != "system" {
+	// Only warn when unrecognized tokens exist AND the fallback is ["system"] (issue #879).
+	if len(yamlUnrecognized) > 0 && len(yamlRoles) == 1 && yamlRoles[0] == "system" {
 		slog.Warn("unrecognised injection scan role(s) in config.yaml: falling back to [system]",
 			slog.String("ignored", strings.Join(yamlUnrecognized, ",")),
 		)

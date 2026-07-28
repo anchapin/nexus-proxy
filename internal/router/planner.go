@@ -272,6 +272,20 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	}
 
 	// Stage 2: DSL fast-pass. Use default patterns when config fields are nil.
+	//
+	// DSL PATTERN PRECEDENCE (issue #876): when a prompt matches multiple
+	// pattern groups, the FIRST match wins. The fixed check order is:
+	//
+	//   1. fusionPatterns     → RouteFusion  (architectural design, system architecture)
+	//   2. formattingPatterns → RouteLocal   (css, format, docstring, lint, ...)
+	//   3. localPatterns     → RouteLocal   (refactor, security scan, generate tests, ...)
+	//   4. unicodePatterns   → RouteLocal   (\p{Han}, \p{Arabic} script detection)
+	//
+	// Operators should be aware that precedence is meaningful: a prompt
+	// containing both "refactor" (local) and "system architecture" (fusion)
+	// will be routed to fusion because fusionPatterns are checked first.
+	// If you need different precedence, the patterns themselves must be
+	// narrowed to avoid overlap.
 	fusionPatterns := p.FusionPatterns
 	if len(fusionPatterns) == 0 {
 		fusionPatterns = DefaultFusionPatterns

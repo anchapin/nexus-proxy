@@ -211,30 +211,40 @@ func (c *EmbedCache) Embed(ctx context.Context, text string) ([]float64, error) 
 			case result = <-slot.ch:
 				timer.Stop()
 			case <-timer.C:
-				// Timeout: close done to signal the loading goroutine
-				// to abort, delete the loading slot, and fall through
-				// to a direct inner call (issue #800).
-				close(slot.done)
+				// Timeout: acquire lock and atomically delete the loading slot
+				// before closing done. If another goroutine already deleted
+				// the slot, skip the close to avoid double-close panic (race
+				// with ctx cancel on the same select; Go picks one randomly).
 				c.mu.Lock()
+				_, stillLoading := c.loading[key]
 				delete(c.loading, key)
 				c.mu.Unlock()
+				if stillLoading {
+					close(slot.done)
+				}
 				return c.inner.Embed(ctx, text)
 			case <-ctx.Done():
 				timer.Stop()
-				close(slot.done)
 				c.mu.Lock()
+				_, stillLoading := c.loading[key]
 				delete(c.loading, key)
 				c.mu.Unlock()
+				if stillLoading {
+					close(slot.done)
+				}
 				return nil, ctx.Err()
 			}
 		} else {
 			select {
 			case result = <-slot.ch:
 			case <-ctx.Done():
-				close(slot.done)
 				c.mu.Lock()
+				_, stillLoading := c.loading[key]
 				delete(c.loading, key)
 				c.mu.Unlock()
+				if stillLoading {
+					close(slot.done)
+				}
 				return nil, ctx.Err()
 			}
 		}
@@ -399,11 +409,10 @@ func (c *EmbedCache) EmbedBatch(ctx context.Context, texts []string) ([][]float6
 }
 
 // CacheStats returns the cumulative hit and miss counts since the cache was
-// created. Used for observability; not thread-safe with concurrent access.
+// created. Used for observability; safe to call concurrently with
+// Embed, EmbedBatch, and Retrieve.
 func (c *EmbedCache) CacheStats() (hits, misses int64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.hits, c.misses
+	return atomic.LoadInt64(&c.hits), atomic.LoadInt64(&c.misses)
 }
 
 // HitCount returns the current total hit count atomically. Used by the
@@ -462,6 +471,10 @@ type RAGStore interface {
 	// RecordBreakerSuccess notifies the embedder's circuit breaker of a
 	// successful retrieval so the failure counter is reset (issue #304).
 	RecordBreakerSuccess()
+	// LastSuccessfulKind returns the circuit kind of the last successful
+	// embedder (e.g. "ollama", "openai", "cohere"), or "" if no embedder
+	// has succeeded yet. Used for RAG circuit breaker observability (issue #886).
+	LastSuccessfulKind() string
 }
 
 // EmbedCacheStats is the observability surface for the prompt embedding cache.
@@ -524,6 +537,7 @@ type Store struct {
 	embedErrors               uint64
 	injectionSkippedSizeLimit uint64
 	generation                int64
+	lastSuccessfulKind        string // circuit kind of last successful embedder (issue #886)
 }
 
 // StoreOption configures a Store.
@@ -871,7 +885,17 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 			}
 			embs, err := s.embedder.EmbedBatch(ctx, texts)
 			if err != nil {
-				slog.Error("rag embed batch", slog.Any("err", err))
+				// Partial batch: entries were appended to s.examples but
+				// upsertExample was never called, so the HNSW index is stale.
+				// Invalidate it so Retrieve falls back to brute-force.
+				s.mu.Lock()
+				s.index = nil
+				s.mu.Unlock()
+				slog.Warn("rag embed batch failed, HNSW index invalidated",
+					slog.Any("err", err),
+					slog.Int("batchStart", i),
+					slog.Int("batchLen", len(batch)),
+				)
 				continue
 			}
 			s.mu.Lock()
@@ -1069,6 +1093,36 @@ func (s *Store) RecordBreakerSuccess() {
 	if e, ok := s.embedder.(interface{ RecordBreakerSuccess() }); ok {
 		e.RecordBreakerSuccess()
 	}
+	// Track the kind of the successful embedder for observability (issue #886).
+	// Use a type switch to identify the embedder kind since we don't want
+	// to add Kind() to the Embedder interface (would break all test doubles).
+	s.lastSuccessfulKind = embedderKind(s.embedder)
+}
+
+// embedderKind returns the circuit kind string for the given embedder.
+// Returns "" for unknown embedder types.
+func embedderKind(e Embedder) string {
+	switch te := e.(type) {
+	case *OllamaEmbedder:
+		return "ollama"
+	case *OpenAIEmbedder:
+		return "openai"
+	case *CohereEmbedder:
+		return "cohere"
+	case *EmbedCache:
+		return embedderKind(te.inner)
+	default:
+		return ""
+	}
+}
+
+// LastSuccessfulKind returns the circuit kind of the last successful embedder
+// (e.g. "ollama", "openai", "cohere"), or "" if no embedder has succeeded yet.
+// Used for RAG circuit breaker observability (issue #886).
+func (s *Store) LastSuccessfulKind() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastSuccessfulKind
 }
 
 // replace swaps the entire examples slice atomically. Used by
@@ -1492,6 +1546,12 @@ func (o *OpenAIEmbedder) RecordBreakerSuccess() {
 	o.breaker.RecordSuccess()
 }
 
+// Kind returns the circuit kind string for this embedder ("openai").
+// Used for RAG circuit breaker observability (issue #886).
+func (o *OpenAIEmbedder) Kind() string {
+	return "openai"
+}
+
 // CohereEmbedder calls the Cohere /v1/embed endpoint. It is safe for
 // concurrent use via a shared http.Client.
 type CohereEmbedder struct {
@@ -1655,6 +1715,12 @@ func (c *CohereEmbedder) RecordBreakerSuccess() {
 	c.breaker.RecordSuccess()
 }
 
+// Kind returns the circuit kind string for this embedder ("cohere").
+// Used for RAG circuit breaker observability (issue #886).
+func (c *CohereEmbedder) Kind() string {
+	return "cohere"
+}
+
 // EmbedderType is the discriminator for the embedder factory.
 type EmbedderType string
 
@@ -1704,4 +1770,10 @@ func (o *OllamaEmbedder) RecordBreakerSuccess() {
 // (cooldown) state. Exported for tests and operational dashboards.
 func (o *OllamaEmbedder) IsBreakerOpen() bool {
 	return o.breaker.IsOpen()
+}
+
+// Kind returns the circuit kind string for this embedder ("ollama").
+// Used for RAG circuit breaker observability (issue #886).
+func (o *OllamaEmbedder) Kind() string {
+	return "ollama"
 }

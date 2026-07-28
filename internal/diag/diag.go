@@ -703,7 +703,7 @@ func checkQualityVerifierFn(cfg config.Config) Check {
 	return Check{
 		Name:   checkQualityVerifier,
 		Status: StatusPass,
-		Detail: fmt.Sprintf("concurrency=%d workers", cfg.QualityConcurrency),
+		Detail: fmt.Sprintf("concurrency=%d workers, queue=%d, ring=%d", cfg.QualityConcurrency, cfg.QualityQueueDepth, cfg.QualityDroppedRingSize),
 	}
 }
 

@@ -326,11 +326,12 @@ type Config struct {
 	// QualityConcurrency is positive; the chat handler treats a
 	// nil observer as "skip me" so the hot path is unaffected when
 	// the verifier is dormant.
-	QualityEnabled     bool          // true iff QualityConcurrency > 0
-	QualityConcurrency int           // max parallel verifier workers (default 2)
-	QualityQueueDepth  int           // buffered channel size (default 64)
-	QualityTimeout     time.Duration // per-check timeout (default 60s)
-	QualityStderrCap   int           // stderr bytes retained per verdict (default 2 KiB)
+	QualityEnabled         bool          // true iff QualityConcurrency > 0
+	QualityConcurrency     int           // max parallel verifier workers (default 2)
+	QualityQueueDepth      int           // buffered channel size (default 64)
+	QualityTimeout         time.Duration // per-check timeout (default 60s)
+	QualityStderrCap       int           // stderr bytes retained per verdict (default 2 KiB)
+	QualityDroppedRingSize int           // ring buffer capacity for dropped events (default 16)
 
 	// Middleware prompts
 	MetaPrompt   string // appended to system prompt by prompt_engine
@@ -1413,6 +1414,12 @@ func Load() (Config, error) {
 	}
 	cfg.QualityStderrCap = stderrCap
 
+	droppedRingSize, err := getEnvInt("NEXUS_QUALITY_DROPED_RING_SIZE", 16)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.QualityDroppedRingSize = droppedRingSize
+
 	cfg.QualityEnabled = cfg.QualityConcurrency > 0
 
 	// Structured logging (issue #3). Defaults match the production
@@ -1462,7 +1469,13 @@ func Load() (Config, error) {
 	rawRoles := getEnv("NEXUS_INJECTION_SCAN_ROLES", "system")
 	roles, unrecognized := parseInjectionScanRoles(rawRoles)
 	cfg.InjectionScanRoles = roles
-	if len(unrecognized) > 0 && rawRoles != "system" {
+	// Warn only when unrecognized tokens exist AND the fallback is ["system"].
+	// This means the user specified at least one invalid value that caused
+	// the parser to discard everything and fall back to the default.
+	// Cases like "system,user" (both valid) or "system,foo" (foo invalid,
+	// fallback to ["system"]) are distinguished by checking the resulting
+	// roles set, not the raw input string (issue #879).
+	if len(unrecognized) > 0 && len(roles) == 1 && roles[0] == "system" {
 		slog.Warn("unrecognised injection scan role(s): falling back to [system]",
 			slog.String("ignored", strings.Join(unrecognized, ",")),
 		)
@@ -2049,6 +2062,28 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 		rateBurst = 0
 	}
 	next.RateLimitBurst = rateBurst
+
+	// Auth brute-force limiter (issue #895).
+	authRateLimitRPM, _ := getEnvInt("NEXUS_AUTH_RATE_LIMIT_RPM", prev.AuthRateLimitRPM)
+	if authRateLimitRPM < 0 {
+		authRateLimitRPM = 0
+	}
+	next.AuthRateLimitRPM = authRateLimitRPM
+
+	authRateLimitBurst, _ := getEnvInt("NEXUS_AUTH_RATE_LIMIT_BURST", prev.AuthRateLimitBurst)
+	if authRateLimitBurst < 0 {
+		authRateLimitBurst = 0
+	}
+	next.AuthRateLimitBurst = authRateLimitBurst
+
+	authRateLimitWindow, _ := getEnvDuration("NEXUS_AUTH_RATE_LIMIT_WINDOW", prev.AuthRateLimitWindow)
+	if authRateLimitWindow < 0 {
+		authRateLimitWindow = 0
+	}
+	if authRateLimitWindow == 0 {
+		authRateLimitWindow = 5 * time.Minute
+	}
+	next.AuthRateLimitWindow = authRateLimitWindow
 
 	logLevel, logLevelErr := parseLogLevel(os.Getenv("NEXUS_LOG_LEVEL"))
 	if logLevelErr != nil {

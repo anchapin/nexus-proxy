@@ -628,6 +628,8 @@ func Panel(
 			cacheHit = true
 			outcome.ArbiterCacheHit = true
 			outcome.ArbiterSkipped = true
+			outcome.Similarity = SimilarityRatio(r1.Content, r2.Content)
+			outcome.SkipReason = "cache_hit"
 			if stream {
 				return outcome, true, streamCachedArbiterSynthesis(w, cached)
 			}
@@ -684,6 +686,12 @@ func Panel(
 		return outcome, false, fmt.Errorf("fusion: arbiter fetch: %w", fetchErr)
 	}
 	if synthesis == "" {
+		slog.Debug("fusion arbiter returned empty synthesis",
+			slog.String("request_id", requestID),
+			slog.String("r1_source", r1.Source),
+			slog.String("r2_source", r2.Source),
+			slog.Int("synthesis_len", 0),
+		)
 		slog.Warn("fusion arbiter returned empty synthesis",
 			slog.String("request_id", requestID),
 			slog.String("r1_source", r1.Source),
@@ -748,7 +756,8 @@ type PanelOutcome struct {
 	// SkipReason describes why the arbiter was skipped (issue #384):
 	// "agreement" when Similarity >= agreementThreshold,
 	// "tool_calls" when the speculative winner carried tool calls,
-	// or "one_member" when only one panel member returned content.
+	// "one_member" when only one panel member returned content,
+	// or "cache_hit" when the synthesis was served from the arbiter cache.
 	// Empty when ArbiterSkipped is false.
 	SkipReason string
 }
@@ -826,6 +835,7 @@ func PanelStreaming(
 		}
 		outcome.ArbiterCacheHit = cacheHit
 		outcome.ArbiterSkipped = panelOutcome.ArbiterSkipped
+		outcome.SkipReason = panelOutcome.SkipReason
 		return outcome, nil
 	}
 

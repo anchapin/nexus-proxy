@@ -142,6 +142,9 @@ func TestRouteCountersNilSafe(t *testing.T) {
 	if err != nil || n != 0 {
 		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
 	}
+	if got := rc.QueueDepthGauge(); got != 0 {
+		t.Errorf("nil QueueDepthGauge should return 0, got %d", got)
+	}
 }
 
 func TestRouteCountersHandlerContentType(t *testing.T) {
@@ -243,15 +246,15 @@ func TestRouteCountersRejectionConcurrentSafe(t *testing.T) {
 }
 
 // TestRouteCountersFusionOutcome verifies the issue #187 fusion arbiter
-// counter family: ObserveFusionOutcome increments the skipped or invoked
-// counter and WriteTo emits nexus_fusion_arbiter_total{outcome} lines.
+// counter family (extended by #882): ObserveFusionOutcome increments the
+// per-reason counter and WriteTo emits nexus_fusion_arbiter_total{reason} lines.
 func TestRouteCountersFusionOutcome(t *testing.T) {
 	rc := NewRouteCounters()
-	rc.ObserveFusionOutcome(true)  // skipped
-	rc.ObserveFusionOutcome(true)  // skipped
-	rc.ObserveFusionOutcome(false) // invoked
-	rc.ObserveFusionOutcome(false) // invoked
-	rc.ObserveFusionOutcome(false) // invoked
+	rc.ObserveFusionOutcome("agreement") // skipped twice
+	rc.ObserveFusionOutcome("agreement")
+	rc.ObserveFusionOutcome("") // invoked three times
+	rc.ObserveFusionOutcome("")
+	rc.ObserveFusionOutcome("")
 
 	var sb strings.Builder
 	if _, err := rc.WriteTo(&sb); err != nil {
@@ -265,8 +268,8 @@ func TestRouteCountersFusionOutcome(t *testing.T) {
 	}{
 		{"nexus_fusion_arbiter_total", "metric family header"},
 		{`# TYPE nexus_fusion_arbiter_total counter`, "counter type line"},
-		{`nexus_fusion_arbiter_total{outcome="skipped"} 2`, "skipped counted twice"},
-		{`nexus_fusion_arbiter_total{outcome="invoked"} 3`, "invoked counted three times"},
+		{`nexus_fusion_arbiter_total{reason="agreement"} 2`, "agreement reason counted twice"},
+		{`nexus_fusion_arbiter_total{reason=""} 3`, "invoked (empty reason) counted three times"},
 	}
 	for _, c := range checks {
 		if !strings.Contains(out, c.fragment) {
@@ -397,12 +400,12 @@ func TestRAGCountersSingleHitSeriesRegardlessOfFilenames(t *testing.T) {
 }
 
 // TestRouteCountersFusionOutcomeDeterministicOrder verifies that repeated
-// scrapes produce identical output (sorted by outcome label) so
+// scrapes produce identical output (sorted by reason label) so
 // Prometheus diff alerts are not triggered by reordering.
 func TestRouteCountersFusionOutcomeDeterministicOrder(t *testing.T) {
 	rc := NewRouteCounters()
-	rc.ObserveFusionOutcome(false) // invoked
-	rc.ObserveFusionOutcome(true)  // skipped
+	rc.ObserveFusionOutcome("")          // invoked (empty reason)
+	rc.ObserveFusionOutcome("agreement") // skipped
 
 	var first, second strings.Builder
 	_, _ = rc.WriteTo(&first)
@@ -439,7 +442,12 @@ func TestRouteCountersFusionOutcomeConcurrentSafe(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			rc.ObserveFusionOutcome(n%2 == 0) // alternate skipped/invoked
+			// alternate between agreement skip and invoked (empty reason)
+			if n%2 == 0 {
+				rc.ObserveFusionOutcome("agreement")
+			} else {
+				rc.ObserveFusionOutcome("")
+			}
 		}(i)
 	}
 	wg.Wait()
@@ -487,8 +495,8 @@ func TestRAGCountersConcurrentSafe(t *testing.T) {
 // TestRouteCountersFusionOutcomeNilSafe verifies that nil receiver does not panic.
 func TestRouteCountersFusionOutcomeNilSafe(t *testing.T) {
 	var rc *RouteCounters
-	rc.ObserveFusionOutcome(true)
-	rc.ObserveFusionOutcome(false)
+	rc.ObserveFusionOutcome("agreement")
+	rc.ObserveFusionOutcome("")
 }
 
 // TestRAGCountersNilSafe verifies that nil receivers are safe.
@@ -1456,7 +1464,7 @@ func TestRouteCountersDSLMiss(t *testing.T) {
 func TestRouteCountersDSLHitNilSafe(t *testing.T) {
 	var rc *RouteCounters
 	rc.ObserveDSLHit("fusion") // must not panic on nil
-	rc.ObserveDSLHit("")      // must not panic on empty reason
+	rc.ObserveDSLHit("")       // must not panic on empty reason
 	n, err := rc.WriteTo(&strings.Builder{})
 	if err != nil || n != 0 {
 		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
@@ -1471,5 +1479,21 @@ func TestRouteCountersDSLMissNilSafe(t *testing.T) {
 	n, err := rc.WriteTo(&strings.Builder{})
 	if err != nil || n != 0 {
 		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
+	}
+}
+
+// TestRouteCountersQueueDepthGauge verifies QueueDepthGauge returns
+// the value supplied by the gauge function (issue #881).
+func TestRouteCountersQueueDepthGauge(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.judgeQueueDepthGauge = func() uint64 { return 5 }
+	if got := rc.QueueDepthGauge(); got != 5 {
+		t.Errorf("QueueDepthGauge() = %d, want 5", got)
+	}
+
+	// nil gauge function returns 0
+	rc.judgeQueueDepthGauge = nil
+	if got := rc.QueueDepthGauge(); got != 0 {
+		t.Errorf("QueueDepthGauge() with nil gauge = %d, want 0", got)
 	}
 }
