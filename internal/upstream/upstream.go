@@ -628,6 +628,7 @@ func Panel(
 			cacheHit = true
 			outcome.ArbiterCacheHit = true
 			outcome.ArbiterSkipped = true
+			outcome.Similarity = SimilarityRatio(r1.Content, r2.Content)
 			outcome.SkipReason = "cache_hit"
 			if stream {
 				return outcome, true, streamCachedArbiterSynthesis(w, cached)
@@ -755,7 +756,8 @@ type PanelOutcome struct {
 	// SkipReason describes why the arbiter was skipped (issue #384):
 	// "agreement" when Similarity >= agreementThreshold,
 	// "tool_calls" when the speculative winner carried tool calls,
-	// or "one_member" when only one panel member returned content.
+	// "one_member" when only one panel member returned content,
+	// or "cache_hit" when the synthesis was served from the arbiter cache.
 	// Empty when ArbiterSkipped is false.
 	SkipReason string
 }
