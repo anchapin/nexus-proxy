@@ -408,6 +408,23 @@ type Config struct {
 	// the prune goroutine lifecycle is bound to the store's lifetime.
 	MetricsRetentionDays int
 
+	// OTLP retry/back-off parameters (issue #803). These tune the
+	// behaviour when the collector returns 5xx errors. The back-off
+	// follows exponential growth: base * 2^(attempt-1) capped at max.
+	//
+	// TracerMaxRetries: maximum retry attempts after the initial POST
+	// fails with a 5xx. Default 3 (total 4 attempts including initial).
+	// Zero or negative falls back to the default.
+	//
+	// TracerRetryBaseDelay: initial back-off delay. Default 100ms.
+	// Zero or negative falls back to the default.
+	//
+	// TracerRetryMaxDelay: ceiling on the back-off delay. Default 2s.
+	// Zero or negative falls back to the default.
+	TracerMaxRetries     int
+	TracerRetryBaseDelay time.Duration
+	TracerRetryMaxDelay  time.Duration
+
 	// Structured logging (issue #3). LogLevel maps NEXUS_LOG_LEVEL
 	// ("debug" | "info" | "warn" | "error") to a slog.Level. LogFormat
 	// maps NEXUS_LOG_FORMAT ("json" | "text") to a slog.Handler; json
@@ -718,6 +735,34 @@ func Load() (Config, error) {
 		retentionDays = 0
 	}
 	cfg.MetricsRetentionDays = retentionDays
+
+	// OTLP retry/back-off parameters (issue #803).
+	tracerMaxRetries, err := getEnvInt("NEXUS_TRACING_MAX_RETRIES", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if tracerMaxRetries < 0 {
+		tracerMaxRetries = 0
+	}
+	cfg.TracerMaxRetries = tracerMaxRetries
+
+	tracerRetryBaseDelay, err := getEnvDuration("NEXUS_TRACING_RETRY_BASE_DELAY", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if tracerRetryBaseDelay < 0 {
+		tracerRetryBaseDelay = 0
+	}
+	cfg.TracerRetryBaseDelay = tracerRetryBaseDelay
+
+	tracerRetryMaxDelay, err := getEnvDuration("NEXUS_TRACING_RETRY_MAX_DELAY", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if tracerRetryMaxDelay < 0 {
+		tracerRetryMaxDelay = 0
+	}
+	cfg.TracerRetryMaxDelay = tracerRetryMaxDelay
 
 	threshold, err := getEnvFloat("NEXUS_RAG_THRESHOLD", 0.55)
 	if err != nil {

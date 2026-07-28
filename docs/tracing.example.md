@@ -286,7 +286,63 @@ failed to start.
 
 ---
 
-## 5. Troubleshooting
+## 5. Retry and Back-off (issue #803)
+
+When the collector returns 5xx errors, the exporter retries with **exponential
+back-off**: the delay doubles after each attempt, capped at a maximum. This
+prevents a struggling collector from being overwhelmed while still giving it
+time to recover.
+
+Three env vars control this behaviour:
+
+### 5.1 `NEXUS_TRACING_MAX_RETRIES`
+
+Maximum retry attempts after the initial POST fails with a 5xx status.
+The back-off follows exponential growth: `base × 2^(attempt-1)` capped at
+`max`. Default: **3** (total 4 attempts including the initial).
+
+```
+NEXUS_TRACING_MAX_RETRIES=3
+```
+
+Set to `0` to disable retries entirely (the batch is dropped on the first
+5xx failure).
+
+### 5.2 `NEXUS_TRACING_RETRY_BASE_DELAY`
+
+Initial back-off delay between retries. The actual delay follows:
+`base × 2^(attempt-1)`. Default: **100ms**.
+
+```
+NEXUS_TRACING_RETRY_BASE_DELAY=100ms
+```
+
+### 5.3 `NEXUS_TRACING_RETRY_MAX_DELAY`
+
+Ceiling on the back-off delay. Prevents retries from exceeding a reasonable
+interval even with many consecutive failures. Default: **2s**.
+
+```
+NEXUS_TRACING_RETRY_MAX_DELAY=2s
+```
+
+**Example — aggressive retry for a nearby collector:**
+
+```bash
+NEXUS_TRACING_MAX_RETRIES=5
+NEXUS_TRACING_RETRY_BASE_DELAY=50ms
+NEXUS_TRACING_RETRY_MAX_DELAY=5s
+```
+
+**Example — disable retries entirely:**
+
+```bash
+NEXUS_TRACING_MAX_RETRIES=0
+```
+
+---
+
+## 6. Troubleshooting
 
 ### Spans are not appearing in the UI
 
