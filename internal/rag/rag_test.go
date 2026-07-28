@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync"
@@ -1162,4 +1164,59 @@ func TestEmbedCacheConcurrentStressWithCancel(t *testing.T) {
 		t.Errorf("c.loading not clean after stress test: %d entries remain", len(cache.loading))
 	}
 	cache.mu.Unlock()
+}
+
+func TestStoreIsBreakerOpen_DelegatesToInner(t *testing.T) {
+	stub := &breakerStub{breakerOpen: true}
+	store := NewStore(stub, 0.55)
+
+	if !store.IsBreakerOpen() {
+		t.Error("IsBreakerOpen() = false, want true (should propagate inner breaker)")
+	}
+	if stub.breakerCalls != 1 {
+		t.Errorf("stub.breakerCalls = %d, want 1", stub.breakerCalls)
+	}
+
+	stub.breakerOpen = false
+	if store.IsBreakerOpen() {
+		t.Error("IsBreakerOpen() = true, want false after inner closes")
+	}
+}
+
+func TestStoreIsBreakerOpen_ReturnsFalseWhenInnerLacksInterface(t *testing.T) {
+	stub := &stubEmbedder{vecs: map[string][]float64{"x": {1, 0}}}
+	store := NewStore(stub, 0.55)
+
+	if store.IsBreakerOpen() {
+		t.Error("IsBreakerOpen() = true, want false (stubEmbedder's IsBreakerOpen returns false)")
+	}
+}
+
+func TestStoreRecordBreakerSuccess_DelegatesToInner(t *testing.T) {
+	stub := &breakerStub{}
+	store := NewStore(stub, 0.55)
+
+	store.RecordBreakerSuccess()
+	store.RecordBreakerSuccess()
+
+	if stub.successCalls != 2 {
+		t.Errorf("stub.successCalls = %d, want 2", stub.successCalls)
+	}
+}
+
+func TestStoreRecordBreakerSuccess_NoOpWhenInnerLacksInterface(t *testing.T) {
+	stub := &stubEmbedder{vecs: map[string][]float64{"x": {1, 0}}}
+	store := NewStore(stub, 0.55)
+
+	store.RecordBreakerSuccess()
+}
+
+func TestOllamaEmbedderIsHealthy_NilCtxUsesDefaultTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"embedding":[0.1,0.2,0.3]}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	emb := NewOllamaEmbedder(srv.URL, "test-model", nil, BreakerConfig{})
+	_ = emb.IsHealthy(nil)
 }
