@@ -48,6 +48,13 @@ type ArbiterCache struct {
 	// front. The slice is rebuilt on each eviction to stay in sync with
 	// the items map.
 	lru [][32]byte
+
+	// EvictionObserver, when non-nil, is invoked once per evicted entry
+	// with reason = "lru". The callback runs after the cache lock is
+	// released so it is safe to call into observability or any other
+	// subsystem. The pointer is captured under mu; callbacks should not
+	// mutate it.
+	EvictionObserver func(reason string)
 }
 
 // NewArbiterCache constructs an empty, ready-to-use cache with the
@@ -110,6 +117,21 @@ func (c *ArbiterCache) evictLru() {
 	delete(c.items, key)
 }
 
+// SetEvictionObserver registers a callback that is invoked once per
+// evicted entry with reason = "lru" (issue #798). Pass nil to clear
+// the observer. The callback runs after the cache lock is released so
+// it is safe to call into observability or logging. Callers that want
+// to record into observability.RouteCounters should pass a closure
+// that forwards to ObserveArbiterCacheEviction.
+func (c *ArbiterCache) SetEvictionObserver(fn func(reason string)) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.EvictionObserver = fn
+	c.mu.Unlock()
+}
+
 // Get returns the cached synthesis text and true if the entry exists
 // and has not expired. Returns ("", false) if the entry is missing
 // or expired. Thread-safe.
@@ -142,10 +164,10 @@ func (c *ArbiterCache) Set(r1Content, r2Content, synthesis string, ttl time.Dura
 	}
 	key := cacheKey(r1Content, r2Content)
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	evicted := false
 	if c.maxEntries > 0 && len(c.items) >= c.maxEntries {
 		c.evictLru()
+		evicted = true
 	}
 
 	c.items[key] = &ArbiterCacheEntry{
@@ -154,6 +176,12 @@ func (c *ArbiterCache) Set(r1Content, r2Content, synthesis string, ttl time.Dura
 		TTLDuration: ttl,
 	}
 	c.touch(key)
+	onEvict := c.EvictionObserver
+	c.mu.Unlock()
+
+	if evicted && onEvict != nil {
+		onEvict("lru")
+	}
 }
 
 // Delete removes a cache entry by key. Used for cache invalidation.

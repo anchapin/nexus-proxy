@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -266,6 +267,48 @@ func TestArbiterCacheMaxEntriesEviction(t *testing.T) {
 	_, ok = cache.Get("g", "h")
 	if !ok {
 		t.Error("cache.Get miss for 'g', 'h' after insertion, want hit")
+	}
+}
+
+func TestArbiterCacheEvictionEmitsMetric(t *testing.T) {
+	cache := NewArbiterCache(time.Hour, 2)
+	ttl := time.Hour
+
+	var mu sync.Mutex
+	var evictions []string
+	cache.SetEvictionObserver(func(reason string) {
+		mu.Lock()
+		evictions = append(evictions, reason)
+		mu.Unlock()
+	})
+
+	cache.Set("a", "b", "v1", ttl)
+	cache.Set("c", "d", "v2", ttl)
+	if len(evictions) != 0 {
+		t.Fatalf("evictions after setup: %d, want 0", len(evictions))
+	}
+
+	cache.Set("e", "f", "v3", ttl)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(evictions) != 1 {
+		t.Fatalf("evictions after third Set: %d, want 1; evictions=%v", len(evictions), evictions)
+	}
+	if evictions[0] != "lru" {
+		t.Errorf("evictions[0] = %q, want %q", evictions[0], "lru")
+	}
+}
+
+func TestArbiterCacheEvictionObserver_NilSafe(t *testing.T) {
+	cache := NewArbiterCache(time.Hour, 1)
+	ttl := time.Hour
+
+	cache.Set("a", "b", "v1", ttl)
+	cache.Set("c", "d", "v2", ttl)
+
+	if cache.Len() != 1 {
+		t.Errorf("cache.Len() = %d, want 1", cache.Len())
 	}
 }
 
