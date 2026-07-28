@@ -1,0 +1,714 @@
+You are filing GitHub issues for the nexus-proxy repository. File ALL of the issues listed below using `gh issue create`. 
+
+**Repo**: anchapin/nexus-proxy
+**Working directory**: /home/alex/AI/nexus-proxy
+
+**IMPORTANT**: 
+- Use `gh issue create` with `--label` flags for each label
+- Use `--assignee "anchapin"` (the repo owner)
+- Do NOT use `--milestone` unless specified
+- Print the issue number and URL for each created issue
+- After ALL issues are filed, output a JSON summary array
+
+**Issues to file** (17 total — skip any already numbered like #825):
+
+---
+
+### Issue 1
+Title: `[P1] HNSW index permanently invalidated after upsert — O(n) regression`
+Body:
+```markdown
+**Focus area**: RAG & Vector Store
+**PRD phase**: Phase 5 — Intelligence/DX/Production (RAG hardening)
+**Estimated effort**: S (1 day)
+**Labels**: `bug`, `hardening`, `area:rag`, `phase:5-production`
+
+### Problem
+After any `Upsert` or `Remove` call, `upsertExample` (`rag.go:1108-1113`) and `removeExample` (`rag.go:1131-1141`) set `s.index = nil` but the lazy-rebuild promise in the comment is **never fulfilled**. `Retrieve` (`rag.go:959`) checks `s.index != nil` to decide HNSW vs brute-force — since the index stays `nil`, every subsequent retrieval falls back to O(n) brute-force for the entire process lifetime.
+
+The comment at `rag.go:1105` says "we rebuild lazily on next Retrieve if needed" but `Retrieve` (`rag.go:928`) has **no rebuild path**: it only reads `s.index` and never calls `rebuildIndex`. The `IndexModeBruteForce` returned by `IndexMode()` after an upsert (`rag_test.go:841`) is therefore **permanent**, not transitional.
+
+### Proposed solution
+1. Add a `generation` int64 field to `Store` incremented atomically on every upsert/delete.
+2. In `Retrieve`, detect a stale index (`s.index == nil && len(s.examples) >= indexThreshold`) and trigger a synchronous `rebuildIndex()` before the search — or spawn a background goroutine that rebuilds and swaps atomically.
+3. Add a `nexus_rag_index_generation` gauge to `/status` so operators can observe when the index was last rebuilt.
+
+A concrete new function: `store.maybeRebuildIndex()` called at the top of `Retrieve` before the `useIndex` decision.
+
+### Acceptance criteria
+- [ ] `TestHNSWIndexUpsertThenRetrieve_HNSWPathActive` — after `Upsert`, `IndexMode()` returns `IndexModeHNSW` (not `IndexModeBruteForce`) for stores above `indexThreshold`
+- [ ] `BenchmarkRetrieve_AfterUpsert` — p99 latency with 1000 examples after 10 upserts is within 2× of cold-start HNSW Retrieve (not O(n) brute-force)
+- [ ] `nexus_rag_index_generation` gauge increments on each upsert/delete
+- [ ] `make ci` passes with coverage ≥ 70%
+
+### References
+- `internal/rag/rag.go:1105-1113` — upsertExample nil-out + misleading comment
+- `internal/rag/rag.go:928-958` — Retrieve, no rebuild path
+- `internal/rag/rag_test.go:829-844` — `upsertInvalidatesIndexReportsBruteForce` test documents the broken behavior
+- `#420` — HNSW index original implementation
+- PRD Phase 5 — RAG hardening
+```
+Labels: bug,area:rag,phase:5-production
+
+---
+
+### Issue 2
+Title: `[P1] containsWord silently matches all prompts when keyword is empty — routing corruption`
+Body:
+```markdown
+**Focus area**: Routing Intelligence
+**PRD phase**: Phase 5 — Intelligence/DX
+**Estimated effort**: S (1 day)
+**Labels**: `bug`, `area:router`, `phase:5-intelligence`
+
+### Problem
+`containsWord` at `dsl.go:171-178` returns `true` for any string when `kw == ""`:
+
+```go
+func containsWord(s, kw string) bool {
+    if kw == "" {
+        return true  // ← matches everything
+    }
+    pattern := `(?i)\b` + regexp.QuoteMeta(kw) + `\b`
+    matched, _ := regexp.MatchString(pattern, s)
+    return matched
+}
+```
+
+`regexp.MatchString("(?i)\\b\\b", "hello")` returns `true` (double word boundary matches at string start/end), so an empty keyword matches every prompt. If any `categoryKeywords` entry ever acquires an empty string, `Categorize` would return the first matching category for **all** prompts — silently corrupting routing for the entire judge-guided adaptive system. No test in `dsl_test.go` or `confidence_test.go` guards against this.
+
+### Proposed solution
+Return `false` when `kw == ""` instead of `true`:
+
+```go
+func containsWord(s, kw string) bool {
+    if kw == "" {
+        return false  // empty keyword matches nothing
+    }
+    // ...
+}
+```
+
+Add a test case in `dsl_test.go` asserting `containsWord("anything", "") == false` and `Categorize("") != ""`.
+
+### Acceptance criteria
+- [ ] `containsWord("anything", "")` returns `false` (not `true`)
+- [ ] `Categorize("")` returns `CategoryOther` (not first matching category)
+- [ ] Existing `dsl_test.go` and `confidence_test.go` tests pass unchanged
+- [ ] `make test-race` passes with coverage ≥ 70%
+
+### References
+- `internal/router/dsl.go:171-173` — the buggy guard
+- `internal/router/confidence.go:148-157` — `Categorize` calls `containsWord`
+```
+Labels: bug,area:router,phase:5-intelligence
+
+---
+
+### Issue 3
+Title: `[P1] Auth limiter blocked requests emit no Prometheus counter — brute-force activity invisible`
+Body:
+```markdown
+**Focus area**: Security & Auth
+**PRD phase**: Phase 5 — Production hardening
+**Estimated effort**: S (1 day)
+**Labels**: `bug`, `hardening`, `area:ratelimit`, `phase:5-production`
+
+### Problem
+When `AuthLimiter.IsBlocked(ip)` returns `true` (brute-force protection triggered), the auth middleware at `internal/auth/auth.go:73-87` writes a 429 response and emits a `slog.Warn`, but **no Prometheus counter is incremented**. The `nexus_auth_limiter_blocked_ips` gauge tells operators how many IPs are currently blocked, but there is no counter for _events_: operators cannot construct a rate of blocked attempts per minute, detect a spike, or fire an alert on sudden brute-force campaigns.
+
+### Proposed solution
+1. Add `authBlockedTotal atomic.Int64` to `observability.Collector` and a `nexus_auth_limiter_blocked_total` counter in `prometheus.go`.
+2. Wire `authBlockedTotal.Inc()` into the `onBlock` callback at `cmd/nexus/main.go:1342` (where `SetOnBlock` is already called for logging).
+3. Alternatively/additionally, expose `BlockedCount()` as a Prometheus gauge with a delta over a scrape interval to derive block rate.
+
+### Acceptance criteria
+- [ ] `nexus_auth_limiter_blocked_total` counter increments each time an IP is blocked (burst threshold crossed)
+- [ ] Counter is observable via `GET /metrics` with no auth required
+- [ ] Unit test covers the path: blocked IP → `authBlockedTotal.Inc()` called
+- [ ] `make ci` passes with coverage ≥ 70%
+
+### References
+- `internal/auth/auth.go:73-87` — 429 written but `authLimiter.OnBlock()` not hooked to a Prometheus counter
+- `internal/ratelimit/auth.go:219-242` — `AuthLimiter.Wrap` has the same gap
+```
+Labels: bug,area:ratelimit,phase:5-production
+
+---
+
+### Issue 4
+Title: `[P2] PersistentStore.IndexDir bypasses NEXUS_RAG_BATCH_SIZE — silent 31× perf regression`
+Body:
+```markdown
+**Focus area**: RAG & Vector Store
+**PRD phase**: Phase 5 — Intelligence/DX/Production
+**Estimated effort**: S (1 day)
+**Labels**: `bug`, `enhancement`, `area:rag`, `phase:5-production`
+
+### Problem
+`NEXUS_RAG_BATCH_SIZE` is wired to `Store` via `WithBatchSize` (`cmd/nexus/main.go:1573,1590`), and `Store.IndexDir` (`rag.go:862-890`) correctly partitions files into batches and calls `EmbedBatch` per batch. However, `PersistentStore.IndexDir` (`sqlite.go:426-506`) **completely overrides** the embedded `Store.IndexDir` and indexes every file individually via a single `Embed` call per file, ignoring `batchSize` entirely.
+
+Result: on a cold boot with 1000 files and `NEXUS_RAG_BATCH_SIZE=32`, the persistent path makes **1000 HTTP round-trips** instead of **32** (a 31× degradation in indexing latency and Ollama load).
+
+### Proposed solution
+1. Refactor `PersistentStore.IndexDir` to:
+   - Collect all valid files first
+   - Partition into batches of `s.Store.batchSize`
+   - Call `EmbedBatch` per batch (matching `Store.IndexDir`'s logic)
+   - Call `Upsert` per batch within a single SQLite transaction
+2. Add `TestPersistentStoreIndexDir_UsesBatchEmbedding` verifying `EmbedBatch` is called (not `Embed`) when `batchSize > 0`.
+
+### Acceptance criteria
+- [ ] With `NEXUS_RAG_BATCH_SIZE=32` and 64 files, `EmbedBatch` is called exactly 2 times (not 64 times)
+- [ ] `PersistentStore.IndexDir` with `batchSize=0` continues to call `Embed` once per file (regression test)
+- [ ] `nexus_rag_retrieval_total` label `{path="brute_force"}` does not increase after cold-boot indexing completes
+- [ ] `make ci` passes with coverage ≥ 70%
+
+### References
+- `internal/rag/sqlite.go:426-506` — `PersistentStore.IndexDir` (overrides embedded method)
+- `internal/rag/rag.go:862-890` — `Store.IndexDir` (correct batch usage)
+- `cmd/nexus/main.go:1573` — `WithBatchSize` wired for persistent store
+- `#771` — batch embedding support (PR #781 merged)
+```
+Labels: bug,area:rag,phase:5-production
+
+---
+
+### Issue 5
+Title: `[P2] CachedEmbedder.EmbedBatch at 0% coverage — cache-partition correctness unverifiable`
+Body:
+```markdown
+**Focus area**: RAG & Vector Store
+**PRD phase**: Phase 5 — Intelligence/DX/Production
+**Estimated effort**: S (1 day)
+**Labels**: `enhancement`, `area:rag`, `phase:5-production`
+
+### Problem
+`CachedEmbedder.EmbedBatch` (`cache.go:97-151`) is exercised **zero times** in the test suite despite having complex logic: it partitions texts into cached/uncached, fetches uncached in one `EmbedBatch` call, then repopulates the cache with a second lock acquisition. The non-trivial double-check pattern (`cache.go:134`) — "another goroutine may have populated this key while we were fetching" — has never been exercised.
+
+### Proposed solution
+Add three tests mirroring the single-lookup coverage:
+1. `TestCachedEmbedderEmbedBatch_AllCached` — all texts hit the L1 cache, `EmbedBatch` calls zero inner calls
+2. `TestCachedEmbedderEmbedBatch_AllUncached` — all texts miss, one `EmbedBatch` call to inner, all inserted
+3. `TestCachedEmbedderEmbedBatch_PartialHit` — some texts hit, others miss; verifies partition correctness and result ordering
+
+### Acceptance criteria
+- [ ] `CachedEmbedder.EmbedBatch` coverage increases from 0% to ≥ 80%
+- [ ] `TestCachedEmbedderEmbedBatch_PartialHit` verifies result slice is in same order as input texts (the method contract explicitly guarantees ordering)
+- [ ] `make ci` passes with coverage ≥ 70%
+
+### References
+- `internal/rag/cache.go:97-151` — `CachedEmbedder.EmbedBatch` 0% coverage
+- `internal/rag/cache_test.go` — existing `Embed` tests at 87%; no `EmbedBatch` tests
+```
+Labels: enhancement,area:rag,phase:5-production
+
+---
+
+### Issue 6
+Title: `[P2] Confidence routing_outcomes table grows unbounded with no vacuum/cleanup`
+Body:
+```markdown
+**Focus area**: Routing Intelligence
+**PRD phase**: Phase 5 — Intelligence/DX
+**Estimated effort**: S (1 day)
+**Labels**: `hardening`, `area:router`, `phase:5-intelligence`
+
+### Problem
+`SQLiteConfidenceStore.RecordOutcome` (`confidence_sqlite.go:170`) inserts into `routing_outcomes` forever. `LocalConfidence` filters by a sliding window (`WHERE timestamp > ?`) but never deletes old rows. With high request volume and a 7-day window, the table accumulates thousands of rows per category. Over months of operation the `.db` file grows with no upper bound and SQLite's query planner may degrade on large tables despite the index on `(category, timestamp)`. The store has no `Close()` path that runs `PRAGMA vacuum`.
+
+### Proposed solution
+Add a row-count ceiling with periodic cleanup:
+1. A `PRAGMA vacuum` on first open (reclaim space after any prior growth)
+2. Every N inserts (e.g., every 1000), delete rows older than `2 * window` as a safety margin
+3. Expose `nexus_confidence_store_rows_total` gauge in `routemetrics.go`
+
+### Acceptance criteria
+- [ ] After 30,000 `RecordOutcome` calls, `routing_outcomes` rows older than `2*window` are deleted
+- [ ] `nexus_confidence_store_rows_total` gauge present in `/metrics`
+- [ ] `SQLiteConfidenceStore` survives `make test-race` with 10,000-record soak
+- [ ] `make ci` passes with coverage ≥ 70%
+
+### References
+- `internal/router/confidence_sqlite.go:170-197` — `RecordOutcome` insert path
+- `internal/router/confidence_sqlite.go:41-46` — `confidenceQuerySQL` sliding window filter
+- `internal/observability/routemetrics.go` — existing SLM cache metrics as a template
+```
+Labels: hardening,area:router,phase:5-intelligence
+
+---
+
+### Issue 7
+Title: `[P2] getSemantic RLock without proactive eviction — stale entries accumulate silently`
+Body:
+```markdown
+**Focus area**: Routing Intelligence
+**PRD phase**: Phase 5 — Intelligence/DX
+**Estimated effort**: S (1 day)
+**Labels**: `enhancement`, `area:router`, `phase:5-intelligence`
+
+### Problem
+`getSemantic` at `slm_cache.go:274` acquires `c.mu.RLock()` and scans all live `c.entries` for cosine similarity. Expired entries are skipped for similarity scoring (`now.Sub(entry.stamp) > c.ttl → continue`) but are **never removed** from `c.entries` or `c.expiry`. Since `getSemantic` holds an RLock (readers don't block readers), it cannot call `evictExpired` (which needs a write lock). With low request volume and long TTL, expired entries accumulate indefinitely between `Set` calls. `Stats().Expired` reports them but no metric surfaces this as a Prometheus gauge.
+
+### Proposed solution
+Add `Stale()` method to `SLMCache` returning count of expired-but-live entries. In `getSemantic`, if `Stale() > 0` after the scan, dispatch a background eviction signal. Also expose `nexus_slm_cache_stale_entries` gauge in `routemetrics.go`.
+
+### Acceptance criteria
+- [ ] `SLMCache.Stale()` returns count of expired-but-not-yet-evicted entries
+- [ ] After TTL expiry on a semantic-cache entry, `Stale()` increases by 1 and `/metrics` reflects it
+- [ ] `getSemantic` with `NEXUS_SLMCACHE_MAX_STALE=1` triggers proactive eviction on next `Get`/`getSemantic` call
+- [ ] Unit test: insert 3 entries, wait past TTL, verify `Stale() == 3` and no eviction yet
+- [ ] `make test-race` passes
+
+### References
+- `internal/router/slm_cache.go:274-313` — `getSemantic`
+- `internal/router/slm_cache.go:184-206` — `evictExpired` (write-lock only)
+- `internal/router/slm_cache.go:458-476` — `Stats()` which already computes `Expired`
+```
+Labels: enhancement,area:router,phase:5-intelligence
+
+---
+
+### Issue 8
+Title: `[P2] Non-progressive fusion Panel does not record FusionOutcomeEvent — observability gap`
+Body:
+```markdown
+**Focus area**: Upstream & Cascade
+**PRD phase**: Phase 2 — Observability & Metrics
+**Estimated effort**: S (1 day)
+**Labels**: `bug`, `area:upstream`, `phase:2-observability`
+
+### Problem
+The non-streaming/non-progressive fusion path (`upstream.Panel`) returns only `(cacheHit bool, error)` (line 528 in `upstream.go`). The chat handler (line 1469) only calls `d.ArbiterCacheObserver(cacheHit)` for this path — it never calls `d.FusionOutcomeObserver`, so `FusionOutcomeEvent` (containing `RequestID` and `ArbiterSkipped`) is never recorded for non-progressive fusion. The progressive path (`PanelStreaming`) correctly calls both observers (lines 1451–1463).
+
+This means `fusion_arbiter_skipped` and `fusion_jaccard_similarity` SQLite columns are always zero for requests in the non-progressive fusion path, making the fusion agreement rate dashboard inaccurate.
+
+### Proposed solution
+Change `Panel` signature from `(cacheHit bool, _ error)` to `(outcome PanelOutcome, cacheHit bool, _ error)`. Populate `outcome.Similarity` (always 0 for non-progressive since no similarity comparison is done), `outcome.ArbiterCacheHit`, and `outcome.ArbiterSkipped` (always `true` when cacheHit, `false` when arbiter was invoked). Update `chat.go:1478` to call `FusionOutcomeObserver.ObserveFusionOutcome` after the `Panel` call, mirroring the `PanelStreaming` path.
+
+### Acceptance criteria
+- [ ] `FusionOutcomeObserver` is called for every non-progressive fusion request with correct `ArbiterSkipped` value (true when cache hit, false when arbiter was invoked)
+- [ ] `make test-race` passes
+- [ ] `make ci` passes with coverage ≥ 70%
+
+### References
+- `internal/upstream/upstream.go:526` — Panel function signature (needs update)
+- `internal/upstream/upstream.go:514` — Panel function body (needs outcome tracking)
+- `internal/handlers/chat.go:1469` — caller of Panel (needs FusionOutcomeObserver call)
+- `internal/handlers/chat.go:277` — FusionOutcomeEvent struct
+```
+Labels: bug,area:upstream,phase:2-observability
+
+---
+
+### Issue 9
+Title: `[P2] Panel non-streaming function has zero slog visibility for non-cache-hit paths`
+Body:
+```markdown
+**Focus area**: Upstream & Cascade
+**PRD phase**: Phase 2 — Observability & Metrics
+**Estimated effort**: S (1 day)
+**Labels**: `enhancement`, `area:upstream`, `phase:2-observability`
+
+### Problem
+The `Panel` function (`upstream.go:514`) is the non-streaming/non-progressive fusion path. It has exactly **one** `slog.Info` call — the arbiter cache hit at line 599. There is zero logging for: which panel member succeeded/failed, when the arbiter was invoked (non-cache-hit path), when the arbiter returned empty synthesis, when a panel goroutine panicked (IncPanelPanics is called but not slogged). This makes production debugging of the non-progressive fusion path effectively impossible — operators must enable debug-level HTTP trace logging to understand what happened.
+
+### Proposed solution
+Add slog calls to the `Panel` function at each meaningful branch:
+1. Panel members completed — `slog.Info("fusion panel: members ready", ...)`
+2. Arbiter invoked (cache miss) — `slog.Info("fusion arbiter invoked", ...)`
+3. Arbiter returned empty synthesis — `slog.Warn("fusion arbiter returned empty synthesis", ...)`
+4. Panel goroutine panic (already calls `IncPanelPanics()`, add slog before it)
+
+Include `requestID string` parameter on `Panel` to enable log correlation (matching `PanelStreaming`'s pattern at `upstream.go:769`).
+
+### Acceptance criteria
+- [ ] `Panel` function has slog.Info/Warn calls for: panel members ready, arbiter invoked, empty synthesis, and panic recovery
+- [ ] `requestID string` parameter added to `Panel` signature (matching `PanelStreaming`)
+- [ ] All slog calls include `request_id` field for log correlation
+- [ ] `make test-race` passes
+- [ ] `make ci` passes with coverage ≥ 70%
+
+### References
+- `internal/upstream/upstream.go:514–660` — Panel function (entire body needs slog additions)
+- `internal/upstream/upstream.go:769` — PanelStreaming requestID parameter (reference for Panel update)
+- `internal/upstream/upstream.go:599` — existing single slog.Info in Panel (arbiter cache hit)
+```
+Labels: enhancement,area:upstream,phase:2-observability
+
+---
+
+### Issue 10
+Title: `[P2] APIKeyAwareKeyFunc Bearer-prefix stripping is case-sensitive — fragmented rate limits`
+Body:
+```markdown
+**Focus area**: Security & Auth
+**PRD phase**: Phase 5 — Production hardening
+**Estimated effort**: S (1 day)
+**Labels**: `bug`, `hardening`, `area:ratelimit`, `phase:5-production`
+
+### Problem
+At `internal/ratelimit/middleware.go:162`, `APIKeyAwareKeyFunc` uses `strings.TrimPrefix(auth, "Bearer ")`. This only strips the prefix when the Authorization header value begins with exactly `"Bearer "` (capital B, single space). If a client sends `"bearer mykey"` or `"BEARER MYKEY"`, `TrimPrefix` finds no match and the full string — including the scheme — is hashed as the bucket key.
+
+The result: the **same API key** behind the **same IP** occupies **different rate-limit buckets** depending on header casing, fragmenting per-client rate limits unpredictably.
+
+The auth middleware itself is case-insensitive on the scheme (`strings.EqualFold` at `internal/auth/auth.go:142`), so this inconsistency is not caught by auth tests.
+
+### Proposed solution
+Replace the case-sensitive `TrimPrefix` check at `middleware.go:162` with a case-insensitive `HasPrefix` + substring extraction:
+
+```go
+// Normalise: strip "Bearer " (case-insensitive) so "bearer mykey"
+// and "Bearer mykey" produce the same bucket key.
+if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+    key = strings.TrimSpace(auth[7:])
+}
+```
+
+### Acceptance criteria
+- [ ] `APIKeyAwareKeyFunc("10.0.0.1", reqWithHeader("bearer mykey"))` returns the same bucket key as `APIKeyAwareKeyFunc("10.0.0.1", reqWithHeader("Bearer mykey"))`
+- [ ] `APIKeyAwareKeyFunc("10.0.0.1", reqWithHeader("Bearer  mykey"))` (double space) also produces the same key
+- [ ] `TestMiddleware_APIKeyAwareKeyFunc_CaseInsensitiveBearer` added with all three cases above
+- [ ] `make ci` passes with coverage ≥ 70%
+
+### References
+- `internal/ratelimit/middleware.go:162` — `strings.TrimPrefix` is case-sensitive
+- `internal/auth/auth.go:142` — auth middleware correctly uses `EqualFold` for scheme comparison
+- `internal/ratelimit/middleware_test.go:675` — `TestMiddleware_APIKeyAwareKeyFunc_NoAuth` covers missing header, not casing
+```
+Labels: bug,area:ratelimit,phase:5-production
+
+---
+
+### Issue 11
+Title: `[P2] Auth middleware accepted-auth path never increments Prometheus counter — accepted metric always zero`
+Body:
+```markdown
+**Focus area**: Security & Auth
+**PRD phase**: Phase 5 — Production hardening
+**Estimated effort**: S (1 day)
+**Labels**: `bug`, `hardening`, `area:auth`, `phase:5-production`
+
+### Problem
+The `observability.Collector` declares `authAccepted atomic.Int64` and `nexus_auth_requests_total{outcome="accepted"}` is rendered in `prometheus.go:296-302`, but **nothing ever calls `IncAuthAccepted()`**. The auth middleware at `internal/auth/auth.go:126` calls `next.ServeHTTP(w, r)` on success and returns without invoking any observer callback.
+
+Consequently, `nexus_auth_requests_total{outcome="accepted"}` is always `0` in `/metrics` output, making it impossible for operators to compute an auth acceptance rate or chart authentications-over-time.
+
+### Proposed solution
+1. Add `IncAuthAccepted()` to the `AuthObserver` interface in `internal/auth/auth.go:28-31`.
+2. Implement it as a no-op on the existing `mockObserver` in `internal/auth/auth_test.go:255-261`.
+3. Call `m.observer.IncAuthAccepted()` on the success path at `internal/auth/auth.go:126` (after `next.ServeHTTP` or just before returning).
+4. Add `authAccepted.Inc()` in `observability.Collector`.
+
+### Acceptance criteria
+- [ ] `nexus_auth_requests_total{outcome="accepted"}` increments on each successful auth
+- [ ] `nexus_auth_requests_total{outcome="rejected_invalid"}` and `nexus_auth_requests_total{outcome="rejected_missing"}` continue to work as before
+- [ ] `TestAuthObserverAccepted` test added covering the success path
+- [ ] `make ci` passes with coverage ≥ 70%
+
+### References
+- `internal/auth/auth.go:126` — success path has no observer call
+- `internal/observability/collector.go` — `IncAuthAccepted` defined but never wired
+- `internal/observability/prometheus.go:296-302` — `nexus_auth_requests_total{outcome="accepted"}` rendered but always zero
+```
+Labels: bug,area:auth,phase:5-production
+
+---
+
+### Issue 12
+Title: `[P2] Auth limiter reaper has no Prometheus counter — idle IP accumulation unobservable`
+Body:
+```markdown
+**Focus area**: Security & Auth
+**PRD phase**: Phase 2 — Observability
+**Estimated effort**: S (1 day)
+**Labels**: `enhancement`, `area:ratelimit`, `phase:2-observability`
+
+### Problem
+The `AuthLimiter` reaper goroutine (`internal/ratelimit/auth.go:135-157`) evicts idle IPs from the `failures` map when they have been idle >10 minutes. This eviction is **completely silent** — no metric, no log, no observability signal. Operators cannot observe how many stale IPs the reaper is cleaning up per tick, whether the reaper is keeping up with the IP birth rate, or if the map is growing unbounded despite the reaper (bug).
+
+### Proposed solution
+1. Add `authReaperEvictions atomic.Int64` to `observability.Collector`.
+2. Add `nexus_auth_limiter_reaper_evictions_total` counter to `prometheus.go` with HELP text noting it counts idle IPs removed.
+3. Increment `authReaperEvictions.Inc()` inside the reaper loop each time an IP is deleted at `auth.go:149`.
+
+### Acceptance criteria
+- [ ] `nexus_auth_limiter_reaper_evictions_total` counter increments each time the reaper evicts an idle IP
+- [ ] Counter is observable via `GET /metrics` with no auth required
+- [ ] Unit test covers reaper eviction path using a manually constructed `failures` map + `reap()` call
+- [ ] `make ci` passes with coverage ≥ 70%
+
+### References
+- `internal/ratelimit/auth.go:135-157` — reaper runs silently
+- `internal/ratelimit/auth.go:148-149` — delete without any instrumentation
+```
+Labels: enhancement,area:ratelimit,phase:2-observability
+
+---
+
+### Issue 13
+Title: `[P2] AuthRateLimit fields missing from YAMLConfig — YAML operators cannot tune brute-force protection`
+Body:
+```markdown
+**Focus area**: Config & Developer Experience
+**PRD phase**: Phase 5 — DX/Production
+**Estimated effort**: S (1 day)
+**Labels**: `enhancement`, `area:config`, `phase:5-dx`
+
+### Problem
+`AuthRateLimitRPM`, `AuthRateLimitBurst`, and `AuthRateLimitWindow` (issue #296) are fully implemented in `config.go` (lines 503–505, parsed at lines 1547–1572) and documented in `.env.example` (lines 226–229), but are **absent from `YAMLConfig`** in `yaml.go`. Operators who run with `NEXUS_CONFIG_FILE=config.yaml` cannot set the auth brute-force protection parameters via YAML — the values silently fall through to hardcoded defaults (RPM=5, Burst=3, Window=5m) regardless of what is written in the YAML file.
+
+### Proposed solution
+1. Add three fields to `YAMLConfig` in `yaml.go`:
+   - `AuthRateLimitRPM int yaml:"auth_rate_limit_rpm"`
+   - `AuthRateLimitBurst int yaml:"auth_rate_limit_burst"`
+   - `AuthRateLimitWindow string yaml:"auth_rate_limit_window"`
+2. Add `env override` blocks in `LoadYAML` mirroring the pattern used for `RateLimitRPM`/`RateLimitBurst`, parsing `NEXUS_AUTH_RATE_LIMIT_RPM`, `NEXUS_AUTH_RATE_LIMIT_BURST`, and `NEXUS_AUTH_RATE_LIMIT_WINDOW`.
+3. Populate defaults in `toConfig()` using the same values as `config.go` defaults (5, 3, 5*time.Minute).
+4. Add `env_example_audit_test.go` coverage to ensure the three new `.env.example` entries are tracked bidirectionally.
+
+### Acceptance criteria
+- [ ] A YAML file containing `auth_rate_limit_rpm: 10` produces `cfg.AuthRateLimitRPM == 10` when loaded via `LoadYAML`
+- [ ] `NEXUS_AUTH_RATE_LIMIT_RPM=10` env var overrides YAML `auth_rate_limit_rpm: 5` (env always wins)
+- [ ] `make ci` passes with coverage ≥ 70%
+- [ ] `TestEnvExampleCoverage` and `TestEnvExampleHotReloadAnnotations` continue to pass
+
+### References
+- `internal/config/config.go:503–505` — struct fields
+- `internal/config/config.go:1547–1572` — env parsing
+- `internal/config/yaml.go:20–189` — `YAMLConfig` struct (missing these 3 fields)
+- `.env.example:226–229` — documented defaults
+- `#296` — original auth brute-force protection feature
+```
+Labels: enhancement,area:config,phase:5-dx
+
+---
+
+### Issue 14
+Title: `[P2] parseBoolEnvStr silent fallback on invalid YAML values — toon_unfenced: maybe passes silently`
+Body:
+```markdown
+**Focus area**: Config & Developer Experience
+**PRD phase**: Phase 5 — DX
+**Estimated effort**: S (1 day)
+**Labels**: `enhancement`, `area:config`, `phase:5-dx`
+
+### Problem
+`parseBoolEnvStr` (`yaml.go:1300–1310`) maps any unrecognised string to the supplied default value with no error, no warning, and no log. This is intentional for env vars (where the variable-not-set case must return a default), but it is problematic for YAML-sourced boolean fields: if an operator writes `toon_unfenced: maybe` in `config.yaml`, the value silently becomes `true` because `parseBoolEnvStr("maybe", true)` returns `true`. Unlike `ProviderTailWeight` (which returns an error for values outside `[0,1]`) and `PromptInjectionMode` (which fails on unknown strings), boolean YAML fields accept any string without complaint.
+
+Issue #573 was opened about this but addressed only the `parseBoolEnvStr` function in isolation. The real fix requires either (a) a dedicated YAML-boolean parser that fails on invalid values, or (b) validation in `YAMLConfig.validate()` for known boolean fields.
+
+### Proposed solution
+Create a `parseYAMLBool(v string) (bool, error)` function in `yaml.go` that returns an error for unrecognised strings (rather than a default), and use it for boolean fields where invalid values should not silently pass. Apply it to `TOONUnfenced` first as a pilot. When `parseYAMLBool` returns an error, propagate it as a boot-failing validation error from `LoadYAML`.
+
+### Acceptance criteria
+- [ ] `config.yaml` containing `toon_unfenced: maybe` causes `LoadYAML` to return a descriptive error: `"config: toon_unfenced value \"maybe\" is not recognised; want true or false"`
+- [ ] `toon_unfenced: true` and `toon_unfenced: false` continue to work correctly
+- [ ] `make ci` passes with coverage ≥ 70%
+- [ ] No regression: env var overrides of boolean fields continue to use `parseBoolEnvStr` with its silent-default behavior (preserving backward compatibility for env paths)
+
+### References
+- `internal/config/yaml.go:1300–1310` — `parseBoolEnvStr` (silent fallback)
+- `internal/config/yaml.go:862–864` — `TOONUnfenced` env override uses `parseBoolEnvStr`
+- `internal/config/yaml.go:1261–1298` — `validate()` (currently only checks negative durations/byte counts)
+- `#573` — related but only addressed the function, not the YAML path
+```
+Labels: enhancement,area:config,phase:5-dx
+
+---
+
+### Issue 15
+Title: `[P3] DSL unicodePatterns branch operates on raw prompt while other branches use lower`
+Body:
+```markdown
+**Focus area**: Routing Intelligence
+**PRD phase**: Phase 5 — Intelligence/DX
+**Estimated effort**: S (1 day)
+**Labels**: `documentation`, `area:router`, `phase:5-intelligence`
+
+### Problem
+`DSL` at `dsl.go:104` calls `lower := toUnicodeLower(prompt)` and then passes `lower` to all pattern branches **except** `unicodePatterns`:
+
+```go
+// line 104
+lower := toUnicodeLower(prompt)
+
+// lines 106-126: fusion, formatting, local — all use lower
+for _, re := range fusionPatterns {
+    if re.MatchString(lower) {  // ← uses lower
+        return RouteFusion, true
+    }
+}
+
+// lines 130-136: unicodePatterns — uses raw prompt
+for _, re := range unicodePatterns {
+    if re.MatchString(prompt) {  // ← uses raw prompt, NOT lower
+        return RouteLocal, true
+    }
+}
+```
+
+The inconsistency is not a functional bug (Unicode character classes `\p{Han}`, `\p{Arabic}` have no case variations, so case-insensitive matching is a no-op on them). However, it is misleading: a future contributor adding a new Unicode pattern might reasonably assume `lower` is used consistently, and if they added an ASCII-range Unicode category (e.g. Latin Extended) it would be silently treated differently than the other branches.
+
+### Proposed solution
+Add a godoc comment to `DSL` explicitly documenting that `unicodePatterns` intentionally operates on the raw prompt because Unicode property escapes are case-invariant. The current code is correct; it just needs a comment explaining why the asymmetry exists.
+
+### Acceptance criteria
+- [ ] `DSL` godoc explicitly documents why `unicodePatterns` uses `prompt` while other branches use `lower`
+- [ ] Existing `TestDSL` cases (chinese, arabic, mixed-ascii) still pass unchanged
+- [ ] Code comment added at `dsl.go:127-129` explaining the design intent
+- [ ] `make test-race` passes
+
+### References
+- `internal/router/dsl.go:103-138` — full `DSL` function
+- `internal/router/dsl.go:42-47` — `DefaultUnicodePatterns` definition
+- `#422` — original Unicode DSL support
+```
+Labels: documentation,area:router,phase:5-intelligence
+
+---
+
+### Issue 16
+Title: `[P3] Arbiter cache hit slog calls missing request_id — log correlation broken`
+Body:
+```markdown
+**Focus area**: Upstream & Cascade
+**PRD phase**: Phase 2 — Observability
+**Estimated effort**: S (half day)
+**Labels**: `enhancement`, `area:upstream`, `phase:2-observability`
+
+### Problem
+Two arbiter cache hit `slog.Info` calls lack the `request_id` field, making it impossible to correlate these log lines with the HTTP handler logs that DO include `request_id`:
+
+1. `upstream.go:599` — `Panel` non-streaming arbiter cache hit (also missing `requestID` parameter on the function)
+2. `upstream.go:1022` — `PanelStreaming` streaming arbiter cache hit (`PanelStreaming` has `requestID` parameter but the slog call at line 1022 doesn't use it)
+
+### Proposed solution
+1. Add `requestID string` parameter to `Panel` function signature (`upstream.go:514`) — also needed for D.2 slog additions
+2. Include `requestID` in the arbiter cache hit slog call at `upstream.go:599`
+3. Add `request_id` to the slog call at `upstream.go:1022` using the already-available `requestID` parameter
+
+### Acceptance criteria
+- [ ] `slog.Info("fusion arbiter cache hit"...)` in Panel includes `request_id` field
+- [ ] `slog.Info("fusion arbiter cache hit (streaming)"...)` in PanelStreaming includes `request_id` field
+- [ ] `make test-race` passes
+
+### References
+- `internal/upstream/upstream.go:599` — Panel arbiter cache hit (missing request_id)
+- `internal/upstream/upstream.go:1022` — PanelStreaming arbiter cache hit (requestID available but not used)
+- `internal/upstream/upstream.go:769` — PanelStreaming function signature showing requestID is already passed
+```
+Labels: enhancement,area:upstream,phase:2-observability
+
+---
+
+### Issue 17
+Title: `[P3] Cascade.Run() slog calls missing request_id — log correlation gap`
+Body:
+```markdown
+**Focus area**: Upstream & Cascade
+**PRD phase**: Phase 5 — Production observability
+**Estimated effort**: S (half day)
+**Labels**: `enhancement`, `area:upstream`, `phase:5-production`
+
+### Problem
+`Cascade.Run()` is called from the chat handler (`chat.go:1611`) where `reqID` is available. However, `Cascade.Run()` has no `requestID` parameter and its two `slog` calls — "cascade served" (`cascade.go:164`) and "cascade step failed" (`cascade.go:195`) — lack the `request_id` field. Operators debugging a cascade request must correlate handler logs (which include `request_id`) with cascade logs (which do not), using other fields like `step.Name` or `attempt`.
+
+### Proposed solution
+Add `requestID string` parameter to `Cascade.Run()` signature at `cascade.go:133`:
+
+```go
+func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client, payload map[string]interface{}, requestID string) (CascadeResult, error)
+```
+
+Include `slog.String("request_id", requestID)` in both slog calls at lines 164 and 195. Update the single caller at `chat.go:1611` to pass `reqID`.
+
+### Acceptance criteria
+- [ ] `Cascade.Run()` accepts `requestID string` parameter
+- [ ] Both slog calls in `Cascade.Run()` include `request_id` field
+- [ ] Caller at `chat.go:1611` is updated to pass `reqID`
+- [ ] `make test-race` passes
+- [ ] `make ci` passes with coverage ≥ 70%
+
+### References
+- `internal/upstream/cascade.go:133` — Cascade.Run signature (needs requestID param)
+- `internal/upstream/cascade.go:164` — slog.Info "cascade served" (needs request_id)
+- `internal/upstream/cascade.go:195` — slog.Warn "cascade step failed" (needs request_id)
+- `internal/handlers/chat.go:1611` — caller of Cascade.Run (needs reqID pass-through)
+```
+Labels: enhancement,area:upstream,phase:5-production
+
+---
+
+### Issue 18
+Title: `[P3] InjectionScanRoles silent fallback masks operator typos — inconsistent with PromptInjectionMode fail-fast`
+Body:
+```markdown
+**Focus area**: Config & Developer Experience
+**PRD phase**: Phase 5 — DX
+**Estimated effort**: S (1 day)
+**Labels**: `enhancement`, `area:config`, `phase:5-dx`
+
+### Problem
+`PromptInjectionMode` (config.go line 350) fails the boot with a clear error when the env value is unrecognised (`"off"`, `"warn"`, `"strict"` only). By contrast, `parseInjectionScanRoles` (`config.go:2018–2035`) silently returns `["system"]` for any unrecognized input — including empty string, misspellings like `"system,admin"`, or any value containing non-`system`/`user` tokens. An operator who writes `NEXUS_INJECTION_SCAN_ROLES=system,admin` in their `.env` gets zero indication that only `"system"` is being used.
+
+The silent fallback is documented, but the inconsistency with `PromptInjectionMode`'s fail-fast policy creates a DX hazard: one knob fails loudly on a typo, the other fails silently.
+
+### Proposed solution
+Add a validate/unrecognised check to `parseInjectionScanRoles` in `config.go`: if the input is non-empty AND after parsing the result is `["system"]` AND the input was not the literal string `"system"`, log a warning (not a boot-fail) indicating the unrecognized roles were ignored. This preserves backward compatibility while surfacing the misconfiguration.
+
+### Acceptance criteria
+- [ ] `NEXUS_INJECTION_SCAN_ROLES=system,admin` logs a warning at boot: `"unrecognised injection scan role(s): admin — falling back to [system]"`
+- [ ] `NEXUS_INJECTION_SCAN_ROLES=system` produces no warning (correct)
+- [ ] `NEXUS_INJECTION_SCAN_ROLES=` (empty) produces no warning (documented fallback)
+- [ ] `make ci` passes with coverage ≥ 70%
+
+### References
+- `internal/config/config.go:2018–2035` — `parseInjectionScanRoles` (silent fallback)
+- `internal/config/config.go:350` — `PromptInjectionMode` (fail-fast on unknown)
+- `.env.example:638` — documented behavior
+```
+Labels: enhancement,area:config,phase:5-dx
+
+---
+
+### Issue 19
+Title: `[P3] Store.IsBreakerOpen/RecordBreakerSuccess at 0% coverage — delegation correctness invisible`
+Body:
+```markdown
+**Focus area**: RAG & Vector Store
+**PRD phase**: Phase 5 — Intelligence/DX/Production
+**Estimated effort**: S (1 day)
+**Labels**: `enhancement`, `area:rag`, `phase:5-production`
+
+### Problem
+`Store.IsBreakerOpen` (`rag.go:1057-1062`) and `Store.RecordBreakerSuccess` (`rag.go:1067-1071`) are **at 0% coverage** despite using a type-assertion delegation pattern that could silently fail if the wrapped embedder doesn't implement the interface. The code is nil-safe (`if e, ok := ...; ok`) but correctness relies entirely on code review. The chat handler (`handlers/chat.go`) calls these on every RAG retrieval to report circuit state to Prometheus, yet the delegation has never been exercised by a test.
+
+The same gap exists for `OllamaEmbedder.IsHealthy` at 0% (`rag.go:1190`): the method checks `ctx == nil` and substitutes a 2-second timeout, but this fallback branch has never been exercised.
+
+### Proposed solution
+1. Add `TestStoreIsBreakerOpen_DelegatesToInner` — construct a `Store` wrapping a breaker stub whose `IsBreakerOpen` returns true; assert `Store.IsBreakerOpen()` propagates `true`.
+2. Add `TestStoreRecordBreakerSuccess_DelegatesToInner` — same pattern.
+3. Add `TestOllamaEmbedderIsHealthy_NilCtxUsesDefaultTimeout` — pass `nil` context and verify it does not panic and uses a default timeout.
+
+### Acceptance criteria
+- [ ] `Store.IsBreakerOpen` and `Store.RecordBreakerSuccess` coverage increases from 0% to 100%
+- [ ] `OllamaEmbedder.IsHealthy` nil-ctx branch covered by a test
+- [ ] `nexus_rag_breaker_open` gauge correctly reflects breaker state after a simulated failure
+- [ ] `make ci` passes with coverage ≥ 70%
+
+### References
+- `internal/rag/rag.go:1057-1062` — `Store.IsBreakerOpen` 0%
+- `internal/rag/rag.go:1067-1071` — `Store.RecordBreakerSuccess` 0%
+- `internal/rag/rag.go:1190-1198` — `OllamaEmbedder.IsHealthy` 0%
+- `internal/rag/rag_test.go:847-898` — `breakerStub` exists but is only used for `CachedEmbedder` tests
+```
+Labels: enhancement,area:rag,phase:5-production
+```
+
+---
+
+After filing ALL issues, output a JSON array like:
+```json
+[{"number": 829, "title": "...", "url": "..."}, ...]
+```
