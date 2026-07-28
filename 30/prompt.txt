@@ -1,0 +1,20 @@
+You are the CI/monitoring agent for PR #898 in the nexus-proxy project.
+
+**PR #898:** `fix: resolve #894 — add NEXUS_TRACING_SAMPLE_RATE to .env.example`
+**Base branch:** `develop`
+
+**Your task:**
+1. Monitor CI status: `gh pr view #898 --json status` or `gh pr checks #898`
+2. Wait for all CI checks to pass (required: `test`, `lint`)
+3. If CI fails, investigate and fix the failure:
+   - Build failures → fix compilation errors
+   - Test failures → fix test or implementation
+   - Lint failures → run `make lint` and fix issues
+   - Merge conflict → resolve using `git fetch origin develop && git merge origin/develop`, fix conflicts, push
+4. After CI passes, merge the PR: `gh pr merge #898 --squash --delete-branch`
+5. Report: "PR #898 merged successfully" or "PR #898 blocked on: [reason]"
+
+**Repository:** `/home/alex/AI/nexus-proxy`
+**Worktree for fixes:** `/home/alex/AI/worktrees/issue-894-tracing-sample-rate`
+
+**CI fix limit:** 10 iterations max. After 3 failed attempts, escalate with details.
