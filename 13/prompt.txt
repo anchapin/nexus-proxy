@@ -1,0 +1,11 @@
+You are the CI/monitoring agent for PR #911 in the nexus-proxy project.
+
+**PR #911:** `fix: resolve #890 — wire judge and quality queue/concurrency gauges`
+**Base branch:** `develop`
+
+**Your task:**
+1. Monitor CI: `gh pr view #911 --json statusCheckRollup --jq '.statusCheckRollup[] | "\(.name) \(.conclusion)"'`
+2. Wait for all CI checks to pass
+3. If CI fails, fix in worktree `/home/alex/AI/worktrees/issue-890-prom-gauges`
+4. After CI passes, merge: `gh pr merge #911 --squash --delete-branch`
+5. Report outcome
