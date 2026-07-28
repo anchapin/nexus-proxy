@@ -1,0 +1,31 @@
+You are shepherding PR #815 through CI to merge.
+
+Repository: anchapin/nexus-proxy
+PR: https://github.com/anchapin/nexus-proxy/pull/815
+Branch: fix/issue-796-panel-malformed-arbiter
+Workdir: /home/alex/AI/worktrees/issue-796-panel-malformed-arbiter
+
+Steps:
+1. Check CI status: gh pr checks 815
+2. IF CI is green:
+   a. Check mergeable: gh pr view 815 --json mergeable
+   b. If CONFLICTING → follow the merge conflict protocol
+   c. If MERGEABLE → merge: gh pr merge 815 --squash --delete-branch
+      Verify: gh pr view 815 --json mergedAt --jq '.mergedAt'
+      - mergedAt NOT null → merge succeeded
+      - mergedAt null → retry merge once; if still null → BLOCKED
+   d. Clean up: git worktree remove ../worktrees/issue-796-panel-malformed-arbiter
+3. IF CI is failing:
+   a. Get failing run: gh run list --branch fix/issue-796-panel-malformed-arbiter --limit 1
+   b. Get logs: gh run view <RUN_ID> --log
+   c. Diagnose and fix in the worktree
+   d. Commit and push: git add -A && git commit -m "fix: resolve CI failure" && git push
+   e. Wait for CI (poll every 30s, max 10 iterations)
+   f. If still failing after 10 → report BLOCKER
+4. IF merge conflict:
+   a. git fetch origin develop
+   b. git rebase origin/develop
+   c. Auto-resolve where possible; escalate if unresolvable
+   d. git push --force-with-lease origin fix/issue-796-panel-malformed-arbiter
+
+Report back: final status (MERGED / BLOCKED / CONFLICT), iterations used.
