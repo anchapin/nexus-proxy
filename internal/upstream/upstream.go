@@ -522,6 +522,7 @@ func Panel(
 	perFetchTimeout time.Duration,
 	arbiterTimeout time.Duration,
 	skipLocal bool,
+	requestID string,
 	arbiterCache *ArbiterCache,
 	arbiterCacheTTL time.Duration,
 ) (cacheHit bool, _ error) {
@@ -597,6 +598,7 @@ func Panel(
 	if arbiterCache != nil && arbiterCacheTTL > 0 {
 		if cached, ok := arbiterCache.Get(r1.Content, r2.Content); ok {
 			slog.Info("fusion arbiter cache hit",
+				slog.String("request_id", requestID),
 				slog.String("r1_source", r1.Source),
 				slog.String("r2_source", r2.Source),
 			)
@@ -782,7 +784,7 @@ func PanelStreaming(
 			localBaseURL, localModel, frontierURL, frontierKey, frontierModel,
 			arbiterURL, arbiterKey, arbiterModel,
 			body, latestPrompt, perFetchTimeout, arbiterTimeout,
-			skipLocal, arbiterCache, arbiterCacheTTL)
+			skipLocal, requestID, arbiterCache, arbiterCacheTTL)
 		if err != nil {
 			return outcome, err
 		}
@@ -1020,6 +1022,7 @@ func PanelStreaming(
 	if arbiterCache != nil && arbiterCacheTTL > 0 {
 		if cached, ok := arbiterCache.Get(first.Content, second.Content); ok {
 			slog.Info("fusion arbiter cache hit (streaming)",
+				slog.String("request_id", requestID),
 				slog.String("first_source", first.Source),
 				slog.String("second_source", second.Source),
 			)

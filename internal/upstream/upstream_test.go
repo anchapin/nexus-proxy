@@ -402,6 +402,7 @@ func TestPanelArbiterTimeoutBoundsHangingCall(t *testing.T) {
 		5*time.Second, // perFetchTimeout (panel members)
 		arbiterTO,     // arbiterTimeout
 		false,         // skipLocal
+		"test-request-id",
 		nil, 0*time.Second,
 	)
 	elapsed := time.Since(start)
@@ -457,6 +458,7 @@ func TestPanelArbiterHappyPathNoRegression(t *testing.T) {
 		5*time.Second, // perFetchTimeout
 		5*time.Second, // arbiterTimeout
 		false,         // skipLocal
+		"test-request-id",
 		nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
@@ -513,6 +515,7 @@ func TestPanelSkipLocalOmitsLocalFetch(t *testing.T) {
 		5*time.Second, // perFetchTimeout
 		5*time.Second, // arbiterTimeout
 		true,          // skipLocal
+		"test-request-id",
 		nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
@@ -563,6 +566,7 @@ func TestPanelSkipLocalArbiterPromptHasDegradedMarker(t *testing.T) {
 		"the user prompt",
 		5*time.Second, 5*time.Second,
 		true, // skipLocal
+		"test-request-id",
 		nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
@@ -827,6 +831,7 @@ func TestPanelArbiterHonorsStreamFlagFalse(t *testing.T) {
 		5*time.Second,
 		5*time.Second,
 		false, // skipLocal (issue #8)
+		"test-request-id",
 		nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
@@ -889,6 +894,7 @@ func TestPanelArbiterHonorsStreamFlagTrueRegression(t *testing.T) {
 		5*time.Second,
 		5*time.Second,
 		false, // skipLocal (issue #8)
+		"test-request-id",
 		nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
@@ -935,7 +941,7 @@ func TestPanelForwardsFrontierBearerToken(t *testing.T) {
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
 		5*time.Second, 5*time.Second,
-		false, nil, 0*time.Second,
+		false, "test-request-id", nil, 0*time.Second,
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -2033,6 +2039,7 @@ func TestPanelCacheHitStream_SetsSSEContentType(t *testing.T) {
 		"test prompt",
 		5*time.Second, 5*time.Second,
 		false,
+		"test-request-id",
 		cache, 5*time.Minute,
 	)
 	if err != nil {
@@ -2100,6 +2107,7 @@ func TestPanelCacheMissWithExpiredEntry_FallsBackToFetch(t *testing.T) {
 		"test prompt",
 		5*time.Second, 5*time.Second,
 		false,
+		"test-request-id",
 		cache, 1*time.Millisecond,
 	)
 	if err != nil {
@@ -2156,6 +2164,7 @@ func TestPanelCacheHitNonStream_SetsJSONContentType(t *testing.T) {
 		"test prompt",
 		5*time.Second, 5*time.Second,
 		false,
+		"test-request-id",
 		cache, 5*time.Minute,
 	)
 	if err != nil {
@@ -2485,6 +2494,7 @@ func TestPanel_MalformedArbiterEmptyChoices_ReturnsError(t *testing.T) {
 		5*time.Second,
 		5*time.Second,
 		false,
+		"test-request-id",
 		nil, 0*time.Second,
 	)
 	if err == nil {
@@ -2531,6 +2541,7 @@ func TestPanel_ValidArbiterResponse_ReturnsNoError(t *testing.T) {
 		5*time.Second,
 		5*time.Second,
 		false,
+		"test-request-id",
 		nil, 0*time.Second,
 	)
 	if err != nil {
@@ -2581,6 +2592,7 @@ func TestPanel_CacheHit_ReturnsNoError(t *testing.T) {
 		"test prompt",
 		5*time.Second, 5*time.Second,
 		false,
+		"test-request-id",
 		cache, 5*time.Minute,
 	)
 	if err != nil {
