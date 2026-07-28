@@ -1,0 +1,40 @@
+You are implementing a fix for GitHub issue #788: P1: streamCachedArbiterSynthesis commits headers before marshaling — marshal failure corrupts response
+
+Repository: anchapin/nexus-proxy
+Branch: fix/issue-788-streamcachedarbiter (already checked out)
+Workdir: /home/alex/AI/worktrees/issue-788-streamcachedarbiter
+
+Steps:
+1. Read the full issue: gh issue view 788
+2. Read the issue comments for additional context: gh issue view 788 --comments
+3. Analyze what code needs to change
+4. Implement the fix/feature with tests
+5. Run local checks if available (make test-race, make lint)
+6. Commit: git add -A && git commit -m "fix: resolve #788 — marshal before WriteHeader in streamCachedArbiterSynthesis"
+7. Push: git push -u origin fix/issue-788-streamcachedarbiter
+8. Open PR with an EXPLICIT body (no `--fill`):
+   ```
+   gh pr create --base develop \
+     --title "fix: resolve #788 — marshal before WriteHeader in streamCachedArbiterSynthesis" \
+     --body "$(cat <<'EOF'
+   Closes #788
+
+   Reorder marshaling before header commit in streamCachedArbiterSynthesis,
+   preventing response corruption when marshal fails after headers are sent.
+   EOF
+   )"
+   ```
+   The body must contain exactly one `Closes #N` line. Do NOT include other `#NNNN` references.
+9. Verify closingReferences count is exactly 1:
+   ```
+   bash scripts/check_pr_closing_refs.sh <PR_NUMBER> 1
+   ```
+   If the check fails, run `gh pr edit <PR> --body "Closes #N\n\n<minimal body>"` to strip spurious references, then re-run the check.
+
+Rules:
+- Work ONLY in your assigned worktree (/home/alex/AI/worktrees/issue-788-streamcachedarbiter)
+- Do NOT modify files outside the scope of this issue
+- Include tests for the fix/feature
+- Follow the repo's AGENTS.md and code style conventions
+- If the issue is unclear, add a comment asking for clarification: gh issue comment 788 -b "..."
+- Report back: PR number, files changed, any blockers encountered
