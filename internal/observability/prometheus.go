@@ -116,6 +116,10 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total telemetry records dropped because the JSONL write buffer was full.",
 		typ:  "counter",
 	},
+	"nexus_telemetry_write_errors_total": {
+		help: "Total write/flush error events in the JSONL recorder background loop (issue #795). Each increment corresponds to one failed disk write or flush that dropped buffered records.",
+		typ:  "counter",
+	},
 	"nexus_telemetry_rotations_total": {
 		help: "Total telemetry file rotations triggered by the NEXUS_TELEMETRY_MAX_BYTES size cap.",
 		typ:  "counter",
