@@ -276,7 +276,7 @@ func TestContainsWord(t *testing.T) {
 		// "unit test" is not followed by space/end in "unit tests"
 		{"multi-word phrase no match", "generate unit tests", "unit test", false},
 		{"multi-word phrase exact", "write unit test here", "unit test", true},
-		{"empty keyword", "anything", "", true},
+		{"empty keyword", "anything", "", false},
 		// Substring false-positives (no boundary)
 		{"test inside contest", "contest app", "test", false},
 		{"test inside detest", "detest this", "test", false},

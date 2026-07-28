@@ -168,7 +168,7 @@ func hasUpperUnicode(s string) bool {
 // inside "contest". The keyword kw is already lowercased by the caller.
 func containsWord(s, kw string) bool {
 	if kw == "" {
-		return true
+		return false
 	}
 	// regexp.QuoteMeta escapes all regex metacharacters, then we wrap with \b.
 	pattern := `(?i)\b` + regexp.QuoteMeta(kw) + `\b`
