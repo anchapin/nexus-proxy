@@ -201,7 +201,10 @@ type PersistentStore struct {
 // The returned store has zero examples — callers should follow up
 // with Load (or LoadOrIndex) before serving traffic so the in-memory
 // slice reflects what's already on disk.
-func OpenPersistentStore(path string, embedder Embedder, threshold float64) (*PersistentStore, error) {
+//
+// opts are applied to the embedded Store (e.g. WithBatchSize to
+// control batch embedding in IndexDir).
+func OpenPersistentStore(path string, embedder Embedder, threshold float64, opts ...StoreOption) (*PersistentStore, error) {
 	if path == "" {
 		return nil, errors.New("rag: empty persistent db path")
 	}
@@ -266,7 +269,7 @@ func OpenPersistentStore(path string, embedder Embedder, threshold float64) (*Pe
 		storePath = ""
 	}
 	return &PersistentStore{
-		Store:         NewStore(embedder, threshold),
+		Store:         NewStore(embedder, threshold, opts...),
 		db:            db,
 		path:          storePath,
 		embedderModel: embedderModel,
@@ -421,6 +424,11 @@ func (p *PersistentStore) LoadOrIndex(ctx context.Context, dir string) (int, err
 // successful embedding also lands in SQLite so the next boot can
 // skip Ollama entirely.
 //
+// When the embedded Store has batchSize > 0, files are partitioned
+// into batches and embedded via EmbedBatch (matching Store.IndexDir's
+// logic). When batchSize == 0, each file is embedded individually via
+// Embed.
+//
 // Security: symlinks are skipped (issue #107) to prevent confidentiality
 // leaks via injected few-shot examples.
 func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
@@ -444,6 +452,12 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 	if err != nil {
 		return fmt.Errorf("rag: read examples dir %q: %w", dir, err)
 	}
+
+	type fileInfo struct {
+		name    string
+		content string
+	}
+	var validFiles []fileInfo
 
 	for _, f := range files {
 		if f.IsDir() {
@@ -481,27 +495,65 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 			)
 			continue
 		}
-		emb, err := p.embedder.Embed(ctx, string(content))
-		if err != nil {
-			slog.Error("rag embed file",
-				slog.String("filename", f.Name()),
-				slog.Any("err", err),
-			)
-			continue
-		}
-		if err := p.Upsert(ctx, FewShotExample{
-			Filename:  f.Name(),
-			Content:   string(content),
-			Embedding: emb,
-		}); err != nil {
-			slog.Error("rag persist file",
-				slog.String("filename", f.Name()),
-				slog.Any("err", err),
-			)
-			continue
-		}
-		slog.Info("rag indexed", slog.String("filename", f.Name()))
+		validFiles = append(validFiles, fileInfo{name: f.Name(), content: string(content)})
 	}
+
+	if p.Store.batchSize > 0 && len(validFiles) > 0 {
+		for i := 0; i < len(validFiles); i += p.Store.batchSize {
+			end := i + p.Store.batchSize
+			if end > len(validFiles) {
+				end = len(validFiles)
+			}
+			batch := validFiles[i:end]
+			texts := make([]string, len(batch))
+			for j, fi := range batch {
+				texts[j] = fi.content
+			}
+			embs, err := p.embedder.EmbedBatch(ctx, texts)
+			if err != nil {
+				slog.Error("rag embed batch", slog.Any("err", err))
+				continue
+			}
+			for j, fi := range batch {
+				if err := p.Upsert(ctx, FewShotExample{
+					Filename:  fi.name,
+					Content:   fi.content,
+					Embedding: embs[j],
+				}); err != nil {
+					slog.Error("rag persist file",
+						slog.String("filename", fi.name),
+						slog.Any("err", err),
+					)
+					continue
+				}
+				slog.Info("rag indexed", slog.String("filename", fi.name))
+			}
+		}
+	} else {
+		for _, fi := range validFiles {
+			emb, err := p.embedder.Embed(ctx, fi.content)
+			if err != nil {
+				slog.Error("rag embed file",
+					slog.String("filename", fi.name),
+					slog.Any("err", err),
+				)
+				continue
+			}
+			if err := p.Upsert(ctx, FewShotExample{
+				Filename:  fi.name,
+				Content:   fi.content,
+				Embedding: emb,
+			}); err != nil {
+				slog.Error("rag persist file",
+					slog.String("filename", fi.name),
+					slog.Any("err", err),
+				)
+				continue
+			}
+			slog.Info("rag indexed", slog.String("filename", fi.name))
+		}
+	}
+
 	return nil
 }
 
