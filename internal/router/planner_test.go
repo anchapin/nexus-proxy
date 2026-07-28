@@ -814,6 +814,64 @@ func TestPlanner_ConfidenceThresholdHardOverride(t *testing.T) {
 			t.Errorf("Source = %q, want %q", dec.Source, SourceSLMEscalation)
 		}
 	})
+
+	t.Run("nil confidence store with threshold > 0 does not escalate (issue #928)", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		// Confidence is nil — no ConfidenceStore wired.
+		p := &Planner{
+			SLM:                 slm,
+			Confidence:          nil,
+			FusionPatterns:      fusionPatterns,
+			FormattingRegex:     formattingPatterns,
+			LocalPatternsRegex:  localPatterns,
+			ConfidenceThreshold: 0.6,
+		}
+		req := PlanRequest{
+			Prompt:          "analyze this exception that keeps happening", // no DSL match
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		// Without a ConfidenceStore, confidence defaults to NeutralConfidence (0.5)
+		// but the threshold check is guarded by p.Confidence != nil, so no escalation.
+		if dec.Route != RouteLocal {
+			t.Errorf("Route = %q, want local (nil ConfidenceStore should not escalate)", dec.Route)
+		}
+		if dec.Source != SourceSLM {
+			t.Errorf("Source = %q, want %q", dec.Source, SourceSLM)
+		}
+		if dec.Reason != "" {
+			t.Errorf("Reason = %q, want empty (no escalation)", dec.Reason)
+		}
+	})
+
+	t.Run("nil confidence store with threshold = 0 does not escalate (control)", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		p := &Planner{
+			SLM:                 slm,
+			Confidence:          nil,
+			FusionPatterns:      fusionPatterns,
+			FormattingRegex:     formattingPatterns,
+			LocalPatternsRegex:  localPatterns,
+			ConfidenceThreshold: 0, // disabled
+		}
+		req := PlanRequest{
+			Prompt:          "analyze this exception that keeps happening",
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		if dec.Route != RouteLocal {
+			t.Errorf("Route = %q, want local", dec.Route)
+		}
+		if dec.Source != SourceSLM {
+			t.Errorf("Source = %q, want %q", dec.Source, SourceSLM)
+		}
+	})
 }
 
 // stringOf returns a String of n copies of byte b. A test helper for

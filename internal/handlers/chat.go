@@ -1240,6 +1240,9 @@ func Chat(d Deps) http.Handler {
 			SLMCache:             d.SLMCache,
 			ConfidenceThreshold:  d.Config.SLMConfidenceThreshold,
 		}
+		if d.Config.SLMConfidenceThreshold > 0 && d.Confidence == nil {
+			slog.Warn("planner: ConfidenceThreshold set but no ConfidenceStore — threshold disabled")
+		}
 		decision := planner.Plan(router.PlanRequest{
 			Prompt:          latestPrompt,
 			GuardrailBudget: guardrailBudget,
