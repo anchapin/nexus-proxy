@@ -256,3 +256,29 @@ func TestConfidenceLocalConfidenceRejectsEmptyCategory(t *testing.T) {
 		t.Errorf("LocalConfidence with empty category = %v, want %v (neutral)", got, NeutralConfidence)
 	}
 }
+
+// TestConfidenceCleanupDeletesOldRows verifies that after cleanEveryN inserts,
+// rows older than 2*window are deleted (issue #834).
+func TestConfidenceCleanupDeletesOldRows(t *testing.T) {
+	window := time.Hour
+	cs, err := OpenConfidenceStore(ConfidenceConfig{
+		Path:       ":memory:",
+		MinSamples: 1,
+		Window:     window,
+	})
+	if err != nil {
+		t.Fatalf("OpenConfidenceStore: %v", err)
+	}
+	defer cs.Close()
+
+	old := time.Now().UTC().Add(-3 * window) // older than 2*window
+	for i := 0; i < cleanEveryN+10; i++ {
+		cs.recordAt("test-cleanup", RouteLocal, 3, old)
+	}
+
+	got := cs.RowsTotal()
+	if got != 10 {
+		t.Errorf("RowsTotal after %d inserts = %d, want 10 (1 old row deleted at insert 1000, then 10 more added)",
+			cleanEveryN+10, got)
+	}
+}

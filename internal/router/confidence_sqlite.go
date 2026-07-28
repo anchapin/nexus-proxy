@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// Pure-Go SQLite driver (no CGo). The same driver backs
@@ -51,6 +52,11 @@ WHERE category = ? AND route = ? AND timestamp > ?`
 // goroutine.
 const confidenceOpTimeout = 5 * time.Second
 
+// cleanEveryN is the interval (in inserts) between stale-row cleanup
+// passes. Every cleanEveryN inserts, rows older than 2*window are deleted
+// to keep the table bounded regardless of the sliding window size.
+const cleanEveryN = 1000
+
 // SQLiteConfidenceStore is the production ConfidenceStore. Writes and reads
 // are synchronous against a single-connection *sql.DB — the volume is low
 // (only ~10% of local requests are judged) so a background drain goroutine
@@ -66,6 +72,7 @@ type SQLiteConfidenceStore struct {
 	successScore int
 	minSamples   int
 	window       time.Duration
+	insertCount  int64
 
 	closeOnce sync.Once
 	closeErr  error
@@ -135,6 +142,9 @@ func OpenConfidenceStore(cfg ConfidenceConfig) (*SQLiteConfidenceStore, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("router: create confidence schema: %w", err)
 	}
+	if _, err := db.ExecContext(context.Background(), "PRAGMA vacuum"); err != nil {
+		slog.Warn("confidence: vacuum on open failed, continuing", slog.Any("err", err))
+	}
 
 	return &SQLiteConfidenceStore{
 		db:           db,
@@ -194,7 +204,23 @@ func (s *SQLiteConfidenceStore) recordAt(category string, route Route, judgeScor
 		)
 		return err
 	}
+
+	// Periodic cleanup: every cleanEveryN inserts, delete rows older than 2*window.
+	count := atomic.AddInt64(&s.insertCount, 1)
+	if count%cleanEveryN == 0 {
+		s.cleanupLocked(ctx)
+	}
+
 	return nil
+}
+
+// cleanupLocked deletes rows older than 2*window. Caller must hold the
+// context with a timeout; this method does not acquire its own context.
+func (s *SQLiteConfidenceStore) cleanupLocked(ctx context.Context) {
+	cutoff := time.Now().UTC().Add(-2 * s.window)
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM routing_outcomes WHERE timestamp < ?`, cutoff); err != nil {
+		slog.Warn("confidence: cleanup delete", slog.Any("err", err))
+	}
 }
 
 // LocalConfidence implements ConfidenceStore. Returns NeutralConfidence
@@ -302,6 +328,23 @@ func (s *SQLiteConfidenceStore) WindowStats() []CategoryStats {
 		all = append(all, CategoryStats{Category: CategoryOther})
 	}
 	return all
+}
+
+// RowsTotal returns the current number of rows in the routing_outcomes
+// table. Used by the /metrics gauge provider to expose
+// nexus_confidence_store_rows_total.
+func (s *SQLiteConfidenceStore) RowsTotal() int64 {
+	if s == nil || s.db == nil {
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), confidenceOpTimeout)
+	defer cancel()
+	var count int64
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM routing_outcomes").Scan(&count); err != nil {
+		slog.Warn("confidence: rows total", slog.Any("err", err))
+		return 0
+	}
+	return count
 }
 
 // Close closes the underlying database. Safe to call multiple times.
