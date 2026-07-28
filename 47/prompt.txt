@@ -1,0 +1,31 @@
+You are shepherding PR #820 through CI to merge.
+
+Repository: anchapin/nexus-proxy
+PR: https://github.com/anchapin/nexus-proxy/pull/820
+Branch: fix/issue-788-streamcachedarbiter
+Workdir: /home/alex/AI/worktrees/issue-788-streamcachedarbiter
+
+Steps:
+1. Check CI status: gh pr checks 820
+2. IF CI is green:
+   a. Check mergeable: gh pr view 820 --json mergeable
+   b. If CONFLICTING → follow the merge conflict protocol
+   c. If MERGEABLE → merge: gh pr merge 820 --squash --delete-branch
+      Verify: gh pr view 820 --json mergedAt --jq '.mergedAt'
+      - mergedAt NOT null → merge succeeded
+      - mergedAt null → retry merge once; if still null → BLOCKED
+   d. Clean up: git worktree remove ../worktrees/issue-788-streamcachedarbiter
+3. IF CI is failing:
+   a. Get failing run: gh run list --branch fix/issue-788-streamcachedarbiter --limit 1
+   b. Get logs: gh run view <RUN_ID> --log
+   c. Diagnose and fix in the worktree
+   d. Commit and push: git add -A && git commit -m "fix: resolve CI failure" && git push
+   e. Wait for CI (poll every 30s, max 10 iterations)
+   f. If still failing after 10 → report BLOCKER
+4. IF merge conflict:
+   a. git fetch origin develop
+   b. git rebase origin/develop
+   c. Auto-resolve where possible; escalate if unresolvable
+   d. git push --force-with-lease origin fix/issue-788-streamcachedarbiter
+
+Report back: final status (MERGED / BLOCKED / CONFLICT), iterations used.
