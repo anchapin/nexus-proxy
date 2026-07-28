@@ -404,10 +404,10 @@ type otlpArrayValue struct {
 }
 
 type otlpAttrValue struct {
-	StringValue *string        `json:"stringValue,omitempty"`
-	BoolValue   *bool         `json:"boolValue,omitempty"`
-	IntValue    *int64        `json:"intValue,omitempty"`
-	DoubleValue *float64      `json:"doubleValue,omitempty"`
+	StringValue *string         `json:"stringValue,omitempty"`
+	BoolValue   *bool           `json:"boolValue,omitempty"`
+	IntValue    *int64          `json:"intValue,omitempty"`
+	DoubleValue *float64        `json:"doubleValue,omitempty"`
 	ArrayValue  *otlpArrayValue `json:"arrayValue,omitempty"`
 }
 
