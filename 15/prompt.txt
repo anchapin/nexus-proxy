@@ -1,0 +1,11 @@
+You are the CI/monitoring agent for PR #909 in the nexus-proxy project.
+
+**PR #909:** `fix: resolve #883 — replace fmt.Printf with slog.Warn in judge sqlite writeOne`
+**Base branch:** `develop`
+
+**Your task:**
+1. Monitor CI: `gh pr view #909 --json statusCheckRollup --jq '.statusCheckRollup[] | "\(.name) \(.conclusion)"'`
+2. Wait for all CI checks to pass
+3. If CI fails, fix in worktree `/home/alex/AI/worktrees/issue-883-judge-slog`
+4. After CI passes, merge: `gh pr merge #909 --squash --delete-branch`
+5. Report outcome
