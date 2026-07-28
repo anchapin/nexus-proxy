@@ -1,0 +1,40 @@
+You are implementing a fix for GitHub issue #800: P2: EmbedCache loading-map race — ctx cancel leaves stale entries and potential goroutine leak
+
+Repository: anchapin/nexus-proxy
+Branch: fix/issue-800-embedcache-race (already checked out)
+Workdir: /home/alex/AI/worktrees/issue-800-embedcache-race
+
+Steps:
+1. Read the full issue: gh issue view 800
+2. Read the issue comments for additional context: gh issue view 800 --comments
+3. Analyze what code needs to change
+4. Implement the fix/feature with tests
+5. Run local checks if available (make test-race ./internal/rag/..., make lint)
+6. Commit: git add -A && git commit -m "fix: resolve #800 — fix EmbedCache ctx cancel stale entry leak"
+7. Push: git push -u origin fix/issue-800-embedcache-race
+8. Open PR with an EXPLICIT body (no `--fill`):
+   ```
+   gh pr create --base develop \
+     --title "fix: resolve #800 — fix EmbedCache ctx cancel stale entry leak" \
+     --body "$(cat <<'EOF'
+   Closes #800
+
+   Fix EmbedCache loading-map race where ctx cancel leaves stale entries and
+   causes goroutine leaks. Add NEXUS_EMBED_CACHE_WAIT_TIMEOUT for waiter timeout.
+   EOF
+   )"
+   ```
+   The body must contain exactly one `Closes #N` line. Do NOT include other `#NNNN` references.
+9. Verify closingReferences count is exactly 1:
+   ```
+   bash scripts/check_pr_closing_refs.sh <PR_NUMBER> 1
+   ```
+   If the check fails, run `gh pr edit <PR> --body "Closes #N\n\n<minimal body>"` to strip spurious references, then re-run the check.
+
+Rules:
+- Work ONLY in your assigned worktree (/home/alex/AI/worktrees/issue-800-embedcache-race)
+- Do NOT modify files outside the scope of this issue
+- Include tests for the fix/feature
+- Follow the repo's AGENTS.md and code style conventions
+- If the issue is unclear, add a comment asking for clarification: gh issue comment 800 -b "..."
+- Report back: PR number, files changed, any blockers encountered
