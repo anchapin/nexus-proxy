@@ -278,6 +278,11 @@ type gpuLimiter struct {
 	// ceilingPerGPU is ceiling/gpuCount rounded up; used as the
 	// default effective slots when probe returns nil/0.
 	ceilingPerGPU int
+
+	// onWait is called just before a goroutine enters cond.Wait().
+	// It is nil in production; tests set it to observe synchronization.
+	// Stored in atomic.Value (storing func()) for race-free access.
+	onWait atomic.Value // stores func()
 }
 
 // NewVRAMLimiter constructs a multi-GPU limiter (issue #775). It
@@ -407,6 +412,9 @@ func (g *gpuLimiter) tryAcquire(ctx context.Context, gpu int) (func(), bool) {
 			stop()
 			return func() { g.releaseGPU(gpu) }, true
 		}
+		if cb, ok := g.onWait.Load().(func()); ok && cb != nil {
+			cb()
+		}
 		g.slots[gpu].cond.Wait()
 	}
 }
@@ -431,6 +439,9 @@ func (g *gpuLimiter) acquireSingle(ctx context.Context, gpu int) (func(), error)
 			g.slots[gpu].mu.Unlock()
 			stop()
 			return func() { g.releaseGPU(gpu) }, nil
+		}
+		if cb, ok := g.onWait.Load().(func()); ok && cb != nil {
+			cb()
 		}
 		g.slots[gpu].cond.Wait()
 	}
