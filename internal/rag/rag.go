@@ -1190,6 +1190,19 @@ func (s *Store) rebuildIndex() {
 	}
 }
 
+// SerializeIndex serializes the current HNSW index to a blob. If the index
+// is nil but the store is large enough to warrant an index, it rebuilds first.
+// Must be called while holding the store lock.
+func (s *Store) SerializeIndex() ([]byte, error) {
+	if s.index == nil && len(s.examples) >= indexThreshold {
+		s.rebuildIndex()
+	}
+	if s.index == nil {
+		return nil, nil
+	}
+	return s.index.Serialize()
+}
+
 // maybeRebuildIndex checks whether the HNSW index needs to be rebuilt
 // after an upsert/delete invalidated it, and rebuilds it synchronously
 // if the store is large enough to warrant indexing. This is the "lazy

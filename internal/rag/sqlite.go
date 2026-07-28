@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS rag_examples (
     embedding BLOB NOT NULL,
     indexed_at DATETIME NOT NULL,
     embedder_model TEXT NOT NULL DEFAULT '',
-    dims INTEGER NOT NULL DEFAULT 0
+    dims INTEGER NOT NULL DEFAULT 0,
+    hnsw_index BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_rag_indexed_at ON rag_examples(indexed_at);
 `
@@ -59,7 +60,7 @@ const ragUpsertSQL = `INSERT INTO rag_examples
 
 const ragDeleteSQL = `DELETE FROM rag_examples WHERE filename = ?`
 
-const ragSelectAllSQL = `SELECT filename, content, embedding, indexed_at, embedder_model, dims
+const ragSelectAllSQL = `SELECT filename, content, embedding, indexed_at, embedder_model, dims, hnsw_index
     FROM rag_examples ORDER BY filename`
 
 // ragOpTimeout bounds a single DB op. The table is small and the
@@ -69,11 +70,12 @@ const ragOpTimeout = 5 * time.Second
 
 const ragSchemaVersionSQL = `CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)`
 
-const currentSchemaVersion = 2
+const currentSchemaVersion = 3
 
 var ragMigrations = []string{
 	`ALTER TABLE rag_examples ADD COLUMN embedder_model TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE rag_examples ADD COLUMN dims INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE rag_examples ADD COLUMN hnsw_index BLOB`,
 }
 
 // wrapCorruptErr wraps sqlite3 errors with a descriptive message when the
@@ -332,6 +334,7 @@ func (p *PersistentStore) Load(ctx context.Context) (int, error) {
 	out := make([]FewShotExample, 0, 64)
 	var lastIndexedAt time.Time
 	var mismatch bool
+	var hnswIndexBlob []byte
 	for rows.Next() {
 		var (
 			name        string
@@ -340,9 +343,13 @@ func (p *PersistentStore) Load(ctx context.Context) (int, error) {
 			indexedAt   time.Time
 			storedModel string
 			storedDims  int
+			hnswBlob    []byte
 		)
-		if err := rows.Scan(&name, &content, &embBlob, &indexedAt, &storedModel, &storedDims); err != nil {
+		if err := rows.Scan(&name, &content, &embBlob, &indexedAt, &storedModel, &storedDims, &hnswBlob); err != nil {
 			return 0, fmt.Errorf("rag: scan %q: %w", name, err)
+		}
+		if hnswIndexBlob == nil && len(hnswBlob) > 0 {
+			hnswIndexBlob = hnswBlob
 		}
 		emb, err := decodeEmbedding(embBlob)
 		if err != nil {
@@ -391,6 +398,11 @@ func (p *PersistentStore) Load(ctx context.Context) (int, error) {
 	p.replace(out)
 	if !lastIndexedAt.IsZero() {
 		p.markIndexed(lastIndexedAt)
+	}
+	if hnswIndexBlob != nil {
+		if err := p.restoreIndex(hnswIndexBlob); err != nil {
+			slog.Warn("rag: restore hnsw index, will rebuild lazily", slog.Any("err", err))
+		}
 	}
 	return len(out), nil
 }
@@ -636,6 +648,18 @@ func (p *PersistentStore) Close() error {
 	}
 	p.closeOnce.Do(func() {
 		if p.db != nil {
+			if p.Store != nil {
+				blob, err := p.SerializeIndex()
+				if err != nil {
+					slog.Warn("rag: serialize index on close", slog.Any("err", err))
+				} else if len(blob) > 0 {
+					ctx, cancel := context.WithTimeout(context.Background(), ragOpTimeout)
+					defer cancel()
+					if _, err := p.db.ExecContext(ctx, `UPDATE rag_examples SET hnsw_index = ?`, blob); err != nil {
+						slog.Warn("rag: save hnsw index on close", slog.Any("err", err))
+					}
+				}
+			}
 			p.closeErr = p.db.Close()
 		}
 	})
