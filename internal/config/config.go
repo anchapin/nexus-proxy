@@ -326,11 +326,12 @@ type Config struct {
 	// QualityConcurrency is positive; the chat handler treats a
 	// nil observer as "skip me" so the hot path is unaffected when
 	// the verifier is dormant.
-	QualityEnabled     bool          // true iff QualityConcurrency > 0
-	QualityConcurrency int           // max parallel verifier workers (default 2)
-	QualityQueueDepth  int           // buffered channel size (default 64)
-	QualityTimeout     time.Duration // per-check timeout (default 60s)
-	QualityStderrCap   int           // stderr bytes retained per verdict (default 2 KiB)
+	QualityEnabled         bool          // true iff QualityConcurrency > 0
+	QualityConcurrency     int           // max parallel verifier workers (default 2)
+	QualityQueueDepth      int           // buffered channel size (default 64)
+	QualityTimeout         time.Duration // per-check timeout (default 60s)
+	QualityStderrCap       int           // stderr bytes retained per verdict (default 2 KiB)
+	QualityDroppedRingSize int           // ring buffer capacity for dropped events (default 16)
 
 	// Middleware prompts
 	MetaPrompt   string // appended to system prompt by prompt_engine
@@ -1412,6 +1413,12 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.QualityStderrCap = stderrCap
+
+	droppedRingSize, err := getEnvInt("NEXUS_QUALITY_DROPED_RING_SIZE", 16)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.QualityDroppedRingSize = droppedRingSize
 
 	cfg.QualityEnabled = cfg.QualityConcurrency > 0
 
