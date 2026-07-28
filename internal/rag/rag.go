@@ -491,17 +491,17 @@ type InjectionSkipRecorder interface {
 }
 
 type StoreStats struct {
-	LastIndexAt       time.Time
-	RetrievalAttempts uint64
-	RetrievalHits     uint64
-	RetrievalMisses   uint64
-	EmptyStoreMisses  uint64
-	ThresholdMisses   uint64
-	EmbedErrors       uint64
-	CacheHits         uint64
-	CacheMisses       uint64
+	LastIndexAt               time.Time
+	RetrievalAttempts         uint64
+	RetrievalHits             uint64
+	RetrievalMisses           uint64
+	EmptyStoreMisses          uint64
+	ThresholdMisses           uint64
+	EmbedErrors               uint64
+	CacheHits                 uint64
+	CacheMisses               uint64
 	InjectionSkippedSizeLimit uint64
-	IndexGeneration   int64
+	IndexGeneration           int64
 }
 
 // Store holds the indexed few-shot examples.
