@@ -12,8 +12,9 @@ import (
 // so tests can assert that the cache skips the inner embedder on a
 // cache hit.
 type countingEmbedder struct {
-	mu    sync.Mutex
-	calls map[string]int
+	mu         sync.Mutex
+	calls      map[string]int
+	batchCalls int
 }
 
 func newCountingEmbedder() *countingEmbedder {
@@ -32,6 +33,7 @@ func (c *countingEmbedder) Embed(_ context.Context, text string) ([]float64, err
 func (c *countingEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.batchCalls++
 	for _, text := range texts {
 		c.calls[text]++
 	}
@@ -60,6 +62,12 @@ func (c *countingEmbedder) totalCalls() int {
 		total += n
 	}
 	return total
+}
+
+func (c *countingEmbedder) batchCallCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.batchCalls
 }
 
 // --- tests ---
@@ -214,6 +222,123 @@ func TestCachedEmbedderCacheStatsNoEmbedCache(t *testing.T) {
 	}
 	if count := cached.EmbedHitCount(); count != 0 {
 		t.Errorf("EmbedHitCount = %d, want 0", count)
+	}
+}
+
+func TestCachedEmbedderEmbedBatch_AllCached(t *testing.T) {
+	inner := newCountingEmbedder()
+	cached := NewCachedEmbedder(inner, 64)
+
+	ctx := context.Background()
+	texts := []string{"alpha", "beta", "gamma"}
+
+	for _, text := range texts {
+		_, _ = cached.Embed(ctx, text)
+	}
+	if inner.totalCalls() != 3 {
+		t.Fatalf("after seeding cache: inner calls = %d, want 3", inner.totalCalls())
+	}
+
+	result, err := cached.EmbedBatch(ctx, texts)
+	if err != nil {
+		t.Fatalf("EmbedBatch: %v", err)
+	}
+	if inner.batchCallCount() != 0 {
+		t.Errorf("after all-cached EmbedBatch: batch calls = %d, want 0", inner.batchCallCount())
+	}
+	if len(result) != len(texts) {
+		t.Fatalf("result length = %d, want %d", len(result), len(texts))
+	}
+	for i, text := range texts {
+		if result[i] == nil {
+			t.Errorf("result[%d] is nil, want non-nil", i)
+			continue
+		}
+		expected := []float64{float64(len(text)), 0, 0}
+		if len(result[i]) != len(expected) {
+			t.Errorf("result[%d] len = %d, want %d", i, len(result[i]), len(expected))
+			continue
+		}
+		for j, v := range expected {
+			if result[i][j] != v {
+				t.Errorf("result[%d][%d] = %v, want %v", i, j, result[i][j], v)
+			}
+		}
+	}
+}
+
+func TestCachedEmbedderEmbedBatch_AllUncached(t *testing.T) {
+	inner := newCountingEmbedder()
+	cached := NewCachedEmbedder(inner, 64)
+
+	ctx := context.Background()
+	texts := []string{"alpha", "beta", "gamma"}
+
+	result, err := cached.EmbedBatch(ctx, texts)
+	if err != nil {
+		t.Fatalf("EmbedBatch: %v", err)
+	}
+	if inner.batchCallCount() != 1 {
+		t.Errorf("after all-uncached EmbedBatch: batch calls = %d, want 1", inner.batchCallCount())
+	}
+	if len(result) != len(texts) {
+		t.Fatalf("result length = %d, want %d", len(result), len(texts))
+	}
+	for i, text := range texts {
+		expected := []float64{float64(len(text)), 0, 0}
+		if len(result[i]) != len(expected) {
+			t.Errorf("result[%d] len = %d, want %d", i, len(result[i]), len(expected))
+			continue
+		}
+		for j, v := range expected {
+			if result[i][j] != v {
+				t.Errorf("result[%d][%d] = %v, want %v", i, j, result[i][j], v)
+			}
+		}
+	}
+
+	_, _ = cached.EmbedBatch(ctx, texts)
+	if inner.batchCallCount() != 1 {
+		t.Errorf("after second EmbedBatch (all cached): batch calls = %d, want 1", inner.batchCallCount())
+	}
+}
+
+func TestCachedEmbedderEmbedBatch_PartialHit(t *testing.T) {
+	inner := newCountingEmbedder()
+	cached := NewCachedEmbedder(inner, 64)
+
+	ctx := context.Background()
+
+	_, _ = cached.Embed(ctx, "alpha")
+
+	texts := []string{"alpha", "beta", "gamma", "alpha"}
+
+	result, err := cached.EmbedBatch(ctx, texts)
+	if err != nil {
+		t.Fatalf("EmbedBatch: %v", err)
+	}
+	if inner.batchCallCount() != 1 {
+		t.Errorf("after partial-hit EmbedBatch: batch calls = %d, want 1 (only beta,gamma fetched)", inner.batchCallCount())
+	}
+	if len(result) != len(texts) {
+		t.Fatalf("result length = %d, want %d", len(result), len(texts))
+	}
+
+	for i, text := range texts {
+		if result[i] == nil {
+			t.Errorf("result[%d] is nil, want non-nil", i)
+			continue
+		}
+		expected := []float64{float64(len(text)), 0, 0}
+		if len(result[i]) != len(expected) {
+			t.Errorf("result[%d] len = %d, want %d", i, len(result[i]), len(expected))
+			continue
+		}
+		for j, v := range expected {
+			if result[i][j] != v {
+				t.Errorf("result[%d][%d] = %v, want %v", i, j, result[i][j], v)
+			}
+		}
 	}
 }
 
