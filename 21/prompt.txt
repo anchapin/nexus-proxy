@@ -1,0 +1,25 @@
+You are implementing GitHub issue #884 in a dedicated worktree.
+
+**Issue #884: Add slog visibility to Panel when arbiter synthesis returns empty**
+
+**Area:** area:upstream, phase:2-observability
+
+**Problem:** In `Panel` (line 686-692), when the arbiter returns an empty synthesis string, the code logs a WARN without the `request_id` attribute that every other log line carries. Also lacks DEBUG-level visibility into what the arbiter returned.
+
+**Acceptance criteria:**
+- Empty-synthesis WARN log carries `request_id`
+- A DEBUG-level log emits the (truncated) synthesis text when it is empty
+- No behavioral change for non-empty synthesis paths
+- Existing tests pass
+
+**Worktree:** `/home/alex/AI/worktrees/issue-884-panel-slog`
+
+**Your task:**
+1. Find the Panel code in `internal/upstream/upstream.go` around lines 686-692
+2. Update the `slog.Warn` to include `slog.String("request_id", requestID)` alongside `r1_source`, `r2_source`
+3. Add a `slog.Debug` that emits the truncated synthesis text when it is empty
+4. Verify existing tests still pass: `make build && make test`
+5. Commit: `fix: resolve #884 — add request_id to empty-synthesis WARN and debug visibility`
+6. Push: `git push -u origin fix/issue-884-panel-slog`
+7. Create PR targeting `develop`: `Closes #884`
+8. Report PR number
