@@ -1162,6 +1162,7 @@ func main() {
 		MiddlewareChain:         mwChain,
 		ContextAwareRAG:         ctxAwareRAG,
 		Confidence:              confidenceObs,
+		ConfidenceErrorHook:     func(category string, err error) { circuitCollector.IncConfidenceError() },
 		SLMCache:                slmCache,
 		JudgeObserver:           judgeObs,
 		QualityObserver:         qualityO,

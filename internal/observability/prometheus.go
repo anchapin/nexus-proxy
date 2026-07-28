@@ -271,6 +271,11 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total IPs blocked by the auth brute-force limiter (burst threshold crossed), by reason (issue #831/#937).",
 		typ:  "counter",
 	},
+	// Confidence store error counter (issue #927).
+	"nexus_confidence_errors_total": {
+		help: "Total LocalConfidence errors in the planner where the SQLite confidence store returned an error (DB locked, query failed, etc.).",
+		typ:  "counter",
+	},
 }
 
 // RenderPrometheus writes the full /metrics body in Prometheus
@@ -444,6 +449,11 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 			{value: "missing", n: c.authBlockedTotal["missing"].Load()},
 			{value: "invalid", n: c.authBlockedTotal["invalid"].Load()},
 		})
+
+	// Confidence store error counter (issue #927).
+	writeCounter(w, "nexus_confidence_errors_total",
+		"Total LocalConfidence errors in the planner where the SQLite confidence store returned an error (DB locked, query failed, etc.).",
+		c.ConfidenceErrors())
 
 	// --- Histograms -----------------------------------------------------
 
