@@ -1,0 +1,41 @@
+You are implementing a fix for GitHub issue #802: P3: SQLiteConfidenceStore.LocalConfidence silently coerces empty category to CategoryOther
+
+Repository: anchapin/nexus-proxy
+Branch: fix/issue-802-sqlite-confidence-store (already checked out)
+Workdir: /home/alex/AI/worktrees/issue-802-sqlite-confidence-store
+
+Steps:
+1. Read the full issue: gh issue view 802
+2. Read the issue comments for additional context: gh issue view 802 --comments
+3. Analyze what code needs to change
+4. Implement the fix/feature with tests
+5. Run local checks if available (make test-race, make lint)
+6. Commit: git add -A && git commit -m "fix: resolve #802 — return error on empty category in LocalConfidence"
+7. Push: git push -u origin fix/issue-802-sqlite-confidence-store
+8. Open PR with an EXPLICIT body (no `--fill`):
+   ```
+   gh pr create --base develop \
+     --title "fix: resolve #802 — return error on empty category in LocalConfidence" \
+     --body "$(cat <<'EOF'
+   Closes #802
+
+   LocalConfidence now returns (NeutralConfidence, error) when called with
+   an empty category string, instead of silently coercing to CategoryOther.
+   Also adds a compile-time assertion that Categorize never returns "".
+   EOF
+   )"
+   ```
+   The body must contain exactly one `Closes #N` line. Do NOT include other `#NNNN` references.
+9. Verify closingReferences count is exactly 1:
+   ```
+   bash scripts/check_pr_closing_refs.sh <PR_NUMBER> 1
+   ```
+   If the check fails, run `gh pr edit <PR> --body "Closes #N\n\n<minimal body>"` to strip spurious references, then re-run the check.
+
+Rules:
+- Work ONLY in your assigned worktree (/home/alex/AI/worktrees/issue-802-sqlite-confidence-store)
+- Do NOT modify files outside the scope of this issue
+- Include tests for the fix/feature
+- Follow the repo's AGENTS.md and code style conventions
+- If the issue is unclear, add a comment asking for clarification: gh issue comment 802 -b "..."
+- Report back: PR number, files changed, any blockers encountered
