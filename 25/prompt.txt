@@ -1,0 +1,11 @@
+You are the CI/monitoring agent for PR #903 in the nexus-proxy project.
+
+**PR #903:** `fix: resolve #888 — make CacheStats() use atomic loads`
+**Base branch:** `develop`
+
+**Your task:**
+1. Monitor CI: `gh pr view #903 --json statusCheckRollup --jq '.statusCheckRollup[] | "\(.name) \(.conclusion)"'`
+2. Wait for all CI checks to pass
+3. If CI fails, fix the issue in worktree `/home/alex/AI/worktrees/issue-888-cache-stats-racy`
+4. After CI passes, merge: `gh pr merge #903 --squash --delete-branch`
+5. Report outcome
