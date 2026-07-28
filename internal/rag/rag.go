@@ -871,7 +871,17 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 			}
 			embs, err := s.embedder.EmbedBatch(ctx, texts)
 			if err != nil {
-				slog.Error("rag embed batch", slog.Any("err", err))
+				// Partial batch: entries were appended to s.examples but
+				// upsertExample was never called, so the HNSW index is stale.
+				// Invalidate it so Retrieve falls back to brute-force.
+				s.mu.Lock()
+				s.index = nil
+				s.mu.Unlock()
+				slog.Warn("rag embed batch failed, HNSW index invalidated",
+					slog.Any("err", err),
+					slog.Int("batchStart", i),
+					slog.Int("batchLen", len(batch)),
+				)
 				continue
 			}
 			s.mu.Lock()
