@@ -58,16 +58,20 @@ var version = "dev"
 var commit = "unknown"
 
 // circuitBreakerAdapter bridges the chat handler's CircuitBreakerObserver
-// calls into the observability Collector (issue #304).
+// calls into the observability Collector (issue #304, #886).
 type circuitBreakerAdapter struct {
 	recordFailure      func(string)
 	recordRecovery     func(string)
 	incEmbedderFailure func(string)
+	incRAGCircuitTrip  func(string)
+	incRAGCircuitRecov func(string)
 }
 
 func (a circuitBreakerAdapter) RecordCircuitFailure(circuit string)  { a.recordFailure(circuit) }
 func (a circuitBreakerAdapter) RecordCircuitRecovery(circuit string) { a.recordRecovery(circuit) }
 func (a circuitBreakerAdapter) IncEmbedderFailure(kind string)       { a.incEmbedderFailure(kind) }
+func (a circuitBreakerAdapter) IncRAGCircuitTrip(kind string)        { a.incRAGCircuitTrip(kind) }
+func (a circuitBreakerAdapter) IncRAGCircuitRecover(kind string)     { a.incRAGCircuitRecov(kind) }
 
 func main() {
 	startTime := time.Now()
@@ -1097,6 +1101,8 @@ func main() {
 		recordFailure:      circuitCollector.RecordCircuitFailure,
 		recordRecovery:     circuitCollector.RecordCircuitRecovery,
 		incEmbedderFailure: circuitCollector.IncEmbedderFailure,
+		incRAGCircuitTrip:  circuitCollector.IncRAGCircuitTrip,
+		incRAGCircuitRecov: circuitCollector.IncRAGCircuitRecover,
 	}
 
 	chatHandler := handlers.Chat(handlers.Deps{

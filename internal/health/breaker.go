@@ -144,3 +144,24 @@ func RegisterBreaker(kind string, brk *Breaker) {
 	defer mu.Unlock()
 	breakers[kind] = brk
 }
+
+// BreakerState holds the current state of a circuit breaker for observability purposes.
+type BreakerState struct {
+	State        int32 // 0=closed, 1=half_open, 2=open
+	FailureCount int32
+}
+
+// GetBreakerStates returns a snapshot of all registered breaker states.
+// Used by the observability package to expose RAG circuit breaker metrics (issue #886).
+func GetBreakerStates() map[string]BreakerState {
+	mu.RLock()
+	defer mu.RUnlock()
+	result := make(map[string]BreakerState, len(breakers))
+	for kind, brk := range breakers {
+		result[kind] = BreakerState{
+			State:        brk.State(),
+			FailureCount: brk.FailureCount(),
+		}
+	}
+	return result
+}
