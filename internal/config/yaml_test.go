@@ -767,6 +767,66 @@ toon_unfenced: false
 	}
 }
 
+func TestLoadYAMLTOONUnfencedInvalidValue(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	yamlContent := `
+toon_unfenced: maybe
+`
+	if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := LoadYAML(path)
+	if err == nil {
+		t.Fatal("LoadYAML: expected error for toon_unfenced: maybe, got nil")
+	}
+	if got := err.Error(); got != `config: toon_unfenced value "maybe" is not recognised; want true or false` {
+		t.Errorf("error = %q, want %q", got, `config: toon_unfenced value "maybe" is not recognised; want true or false`)
+	}
+}
+
+func TestParseYAMLBool(t *testing.T) {
+	tests := []struct {
+		input   string
+		wantVal bool
+		wantErr bool
+	}{
+		{"true", true, false},
+		{"false", false, false},
+		{"1", true, false},
+		{"0", false, false},
+		{"yes", true, false},
+		{"no", false, false},
+		{"on", true, false},
+		{"off", false, false},
+		{"True", true, false},
+		{"FALSE", false, false},
+		{"  yes  ", true, false},
+		{"maybe", false, true},
+		{"certainly", false, true},
+		{"", false, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := parseYAMLBool(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("parseYAMLBool(%q) = _, nil; want error", tt.input)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("parseYAMLBool(%q) = _, %v; want no error", tt.input, err)
+				}
+				if got != tt.wantVal {
+					t.Errorf("parseYAMLBool(%q) = %v; want %v", tt.input, got, tt.wantVal)
+				}
+			}
+		})
+	}
+}
+
 func TestLoadYAMLCascadeMaxResponseBytesEnvOverridesYAML(t *testing.T) {
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "config.yaml")

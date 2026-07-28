@@ -203,6 +203,14 @@ func LoadYAML(path string) (Config, error) {
 		return Config{}, fmt.Errorf("config: cannot read config.yaml %q: %w", path, err)
 	}
 
+	// Pre-pass: inspect raw YAML values for boolean fields that must be
+	// valid bools. This catches "toon_unfenced: maybe" before yaml.Unmarshal
+	// silently leaves the field at its zero value (false), which would then
+	// be incorrectly interpreted as the default.
+	if err := validateRawBoolFields(data); err != nil {
+		return Config{}, err
+	}
+
 	var yc YAMLConfig
 	if err := yaml.Unmarshal(data, &yc); err != nil {
 		return Config{}, fmt.Errorf("config: cannot unmarshal config.yaml %q: %w", path, err)
@@ -1316,6 +1324,51 @@ func (yc YAMLConfig) validate() error {
 		}
 	}
 	return nil
+}
+
+// validateRawBoolFields checks that boolean fields in the raw YAML data
+// contain valid bool values. It uses a map unmarshal to inspect raw values
+// before the real struct unmarshal, so invalid values like "maybe" for a
+// bool field are caught and reported rather than silently becoming the zero
+// value (which would then be misinterpreted as the default).
+func validateRawBoolFields(data []byte) error {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil // yaml parse error will be caught by the real unmarshal
+	}
+
+	// TOONUnfenced: reject non-bool values
+	if v, ok := raw["toon_unfenced"]; ok {
+		switch v := v.(type) {
+		case bool:
+			// valid
+		case string:
+			// Try to parse as bool; reject if unrecognized
+			if _, err := parseYAMLBool(v); err != nil {
+				return fmt.Errorf("config: toon_unfenced %s", err.Error())
+			}
+		default:
+			// Also catch int/float etc that yaml.Unmarshal accepted
+			return fmt.Errorf("config: toon_unfenced value %v is not a boolean", v)
+		}
+	}
+
+	return nil
+}
+
+// parseYAMLBool parses a boolean value from a YAML field string and returns
+// an error for unrecognized strings (unlike parseBoolEnvStr which silently
+// falls back to the default). Used for YAML fields where invalid values
+// should fail-fast rather than silently passing.
+func parseYAMLBool(v string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1", "yes", "on":
+		return true, nil
+	case "false", "0", "no", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("value %q is not recognised; want true or false", v)
+	}
 }
 
 // parseBoolEnvStr is like parseBoolEnv but takes the raw string directly.
