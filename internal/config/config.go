@@ -504,16 +504,6 @@ type Config struct {
 	AuthRateLimitBurst  int
 	AuthRateLimitWindow time.Duration // window for auth failure tracking (default 5 min)
 
-	// Distributed tracing OTLP exporter timeout (issue #804). Bounds
-	// each POST to the collector; a stalled collector that honours
-	// TCP keepalive but never responds causes the exporter's context
-	// to hang indefinitely without this cap. The default 10s is
-	// conservative for local collectors; operators with high-latency
-	// collectors (e.g. multi-region aggregators, TLS handshake delay)
-	// can increase this via NEXUS_TRACING_TIMEOUT. 0 falls back to
-	// the default.
-	TracingTimeout time.Duration
-
 	// Readiness mode for /readyz (issue #302). Controls whether the
 	// readiness probe returns 503 when Ollama is down (strict) or
 	// always returns 200 while surfacing the degraded flag (degraded,
@@ -1245,21 +1235,6 @@ func Load() (Config, error) {
 	}
 	cfg.LocalCooldown = localCooldown
 
-	// Distributed tracing OTLP exporter timeout (issue #804). Default 10s;
-	// zero falls back to the default so the knob can never accidentally
-	// disable the exporter's timeout.
-	tracingTimeout, err := getEnvDuration("NEXUS_TRACING_TIMEOUT", DefaultTracingTimeout)
-	if err != nil {
-		return cfg, err
-	}
-	if tracingTimeout < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT must not be negative, got %s", tracingTimeout)
-	}
-	if tracingTimeout == 0 {
-		tracingTimeout = DefaultTracingTimeout
-	}
-	cfg.TracingTimeout = tracingTimeout
-
 	// Hard request-body cap (issue #11). Default 1 MiB matches typical
 	// OpenAI-compatible request sizes; the chat handler wraps r.Body
 	// with http.MaxBytesReader so an oversized POST is rejected with
@@ -1607,25 +1582,22 @@ func Load() (Config, error) {
 	// (NewExporter returns nil, RegisterExporter is never called).
 	cfg.TracingEndpoint = getEnvAllowEmpty("NEXUS_TRACING_ENDPOINT", "")
 
-	tracingTimeout, err := getEnvDuration("NEXUS_TRACING_TIMEOUT", 10*time.Second)
-	if err != nil {
-		return cfg, err
-	}
+	tracingTimeout := time.Duration(0)
+	tracingTimeout, err = getEnvDuration("NEXUS_TRACING_TIMEOUT", 10*time.Second)
 	if tracingTimeout < 0 {
 		tracingTimeout = 10 * time.Second
 	}
 	cfg.TracingTimeout = tracingTimeout
 
-	tracingQueueSize, err := getEnvInt("NEXUS_TRACING_QUEUE_SIZE", 256)
-	if err != nil {
-		return cfg, err
-	}
+	tracingQueueSize := 0
+	tracingQueueSize, err = getEnvInt("NEXUS_TRACING_QUEUE_SIZE", 256)
 	if tracingQueueSize < 0 {
 		tracingQueueSize = 256
 	}
 	cfg.TracingQueueSize = tracingQueueSize
 
-	tracingSampleRate, err := getEnvFloat("NEXUS_TRACING_SAMPLE_RATE", 1.0)
+	tracingSampleRate := 0.0
+	tracingSampleRate, err = getEnvFloat("NEXUS_TRACING_SAMPLE_RATE", 1.0)
 	if err != nil {
 		return cfg, err
 	}
