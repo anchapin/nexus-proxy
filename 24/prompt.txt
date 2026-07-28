@@ -1,0 +1,11 @@
+You are the CI/monitoring agent for PR #905 in the nexus-proxy project.
+
+**PR #905:** `feat(quality): ring buffer for dropped verifier events (issue #887)`
+**Base branch:** `develop`
+
+**Your task:**
+1. Monitor CI: `gh pr view #905 --json statusCheckRollup --jq '.statusCheckRollup[] | "\(.name) \(.conclusion)"'`
+2. Wait for all CI checks to pass
+3. If CI fails, fix the issue in worktree `/home/alex/AI/worktrees/issue-887-quality-dropped`
+4. After CI passes, merge: `gh pr merge #905 --squash --delete-branch`
+5. Report outcome
