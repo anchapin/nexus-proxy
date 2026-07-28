@@ -991,10 +991,10 @@ func TestRenderPrometheusAuthLimiterGauges(t *testing.T) {
 	}
 
 	// Record failures for two IPs; one reaches burst threshold.
-	al.RecordFailure("10.0.0.1")
-	al.RecordFailure("10.0.0.1")
-	al.RecordFailure("10.0.0.1") // burst reached → blocked
-	al.RecordFailure("10.0.0.2") // below burst → not blocked
+	al.RecordFailure("10.0.0.1", "missing")
+	al.RecordFailure("10.0.0.1", "missing")
+	al.RecordFailure("10.0.0.1", "missing") // burst reached → blocked
+	al.RecordFailure("10.0.0.2", "missing") // below burst → not blocked
 
 	sb.Reset()
 	RenderPrometheus(&sb, c, provider)
@@ -1043,13 +1043,16 @@ func TestRenderPrometheusAuthLimiterGaugesAbsentWhenDisabled(t *testing.T) {
 
 // TestRenderPrometheusAuthLimiterBlockedCounter verifies that the
 // nexus_auth_limiter_blocked_total counter is rendered correctly
-// after IncAuthBlocked calls (issue #831).
+// with reason labels after IncAuthBlocked calls (issues #831/#937).
 func TestRenderPrometheusAuthLimiterBlockedCounter(t *testing.T) {
 	c := NewCollector()
 
-	c.IncAuthBlocked()
-	c.IncAuthBlocked()
-	c.IncAuthBlocked()
+	// 2 missing, 3 invalid
+	c.IncAuthBlocked("missing")
+	c.IncAuthBlocked("missing")
+	c.IncAuthBlocked("invalid")
+	c.IncAuthBlocked("invalid")
+	c.IncAuthBlocked("invalid")
 
 	var sb strings.Builder
 	RenderPrometheus(&sb, c)
@@ -1058,7 +1061,8 @@ func TestRenderPrometheusAuthLimiterBlockedCounter(t *testing.T) {
 	wantLines := []string{
 		"# HELP nexus_auth_limiter_blocked_total",
 		"# TYPE nexus_auth_limiter_blocked_total counter",
-		"nexus_auth_limiter_blocked_total 3",
+		`nexus_auth_limiter_blocked_total{reason="missing"} 2`,
+		`nexus_auth_limiter_blocked_total{reason="invalid"} 3`,
 	}
 	for _, want := range wantLines {
 		if !strings.Contains(out, want) {

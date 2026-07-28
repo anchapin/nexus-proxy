@@ -196,9 +196,10 @@ type Collector struct {
 	// failures map.
 	authReaperEvictions atomic.Uint64
 
-	// Auth limiter blocked counter (issue #831). Incremented each time
+	// Auth limiter blocked counter (issue #831/#937). Incremented each time
 	// an IP is blocked (burst threshold crossed) by the auth limiter.
-	authBlockedTotal atomic.Uint64
+	// Keyed by reason: "missing" or "invalid".
+	authBlockedTotal map[string]*atomic.Uint64
 
 	// Rate-limit counters are emitted per bucket (global / per_client)
 	// so operators can tell at a glance whether the global bucket or a
@@ -315,6 +316,10 @@ func NewCollector() *Collector {
 		stageSLM:         NewHistogram(DefaultBuckets),
 		stageUpstream:    NewHistogram(DefaultBuckets),
 		embedderFailures: make(map[string]*atomic.Uint64),
+		authBlockedTotal: map[string]*atomic.Uint64{
+			"missing": {},
+			"invalid": {},
+		},
 	}
 	// Pre-allocate SLM confidence histograms for each known category
 	// (issue #425). Pre-allocation means ObserveSLMConfidence only
@@ -547,8 +552,10 @@ func (c *Collector) IncAuthRejectedMissing() { c.authRejectedMissing.Add(1) }
 func (c *Collector) IncAuthReaperEvictions() { c.authReaperEvictions.Add(1) }
 
 // IncAuthBlocked records one auth limiter block event — an IP that
-// crossed the burst threshold and is now blocked (issue #831).
-func (c *Collector) IncAuthBlocked() { c.authBlockedTotal.Add(1) }
+// crossed the burst threshold and is now blocked (issue #831/#937).
+// reason is "missing" or "invalid", indicating which auth failure type
+// accumulated to the burst threshold.
+func (c *Collector) IncAuthBlocked(reason string) { c.authBlockedTotal[reason].Add(1) }
 
 // AuthAuthenticatedClients returns the cumulative count of accepted
 // authentications. The /metrics renderer exposes it under the gauge

@@ -363,7 +363,7 @@ func TestAuthLimiterBlockedIP(t *testing.T) {
 
 	blockedIP := "203.0.113.50"
 	for i := 0; i < 3; i++ {
-		al.RecordFailure(blockedIP)
+		al.RecordFailure(blockedIP, "missing")
 	}
 	if !al.IsBlocked(blockedIP) {
 		t.Fatal("IP should be blocked after 3 failures")
@@ -451,7 +451,7 @@ func TestAuthLimiterExemptPathBypassesLimiter(t *testing.T) {
 	m := NewMiddleware("secret-key", exempt, al, nil)
 
 	clientIP := "192.0.2.10"
-	al.RecordFailure(clientIP)
+	al.RecordFailure(clientIP, "invalid")
 	if !al.IsBlocked(clientIP) {
 		t.Fatal("IP should be blocked after 1 failure with burst=1")
 	}
@@ -493,7 +493,7 @@ func TestAuthLimiterCorrectTokenNoRecord(t *testing.T) {
 }
 
 // TestAuthLimiterOnBlockCallback verifies that the SetOnBlock callback is
-// invoked when the burst threshold is crossed (issue #831). The callback
+// invoked when the burst threshold is crossed (issue #831/#937). The callback
 // fires each time the failure count reaches the burst threshold.
 func TestAuthLimiterOnBlockCallback(t *testing.T) {
 	resolver := ratelimit.NewClientIPResolver(nil)
@@ -501,18 +501,18 @@ func TestAuthLimiterOnBlockCallback(t *testing.T) {
 	// burst=3: onBlock fires on the 3rd RecordFailure
 	al := ratelimit.NewAuthLimiter(60, 3, 5*time.Minute, resolver)
 	calls := 0
-	al.SetOnBlock(func() { calls++ })
+	al.SetOnBlock(func(reason string) { calls++ })
 
 	clientIP := "198.51.100.5"
-	al.RecordFailure(clientIP)
+	al.RecordFailure(clientIP, "missing")
 	if calls != 0 {
 		t.Errorf("onBlock callback calls after 1 failure (burst=3) = %d, want 0", calls)
 	}
-	al.RecordFailure(clientIP)
+	al.RecordFailure(clientIP, "missing")
 	if calls != 0 {
 		t.Errorf("onBlock callback calls after 2 failures (burst=3) = %d, want 0", calls)
 	}
-	al.RecordFailure(clientIP)
+	al.RecordFailure(clientIP, "missing")
 	if calls != 1 {
 		t.Errorf("onBlock callback calls after 3rd failure (burst=3) = %d, want 1", calls)
 	}
@@ -520,19 +520,19 @@ func TestAuthLimiterOnBlockCallback(t *testing.T) {
 	// burst=2: onBlock fires on 2nd RecordFailure
 	al2 := ratelimit.NewAuthLimiter(60, 2, 5*time.Minute, resolver)
 	calls2 := 0
-	al2.SetOnBlock(func() { calls2++ })
-	al2.RecordFailure(clientIP)
+	al2.SetOnBlock(func(reason string) { calls2++ })
+	al2.RecordFailure(clientIP, "invalid")
 	if calls2 != 0 {
 		t.Errorf("onBlock callback calls before threshold = %d, want 0", calls2)
 	}
-	al2.RecordFailure(clientIP)
+	al2.RecordFailure(clientIP, "invalid")
 	if calls2 != 1 {
 		t.Errorf("onBlock callback calls after reaching burst=2 = %d, want 1", calls2)
 	}
 	// Each subsequent failure within the window also fires onBlock since
-	// len(f.ts) remains >= burst (2), so callers that want "once per
+	// the same reason count remains >= burst (2), so callers that want "once per
 	// blocked transition" must de-duplicate at their level.
-	al2.RecordFailure(clientIP)
+	al2.RecordFailure(clientIP, "invalid")
 	if calls2 != 2 {
 		t.Errorf("onBlock callback calls after 3rd failure (burst=2) = %d, want 2", calls2)
 	}
@@ -540,22 +540,22 @@ func TestAuthLimiterOnBlockCallback(t *testing.T) {
 
 // TestAuthLimiterOnBlockCallbackFiresEachThresholdCrossing verifies that
 // onBlock fires each time the failure count re-enters the blocked state
-// (issue #831). This is the underlying mechanism that increments the
+// (issue #831/#937). This is the underlying mechanism that increments the
 // nexus_auth_limiter_blocked_total counter.
 func TestAuthLimiterOnBlockCallbackFiresEachThresholdCrossing(t *testing.T) {
 	resolver := ratelimit.NewClientIPResolver(nil)
 	al := ratelimit.NewAuthLimiter(60, 2, 5*time.Minute, resolver)
 	calls := 0
-	al.SetOnBlock(func() { calls++ })
+	al.SetOnBlock(func(reason string) { calls++ })
 
 	ip := "203.0.2.1"
-	al.RecordFailure(ip)
-	al.RecordFailure(ip) // burst reached → onBlock fires (calls=1)
+	al.RecordFailure(ip, "missing")
+	al.RecordFailure(ip, "missing") // burst reached → onBlock fires (calls=1)
 
 	// Subsequent failures within window also trigger onBlock since
-	// len(f.ts) >= burst is still true.
+	// the same reason count >= burst is still true.
 	for i := 0; i < 4; i++ {
-		al.RecordFailure(ip)
+		al.RecordFailure(ip, "missing")
 	}
 	// calls = 1 (2nd failure) + 4 (subsequent) = 5
 	if calls != 5 {

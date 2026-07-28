@@ -1445,9 +1445,9 @@ func main() {
 				cfg.AuthRateLimitWindow,
 				ipResolver,
 			)
-			authLimiter.SetOnBlock(func() {
+			authLimiter.SetOnBlock(func(reason string) {
 				routeCounters.ObserveRejection(handlers.RejectionAuthRateLimit)
-				circuitCollector.IncAuthBlocked()
+				circuitCollector.IncAuthBlocked(reason)
 			})
 			authLimiter.SetOnReap(func() {
 				routeCounters.IncAuthReaperEvictions()

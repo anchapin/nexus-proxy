@@ -130,7 +130,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			}
 			if m.authLimiter != nil && m.authLimiter.Enabled() {
 				ip := m.resolver.Resolve(r)
-				m.authLimiter.RecordFailure(ip)
+				m.authLimiter.RecordFailure(ip, "missing")
 			}
 			return
 		}
@@ -149,7 +149,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			}
 			if m.authLimiter != nil && m.authLimiter.Enabled() {
 				ip := m.resolver.Resolve(r)
-				m.authLimiter.RecordFailure(ip)
+				m.authLimiter.RecordFailure(ip, "invalid")
 			}
 			return
 		}
