@@ -875,6 +875,9 @@ func main() {
 			slog.Duration("ttl", cfg.ArbiterCacheTTL),
 			slog.Int("max_entries", cfg.ArbiterCacheMaxEntries),
 		)
+		arbiterCache.SetEvictionObserver(func(reason string) {
+			routeCounters.ObserveArbiterCacheEviction(reason)
+		})
 	}
 	mux.Handle("/metrics", routeCounters.Handler())
 	slog.Info("metrics endpoint serves prometheus text format",
