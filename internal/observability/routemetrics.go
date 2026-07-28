@@ -193,6 +193,13 @@ type RouteCounters struct {
 	// the other map-based counters.
 	localCooldownTriggers uint64
 
+	// DSL fast-pass counters (issue #875). dslHits is keyed by reason
+	// ("fusion", "formatting", "local", "unicode"); dslMisses is a
+	// single counter incremented when DSL had no opinion and the
+	// request fell through to SLM.
+	dslHits   map[string]*uint64
+	dslMisses *uint64
+
 	// collector is an optional Collector whose CircuitBreakerGauges()
 	// are merged into the /metrics output when non-nil.
 	collector *Collector
@@ -208,6 +215,7 @@ func NewRouteCounters() *RouteCounters {
 	cHits, cMisses := uint64(0), uint64(0)
 	ragHits := uint64(0)
 	slmEmbedErrs := uint64(0)
+	dslMisses := uint64(0)
 	return &RouteCounters{
 		routeDecisions:           make(map[counterKey]*uint64),
 		slmDecisions:             make(map[counterKey]*uint64),
@@ -228,6 +236,8 @@ func NewRouteCounters() *RouteCounters {
 		ragCacheHits:             &cHits,
 		ragCacheMisses:           &cMisses,
 		promptInjectionHits:      make(map[string]*uint64),
+		dslHits:                  make(map[string]*uint64),
+		dslMisses:                &dslMisses,
 	}
 }
 
@@ -489,6 +499,34 @@ func (rc *RouteCounters) IncAuthReaperEvictions() {
 	if rc.collector != nil {
 		rc.collector.IncAuthReaperEvictions()
 	}
+}
+
+// ObserveDSLHit records a DSL fast-pass hit (issue #875). reason is the
+// DSL category that matched: "fusion", "formatting", "local", or "unicode".
+// Safe for concurrent use; nil receivers and empty reason are no-ops.
+func (rc *RouteCounters) ObserveDSLHit(reason string) {
+	if rc == nil || reason == "" {
+		return
+	}
+	rc.mu.Lock()
+	p, ok := rc.dslHits[reason]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.dslHits[reason] = p
+	}
+	rc.mu.Unlock()
+	atomic.AddUint64(p, 1)
+}
+
+// ObserveDSLMiss records one DSL fast-pass miss — the DSL had no opinion
+// and the request fell through to the SLM (issue #875). Safe for concurrent
+// use; nil receivers are no-ops.
+func (rc *RouteCounters) ObserveDSLMiss() {
+	if rc == nil || rc.dslMisses == nil {
+		return
+	}
+	atomic.AddUint64(rc.dslMisses, 1)
 }
 
 // slmCacheEvictionSlot returns the *uint64 for the SLM cache eviction
@@ -970,6 +1008,13 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += n
 	}
+	// DSL fast-pass counters (issue #875): nexus_router_dsl_hits_total{reason}
+	// and nexus_router_dsl_misses_total.
+	if n, err := writeDSLHitSeries(w, rc.dslHits, rc.dslMisses); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
 	return total, nil
 }
 
@@ -1228,6 +1273,50 @@ func writeArbiterCacheEvictionsSeries(w io.Writer, evictions map[string]*uint64)
 		}
 		total += int64(n)
 	}
+
+	return total, nil
+}
+
+// writeDSLHitSeries emits the DSL fast-pass counters (issue #875):
+//   - nexus_router_dsl_hits_total{reason}  (reason: fusion, formatting, local, unicode)
+//   - nexus_router_dsl_misses_total       (unlabelled)
+//
+// Output is sorted by reason label for deterministic scrape diffs.
+func writeDSLHitSeries(w io.Writer, hits map[string]*uint64, misses *uint64) (int64, error) {
+	var total int64
+
+	// DSL hits family
+	n, err := fmt.Fprintf(w, "# HELP nexus_router_dsl_hits_total DSL fast-pass hits by reason (issue #875).\n# TYPE nexus_router_dsl_hits_total counter\n")
+	if err != nil {
+		return total, err
+	}
+	total += int64(n)
+
+	// Collect and sort keys for deterministic output
+	keys := make([]string, 0, len(hits))
+	for k := range hits {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := atomic.LoadUint64(hits[k])
+		n, err := fmt.Fprintf(w, "nexus_router_dsl_hits_total{reason=%q} %d\n", k, v)
+		if err != nil {
+			return total, err
+		}
+		total += int64(n)
+	}
+
+	// DSL misses family (unlabelled)
+	missesVal := uint64(0)
+	if misses != nil {
+		missesVal = atomic.LoadUint64(misses)
+	}
+	n, err = fmt.Fprintf(w, "# HELP nexus_router_dsl_misses_total DSL fast-pass misses — no pattern matched, fell through to SLM (issue #875).\n# TYPE nexus_router_dsl_misses_total counter\nnexus_router_dsl_misses_total %d\n", missesVal)
+	if err != nil {
+		return total, err
+	}
+	total += int64(n)
 
 	return total, nil
 }

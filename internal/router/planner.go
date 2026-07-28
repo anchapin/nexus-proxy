@@ -288,10 +288,11 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	if len(unicodePatterns) == 0 {
 		unicodePatterns = DefaultUnicodePatterns
 	}
-	if r, hit := DSL(req.Prompt, fusionPatterns, formattingPatterns, localPatterns, unicodePatterns); hit {
+	if r, reason, hit := DSL(req.Prompt, fusionPatterns, formattingPatterns, localPatterns, unicodePatterns); hit {
 		return Decision{
 			Route:           r,
 			Source:          SourceDSL,
+			Reason:          reason, // DSL fast-pass reason: fusion, formatting, local, unicode
 			Confidence:      NeutralConfidence,
 			EstimatedTokens: estimatedTokens,
 			BudgetSource:    req.GuardrailSource,

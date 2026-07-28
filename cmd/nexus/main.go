@@ -893,6 +893,17 @@ func main() {
 		} else {
 			routeCounters.ObserveSLMCacheMiss()
 		}
+		// Issue #875: record DSL fast-pass hits and misses.
+		// e.Source == "dsl" when the DSL matched; e.Reason carries the
+		// category (fusion, formatting, local, unicode).
+		if e.Source == "dsl" {
+			routeCounters.ObserveDSLHit(e.Reason)
+		}
+		// e.DSLMiss is true when the DSL had no opinion and the request
+		// fell through to the SLM.
+		if e.DSLMiss {
+			routeCounters.ObserveDSLMiss()
+		}
 	})
 	// Rejection observer (issue #119). The chat handler dispatches
 	// one RejectionEvent per early-return path; the closure forwards
