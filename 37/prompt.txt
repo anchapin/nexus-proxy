@@ -1,0 +1,39 @@
+You are implementing a fix for GitHub issue #847: [P2] Auth middleware accepted-auth path never increments Prometheus counter — accepted metric always zero
+
+Repository: anchapin/nexus-proxy
+Branch: fix/issue-847-auth-accepted-metric (already checked out)
+Workdir: /home/alex/AI/worktrees/issue-847-auth-accepted-metric
+
+Steps:
+1. Read the full issue: gh issue view 847
+2. Read the issue comments for additional context: gh issue view 847 --comments
+3. Analyze what code needs to change
+4. Implement the fix/feature with tests
+5. Run local checks if available (make test-fast, make lint)
+6. Commit: git add -A && git commit -m "{fix|feat}: resolve #847 — add IncAuthAccepted to auth middleware and Collector"
+7. Push: git push -u origin fix/issue-847-auth-accepted-metric
+8. Open PR with an EXPLICIT body (no `--fill` — see PR-body conventions):
+   ```
+   gh pr create --base develop \
+     --title "fix: resolve #847 — add IncAuthAccepted to auth middleware and Collector" \
+     --body "$(cat <<'EOF'
+Closes #847
+
+Add IncAuthAccepted() call to the auth middleware success path and implement it in the Collector so the nexus_auth_requests_total{outcome="accepted"} Prometheus metric actually increments on successful authentication.
+EOF
+   )"
+   The body must contain exactly one `Closes #N` line. Do NOT include other `#NNNN` references in the body or title.
+9. Verify closingReferences count is exactly 1:
+   ```
+   bash /home/alex/AI/nexus-proxy/scripts/check_pr_closing_refs.sh <PR_NUMBER> 1
+   ```
+   If the check fails, run `gh pr edit <PR> --body "Closes #847\n\n<minimal body>"`
+   to strip the spurious references, then re-run the check.
+
+Rules:
+- Work ONLY in your assigned worktree (/home/alex/AI/worktrees/issue-847-auth-accepted-metric)
+- Do NOT modify files outside the scope of this issue
+- Include tests for the fix/feature if the repo has a test suite
+- Follow the repo's AGENTS.md and code style conventions
+- If the issue is unclear, add a comment asking for clarification: gh issue comment 847 -b "..."
+- Report back: PR number, files changed, any blockers encountered
