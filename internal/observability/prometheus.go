@@ -140,6 +140,10 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Current number of trace spans waiting in the exporter buffer (issue #596). Gives operators early warning of exporter saturation before nexus_tracing_dropped_total begins incrementing.",
 		typ:  "gauge",
 	},
+	"nexus_tracing_batch_size": {
+		help: "Configured OTLP tracing batch size (issue #826). Shows the cap set via NEXUS_TRACING_BATCH_SIZE, not the current fill level.",
+		typ:  "gauge",
+	},
 	// Issue #70: live middleware gauges. These come from backing
 	// sources (rate-limit bucket count, budget running total) at
 	// scrape time rather than from per-request events, so they are

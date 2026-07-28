@@ -524,6 +524,7 @@ type Config struct {
 	TracingEndpoint   string
 	TracingTimeout    time.Duration
 	TracingQueueSize  int
+	TracingBatchSize  int
 	TracingSampleRate float64
 }
 
@@ -1614,6 +1615,13 @@ func Load() (Config, error) {
 		tracingQueueSize = 256
 	}
 	cfg.TracingQueueSize = tracingQueueSize
+
+	tracingBatchSize := 0
+	tracingBatchSize, _ = getEnvInt("NEXUS_TRACING_BATCH_SIZE", 64)
+	if tracingBatchSize < 1 {
+		tracingBatchSize = 64
+	}
+	cfg.TracingBatchSize = tracingBatchSize
 
 	tracingSampleRate := 0.0
 	tracingSampleRate, _ = getEnvFloat("NEXUS_TRACING_SAMPLE_RATE", 1.0)

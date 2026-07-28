@@ -192,6 +192,7 @@ type YAMLConfig struct {
 	TracingEndpoint   string  `yaml:"tracing_endpoint"`
 	TracingTimeout    string  `yaml:"tracing_timeout"`
 	TracingQueueSize  int     `yaml:"tracing_queue_size"`
+	TracingBatchSize  int     `yaml:"tracing_batch_size"`
 	TracingSampleRate float64 `yaml:"tracing_sample_rate"`
 }
 
@@ -1055,6 +1056,16 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.TracingQueueSize = n
 	}
+	if v := os.Getenv("NEXUS_TRACING_BATCH_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_BATCH_SIZE: %w", err)
+		}
+		if n < 1 {
+			n = 64
+		}
+		cfg.TracingBatchSize = n
+	}
 	if v := os.Getenv("NEXUS_TRACING_SAMPLE_RATE"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
@@ -1227,6 +1238,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		TracingEndpoint:   yc.stringDefault(yc.TracingEndpoint, ""),
 		TracingTimeout:    yc.durationDefault(yc.TracingTimeout, 10*time.Second),
 		TracingQueueSize:  yc.intDefault(yc.TracingQueueSize, 256),
+		TracingBatchSize:  yc.intDefault(yc.TracingBatchSize, 64),
 		TracingSampleRate: yc.floatDefault(yc.TracingSampleRate, 1.0),
 	}
 
