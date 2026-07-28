@@ -3,7 +3,7 @@
   "checkpoint_id": "01KYM281JY30A8VC73RDQ116DE",
   "strategy": "manual-commit",
   "branch": "docs/update-agents-md",
-  "checkpoints_count": 35,
+  "checkpoints_count": 36,
   "files_touched": [
     "AGENTS.md"
   ],
@@ -252,13 +252,20 @@
       "compact_transcript": "/34/transcript.jsonl",
       "content_hash": "/34/content_hash.txt",
       "prompt": "/34/prompt.txt"
+    },
+    {
+      "metadata": "/35/metadata.json",
+      "transcript": "/35/full.jsonl",
+      "compact_transcript": "/35/transcript.jsonl",
+      "content_hash": "/35/content_hash.txt",
+      "prompt": "/35/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 1154403,
-    "cache_creation_tokens": 1530048,
-    "cache_read_tokens": 143876817,
-    "output_tokens": 314261,
-    "api_call_count": 1440
+    "input_tokens": 1209806,
+    "cache_creation_tokens": 1587326,
+    "cache_read_tokens": 150330858,
+    "output_tokens": 330452,
+    "api_call_count": 1510
   }
 }
