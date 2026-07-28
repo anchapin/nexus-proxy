@@ -703,6 +703,7 @@ func TestBufferedFetchForcesStreamFalseOnWire(t *testing.T) {
 		seenBody = string(b)
 		return &http.Response{
 			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
 			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"ok"}}]}`)),
 		}, nil
 	})}
@@ -724,6 +725,7 @@ func TestBufferedFetchSetsBearerWhenKeySet(t *testing.T) {
 		seenAuth = r.Header.Get("Authorization")
 		return &http.Response{
 			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
 			Body:       io.NopCloser(strings.NewReader(`{}`)),
 		}, nil
 	})}
@@ -770,6 +772,30 @@ func TestBufferedFetchRejectsInvalidJSON(t *testing.T) {
 	}
 	// Status must not have been written — the harness would otherwise
 	// receive a 200 with an HTML body, which is the worst-case mix.
+	if rw.status != 0 {
+		t.Errorf("status written before validation: %d", rw.status)
+	}
+}
+
+// TestBufferedFetchRejectsContentTypeMismatch reproduces issue #930: a 200 OK
+// response with Content-Type: text/html must be rejected before JSON parsing
+// and return ErrUpstreamContentTypeMismatch. The response writer must not
+// receive any WriteHeader call.
+func TestBufferedFetchRejectsContentTypeMismatch(t *testing.T) {
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/html"}},
+			Body:       io.NopCloser(strings.NewReader("<html>oops</html>")),
+		}, nil
+	})}
+	rw := newJSONRW()
+	err := BufferedFetch(rw, client, "http://x", "", nil)
+	if !errors.Is(err, ErrUpstreamContentTypeMismatch) {
+		t.Fatalf("BufferedFetch error = %v, want ErrUpstreamContentTypeMismatch", err)
+	}
+	// Status must not have been written — the harness would otherwise
+	// receive a 200 with an HTML body.
 	if rw.status != 0 {
 		t.Errorf("status written before validation: %d", rw.status)
 	}
