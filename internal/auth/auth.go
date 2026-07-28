@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"github.com/anchapin/nexus-proxy/internal/ratelimit"
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
 // AuthObserver is the interface for receiving auth lifecycle callbacks.
@@ -69,9 +70,29 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var span *tracing.Span
+		if tracing.Enabled() {
+			r2, s := tracing.StartSpanFromContext(r.Context(), "auth.check")
+			span = s
+			r = r.WithContext(r2)
+			defer span.End()
+		}
+
+		exempt := m.exempt != nil && m.exempt(r)
+		token := BearerToken(r)
+		tokenPresent := token != ""
+
+		if span != nil {
+			span.SetAttr("auth.exempt", exempt)
+			span.SetAttr("auth.token_present", tokenPresent)
+		}
+
 		if m.authLimiter != nil && m.authLimiter.Enabled() {
 			ip := m.resolver.Resolve(r)
 			if m.authLimiter.IsBlocked(ip) {
+				if span != nil {
+					span.SetAttr("auth.outcome", "reject")
+				}
 				w.Header().Set("Content-Type", "application/json")
 				w.Header().Set("Retry-After", "60")
 				w.WriteHeader(http.StatusTooManyRequests)
@@ -89,12 +110,17 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			}
 		}
 
-		if m.exempt != nil && m.exempt(r) {
+		if exempt {
+			if span != nil {
+				span.SetAttr("auth.outcome", "accept")
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
-		token := BearerToken(r)
 		if token == "" {
+			if span != nil {
+				span.SetAttr("auth.outcome", "reject")
+			}
 			w.Header().Set("WWW-Authenticate", `Bearer realm="nexus-proxy"`)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
@@ -111,6 +137,9 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		// Use crypto/subtle.ConstantTimeCompare to prevent timing attacks
 		// (issue #228). The == 0 return value means the strings differ.
 		if subtle.ConstantTimeCompare([]byte(token), []byte(m.key)) == 0 {
+			if span != nil {
+				span.SetAttr("auth.outcome", "invalid")
+			}
 			w.Header().Set("WWW-Authenticate", `Bearer realm="nexus-proxy", error="invalid_token"`)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
@@ -123,6 +152,9 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 				m.authLimiter.RecordFailure(ip)
 			}
 			return
+		}
+		if span != nil {
+			span.SetAttr("auth.outcome", "accept")
 		}
 		next.ServeHTTP(w, r)
 		if m.observer != nil {

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/ratelimit"
+	"github.com/anchapin/nexus-proxy/internal/tracingtest"
 )
 
 // okHandler is a simple 200-OK handler used across tests.
@@ -559,5 +560,163 @@ func TestAuthLimiterOnBlockCallbackFiresEachThresholdCrossing(t *testing.T) {
 	// calls = 1 (2nd failure) + 4 (subsequent) = 5
 	if calls != 5 {
 		t.Errorf("onBlock calls after 6 total failures = %d, want 5", calls)
+	}
+}
+
+// TestAuthSpanAttributesOnAccept verifies that when auth succeeds, it emits
+// an "auth.check" span with auth.exempt=false, auth.token_present=true,
+// and auth.outcome="accept" (issue #936).
+func TestAuthSpanAttributesOnAccept(t *testing.T) {
+	m := NewMiddleware("secret-key", nil, nil, nil)
+
+	// Set up a tracing collector to capture spans.
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+	defer exp.Close()
+
+	h := m.Wrap(okHandler())
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer secret-key")
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("request should succeed, got %d", rec.Code)
+	}
+
+	// Close the exporter to drain the queue before checking spans.
+	if err := exp.Close(); err != nil {
+		t.Fatalf("exporter Close: %v", err)
+	}
+
+	// Verify the span was captured with the correct attributes.
+	span := coll.FindSpan(t, "auth.check")
+	if span == nil {
+		t.Fatal("no auth.check span found in captured spans")
+	}
+	if exempt := tracingtest.AttrBool(span, "auth.exempt"); exempt {
+		t.Errorf("auth.exempt = true, want false")
+	}
+	if tokenPresent := tracingtest.AttrBool(span, "auth.token_present"); !tokenPresent {
+		t.Errorf("auth.token_present = false, want true")
+	}
+	if outcome := tracingtest.AttrString(span, "auth.outcome"); outcome != "accept" {
+		t.Errorf("auth.outcome = %q, want %q", outcome, "accept")
+	}
+}
+
+// TestAuthSpanAttributesOnRejectMissing verifies that when auth fails due
+// to missing token, it emits an "auth.check" span with auth.outcome="reject"
+// (issue #936).
+func TestAuthSpanAttributesOnRejectMissing(t *testing.T) {
+	m := NewMiddleware("secret-key", nil, nil, nil)
+
+	// Set up a tracing collector to capture spans.
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+	defer exp.Close()
+
+	h := m.Wrap(okHandler())
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("request should be rejected, got %d", rec.Code)
+	}
+
+	// Close the exporter to drain the queue before checking spans.
+	if err := exp.Close(); err != nil {
+		t.Fatalf("exporter Close: %v", err)
+	}
+
+	// Verify the span was captured with the correct attributes.
+	span := coll.FindSpan(t, "auth.check")
+	if span == nil {
+		t.Fatal("no auth.check span found in captured spans")
+	}
+	if outcome := tracingtest.AttrString(span, "auth.outcome"); outcome != "reject" {
+		t.Errorf("auth.outcome = %q, want %q", outcome, "reject")
+	}
+}
+
+// TestAuthSpanAttributesOnRejectInvalid verifies that when auth fails due
+// to invalid token, it emits an "auth.check" span with auth.outcome="invalid"
+// (issue #936).
+func TestAuthSpanAttributesOnRejectInvalid(t *testing.T) {
+	m := NewMiddleware("secret-key", nil, nil, nil)
+
+	// Set up a tracing collector to capture spans.
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+	defer exp.Close()
+
+	h := m.Wrap(okHandler())
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer wrong-key")
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("request should be rejected, got %d", rec.Code)
+	}
+
+	// Close the exporter to drain the queue before checking spans.
+	if err := exp.Close(); err != nil {
+		t.Fatalf("exporter Close: %v", err)
+	}
+
+	// Verify the span was captured with the correct attributes.
+	span := coll.FindSpan(t, "auth.check")
+	if span == nil {
+		t.Fatal("no auth.check span found in captured spans")
+	}
+	if outcome := tracingtest.AttrString(span, "auth.outcome"); outcome != "invalid" {
+		t.Errorf("auth.outcome = %q, want %q", outcome, "invalid")
+	}
+}
+
+// TestAuthSpanAttributesOnExempt verifies that when a request is exempt
+// from auth, it emits an "auth.check" span with auth.exempt=true and
+// auth.outcome="accept" (issue #936).
+func TestAuthSpanAttributesOnExempt(t *testing.T) {
+	exempt := func(r *http.Request) bool {
+		return r.URL.Path == "/healthz"
+	}
+	m := NewMiddleware("secret-key", exempt, nil, nil)
+
+	// Set up a tracing collector to capture spans.
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+	defer exp.Close()
+
+	h := m.Wrap(okHandler())
+
+	req := httptest.NewRequest("GET", "/healthz", nil)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("request should succeed, got %d", rec.Code)
+	}
+
+	// Close the exporter to drain the queue before checking spans.
+	if err := exp.Close(); err != nil {
+		t.Fatalf("exporter Close: %v", err)
+	}
+
+	// Verify the span was captured with the correct attributes.
+	span := coll.FindSpan(t, "auth.check")
+	if span == nil {
+		t.Fatal("no auth.check span found in captured spans")
+	}
+	if exemptAttr := tracingtest.AttrBool(span, "auth.exempt"); !exemptAttr {
+		t.Errorf("auth.exempt = false, want true")
+	}
+	if outcome := tracingtest.AttrString(span, "auth.outcome"); outcome != "accept" {
+		t.Errorf("auth.outcome = %q, want %q", outcome, "accept")
 	}
 }

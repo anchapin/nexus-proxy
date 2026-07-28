@@ -9,6 +9,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/tracing"
+	"github.com/anchapin/nexus-proxy/internal/tracingtest"
 )
 
 func TestMiddleware_Disabled_Passthrough(t *testing.T) {
@@ -904,6 +907,200 @@ func TestMiddleware_Concurrent_IPvsAPIKey(t *testing.T) {
 			t.Errorf("API-key-aware: expected 50 buckets (one per IP+key), got %d", m.BucketCount())
 		}
 	})
+}
+
+// TestMiddleware_RejectedSpanHasRateLimitAttributes verifies that when the
+// middleware rejects a request with 429, it emits a "ratelimit.check"
+// span with ratelimit.allowed=false and ratelimit.key_type="ip"
+// attributes (issue #936).
+func TestMiddleware_RejectedSpanHasRateLimitAttributes(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 1, resolver, nil) // burst 1
+
+	// Set up a tracing collector to capture spans.
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+
+	// First request succeeds.
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, req)
+	if rec1.Code != 200 {
+		t.Fatalf("first request should succeed, got %d", rec1.Code)
+	}
+
+	// Second request is rejected with 429.
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req)
+	if rec2.Code != 429 {
+		t.Fatalf("second request should be 429, got %d", rec2.Code)
+	}
+
+	// Close the exporter to drain the queue before checking spans.
+	if err := exp.Close(); err != nil {
+		t.Fatalf("exporter Close: %v", err)
+	}
+
+	// Find the span with allowed=false (rejected request).
+	var span *tracingtest.CapturedSpan
+	for _, s := range coll.Spans(t) {
+		if s.Name == "ratelimit.check" && !tracingtest.AttrBool(&s, "ratelimit.allowed") {
+			span = &s
+			break
+		}
+	}
+	if span == nil {
+		t.Fatal("no ratelimit.check span with allowed=false found in captured spans")
+	}
+	if keyType := tracingtest.AttrString(span, "ratelimit.key_type"); keyType != "ip" {
+		t.Errorf("ratelimit.key_type = %q, want %q", keyType, "ip")
+	}
+}
+
+// TestMiddleware_AcceptedSpanHasRateLimitAttributes verifies that when the
+// middleware allows a request, it emits a "ratelimit.check" span with
+// ratelimit.allowed=true and ratelimit.key_type="ip" attributes
+// (issue #936).
+func TestMiddleware_AcceptedSpanHasRateLimitAttributes(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 10, resolver, nil) // burst 10
+
+	// Set up a tracing collector to capture spans.
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("request should succeed, got %d", rec.Code)
+	}
+
+	// Close the exporter to drain the queue before checking spans.
+	if err := exp.Close(); err != nil {
+		t.Fatalf("exporter Close: %v", err)
+	}
+
+	// Verify the span was captured with the correct attributes.
+	span := coll.FindSpan(t, "ratelimit.check")
+	if span == nil {
+		t.Fatal("no ratelimit.check span found in captured spans")
+	}
+	if allowed := tracingtest.AttrBool(span, "ratelimit.allowed"); !allowed {
+		t.Errorf("ratelimit.allowed = false, want true on accept")
+	}
+	if keyType := tracingtest.AttrString(span, "ratelimit.key_type"); keyType != "ip" {
+		t.Errorf("ratelimit.key_type = %q, want %q", keyType, "ip")
+	}
+}
+
+// TestMiddleware_RejectedSpanHasRateLimitReason verifies that when the
+// middleware rejects a request with 429, it emits a "ratelimit.check"
+// span with ratelimit.reason="rate_exceeded" (issue #938).
+func TestMiddleware_RejectedSpanHasRateLimitReason(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 1, resolver, nil) // burst 1
+
+	// Set up a tracing collector to capture spans.
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+
+	// First request succeeds.
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, req)
+	if rec1.Code != 200 {
+		t.Fatalf("first request should succeed, got %d", rec1.Code)
+	}
+
+	// Second request is rejected with 429.
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req)
+	if rec2.Code != 429 {
+		t.Fatalf("second request should be 429, got %d", rec2.Code)
+	}
+
+	// Close the exporter to drain the queue before checking spans.
+	if err := exp.Close(); err != nil {
+		t.Fatalf("exporter Close: %v", err)
+	}
+
+	// Verify the span was captured with the correct reason attribute.
+	allSpans := coll.Spans(t)
+	t.Logf("total spans captured: %d", len(allSpans))
+	for i, s := range allSpans {
+		t.Logf("span[%d]: name=%q, allowed=%v, key_type=%q, reason=%q",
+			i, s.Name,
+			tracingtest.AttrBool(&s, "ratelimit.allowed"),
+			tracingtest.AttrString(&s, "ratelimit.key_type"),
+			tracingtest.AttrString(&s, "ratelimit.reason"))
+	}
+
+	// Find the span from the rejected request (allowed=false).
+	var rejectedSpan *tracingtest.CapturedSpan
+	for _, s := range allSpans {
+		if s.Name == "ratelimit.check" && !tracingtest.AttrBool(&s, "ratelimit.allowed") {
+			sp := s
+			rejectedSpan = &sp
+			break
+		}
+	}
+	if rejectedSpan == nil {
+		t.Fatal("no ratelimit.check span with allowed=false found in captured spans")
+	}
+	if reason := tracingtest.AttrString(rejectedSpan, "ratelimit.reason"); reason != "rate_exceeded" {
+		t.Errorf("ratelimit.reason = %q, want %q", reason, "rate_exceeded")
+	}
+}
+
+// TestMiddleware_RejectedSpanNilSafeWhenTracingDisabled verifies that when
+// tracing is not enabled, the middleware does not panic and still
+// emits 429 correctly.
+func TestMiddleware_RejectedSpanNilSafeWhenTracingDisabled(t *testing.T) {
+	// Ensure tracing is disabled.
+	tracing.RegisterExporter(nil)
+
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 1, resolver, nil) // burst 1
+
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+
+	// First request succeeds.
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, req)
+	if rec1.Code != 200 {
+		t.Fatalf("first request should succeed, got %d", rec1.Code)
+	}
+
+	// Second request is rejected with 429 — must not panic.
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req)
+	if rec2.Code != 429 {
+		t.Fatalf("second request should be 429, got %d", rec2.Code)
+	}
 }
 
 var _ = fmt.Sprintf // for TestMiddleware_Concurrent_IPvsAPIKey

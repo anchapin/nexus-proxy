@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
 // Middleware is an http.Handler decorator that bounds the number of
@@ -187,7 +189,22 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		if m.keyFn != nil {
 			bucketKey = m.keyFn(r)
 		}
-		if !m.allow(bucketKey, ip, time.Now()) {
+		var span *tracing.Span
+		if tracing.Enabled() {
+			r2, s := tracing.StartSpanFromContext(r.Context(), "ratelimit.check")
+			span = s
+			r = r.WithContext(r2)
+			defer span.End()
+			span.SetAttr("ratelimit.key_type", m.keyType)
+		}
+		allowed := m.allow(bucketKey, ip, time.Now())
+		if span != nil {
+			span.SetAttr("ratelimit.allowed", allowed)
+		}
+		if !allowed {
+			if span != nil {
+				span.SetAttr("ratelimit.reason", "rate_exceeded")
+			}
 			if m.onReject != nil {
 				m.onReject()
 			}
