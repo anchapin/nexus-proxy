@@ -105,10 +105,17 @@ to **frontier** (safe choice).
 | Prompt matches `NEXUS_DSL_FUSION_PATTERNS` (default: `architectural design\|system architecture`) | `fusion` |
 | Prompt matches `NEXUS_DSL_FORMATTING_PATTERNS` (default: `css\|format\|docstring\|lint\|typo\|boilerplate\|debug\|fix bug\|git commit\|sql query\|parse json\|validate input\|regex\|api endpoint\|test\|optimize\|readme`) | `local` |
 | Prompt matches `NEXUS_DSL_LOCAL_PATTERNS` (default: `refactor\|security scan\|generate tests\|explain this code\|performance analysis`) | `local` |
+| Prompt matches `NEXUS_DSL_UNICODE_PATTERNS` (non-ASCII text categories like `\p{Han}`, issue #422) | `local` |
 | Otherwise | SLM decides (qwen3-coder:4b JSON decision) |
 | SLM confidence < threshold OR SLM fails | `frontier` (escalation) |
 
 DSL patterns are **comma-separated regexes** (set via env var, not a map).
+
+**Pattern precedence** (issue #876): patterns are checked in fixed order; first match wins:
+1. `NEXUS_DSL_FUSION_PATTERNS` → `fusion`
+2. `NEXUS_DSL_FORMATTING_PATTERNS` → `local`
+3. `NEXUS_DSL_LOCAL_PATTERNS` → `local`
+4. `NEXUS_DSL_UNICODE_PATTERNS` → `local`
 
 **SLM decision cache:** `NEXUS_SLM_CACHE_MAX_ENTRIES` + `NEXUS_SLM_CACHE_TTL`
 (default 512 entries / 30s). Set `NEXUS_SLM_CACHE_TTL=0` to disable.
@@ -225,6 +232,12 @@ stock plaintext bind must not advertise HSTS.
 `internal/middleware` is intentionally net/http-free. Any response-header
 middleware belongs in `internal/handlers`.
 
+## Auth brute-force protection (issue #296)
+
+After `NEXUS_AUTH_RATE_LIMIT_BURST` auth failures from the same client IP
+within the `NEXUS_AUTH_RATE_LIMIT_WINDOW` sliding window, the proxy returns
+429 with `Retry-After`. Disabled when `NEXUS_AUTH_RATE_LIMIT_RPM <= 0`.
+
 ## Prompt injection hardening (issue #76)
 
 `NEXUS_PROMPT_INJECTION_MODE` controls policy-text isolation:
@@ -291,9 +304,13 @@ are exempt: `NEXUS_PROVIDER_`, `NEXUS_FRONTIER_`, `NEXUS_ZAI_`, `NEXUS_HTTP_`;
 plus `NEXUS_QUALITY_TEST_HOOK` (test-only).
 
 For hot-reloadable knobs add the field to `ReloadHotReloadable()` in
-`config.go`. Sending **SIGHUP** re-reads exactly: `NEXUS_LOG_LEVEL`,
-`NEXUS_LOG_FORMAT`, `NEXUS_DEBUG`, `NEXUS_RATE_LIMIT_RPM`,
-`NEXUS_RATE_LIMIT_BURST`. Everything else requires a full restart.
+`config.go`. Sending **SIGHUP** re-reads exactly:
+- `NEXUS_LOG_LEVEL`, `NEXUS_LOG_FORMAT`, `NEXUS_DEBUG`
+- `NEXUS_RATE_LIMIT_RPM`, `NEXUS_RATE_LIMIT_BURST`
+- `NEXUS_AUTH_RATE_LIMIT_RPM`, `NEXUS_AUTH_RATE_LIMIT_BURST`, `NEXUS_AUTH_RATE_LIMIT_WINDOW`
+- `NEXUS_SHUTDOWN_TIMEOUT`
+- `NEXUS_TRUSTED_PROXIES` (issue #896 — re-parsed without restart)
+Everything else requires a full restart.
 The `env_example_audit_test.go` bidirectional test enforces that every
 var listed in `ReloadHotReloadable()` carries the `# hot-reloadable via
 SIGHUP` annotation in `.env.example` — omitting the annotation from a new
@@ -346,6 +363,9 @@ These are documented in `.env.example` with full context; key ones to know:
 - **`NEXUS_RAG_EMBED_CACHE_SIZE`** (default 256) + **`NEXUS_RAG_EMBED_CACHE_TTL`**
   (default 24h): LRU cache for prompt embeddings — repeat prompts skip Ollama
   round-trip entirely.
+- **`NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT`** (default 5s): max time a waiter goroutine
+  waits for a concurrent in-flight Embed call before falling through to a direct call
+  (issue #800). Set to 0 to disable (waiters wait indefinitely).
 - **`NEXUS_RAG_BATCH_SIZE`** (default 32): batch embedding in `IndexDir` to
   reduce HTTP round-trips by ~60–80%.
 - **`NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD`** (default 3) + **`NEXUS_RAG_CIRCUIT_BREAKER_COOLDOWN`**
