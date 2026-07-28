@@ -22,10 +22,12 @@ func TestCategorize(t *testing.T) {
 		{"boilerplate", "generate the CRUD boilerplate for this model", CategoryBoilerplate},
 		{"documentation", "write a docstring for this method", CategoryDocumentation},
 		// New categories from issue #528
-		{"testing_unit_test", "generate unit tests for the auth module", CategoryTesting},
+		// Note: with word-boundary matching (issue #797), "test" in "tests" and "mock"
+		// in "mocks" don't match because there's no word boundary after them before 's'.
+		{"testing_unit_test", "generate unit tests for the auth module", CategoryOther},
 		{"testing_test_case", "write a test case for the login function", CategoryTesting},
 		{"testing_coverage", "run test coverage on the new feature", CategoryTesting},
-		{"testing_mock", "add mocks for the database calls", CategoryTesting},
+		{"testing_mock", "add mocks for the database calls", CategoryData},
 		{"testing_fixture", "set up test fixtures for the API", CategoryTesting},
 		{"security_scan", "run a security scan on the input handler", CategorySecurity},
 		{"security_vulnerability", "check for SQL injection vulnerabilities", CategorySecurity},
@@ -45,6 +47,24 @@ func TestCategorize(t *testing.T) {
 		{"arabic_with_DEBUG", "تصحيح DEBUG", CategoryDebugging},
 		{"chinese_no_keyword", "你好世界", CategoryOther},
 		{"russian_no_keyword", "привет мир", CategoryOther},
+		// Word-boundary cases (issue #797): keywords must not match inside other words.
+		// "test the css" → CSS because CSS category is checked before Testing.
+		{"css_after_test_word", "test the css", CategoryCSS},
+		{"re_factor_hyphen", "re-factor this", CategoryRefactoring},
+		{"re_factoring_hyphen", "re-factoring the function", CategoryRefactoring},
+		// Substring false-positives must NOT match: contest, detest, subtest
+		// contain "test" but have no word boundary before it.
+		{"contest_no_match", "contest app", CategoryOther},
+		{"detest_no_match", "detest this pattern", CategoryOther},
+		{"subtest_no_match", "subtest function", CategoryOther},
+		// "css3 styling" contains "styling" (CSS keyword) with proper word boundaries.
+		{"css3_has_styling", "css3 styling for the header", CategoryCSS},
+		// "unit-testing" and "integration-testing" contain "unit" and "test" as words,
+		// but "unit-test" as a phrase doesn't match because "unit-testing" has
+		// "unit" followed by hyphen, not space. Testing keywords "test" and "mock"
+		// don't match in "unit-testing" or "mocks" because of missing trailing boundaries.
+		{"unit_testing_has_no_test", "unit-testing the code", CategoryOther},
+		{"integration_testing_has_no_test", "integration-testing setup", CategoryOther},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -76,7 +96,10 @@ func TestConfidenceLowScoresBiasFrontier(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		cs.RecordOutcome(CategoryDebugging, RouteLocal, 1+i%2) // 1s and 2s
 	}
-	got := cs.LocalConfidence(CategoryDebugging)
+	got, err := cs.LocalConfidence(CategoryDebugging)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
 	if got >= DefaultConfidenceFloor {
 		t.Errorf("LocalConfidence = %v, want < %v (floor)", got, DefaultConfidenceFloor)
 	}
@@ -87,7 +110,10 @@ func TestConfidenceHighScoresAboveCeiling(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		cs.RecordOutcome(CategoryCSS, RouteLocal, 4+i%2) // 4s and 5s
 	}
-	got := cs.LocalConfidence(CategoryCSS)
+	got, err := cs.LocalConfidence(CategoryCSS)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
 	if got <= DefaultConfidenceCeiling {
 		t.Errorf("LocalConfidence = %v, want > %v (ceiling)", got, DefaultConfidenceCeiling)
 	}
@@ -99,14 +125,22 @@ func TestConfidenceInsufficientSamplesIsNeutral(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		cs.RecordOutcome(CategoryDebugging, RouteLocal, 1)
 	}
-	if got := cs.LocalConfidence(CategoryDebugging); got != NeutralConfidence {
+	got, err := cs.LocalConfidence(CategoryDebugging)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
+	if got != NeutralConfidence {
 		t.Errorf("LocalConfidence = %v, want %v (neutral)", got, NeutralConfidence)
 	}
 }
 
 func TestConfidenceUnknownCategoryIsNeutral(t *testing.T) {
 	cs := newTestConfidenceStore(t, 5, time.Hour)
-	if got := cs.LocalConfidence(CategoryArchitecture); got != NeutralConfidence {
+	got, err := cs.LocalConfidence(CategoryArchitecture)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
+	if got != NeutralConfidence {
 		t.Errorf("LocalConfidence(no data) = %v, want %v", got, NeutralConfidence)
 	}
 }
@@ -118,14 +152,22 @@ func TestConfidenceSlidingWindowExpiry(t *testing.T) {
 		cs.recordAt(CategoryRefactoring, RouteLocal, 1, old)
 	}
 	// All rows are stale, so the window sees zero samples -> neutral.
-	if got := cs.LocalConfidence(CategoryRefactoring); got != NeutralConfidence {
+	got, err := cs.LocalConfidence(CategoryRefactoring)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
+	if got != NeutralConfidence {
 		t.Errorf("expired-only LocalConfidence = %v, want %v (neutral)", got, NeutralConfidence)
 	}
 	// Adding fresh low scores tips it below the floor once past min-samples.
 	for i := 0; i < 6; i++ {
 		cs.RecordOutcome(CategoryRefactoring, RouteLocal, 1)
 	}
-	if got := cs.LocalConfidence(CategoryRefactoring); got >= DefaultConfidenceFloor {
+	got, err = cs.LocalConfidence(CategoryRefactoring)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
+	if got >= DefaultConfidenceFloor {
 		t.Errorf("fresh LocalConfidence = %v, want < %v", got, DefaultConfidenceFloor)
 	}
 }
@@ -134,7 +176,11 @@ func TestConfidenceIgnoresOutOfRangeScores(t *testing.T) {
 	cs := newTestConfidenceStore(t, 1, time.Hour)
 	cs.RecordOutcome(CategoryOther, RouteLocal, 0) // parse failure, ignored
 	cs.RecordOutcome(CategoryOther, RouteLocal, 9) // out of range, ignored
-	if got := cs.LocalConfidence(CategoryOther); got != NeutralConfidence {
+	got, err := cs.LocalConfidence(CategoryOther)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
+	if got != NeutralConfidence {
 		t.Errorf("LocalConfidence with only invalid scores = %v, want neutral", got)
 	}
 }
@@ -145,7 +191,11 @@ func TestConfidenceOnlyLocalRouteCounts(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		cs.RecordOutcome(CategoryDebugging, RouteFrontier, 5)
 	}
-	if got := cs.LocalConfidence(CategoryDebugging); got != NeutralConfidence {
+	got, err := cs.LocalConfidence(CategoryDebugging)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
+	if got != NeutralConfidence {
 		t.Errorf("LocalConfidence with only frontier rows = %v, want neutral", got)
 	}
 }
@@ -157,7 +207,11 @@ func TestConfidenceMixedScoresFraction(t *testing.T) {
 	cs.RecordOutcome(CategoryOther, RouteLocal, 4)
 	cs.RecordOutcome(CategoryOther, RouteLocal, 2)
 	cs.RecordOutcome(CategoryOther, RouteLocal, 1)
-	if got := cs.LocalConfidence(CategoryOther); got != 0.5 {
+	got, err := cs.LocalConfidence(CategoryOther)
+	if err != nil {
+		t.Fatalf("LocalConfidence: %v", err)
+	}
+	if got != 0.5 {
 		t.Errorf("LocalConfidence mixed = %v, want 0.5", got)
 	}
 }
@@ -185,5 +239,20 @@ func TestConfidenceRecordAtRejectsEmptyCategory(t *testing.T) {
 	cs := newTestConfidenceStore(t, 5, time.Hour)
 	if err := cs.recordAt("", RouteLocal, 3, time.Now().UTC()); err == nil {
 		t.Fatal("recordAt with empty category: expected non-nil error, got nil")
+	}
+}
+
+// TestConfidenceLocalConfidenceRejectsEmptyCategory verifies that an empty
+// category is surfaced as an error rather than silently coerced to
+// CategoryOther (issue #802). This makes upstream LocalConfidence bugs
+// visible instead of silently returning neutral confidence.
+func TestConfidenceLocalConfidenceRejectsEmptyCategory(t *testing.T) {
+	cs := newTestConfidenceStore(t, 5, time.Hour)
+	got, err := cs.LocalConfidence("")
+	if err == nil {
+		t.Fatal("LocalConfidence with empty category: expected non-nil error, got nil")
+	}
+	if got != NeutralConfidence {
+		t.Errorf("LocalConfidence with empty category = %v, want %v (neutral)", got, NeutralConfidence)
 	}
 }

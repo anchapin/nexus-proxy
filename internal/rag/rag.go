@@ -114,26 +114,13 @@ type embedCacheEntry struct {
 	expire time.Time // TTL boundary
 }
 
-// EmbedCache is a并发-safe LRU cache for prompt embeddings keyed on the
-// exact prompt string. It wraps an Embedder and eliminates redundant
-// /api/embeddings round-trips for duplicate prompts within a configurable
-// TTL window (issue #227).
-type EmbedCache struct {
-	inner  Embedder
-	max    int           // max entries; 0 disables the cache
-	ttl    time.Duration // per-entry TTL; 0 means no expiry
-	mu     sync.Mutex
-	lru    *list.List               // front = most-recently-used
-	index  map[string]*list.Element // prompt → linked-list node
-	hits   int64
-	misses int64
-	// hitCount is an atomic counter incremented on every cache hit.
-	// Handlers snapshot it before and after Retrieve to estimate
-	// per-request cache hits without being disturbed by concurrent requests.
-	hitCount int64
-	// loading tracks in-flight inner.Embed calls so concurrent goroutines
-	// for the same key share a single upstream request.
-	loading map[string]chan loadResult
+// loadingSlot holds the shared channel for an in-flight inner.Embed call
+// and a done channel that signals all waiters have given up (timeout or
+// ctx cancel). When the done channel is closed, the loading goroutine
+// stops trying to broadcast its result and cleans up.
+type loadingSlot struct {
+	ch   chan loadResult
+	done chan struct{}
 }
 
 // loadResult is the result of an inner.Embed call, shared across waiters.
@@ -142,18 +129,44 @@ type loadResult struct {
 	err error
 }
 
+// EmbedCache is a并发-safe LRU cache for prompt embeddings keyed on the
+// exact prompt string. It wraps an Embedder and eliminates redundant
+// /api/embeddings round-trips for duplicate prompts within a configurable
+// TTL window (issue #227).
+type EmbedCache struct {
+	inner       Embedder
+	max         int           // max entries; 0 disables the cache
+	ttl         time.Duration // per-entry TTL; 0 means no expiry
+	waitTimeout time.Duration // max time a waiter waits for a concurrent load; issue #800
+	mu          sync.Mutex
+	lru         *list.List               // front = most-recently-used
+	index       map[string]*list.Element // prompt → linked-list node
+	hits        int64
+	misses      int64
+	// hitCount is an atomic counter incremented on every cache hit.
+	// Handlers snapshot it before and after Retrieve to estimate
+	// per-request cache hits without being disturbed by concurrent requests.
+	hitCount int64
+	// loading tracks in-flight inner.Embed calls so concurrent goroutines
+	// for the same key share a single upstream request.
+	loading map[string]*loadingSlot
+}
+
 // NewEmbedCache returns a cache that wraps inner. max is the LRU capacity
 // (entries are evicted oldest-first when full); ttl is the per-entry time-to-live
-// (zero = no expiry). Both max and ttl must be > 0 for caching to be active;
+// (zero = no expiry); waitTimeout is how long a waiter goroutine waits for
+// the in-flight inner.Embed to complete before falling through to a direct call.
+// Both max and ttl must be > 0 for caching to be active;
 // when either is zero the cache is a no-op pass-through to inner.
-func NewEmbedCache(inner Embedder, max int, ttl time.Duration) *EmbedCache {
+func NewEmbedCache(inner Embedder, max int, ttl time.Duration, waitTimeout time.Duration) *EmbedCache {
 	return &EmbedCache{
-		inner:   inner,
-		max:     max,
-		ttl:     ttl,
-		lru:     list.New(),
-		index:   make(map[string]*list.Element),
-		loading: make(map[string]chan loadResult),
+		inner:       inner,
+		max:         max,
+		ttl:         ttl,
+		waitTimeout: waitTimeout,
+		lru:         list.New(),
+		index:       make(map[string]*list.Element),
+		loading:     make(map[string]*loadingSlot),
 	}
 }
 
@@ -187,9 +200,44 @@ func (c *EmbedCache) Embed(ctx context.Context, text string) ([]float64, error) 
 
 	// Check if another goroutine is already loading this key.
 	// If so, release the lock and wait for that goroutine's result.
-	if waitCh, ok := c.loading[key]; ok {
+	if slot, ok := c.loading[key]; ok {
 		c.mu.Unlock()
-		result := <-waitCh
+		// Wait for the result with optional timeout. If waitTimeout is 0,
+		// we wait indefinitely (pre-issue-#800 behaviour).
+		var result loadResult
+		if c.waitTimeout > 0 {
+			timer := time.NewTimer(c.waitTimeout)
+			select {
+			case result = <-slot.ch:
+				timer.Stop()
+			case <-timer.C:
+				// Timeout: close done to signal the loading goroutine
+				// to abort, delete the loading slot, and fall through
+				// to a direct inner call (issue #800).
+				close(slot.done)
+				c.mu.Lock()
+				delete(c.loading, key)
+				c.mu.Unlock()
+				return c.inner.Embed(ctx, text)
+			case <-ctx.Done():
+				timer.Stop()
+				close(slot.done)
+				c.mu.Lock()
+				delete(c.loading, key)
+				c.mu.Unlock()
+				return nil, ctx.Err()
+			}
+		} else {
+			select {
+			case result = <-slot.ch:
+			case <-ctx.Done():
+				close(slot.done)
+				c.mu.Lock()
+				delete(c.loading, key)
+				c.mu.Unlock()
+				return nil, ctx.Err()
+			}
+		}
 		if result.err != nil {
 			return nil, result.err
 		}
@@ -201,10 +249,13 @@ func (c *EmbedCache) Embed(ctx context.Context, text string) ([]float64, error) 
 		return out, nil
 	}
 
-	// Mark this key as being loaded. Use a buffered channel so we can
-	// signal completion without blocking the broadcasting goroutine.
-	loadCh := make(chan loadResult, 1)
-	c.loading[key] = loadCh
+	// Mark this key as being loaded. Create a slot with a buffered
+	// result channel and an unbuffered done channel.
+	slot := &loadingSlot{
+		ch:   make(chan loadResult, 1),
+		done: make(chan struct{}),
+	}
+	c.loading[key] = slot
 	c.mu.Unlock()
 
 	// Call the underlying embedder while not holding the lock.
@@ -216,8 +267,14 @@ func (c *EmbedCache) Embed(ctx context.Context, text string) ([]float64, error) 
 	if err != nil {
 		atomic.AddInt64(&c.misses, 1)
 		c.mu.Unlock()
-		loadCh <- loadResult{err: err}
-		close(loadCh)
+		select {
+		case slot.ch <- loadResult{err: err}:
+		case <-slot.done:
+			// All waiters gave up; result is orphaned in the buffered
+			// channel — that's fine, the sender (us) will exit and
+			// the GC will clean up the slot.
+		}
+		close(slot.ch)
 		return nil, err
 	}
 
@@ -253,8 +310,13 @@ func (c *EmbedCache) Embed(ctx context.Context, text string) ([]float64, error) 
 	}
 	c.mu.Unlock()
 
-	loadCh <- loadResult{vec: vec, err: nil}
-	close(loadCh)
+	select {
+	case slot.ch <- loadResult{vec: vec, err: nil}:
+	case <-slot.done:
+		// All waiters gave up; result is orphaned in the buffered
+		// channel — that's fine.
+	}
+	close(slot.ch)
 
 	out := make([]float64, len(vec))
 	copy(out, vec)
@@ -495,27 +557,29 @@ func ParseThresholdOverrides() map[string]float64 {
 		if !strings.HasPrefix(env, prefix) {
 			continue
 		}
-		// Split on '=' to get the threshold value
 		idx := strings.Index(env, "=")
 		if idx < 0 {
 			continue
 		}
-		dirPart := env[len(prefix):idx]
-		thresholdStr := env[idx+1:]
-		if dirPart == "" || thresholdStr == "" {
+		rawKey := env[len(prefix):idx]
+		if rawKey == "" {
 			continue
 		}
-		threshold, err := strconv.ParseFloat(thresholdStr, 64)
+		key := prefix + strings.ToValidUTF8(rawKey, "")
+		val := os.Getenv(key)
+		if val == "" {
+			continue
+		}
+		threshold, err := strconv.ParseFloat(val, 64)
 		if err != nil || threshold < 0 || threshold > 1 {
 			slog.Warn("rag: ignoring invalid threshold override",
-				slog.String("dir", dirPart),
-				slog.String("value", thresholdStr),
+				slog.String("dir", rawKey),
+				slog.String("value", val),
 				slog.Any("err", err),
 			)
 			continue
 		}
-		// Normalize directory name to lowercase for case-insensitive matching
-		overrides[strings.ToLower(dirPart)] = threshold
+		overrides[strings.ToLower(strings.ToValidUTF8(rawKey, ""))] = threshold
 	}
 	return overrides
 }

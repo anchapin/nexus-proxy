@@ -119,8 +119,9 @@ type Config struct {
 	// deterministic for a given model+text pair, so they are memoized
 	// in a bounded LRU with TTL. RAGEmbedCacheSize=0 disables the cache;
 	// RAGEmbedCacheTTL=0 disables caching (pass-through) even when size>0.
-	RAGEmbedCacheSize int           // max LRU entries (256)
-	RAGEmbedCacheTTL  time.Duration // per-entry TTL (24h default); 0 = pass-through
+	RAGEmbedCacheSize        int           // max LRU entries (256)
+	RAGEmbedCacheTTL         time.Duration // per-entry TTL (24h default); 0 = pass-through
+	RAGEmbedCacheWaitTimeout time.Duration // max time a waiter waits for a concurrent load (5s default); issue #800
 
 	// RAG circuit breaker (issue #222). After RAGCircuitBreakerThreshold
 	// consecutive Ollama /api/embeddings failures the breaker trips and
@@ -408,6 +409,23 @@ type Config struct {
 	// the prune goroutine lifecycle is bound to the store's lifetime.
 	MetricsRetentionDays int
 
+	// OTLP retry/back-off parameters (issue #803). These tune the
+	// behaviour when the collector returns 5xx errors. The back-off
+	// follows exponential growth: base * 2^(attempt-1) capped at max.
+	//
+	// TracerMaxRetries: maximum retry attempts after the initial POST
+	// fails with a 5xx. Default 3 (total 4 attempts including initial).
+	// Zero or negative falls back to the default.
+	//
+	// TracerRetryBaseDelay: initial back-off delay. Default 100ms.
+	// Zero or negative falls back to the default.
+	//
+	// TracerRetryMaxDelay: ceiling on the back-off delay. Default 2s.
+	// Zero or negative falls back to the default.
+	TracerMaxRetries     int
+	TracerRetryBaseDelay time.Duration
+	TracerRetryMaxDelay  time.Duration
+
 	// Structured logging (issue #3). LogLevel maps NEXUS_LOG_LEVEL
 	// ("debug" | "info" | "warn" | "error") to a slog.Level. LogFormat
 	// maps NEXUS_LOG_FORMAT ("json" | "text") to a slog.Handler; json
@@ -485,6 +503,16 @@ type Config struct {
 	AuthRateLimitRPM    int
 	AuthRateLimitBurst  int
 	AuthRateLimitWindow time.Duration // window for auth failure tracking (default 5 min)
+
+	// Distributed tracing OTLP exporter timeout (issue #804). Bounds
+	// each POST to the collector; a stalled collector that honours
+	// TCP keepalive but never responds causes the exporter's context
+	// to hang indefinitely without this cap. The default 10s is
+	// conservative for local collectors; operators with high-latency
+	// collectors (e.g. multi-region aggregators, TLS handshake delay)
+	// can increase this via NEXUS_TRACING_TIMEOUT. 0 falls back to
+	// the default.
+	TracingTimeout time.Duration
 
 	// Readiness mode for /readyz (issue #302). Controls whether the
 	// readiness probe returns 503 when Ollama is down (strict) or
@@ -709,6 +737,34 @@ func Load() (Config, error) {
 	}
 	cfg.MetricsRetentionDays = retentionDays
 
+	// OTLP retry/back-off parameters (issue #803).
+	tracerMaxRetries, err := getEnvInt("NEXUS_TRACING_MAX_RETRIES", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if tracerMaxRetries < 0 {
+		tracerMaxRetries = 0
+	}
+	cfg.TracerMaxRetries = tracerMaxRetries
+
+	tracerRetryBaseDelay, err := getEnvDuration("NEXUS_TRACING_RETRY_BASE_DELAY", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if tracerRetryBaseDelay < 0 {
+		tracerRetryBaseDelay = 0
+	}
+	cfg.TracerRetryBaseDelay = tracerRetryBaseDelay
+
+	tracerRetryMaxDelay, err := getEnvDuration("NEXUS_TRACING_RETRY_MAX_DELAY", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if tracerRetryMaxDelay < 0 {
+		tracerRetryMaxDelay = 0
+	}
+	cfg.TracerRetryMaxDelay = tracerRetryMaxDelay
+
 	threshold, err := getEnvFloat("NEXUS_RAG_THRESHOLD", 0.55)
 	if err != nil {
 		return cfg, err
@@ -748,6 +804,20 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.RAGEmbedCacheTTL = ragCacheTTL
+
+	// RAG embed cache waiter timeout (issue #800). When multiple goroutines
+	// request the same key concurrently, waiters block on the in-flight
+	// inner.Embed call. If the inner call takes too long or the waiting
+	// goroutine's context is cancelled, the waiter gives up after this
+	// timeout and falls through to a direct inner call. A value of 0
+	// disables the timeout (waiters wait indefinitely — pre-issue-#800
+	// behaviour). Default 5s is long enough to benefit from coalescing
+	// without excessive latency on cache misses.
+	waitTimeout, err := getEnvDuration("NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT", 5*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RAGEmbedCacheWaitTimeout = waitTimeout
 
 	// RAG embedder plugin interface (issue #238). The type selects
 	// which backend the RAG store uses for vector embeddings.
@@ -1161,6 +1231,21 @@ func Load() (Config, error) {
 		localCooldown = 0
 	}
 	cfg.LocalCooldown = localCooldown
+
+	// Distributed tracing OTLP exporter timeout (issue #804). Default 10s;
+	// zero falls back to the default so the knob can never accidentally
+	// disable the exporter's timeout.
+	tracingTimeout, err := getEnvDuration("NEXUS_TRACING_TIMEOUT", DefaultTracingTimeout)
+	if err != nil {
+		return cfg, err
+	}
+	if tracingTimeout < 0 {
+		return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT must not be negative, got %s", tracingTimeout)
+	}
+	if tracingTimeout == 0 {
+		tracingTimeout = DefaultTracingTimeout
+	}
+	cfg.TracingTimeout = tracingTimeout
 
 	// Hard request-body cap (issue #11). Default 1 MiB matches typical
 	// OpenAI-compatible request sizes; the chat handler wraps r.Body
@@ -1597,6 +1682,11 @@ const DefaultServerMaxHeaderBytes = 1 << 20 // 1 MiB
 // of 30s. Operators running longer upstreams (or larger
 // terminationGracePeriodSeconds) raise this via NEXUS_SHUTDOWN_TIMEOUT.
 const DefaultShutdownTimeout = 30 * time.Second
+
+// DefaultTracingTimeout is the default OTLP exporter POST timeout (issue #804).
+// 10s is conservative for local collectors; operators with high-latency
+// collectors can increase this via NEXUS_TRACING_TIMEOUT.
+const DefaultTracingTimeout = 10 * time.Second
 
 // DefaultMaxBodyBytes is the fallback request-body cap (issue #11). 1 MiB
 // matches the typical OpenAI chat-completions request envelope; agents that

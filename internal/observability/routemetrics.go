@@ -131,6 +131,10 @@ type counterKey struct {
 //     or "lru" (entries removed to make room at capacity). The label
 //     set is bounded so cardinality stays at 2 series maximum.
 //
+// A ninth family (issue #798) records arbiter cache LRU evictions:
+//   - nexus_arbiter_cache_evictions_total{reason}
+//     where reason is "lru" (entries removed to make room at capacity).
+//
 // The reason label values are short, bounded strings (method,
 // body_too_large, bad_request, rate_limit, ...) defined as constants
 // in internal/handlers so the chat handler and the rate-limit
@@ -159,6 +163,7 @@ type RouteCounters struct {
 	rRAGMisses               map[string]*uint64
 	cascadeFallbacks         map[string]*uint64
 	arbiterCache             map[string]*uint64 // "hit" | "miss"
+	arbiterCacheEvictions    map[string]*uint64 // "lru" (issue #798)
 	slmEscalations           map[string]*uint64 // reason label for issue #301
 
 	judgeQueueOverflow   uint64 // atomic; use atomic.AddUint64/atomic.LoadUint64
@@ -217,6 +222,7 @@ func NewRouteCounters() *RouteCounters {
 		rRAGMisses:               make(map[string]*uint64),
 		cascadeFallbacks:         make(map[string]*uint64),
 		arbiterCache:             make(map[string]*uint64),
+		arbiterCacheEvictions:    make(map[string]*uint64),
 		slmEscalations:           make(map[string]*uint64),
 		handlerPanics:            make(map[string]*uint64),
 		ragCacheHits:             &cHits,
@@ -524,6 +530,36 @@ func (rc *RouteCounters) ObserveArbiterCacheHit(hit bool) {
 	}
 	rc.mu.Unlock()
 	atomic.AddUint64(p, 1)
+}
+
+// ObserveArbiterCacheEviction records one arbiter cache LRU eviction
+// (issue #798). reason is the bounded label value: "lru" when an entry
+// was removed to make room at capacity. Distinguishing eviction from
+// miss is critical so operators can tell whether the cache is undersized
+// (high lru) vs. TTL being too short (high miss rate). Safe for
+// concurrent use; nil receivers and empty reason are no-ops so callers
+// can invoke unconditionally without guarding the call site.
+func (rc *RouteCounters) ObserveArbiterCacheEviction(reason string) {
+	if rc == nil || reason == "" {
+		return
+	}
+	atomic.AddUint64(rc.arbiterCacheEvictionSlot(reason), 1)
+}
+
+// arbiterCacheEvictionSlot returns the *uint64 for the arbiter cache eviction
+// reason label, creating it if absent. Same lock-then-atomic pattern as
+// reasonSlot: the mutex guards the map mutation only, the increment
+// happens lock-free.
+func (rc *RouteCounters) arbiterCacheEvictionSlot(reason string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.arbiterCacheEvictions[reason]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.arbiterCacheEvictions[reason] = p
+	}
+	rc.mu.Unlock()
+	return p
 }
 
 // ObserveJudgeQueueOverflow records one judge queue overflow event
@@ -882,6 +918,11 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += n
 	}
+	if n, err := writeArbiterCacheEvictionsSeries(w, rc.arbiterCacheEvictions); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
 	if n, err := writeOverflowSeries(w, "nexus_judge_queue_overflow_total",
 		"Judge evaluator queue overflow events — sample was dropped because the queue was full.",
 		&rc.judgeQueueOverflow); err != nil {
@@ -1137,6 +1178,39 @@ func writeSLMCacheEvictionsSeries(w io.Writer, evictions map[string]*uint64) (in
 	for _, k := range keys {
 		v := atomic.LoadUint64(evictions[k])
 		n, err := fmt.Fprintf(w, "nexus_slm_cache_evictions_total{reason=%q} %d\n", k, v)
+		if err != nil {
+			return total, err
+		}
+		total += int64(n)
+	}
+
+	return total, nil
+}
+
+// writeArbiterCacheEvictionsSeries emits the
+// nexus_arbiter_cache_evictions_total counter family (issue #798). The
+// reason label is bounded to "lru" so the metric family never exceeds
+// one series. Output is sorted by reason label for deterministic scrape
+// diffs. The map may be nil or empty; an empty map still emits
+// HELP/TYPE so scrapers can discover the family even before the first
+// eviction fires.
+func writeArbiterCacheEvictionsSeries(w io.Writer, evictions map[string]*uint64) (int64, error) {
+	var total int64
+
+	n, err := fmt.Fprintf(w, "# HELP nexus_arbiter_cache_evictions_total Arbiter cache LRU evictions partitioned by reason (issue #798).\n# TYPE nexus_arbiter_cache_evictions_total counter\n")
+	if err != nil {
+		return total, err
+	}
+	total += int64(n)
+
+	keys := make([]string, 0, len(evictions))
+	for k := range evictions {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := atomic.LoadUint64(evictions[k])
+		n, err := fmt.Fprintf(w, "nexus_arbiter_cache_evictions_total{reason=%q} %d\n", k, v)
 		if err != nil {
 			return total, err
 		}

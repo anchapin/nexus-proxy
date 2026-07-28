@@ -1252,6 +1252,71 @@ func TestRouteCountersArbiterCacheHitNilSafe(t *testing.T) {
 	}
 }
 
+// TestRouteCountersArbiterCacheEviction verifies ObserveArbiterCacheEviction
+// increments the nexus_arbiter_cache_evictions_total family with reason="lru"
+// (issue #798). Eviction must not be confused with cache miss.
+func TestRouteCountersArbiterCacheEviction(t *testing.T) {
+	rc := NewRouteCounters()
+
+	rc.ObserveArbiterCacheEviction("lru")
+	rc.ObserveArbiterCacheEviction("lru")
+	rc.ObserveArbiterCacheEviction("lru")
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_arbiter_cache_evictions_total", "metric family header"},
+		{"# TYPE nexus_arbiter_cache_evictions_total counter", "TYPE line"},
+		{`nexus_arbiter_cache_evictions_total{reason="lru"} 3`, "three LRU evictions"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+	if strings.Contains(out, "nexus_arbiter_cache_evictions_total{reason=\"cache_hit\"}") ||
+		strings.Contains(out, "nexus_arbiter_cache_evictions_total{reason=\"cache_miss\"}") {
+		t.Error("arbiter cache eviction metric must not contain cache_hit/cache_miss labels")
+	}
+}
+
+// TestRouteCountersArbiterCacheEvictionNilSafe verifies ObserveArbiterCacheEviction
+// on a nil receiver and empty reason are no-ops (must not panic).
+func TestRouteCountersArbiterCacheEvictionNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveArbiterCacheEviction("lru")
+	rc.ObserveArbiterCacheEviction("")
+	n, err := rc.WriteTo(&strings.Builder{})
+	if err != nil || n != 0 {
+		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
+	}
+}
+
+// TestArbiterCacheEvictionsEmptyFamilyStillEmitsHeader verifies the
+// metric family is announced with HELP/TYPE even before the first
+// eviction, so scrapers can discover it without a placeholder sample.
+func TestArbiterCacheEvictionsEmptyFamilyStillEmitsHeader(t *testing.T) {
+	rc := NewRouteCounters()
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+	if !strings.Contains(out, "# HELP nexus_arbiter_cache_evictions_total") {
+		t.Errorf("missing HELP header for empty eviction family:\n%s", out)
+	}
+	if !strings.Contains(out, "# TYPE nexus_arbiter_cache_evictions_total counter") {
+		t.Errorf("missing TYPE header for empty eviction family:\n%s", out)
+	}
+}
+
 // TestRouteCountersSLMCacheMiss verifies ObserveSLMCacheMiss increments
 // the nexus_slm_cache_misses_total counter (issue #206). The method is
 // invoked from the chat-handler hot path via a closure when the SLM

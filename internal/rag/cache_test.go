@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // countingEmbedder tracks how many times Embed is actually called,
@@ -199,4 +200,64 @@ func TestCachedEmbedderConcurrent(t *testing.T) {
 func promptForGoroutine(id, slot int) string {
 	// Only 5 distinct prompts per goroutine but shared across goroutines.
 	return "prompt-slot-" + string(rune('A'+slot))
+}
+
+func TestCachedEmbedderCacheStatsNoEmbedCache(t *testing.T) {
+	// When inner is NOT an *EmbedCache, CacheStats and EmbedHitCount must
+	// return zeros and NOT panic (issue #794).
+	inner := newCountingEmbedder()
+	cached := NewCachedEmbedder(inner, 64)
+
+	hits, misses := cached.CacheStats()
+	if hits != 0 || misses != 0 {
+		t.Errorf("CacheStats = (%d, %d), want (0, 0)", hits, misses)
+	}
+	if count := cached.EmbedHitCount(); count != 0 {
+		t.Errorf("EmbedHitCount = %d, want 0", count)
+	}
+}
+
+func TestCachedEmbedderCacheStatsWithEmbedCache(t *testing.T) {
+	// When inner IS an *EmbedCache, CacheStats and EmbedHitCount must
+	// forward to the wrapped cache (issue #794).
+	inner := &stubEmbedder{vecs: map[string][]float64{
+		"prompt": {1, 0, 0},
+	}}
+	cache := NewEmbedCache(inner, 100, 5*time.Minute, 5*time.Second)
+	cached := NewCachedEmbedder(cache, 64)
+
+	ctx := context.Background()
+
+	// First call: cache miss.
+	if _, err := cached.Embed(ctx, "prompt"); err != nil {
+		t.Fatalf("first Embed: %v", err)
+	}
+
+	hits, misses := cached.CacheStats()
+	if hits != 0 {
+		t.Errorf("after first Embed, hits = %d, want 0 (miss)", hits)
+	}
+	if misses != 1 {
+		t.Errorf("after first Embed, misses = %d, want 1", misses)
+	}
+
+	// Second call: CachedEmbedder LRU hits — the call never reaches
+	// EmbedCache, so EmbedCache stats are unchanged (0 hits, 1 miss).
+	if _, err := cached.Embed(ctx, "prompt"); err != nil {
+		t.Fatalf("second Embed: %v", err)
+	}
+
+	hits, misses = cached.CacheStats()
+	if hits != 0 {
+		t.Errorf("after second Embed (LRU hit), hits = %d, want 0 (EmbedCache was not called)", hits)
+	}
+	if misses != 1 {
+		t.Errorf("after second Embed, misses = %d, want 1", misses)
+	}
+
+	// EmbedCache.HitCount() increments only on actual cache hits within
+	// EmbedCache.Embed — the second call never reached EmbedCache.
+	if count := cached.EmbedHitCount(); count != 0 {
+		t.Errorf("EmbedHitCount = %d, want 0 (EmbedCache not called on second request)", count)
+	}
 }

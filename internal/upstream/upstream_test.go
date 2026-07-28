@@ -2451,3 +2451,194 @@ func TestStreamCachedArbiterSynthesisSecondWriteClientAbort(t *testing.T) {
 		t.Errorf("err = %v, want io.ErrUnexpectedEOF", err)
 	}
 }
+
+func TestPanel_MalformedArbiterEmptyChoices_ReturnsError(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local/v1/chat/completions"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local reply"}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier reply"}}]}`)
+	})
+	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[]}`)
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newJSONRW()
+	cacheHit, err := Panel(
+		context.Background(), rw, client,
+		"http://local.local", "local-m",
+		"http://frontier.local", "", "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}, "stream": false},
+		"test prompt",
+		5*time.Second,
+		5*time.Second,
+		false,
+		nil, 0*time.Second,
+	)
+	if err == nil {
+		t.Fatalf("Panel: expected error for empty choices, got nil")
+	}
+	if cacheHit {
+		t.Errorf("cacheHit = true, want false")
+	}
+	if !strings.Contains(err.Error(), "empty synthesis") {
+		t.Errorf("error message = %q, want it to contain 'empty synthesis'", err.Error())
+	}
+}
+
+func TestPanel_ValidArbiterResponse_ReturnsNoError(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local/v1/chat/completions"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local reply"}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier reply"}}]}`)
+	})
+	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"synthesized response"}}]}`)
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newJSONRW()
+	cacheHit, err := Panel(
+		context.Background(), rw, client,
+		"http://local.local", "local-m",
+		"http://frontier.local", "", "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}, "stream": false},
+		"test prompt",
+		5*time.Second,
+		5*time.Second,
+		false,
+		nil, 0*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("Panel: unexpected error: %v", err)
+	}
+	if cacheHit {
+		t.Errorf("cacheHit = true, want false")
+	}
+	if !strings.Contains(rw.body.String(), `"content":"synthesized response"`) {
+		t.Errorf("body missing synthesized response: %q", rw.body.String())
+	}
+}
+
+func TestPanel_CacheHit_ReturnsNoError(t *testing.T) {
+	const (
+		localURL    = "http://local.local/v1/chat/completions"
+		frontierURL = "http://frontier.local"
+		arbiterURL  = "http://arbiter.local/v1/chat/completions"
+	)
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local divergent"}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier divergent"}}]}`)
+	})
+	var arbiterCalled int32
+	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&arbiterCalled, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"arbiter synthesis"}}]}`)
+	})
+	client := &http.Client{Transport: ft}
+
+	cache := NewArbiterCache(5*time.Minute, 0)
+	cache.Set("local divergent", "frontier divergent", "cached synthesis", 5*time.Minute)
+
+	rw := newJSONRW()
+	cacheHit, err := Panel(
+		context.Background(), rw, client,
+		"http://local.local", "local-m",
+		"http://frontier.local", "", "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}, "stream": false},
+		"test prompt",
+		5*time.Second, 5*time.Second,
+		false,
+		cache, 5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("Panel: unexpected error: %v", err)
+	}
+	if !cacheHit {
+		t.Errorf("cacheHit = false, want true")
+	}
+	if !strings.Contains(rw.body.String(), `"content":"cached synthesis"`) {
+		t.Errorf("body missing cached synthesis: %q", rw.body.String())
+	}
+	if arbiterCalled > 0 {
+		t.Errorf("arbiter called %d times, want 0 (cache hit)", arbiterCalled)
+	}
+}
+
+// failingMarshal is a json.Marshaler that always returns an error.
+// Used to exercise the marshal-before-WriteHeader ordering in
+// streamCachedArbiterSynthesis (issue #788).
+type failingMarshal struct{ s string }
+
+func (failingMarshal) MarshalJSON() ([]byte, error) {
+	return nil, errors.New("synthetic marshal error for test")
+}
+
+// TestStreamCachedArbiterSynthesis_MarshalFailureBeforeHeaders verifies that
+// when json.Marshal fails, WriteHeader is never called and the error is
+// returned to the caller (issue #788).
+func TestStreamCachedArbiterSynthesis_MarshalFailureBeforeHeaders(t *testing.T) {
+	rw := newSSERW()
+	err := streamCachedArbiterSynthesis(rw, failingMarshal{s: "test"})
+	if err == nil {
+		t.Fatal("expected marshal error, got nil")
+	}
+	if !strings.Contains(err.Error(), "marshal") {
+		t.Errorf("error = %v, want error mentioning 'marshal'", err)
+	}
+	if rw.status != 0 {
+		t.Errorf("WriteHeader called with status %d on marshal error; expected no WriteHeader", rw.status)
+	}
+}
+
+// TestStreamCachedArbiterSynthesis_Success verifies the success path: SSE chunk
+// is written correctly and WriteHeader is called exactly once with 200 (issue #788).
+func TestStreamCachedArbiterSynthesis_Success(t *testing.T) {
+	rw := newSSERW()
+	err := streamCachedArbiterSynthesis(rw, "synthesized answer")
+	if err != nil {
+		t.Fatalf("streamCachedArbiterSynthesis: %v", err)
+	}
+	if rw.status != 200 {
+		t.Errorf("status = %d, want 200", rw.status)
+	}
+	body := rw.body.String()
+	if !strings.Contains(body, `"content":"synthesized answer"`) {
+		t.Errorf("body missing synthesis text: %q", body)
+	}
+	if !strings.HasSuffix(body, "data: [DONE]\n\n") {
+		t.Errorf("body does not end with SSE done: %q", body)
+	}
+}

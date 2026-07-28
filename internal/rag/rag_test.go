@@ -507,7 +507,7 @@ func (e *batchCountingEmbedder) RecordBreakerSuccess()          {}
 func TestEmbedCacheDisabled(t *testing.T) {
 	// When max entries or TTL is zero, EmbedCache is a pass-through.
 	inner := &stubEmbedder{vecs: map[string][]float64{"hello": {1, 2, 3}}}
-	cache := NewEmbedCache(inner, 0, 5*time.Minute) // max=0 → no cache
+	cache := NewEmbedCache(inner, 0, 5*time.Minute, 5*time.Second) // max=0 → no cache
 	vec, err := cache.Embed(context.Background(), "hello")
 	if err != nil {
 		t.Fatalf("Embed: %v", err)
@@ -522,7 +522,7 @@ func TestEmbedCacheDisabled(t *testing.T) {
 
 func TestEmbedCacheHit(t *testing.T) {
 	inner := &stubEmbedder{vecs: map[string][]float64{"hello": {1, 2, 3}}}
-	cache := NewEmbedCache(inner, 100, 5*time.Minute)
+	cache := NewEmbedCache(inner, 100, 5*time.Minute, 5*time.Second)
 
 	// First call: cache miss, calls inner.
 	_, err := cache.Embed(context.Background(), "hello")
@@ -560,7 +560,7 @@ func TestEmbedCacheLRUEviction(t *testing.T) {
 		"b": {0, 1, 0},
 		"c": {0, 0, 1},
 	}}
-	cache := NewEmbedCache(inner, 2, 5*time.Minute) // capacity = 2
+	cache := NewEmbedCache(inner, 2, 5*time.Minute, 5*time.Second) // capacity = 2
 
 	cache.Embed(context.Background(), "a") // miss → a
 	cache.Embed(context.Background(), "b") // miss → b
@@ -582,7 +582,7 @@ func TestEmbedCacheLRUEviction(t *testing.T) {
 
 func TestEmbedCacheTTLExpiry(t *testing.T) {
 	inner := &stubEmbedder{}
-	cache := NewEmbedCache(inner, 100, 10*time.Millisecond)
+	cache := NewEmbedCache(inner, 100, 10*time.Millisecond, 5*time.Second)
 
 	cache.Embed(context.Background(), "key") // miss
 	if inner.callCount != 1 {
@@ -607,7 +607,7 @@ func TestEmbedCacheTTLExpiry(t *testing.T) {
 
 func TestEmbedCacheErrorPassthrough(t *testing.T) {
 	inner := &stubEmbedder{err: errSentinel}
-	cache := NewEmbedCache(inner, 100, 5*time.Minute)
+	cache := NewEmbedCache(inner, 100, 5*time.Minute, 5*time.Second)
 	_, err := cache.Embed(context.Background(), "hello")
 	if err == nil {
 		t.Error("expected error, got nil")
@@ -619,7 +619,7 @@ func TestEmbedCacheErrorPassthrough(t *testing.T) {
 
 func TestEmbedCacheConcurrent(t *testing.T) {
 	inner := &stubEmbedder{}
-	cache := NewEmbedCache(inner, 100, 5*time.Minute)
+	cache := NewEmbedCache(inner, 100, 5*time.Minute, 5*time.Second)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {
@@ -648,7 +648,7 @@ func TestEmbedCacheConcurrent(t *testing.T) {
 
 func TestEmbedCacheHitCount(t *testing.T) {
 	inner := &stubEmbedder{vecs: map[string][]float64{"a": {1}}}
-	cache := NewEmbedCache(inner, 10, 5*time.Minute)
+	cache := NewEmbedCache(inner, 10, 5*time.Minute, 5*time.Second)
 
 	before := cache.HitCount()
 	cache.Embed(context.Background(), "a") // miss
@@ -690,7 +690,7 @@ func TestEmbedCacheIsBreakerOpenDelegation(t *testing.T) {
 		stubEmbedder: stubEmbedder{vecs: map[string][]float64{"hello": {1, 2, 3}}},
 		breakerOpen:  true,
 	}
-	cache := NewEmbedCache(inner, 100, 5*time.Minute)
+	cache := NewEmbedCache(inner, 100, 5*time.Minute, 5*time.Second)
 
 	if !cache.IsBreakerOpen() {
 		t.Error("IsBreakerOpen() = false, want true (should propagate inner breaker)")
@@ -712,7 +712,7 @@ func TestEmbedCacheIsBreakerOpenDelegation(t *testing.T) {
 // already covered in cache_test.go; EmbedCache uses the same delegation pattern.
 func TestEmbedCacheIsBreakerOpenWithoutBreaker(t *testing.T) {
 	inner := &stubEmbedder{vecs: map[string][]float64{"hello": {1, 2, 3}}}
-	cache := NewEmbedCache(inner, 100, 5*time.Minute)
+	cache := NewEmbedCache(inner, 100, 5*time.Minute, 5*time.Second)
 
 	// stubEmbedder.IsBreakerOpen returns false.
 	if cache.IsBreakerOpen() {
@@ -727,7 +727,7 @@ func TestEmbedCacheRecordBreakerSuccessDelegation(t *testing.T) {
 	inner := &embedCacheBreakerStub{
 		stubEmbedder: stubEmbedder{vecs: map[string][]float64{"hello": {1, 2, 3}}},
 	}
-	cache := NewEmbedCache(inner, 100, 5*time.Minute)
+	cache := NewEmbedCache(inner, 100, 5*time.Minute, 5*time.Second)
 
 	cache.RecordBreakerSuccess()
 	cache.RecordBreakerSuccess()
@@ -742,7 +742,7 @@ func TestEmbedCacheRecordBreakerSuccessDelegation(t *testing.T) {
 // embedder whose breaker is not tripped (issue #670).
 func TestEmbedCacheRecordBreakerSuccessWithoutBreaker(t *testing.T) {
 	inner := &stubEmbedder{vecs: map[string][]float64{"hello": {1, 2, 3}}}
-	cache := NewEmbedCache(inner, 100, 5*time.Minute)
+	cache := NewEmbedCache(inner, 100, 5*time.Minute, 5*time.Second)
 
 	// Should not panic.
 	cache.RecordBreakerSuccess()
@@ -754,7 +754,7 @@ func TestStoreWithCachingEmbedder(t *testing.T) {
 		"prompt": {1, 0, 0},
 		"match":  {0.9, 0.1, 0},
 	}}
-	cache := NewEmbedCache(inner, 100, 5*time.Minute)
+	cache := NewEmbedCache(inner, 100, 5*time.Minute, 5*time.Second)
 	store := NewStore(cache, 0.55)
 	store.Add("match.go", "matching", inner.vecs["match"])
 
@@ -941,4 +941,225 @@ func TestCachedEmbedderNoBreaker(t *testing.T) {
 		t.Error("IsBreakerOpen() = true, want false for plain embedder")
 	}
 	c.RecordBreakerSuccess()
+}
+
+func TestParseThresholdOverridesNonASCII(t *testing.T) {
+	key := "NEXUS_RAG_THRESHOLD_代码"
+	if err := os.Setenv(key, "0.7"); err != nil {
+		t.Fatalf("Setenv(%q): %v", key, err)
+	}
+	defer os.Unsetenv(key)
+
+	overrides := ParseThresholdOverrides()
+	if got, ok := overrides["代码"]; !ok {
+		t.Errorf("overrides[%q] missing; got %v", "代码", overrides)
+	} else if got != 0.7 {
+		t.Errorf("overrides[%q] = %v, want 0.7", "代码", got)
+	}
+}
+
+func TestParseThresholdOverrides(t *testing.T) {
+	cases := []struct {
+		name  string
+		key   string
+		val   string
+		dir   string
+		want  float64
+		valid bool
+	}{
+		{"ASCII override", "NEXUS_RAG_THRESHOLD_代码", "0.7", "代码", 0.7, true},
+		{"empty value", "NEXUS_RAG_THRESHOLD_emptydir", "", "emptydir", 0, false},
+		{"invalid value", "NEXUS_RAG_THRESHOLD_invaliddir", "not_a_float", "invaliddir", 0, false},
+		{"out of range", "NEXUS_RAG_THRESHOLD_oobdir", "1.5", "oobdir", 0, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.valid {
+				if err := os.Setenv(tc.key, tc.val); err != nil {
+					t.Fatalf("Setenv(%q, %q): %v", tc.key, tc.val, err)
+				}
+				defer os.Unsetenv(tc.key)
+			}
+
+			overrides := ParseThresholdOverrides()
+			if tc.valid {
+				if got, ok := overrides[tc.dir]; !ok {
+					t.Errorf("overrides[%q] missing; got %v", tc.dir, overrides)
+				} else if got != tc.want {
+					t.Errorf("overrides[%q] = %v, want %v", tc.dir, got, tc.want)
+				}
+			} else {
+				if _, ok := overrides[tc.dir]; ok {
+					t.Errorf("overrides[%q] unexpectedly present; got %v", tc.dir, overrides)
+				}
+			}
+		})
+	}
+}
+
+// delayedEmbedder blocks until the unblock channel is closed or the
+// context is cancelled. It implements Embedder for testing.
+type delayedEmbedder struct {
+	unblock chan struct{}
+}
+
+func (d *delayedEmbedder) Embed(ctx context.Context, text string) ([]float64, error) {
+	select {
+	case <-d.unblock:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return []float64{0, 0, 0}, nil
+}
+
+func (d *delayedEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float64, error) {
+	select {
+	case <-d.unblock:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	result := make([][]float64, len(texts))
+	for i := range texts {
+		result[i] = []float64{0, 0, 0}
+	}
+	return result, nil
+}
+
+func (d *delayedEmbedder) IsHealthy(context.Context) bool { return true }
+func (d *delayedEmbedder) IsBreakerOpen() bool            { return false }
+func (d *delayedEmbedder) RecordBreakerSuccess()          {}
+
+// TestEmbedCacheCtxCancelNoStaleEntry verifies that when a waiting goroutine's
+// context is cancelled, the loading slot is removed from c.loading and no
+// goroutine is leaked (issue #800).
+func TestEmbedCacheCtxCancelNoStaleEntry(t *testing.T) {
+	unblock := make(chan struct{})
+	close(unblock) // immediate return — inner embed will not block in this test
+	inner := &delayedEmbedder{unblock: unblock}
+	cache := NewEmbedCache(inner, 100, 5*time.Minute, 100*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Start a goroutine that embeds and will cancel.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		cache.Embed(ctx, "key")
+	}()
+
+	// Give the goroutine time to register in c.loading.
+	time.Sleep(10 * time.Millisecond)
+
+	// Cancel the context — the waiting goroutine should detect this and
+	// delete the loading slot.
+	cancel()
+
+	// Wait for the goroutine to exit.
+	wg.Wait()
+
+	// Verify no stale entry is left in c.loading.
+	cache.mu.Lock()
+	_, hasStale := cache.loading["key"]
+	cache.mu.Unlock()
+
+	if hasStale {
+		t.Error("c.loading[\"key\"] still present after ctx cancel — stale entry leak")
+	}
+}
+
+// TestEmbedCacheTimeoutFallsThrough verifies that a waiting goroutine
+// that times out falls through to a direct inner call and cleans up the
+// loading slot (issue #800).
+func TestEmbedCacheTimeoutFallsThrough(t *testing.T) {
+	// Use a stubEmbedder that returns immediately. The test sets a very short
+	// waitTimeout so the concurrent goroutine times out while the first
+	// goroutine's result is "in flight".
+	inner := &stubEmbedder{vecs: map[string][]float64{"key": {1, 2, 3}}}
+	cache := NewEmbedCache(inner, 100, 5*time.Minute, 50*time.Millisecond)
+
+	ctx := context.Background()
+
+	// First goroutine: starts loading and will complete quickly.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var firstErr error
+	go func() {
+		defer wg.Done()
+		_, firstErr = cache.Embed(ctx, "key")
+	}()
+
+	// Give the first goroutine time to register in c.loading.
+	time.Sleep(5 * time.Millisecond)
+
+	// Second goroutine: arrives while first is loading, times out waiting.
+	wg.Add(1)
+	var waiterErr error
+	go func() {
+		defer wg.Done()
+		_, waiterErr = cache.Embed(ctx, "key")
+	}()
+
+	wg.Wait()
+
+	// Both should succeed (the waiter's timeout is short enough that it
+	// falls through to a direct call which succeeds because stub returns fast).
+	if firstErr != nil {
+		t.Errorf("first goroutine: %v", firstErr)
+	}
+	if waiterErr != nil {
+		t.Errorf("waiter goroutine: %v", waiterErr)
+	}
+
+	// Verify no stale entry.
+	cache.mu.Lock()
+	_, hasStale := cache.loading["key"]
+	cache.mu.Unlock()
+
+	if hasStale {
+		t.Error("c.loading[\"key\"] still present — stale entry leak")
+	}
+}
+
+// TestEmbedCacheConcurrentStressWithCancel races many goroutines with
+// context cancellation to detect loading-map corruption. Run under
+// `go test -race ./internal/rag/...`.
+func TestEmbedCacheConcurrentStressWithCancel(t *testing.T) {
+	unblock := make(chan struct{})
+	close(unblock) // immediate return
+	inner := &delayedEmbedder{unblock: unblock}
+	cache := NewEmbedCache(inner, 100, 5*time.Minute, 200*time.Millisecond)
+
+	var wg sync.WaitGroup
+	var errors atomic.Int64
+	ctx, cancel := context.WithCancel(context.Background())
+
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			// Half the goroutines get a cancelled context.
+			c := ctx
+			if id%2 == 0 {
+				subCtx, subCancel := context.WithCancel(context.Background())
+				subCancel()
+				c = subCtx
+			}
+			_, _ = cache.Embed(c, fmt.Sprintf("prompt-%d", id%5))
+		}(i)
+	}
+	wg.Wait()
+	cancel()
+
+	if errors.Load() > 0 {
+		t.Errorf("%d errors during concurrent ctx-cancel stress test", errors.Load())
+	}
+
+	// c.loading must be clean after all goroutines settle.
+	cache.mu.Lock()
+	if len(cache.loading) > 0 {
+		t.Errorf("c.loading not clean after stress test: %d entries remain", len(cache.loading))
+	}
+	cache.mu.Unlock()
 }

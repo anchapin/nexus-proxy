@@ -57,9 +57,9 @@ type stubConf struct {
 
 func (s *stubConf) RecordOutcome(_ string, _ Route, _ int) error { return nil }
 
-func (s *stubConf) LocalConfidence(category string) float64 {
+func (s *stubConf) LocalConfidence(category string) (float64, error) {
 	s.queried = append(s.queried, category)
-	return s.value
+	return s.value, nil
 }
 
 // formattingPatterns matches the handler's NEXUS_DSL_FORMATTING_PATTERNS default.
@@ -474,8 +474,10 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 			FormattingRegex:    formattingPatterns,
 			LocalPatternsRegex: localPatterns,
 		}
+		// "bug" is a Debugging keyword but NOT in DSL, so DSL won't match
+		// and Decide will be called. Categorize finds "bug" with word boundaries (issue #797).
 		req := PlanRequest{
-			Prompt:          "analyze why this code keeps crashing",
+			Prompt:          "there is a bug in the code",
 			GuardrailBudget: 6000,
 			GuardrailSource: "static-fallback",
 			Context:         context.Background(),

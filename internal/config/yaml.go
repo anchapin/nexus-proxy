@@ -76,16 +76,17 @@ type YAMLConfig struct {
 	ProviderTailWeight      float64 `yaml:"provider_tail_weight"`
 
 	// RAG
-	ExamplesDir       string  `yaml:"examples_dir"`
-	RAGThreshold      float64 `yaml:"rag_threshold"`
-	EmbedderType      string  `yaml:"embedder_type"`
-	EmbedderBaseURL   string  `yaml:"embedder_base_url"`
-	CohereAPIKey      string  `yaml:"cohere_api_key"`
-	RAGDBPath         string  `yaml:"rag_db_path"`
-	RAGPollInterval   string  `yaml:"rag_poll_interval"`
-	RAGEmbedCacheSize int     `yaml:"rag_embed_cache_size"`
-	RAGEmbedCacheTTL  string  `yaml:"rag_embed_cache_ttl"`
-	RAGBatchSize      int     `yaml:"rag_batch_size"`
+	ExamplesDir              string  `yaml:"examples_dir"`
+	RAGThreshold             float64 `yaml:"rag_threshold"`
+	EmbedderType             string  `yaml:"embedder_type"`
+	EmbedderBaseURL          string  `yaml:"embedder_base_url"`
+	CohereAPIKey             string  `yaml:"cohere_api_key"`
+	RAGDBPath                string  `yaml:"rag_db_path"`
+	RAGPollInterval          string  `yaml:"rag_poll_interval"`
+	RAGEmbedCacheSize        int     `yaml:"rag_embed_cache_size"`
+	RAGEmbedCacheTTL         string  `yaml:"rag_embed_cache_ttl"`
+	RAGEmbedCacheWaitTimeout string  `yaml:"rag_embed_cache_wait_timeout"`
+	RAGBatchSize             int     `yaml:"rag_batch_size"`
 
 	// Routing
 	TokenGuardrail            int     `yaml:"token_guardrail"`
@@ -97,6 +98,7 @@ type YAMLConfig struct {
 	CascadeTimeout            string  `yaml:"cascade_timeout"`
 	ArbiterTimeout            string  `yaml:"arbiter_timeout"`
 	CascadeMaxResponseBytes   int     `yaml:"cascade_max_response_bytes"`
+	MaxResponseBytes          int     `yaml:"max_response_bytes"`
 
 	// Fusion
 	FusionProgressiveDelivery bool    `yaml:"fusion_progressive_delivery"`
@@ -164,6 +166,11 @@ type YAMLConfig struct {
 	// table. 0 = disabled (grow without bound). Not hot-reloadable.
 	MetricsRetentionDays int `yaml:"metrics_retention_days"`
 
+	// OTLP retry/back-off parameters (issue #803).
+	TracerMaxRetries     int    `yaml:"tracer_max_retries"`
+	TracerRetryBaseDelay string `yaml:"tracer_retry_base_delay"`
+	TracerRetryMaxDelay  string `yaml:"tracer_retry_max_delay"`
+
 	// Models
 	ModelsEndpointEnabled bool   `yaml:"models_endpoint_enabled"`
 	ModelsCacheTTL        string `yaml:"models_cache_ttl"`
@@ -173,6 +180,9 @@ type YAMLConfig struct {
 	RateLimitRPM      int    `yaml:"rate_limit_rpm"`
 	RateLimitBurst    int    `yaml:"rate_limit_burst"`
 	RateLimitByAPIKey bool   `yaml:"rate_limit_by_api_key"`
+
+	// Distributed tracing
+	TracingTimeout string `yaml:"tracing_timeout"`
 }
 
 // LoadYAML reads configuration from a YAML file at path, then overlays
@@ -261,6 +271,13 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.MaxBodyBytes = n
 	}
+	if v := os.Getenv("NEXUS_MAX_RESPONSE_BYTES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_MAX_RESPONSE_BYTES: %w", err)
+		}
+		cfg.MaxResponseBytes = n
+	}
 	if v := os.Getenv("NEXUS_SHUTDOWN_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -273,6 +290,19 @@ func LoadYAML(path string) (Config, error) {
 			d = DefaultShutdownTimeout
 		}
 		cfg.ShutdownTimeout = d
+	}
+	if v := os.Getenv("NEXUS_TRACING_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT: %w", err)
+		}
+		if d < 0 {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT must not be negative, got %s", d)
+		}
+		if d == 0 {
+			d = DefaultTracingTimeout
+		}
+		cfg.TracingTimeout = d
 	}
 	if v := os.Getenv("NEXUS_TLS_ENABLED"); v != "" {
 		cfg.TLSEnabled = parseBoolEnvStr(v, false)
@@ -498,6 +528,13 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.RAGEmbedCacheTTL = d
 	}
+	if v := os.Getenv("NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT: %w", err)
+		}
+		cfg.RAGEmbedCacheWaitTimeout = d
+	}
 	if v := os.Getenv("NEXUS_RAG_BATCH_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
@@ -568,6 +605,13 @@ func LoadYAML(path string) (Config, error) {
 			return cfg, fmt.Errorf("config: NEXUS_ARBITER_TIMEOUT: %w", err)
 		}
 		cfg.ArbiterTimeout = d
+	}
+	if v := os.Getenv("NEXUS_CASCADE_MAX_RESPONSE_BYTES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_CASCADE_MAX_RESPONSE_BYTES: %w", err)
+		}
+		cfg.CascadeMaxResponseBytes = n
 	}
 
 	// Fusion
@@ -857,6 +901,23 @@ func LoadYAML(path string) (Config, error) {
 		}
 	}
 
+	// OTLP retry/back-off parameters (issue #803).
+	if v := os.Getenv("NEXUS_TRACING_MAX_RETRIES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.TracerMaxRetries = n
+		}
+	}
+	if v := os.Getenv("NEXUS_TRACING_RETRY_BASE_DELAY"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.TracerRetryBaseDelay = d
+		}
+	}
+	if v := os.Getenv("NEXUS_TRACING_RETRY_MAX_DELAY"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.TracerRetryMaxDelay = d
+		}
+	}
+
 	// Models
 	if v := os.Getenv("NEXUS_MODELS_ENDPOINT"); v != "" {
 		cfg.ModelsEndpointEnabled = parseBoolEnvStr(v, true)
@@ -942,11 +1003,17 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		MetricsDBPath:          yc.stringDefault(yc.MetricsDBPath, DefaultMetricsDBPath()),
 		MetricsRetentionDays:   yc.intDefault(yc.MetricsRetentionDays, 0),
 
+		// OTLP retry/back-off parameters (issue #803).
+		TracerMaxRetries:     yc.intDefault(yc.TracerMaxRetries, 0),
+		TracerRetryBaseDelay: yc.durationDefault(yc.TracerRetryBaseDelay, 0),
+		TracerRetryMaxDelay:  yc.durationDefault(yc.TracerRetryMaxDelay, 0),
+
 		// Non-string fields with defaults
 		RAGThreshold:              yc.floatDefault(yc.RAGThreshold, 0.55),
 		RAGDBPath:                 yc.stringDefault(yc.RAGDBPath, DefaultRAGDBPath()),
 		RAGEmbedCacheSize:         yc.intDefault(yc.RAGEmbedCacheSize, 256),
 		RAGEmbedCacheTTL:          yc.durationDefault(yc.RAGEmbedCacheTTL, 24*time.Hour),
+		RAGEmbedCacheWaitTimeout:  yc.durationDefault(yc.RAGEmbedCacheWaitTimeout, 5*time.Second),
 		RAGBatchSize:              yc.intDefault(yc.RAGBatchSize, 32),
 		TokenGuardrail:            yc.intDefault(yc.TokenGuardrail, 6000),
 		SLMTimeout:                yc.durationDefault(yc.SLMTimeout, 8*time.Second),
@@ -957,6 +1024,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		CascadeTimeout:            yc.durationDefault(yc.CascadeTimeout, 30*time.Second),
 		ArbiterTimeout:            yc.durationDefault(yc.ArbiterTimeout, 60*time.Second),
 		CascadeMaxResponseBytes:   yc.intDefault(yc.CascadeMaxResponseBytes, DefaultMaxResponseBytes),
+		MaxResponseBytes:          yc.intDefault(yc.MaxResponseBytes, DefaultMaxResponseBytes),
 
 		FusionProgressiveDelivery: yc.boolFieldDefault(yc.FusionProgressiveDelivery, true),
 		FusionAgreementThreshold:  yc.floatDefault(yc.FusionAgreementThreshold, 0.85),
@@ -1039,6 +1107,8 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		RateLimitRPM:      yc.intDefault(yc.RateLimitRPM, 0),
 		RateLimitBurst:    yc.intDefault(yc.RateLimitBurst, 0),
 		RateLimitByAPIKey: yc.RateLimitByAPIKey,
+
+		TracingTimeout: yc.durationDefault(yc.TracingTimeout, DefaultTracingTimeout),
 	}
 
 	// Embedder type

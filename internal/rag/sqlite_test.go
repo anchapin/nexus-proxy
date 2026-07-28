@@ -926,7 +926,7 @@ func TestExtractEmbedderModel_UnwrapsEmbedCache(t *testing.T) {
 	t.Parallel()
 
 	inner := &OllamaEmbedder{BaseURL: "http://localhost:11434", Model: "nomic-embed-text"}
-	wrapped := NewEmbedCache(inner, 8, time.Minute)
+	wrapped := NewEmbedCache(inner, 8, time.Minute, 5*time.Second)
 
 	if got := extractEmbedderModel(wrapped); got != "nomic-embed-text" {
 		t.Errorf("extractEmbedderModel(EmbedCache) = %q, want %q", got, "nomic-embed-text")

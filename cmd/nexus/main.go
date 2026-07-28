@@ -146,10 +146,11 @@ func main() {
 	// the cache (falls back to the raw embedder).
 	var ragEmbedder rag.Embedder = emb
 	if cfg.RAGEmbedCacheSize > 0 && cfg.RAGEmbedCacheTTL > 0 {
-		ragEmbedder = rag.NewEmbedCache(emb, cfg.RAGEmbedCacheSize, cfg.RAGEmbedCacheTTL)
+		ragEmbedder = rag.NewEmbedCache(emb, cfg.RAGEmbedCacheSize, cfg.RAGEmbedCacheTTL, cfg.RAGEmbedCacheWaitTimeout)
 		slog.Info("rag embedding cache enabled",
 			slog.Int("max_entries", cfg.RAGEmbedCacheSize),
 			slog.Duration("ttl", cfg.RAGEmbedCacheTTL),
+			slog.Duration("wait_timeout", cfg.RAGEmbedCacheWaitTimeout),
 		)
 	}
 
@@ -525,6 +526,26 @@ func main() {
 		}
 	}()
 
+	// Distributed tracing OTLP exporter (issue #41, #804). When
+	// NEXUS_TRACING_ENDPOINT is set, start the exporter and register
+	// it as the process-wide tracer so middleware and the chat handler
+	// can guard span creation with tracing.Enabled. The timeout is
+	// configurable via NEXUS_TRACING_TIMEOUT (default 10s) so
+	// high-latency collectors don't cause premature POST failures.
+	if endpoint := os.Getenv("NEXUS_TRACING_ENDPOINT"); endpoint != "" {
+		exp := tracing.NewExporter(tracing.ExporterConfig{
+			Endpoint: endpoint,
+			Timeout:  cfg.TracingTimeout,
+		})
+		if exp != nil {
+			tracing.RegisterExporter(exp)
+			slog.Info("tracing exporter started",
+				slog.String("endpoint", endpoint),
+				slog.Duration("timeout", cfg.TracingTimeout),
+			)
+		}
+	}
+
 	// Frontier provider registry (issue #223). When NEXUS_FRONTIER_PROVIDERS
 	// is set, ParseProvidersFromEnv parses the JSON array and returns a
 	// registry of Provider objects. When nil the chat handler falls back
@@ -709,6 +730,16 @@ func main() {
 			}}
 		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var v uint64
+			if w, ok := recorder.(interface{ WriteErrors() uint64 }); ok {
+				v = w.WriteErrors()
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_telemetry_write_errors_total",
+				Value: float64(v),
+			}}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
 			return []observability.GaugeSample{{
 				Name:  "nexus_tracing_dropped_total",
 				Value: float64(tracing.GlobalExporter().Dropped()),
@@ -875,6 +906,9 @@ func main() {
 			slog.Duration("ttl", cfg.ArbiterCacheTTL),
 			slog.Int("max_entries", cfg.ArbiterCacheMaxEntries),
 		)
+		arbiterCache.SetEvictionObserver(func(reason string) {
+			routeCounters.ObserveArbiterCacheEviction(reason)
+		})
 	}
 	mux.Handle("/metrics", routeCounters.Handler())
 	slog.Info("metrics endpoint serves prometheus text format",

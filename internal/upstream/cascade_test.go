@@ -380,6 +380,17 @@ func TestCascadeFallbackReasonUnknown(t *testing.T) {
 	}
 }
 
+// TestCascadeFallbackReason_ModelUnavailable verifies issue #790: a
+// cascadeErr with reason="model_unavailable" (local 404) is labeled
+// "model_unavailable", not "unknown", so the metric
+// cascade_fallback_total{reason="model_unavailable"} is emitted.
+func TestCascadeFallbackReason_ModelUnavailable(t *testing.T) {
+	modelUnavailableErr := newCascadeErr(true, "model_unavailable", "local model not found (404)")
+	if got := CascadeFallbackReason(modelUnavailableErr); got != "model_unavailable" {
+		t.Errorf("CascadeFallbackReason(modelUnavailableErr) = %q, want model_unavailable", got)
+	}
+}
+
 func TestCascadeFallsBackOnTimeout(t *testing.T) {
 	// Primary hangs; cascade timeout short-circuits it.
 	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

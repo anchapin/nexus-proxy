@@ -20,7 +20,8 @@ type AuthLimiter struct {
 	burst  int           // max failures before block
 	window time.Duration // sliding window for failure tracking
 
-	onBlock func() // called when a client is blocked; must not block
+	onBlock  func()            // called when a client is blocked; must not block
+	resolver *ClientIPResolver // resolves client IP for rate-limit bucketing
 
 	mu       sync.Mutex
 	failures map[string]*authFailure // keyed by resolved client IP
@@ -51,6 +52,7 @@ func NewAuthLimiter(rpm, burst int, window time.Duration, resolver *ClientIPReso
 		rpm:      rpm,
 		burst:    burst,
 		window:   window,
+		resolver: resolver,
 		failures: make(map[string]*authFailure),
 		stopCh:   make(chan struct{}),
 	}
@@ -180,6 +182,14 @@ func (al *AuthLimiter) Enabled() bool {
 		return false
 	}
 	return al.rpm > 0
+}
+
+// Resolver returns the configured client IP resolver. May be nil.
+func (al *AuthLimiter) Resolver() *ClientIPResolver {
+	if al == nil {
+		return nil
+	}
+	return al.resolver
 }
 
 // BlockedCount returns the number of IPs currently blocked (failure count

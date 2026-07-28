@@ -14,6 +14,9 @@ package auth
 
 import (
 	"crypto/subtle"
+	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -36,6 +39,7 @@ type Middleware struct {
 	exempt      func(*http.Request) bool
 	authLimiter *ratelimit.AuthLimiter
 	observer    AuthObserver
+	resolver    *ratelimit.ClientIPResolver
 }
 
 // NewMiddleware returns a middleware that rejects requests without a
@@ -47,7 +51,11 @@ type Middleware struct {
 // When observer is non-nil, auth rejection counters are incremented on
 // 401 responses (issue #295).
 func NewMiddleware(key string, exempt func(*http.Request) bool, authLimiter *ratelimit.AuthLimiter, observer AuthObserver) *Middleware {
-	return &Middleware{key: key, exempt: exempt, authLimiter: authLimiter, observer: observer}
+	var resolver *ratelimit.ClientIPResolver
+	if authLimiter != nil {
+		resolver = authLimiter.Resolver()
+	}
+	return &Middleware{key: key, exempt: exempt, authLimiter: authLimiter, observer: observer, resolver: resolver}
 }
 
 // Enabled reports whether the middleware actually enforces auth.
@@ -60,6 +68,26 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if m.authLimiter != nil && m.authLimiter.Enabled() {
+			ip := m.resolver.Resolve(r)
+			if m.authLimiter.IsBlocked(ip) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Retry-After", "60")
+				w.WriteHeader(http.StatusTooManyRequests)
+				enc := json.NewEncoder(w)
+				_ = enc.Encode(map[string]any{
+					"error": map[string]any{
+						"type":    "auth_rate_limit_exceeded",
+						"message": "too many authentication failures for this client",
+					},
+				})
+				slog.Warn("auth rate limit exceeded",
+					slog.String("client_ip", ip),
+				)
+				return
+			}
+		}
+
 		if m.exempt != nil && m.exempt(r) {
 			next.ServeHTTP(w, r)
 			return
@@ -67,9 +95,15 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		token := BearerToken(r)
 		if token == "" {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="nexus-proxy"`)
-			http.Error(w, `{"error":"missing or malformed Authorization header"}`, http.StatusUnauthorized)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = fmt.Fprint(w, `{"error":"missing or malformed Authorization header"}`)
 			if m.observer != nil {
 				m.observer.IncAuthRejectedMissing()
+			}
+			if m.authLimiter != nil && m.authLimiter.Enabled() {
+				ip := m.resolver.Resolve(r)
+				m.authLimiter.RecordFailure(ip)
 			}
 			return
 		}
@@ -77,9 +111,15 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		// (issue #228). The == 0 return value means the strings differ.
 		if subtle.ConstantTimeCompare([]byte(token), []byte(m.key)) == 0 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="nexus-proxy", error="invalid_token"`)
-			http.Error(w, `{"error":"invalid API key"}`, http.StatusUnauthorized)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = fmt.Fprint(w, `{"error":"invalid API key"}`)
 			if m.observer != nil {
 				m.observer.IncAuthRejectedInvalid()
+			}
+			if m.authLimiter != nil && m.authLimiter.Enabled() {
+				ip := m.resolver.Resolve(r)
+				m.authLimiter.RecordFailure(ip)
 			}
 			return
 		}

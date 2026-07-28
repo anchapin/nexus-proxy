@@ -606,6 +606,109 @@ func TestExporterNilRespNetworkError(t *testing.T) {
 	}
 }
 
+func TestExporterRetryParamsConfigurable(t *testing.T) {
+	// Issue #803: retry parameters must be configurable via ExporterConfig.
+	// Verify the constructor applies custom values and falls back to
+	// defaults when <= 0.
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	// Custom: 1 retry with 10ms base, 50ms max.
+	e := NewExporter(ExporterConfig{
+		Endpoint:       srv.URL,
+		MaxRetries:     1,
+		RetryBaseDelay: 10 * time.Millisecond,
+		MaxRetryDelay:  50 * time.Millisecond,
+	})
+	if e == nil {
+		t.Fatal("NewExporter returned nil")
+	}
+	defer e.Close()
+
+	_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "op")
+	s.End()
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Initial attempt + 1 retry = 2 total attempts.
+	if got := attempts.Load(); got != 2 {
+		t.Errorf("attempts = %d, want 2 (initial + 1 retry)", got)
+	}
+	if e.FlushFailures() == 0 {
+		t.Error("FlushFailures() = 0, want > 0 after retries exhausted")
+	}
+}
+
+func TestExporterRetryParamsDefaults(t *testing.T) {
+	// When MaxRetries/RetryBaseDelay/MaxRetryDelay are 0 (or negative),
+	// the constructor must fall back to the defaults.
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{
+		Endpoint:       srv.URL,
+		MaxRetries:     0, // should fall back to defaultMaxRetries (3)
+		RetryBaseDelay: 0,
+		MaxRetryDelay:  0,
+	})
+	if e == nil {
+		t.Fatal("NewExporter returned nil")
+	}
+	defer e.Close()
+
+	_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "op")
+	s.End()
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Initial attempt + 3 retries = 4 total attempts.
+	if got := attempts.Load(); got != 4 {
+		t.Errorf("attempts = %d, want 4 (initial + 3 retries)", got)
+	}
+}
+
+func TestExporterRetryParamsNegative(t *testing.T) {
+	// Negative values must also fall back to defaults.
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{
+		Endpoint:       srv.URL,
+		MaxRetries:     -5,
+		RetryBaseDelay: -100 * time.Millisecond,
+		MaxRetryDelay:  -1 * time.Second,
+	})
+	if e == nil {
+		t.Fatal("NewExporter returned nil")
+	}
+	defer e.Close()
+
+	_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "op")
+	s.End()
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Initial attempt + 3 retries = 4 total attempts.
+	if got := attempts.Load(); got != 4 {
+		t.Errorf("attempts = %d, want 4 (negative values should fall back to defaults)", got)
+	}
+}
+
 type errorTransport struct {
 	err error
 }
