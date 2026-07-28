@@ -119,8 +119,9 @@ type Config struct {
 	// deterministic for a given model+text pair, so they are memoized
 	// in a bounded LRU with TTL. RAGEmbedCacheSize=0 disables the cache;
 	// RAGEmbedCacheTTL=0 disables caching (pass-through) even when size>0.
-	RAGEmbedCacheSize int           // max LRU entries (256)
-	RAGEmbedCacheTTL  time.Duration // per-entry TTL (24h default); 0 = pass-through
+	RAGEmbedCacheSize        int           // max LRU entries (256)
+	RAGEmbedCacheTTL         time.Duration // per-entry TTL (24h default); 0 = pass-through
+	RAGEmbedCacheWaitTimeout time.Duration // max time a waiter waits for a concurrent load (5s default); issue #800
 
 	// RAG circuit breaker (issue #222). After RAGCircuitBreakerThreshold
 	// consecutive Ollama /api/embeddings failures the breaker trips and
@@ -803,6 +804,20 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.RAGEmbedCacheTTL = ragCacheTTL
+
+	// RAG embed cache waiter timeout (issue #800). When multiple goroutines
+	// request the same key concurrently, waiters block on the in-flight
+	// inner.Embed call. If the inner call takes too long or the waiting
+	// goroutine's context is cancelled, the waiter gives up after this
+	// timeout and falls through to a direct inner call. A value of 0
+	// disables the timeout (waiters wait indefinitely — pre-issue-#800
+	// behaviour). Default 5s is long enough to benefit from coalescing
+	// without excessive latency on cache misses.
+	waitTimeout, err := getEnvDuration("NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT", 5*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RAGEmbedCacheWaitTimeout = waitTimeout
 
 	// RAG embedder plugin interface (issue #238). The type selects
 	// which backend the RAG store uses for vector embeddings.
