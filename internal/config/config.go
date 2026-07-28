@@ -1583,24 +1583,21 @@ func Load() (Config, error) {
 	cfg.TracingEndpoint = getEnvAllowEmpty("NEXUS_TRACING_ENDPOINT", "")
 
 	tracingTimeout := time.Duration(0)
-	tracingTimeout, err = getEnvDuration("NEXUS_TRACING_TIMEOUT", 10*time.Second)
+	tracingTimeout, _ = getEnvDuration("NEXUS_TRACING_TIMEOUT", 10*time.Second)
 	if tracingTimeout < 0 {
 		tracingTimeout = 10 * time.Second
 	}
 	cfg.TracingTimeout = tracingTimeout
 
 	tracingQueueSize := 0
-	tracingQueueSize, err = getEnvInt("NEXUS_TRACING_QUEUE_SIZE", 256)
+	tracingQueueSize, _ = getEnvInt("NEXUS_TRACING_QUEUE_SIZE", 256)
 	if tracingQueueSize < 0 {
 		tracingQueueSize = 256
 	}
 	cfg.TracingQueueSize = tracingQueueSize
 
 	tracingSampleRate := 0.0
-	tracingSampleRate, err = getEnvFloat("NEXUS_TRACING_SAMPLE_RATE", 1.0)
-	if err != nil {
-		return cfg, err
-	}
+	tracingSampleRate, _ = getEnvFloat("NEXUS_TRACING_SAMPLE_RATE", 1.0)
 	if tracingSampleRate < 0 {
 		tracingSampleRate = 0
 	}
