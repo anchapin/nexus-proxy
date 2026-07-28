@@ -1,0 +1,20 @@
+You are implementing GitHub issue #873 in a dedicated worktree.
+
+**Issue #873: BenchmarkRegistryByName and BenchmarkRegistryAll panic on second iteration — duplicate provider registration**
+
+**Area:** (no label - bug in internal/providers)
+
+**Problem:** Both benchmarks loop 100 times calling `reg.Register(...)` with the **same** `NameVal: "provider"` on every iteration. `ProviderRegistry.Register` calls `getOrCreate(name)` which panics when a name is registered twice.
+
+**Proposed fix:** Use a unique provider name per iteration: `NameVal: fmt.Sprintf("provider-%d", i)` instead of `NameVal: "provider"`.
+
+**Worktree:** `/home/alex/AI/worktrees/issue-873-benchmark-fix`
+
+**Your task:**
+1. Find `BenchmarkRegistryByName` and `BenchmarkRegistryAll` in `internal/providers/registry_test.go`
+2. Change the loop to use `fmt.Sprintf("provider-%d", i)` instead of `"provider"` for the NameVal
+3. Run the benchmarks to verify they no longer panic: `go test -bench=BenchmarkRegistry -benchtime=1s ./internal/providers`
+4. Commit: `fix: resolve #873 — use unique provider names in benchmarks`
+5. Push: `git push -u origin fix/issue-873-benchmark-fix`
+6. Create PR targeting `develop`: `Closes #873`
+7. Report PR number
