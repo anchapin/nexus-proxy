@@ -147,7 +147,7 @@ func RegisterBreaker(kind string, brk *Breaker) {
 
 // BreakerState holds the current state of a circuit breaker for observability purposes.
 type BreakerState struct {
-	State       int32 // 0=closed, 1=half_open, 2=open
+	State        int32 // 0=closed, 1=half_open, 2=open
 	FailureCount int32
 }
 
@@ -159,7 +159,7 @@ func GetBreakerStates() map[string]BreakerState {
 	result := make(map[string]BreakerState, len(breakers))
 	for kind, brk := range breakers {
 		result[kind] = BreakerState{
-			State:       brk.State(),
+			State:        brk.State(),
 			FailureCount: brk.FailureCount(),
 		}
 	}

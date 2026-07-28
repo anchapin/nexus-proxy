@@ -211,30 +211,40 @@ func (c *EmbedCache) Embed(ctx context.Context, text string) ([]float64, error) 
 			case result = <-slot.ch:
 				timer.Stop()
 			case <-timer.C:
-				// Timeout: close done to signal the loading goroutine
-				// to abort, delete the loading slot, and fall through
-				// to a direct inner call (issue #800).
-				close(slot.done)
+				// Timeout: acquire lock and atomically delete the loading slot
+				// before closing done. If another goroutine already deleted
+				// the slot, skip the close to avoid double-close panic (race
+				// with ctx cancel on the same select; Go picks one randomly).
 				c.mu.Lock()
+				_, stillLoading := c.loading[key]
 				delete(c.loading, key)
 				c.mu.Unlock()
+				if stillLoading {
+					close(slot.done)
+				}
 				return c.inner.Embed(ctx, text)
 			case <-ctx.Done():
 				timer.Stop()
-				close(slot.done)
 				c.mu.Lock()
+				_, stillLoading := c.loading[key]
 				delete(c.loading, key)
 				c.mu.Unlock()
+				if stillLoading {
+					close(slot.done)
+				}
 				return nil, ctx.Err()
 			}
 		} else {
 			select {
 			case result = <-slot.ch:
 			case <-ctx.Done():
-				close(slot.done)
 				c.mu.Lock()
+				_, stillLoading := c.loading[key]
 				delete(c.loading, key)
 				c.mu.Unlock()
+				if stillLoading {
+					close(slot.done)
+				}
 				return nil, ctx.Err()
 			}
 		}
@@ -522,13 +532,13 @@ type Store struct {
 	lastIndexAt               int64
 	retrievalAttempts         uint64
 	retrievalHits             uint64
-	retrievalMisses          uint64
+	retrievalMisses           uint64
 	emptyStoreMisses          uint64
 	thresholdMisses           uint64
 	embedErrors               uint64
 	injectionSkippedSizeLimit uint64
 	generation                int64
-	lastSuccessfulKind         string // circuit kind of last successful embedder (issue #886)
+	lastSuccessfulKind        string // circuit kind of last successful embedder (issue #886)
 }
 
 // StoreOption configures a Store.

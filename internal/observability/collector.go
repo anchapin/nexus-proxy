@@ -271,8 +271,8 @@ type Collector struct {
 	//
 	// Tracks trip/recover events per embedder kind. State and failure count
 	// are read live from health.breakers at scrape time.
-	ragCircuitMu     sync.RWMutex
-	ragCircuitTrips   map[string]*atomic.Uint64 // keyed by "ollama", "openai", "cohere"
+	ragCircuitMu       sync.RWMutex
+	ragCircuitTrips    map[string]*atomic.Uint64 // keyed by "ollama", "openai", "cohere"
 	ragCircuitRecovers map[string]*atomic.Uint64
 
 	// --- Per-route latency percentile ring buffers (issue #774) --------

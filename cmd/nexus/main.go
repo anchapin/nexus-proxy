@@ -60,17 +60,17 @@ var commit = "unknown"
 // circuitBreakerAdapter bridges the chat handler's CircuitBreakerObserver
 // calls into the observability Collector (issue #304, #886).
 type circuitBreakerAdapter struct {
-	recordFailure       func(string)
-	recordRecovery      func(string)
-	incEmbedderFailure  func(string)
-	incRAGCircuitTrip   func(string)
-	incRAGCircuitRecov  func(string)
+	recordFailure      func(string)
+	recordRecovery     func(string)
+	incEmbedderFailure func(string)
+	incRAGCircuitTrip  func(string)
+	incRAGCircuitRecov func(string)
 }
 
 func (a circuitBreakerAdapter) RecordCircuitFailure(circuit string)  { a.recordFailure(circuit) }
 func (a circuitBreakerAdapter) RecordCircuitRecovery(circuit string) { a.recordRecovery(circuit) }
 func (a circuitBreakerAdapter) IncEmbedderFailure(kind string)       { a.incEmbedderFailure(kind) }
-func (a circuitBreakerAdapter) IncRAGCircuitTrip(kind string)       { a.incRAGCircuitTrip(kind) }
+func (a circuitBreakerAdapter) IncRAGCircuitTrip(kind string)        { a.incRAGCircuitTrip(kind) }
 func (a circuitBreakerAdapter) IncRAGCircuitRecover(kind string)     { a.incRAGCircuitRecov(kind) }
 
 func main() {
@@ -1071,9 +1071,9 @@ func main() {
 	routeCounters.SetCollector(circuitCollector)
 
 	circuitBreakerObs := circuitBreakerAdapter{
-		recordFailure:       circuitCollector.RecordCircuitFailure,
-		recordRecovery:      circuitCollector.RecordCircuitRecovery,
-		incEmbedderFailure:  circuitCollector.IncEmbedderFailure,
+		recordFailure:      circuitCollector.RecordCircuitFailure,
+		recordRecovery:     circuitCollector.RecordCircuitRecovery,
+		incEmbedderFailure: circuitCollector.IncEmbedderFailure,
 		incRAGCircuitTrip:  circuitCollector.IncRAGCircuitTrip,
 		incRAGCircuitRecov: circuitCollector.IncRAGCircuitRecover,
 	}
