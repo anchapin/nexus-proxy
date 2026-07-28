@@ -1,0 +1,23 @@
+You are implementing GitHub issue #894 in a dedicated worktree.
+
+**Issue #894: NEXUS_TRACING_SAMPLE_RATE env var is parsed but missing from .env.example**
+
+**Area:** area:observability, phase:5-dx
+
+**Problem:** `NEXUS_TRACING_SAMPLE_RATE` env var is parsed in `config.go` but missing from `.env.example`, making it a hidden knob.
+
+**Acceptance criteria:**
+- `NEXUS_TRACING_SAMPLE_RATE` appears in `.env.example`
+- Documentation describes the accepted range (0.0–1.0) and effect
+
+**Worktree:** `/home/alex/AI/worktrees/issue-894-tracing-sample-rate`
+
+**Your task:**
+1. In the worktree at `/home/alex/AI/worktrees/issue-894-tracing-sample-rate`, implement the fix
+2. Examine `.env.example` and `internal/config/config.go` to find the existing `NEXUS_TRACING_SAMPLE_RATE` parsing
+3. Add `NEXUS_TRACING_SAMPLE_RATE` to `.env.example` with proper documentation (range 0.0–1.0)
+4. Run `make build` to verify
+5. Commit: `fix: resolve #894 — add NEXUS_TRACING_SAMPLE_RATE to .env.example`
+6. Push: `git push -u origin fix/issue-894-tracing-sample-rate`
+7. Create PR: `Closes #894`
+8. Report PR number when done
