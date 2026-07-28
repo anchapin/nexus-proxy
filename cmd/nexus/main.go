@@ -1478,6 +1478,12 @@ func main() {
 				rateLimiter.SetRPM(newCfg.RateLimitRPM)
 				rateLimiter.SetBurst(newCfg.RateLimitBurst)
 			}
+			// Update auth brute-force limiter (issue #895).
+			if authLimiter != nil {
+				authLimiter.SetRPM(newCfg.AuthRateLimitRPM)
+				authLimiter.SetBurst(newCfg.AuthRateLimitBurst)
+				authLimiter.SetWindow(newCfg.AuthRateLimitWindow)
+			}
 			// Update trusted-proxy allowlist so rate limiter sees the new CIDRs
 			// without requiring a restart (issue #896).
 			ipResolver.SetTrustedProxies(newCfg.TrustedProxies)
@@ -1488,6 +1494,9 @@ func main() {
 			slog.Info("config reloaded via SIGHUP",
 				slog.Int("rate_limit_rpm", newCfg.RateLimitRPM),
 				slog.Int("rate_limit_burst", newCfg.RateLimitBurst),
+				slog.Int("auth_rate_limit_rpm", newCfg.AuthRateLimitRPM),
+				slog.Int("auth_rate_limit_burst", newCfg.AuthRateLimitBurst),
+				slog.Duration("auth_rate_limit_window", newCfg.AuthRateLimitWindow),
 				slog.String("log_level", newCfg.LogLevel.String()),
 				slog.String("log_format", newCfg.LogFormat.String()),
 				slog.Bool("debug", newCfg.Debug),

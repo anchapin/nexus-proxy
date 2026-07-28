@@ -2050,6 +2050,28 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 	}
 	next.RateLimitBurst = rateBurst
 
+	// Auth brute-force limiter (issue #895).
+	authRateLimitRPM, _ := getEnvInt("NEXUS_AUTH_RATE_LIMIT_RPM", prev.AuthRateLimitRPM)
+	if authRateLimitRPM < 0 {
+		authRateLimitRPM = 0
+	}
+	next.AuthRateLimitRPM = authRateLimitRPM
+
+	authRateLimitBurst, _ := getEnvInt("NEXUS_AUTH_RATE_LIMIT_BURST", prev.AuthRateLimitBurst)
+	if authRateLimitBurst < 0 {
+		authRateLimitBurst = 0
+	}
+	next.AuthRateLimitBurst = authRateLimitBurst
+
+	authRateLimitWindow, _ := getEnvDuration("NEXUS_AUTH_RATE_LIMIT_WINDOW", prev.AuthRateLimitWindow)
+	if authRateLimitWindow < 0 {
+		authRateLimitWindow = 0
+	}
+	if authRateLimitWindow == 0 {
+		authRateLimitWindow = 5 * time.Minute
+	}
+	next.AuthRateLimitWindow = authRateLimitWindow
+
 	logLevel, logLevelErr := parseLogLevel(os.Getenv("NEXUS_LOG_LEVEL"))
 	if logLevelErr != nil {
 		slog.Warn("invalid NEXUS_LOG_LEVEL, using info level", slog.String("reason", logLevelErr.Error()))
