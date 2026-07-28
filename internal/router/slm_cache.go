@@ -470,11 +470,13 @@ func (c *SLMCache) SetMaxStale(maxStale int) {
 	c.mu.Unlock()
 }
 
-// Stale returns the number of entries that have passed their TTL but
-// have not yet been evicted (issue #835). This is the count that
-// accumulates silently when getSemantic is the only reader and Set is
-// not called frequently enough to trigger eviction on write.
-func (c *SLMCache) Stale() int {
+// StaleEntries returns the number of entries that have passed their TTL
+// but have not yet been evicted (issue #801). This is the count that
+// accumulates silently when Get is the only reader and Set is not called
+// frequently enough to trigger eviction on write. It is exposed as the
+// `nexus_slm_cache_stale_entries` gauge so operators can observe cache
+// pollution from /metrics without debug tracing.
+func (c *SLMCache) StaleEntries() int {
 	if c == nil {
 		return 0
 	}
@@ -492,6 +494,11 @@ func (c *SLMCache) Stale() int {
 		}
 	}
 	return stale
+}
+
+// Stale is an alias for StaleEntries for backward compatibility (issue #801).
+func (c *SLMCache) Stale() int {
+	return c.StaleEntries()
 }
 
 // EvictExpired removes all entries whose TTL has expired and returns
