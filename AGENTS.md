@@ -279,9 +279,10 @@ Config env vars are split across two files. New vars need **both**:
 2. **YAML mirror** in `internal/config/yaml.go` (`YAMLConfig` struct
    field, snake_case) + an env-overrides-yaml branch in `LoadYAML()`.
 
-Config file: `$XDG_CONFIG_HOME/nexus-proxy/config.yaml` or
-`~/.config/nexus-proxy/...` or `./config.yaml`. Env vars always override
-file values.
+Config file: `NEXUS_CONFIG_FILE` if set, else
+`$XDG_CONFIG_HOME/nexus-proxy/config.yaml` if `XDG_CONFIG_HOME` is set,
+else `./config.yaml`. Env vars always override file values.
+`nexus config validate <file>` checks a YAML file before use (exits 0/1).
 
 `internal/config/env_example_audit_test.go` **enforces** the `.env.example` ↔
 parser contract bidirectionally (issue #478). Adding a var without both the
@@ -290,9 +291,13 @@ are exempt: `NEXUS_PROVIDER_`, `NEXUS_FRONTIER_`, `NEXUS_ZAI_`, `NEXUS_HTTP_`;
 plus `NEXUS_QUALITY_TEST_HOOK` (test-only).
 
 For hot-reloadable knobs add the field to `ReloadHotReloadable()` in
-`config.go`. Sending **SIGHUP** re-reads exactly: log level, log format,
-debug, rate-limit RPM, rate-limit burst. Everything else requires a full
-restart.
+`config.go`. Sending **SIGHUP** re-reads exactly: `NEXUS_LOG_LEVEL`,
+`NEXUS_LOG_FORMAT`, `NEXUS_DEBUG`, `NEXUS_RATE_LIMIT_RPM`,
+`NEXUS_RATE_LIMIT_BURST`. Everything else requires a full restart.
+The `env_example_audit_test.go` bidirectional test enforces that every
+var listed in `ReloadHotReloadable()` carries the `# hot-reloadable via
+SIGHUP` annotation in `.env.example` — omitting the annotation from a new
+hot-reloadable var will fail the test.
 
 ## Branch conventions
 
