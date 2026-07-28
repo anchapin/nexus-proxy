@@ -1592,7 +1592,7 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 		return store, nil, nil
 	}
 
-	ps, err := rag.OpenPersistentStore(cfg.RAGDBPath, cachedEmb, cfg.RAGThreshold)
+	ps, err := rag.OpenPersistentStore(cfg.RAGDBPath, cachedEmb, cfg.RAGThreshold, rag.WithBatchSize(cfg.RAGBatchSize))
 	if err != nil {
 		// Persistence is a best-effort optimisation. Fall back to
 		// the in-memory store so the proxy still serves traffic —

@@ -990,3 +990,101 @@ func TestPersistentStore_Path_InMemory(t *testing.T) {
 		t.Errorf("Path() = %q, want empty string for :memory:", got)
 	}
 }
+
+// batchCounterEmbedder tracks Embed vs EmbedBatch call counts separately
+// so tests can assert which method was invoked.
+type batchCounterEmbedder struct {
+	mu         sync.Mutex
+	embedCalls int
+	batchCalls int
+}
+
+func (b *batchCounterEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
+	b.mu.Lock()
+	b.embedCalls++
+	b.mu.Unlock()
+	return []float64{0, 0, 0}, nil
+}
+
+func (b *batchCounterEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float64, error) {
+	b.mu.Lock()
+	b.batchCalls++
+	b.mu.Unlock()
+	result := make([][]float64, len(texts))
+	for i := range texts {
+		result[i] = []float64{0, 0, 0}
+	}
+	return result, nil
+}
+
+func (b *batchCounterEmbedder) IsHealthy(context.Context) bool { return true }
+func (b *batchCounterEmbedder) IsBreakerOpen() bool            { return false }
+func (b *batchCounterEmbedder) RecordBreakerSuccess()          {}
+
+func (b *batchCounterEmbedder) EmbedCalls() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.embedCalls
+}
+
+func (b *batchCounterEmbedder) BatchCalls() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.batchCalls
+}
+
+// TestPersistentStoreIndexDir_UsesBatchEmbedding verifies that when
+// batchSize > 0, IndexDir calls EmbedBatch (not Embed) and that the
+// number of EmbedBatch calls matches the expected partition count.
+// This is the regression test for issue #832.
+func TestPersistentStoreIndexDir_UsesBatchEmbedding(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	const fileCount = 10
+	for i := 0; i < fileCount; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("file%d.go", i)), []byte(fmt.Sprintf("content %d", i)), 0o644); err != nil {
+			t.Fatalf("write file%d: %v", i, err)
+		}
+	}
+
+	t.Run("batchSize=4_callsEmbedBatch", func(t *testing.T) {
+		emb := &batchCounterEmbedder{}
+		ps, err := OpenPersistentStore(":memory:", emb, 0.55, WithBatchSize(4))
+		if err != nil {
+			t.Fatalf("OpenPersistentStore: %v", err)
+		}
+		t.Cleanup(func() { _ = ps.Close() })
+
+		if err := ps.IndexDir(context.Background(), dir); err != nil {
+			t.Fatalf("IndexDir: %v", err)
+		}
+
+		if emb.EmbedCalls() != 0 {
+			t.Errorf("Embed calls = %d, want 0 (should use EmbedBatch when batchSize > 0)", emb.EmbedCalls())
+		}
+		wantBatchCalls := (fileCount + 4 - 1) / 4
+		if emb.BatchCalls() != wantBatchCalls {
+			t.Errorf("EmbedBatch calls = %d, want %d", emb.BatchCalls(), wantBatchCalls)
+		}
+	})
+
+	t.Run("batchSize=0_callsEmbed", func(t *testing.T) {
+		emb := &batchCounterEmbedder{}
+		ps, err := OpenPersistentStore(":memory:", emb, 0.55)
+		if err != nil {
+			t.Fatalf("OpenPersistentStore: %v", err)
+		}
+		t.Cleanup(func() { _ = ps.Close() })
+
+		if err := ps.IndexDir(context.Background(), dir); err != nil {
+			t.Fatalf("IndexDir: %v", err)
+		}
+
+		if emb.BatchCalls() != 0 {
+			t.Errorf("EmbedBatch calls = %d, want 0 (should use Embed when batchSize == 0)", emb.BatchCalls())
+		}
+		if emb.EmbedCalls() != fileCount {
+			t.Errorf("Embed calls = %d, want %d", emb.EmbedCalls(), fileCount)
+		}
+	})
+}
