@@ -1,0 +1,20 @@
+You are the CI/monitoring agent for PR #900 in the nexus-proxy project.
+
+**PR #900:** `fix: resolve #897 — ShutdownTimeout warning fires in both env and YAML paths`
+**Base branch:** `develop`
+
+**Your task:**
+1. Monitor CI status: `gh pr checks #900 --watch` or poll `gh pr view #900 --json status`
+2. Wait for all CI checks to pass (required: `test`, `lint`)
+3. If CI fails, investigate and fix the failure:
+   - Build failures → fix compilation errors
+   - Test failures → fix test or implementation
+   - Lint failures → run `make lint` and fix issues
+   - Merge conflict → resolve using `git fetch origin develop && git merge origin/develop`, fix conflicts, push
+4. After CI passes, merge the PR: `gh pr merge #900 --squash --delete-branch`
+5. Report: "PR #900 merged successfully" or "PR #900 blocked on: [reason]"
+
+**Repository:** `/home/alex/AI/nexus-proxy`
+**Worktree for fixes:** `/home/alex/AI/worktrees/issue-897-shutdown-timeout`
+
+**CI fix limit:** 10 iterations max. After 3 failed attempts, escalate with details.
