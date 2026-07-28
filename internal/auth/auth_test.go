@@ -253,12 +253,12 @@ func TestConstantTimeComparisonRegression(t *testing.T) {
 
 // mockObserver implements AuthObserver for testing (issue #295).
 type mockObserver struct {
-	accepted         int
-	rejectedInvalid  int
-	rejectedMissing  int
+	accepted        int
+	rejectedInvalid int
+	rejectedMissing int
 }
 
-func (m *mockObserver) IncAuthAccepted()         { m.accepted++ }
+func (m *mockObserver) IncAuthAccepted()        { m.accepted++ }
 func (m *mockObserver) IncAuthRejectedInvalid() { m.rejectedInvalid++ }
 func (m *mockObserver) IncAuthRejectedMissing() { m.rejectedMissing++ }
 
