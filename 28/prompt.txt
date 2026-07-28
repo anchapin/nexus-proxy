@@ -1,0 +1,25 @@
+You are implementing GitHub issue #889 in a dedicated worktree.
+
+**Issue #889: RAG embed batch partial-failure path does not log per-file outcomes**
+
+**Area:** area:rag, phase:5-dx
+
+**Problem:** In `Store.IndexDir` batch path (rag.go:861-889), when `EmbedBatch` succeeds but individual `Upsert` calls fail, the loop logs "rag indexed" per file but silently skips files whose `Upsert` returned error. No warning log for failed upserts.
+
+**Acceptance criteria:**
+- A failed `Upsert` after successful embedding logs `slog.Warn("rag: embed batch upsert failed", slog.String("filename", ...), slog.Any("err", err))`
+- The same pattern already exists in the non-batch path (rag.go:547) — parity is the ask
+- A test verifies that an `Upsert` failure after a successful batch embed does not panic and logs appropriately
+
+**Worktree:** `/home/alex/AI/worktrees/issue-889-rag-batch-logging`
+
+**Your task:**
+1. In the worktree, implement the fix
+2. Examine `internal/rag/rag.go` around lines 861-889 (the batch path) and line 547 (the non-batch path for reference)
+3. Add a warning log for failed `Upsert` calls after successful `EmbedBatch` — match the pattern from the non-batch path
+4. Add a test that verifies `Upsert` failure after batch embed logs appropriately and doesn't panic
+5. Run `make build && go test ./internal/rag` to verify
+6. Commit: `fix: resolve #889 — log RAG batch upsert failures`
+7. Push: `git push -u origin fix/issue-889-rag-batch-logging`
+8. Create PR targeting `develop`: `Closes #889`
+9. Report PR number
