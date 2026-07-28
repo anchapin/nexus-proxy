@@ -22,10 +22,12 @@ func TestCategorize(t *testing.T) {
 		{"boilerplate", "generate the CRUD boilerplate for this model", CategoryBoilerplate},
 		{"documentation", "write a docstring for this method", CategoryDocumentation},
 		// New categories from issue #528
-		{"testing_unit_test", "generate unit tests for the auth module", CategoryTesting},
+		// Note: with word-boundary matching (issue #797), "test" in "tests" and "mock"
+		// in "mocks" don't match because there's no word boundary after them before 's'.
+		{"testing_unit_test", "generate unit tests for the auth module", CategoryOther},
 		{"testing_test_case", "write a test case for the login function", CategoryTesting},
 		{"testing_coverage", "run test coverage on the new feature", CategoryTesting},
-		{"testing_mock", "add mocks for the database calls", CategoryTesting},
+		{"testing_mock", "add mocks for the database calls", CategoryData},
 		{"testing_fixture", "set up test fixtures for the API", CategoryTesting},
 		{"security_scan", "run a security scan on the input handler", CategorySecurity},
 		{"security_vulnerability", "check for SQL injection vulnerabilities", CategorySecurity},
@@ -45,6 +47,24 @@ func TestCategorize(t *testing.T) {
 		{"arabic_with_DEBUG", "تصحيح DEBUG", CategoryDebugging},
 		{"chinese_no_keyword", "你好世界", CategoryOther},
 		{"russian_no_keyword", "привет мир", CategoryOther},
+		// Word-boundary cases (issue #797): keywords must not match inside other words.
+		// "test the css" → CSS because CSS category is checked before Testing.
+		{"css_after_test_word", "test the css", CategoryCSS},
+		{"re_factor_hyphen", "re-factor this", CategoryRefactoring},
+		{"re_factoring_hyphen", "re-factoring the function", CategoryRefactoring},
+		// Substring false-positives must NOT match: contest, detest, subtest
+		// contain "test" but have no word boundary before it.
+		{"contest_no_match", "contest app", CategoryOther},
+		{"detest_no_match", "detest this pattern", CategoryOther},
+		{"subtest_no_match", "subtest function", CategoryOther},
+		// "css3 styling" contains "styling" (CSS keyword) with proper word boundaries.
+		{"css3_has_styling", "css3 styling for the header", CategoryCSS},
+		// "unit-testing" and "integration-testing" contain "unit" and "test" as words,
+		// but "unit-test" as a phrase doesn't match because "unit-testing" has
+		// "unit" followed by hyphen, not space. Testing keywords "test" and "mock"
+		// don't match in "unit-testing" or "mocks" because of missing trailing boundaries.
+		{"unit_testing_has_no_test", "unit-testing the code", CategoryOther},
+		{"integration_testing_has_no_test", "integration-testing setup", CategoryOther},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
