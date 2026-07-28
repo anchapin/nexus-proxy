@@ -1236,15 +1236,15 @@ func Chat(d Deps) http.Handler {
 		}
 
 		planner := &router.Planner{
-			SLM:                   d.SLM,
-			Confidence:            d.Confidence,
+			SLM:                  d.SLM,
+			Confidence:           d.Confidence,
 			FusionPatterns:       d.Config.DSLFusionPatterns,
-			FormattingRegex:       d.Config.DSLFormattingPatterns,
-			LocalPatternsRegex:    d.LocalPatternsRegex,
-			UnicodePatternsRegex:  d.Config.DSLUnicodePatterns,
-			SLMCache:              d.SLMCache,
-			ConfidenceThreshold:   d.Config.SLMConfidenceThreshold,
-			ConfidenceErrorHook:   d.ConfidenceErrorHook,
+			FormattingRegex:      d.Config.DSLFormattingPatterns,
+			LocalPatternsRegex:   d.LocalPatternsRegex,
+			UnicodePatternsRegex: d.Config.DSLUnicodePatterns,
+			SLMCache:             d.SLMCache,
+			ConfidenceThreshold:  d.Config.SLMConfidenceThreshold,
+			ConfidenceErrorHook:  d.ConfidenceErrorHook,
 		}
 		if d.Config.SLMConfidenceThreshold > 0 && d.Confidence == nil {
 			slog.Warn("planner: ConfidenceThreshold set but no ConfidenceStore — threshold disabled")

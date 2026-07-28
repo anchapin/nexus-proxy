@@ -346,19 +346,19 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	// Check cache first if enabled.
 	if p.SLMCache != nil {
 		if cached, hit, hitKind := p.SLMCache.Get(req.Context, req.Prompt); hit {
-		if p.Confidence != nil {
-			if conf, err := p.Confidence.LocalConfidence(category); err != nil {
-				slog.Warn("planner: confidence lookup",
-					slog.String("category", category),
-					slog.Any("err", err),
-				)
-				if p.ConfidenceErrorHook != nil {
-					p.ConfidenceErrorHook(category, err)
+			if p.Confidence != nil {
+				if conf, err := p.Confidence.LocalConfidence(category); err != nil {
+					slog.Warn("planner: confidence lookup",
+						slog.String("category", category),
+						slog.Any("err", err),
+					)
+					if p.ConfidenceErrorHook != nil {
+						p.ConfidenceErrorHook(category, err)
+					}
+				} else {
+					confidence = conf
 				}
-			} else {
-				confidence = conf
 			}
-		}
 			// Hard override: same check as the miss path — a cached
 			// local/fusion decision with low confidence still escalates.
 			if p.ConfidenceThreshold > 0 && p.Confidence != nil && (cached == RouteLocal || cached == RouteFusion) && confidence < p.ConfidenceThreshold {
