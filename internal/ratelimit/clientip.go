@@ -119,6 +119,17 @@ func (r *ClientIPResolver) Trusted() bool {
 	return r != nil && len(r.trusted) > 0
 }
 
+// SetTrustedProxies atomically replaces the trusted-proxy CIDR allowlist.
+// Issue #896: this allows the SIGHUP handler to update the resolver without
+// constructing a new ClientIPResolver, so in-flight requests see a consistent
+// view of the old list until the swap is visible to the next Resolve call.
+func (r *ClientIPResolver) SetTrustedProxies(trusted []*net.IPNet) {
+	if r == nil {
+		return
+	}
+	r.trusted = trusted
+}
+
 // Resolve returns the effective client IP for the request.
 //
 // Decision tree (in order):
