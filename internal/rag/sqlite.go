@@ -520,7 +520,7 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 					Content:   fi.content,
 					Embedding: embs[j],
 				}); err != nil {
-					slog.Error("rag persist file",
+					slog.Warn("rag: embed batch upsert failed",
 						slog.String("filename", fi.name),
 						slog.Any("err", err),
 					)
