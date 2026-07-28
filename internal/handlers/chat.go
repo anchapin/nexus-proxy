@@ -1608,7 +1608,7 @@ func Chat(d Deps) http.Handler {
 				// #8) is honoured — when the health poller reports
 				// Ollama unreachable the cascade skips the local step
 				// entirely and starts at frontier.
-				res, err := cas.Run(r.Context(), rw, d.Client, body)
+				res, err := cas.Run(r.Context(), rw, d.Client, body, reqID)
 				logCascadeTelemetry(res, err, reqID)
 				// Issue #205: record cascade fallback metric when a retryable
 				// step failure caused the cascade to fall back to the next
