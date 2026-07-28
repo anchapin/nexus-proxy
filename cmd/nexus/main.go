@@ -766,7 +766,6 @@ func main() {
 				{Name: "nexus_quality_concurrency", Value: float64(cc)},
 			}
 		}),
-		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
 			var v uint64
 			if ms, ok := metricsStore.(*metrics.SQLiteStore); ok {
