@@ -1,0 +1,25 @@
+You are implementing GitHub issue #886 in a dedicated worktree.
+
+**Issue #886: RAG embedder circuit breaker state transitions are not observable via Prometheus**
+
+**Area:** area:rag, phase:2-observability
+
+**Problem:** `health.Breaker` logs `breaker tripped` and exposes `State()` and `FailureCount()` but they are not wired to Prometheus. No metric tracks breaker state transitions.
+
+**Acceptance criteria:**
+- `nexus_rag_circuit_state{service="ollama|openai|cohere"}` gauge (0=closed, 1=half-open, 2=open) exists in `/metrics`
+- `nexus_rag_circuit_trip_total{service="..."}` counter increments on each breaker trip
+- `nexus_rag_circuit_recover_total{service="..."}` counter increments on each successful recovery
+- `nexus_rag_circuit_failure_count{service="..."}` gauge shows current consecutive failure count
+
+**Worktree:** `/home/alex/AI/worktrees/issue-886-rag-circuit`
+
+**Your task:**
+1. Examine `internal/health/breaker.go` for the `health.Breaker` type and its `State()`/`FailureCount()` methods
+2. Wire the breaker state transitions to Prometheus in `internal/observability/collector.go` or `cmd/nexus/main.go`
+3. Add all four metrics: `nexus_rag_circuit_state`, `nexus_rag_circuit_trip_total`, `nexus_rag_circuit_recover_total`, `nexus_rag_circuit_failure_count`
+4. Run `make build && make test` to verify
+5. Commit: `fix: resolve #886 — wire RAG circuit breaker state to Prometheus`
+6. Push: `git push -u origin fix/issue-886-rag-circuit`
+7. Create PR targeting `develop`: `Closes #886`
+8. Report PR number
