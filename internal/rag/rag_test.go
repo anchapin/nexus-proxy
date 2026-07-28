@@ -1227,3 +1227,46 @@ func TestOllamaEmbedderIsHealthy_NilCtxUsesDefaultTimeout(t *testing.T) {
 	emb := NewOllamaEmbedder(srv.URL, "test-model", nil, BreakerConfig{})
 	_ = emb.IsHealthy(context.TODO())
 }
+
+// TestThresholdFor_CaseInsensitive verifies that ThresholdFor performs a
+// case-insensitive directory-name lookup so that mixed-case directory names
+// (e.g., "Go_TESTS") match their lowercased env-var keys (e.g.,
+// NEXUS_RAG_THRESHOLD_GO_TESTS=0.7). Regression test for issue #940.
+func TestThresholdFor_CaseInsensitive(t *testing.T) {
+	store := NewStore(&stubEmbedder{vecs: map[string][]float64{"x": {1, 0}}}, 0.5)
+	store.thresholdOverrides = map[string]float64{
+		"go_tests": 0.7,
+		"my_dir":   0.3,
+	}
+
+	cases := []struct {
+		dir  string
+		want float64
+	}{
+		// Mixed-case path → override matches lowercased key
+		{"/path/to/Go_TESTS", 0.7},
+		// Bare mixed-case name
+		{"Go_TESTS", 0.7},
+		// Exact lowercase (baseline)
+		{"go_tests", 0.7},
+		// All uppercase
+		{"GO_TESTS", 0.7},
+		// Mixed-case path for second entry; filepath.Base gives last element
+		{"/some/path/My_Dir", 0.3},
+		{"My_Dir", 0.3},
+		{"my_dir", 0.3},
+		{"MY_DIR", 0.3},
+		// Unmatched directory falls back to global threshold (0.5)
+		{"/unknown/path", 0.5},
+		{"unknown", 0.5},
+		// Edge: path with no directory component
+		{"./Go_TESTS", 0.7},
+	}
+
+	for _, tc := range cases {
+		got := store.ThresholdFor(tc.dir)
+		if got != tc.want {
+			t.Errorf("ThresholdFor(%q) = %v, want %v", tc.dir, got, tc.want)
+		}
+	}
+}
