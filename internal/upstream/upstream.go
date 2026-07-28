@@ -532,7 +532,7 @@ func Panel(
 	requestID string,
 	arbiterCache *ArbiterCache,
 	arbiterCacheTTL time.Duration,
-) (cacheHit bool, _ error) {
+) (outcome PanelOutcome, cacheHit bool, _ error) {
 	results := make(chan PanelResult, 2)
 	if skipLocal {
 		// Synthetic local failure so the arbiter prompt shape stays
@@ -626,10 +626,12 @@ func Panel(
 				slog.String("r2_source", r2.Source),
 			)
 			cacheHit = true
+			outcome.ArbiterCacheHit = true
+			outcome.ArbiterSkipped = true
 			if stream {
-				return true, streamCachedArbiterSynthesis(w, cached)
+				return outcome, true, streamCachedArbiterSynthesis(w, cached)
 			}
-			return true, writeCachedArbiterJSON(w, cached, arbiterModel)
+			return outcome, true, writeCachedArbiterJSON(w, cached, arbiterModel)
 		}
 	}
 
@@ -649,12 +651,12 @@ func Panel(
 		// stream=true: SSE passthrough, no caching
 		fetchErr = StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody)
 		if fetchErr != nil {
-			return false, fmt.Errorf("fusion: arbiter stream: %w", fetchErr)
+			return outcome, false, fmt.Errorf("fusion: arbiter stream: %w", fetchErr)
 		}
 		if err := writeSSEDone(w); err != nil {
-			return false, err
+			return outcome, false, err
 		}
-		return false, nil
+		return outcome, false, nil
 	}
 	// stream=false: buffered fetch, can cache
 	{
@@ -679,7 +681,7 @@ func Panel(
 		}
 	}
 	if fetchErr != nil {
-		return false, fmt.Errorf("fusion: arbiter fetch: %w", fetchErr)
+		return outcome, false, fmt.Errorf("fusion: arbiter fetch: %w", fetchErr)
 	}
 	if synthesis == "" {
 		slog.Warn("fusion arbiter returned empty synthesis",
@@ -687,7 +689,7 @@ func Panel(
 			slog.String("r1_source", r1.Source),
 			slog.String("r2_source", r2.Source),
 		)
-		return false, fmt.Errorf("fusion: arbiter returned empty synthesis")
+		return outcome, false, fmt.Errorf("fusion: arbiter returned empty synthesis")
 	}
 
 	// Cache the synthesis for future identical panel members (issue #232).
@@ -695,7 +697,7 @@ func Panel(
 		arbiterCache.Set(r1.Content, r2.Content, synthesis, arbiterCacheTTL)
 	}
 
-	return false, writeCachedArbiterJSON(w, synthesis, arbiterModel)
+	return outcome, false, writeCachedArbiterJSON(w, synthesis, arbiterModel)
 }
 
 // SynthesisPrompt formats the arbiter prompt. Exported so the handler and
@@ -814,7 +816,7 @@ func PanelStreaming(
 	// hands PanelStreaming a stream=false body gets the existing
 	// JSON-object response shape (issue #10).
 	if s, ok := body["stream"].(bool); ok && !s {
-		cacheHit, err := Panel(ctx, w, client,
+		panelOutcome, cacheHit, err := Panel(ctx, w, client,
 			localBaseURL, localModel, frontierURL, frontierKey, frontierModel,
 			arbiterURL, arbiterKey, arbiterModel,
 			body, latestPrompt, perFetchTimeout, arbiterTimeout,
@@ -823,6 +825,7 @@ func PanelStreaming(
 			return outcome, err
 		}
 		outcome.ArbiterCacheHit = cacheHit
+		outcome.ArbiterSkipped = panelOutcome.ArbiterSkipped
 		return outcome, nil
 	}
 

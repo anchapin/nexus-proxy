@@ -1465,8 +1465,9 @@ func Chat(d Deps) http.Handler {
 					})
 				}
 			} else {
+				var outcome upstream.PanelOutcome
 				var cacheHit bool
-				cacheHit, upErr = upstream.Panel(
+				outcome, cacheHit, upErr = upstream.Panel(
 					r.Context(),
 					obs, d.Client,
 					d.Config.OllamaURL, d.Config.LocalModel,
@@ -1481,6 +1482,12 @@ func Chat(d Deps) http.Handler {
 				)
 				if d.ArbiterCacheObserver != nil {
 					d.ArbiterCacheObserver(cacheHit)
+				}
+				if d.FusionOutcomeObserver != nil {
+					d.FusionOutcomeObserver.ObserveFusionOutcome(FusionOutcomeEvent{
+						RequestID:      reqID,
+						ArbiterSkipped: outcome.ArbiterSkipped,
+					})
 				}
 			}
 			if upErr != nil {
