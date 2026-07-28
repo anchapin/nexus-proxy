@@ -164,10 +164,11 @@ func Stream(w http.ResponseWriter, client Client, targetURL, apiKey string, payl
 var ErrUpstreamTruncated = errors.New("upstream: stream truncated")
 
 // ErrUpstreamContentTypeMismatch is returned by BufferedFetchWithContext
-// when the upstream responds with 200 OK but declares a Content-Type that
-// is neither application/json nor text/event-stream. This catches misbehaving
-// back-ends (e.g. an HTML error page masquerading as JSON) before the
-// JSON unmarshal step. See issue #930.
+// (issue #930) and by StreamWithContext (issue #934) when the upstream
+// responds with 200 OK but declares a Content-Type that is neither
+// application/json nor text/event-stream. This prevents HTML or other
+// non-compliant bodies from being forwarded as SSE frames or being
+// unmarshalled as JSON.
 var ErrUpstreamContentTypeMismatch = errors.New("upstream: content-type mismatch")
 
 // sseDoneMarker is the OpenAI SSE stream terminator, recognised as a
@@ -205,6 +206,21 @@ func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client
 		return fmt.Errorf("upstream: do: %w", err)
 	}
 	defer resp.Body.Close()
+
+	// Issue #934: validate Content-Type before any data is written to the
+	// client. A 200 response with text/html would otherwise have its body
+	// forwarded line-by-line as SSE data, corrupting the response stream.
+	if resp.StatusCode == http.StatusOK {
+		ct := resp.Header.Get("Content-Type")
+		if ct != "text/event-stream" && ct != "application/json" {
+			slog.Warn("upstream Content-Type mismatch",
+				"status", resp.StatusCode,
+				"content_type", ct,
+				"target", targetURL,
+			)
+			return ErrUpstreamContentTypeMismatch
+		}
+	}
 
 	// Forward only allowlisted upstream headers so the proxy does not
 	// leak upstream identity (Server), session state (Set-Cookie), or

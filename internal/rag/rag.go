@@ -1391,6 +1391,10 @@ func (o *OllamaEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 		o.breaker.RecordFailure()
 		return nil, fmt.Errorf("ollama embed batch: empty embeddings for model %s", o.Model)
 	}
+	if len(raw.Embeddings) != len(texts) {
+		o.breaker.RecordFailure()
+		return nil, fmt.Errorf("ollama embed batch: response has %d embeddings, want %d", len(raw.Embeddings), len(texts))
+	}
 	for i, emb := range raw.Embeddings {
 		if len(emb) == 0 {
 			o.breaker.RecordFailure()

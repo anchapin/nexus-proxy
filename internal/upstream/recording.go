@@ -124,6 +124,12 @@ func (r *recorderRW) Result() *http.Response {
 	if r.status == 0 {
 		r.status = http.StatusOK
 	}
+	// Set a default Content-Type for streaming responses if none was set.
+	// Real upstreams always set this; the default is needed because many
+	// test mocks call Write without explicitly setting Content-Type.
+	if r.headers.Get("Content-Type") == "" {
+		r.headers.Set("Content-Type", "text/event-stream")
+	}
 	return &http.Response{
 		StatusCode: r.status,
 		Header:     r.headers,
