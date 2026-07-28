@@ -299,6 +299,25 @@ func TestIncAuthCounters(t *testing.T) {
 	}
 }
 
+// TestIncAuthBlocked verifies IncAuthBlocked increments the counter
+// (issue #831).
+func TestIncAuthBlocked(t *testing.T) {
+	c := NewCollector()
+	if got := c.authBlockedTotal.Load(); got != 0 {
+		t.Errorf("initial authBlockedTotal = %d, want 0", got)
+	}
+	c.IncAuthBlocked()
+	if got := c.authBlockedTotal.Load(); got != 1 {
+		t.Errorf("after 1 IncAuthBlocked: authBlockedTotal = %d, want 1", got)
+	}
+	for i := 0; i < 9; i++ {
+		c.IncAuthBlocked()
+	}
+	if got := c.authBlockedTotal.Load(); got != 10 {
+		t.Errorf("after 10 IncAuthBlocked: authBlockedTotal = %d, want 10", got)
+	}
+}
+
 // TestIncRateLimitScopes verifies the IncRateLimit(scope, allowed)
 // helper routes to the correct counter for both recognised scopes
 // and silently drops unknown ones (so a wiring bug is visible in

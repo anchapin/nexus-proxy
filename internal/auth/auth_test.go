@@ -490,3 +490,74 @@ func TestAuthLimiterCorrectTokenNoRecord(t *testing.T) {
 		t.Errorf("after successful auth: bucket count = %d, want 0", al.BucketCount())
 	}
 }
+
+// TestAuthLimiterOnBlockCallback verifies that the SetOnBlock callback is
+// invoked when the burst threshold is crossed (issue #831). The callback
+// fires each time the failure count reaches the burst threshold.
+func TestAuthLimiterOnBlockCallback(t *testing.T) {
+	resolver := ratelimit.NewClientIPResolver(nil)
+
+	// burst=3: onBlock fires on the 3rd RecordFailure
+	al := ratelimit.NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	calls := 0
+	al.SetOnBlock(func() { calls++ })
+
+	clientIP := "198.51.100.5"
+	al.RecordFailure(clientIP)
+	if calls != 0 {
+		t.Errorf("onBlock callback calls after 1 failure (burst=3) = %d, want 0", calls)
+	}
+	al.RecordFailure(clientIP)
+	if calls != 0 {
+		t.Errorf("onBlock callback calls after 2 failures (burst=3) = %d, want 0", calls)
+	}
+	al.RecordFailure(clientIP)
+	if calls != 1 {
+		t.Errorf("onBlock callback calls after 3rd failure (burst=3) = %d, want 1", calls)
+	}
+
+	// burst=2: onBlock fires on 2nd RecordFailure
+	al2 := ratelimit.NewAuthLimiter(60, 2, 5*time.Minute, resolver)
+	calls2 := 0
+	al2.SetOnBlock(func() { calls2++ })
+	al2.RecordFailure(clientIP)
+	if calls2 != 0 {
+		t.Errorf("onBlock callback calls before threshold = %d, want 0", calls2)
+	}
+	al2.RecordFailure(clientIP)
+	if calls2 != 1 {
+		t.Errorf("onBlock callback calls after reaching burst=2 = %d, want 1", calls2)
+	}
+	// Each subsequent failure within the window also fires onBlock since
+	// len(f.ts) remains >= burst (2), so callers that want "once per
+	// blocked transition" must de-duplicate at their level.
+	al2.RecordFailure(clientIP)
+	if calls2 != 2 {
+		t.Errorf("onBlock callback calls after 3rd failure (burst=2) = %d, want 2", calls2)
+	}
+}
+
+// TestAuthLimiterOnBlockCallbackFiresEachThresholdCrossing verifies that
+// onBlock fires each time the failure count re-enters the blocked state
+// (issue #831). This is the underlying mechanism that increments the
+// nexus_auth_limiter_blocked_total counter.
+func TestAuthLimiterOnBlockCallbackFiresEachThresholdCrossing(t *testing.T) {
+	resolver := ratelimit.NewClientIPResolver(nil)
+	al := ratelimit.NewAuthLimiter(60, 2, 5*time.Minute, resolver)
+	calls := 0
+	al.SetOnBlock(func() { calls++ })
+
+	ip := "203.0.2.1"
+	al.RecordFailure(ip)
+	al.RecordFailure(ip) // burst reached → onBlock fires (calls=1)
+
+	// Subsequent failures within window also trigger onBlock since
+	// len(f.ts) >= burst is still true.
+	for i := 0; i < 4; i++ {
+		al.RecordFailure(ip)
+	}
+	// calls = 1 (2nd failure) + 4 (subsequent) = 5
+	if calls != 5 {
+		t.Errorf("onBlock calls after 6 total failures = %d, want 5", calls)
+	}
+}

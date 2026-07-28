@@ -1003,3 +1003,29 @@ func TestRenderPrometheusAuthLimiterGaugesAbsentWhenDisabled(t *testing.T) {
 		t.Errorf("nexus_auth_limiter_blocked_ips should not appear when limiter is nil\n--- output ---\n%s", out)
 	}
 }
+
+// TestRenderPrometheusAuthLimiterBlockedCounter verifies that the
+// nexus_auth_limiter_blocked_total counter is rendered correctly
+// after IncAuthBlocked calls (issue #831).
+func TestRenderPrometheusAuthLimiterBlockedCounter(t *testing.T) {
+	c := NewCollector()
+
+	c.IncAuthBlocked()
+	c.IncAuthBlocked()
+	c.IncAuthBlocked()
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c)
+	out := sb.String()
+
+	wantLines := []string{
+		"# HELP nexus_auth_limiter_blocked_total",
+		"# TYPE nexus_auth_limiter_blocked_total counter",
+		"nexus_auth_limiter_blocked_total 3",
+	}
+	for _, want := range wantLines {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+}

@@ -1353,6 +1353,7 @@ func main() {
 			)
 			authLimiter.SetOnBlock(func() {
 				routeCounters.ObserveRejection(handlers.RejectionAuthRateLimit)
+				circuitCollector.IncAuthBlocked()
 			})
 			authLimiter.SetOnReap(func() {
 				routeCounters.IncAuthReaperEvictions()

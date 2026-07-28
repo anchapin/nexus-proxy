@@ -194,6 +194,10 @@ type Collector struct {
 	// failures map.
 	authReaperEvictions atomic.Uint64
 
+	// Auth limiter blocked counter (issue #831). Incremented each time
+	// an IP is blocked (burst threshold crossed) by the auth limiter.
+	authBlockedTotal atomic.Uint64
+
 	// Rate-limit counters are emitted per bucket (global / per_client)
 	// so operators can tell at a glance whether the global bucket or a
 	// specific client is the bottleneck (issue #70 AC: "How many
@@ -531,6 +535,10 @@ func (c *Collector) IncAuthRejectedMissing() { c.authRejectedMissing.Add(1) }
 // IncAuthReaperEvictions records one reaper eviction of an idle IP
 // from the auth limiter's failures map (issue #839).
 func (c *Collector) IncAuthReaperEvictions() { c.authReaperEvictions.Add(1) }
+
+// IncAuthBlocked records one auth limiter block event — an IP that
+// crossed the burst threshold and is now blocked (issue #831).
+func (c *Collector) IncAuthBlocked() { c.authBlockedTotal.Add(1) }
 
 // AuthAuthenticatedClients returns the cumulative count of accepted
 // authentications. The /metrics renderer exposes it under the gauge
