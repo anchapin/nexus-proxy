@@ -165,20 +165,6 @@ func hasUpperUnicode(s string) bool {
 	return false
 }
 
-func stringsContains(s, substr string) bool {
-	return len(substr) == 0 || (len(s) >= len(substr) && indexOf(s, substr) >= 0)
-}
-
-func indexOf(s, substr string) int {
-	n, m := len(s), len(substr)
-	for i := 0; i+m <= n; i++ {
-		if s[i:i+m] == substr {
-			return i
-		}
-	}
-	return -1
-}
-
 // containsWord returns true if kw appears in s as a whole word/phrase,
 // using \b word-boundary matching so that e.g. "test" does not match
 // inside "contest". The keyword kw is already lowercased by the caller.
