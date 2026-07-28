@@ -2,8 +2,12 @@ package tracing
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -375,4 +379,52 @@ func TestRegisterExporterIdempotent(t *testing.T) {
 
 	RegisterExporter(nil)
 	e.Close()
+}
+
+// TestRegisterExporterEnablesGlobalWiring is the regression test for issue #787:
+// RegisterExporter must be called so that GlobalExporter() returns the registered
+// exporter and spans submitted via GlobalExporter() are actually exported.
+func TestRegisterExporterEnablesGlobalWiring(t *testing.T) {
+	RegisterExporter(nil)
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{
+		Endpoint:  srv.URL,
+		QueueSize: 4,
+	})
+	RegisterExporter(e)
+	defer func() {
+		RegisterExporter(nil)
+		e.Close()
+	}()
+
+	if GlobalExporter() == nil {
+		t.Fatal("GlobalExporter() = nil, want non-nil after RegisterExporter")
+	}
+	if GlobalExporter() != e {
+		t.Errorf("GlobalExporter() = %v, want %v", GlobalExporter(), e)
+	}
+
+	// Spans submitted through GlobalExporter() must reach the collector.
+	const n = 4
+	for i := 0; i < n; i++ {
+		ctx, s := GlobalExporter().StartSpan(Context{TraceID: NewTraceID()}, "test")
+		s.SetAttr("k", "v")
+		s.End()
+		_ = ctx
+	}
+
+	if err := GlobalExporter().Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if hits.Load() == 0 {
+		t.Error("collector received no requests — spans submitted via GlobalExporter() were not exported")
+	}
 }

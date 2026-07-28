@@ -122,6 +122,38 @@ func main() {
 	logger := cfg.NewLogger()
 	slog.SetDefault(logger)
 
+	// OTLP/JSON tracing exporter (issue #787). When TracingEndpoint is
+	// empty the exporter is nil and RegisterExporter is skipped — all
+	// GlobalExporter() calls are safe no-ops and the gauge providers
+	// below will return 0 for queue-depth / dropped counters.
+	var exporterCloser func() error
+	if cfg.TracingEndpoint != "" {
+		exporter := tracing.NewExporter(tracing.ExporterConfig{
+			Endpoint:  cfg.TracingEndpoint,
+			Timeout:   cfg.TracingTimeout,
+			QueueSize: cfg.TracingQueueSize,
+			Sampler:   tracing.NewProbabilitySampler(cfg.TracingSampleRate),
+		})
+		tracing.RegisterExporter(exporter)
+		exporterCloser = exporter.Close
+		slog.Info("tracing exporter wired",
+			slog.String("endpoint", cfg.TracingEndpoint),
+			slog.Duration("timeout", cfg.TracingTimeout),
+			slog.Int("queue_size", cfg.TracingQueueSize),
+			slog.Float64("sample_rate", cfg.TracingSampleRate),
+		)
+	}
+
+	// Safety net: in normal operation the signal handler closes the
+	// exporter explicitly. The deferred call fires on any early return
+	// (e.g. a future introduced before the signal handler is reachable)
+	// and is a no-op when exporterCloser is nil or already called.
+	defer func() {
+		if exporterCloser != nil {
+			_ = exporterCloser() // nil func is impossible here, but defers are fire-and-forget
+		}
+	}()
+
 	// Shared pooled HTTP client for all outbound upstream calls (issue #184).
 	// Connection pooling reduces TCP handshake overhead across Ollama,
 	// frontier API, and arbiter calls. Created once and passed to every
@@ -1390,6 +1422,11 @@ func main() {
 		}
 		if authLimiter != nil {
 			authLimiter.Stop()
+		}
+		if exporterCloser != nil {
+			if err := exporterCloser(); err != nil {
+				slog.Warn("tracing exporter close", slog.Any("err", err))
+			}
 		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
