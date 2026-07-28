@@ -16,6 +16,7 @@ package router
 
 import (
 	"context"
+	"log/slog"
 	"regexp"
 
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
@@ -215,6 +216,11 @@ type Planner struct {
 	// planner uses >, not >=, so a threshold of 0.3 fires when
 	// confidence is 0.29.
 	ConfidenceThreshold float64
+
+	// ConfidenceErrorHook is invoked when LocalConfidence returns an error
+	// (issue #927). The hook logs at Warn level and increments the
+	// nexus_confidence_errors_total counter. Nil is a safe no-op.
+	ConfidenceErrorHook func(category string, err error)
 }
 
 // PlanRequest carries the per-request inputs the planner needs. The
@@ -341,11 +347,21 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	if p.SLMCache != nil {
 		if cached, hit, hitKind := p.SLMCache.Get(req.Context, req.Prompt); hit {
 			if p.Confidence != nil {
-				confidence, _ = p.Confidence.LocalConfidence(category)
+				if conf, err := p.Confidence.LocalConfidence(category); err != nil {
+					slog.Warn("planner: confidence lookup",
+						slog.String("category", category),
+						slog.Any("err", err),
+					)
+					if p.ConfidenceErrorHook != nil {
+						p.ConfidenceErrorHook(category, err)
+					}
+				} else {
+					confidence = conf
+				}
 			}
 			// Hard override: same check as the miss path — a cached
 			// local/fusion decision with low confidence still escalates.
-			if p.ConfidenceThreshold > 0 && (cached == RouteLocal || cached == RouteFusion) && confidence < p.ConfidenceThreshold {
+			if p.ConfidenceThreshold > 0 && p.Confidence != nil && (cached == RouteLocal || cached == RouteFusion) && confidence < p.ConfidenceThreshold {
 				return Decision{
 					Route:           RouteFrontier,
 					Source:          SourceSLMEscalation,
@@ -374,7 +390,17 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	}
 
 	if p.Confidence != nil {
-		confidence, _ = p.Confidence.LocalConfidence(category)
+		if conf, err := p.Confidence.LocalConfidence(category); err != nil {
+			slog.Warn("planner: confidence lookup",
+				slog.String("category", category),
+				slog.Any("err", err),
+			)
+			if p.ConfidenceErrorHook != nil {
+				p.ConfidenceErrorHook(category, err)
+			}
+		} else {
+			confidence = conf
+		}
 		dec, err = p.SLM.DecideWithConfidence(req.Context, req.Prompt, confidence)
 	} else {
 		dec, err = p.SLM.Decide(req.Context, req.Prompt)
@@ -394,11 +420,11 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 		}
 	}
 
-	// Hard override: if the SLM returned local/fusion but confidence
+	// Hard override: if the SLM returned local/fusion but confidence (issue #928: only when ConfidenceStore is wired)
 	// is below the threshold, escalate to frontier (issue #301).
 	// The check uses > so threshold 0.3 fires on 0.29. A zero or
 	// negative threshold disables the override.
-	if p.ConfidenceThreshold > 0 && (dec == RouteLocal || dec == RouteFusion) && confidence < p.ConfidenceThreshold {
+	if p.ConfidenceThreshold > 0 && p.Confidence != nil && (dec == RouteLocal || dec == RouteFusion) && confidence < p.ConfidenceThreshold {
 		return Decision{
 			Route:           RouteFrontier,
 			Source:          SourceSLMEscalation,
