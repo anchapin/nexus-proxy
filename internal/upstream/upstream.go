@@ -163,6 +163,13 @@ func Stream(w http.ResponseWriter, client Client, targetURL, apiKey string, payl
 // record the truncation via its observability hook.
 var ErrUpstreamTruncated = errors.New("upstream: stream truncated")
 
+// ErrUpstreamContentTypeMismatch is returned by BufferedFetchWithContext
+// when the upstream responds with 200 OK but declares a Content-Type that
+// is neither application/json nor text/event-stream. This catches misbehaving
+// back-ends (e.g. an HTML error page masquerading as JSON) before the
+// JSON unmarshal step. See issue #930.
+var ErrUpstreamContentTypeMismatch = errors.New("upstream: content-type mismatch")
+
 // sseDoneMarker is the OpenAI SSE stream terminator, recognised as a
 // standalone frame so a [DONE] embedded inside a JSON content chunk
 // never falsely marks the stream complete.
@@ -356,6 +363,21 @@ func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client
 	// had more data we did not receive.
 	if err != nil || int64(len(respBody)) >= maxResponseBytes {
 		return fmt.Errorf("upstream: read response: %w", err)
+	}
+
+	// Reject 200 responses with wrong Content-Type before JSON unmarshal.
+	// A misbehaving upstream returning e.g. text/html would otherwise be
+	// forwarded as application/json and confuse the harness. Issue #930.
+	if resp.StatusCode == http.StatusOK {
+		ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
+		if ct != "application/json" && ct != "text/event-stream" {
+			slog.Warn("upstream content-type mismatch",
+				"status", resp.StatusCode,
+				"content_type", ct,
+				"target", targetURL,
+			)
+			return ErrUpstreamContentTypeMismatch
+		}
 	}
 
 	// Validate the upstream body is a single JSON object. A misbehaving
