@@ -1,9 +1,13 @@
 package auth
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/ratelimit"
 )
 
 // okHandler is a simple 200-OK handler used across tests.
@@ -12,6 +16,15 @@ func okHandler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
+}
+
+func mustCIDRs(t *testing.T, raw string) []*net.IPNet {
+	t.Helper()
+	out, err := ratelimit.ParseTrustedCIDRs(raw)
+	if err != nil {
+		t.Fatalf("ParseTrustedCIDRs(%q): %v", raw, err)
+	}
+	return out
 }
 
 func TestDisabledWhenNoKey(t *testing.T) {
@@ -309,5 +322,144 @@ func TestAuthObserverNoCallbackOnSuccess(t *testing.T) {
 	}
 	if obs.rejectedMissing != 0 {
 		t.Errorf("IncAuthRejectedMissing call count = %d, want 0", obs.rejectedMissing)
+	}
+}
+
+// TestAuthLimiterBlockedIP gets a 429 when the limiter marks the IP blocked.
+// The exempt check happens AFTER the block check, so blocked IPs always get 429.
+func TestAuthLimiterBlockedIP(t *testing.T) {
+	trusted := mustCIDRs(t, "10.0.0.0/8")
+	resolver := ratelimit.NewClientIPResolver(trusted)
+	al := ratelimit.NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	m := NewMiddleware("secret-key", nil, al, nil)
+
+	blockedIP := "203.0.113.50"
+	for i := 0; i < 3; i++ {
+		al.RecordFailure(blockedIP)
+	}
+	if !al.IsBlocked(blockedIP) {
+		t.Fatal("IP should be blocked after 3 failures")
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("X-Real-IP", blockedIP)
+	req.RemoteAddr = "10.0.0.5:12345"
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusTooManyRequests {
+		t.Errorf("blocked IP: status = %d, want 429", rr.Code)
+	}
+	if rr.Header().Get("Retry-After") == "" {
+		t.Error("Retry-After header not set on 429")
+	}
+	if rr.Header().Get("Content-Type") != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", rr.Header().Get("Content-Type"))
+	}
+}
+
+// TestAuthLimiterFailureIncrementsMap verifies that auth failures are recorded
+// in the limiter's failure map.
+func TestAuthLimiterFailureIncrementsMap(t *testing.T) {
+	resolver := ratelimit.NewClientIPResolver(nil)
+	al := ratelimit.NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	m := NewMiddleware("secret-key", nil, al, nil)
+
+	clientIP := "198.51.100.20"
+	if al.BucketCount() != 0 {
+		t.Fatalf("initial bucket count = %d, want 0", al.BucketCount())
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("X-Real-IP", clientIP)
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("no token: status = %d, want 401", rr.Code)
+	}
+	if al.BucketCount() != 1 {
+		t.Errorf("after 1 failure: bucket count = %d, want 1", al.BucketCount())
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("X-Real-IP", clientIP)
+	req.Header.Set("Authorization", "Bearer wrong-key")
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong token: status = %d, want 401", rr.Code)
+	}
+	if al.BucketCount() != 1 {
+		t.Errorf("after 2 failures same IP: bucket count = %d, want 1", al.BucketCount())
+	}
+}
+
+// TestAuthLimiterNoOpWhenDisabled verifies that a disabled limiter does not
+// affect auth behavior (nil or rpm<=0 limiter is a no-op).
+func TestAuthLimiterNoOpWhenDisabled(t *testing.T) {
+	al := ratelimit.NewAuthLimiter(0, 3, 5*time.Minute, nil)
+	m := NewMiddleware("secret-key", nil, al, nil)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("disabled limiter: status = %d, want 401", rr.Code)
+	}
+	if al.BucketCount() != 0 {
+		t.Errorf("disabled limiter: bucket count = %d, want 0", al.BucketCount())
+	}
+}
+
+// TestAuthLimiterExemptPathBypassesLimiter verifies that exempt paths skip
+// both the auth check and the limiter check.
+func TestAuthLimiterExemptPathBypassesLimiter(t *testing.T) {
+	resolver := ratelimit.NewClientIPResolver(nil)
+	al := ratelimit.NewAuthLimiter(60, 1, 5*time.Minute, resolver)
+	exempt := func(r *http.Request) bool { return r.URL.Path == "/healthz" }
+	m := NewMiddleware("secret-key", exempt, al, nil)
+
+	clientIP := "192.0.2.10"
+	al.RecordFailure(clientIP)
+	if !al.IsBlocked(clientIP) {
+		t.Fatal("IP should be blocked after 1 failure with burst=1")
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	req.Header.Set("X-Real-IP", clientIP)
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("exempt path: status = %d, want 200", rr.Code)
+	}
+}
+
+// TestAuthLimiterCorrectTokenNoRecord verifies that successful auth does not
+// record a failure.
+func TestAuthLimiterCorrectTokenNoRecord(t *testing.T) {
+	resolver := ratelimit.NewClientIPResolver(nil)
+	al := ratelimit.NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	m := NewMiddleware("secret-key", nil, al, nil)
+
+	clientIP := "203.0.113.99"
+	if al.BucketCount() != 0 {
+		t.Fatalf("initial bucket count = %d, want 0", al.BucketCount())
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("X-Real-IP", clientIP)
+	req.Header.Set("Authorization", "Bearer secret-key")
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("correct token: status = %d, want 200", rr.Code)
+	}
+	if al.BucketCount() != 0 {
+		t.Errorf("after successful auth: bucket count = %d, want 0", al.BucketCount())
 	}
 }
