@@ -399,11 +399,16 @@ func (e *Exporter) flush(batch []*Span) error {
 // the JSON shape stays strictly typed — collectors reject
 // untyped values.
 
+type otlpArrayValue struct {
+	Values []otlpAttrValue `json:"values"`
+}
+
 type otlpAttrValue struct {
-	StringValue *string  `json:"stringValue,omitempty"`
-	BoolValue   *bool    `json:"boolValue,omitempty"`
-	IntValue    *int64   `json:"intValue,omitempty"`
-	DoubleValue *float64 `json:"doubleValue,omitempty"`
+	StringValue *string        `json:"stringValue,omitempty"`
+	BoolValue   *bool         `json:"boolValue,omitempty"`
+	IntValue    *int64        `json:"intValue,omitempty"`
+	DoubleValue *float64      `json:"doubleValue,omitempty"`
+	ArrayValue  *otlpArrayValue `json:"arrayValue,omitempty"`
 }
 
 type otlpAttr struct {
@@ -560,6 +565,42 @@ func encodeAttr(v any) otlpAttrValue {
 		out.DoubleValue = &f
 	case float64:
 		out.DoubleValue = &x
+	case []any:
+		arr := make([]otlpAttrValue, len(x))
+		for i, elem := range x {
+			arr[i] = encodeAttr(elem)
+		}
+		out.ArrayValue = &otlpArrayValue{Values: arr}
+	case []string:
+		arr := make([]otlpAttrValue, len(x))
+		for i, elem := range x {
+			arr[i] = encodeAttr(elem)
+		}
+		out.ArrayValue = &otlpArrayValue{Values: arr}
+	case []bool:
+		arr := make([]otlpAttrValue, len(x))
+		for i, elem := range x {
+			arr[i] = encodeAttr(elem)
+		}
+		out.ArrayValue = &otlpArrayValue{Values: arr}
+	case []int:
+		arr := make([]otlpAttrValue, len(x))
+		for i, elem := range x {
+			arr[i] = encodeAttr(elem)
+		}
+		out.ArrayValue = &otlpArrayValue{Values: arr}
+	case []int64:
+		arr := make([]otlpAttrValue, len(x))
+		for i, elem := range x {
+			arr[i] = encodeAttr(elem)
+		}
+		out.ArrayValue = &otlpArrayValue{Values: arr}
+	case []float64:
+		arr := make([]otlpAttrValue, len(x))
+		for i, elem := range x {
+			arr[i] = encodeAttr(elem)
+		}
+		out.ArrayValue = &otlpArrayValue{Values: arr}
 	default:
 		// Fallback: stringify via fmt so an unknown type still
 		// renders something the collector can index. Operators

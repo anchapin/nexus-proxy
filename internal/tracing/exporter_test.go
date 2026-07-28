@@ -488,6 +488,73 @@ func TestEncodeAttrTypes(t *testing.T) {
 				t.Errorf("got %+v, want StringValue=%q", v, want)
 			}
 		}},
+		{"array_any_mixed", []any{"a", 1, true}, func(t *testing.T, v otlpAttrValue) {
+			if v.ArrayValue == nil || len(v.ArrayValue.Values) != 3 {
+				t.Errorf("expected arrayValue with 3 elements, got %+v", v)
+				return
+			}
+			if v.ArrayValue.Values[0].StringValue == nil || *v.ArrayValue.Values[0].StringValue != "a" {
+				t.Errorf("expected stringValue 'a' at [0], got %+v", v.ArrayValue.Values[0])
+			}
+			if v.ArrayValue.Values[1].IntValue == nil || *v.ArrayValue.Values[1].IntValue != 1 {
+				t.Errorf("expected intValue 1 at [1], got %+v", v.ArrayValue.Values[1])
+			}
+			if v.ArrayValue.Values[2].BoolValue == nil || !*v.ArrayValue.Values[2].BoolValue {
+				t.Errorf("expected boolValue true at [2], got %+v", v.ArrayValue.Values[2])
+			}
+		}},
+		{"array_string", []string{"foo", "bar"}, func(t *testing.T, v otlpAttrValue) {
+			if v.ArrayValue == nil || len(v.ArrayValue.Values) != 2 {
+				t.Errorf("expected arrayValue with 2 elements, got %+v", v)
+				return
+			}
+			if v.ArrayValue.Values[0].StringValue == nil || *v.ArrayValue.Values[0].StringValue != "foo" {
+				t.Errorf("expected stringValue 'foo' at [0], got %+v", v.ArrayValue.Values[0])
+			}
+			if v.ArrayValue.Values[1].StringValue == nil || *v.ArrayValue.Values[1].StringValue != "bar" {
+				t.Errorf("expected stringValue 'bar' at [1], got %+v", v.ArrayValue.Values[1])
+			}
+		}},
+		{"array_int", []int{1, 2, 3}, func(t *testing.T, v otlpAttrValue) {
+			if v.ArrayValue == nil || len(v.ArrayValue.Values) != 3 {
+				t.Errorf("expected arrayValue with 3 elements, got %+v", v)
+				return
+			}
+			for i, want := range []int64{1, 2, 3} {
+				if v.ArrayValue.Values[i].IntValue == nil || *v.ArrayValue.Values[i].IntValue != want {
+					t.Errorf("expected intValue %d at [%d], got %+v", want, i, v.ArrayValue.Values[i])
+				}
+			}
+		}},
+		{"array_float64", []float64{1.1, 2.2}, func(t *testing.T, v otlpAttrValue) {
+			if v.ArrayValue == nil || len(v.ArrayValue.Values) != 2 {
+				t.Errorf("expected arrayValue with 2 elements, got %+v", v)
+				return
+			}
+			if v.ArrayValue.Values[0].DoubleValue == nil || *v.ArrayValue.Values[0].DoubleValue != 1.1 {
+				t.Errorf("expected doubleValue 1.1 at [0], got %+v", v.ArrayValue.Values[0])
+			}
+			if v.ArrayValue.Values[1].DoubleValue == nil || *v.ArrayValue.Values[1].DoubleValue != 2.2 {
+				t.Errorf("expected doubleValue 2.2 at [1], got %+v", v.ArrayValue.Values[1])
+			}
+		}},
+		{"array_bool", []bool{true, false}, func(t *testing.T, v otlpAttrValue) {
+			if v.ArrayValue == nil || len(v.ArrayValue.Values) != 2 {
+				t.Errorf("expected arrayValue with 2 elements, got %+v", v)
+				return
+			}
+			if v.ArrayValue.Values[0].BoolValue == nil || !*v.ArrayValue.Values[0].BoolValue {
+				t.Errorf("expected boolValue true at [0], got %+v", v.ArrayValue.Values[0])
+			}
+			if v.ArrayValue.Values[1].BoolValue == nil || *v.ArrayValue.Values[1].BoolValue {
+				t.Errorf("expected boolValue false at [1], got %+v", v.ArrayValue.Values[1])
+			}
+		}},
+		{"array_empty", []any{}, func(t *testing.T, v otlpAttrValue) {
+			if v.ArrayValue == nil || len(v.ArrayValue.Values) != 0 {
+				t.Errorf("expected empty arrayValue, got %+v", v)
+			}
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
