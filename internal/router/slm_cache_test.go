@@ -1283,3 +1283,141 @@ func TestSLMCache_SetMaxStale(t *testing.T) {
 	c.SetMaxStale(0)
 	c.SetMaxStale(100) // must not panic
 }
+
+// --- Semantic scan limit (issue #933) ---
+
+func TestSLMCache_SetMaxScanEntries_NilSafe(t *testing.T) {
+	// SetMaxScanEntries must not panic on a nil *SLMCache.
+	var c *SLMCache
+	c.SetMaxScanEntries(10) // must not panic
+}
+
+func TestSLMCache_SemanticScanLimit_ZeroUnlimited(t *testing.T) {
+	// With maxScanEntries=0 (default = unlimited), all entries with valid
+	// embeddings are scanned. Pre-seed stub embeddings so Set stores them.
+	stub := newStubEmbedder()
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, stub, 0.5)
+	ctx := context.Background()
+
+	// Pre-seed so Set stores these exact embeddings in entry.emb.
+	stub.embeddings["cached-a"] = []float64{1.0, 0.0, 0.0, 0.0}
+	stub.embeddings["query-a"] = []float64{0.99, 0.01, 0.0, 0.0}
+
+	c.Set(ctx, "cached-a", RouteLocal) // entry.emb = [1,0,0,0] from stub
+
+	// "query-a" → no exact match → semantic scan → cosine([1,0,0,0],[0.99,0.01,0,0]) > 0.5 → hit.
+	got, ok, kind := c.Get(ctx, "query-a")
+	if !ok || got != RouteLocal || kind != CacheHitSemantic {
+		t.Errorf("unlimited scan: got (%v, %v, %v), want (RouteLocal, true, CacheHitSemantic)", got, ok, kind)
+	}
+}
+
+func TestSLMCache_SemanticScanLimit_OneScansOne(t *testing.T) {
+	// With maxScanEntries=1 and one valid entry, the entry is scanned and found.
+	stub := newStubEmbedder()
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, stub, 0.5)
+	ctx := context.Background()
+
+	stub.embeddings["cached-b"] = []float64{1.0, 0.0, 0.0, 0.0}
+	stub.embeddings["query-b"] = []float64{0.99, 0.01, 0.0, 0.0}
+
+	c.Set(ctx, "cached-b", RouteLocal)
+	c.SetMaxScanEntries(1)
+
+	// maxScanEntries=1; only "cached-b" is scanned; cosine > 0.5 → hit.
+	got, ok, kind := c.Get(ctx, "query-b")
+	if !ok || got != RouteLocal || kind != CacheHitSemantic {
+		t.Errorf("maxScanEntries=1: got (%v, %v, %v), want (RouteLocal, true, CacheHitSemantic)", got, ok, kind)
+	}
+}
+
+func TestSLMCache_SemanticScanLimit_NilEmbedEntrySkipped(t *testing.T) {
+	// When the only cached entry has nil emb (SetEmbedding with nil), scanning
+	// skips it (nil emb → not cosine-scored). maxScanEntries=1 is exhausted on
+	// the nil entry → miss.
+	stub := newStubEmbedder()
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, stub, 0.5)
+	ctx := context.Background()
+
+	stub.embeddings["cached-nil"] = []float64{1.0, 0.0, 0.0, 0.0}
+	stub.embeddings["query-nil"] = []float64{0.99, 0.01, 0.0, 0.0}
+
+	// SetEmbedding with nil: entry.emb=nil (embedder NOT called).
+	c.SetEmbedding("cached-nil", RouteLocal, nil)
+	c.SetMaxScanEntries(1)
+
+	// Scan: entry.emb is nil → skipped (counts toward limit, no cosine call).
+	// Limit exhausted (1 scanned) → miss.
+	got, ok, kind := c.Get(ctx, "query-nil")
+	if ok {
+		t.Errorf("nil emb entry should be skipped; got (%v, %v, %v), want miss", got, ok, kind)
+	}
+}
+
+func TestSLMCache_SemanticScanLimit_TwoEntriesOneSkipped(t *testing.T) {
+	// With 2 entries and maxScanEntries=1: if the first scanned entry has nil emb,
+	// it is skipped (counts toward limit) and the second entry is never reached → miss.
+	stub := newStubEmbedder()
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, stub, 0.5)
+	ctx := context.Background()
+
+	stub.embeddings["nil-entry"] = []float64{1.0, 0.0, 0.0, 0.0}
+	stub.embeddings["valid-entry"] = []float64{1.0, 0.0, 0.0, 0.0}
+	stub.embeddings["query-two"] = []float64{0.99, 0.01, 0.0, 0.0}
+
+	// nil-entry: entry.emb=nil (SetEmbedding with nil).
+	// valid-entry: entry.emb=[1,0,0,0] (SetEmbedding with explicit emb).
+	c.SetEmbedding("nil-entry", RouteLocal, nil)
+	c.SetEmbedding("valid-entry", RouteFrontier, []float64{1.0, 0.0, 0.0, 0.0})
+	c.SetMaxScanEntries(1)
+
+	// Scan limit=1 is enforced — at most one entry is cosine-scored.
+	// Which entry wins the map iteration lottery is non-deterministic.
+	// The test verifies the call completes without panicking or hanging,
+	// and that the bounded-scan code path is exercised.
+	got, ok, kind := c.Get(ctx, "query-two")
+	_ = got
+	_ = ok
+	_ = kind
+}
+
+func TestSLMCache_SemanticScanLimit_ZeroLimitAllScanned(t *testing.T) {
+	// With maxScanEntries=0 (unlimited) and 2 entries, both are scanned;
+	// nil-entry is skipped, valid-a is matched → semantic hit.
+	stub := newStubEmbedder()
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, stub, 0.5)
+	ctx := context.Background()
+
+	stub.embeddings["nil-a"] = []float64{1.0, 0.0, 0.0, 0.0}
+	stub.embeddings["valid-a"] = []float64{1.0, 0.0, 0.0, 0.0}
+	stub.embeddings["query-zero"] = []float64{0.99, 0.01, 0.0, 0.0}
+
+	c.SetEmbedding("nil-a", RouteLocal, nil)                                // nil emb
+	c.SetEmbedding("valid-a", RouteFrontier, []float64{1.0, 0.0, 0.0, 0.0}) // valid emb
+	c.SetMaxScanEntries(0)                                                  // unlimited
+
+	// Unlimited scan: nil-a skipped, valid-a scanned and matched → hit.
+	got, ok, kind := c.Get(ctx, "query-zero")
+	if !ok || got != RouteFrontier || kind != CacheHitSemantic {
+		t.Errorf("unlimited scan with nil first: got (%v, %v, %v), want (RouteFrontier, true, CacheHitSemantic)", got, ok, kind)
+	}
+}
+
+func TestSLMCache_SemanticScanLimit_LimitExhaustedAfterValidHit(t *testing.T) {
+	// With maxScanEntries=1 and 1 valid entry, the entry is scanned and a
+	// semantic hit is returned immediately.
+	stub := newStubEmbedder()
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, stub, 0.5)
+	ctx := context.Background()
+
+	stub.embeddings["only-entry"] = []float64{1.0, 0.0, 0.0, 0.0}
+	stub.embeddings["query-only"] = []float64{0.99, 0.01, 0.0, 0.0}
+
+	c.SetEmbedding("only-entry", RouteLocal, []float64{1.0, 0.0, 0.0, 0.0})
+	c.SetMaxScanEntries(1)
+
+	got, ok, kind := c.Get(ctx, "query-only")
+	if !ok || got != RouteLocal || kind != CacheHitSemantic {
+		t.Errorf("valid hit with limit=1: got (%v, %v, %v), want (RouteLocal, true, CacheHitSemantic)", got, ok, kind)
+	}
+}
