@@ -20,7 +20,7 @@ type AuthLimiter struct {
 	burst  int           // max failures before block
 	window time.Duration // sliding window for failure tracking
 
-	onBlock  func()            // called when a client is blocked; must not block
+	onBlock  func(reason string) // called when a client is blocked with reason "missing" or "invalid"; must not block
 	onReap   func()            // called when the reaper evicts an idle IP; must not block
 	resolver *ClientIPResolver // resolves client IP for rate-limit bucketing
 
@@ -31,9 +31,11 @@ type AuthLimiter struct {
 
 // authFailure tracks failure timestamps for one client IP.
 type authFailure struct {
-	mu       sync.Mutex
-	ts       []time.Time // failure timestamps within the window
-	lastSeen time.Time   // for idle reaping
+	mu           sync.Mutex
+	missingTs    []time.Time // missing-token failure timestamps within the window
+	invalidTs    []time.Time // invalid-token failure timestamps within the window
+	blockReason  string      // reason that triggered the block: "missing" or "invalid"
+	lastSeen     time.Time   // for idle reaping
 }
 
 // NewAuthLimiter constructs an AuthLimiter. A non-positive rpm produces
@@ -62,9 +64,10 @@ func NewAuthLimiter(rpm, burst int, window time.Duration, resolver *ClientIPReso
 }
 
 // SetOnBlock installs a callback invoked when a client is blocked.
-// The callback must not block. Pass nil to remove a previously installed
+// The callback receives the reason ("missing" or "invalid") that triggered
+// the block and must not block. Pass nil to remove a previously installed
 // callback.
-func (al *AuthLimiter) SetOnBlock(fn func()) {
+func (al *AuthLimiter) SetOnBlock(fn func(reason string)) {
 	if al == nil {
 		return
 	}
@@ -142,11 +145,12 @@ func (al *AuthLimiter) IsBlocked(ip string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	al.pruneLocked(f, time.Now())
-	return len(f.ts) >= al.burst
+	return len(f.missingTs) >= al.burst || len(f.invalidTs) >= al.burst
 }
 
 // RecordFailure notes one auth failure for the client at ip.
-func (al *AuthLimiter) RecordFailure(ip string) {
+// reason is "missing" (no credentials) or "invalid" (wrong credentials).
+func (al *AuthLimiter) RecordFailure(ip string, reason string) {
 	if al == nil || al.rpm <= 0 {
 		return
 	}
@@ -159,16 +163,32 @@ func (al *AuthLimiter) RecordFailure(ip string) {
 		al.failures[ip] = f
 	}
 	f.mu.Lock()
-	f.ts = append(f.ts, now)
+	switch reason {
+	case "missing":
+		f.missingTs = append(f.missingTs, now)
+	case "invalid":
+		f.invalidTs = append(f.invalidTs, now)
+	}
 	f.lastSeen = now
 	f.mu.Unlock()
 
-	if len(f.ts) >= al.burst {
+	// Check if this specific failure type hit the burst threshold.
+	count := len(f.missingTs)
+	if reason == "invalid" {
+		count = len(f.invalidTs)
+	}
+	if count >= al.burst {
+		f.mu.Lock()
+		if f.blockReason == "" {
+			f.blockReason = reason
+		}
+		f.mu.Unlock()
 		if al.onBlock != nil {
-			al.onBlock()
+			al.onBlock(reason)
 		}
 		slog.Warn("auth rate limit exceeded",
 			slog.String("client_ip", ip),
+			slog.String("reason", reason),
 		)
 	}
 }
@@ -177,12 +197,23 @@ func (al *AuthLimiter) RecordFailure(ip string) {
 // Caller must hold f.mu.
 func (al *AuthLimiter) pruneLocked(f *authFailure, now time.Time) {
 	cutoff := now.Add(-al.window)
+
+	// Prune missingTs.
 	i := 0
-	for i < len(f.ts) && f.ts[i].Before(cutoff) {
+	for i < len(f.missingTs) && f.missingTs[i].Before(cutoff) {
 		i++
 	}
 	if i > 0 {
-		f.ts = f.ts[i:]
+		f.missingTs = f.missingTs[i:]
+	}
+
+	// Prune invalidTs.
+	j := 0
+	for j < len(f.invalidTs) && f.invalidTs[j].Before(cutoff) {
+		j++
+	}
+	if j > 0 {
+		f.invalidTs = f.invalidTs[j:]
 	}
 }
 
@@ -200,7 +231,7 @@ func (al *AuthLimiter) reaper() {
 				al.pruneLocked(f, now)
 				idle := now.Sub(f.lastSeen)
 				f.mu.Unlock()
-				if idle > 10*time.Minute && len(f.ts) == 0 {
+				if idle > 10*time.Minute && len(f.missingTs) == 0 && len(f.invalidTs) == 0 {
 					delete(al.failures, ip)
 					if al.onReap != nil {
 						al.onReap()
@@ -239,7 +270,7 @@ func (al *AuthLimiter) Reap() {
 		al.pruneLocked(f, now)
 		idle := now.Sub(f.lastSeen)
 		f.mu.Unlock()
-		if idle > 10*time.Minute && len(f.ts) == 0 {
+		if idle > 10*time.Minute && len(f.missingTs) == 0 && len(f.invalidTs) == 0 {
 			delete(al.failures, ip)
 			if al.onReap != nil {
 				al.onReap()
@@ -287,7 +318,7 @@ func (al *AuthLimiter) BlockedCount() int {
 	for _, f := range al.failures {
 		f.mu.Lock()
 		al.pruneLocked(f, now)
-		if len(f.ts) >= al.burst {
+		if len(f.missingTs) >= al.burst || len(f.invalidTs) >= al.burst {
 			n++
 		}
 		f.mu.Unlock()
@@ -306,7 +337,18 @@ func (al *AuthLimiter) Wrap(next http.Handler, resolver *ClientIPResolver) http.
 		ip := resolver.Resolve(r)
 		if al.IsBlocked(ip) {
 			if al.onBlock != nil {
-				al.onBlock()
+				al.mu.Lock()
+				f := al.failures[ip]
+				reason := "missing"
+				if f != nil {
+					f.mu.Lock()
+					if f.blockReason != "" {
+						reason = f.blockReason
+					}
+					f.mu.Unlock()
+				}
+				al.mu.Unlock()
+				al.onBlock(reason)
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Retry-After", "60")

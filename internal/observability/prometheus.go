@@ -266,9 +266,9 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total idle IPs evicted from the auth limiter's failures map by the reaper (issue #839).",
 		typ:  "counter",
 	},
-	// Auth limiter blocked counter (issue #831).
+	// Auth limiter blocked counter (issue #831/#937).
 	"nexus_auth_limiter_blocked_total": {
-		help: "Total IPs blocked by the auth brute-force limiter (burst threshold crossed) (issue #831).",
+		help: "Total IPs blocked by the auth brute-force limiter (burst threshold crossed), by reason (issue #831/#937).",
 		typ:  "counter",
 	},
 }
@@ -437,10 +437,13 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 		"Total idle IPs evicted from the auth limiter's failures map by the reaper (issue #839).",
 		c.authReaperEvictions.Load())
 
-	// Auth limiter blocked counter (issue #831).
-	writeCounter(w, "nexus_auth_limiter_blocked_total",
-		"Total IPs blocked by the auth brute-force limiter (burst threshold crossed) (issue #831).",
-		c.authBlockedTotal.Load())
+	// Auth limiter blocked counter (issue #831/#937).
+	writeCounterLabeled(w, "nexus_auth_limiter_blocked_total",
+		"Total IPs blocked by the auth brute-force limiter (burst threshold crossed), by reason (issue #831/#937).",
+		"reason", []labelSample{
+			{value: "missing", n: c.authBlockedTotal["missing"].Load()},
+			{value: "invalid", n: c.authBlockedTotal["invalid"].Load()},
+		})
 
 	// --- Histograms -----------------------------------------------------
 
