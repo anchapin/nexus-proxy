@@ -626,6 +626,37 @@ func TestOllamaEmbedder_EmbedBatch(t *testing.T) {
 	}
 }
 
+// TestOllamaEmbedder_EmbedBatch_ShortResponse verifies that EmbedBatch returns
+// an error when the server returns fewer embeddings than requested (issue #932).
+func TestOllamaEmbedder_EmbedBatch_ShortResponse(t *testing.T) {
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model   string   `json:"model"`
+			Prompts []string `json:"prompts"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		// Simulate Ollama silently returning fewer embeddings than requested.
+		resp := map[string]any{
+			"embeddings": [][]float64{
+				{0.1, 0.2, 0.3}, // only 1 embedding returned, but 3 were requested
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer svr.Close()
+
+	emb := NewOllamaEmbedder(svr.URL, "nomic-embed-text", svr.Client(), BreakerConfig{})
+	_, err := emb.EmbedBatch(context.Background(), []string{"a", "b", "c"})
+	if err == nil {
+		t.Fatal("expected error for short response, got nil")
+	}
+	if !strings.Contains(err.Error(), "response has 1 embeddings, want 3") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
 // TestOpenAIEmbedder_EmbedBatch verifies that EmbedBatch correctly sends
 // an array input and unpacks the batch response.
 func TestOpenAIEmbedder_EmbedBatch(t *testing.T) {
