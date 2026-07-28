@@ -25,6 +25,7 @@ func (m *mockStore) ThresholdFor(dir string) float64                   { return 
 func (m *mockStore) IndexMode() string                                 { return rag.IndexModeNone }
 func (m *mockStore) IsBreakerOpen() bool                               { return false }
 func (m *mockStore) RecordBreakerSuccess()                             {}
+func (m *mockStore) LastSuccessfulKind() string                         { return "" }
 
 // --- MiddlewareFunc tests ---
 

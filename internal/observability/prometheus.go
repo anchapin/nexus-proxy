@@ -193,6 +193,23 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total number of circuit breaker trip events for embedder kinds (issue #423).",
 		typ:  "counter",
 	},
+	// RAG embedder circuit breaker state metrics (issue #886).
+	"nexus_rag_circuit_state": {
+		help: "RAG embedder circuit breaker state: 0=closed, 1=half_open, 2=open (issue #886).",
+		typ:  "gauge",
+	},
+	"nexus_rag_circuit_trip_total": {
+		help: "Total number of RAG embedder circuit breaker trip events (issue #886).",
+		typ:  "counter",
+	},
+	"nexus_rag_circuit_recover_total": {
+		help: "Total number of RAG embedder circuit breaker recovery events (issue #886).",
+		typ:  "counter",
+	},
+	"nexus_rag_circuit_failure_count": {
+		help: "Current consecutive failure count for RAG embedder circuit breakers (issue #886).",
+		typ:  "gauge",
+	},
 	// SLM decision cache gauges (issue #531).
 	"nexus_slm_cache_entries": {
 		help: "Current number of entries in the SLM decision cache (issue #531).",
@@ -389,6 +406,26 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 		writeCounterLabeled(w, "nexus_embedder_failures_total",
 			"Total circuit breaker trip events for embedder kinds (issue #423).",
 			"kind", samples)
+	}
+
+	// RAG circuit breaker trip/recover counters (issue #886).
+	if trips := c.RAGCircuitTrips(); len(trips) > 0 {
+		samples := make([]labelSample, 0, len(trips))
+		for kind, count := range trips {
+			samples = append(samples, labelSample{value: kind, n: count})
+		}
+		writeCounterLabeled(w, "nexus_rag_circuit_trip_total",
+			"Total RAG embedder circuit breaker trip events (issue #886).",
+			"service", samples)
+	}
+	if recovers := c.RAGCircuitRecovers(); len(recovers) > 0 {
+		samples := make([]labelSample, 0, len(recovers))
+		for kind, count := range recovers {
+			samples = append(samples, labelSample{value: kind, n: count})
+		}
+		writeCounterLabeled(w, "nexus_rag_circuit_recover_total",
+			"Total RAG embedder circuit breaker recovery events (issue #886).",
+			"service", samples)
 	}
 
 	// Auth limiter reaper evictions counter (issue #839).

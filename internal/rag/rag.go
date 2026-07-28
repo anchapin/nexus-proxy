@@ -462,6 +462,10 @@ type RAGStore interface {
 	// RecordBreakerSuccess notifies the embedder's circuit breaker of a
 	// successful retrieval so the failure counter is reset (issue #304).
 	RecordBreakerSuccess()
+	// LastSuccessfulKind returns the circuit kind of the last successful
+	// embedder (e.g. "ollama", "openai", "cohere"), or "" if no embedder
+	// has succeeded yet. Used for RAG circuit breaker observability (issue #886).
+	LastSuccessfulKind() string
 }
 
 // EmbedCacheStats is the observability surface for the prompt embedding cache.
@@ -518,12 +522,13 @@ type Store struct {
 	lastIndexAt               int64
 	retrievalAttempts         uint64
 	retrievalHits             uint64
-	retrievalMisses           uint64
+	retrievalMisses          uint64
 	emptyStoreMisses          uint64
 	thresholdMisses           uint64
 	embedErrors               uint64
 	injectionSkippedSizeLimit uint64
 	generation                int64
+	lastSuccessfulKind         string // circuit kind of last successful embedder (issue #886)
 }
 
 // StoreOption configures a Store.
@@ -1069,6 +1074,36 @@ func (s *Store) RecordBreakerSuccess() {
 	if e, ok := s.embedder.(interface{ RecordBreakerSuccess() }); ok {
 		e.RecordBreakerSuccess()
 	}
+	// Track the kind of the successful embedder for observability (issue #886).
+	// Use a type switch to identify the embedder kind since we don't want
+	// to add Kind() to the Embedder interface (would break all test doubles).
+	s.lastSuccessfulKind = embedderKind(s.embedder)
+}
+
+// embedderKind returns the circuit kind string for the given embedder.
+// Returns "" for unknown embedder types.
+func embedderKind(e Embedder) string {
+	switch te := e.(type) {
+	case *OllamaEmbedder:
+		return "ollama"
+	case *OpenAIEmbedder:
+		return "openai"
+	case *CohereEmbedder:
+		return "cohere"
+	case *EmbedCache:
+		return embedderKind(te.inner)
+	default:
+		return ""
+	}
+}
+
+// LastSuccessfulKind returns the circuit kind of the last successful embedder
+// (e.g. "ollama", "openai", "cohere"), or "" if no embedder has succeeded yet.
+// Used for RAG circuit breaker observability (issue #886).
+func (s *Store) LastSuccessfulKind() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastSuccessfulKind
 }
 
 // replace swaps the entire examples slice atomically. Used by
@@ -1492,6 +1527,12 @@ func (o *OpenAIEmbedder) RecordBreakerSuccess() {
 	o.breaker.RecordSuccess()
 }
 
+// Kind returns the circuit kind string for this embedder ("openai").
+// Used for RAG circuit breaker observability (issue #886).
+func (o *OpenAIEmbedder) Kind() string {
+	return "openai"
+}
+
 // CohereEmbedder calls the Cohere /v1/embed endpoint. It is safe for
 // concurrent use via a shared http.Client.
 type CohereEmbedder struct {
@@ -1655,6 +1696,12 @@ func (c *CohereEmbedder) RecordBreakerSuccess() {
 	c.breaker.RecordSuccess()
 }
 
+// Kind returns the circuit kind string for this embedder ("cohere").
+// Used for RAG circuit breaker observability (issue #886).
+func (c *CohereEmbedder) Kind() string {
+	return "cohere"
+}
+
 // EmbedderType is the discriminator for the embedder factory.
 type EmbedderType string
 
@@ -1704,4 +1751,10 @@ func (o *OllamaEmbedder) RecordBreakerSuccess() {
 // (cooldown) state. Exported for tests and operational dashboards.
 func (o *OllamaEmbedder) IsBreakerOpen() bool {
 	return o.breaker.IsOpen()
+}
+
+// Kind returns the circuit kind string for this embedder ("ollama").
+// Used for RAG circuit breaker observability (issue #886).
+func (o *OllamaEmbedder) Kind() string {
+	return "ollama"
 }
