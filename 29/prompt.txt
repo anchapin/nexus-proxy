@@ -1,0 +1,38 @@
+You are shepherding PR #853 through CI to merge.
+
+Repository: anchapin/nexus-proxy
+PR: https://github.com/anchapin/nexus-proxy/pull/853
+Branch: fix/issue-843-arbiter-slog
+Workdir: /home/alex/AI/worktrees/issue-843-arbiter-slog
+
+Steps:
+1. Check CI status: gh pr checks 853
+2. IF CI is green:
+   a. Check mergeable: gh pr view 853 --json mergeable
+   b. If CONFLICTING → follow the merge conflict protocol below
+   c. If MERGEABLE → merge: gh pr merge 853 --squash --delete-branch
+      Then verify the merge persisted:
+      ```
+      gh pr view 853 --json mergedAt --jq '.mergedAt'
+      ```
+      - If mergedAt is NOT null → merge succeeded, proceed to cleanup
+      - If mergedAt IS null → retry once: `gh pr merge 853 --squash --delete-branch`
+        If second attempt also yields null mergedAt → report BLOCKED and STOP
+   d. Clean up: git worktree remove ../worktrees/issue-843-arbiter-slog
+3. IF CI is failing:
+   a. Get failing run: gh run list --branch fix/issue-843-arbiter-slog --limit 1
+   b. Get logs: gh run view <RUN_ID> --log
+   c. Diagnose the FIRST failing step
+   d. Apply minimal fix in the worktree
+   e. Commit and push: git add -A && git commit -m "fix: resolve CI failure" && git push
+   f. Wait for CI to re-run (poll every 30s, max 10 iterations)
+   g. If still failing after 10 iterations → report blocker and STOP
+4. IF merge conflict detected:
+   a. git fetch origin develop
+   b. git rebase origin/develop
+   c. Resolve conflicts automatically where possible
+   d. If conflicts cannot be auto-resolved → STOP and report conflict details
+   e. git push --force-with-lease origin fix/issue-843-arbiter-slog
+   f. Re-trigger CI and return to step 1
+
+Report back: final status (MERGED / BLOCKED / CONFLICT), iterations used, files fixed.
