@@ -76,16 +76,17 @@ type YAMLConfig struct {
 	ProviderTailWeight      float64 `yaml:"provider_tail_weight"`
 
 	// RAG
-	ExamplesDir       string  `yaml:"examples_dir"`
-	RAGThreshold      float64 `yaml:"rag_threshold"`
-	EmbedderType      string  `yaml:"embedder_type"`
-	EmbedderBaseURL   string  `yaml:"embedder_base_url"`
-	CohereAPIKey      string  `yaml:"cohere_api_key"`
-	RAGDBPath         string  `yaml:"rag_db_path"`
-	RAGPollInterval   string  `yaml:"rag_poll_interval"`
-	RAGEmbedCacheSize int     `yaml:"rag_embed_cache_size"`
-	RAGEmbedCacheTTL  string  `yaml:"rag_embed_cache_ttl"`
-	RAGBatchSize      int     `yaml:"rag_batch_size"`
+	ExamplesDir              string  `yaml:"examples_dir"`
+	RAGThreshold             float64 `yaml:"rag_threshold"`
+	EmbedderType             string  `yaml:"embedder_type"`
+	EmbedderBaseURL          string  `yaml:"embedder_base_url"`
+	CohereAPIKey             string  `yaml:"cohere_api_key"`
+	RAGDBPath                string  `yaml:"rag_db_path"`
+	RAGPollInterval          string  `yaml:"rag_poll_interval"`
+	RAGEmbedCacheSize        int     `yaml:"rag_embed_cache_size"`
+	RAGEmbedCacheTTL         string  `yaml:"rag_embed_cache_ttl"`
+	RAGEmbedCacheWaitTimeout string  `yaml:"rag_embed_cache_wait_timeout"`
+	RAGBatchSize             int     `yaml:"rag_batch_size"`
 
 	// Routing
 	TokenGuardrail            int     `yaml:"token_guardrail"`
@@ -518,6 +519,13 @@ func LoadYAML(path string) (Config, error) {
 			return cfg, fmt.Errorf("config: NEXUS_RAG_EMBED_CACHE_TTL: %w", err)
 		}
 		cfg.RAGEmbedCacheTTL = d
+	}
+	if v := os.Getenv("NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT: %w", err)
+		}
+		cfg.RAGEmbedCacheWaitTimeout = d
 	}
 	if v := os.Getenv("NEXUS_RAG_BATCH_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -997,6 +1005,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		RAGDBPath:                 yc.stringDefault(yc.RAGDBPath, DefaultRAGDBPath()),
 		RAGEmbedCacheSize:         yc.intDefault(yc.RAGEmbedCacheSize, 256),
 		RAGEmbedCacheTTL:          yc.durationDefault(yc.RAGEmbedCacheTTL, 24*time.Hour),
+		RAGEmbedCacheWaitTimeout:  yc.durationDefault(yc.RAGEmbedCacheWaitTimeout, 5*time.Second),
 		RAGBatchSize:              yc.intDefault(yc.RAGBatchSize, 32),
 		TokenGuardrail:            yc.intDefault(yc.TokenGuardrail, 6000),
 		SLMTimeout:                yc.durationDefault(yc.SLMTimeout, 8*time.Second),

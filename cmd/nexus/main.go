@@ -146,10 +146,11 @@ func main() {
 	// the cache (falls back to the raw embedder).
 	var ragEmbedder rag.Embedder = emb
 	if cfg.RAGEmbedCacheSize > 0 && cfg.RAGEmbedCacheTTL > 0 {
-		ragEmbedder = rag.NewEmbedCache(emb, cfg.RAGEmbedCacheSize, cfg.RAGEmbedCacheTTL)
+		ragEmbedder = rag.NewEmbedCache(emb, cfg.RAGEmbedCacheSize, cfg.RAGEmbedCacheTTL, cfg.RAGEmbedCacheWaitTimeout)
 		slog.Info("rag embedding cache enabled",
 			slog.Int("max_entries", cfg.RAGEmbedCacheSize),
 			slog.Duration("ttl", cfg.RAGEmbedCacheTTL),
+			slog.Duration("wait_timeout", cfg.RAGEmbedCacheWaitTimeout),
 		)
 	}
 
