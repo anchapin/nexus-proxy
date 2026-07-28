@@ -142,7 +142,7 @@ func ShouldRetry(statusCode int, err error) bool {
 // HTTP handler). When the client disconnects, ctx is cancelled and the
 // in-flight upstream call is cancelled within 1 second rather than waiting
 // for the full timeout (issue #297).
-func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client, payload map[string]interface{}) (CascadeResult, error) {
+func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client, payload map[string]interface{}, requestID string) (CascadeResult, error) {
 	if len(c.Steps) == 0 {
 		return CascadeResult{}, errors.New("cascade: no steps configured")
 	}
@@ -162,6 +162,7 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 		cancel()
 		if err == nil {
 			slog.Info("cascade served",
+				slog.String("request_id", requestID),
 				slog.String("step", step.Name),
 				slog.Int("attempt", i+1),
 				slog.Int("total", len(c.Steps)),
@@ -193,6 +194,7 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 			res.FallbackReason = CascadeFallbackReason(err)
 		}
 		slog.Warn("cascade step failed",
+			slog.String("request_id", requestID),
 			slog.String("step", step.Name),
 			slog.Int("attempt", i+1),
 			slog.Int("total", len(c.Steps)),
