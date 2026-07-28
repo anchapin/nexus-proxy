@@ -200,6 +200,12 @@ type RouteCounters struct {
 	// gaugeProviders supply live gauge readings (e.g. dropped counters)
 	// at scrape time. They are passed to RenderPrometheus by Handler().
 	gaugeProviders []GaugeProvider
+
+	// judgeQueueDepthGauge returns the current judge evaluator queue depth.
+	// It is called by the GaugeProvider closure in main.go at scrape time
+	// so the gauge reads live data without needing an explicit poll interval.
+	// Nil receivers return 0 (no-op).
+	judgeQueueDepthGauge func() uint64
 }
 
 // NewRouteCounters returns a ready-to-use RouteCounters.
@@ -771,6 +777,17 @@ func (rc *RouteCounters) SetCollector(c *Collector) {
 // Nil providers are silently ignored at scrape time.
 func (rc *RouteCounters) SetGaugeProviders(providers ...GaugeProvider) {
 	rc.gaugeProviders = append(rc.gaugeProviders, providers...)
+}
+
+// QueueDepthGauge returns the current judge evaluator queue depth (issue #881).
+// Nil receivers return 0 (no-op). The gauge function is set by the GaugeProvider
+// closure in main.go so it reads live data at scrape time without an explicit
+// poll interval.
+func (rc *RouteCounters) QueueDepthGauge() uint64 {
+	if rc == nil || rc.judgeQueueDepthGauge == nil {
+		return 0
+	}
+	return rc.judgeQueueDepthGauge()
 }
 
 // Snapshot returns a point-in-time copy of the routing decision counters

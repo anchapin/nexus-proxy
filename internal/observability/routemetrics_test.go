@@ -142,6 +142,9 @@ func TestRouteCountersNilSafe(t *testing.T) {
 	if err != nil || n != 0 {
 		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
 	}
+	if got := rc.QueueDepthGauge(); got != 0 {
+		t.Errorf("nil QueueDepthGauge should return 0, got %d", got)
+	}
 }
 
 func TestRouteCountersHandlerContentType(t *testing.T) {
@@ -1363,5 +1366,21 @@ func TestRouteCountersSLMCacheMissNilSafe(t *testing.T) {
 	n, err := rc.WriteTo(&strings.Builder{})
 	if err != nil || n != 0 {
 		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
+	}
+}
+
+// TestRouteCountersQueueDepthGauge verifies QueueDepthGauge returns
+// the value supplied by the gauge function (issue #881).
+func TestRouteCountersQueueDepthGauge(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.judgeQueueDepthGauge = func() uint64 { return 5 }
+	if got := rc.QueueDepthGauge(); got != 5 {
+		t.Errorf("QueueDepthGauge() = %d, want 5", got)
+	}
+
+	// nil gauge function returns 0
+	rc.judgeQueueDepthGauge = nil
+	if got := rc.QueueDepthGauge(); got != 0 {
+		t.Errorf("QueueDepthGauge() with nil gauge = %d, want 0", got)
 	}
 }

@@ -227,6 +227,43 @@ func TestRenderPrometheusTracingQueueDepthGauge(t *testing.T) {
 	}
 }
 
+// TestRenderPrometheusJudgeQueueDepthGauge (issue #881) verifies the
+// nexus_judge_queue_depth gauge is registered with type "gauge" and a
+// HELP line, and that a supplied queue-depth value flows through to the
+// rendered output.
+func TestRenderPrometheusJudgeQueueDepthGauge(t *testing.T) {
+	c := NewCollector()
+	provider := GaugeProviderFunc(func() []GaugeSample {
+		return []GaugeSample{
+			{Name: "nexus_judge_queue_depth", Value: 0},
+		}
+	})
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c, provider)
+	out := sb.String()
+
+	if !strings.Contains(out, "# HELP nexus_judge_queue_depth ") {
+		t.Errorf("judge_queue_depth HELP line missing\n%s", out)
+	}
+	if !strings.Contains(out, "# TYPE nexus_judge_queue_depth gauge") {
+		t.Errorf("judge_queue_depth not typed gauge\n%s", out)
+	}
+	if !strings.Contains(out, "nexus_judge_queue_depth 0") {
+		t.Errorf("judge_queue_depth value 0 missing\n%s", out)
+	}
+
+	// A non-zero value (queue has samples) must render identically.
+	sb.Reset()
+	provider = GaugeProviderFunc(func() []GaugeSample{
+		return []GaugeSample{{Name: "nexus_judge_queue_depth", Value: 7}}
+	})
+	RenderPrometheus(&sb, c, provider)
+	if !strings.Contains(sb.String(), "nexus_judge_queue_depth 7") {
+		t.Errorf("judge_queue_depth value 7 missing\n%s", sb.String())
+	}
+}
+
 // TestRenderPrometheusTracingQueueDepthLiveExporter (issue #596) wires a
 // real tracing.Exporter through the same GaugeProviderFunc closure shape
 // that cmd/nexus/main.go uses and asserts the gauge reads 0 on a fresh
