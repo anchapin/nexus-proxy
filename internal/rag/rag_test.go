@@ -943,7 +943,7 @@ func TestCachedEmbedderNoBreaker(t *testing.T) {
 	c.RecordBreakerSuccess()
 }
 
-<func TestParseThresholdOverridesNonASCII(t *testing.T) {
+func TestParseThresholdOverridesNonASCII(t *testing.T) {
 	key := "NEXUS_RAG_THRESHOLD_代码"
 	if err := os.Setenv(key, "0.7"); err != nil {
 		t.Fatalf("Setenv(%q): %v", key, err)

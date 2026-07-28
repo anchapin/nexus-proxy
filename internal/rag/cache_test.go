@@ -223,7 +223,7 @@ func TestCachedEmbedderCacheStatsWithEmbedCache(t *testing.T) {
 	inner := &stubEmbedder{vecs: map[string][]float64{
 		"prompt": {1, 0, 0},
 	}}
-	cache := NewEmbedCache(inner, 100, 5*time.Minute)
+	cache := NewEmbedCache(inner, 100, 5*time.Minute, 5*time.Second)
 	cached := NewCachedEmbedder(cache, 64)
 
 	ctx := context.Background()
