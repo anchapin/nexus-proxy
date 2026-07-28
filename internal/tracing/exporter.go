@@ -42,6 +42,8 @@ type Exporter struct {
 
 	sampler Sampler
 
+	batchCap int
+
 	queue chan *Span
 
 	wg     sync.WaitGroup
@@ -52,7 +54,7 @@ type Exporter struct {
 	dropped atomic.Uint64
 	// flushFailures is the count of batches that failed to POST to
 	// the collector (4xx/5xx, timeout, connection error). Each
-	// failure drops up to batchCap spans, so this is a per-batch
+	// failure drops up to e.batchCap spans, so this is a per-batch
 	// counter — distinct from dropped, which counts per-span
 	// buffer-full sheds at Submit-time. Surfaced as
 	// nexus_tracing_flush_failures_total so operators can alert on
@@ -108,16 +110,23 @@ type ExporterConfig struct {
 	// many failures. A value <= 0 falls back to
 	// defaultMaxRetryDelay.
 	MaxRetryDelay time.Duration
+
+	// BatchSize bounds the in-memory batch size — once reached
+	// the consumer flushes before draining more spans. Keeps the
+	// worst-case body size predictable. A value <= 0 falls back
+	// to defaultBatchCap. Operators with high-throughput/low-
+	// latency collectors may want larger batches to reduce HTTP
+	// overhead; operators with high-latency collectors may prefer
+	// smaller batches to reduce per-batch loss exposure.
+	BatchSize int
 }
 
 const (
 	defaultExporterQueue   = 256
 	defaultExporterTimeout = 10 * time.Second
-	// batchCap bounds the in-memory batch size — once reached
-	// the consumer flushes before draining more spans. Keeps the
-	// worst-case body size predictable (256 spans × ~500 B ≈
-	// 128 KB, well within OTLP collector defaults).
-	batchCap = 64
+	// defaultBatchCap is the fallback batch size when BatchSize
+	// is not configured or is <= 0.
+	defaultBatchCap = 64
 )
 
 // Default retry constants for OTLP POST retries with exponential backoff.
@@ -168,11 +177,16 @@ func NewExporter(cfg ExporterConfig) *Exporter {
 	if maxRetryDelay <= 0 {
 		maxRetryDelay = defaultMaxRetryDelay
 	}
+	batchCap := cfg.BatchSize
+	if batchCap <= 0 {
+		batchCap = defaultBatchCap
+	}
 	e := &Exporter{
 		endpoint:       cfg.Endpoint,
 		client:         client,
 		timeout:        cfg.Timeout,
 		sampler:        sampler,
+		batchCap:       batchCap,
 		queue:          make(chan *Span, cfg.QueueSize),
 		maxRetries:     maxRetries,
 		retryBaseDelay: retryBaseDelay,
@@ -203,7 +217,7 @@ func (e *Exporter) Dropped() uint64 {
 
 // FlushFailures returns the cumulative count of batches that failed
 // to POST to the collector (HTTP 4xx/5xx, timeout, or transport
-// error). Each failure silently drops up to batchCap spans, so this
+// error). Each failure silently drops up to e.batchCap spans, so this
 // counter is the operator-visible signal for trace loss that Dropped
 // does not capture — Dropped only counts per-span buffer-full sheds
 // at Submit-time. Surfaced as nexus_tracing_flush_failures_total
@@ -222,6 +236,15 @@ func (e *Exporter) QueueDepth() int {
 		return 0
 	}
 	return len(e.queue)
+}
+
+// BatchCap returns the configured batch size cap. Useful for /metrics
+// gauges so operators can see what batch size is configured.
+func (e *Exporter) BatchCap() int {
+	if e == nil {
+		return 0
+	}
+	return e.batchCap
 }
 
 // Submit enqueues s for asynchronous POST. The call never blocks:
@@ -294,14 +317,14 @@ func (e *Exporter) Close() error {
 }
 
 // run is the background consumer. It batches queued spans and
-// flushes when the batch reaches batchCap OR when the channel
+// flushes when the batch reaches e.batchCap OR when the channel
 // closes (final drain on shutdown). Batches that fail to POST log a
 // warning but are otherwise dropped — the spec mandates
 // non-blocking semantics on the request path, so the export loop
 // must never queue unbounded retries.
 func (e *Exporter) run() {
 	defer e.wg.Done()
-	batch := make([]*Span, 0, batchCap)
+	batch := make([]*Span, 0, e.batchCap)
 	flush := func() {
 		if len(batch) == 0 {
 			return
@@ -318,7 +341,7 @@ func (e *Exporter) run() {
 	}
 	for s := range e.queue {
 		batch = append(batch, s)
-		if len(batch) >= batchCap {
+		if len(batch) >= e.batchCap {
 			flush()
 		}
 	}

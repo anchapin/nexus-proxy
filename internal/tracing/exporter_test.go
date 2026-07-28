@@ -220,7 +220,7 @@ func TestExporterOTLPBodyShape(t *testing.T) {
 	root.SetAttr("ttft_ms", int64(120))
 	root.End()
 
-	// Allow batch flush (batchCap=64 so we must Close to drain).
+	// Allow batch flush (defaultBatchCap=64 so we must Close to drain).
 	if err := e.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -333,8 +333,8 @@ func TestExporterFlushFailuresIncrementOn503(t *testing.T) {
 	}
 
 	// Submit enough spans to force at least one full batch flush
-	// (batchCap=64) plus trailing spans drained on Close.
-	for i := 0; i < batchCap+5; i++ {
+	// (defaultBatchCap=64) plus trailing spans drained on Close.
+	for i := 0; i < defaultBatchCap+5; i++ {
 		_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "op")
 		s.End()
 	}
@@ -794,5 +794,78 @@ func TestExporterNilQueueDepthAndDropped(t *testing.T) {
 	}
 	if e.FlushFailures() != 0 {
 		t.Errorf("nil exporter FlushFailures() = %d, want 0", e.FlushFailures())
+	}
+	if e.BatchCap() != 0 {
+		t.Errorf("nil exporter BatchCap() = %d, want 0", e.BatchCap())
+	}
+}
+
+func TestExporterBatchCap(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// Default batch size when not configured.
+	e := NewExporter(ExporterConfig{Endpoint: srv.URL})
+	if e.BatchCap() != defaultBatchCap {
+		t.Errorf("default BatchCap() = %d, want %d", e.BatchCap(), defaultBatchCap)
+	}
+	e.Close()
+
+	// Custom batch size.
+	e = NewExporter(ExporterConfig{Endpoint: srv.URL, BatchSize: 128})
+	if e.BatchCap() != 128 {
+		t.Errorf("BatchCap() = %d, want 128", e.BatchCap())
+	}
+	e.Close()
+
+	// Batch size <= 0 falls back to default.
+	e = NewExporter(ExporterConfig{Endpoint: srv.URL, BatchSize: 0})
+	if e.BatchCap() != defaultBatchCap {
+		t.Errorf("BatchCap() = %d, want %d (zero falls back to default)", e.BatchCap(), defaultBatchCap)
+	}
+	e.Close()
+
+	e = NewExporter(ExporterConfig{Endpoint: srv.URL, BatchSize: -5})
+	if e.BatchCap() != defaultBatchCap {
+		t.Errorf("BatchCap() = %d, want %d (negative falls back to default)", e.BatchCap(), defaultBatchCap)
+	}
+	e.Close()
+}
+
+func TestExporterCustomBatchSizeFlush(t *testing.T) {
+	// Test that a custom batch size is respected: flush fires at
+	// the configured cap, not the default.
+	var batches atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		batches.Add(1)
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	const customBatchSize = 8
+	e := NewExporter(ExporterConfig{
+		Endpoint:  srv.URL,
+		BatchSize: customBatchSize,
+	})
+	if e == nil {
+		t.Fatal("NewExporter returned nil")
+	}
+	defer e.Close()
+
+	// Submit exactly customBatchSize spans — should trigger one flush.
+	for i := 0; i < customBatchSize; i++ {
+		_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "op")
+		s.End()
+	}
+
+	// Give the background goroutine time to flush.
+	time.Sleep(100 * time.Millisecond)
+
+	if batches.Load() != 1 {
+		t.Errorf("batches = %d after %d spans (custom batch size %d), want 1 flush",
+			batches.Load(), customBatchSize, customBatchSize)
 	}
 }

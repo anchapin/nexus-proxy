@@ -132,6 +132,7 @@ func main() {
 			Endpoint:  cfg.TracingEndpoint,
 			Timeout:   cfg.TracingTimeout,
 			QueueSize: cfg.TracingQueueSize,
+			BatchSize: cfg.TracingBatchSize,
 			Sampler:   tracing.NewProbabilitySampler(cfg.TracingSampleRate),
 		})
 		tracing.RegisterExporter(exporter)
@@ -140,6 +141,7 @@ func main() {
 			slog.String("endpoint", cfg.TracingEndpoint),
 			slog.Duration("timeout", cfg.TracingTimeout),
 			slog.Int("queue_size", cfg.TracingQueueSize),
+			slog.Int("batch_size", cfg.TracingBatchSize),
 			slog.Float64("sample_rate", cfg.TracingSampleRate),
 		)
 	}
@@ -566,14 +568,16 @@ func main() {
 	// high-latency collectors don't cause premature POST failures.
 	if endpoint := os.Getenv("NEXUS_TRACING_ENDPOINT"); endpoint != "" {
 		exp := tracing.NewExporter(tracing.ExporterConfig{
-			Endpoint: endpoint,
-			Timeout:  cfg.TracingTimeout,
+			Endpoint:  endpoint,
+			Timeout:   cfg.TracingTimeout,
+			BatchSize: cfg.TracingBatchSize,
 		})
 		if exp != nil {
 			tracing.RegisterExporter(exp)
 			slog.Info("tracing exporter started",
 				slog.String("endpoint", endpoint),
 				slog.Duration("timeout", cfg.TracingTimeout),
+				slog.Int("batch_size", cfg.TracingBatchSize),
 			)
 		}
 	}
@@ -790,6 +794,14 @@ func main() {
 			return []observability.GaugeSample{{
 				Name:  "nexus_tracing_queue_depth",
 				Value: float64(tracing.GlobalExporter().QueueDepth()),
+			}}
+		}),
+		// Tracing batch-size gauge (issue #826). Exposes the configured
+		// batch cap so operators can see what's set at a glance.
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			return []observability.GaugeSample{{
+				Name:  "nexus_tracing_batch_size",
+				Value: float64(tracing.GlobalExporter().BatchCap()),
 			}}
 		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
