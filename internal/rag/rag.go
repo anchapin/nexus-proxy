@@ -1137,6 +1137,19 @@ func (s *Store) replace(examples []FewShotExample) {
 	s.rebuildIndex()
 }
 
+// restoreIndex sets the HNSW index from a serialized blob produced
+// by HNSWIndex.Serialize, replacing any in-progress rebuild. This
+// lets Load skip the O(n) reconstruction for large corpora (issue #939).
+// Must be called while holding the store lock.
+func (s *Store) restoreIndex(blob []byte) error {
+	idx, err := DeserializeHNSWIndex(blob, s.indexConfig)
+	if err != nil {
+		return fmt.Errorf("rag: restore hnsw index: %w", err)
+	}
+	s.index = idx
+	return nil
+}
+
 // upsertExample inserts or replaces the example keyed by filename
 // in the in-memory slice. Caller is responsible for the DB write;
 // this only updates the search corpus so Retrieve sees the change.
