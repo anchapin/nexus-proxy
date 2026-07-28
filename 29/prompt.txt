@@ -1,0 +1,24 @@
+You are implementing GitHub issue #893 in a dedicated worktree.
+
+**Issue #893: nexus_slm_cache_stale_entries gauge is not exposed via /metrics**
+
+**Area:** area:observability, phase:2-observability
+
+**Problem:** `nexus_slm_cache_stale_entries` has a `Stale()` accessor and `gaugeMeta` entry, but is not wired in `cmd/nexus/main.go`. Operators cannot monitor SLM cache staleness.
+
+**Acceptance criteria:**
+- `nexus_slm_cache_stale_entries` gauge appears in `/metrics`
+- Gauge reflects current number of stale entries in the SLM cache
+
+**Worktree:** `/home/alex/AI/worktrees/issue-893-slm-cache-gauge`
+
+**Your task:**
+1. In the worktree, implement the fix
+2. Find the `nexus_slm_cache_stale_entries` gauge in `internal/observability/prometheus.go`
+3. Find the SLM cache in `internal/router/` and locate its `Stale()` method (or equivalent)
+4. Wire the gauge to the SLM cache's stale entry count in `cmd/nexus/main.go`
+5. Run `make build && make test` to verify
+6. Commit: `fix: resolve #893 — wire nexus_slm_cache_stale_entries gauge`
+7. Push: `git push -u origin fix/issue-893-slm-cache-gauge`
+8. Create PR targeting `develop`: `Closes #893`
+9. Report PR number
