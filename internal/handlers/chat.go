@@ -1475,6 +1475,7 @@ func Chat(d Deps) http.Handler {
 					body, latestPrompt, d.Config.FusionTimeout,
 					d.Config.ArbiterTimeout,
 					skipLocal,
+					reqID,
 					d.ArbiterCache,
 					d.Config.ArbiterCacheTTL,
 				)
