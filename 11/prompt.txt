@@ -1,0 +1,25 @@
+You are implementing GitHub issue #879 in a dedicated worktree.
+
+**Issue #879: NEXUS_INJECTION_SCAN_ROLES warning is noisy and doesn't identify the offending token**
+
+**Area:** area:middleware, phase:5-production
+
+**Problem:** In `config.go:1465`, when `NEXUS_INJECTION_SCAN_ROLES` contains unrecognized values, a slog.Warn is emitted listing the unrecognized tokens. However, the warning fires even when the user correctly specified `"system"` (the default) alongside some valid-but-unnecessary values. The warning doesn't indicate which specific token caused it.
+
+**Acceptance criteria:**
+- A config with `NEXUS_INJECTION_SCAN_ROLES=system,foo` logs a warning mentioning `foo` specifically and noting fallback to `["system"]`
+- A config with `NEXUS_INJECTION_SCAN_ROLES=system,user` does NOT log a warning (both are valid)
+- `parseInjectionScanRoles` test coverage includes the case of partial-valid input
+
+**Worktree:** `/home/alex/AI/worktrees/issue-879-injection-roles`
+
+**Your task:**
+1. Find `parseInjectionScanRoles` in `internal/config/config.go` around line 1465
+2. Refine the warning to only fire when `unrecognized` is non-empty AND the resulting `roles` set is `{"system"}` (the fallback)
+3. Include the offending token(s) and the resulting fallback in the warning message
+4. Add test coverage for partial-valid input
+5. Run `make build && make test` to verify
+6. Commit: `fix: resolve #879 — refine NEXUS_INJECTION_SCAN_ROLES warning to identify offending token`
+7. Push: `git push -u origin fix/issue-879-injection-roles`
+8. Create PR targeting `develop`: `Closes #879`
+9. Report PR number
