@@ -458,6 +458,13 @@ type PanelResult struct {
 	Err       error
 }
 
+func (p PanelResult) ErrStr() string {
+	if p.Err == nil {
+		return ""
+	}
+	return p.Err.Error()
+}
+
 // Panel runs local and frontier fetches concurrently and waits for both.
 // Each member gets its own timeout (perFetchTimeout) so a slow frontier
 // can't pin the local one.
@@ -538,6 +545,10 @@ func Panel(
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
+					slog.Warn("fusion panel local goroutine panicked",
+						slog.String("request_id", requestID),
+						slog.Any("panic", r),
+					)
 					IncPanelPanics()
 					results <- PanelResult{Source: "local", Err: fmt.Errorf("panic: %v", r)}
 				}
@@ -552,6 +563,10 @@ func Panel(
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
+				slog.Warn("fusion panel frontier goroutine panicked",
+					slog.String("request_id", requestID),
+					slog.Any("panic", r),
+				)
 				IncPanelPanics()
 				results <- PanelResult{Source: "frontier", Err: fmt.Errorf("panic: %v", r)}
 			}
@@ -564,6 +579,14 @@ func Panel(
 	}()
 	r1 := <-results
 	r2 := <-results
+
+	slog.Info("fusion panel: members ready",
+		slog.String("request_id", requestID),
+		slog.String("r1_source", r1.Source),
+		slog.String("r2_source", r2.Source),
+		slog.String("r1_err", r1.ErrStr()),
+		slog.String("r2_err", r2.ErrStr()),
+	)
 
 	synth := SynthesisPrompt(latestPrompt, r1, r2)
 	synthBody := map[string]interface{}{
@@ -610,6 +633,12 @@ func Panel(
 		}
 	}
 
+	slog.Info("fusion arbiter invoked",
+		slog.String("request_id", requestID),
+		slog.String("r1_source", r1.Source),
+		slog.String("r2_source", r2.Source),
+	)
+
 	// When stream=true, use the original StreamWithContext to pass SSE through
 	// directly (no caching possible, but preserves passthrough behavior).
 	// When stream=false, use BufferedFetchWithContext with stream=false to get
@@ -653,6 +682,11 @@ func Panel(
 		return false, fmt.Errorf("fusion: arbiter fetch: %w", fetchErr)
 	}
 	if synthesis == "" {
+		slog.Warn("fusion arbiter returned empty synthesis",
+			slog.String("request_id", requestID),
+			slog.String("r1_source", r1.Source),
+			slog.String("r2_source", r2.Source),
+		)
 		return false, fmt.Errorf("fusion: arbiter returned empty synthesis")
 	}
 
