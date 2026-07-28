@@ -1414,7 +1414,12 @@ func Load() (Config, error) {
 	}
 	cfg.QualityStderrCap = stderrCap
 
-	droppedRingSize, err := getEnvInt("NEXUS_QUALITY_DROPED_RING_SIZE", 16)
+	// Backward-compat alias (issue #924)
+	if v := os.Getenv("NEXUS_QUALITY_DROPED_RING_SIZE"); v != "" {
+		slog.Warn("NEXUS_QUALITY_DROPED_RING_SIZE is deprecated; use NEXUS_QUALITY_DROPPED_RING_SIZE",
+			slog.String("component", "config"))
+	}
+	droppedRingSize, err := getEnvInt("NEXUS_QUALITY_DROPPED_RING_SIZE", 16)
 	if err != nil {
 		return cfg, err
 	}
