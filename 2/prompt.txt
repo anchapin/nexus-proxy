@@ -1,0 +1,37 @@
+You are implementing a fix for GitHub issue #801: P3: SLMCache evictExpired only runs inside Set — stale entries accumulate with no Prometheus visibility
+
+Repository: anchapin/nexus-proxy
+Branch: fix/issue-801-slm-evict (already checked out)
+Workdir: /home/alex/AI/worktrees/issue-801-slm-evict
+
+Steps:
+1. Read the full issue: gh issue view 801
+2. Read the issue comments for additional context: gh issue view 801 --comments
+3. Analyze what code needs to change
+4. Implement the fix/feature with tests
+5. Run local checks if available (make test-fast, make lint)
+6. Commit: git add -A && git commit -m "fix: resolve #801 — add Prometheus visibility for SLMCache evictExpired"
+7. Push: git push -u origin fix/issue-801-slm-evict
+8. Open PR with an EXPLICIT body:
+   ```
+   gh pr create --base develop \
+     --title "fix: resolve #801 — add Prometheus visibility for SLMCache evictExpired" \
+     --body "$(cat <<'EOF'
+Closes #801
+
+Add Prometheus visibility for SLMCache eviction so operators can observe when stale entries are being cleaned up.
+EOF
+   )"
+   The body must contain exactly one `Closes #N` line.
+9. Verify closingReferences count is exactly 1:
+   ```
+   bash /home/alex/AI/nexus-proxy/scripts/check_pr_closing_refs.sh <PR_NUMBER> 1
+   ```
+   If the check fails, run `gh pr edit <PR> --body "Closes #801\n\n<minimal body>"`
+
+Rules:
+- Work ONLY in your assigned worktree (/home/alex/AI/worktrees/issue-801-slm-evict)
+- Do NOT modify files outside the scope of this issue
+- Include tests for the fix if the repo has a test suite
+- Follow the repo's AGENTS.md and code style conventions
+- Report back: PR number, files changed, any blockers encountered
