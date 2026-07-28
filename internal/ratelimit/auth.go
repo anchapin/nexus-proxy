@@ -21,6 +21,7 @@ type AuthLimiter struct {
 	window time.Duration // sliding window for failure tracking
 
 	onBlock  func()            // called when a client is blocked; must not block
+	onReap   func()            // called when the reaper evicts an idle IP; must not block
 	resolver *ClientIPResolver // resolves client IP for rate-limit bucketing
 
 	mu       sync.Mutex
@@ -70,6 +71,18 @@ func (al *AuthLimiter) SetOnBlock(fn func()) {
 	al.mu.Lock()
 	defer al.mu.Unlock()
 	al.onBlock = fn
+}
+
+// SetOnReap installs a callback invoked each time the reaper evicts an
+// idle IP from the failures map. The callback must not block. Pass nil
+// to remove a previously installed callback.
+func (al *AuthLimiter) SetOnReap(fn func()) {
+	if al == nil {
+		return
+	}
+	al.mu.Lock()
+	defer al.mu.Unlock()
+	al.onReap = fn
 }
 
 // IsBlocked reports whether the client at ip is currently blocked due to
@@ -147,6 +160,9 @@ func (al *AuthLimiter) reaper() {
 				f.mu.Unlock()
 				if idle > 10*time.Minute && len(f.ts) == 0 {
 					delete(al.failures, ip)
+					if al.onReap != nil {
+						al.onReap()
+					}
 				}
 			}
 			al.mu.Unlock()
@@ -164,6 +180,30 @@ func (al *AuthLimiter) Stop() {
 		return
 	}
 	close(al.stopCh)
+}
+
+// Reap triggers one reaper eviction tick synchronously. Exposed for tests
+// and for direct invocation in the acceptance test. It is safe to call
+// on a disabled or nil limiter; it is a no-op in those cases.
+func (al *AuthLimiter) Reap() {
+	if al == nil || al.rpm <= 0 {
+		return
+	}
+	al.mu.Lock()
+	defer al.mu.Unlock()
+	now := time.Now()
+	for ip, f := range al.failures {
+		f.mu.Lock()
+		al.pruneLocked(f, now)
+		idle := now.Sub(f.lastSeen)
+		f.mu.Unlock()
+		if idle > 10*time.Minute && len(f.ts) == 0 {
+			delete(al.failures, ip)
+			if al.onReap != nil {
+				al.onReap()
+			}
+		}
+	}
 }
 
 // BucketCount returns the number of tracked client IPs. Exposed for tests.

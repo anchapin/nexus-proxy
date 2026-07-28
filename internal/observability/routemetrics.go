@@ -479,6 +479,18 @@ func (rc *RouteCounters) IncLocalCooldownTriggers() {
 	atomic.AddUint64(&rc.localCooldownTriggers, 1)
 }
 
+// IncAuthReaperEvictions increments the auth limiter reaper evictions counter
+// (issue #839). Forwarded to the attached Collector when set. Nil receivers
+// are safe — no-op.
+func (rc *RouteCounters) IncAuthReaperEvictions() {
+	if rc == nil {
+		return
+	}
+	if rc.collector != nil {
+		rc.collector.IncAuthReaperEvictions()
+	}
+}
+
 // slmCacheEvictionSlot returns the *uint64 for the SLM cache eviction
 // reason label, creating it if absent. Same lock-then-atomic pattern
 // as reasonSlot: the mutex guards the map mutation only, the increment
