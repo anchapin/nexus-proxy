@@ -1,0 +1,40 @@
+You are implementing a fix for GitHub issue #791: P1: CascadeMaxResponseBytes env override missing in yaml.go
+
+Repository: anchapin/nexus-proxy
+Branch: fix/issue-791-cascade-max-response-bytes (already checked out)
+Workdir: /home/alex/AI/worktrees/issue-791-cascade-max-response-bytes
+
+Steps:
+1. Read the full issue: gh issue view 791
+2. Read the issue comments for additional context: gh issue view 791 --comments
+3. Analyze what code needs to change
+4. Implement the fix/feature with tests
+5. Run local checks if available (make test-race, make lint)
+6. Commit: git add -A && git commit -m "fix: resolve #791 — add NEXUS_CASCADE_MAX_RESPONSE_BYTES env override in LoadYAML"
+7. Push: git push -u origin fix/issue-791-cascade-max-response-bytes
+8. Open PR with an EXPLICIT body (no `--fill`):
+   ```
+   gh pr create --base develop \
+     --title "fix: resolve #791 — add NEXUS_CASCADE_MAX_RESPONSE_BYTES env override in LoadYAML" \
+     --body "$(cat <<'EOF'
+   Closes #791
+
+   Add NEXUS_CASCADE_MAX_RESPONSE_BYTES env override branch in LoadYAML(),
+   completing the config contract where env vars always override YAML values.
+   EOF
+   )"
+   ```
+   The body must contain exactly one `Closes #N` line. Do NOT include other `#NNNN` references.
+9. Verify closingReferences count is exactly 1:
+   ```
+   bash scripts/check_pr_closing_refs.sh <PR_NUMBER> 1
+   ```
+   If the check fails, run `gh pr edit <PR> --body "Closes #N\n\n<minimal body>"` to strip spurious references, then re-run the check.
+
+Rules:
+- Work ONLY in your assigned worktree (/home/alex/AI/worktrees/issue-791-cascade-max-response-bytes)
+- Do NOT modify files outside the scope of this issue
+- Include tests for the fix/feature
+- Follow the repo's AGENTS.md and code style conventions
+- If the issue is unclear, add a comment asking for clarification: gh issue comment 791 -b "..."
+- Report back: PR number, files changed, any blockers encountered
