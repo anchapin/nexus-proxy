@@ -1,0 +1,37 @@
+You are implementing a fix for GitHub issue #835: [P2] getSemantic RLock without proactive eviction — stale entries accumulate silently
+
+Repository: anchapin/nexus-proxy
+Branch: fix/issue-835-getsemantic-evict (already checked out)
+Workdir: /home/alex/AI/worktrees/issue-835-getsemantic-evict
+
+Steps:
+1. Read the full issue: gh issue view 835
+2. Read the issue comments for additional context: gh issue view 835 --comments
+3. Analyze what code needs to change
+4. Implement the fix/feature with tests
+5. Run local checks if available (make test-fast, make lint)
+6. Commit: git add -A && git commit -m "fix: resolve #835 — add proactive eviction to getSemantic RLock"
+7. Push: git push -u origin fix/issue-835-getsemantic-evict
+8. Open PR with an EXPLICIT body:
+   ```
+   gh pr create --base develop \
+     --title "fix: resolve #835 — add proactive eviction to getSemantic RLock" \
+     --body "$(cat <<'EOF'
+Closes #835
+
+Add proactive eviction to getSemantic so stale entries are removed before they can accumulate silently, preventing unbounded memory growth.
+EOF
+   )"
+   The body must contain exactly one `Closes #N` line.
+9. Verify closingReferences count is exactly 1:
+   ```
+   bash /home/alex/AI/nexus-proxy/scripts/check_pr_closing_refs.sh <PR_NUMBER> 1
+   ```
+   If the check fails, run `gh pr edit <PR> --body "Closes #835\n\n<minimal body>"`
+
+Rules:
+- Work ONLY in your assigned worktree (/home/alex/AI/worktrees/issue-835-getsemantic-evict)
+- Do NOT modify files outside the scope of this issue
+- Include tests for the fix if the repo has a test suite
+- Follow the repo's AGENTS.md and code style conventions
+- Report back: PR number, files changed, any blockers encountered
