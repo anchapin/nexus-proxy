@@ -1,0 +1,25 @@
+You are implementing GitHub issue #880 in a dedicated worktree.
+
+**Issue #880: Panel arbiter-cache hit path does not compute or log similarity**
+
+**Area:** area:upstream, phase:2-observability
+
+**Problem:** When `Panel` serves from the arbiter cache, it returns `outcome.ArbiterCacheHit=true` and `outcome.ArbiterSkipped=true` but leaves `outcome.Similarity` at 0.0 and `outcome.SkipReason` empty. The `skipped` bucket in `nexus_fusion_arbiter_total` grows identically for agreement-based skips and cache hits.
+
+**Acceptance criteria:**
+- `Panel` on a cache hit sets `outcome.Similarity` to the Jaccard ratio of the two panel members
+- `Panel` on a cache hit sets `outcome.SkipReason` to `"cache_hit"`
+- No goroutine blocking or additional allocations on the hot path
+- Existing tests in `upstream_test.go` pass
+
+**Worktree:** `/home/alex/AI/worktrees/issue-880-cache-hit`
+
+**Your task:**
+1. Find the arbiter cache hit path in `internal/upstream/upstream.go` (around line 629)
+2. Compute `outcome.Similarity = SimilarityRatio(r1.Content, r2.Content)` on cache hit
+3. Set `outcome.SkipReason = "cache_hit"` before the early return
+4. Run `make build && go test ./internal/upstream` to verify
+5. Commit: `fix: resolve #880 — compute similarity on arbiter cache hit`
+6. Push: `git push -u origin fix/issue-880-cache-hit`
+7. Create PR targeting `develop`: `Closes #880`
+8. Report PR number
