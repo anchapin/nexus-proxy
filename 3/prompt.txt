@@ -1,0 +1,24 @@
+You are implementing GitHub issue #876 in a dedicated worktree.
+
+**Issue #876: DSL pattern precedence is undocumented — overlapping keywords produce confusing results**
+
+**Area:** area:router, phase:5-dx
+
+**Problem:** The DSL checks pattern groups in a fixed precedence order: `fusionPatterns` → `formattingPatterns` → `localPatterns` → `unicodePatterns`. When a prompt matches multiple groups, the first match wins silently. Operators have no way to know that precedence is meaningful.
+
+**Acceptance criteria:**
+- `.env.example` documents the precedence explicitly for each DSL env var
+- The `DSL` function's precedence order is unchanged (no behavior change, only docs)
+- A comment block in `planner.go` explains the precedence at the point where patterns are checked
+
+**Worktree:** `/home/alex/AI/worktrees/issue-876-dsl-precedence`
+
+**Your task:**
+1. Examine `internal/router/planner.go` and `internal/router/confidence.go` to understand the DSL precedence order
+2. Add comment block in `planner.go` explaining the precedence at the point where patterns are checked
+3. Update `.env.example` to document the precedence explicitly for each DSL env var
+4. Run `make build` to verify
+5. Commit: `fix: resolve #876 — document DSL pattern precedence in planner.go and .env.example`
+6. Push: `git push -u origin fix/issue-876-dsl-precedence`
+7. Create PR targeting `develop`: `Closes #876`
+8. Report PR number
