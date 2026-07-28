@@ -439,7 +439,7 @@ func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName
 		return AssistantMessage{}, fmt.Errorf("fusion: read response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return AssistantMessage{}, fmt.Errorf("fusion: %s status %d: %s", modelName, resp.StatusCode, respBody)
+		return AssistantMessage{}, fmt.Errorf("fusion: %s status %d: %s", modelName, resp.StatusCode, truncateForLog(respBody, 200))
 	}
 
 	var raw struct {

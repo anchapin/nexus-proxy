@@ -313,6 +313,44 @@ func TestFetchPanelNon200(t *testing.T) {
 	}
 }
 
+// TestFetchPanelNon200BodyTruncation verifies that FetchPanel truncates
+// large non-200 response bodies in error messages to avoid info-leak (issue #935).
+func TestFetchPanelNon200BodyTruncation(t *testing.T) {
+	// Body is 300 bytes — larger than the 200-byte truncation threshold.
+	largeBody := strings.Repeat("internal server error with sensitive data ", 10)
+	bodyLen := len(largeBody)
+	if bodyLen <= 200 {
+		t.Fatalf("test body must be > 200 bytes, got %d", bodyLen)
+	}
+
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 500,
+			Body:       io.NopCloser(strings.NewReader(largeBody)),
+		}, nil
+	})}
+	_, err := FetchPanel(context.Background(), client, "http://x", "", "m", nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	errStr := err.Error()
+
+	// The error must NOT contain the full untruncated body.
+	if strings.Contains(errStr, largeBody) {
+		t.Errorf("error contains untruncated body (info-leak); got %q", errStr)
+	}
+
+	// The error must contain the truncated suffix.
+	if !strings.Contains(errStr, "...(truncated)") {
+		t.Errorf("error does not contain truncation suffix; got %q", errStr)
+	}
+
+	// The error must still contain the status code.
+	if !strings.Contains(errStr, "500") {
+		t.Errorf("error does not contain status code; got %q", errStr)
+	}
+}
+
 func TestFetchPanelRespectsMaxResponseBytesLimit(t *testing.T) {
 	ConfigureMaxResponseBytes(1024)
 	defer ResetMaxResponseBytesForTest()

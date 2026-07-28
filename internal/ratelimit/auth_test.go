@@ -48,7 +48,7 @@ func TestAuthLimiter_BlockedAfterBurst(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/", nil)
 		req.RemoteAddr = "10.0.0.1:1000"
-		al.RecordFailure(resolver.Resolve(req))
+		al.RecordFailure(resolver.Resolve(req), "missing")
 	}
 
 	// 4th failure should block
@@ -74,9 +74,9 @@ func TestAuthLimiter_PerClientIsolation(t *testing.T) {
 	resolver := NewClientIPResolver(nil)
 	al := NewAuthLimiter(60, 2, 5*time.Minute, resolver) // burst 2
 
-	// Exhaust burst for IP 1
+	// Exhaust burst for IP 1 (using "invalid" reason)
 	for i := 0; i < 2; i++ {
-		al.RecordFailure("10.0.0.1")
+		al.RecordFailure("10.0.0.1", "invalid")
 	}
 
 	// IP 1 should be blocked, IP 2 should not
@@ -93,13 +93,13 @@ func TestAuthLimiter_OnBlockFires(t *testing.T) {
 	resolver := NewClientIPResolver(nil)
 	al := NewAuthLimiter(60, 2, 5*time.Minute, resolver) // burst 2
 	var blocked int64
-	al.SetOnBlock(func() {
+	al.SetOnBlock(func(reason string) {
 		atomic.AddInt64(&blocked, 1)
 	})
 
 	// Exhaust burst
-	al.RecordFailure("10.0.0.1")
-	al.RecordFailure("10.0.0.1")
+	al.RecordFailure("10.0.0.1", "invalid")
+	al.RecordFailure("10.0.0.1", "invalid")
 
 	if blocked != 1 {
 		t.Errorf("onBlock fired %d times, want 1", blocked)
@@ -113,7 +113,7 @@ func TestAuthLimiter_WindowExpiry(t *testing.T) {
 
 	// Record 3 failures
 	for i := 0; i < 3; i++ {
-		al.RecordFailure("10.0.0.1")
+		al.RecordFailure("10.0.0.1", "missing")
 	}
 	if !al.IsBlocked("10.0.0.1") {
 		t.Error("IP should be blocked after 3 failures")
@@ -146,7 +146,7 @@ func TestAuthLimiter_Concurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 10; j++ {
-				al.RecordFailure("10.0.0.1")
+				al.RecordFailure("10.0.0.1", "missing")
 			}
 		}()
 	}
@@ -173,7 +173,7 @@ func TestAuthLimiter_429Body(t *testing.T) {
 	}), resolver)
 
 	// Exhaust burst
-	al.RecordFailure("10.0.0.1")
+	al.RecordFailure("10.0.0.1", "missing")
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
@@ -219,13 +219,13 @@ func TestAuthLimiter_BucketCount_Active(t *testing.T) {
 		t.Error("fresh limiter should have 0 buckets")
 	}
 
-	al.RecordFailure("10.0.0.1")
+	al.RecordFailure("10.0.0.1", "missing")
 	if al.BucketCount() != 1 {
 		t.Errorf("BucketCount = %d, want 1", al.BucketCount())
 	}
 
-	al.RecordFailure("10.0.0.2")
-	al.RecordFailure("10.0.0.3")
+	al.RecordFailure("10.0.0.2", "missing")
+	al.RecordFailure("10.0.0.3", "missing")
 	if al.BucketCount() != 3 {
 		t.Errorf("BucketCount = %d, want 3", al.BucketCount())
 	}
@@ -255,7 +255,7 @@ func TestAuthLimiter_BucketCount_AfterReap(t *testing.T) {
 		al.pruneLocked(f, now)
 		idle := now.Sub(f.lastSeen)
 		f.mu.Unlock()
-		if idle > 10*time.Minute && len(f.ts) == 0 {
+		if idle > 10*time.Minute && len(f.missingTs) == 0 && len(f.invalidTs) == 0 {
 			delete(al.failures, ip)
 		}
 	}
@@ -335,16 +335,19 @@ func TestAuthLimiter_Reaper_Eviction(t *testing.T) {
 	// Three entries: idle >10min with no failures, idle <10min, and active
 	al.mu.Lock()
 	al.failures["stale-empty"] = &authFailure{
-		ts:       nil,
-		lastSeen: now.Add(-15 * time.Minute), // idle > 10 min, no failures → evicted
+		missingTs: nil,
+		invalidTs: nil,
+		lastSeen:  now.Add(-15 * time.Minute), // idle > 10 min, no failures → evicted
 	}
 	al.failures["stale-with-failures"] = &authFailure{
-		ts:       []time.Time{now.Add(-5 * time.Minute)}, // has recent failure → kept
-		lastSeen: now.Add(-15 * time.Minute),
+		missingTs: []time.Time{now.Add(-5 * time.Minute)}, // has recent failure → kept
+		invalidTs: nil,
+		lastSeen:  now.Add(-15 * time.Minute),
 	}
 	al.failures["recent"] = &authFailure{
-		ts:       nil,
-		lastSeen: now.Add(-5 * time.Minute), // idle < 10 min → kept
+		missingTs: nil,
+		invalidTs: nil,
+		lastSeen:  now.Add(-5 * time.Minute), // idle < 10 min → kept
 	}
 	al.mu.Unlock()
 
@@ -359,7 +362,7 @@ func TestAuthLimiter_Reaper_Eviction(t *testing.T) {
 		al.pruneLocked(f, now)
 		idle := now.Sub(f.lastSeen)
 		f.mu.Unlock()
-		if idle > 10*time.Minute && len(f.ts) == 0 {
+		if idle > 10*time.Minute && len(f.missingTs) == 0 && len(f.invalidTs) == 0 {
 			delete(al.failures, ip)
 		}
 	}
@@ -395,16 +398,19 @@ func TestAuthLimiter_SetOnReap_Fires(t *testing.T) {
 	// Three entries: two will be evicted, one will not
 	al.mu.Lock()
 	al.failures["stale-evict1"] = &authFailure{
-		ts:       nil,
-		lastSeen: now.Add(-15 * time.Minute), // idle > 10 min, no failures → evicted
+		missingTs: nil,
+		invalidTs: nil,
+		lastSeen:  now.Add(-15 * time.Minute), // idle > 10 min, no failures → evicted
 	}
 	al.failures["stale-evict2"] = &authFailure{
-		ts:       nil,
-		lastSeen: now.Add(-20 * time.Minute), // idle > 10 min, no failures → evicted
+		missingTs: nil,
+		invalidTs: nil,
+		lastSeen:  now.Add(-20 * time.Minute), // idle > 10 min, no failures → evicted
 	}
 	al.failures["stale-kept"] = &authFailure{
-		ts:       []time.Time{now.Add(-1 * time.Minute)}, // has recent failure → kept
-		lastSeen: now.Add(-15 * time.Minute),
+		missingTs: []time.Time{now.Add(-1 * time.Minute)}, // has recent failure → kept
+		invalidTs: nil,
+		lastSeen:  now.Add(-15 * time.Minute),
 	}
 	al.mu.Unlock()
 

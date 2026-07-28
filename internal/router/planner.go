@@ -345,7 +345,7 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 			}
 			// Hard override: same check as the miss path — a cached
 			// local/fusion decision with low confidence still escalates.
-			if p.ConfidenceThreshold > 0 && (cached == RouteLocal || cached == RouteFusion) && confidence < p.ConfidenceThreshold {
+			if p.ConfidenceThreshold > 0 && p.Confidence != nil && (cached == RouteLocal || cached == RouteFusion) && confidence < p.ConfidenceThreshold {
 				return Decision{
 					Route:           RouteFrontier,
 					Source:          SourceSLMEscalation,
@@ -394,11 +394,11 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 		}
 	}
 
-	// Hard override: if the SLM returned local/fusion but confidence
+	// Hard override: if the SLM returned local/fusion but confidence (issue #928: only when ConfidenceStore is wired)
 	// is below the threshold, escalate to frontier (issue #301).
 	// The check uses > so threshold 0.3 fires on 0.29. A zero or
 	// negative threshold disables the override.
-	if p.ConfidenceThreshold > 0 && (dec == RouteLocal || dec == RouteFusion) && confidence < p.ConfidenceThreshold {
+	if p.ConfidenceThreshold > 0 && p.Confidence != nil && (dec == RouteLocal || dec == RouteFusion) && confidence < p.ConfidenceThreshold {
 		return Decision{
 			Route:           RouteFrontier,
 			Source:          SourceSLMEscalation,

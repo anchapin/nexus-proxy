@@ -299,22 +299,38 @@ func TestIncAuthCounters(t *testing.T) {
 	}
 }
 
-// TestIncAuthBlocked verifies IncAuthBlocked increments the counter
-// (issue #831).
+// TestIncAuthBlocked verifies IncAuthBlocked increments the per-reason
+// counter (issues #831/#937).
 func TestIncAuthBlocked(t *testing.T) {
 	c := NewCollector()
-	if got := c.authBlockedTotal.Load(); got != 0 {
-		t.Errorf("initial authBlockedTotal = %d, want 0", got)
+	if got := c.authBlockedTotal["missing"].Load(); got != 0 {
+		t.Errorf("initial authBlockedTotal[missing] = %d, want 0", got)
 	}
-	c.IncAuthBlocked()
-	if got := c.authBlockedTotal.Load(); got != 1 {
-		t.Errorf("after 1 IncAuthBlocked: authBlockedTotal = %d, want 1", got)
+	if got := c.authBlockedTotal["invalid"].Load(); got != 0 {
+		t.Errorf("initial authBlockedTotal[invalid] = %d, want 0", got)
 	}
-	for i := 0; i < 9; i++ {
-		c.IncAuthBlocked()
+	// 3 missing-token blocks
+	c.IncAuthBlocked("missing")
+	c.IncAuthBlocked("missing")
+	c.IncAuthBlocked("missing")
+	// 2 invalid-token blocks
+	c.IncAuthBlocked("invalid")
+	c.IncAuthBlocked("invalid")
+	if got := c.authBlockedTotal["missing"].Load(); got != 3 {
+		t.Errorf("after 3 IncAuthBlocked(missing): authBlockedTotal[missing] = %d, want 3", got)
 	}
-	if got := c.authBlockedTotal.Load(); got != 10 {
-		t.Errorf("after 10 IncAuthBlocked: authBlockedTotal = %d, want 10", got)
+	if got := c.authBlockedTotal["invalid"].Load(); got != 2 {
+		t.Errorf("after 2 IncAuthBlocked(invalid): authBlockedTotal[invalid] = %d, want 2", got)
+	}
+	// Remaining 5 blocks are missing
+	for i := 0; i < 5; i++ {
+		c.IncAuthBlocked("missing")
+	}
+	if got := c.authBlockedTotal["missing"].Load(); got != 8 {
+		t.Errorf("after 8 IncAuthBlocked(missing): authBlockedTotal[missing] = %d, want 8", got)
+	}
+	if got := c.authBlockedTotal["invalid"].Load(); got != 2 {
+		t.Errorf("after 2 IncAuthBlocked(invalid): authBlockedTotal[invalid] = %d, want 2", got)
 	}
 }
 
