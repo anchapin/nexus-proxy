@@ -1,0 +1,30 @@
+You are shepherding PR #860 through CI to merge.
+
+Repository: anchapin/nexus-proxy
+PR: https://github.com/anchapin/nexus-proxy/pull/860
+Branch: fix/issue-833-cached-embedder
+Workdir: /home/alex/AI/worktrees/issue-833-cached-embedder
+
+Steps:
+1. Check CI status: gh pr checks 860
+2. IF CI is green:
+   a. Check mergeable: gh pr view 860 --json mergeable
+   b. If CONFLICTING → follow the merge conflict protocol
+   c. If MERGEABLE → merge: gh pr merge 860 --squash --delete-branch
+      Verify: gh pr view 860 --json mergedAt --jq '.mergedAt'
+      If null after retry → report BLOCKED
+   d. Clean up: git worktree remove ../worktrees/issue-833-cached-embedder
+3. IF CI is failing:
+   a. gh run list --branch fix/issue-833-cached-embedder --limit 1
+   b. gh run view <RUN_ID> --log
+   c. Apply minimal fix in the worktree
+   d. git add -A && git commit -m "fix: resolve CI failure" && git push
+   e. Wait for CI (poll every 30s, max 10 iterations)
+   f. If still failing → report blocker and STOP
+4. IF merge conflict:
+   a. git fetch origin develop && git rebase origin/develop
+   b. Auto-resolve; if unresolvable → STOP and report
+   c. git push --force-with-lease origin fix/issue-833-cached-embedder
+   d. Re-trigger CI
+
+Report back: final status (MERGED / BLOCKED / CONFLICT), iterations used.
