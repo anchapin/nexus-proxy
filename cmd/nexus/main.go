@@ -903,11 +903,11 @@ func main() {
 	rejectionObs := handlers.RejectionObserverFunc(func(e handlers.RejectionEvent) {
 		routeCounters.ObserveRejection(e.Reason)
 	})
-	// Fusion outcome observer (issue #187). Records whether the fusion
-	// arbiter was skipped (panel members agreed) or invoked (disagreement).
-	// Surfaces as nexus_fusion_arbiter_total{outcome="skipped"|"invoked"}.
+	// Fusion outcome observer (issue #187, extended by #882). Records the
+	// reason the fusion arbiter was skipped or empty when invoked.
+	// Surfaces as nexus_fusion_arbiter_total{reason="agreement"|"tool_calls"|"one_member"|"cache_hit"|""}.
 	fusionOutcomeObs := handlers.FusionOutcomeObserverFunc(func(e handlers.FusionOutcomeEvent) {
-		routeCounters.ObserveFusionOutcome(e.ArbiterSkipped)
+		routeCounters.ObserveFusionOutcome(e.SkipReason)
 	})
 	// Cascade fallback observer (issue #205): the chat handler dispatches
 	// one CascadeFallbackEvent per request when a retryable step failure

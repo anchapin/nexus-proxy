@@ -273,6 +273,13 @@ func (f RejectionObserverFunc) ObserveRejection(e RejectionEvent) { f(e) }
 type FusionOutcomeEvent struct {
 	RequestID      string
 	ArbiterSkipped bool
+	// SkipReason describes why the arbiter was skipped (issue #882):
+	// "agreement" when the two panel members agreed, "tool_calls" when
+	// the speculative winner carried tool calls, "one_member" when only
+	// one panel member returned content, "cache_hit" when the arbiter
+	// synthesis was served from cache. Empty when ArbiterSkipped is
+	// false (arbiter was invoked).
+	SkipReason string
 }
 
 // FusionOutcomeObserver is the hook invoked once per fusion request
@@ -1469,6 +1476,7 @@ func Chat(d Deps) http.Handler {
 					d.FusionOutcomeObserver.ObserveFusionOutcome(FusionOutcomeEvent{
 						RequestID:      reqID,
 						ArbiterSkipped: outcome.ArbiterSkipped,
+						SkipReason:     outcome.SkipReason,
 					})
 				}
 			} else {
@@ -1490,12 +1498,13 @@ func Chat(d Deps) http.Handler {
 				if d.ArbiterCacheObserver != nil {
 					d.ArbiterCacheObserver(cacheHit)
 				}
-				if d.FusionOutcomeObserver != nil {
-					d.FusionOutcomeObserver.ObserveFusionOutcome(FusionOutcomeEvent{
-						RequestID:      reqID,
-						ArbiterSkipped: outcome.ArbiterSkipped,
-					})
-				}
+			if d.FusionOutcomeObserver != nil {
+				d.FusionOutcomeObserver.ObserveFusionOutcome(FusionOutcomeEvent{
+					RequestID:      reqID,
+					ArbiterSkipped: outcome.ArbiterSkipped,
+					SkipReason:     outcome.SkipReason,
+				})
+			}
 			}
 			if upErr != nil {
 				slog.Error("fusion error",
