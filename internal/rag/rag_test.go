@@ -828,7 +828,7 @@ func TestStoreIndexMode(t *testing.T) {
 		}
 	})
 
-	t.Run("upsertInvalidatesIndexReportsBruteForce", func(t *testing.T) {
+	t.Run("upsertThenRetrieve_IndexRebuiltHNSWActive", func(t *testing.T) {
 		store := NewStore(emb, 0.0)
 		for i := 0; i < indexThreshold+5; i++ {
 			store.Add(fmt.Sprintf("snippet-%d", i), "x", []float64{1, 0, 0})
@@ -836,12 +836,19 @@ func TestStoreIndexMode(t *testing.T) {
 		if got := store.IndexMode(); got != IndexModeHNSW {
 			t.Fatalf("IndexMode() before upsert = %q, want %q", got, IndexModeHNSW)
 		}
-		// upsertExample invalidates the HNSW index (issue #420) —
-		// the next Retrieve will fall back to brute_force until the
-		// lazy rebuild happens.
+		// upsertExample invalidates the HNSW index (issue #829) —
+		// the next Retrieve will rebuild it lazily, restoring HNSW.
 		store.upsertExample(FewShotExample{Filename: "snippet-0", Content: "x", Embedding: []float64{1, 0, 0}})
 		if got := store.IndexMode(); got != IndexModeBruteForce {
-			t.Errorf("IndexMode() after upsert = %q, want %q", got, IndexModeBruteForce)
+			t.Fatalf("IndexMode() immediately after upsert = %q, want %q (no Retrieve yet)", got, IndexModeBruteForce)
+		}
+		// Retrieve triggers the lazy rebuild.
+		_, _, _, err := store.Retrieve(context.Background(), "test prompt")
+		if err != nil {
+			t.Fatalf("Retrieve() after upsert failed: %v", err)
+		}
+		if got := store.IndexMode(); got != IndexModeHNSW {
+			t.Errorf("IndexMode() after upsert+Retrieve = %q, want %q", got, IndexModeHNSW)
 		}
 	})
 }

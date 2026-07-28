@@ -67,6 +67,7 @@ type RAGStatus struct {
 	DocumentCount   int                `json:"document_count"`
 	Threshold       float64            `json:"threshold"`
 	IndexMode       string             `json:"index_mode"`
+	IndexGeneration int64              `json:"rag_index_generation"`
 	Embedder        ragEmbedderStatus  `json:"embedder"`
 	LastIndexAt     time.Time          `json:"last_index_at"`
 	Retrieval       ragRetrievalStatus `json:"retrieval"`
