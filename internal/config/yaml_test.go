@@ -767,6 +767,27 @@ toon_unfenced: false
 	}
 }
 
+func TestLoadYAMLCascadeMaxResponseBytesEnvOverridesYAML(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	yamlContent := `
+cascade_max_response_bytes: 12345
+`
+	if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	t.Setenv("NEXUS_CASCADE_MAX_RESPONSE_BYTES", "67890")
+
+	cfg, err := LoadYAML(path)
+	if err != nil {
+		t.Fatalf("LoadYAML: %v", err)
+	}
+	if cfg.CascadeMaxResponseBytes != 67890 {
+		t.Errorf("CascadeMaxResponseBytes = %d, want 67890 (env overrides YAML 12345)", cfg.CascadeMaxResponseBytes)
+	}
+}
+
 func TestClampFloatBoundaryConditions(t *testing.T) {
 	tests := []struct {
 		name string

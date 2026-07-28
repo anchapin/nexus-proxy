@@ -569,6 +569,13 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.ArbiterTimeout = d
 	}
+	if v := os.Getenv("NEXUS_CASCADE_MAX_RESPONSE_BYTES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_CASCADE_MAX_RESPONSE_BYTES: %w", err)
+		}
+		cfg.CascadeMaxResponseBytes = n
+	}
 
 	// Fusion
 	if v := os.Getenv("NEXUS_FUSION_PROGRESSIVE"); v != "" {
