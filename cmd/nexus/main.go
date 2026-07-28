@@ -1213,6 +1213,7 @@ func main() {
 				DocumentCount:   documentCount,
 				Threshold:       store.Threshold(),
 				IndexMode:       store.IndexMode(),
+				IndexGeneration: stats.IndexGeneration,
 				LastIndexAt:     stats.LastIndexAt,
 			}
 			status.Embedder.Type = string(cfg.EmbedderType)

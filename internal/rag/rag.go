@@ -500,11 +500,8 @@ type StoreStats struct {
 	EmbedErrors       uint64
 	CacheHits         uint64
 	CacheMisses       uint64
-	// InjectionSkippedSizeLimit counts RAG injections that were aborted
-	// because the retrieved context block would have exceeded the
-	// NEXUS_MAX_BODY_BYTES guard (issue #594). Surfaced on /status as
-	// rag.retrieval.last_injection_skipped_size_limit.
 	InjectionSkippedSizeLimit uint64
+	IndexGeneration   int64
 }
 
 // Store holds the indexed few-shot examples.
@@ -526,6 +523,7 @@ type Store struct {
 	thresholdMisses           uint64
 	embedErrors               uint64
 	injectionSkippedSizeLimit uint64
+	generation                int64
 }
 
 // StoreOption configures a Store.
@@ -725,6 +723,7 @@ func (s *Store) Stats() StoreStats {
 	if timestamp := atomic.LoadInt64(&s.lastIndexAt); timestamp > 0 {
 		stats.LastIndexAt = time.Unix(0, timestamp).UTC()
 	}
+	stats.IndexGeneration = atomic.LoadInt64(&s.generation)
 	return stats
 }
 
@@ -947,6 +946,8 @@ func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, f
 		return nil, 0, IndexPathNone, err
 	}
 
+	s.maybeRebuildIndex()
+
 	s.mu.RLock()
 	useIndex := n >= indexThreshold && s.index != nil && s.index.Size() >= n
 	examples := s.examples
@@ -1102,15 +1103,11 @@ func (s *Store) upsertExample(ex FewShotExample) {
 	} else {
 		s.examples = append(s.examples, ex)
 	}
-	// Invalidate the index — we rebuild lazily on next Retrieve if needed.
-	// Use Size() == 0 as the "invalidated" sentinel since the actual
-	// index size is always >= 0 for a built index.
+	// Invalidate the index — Retrieve will rebuild lazily on next call.
 	if s.index != nil {
-		// Mark as stale by setting a flag. We use the index's size field
-		// trick: set size to a special value that won't match real examples.
-		// Actually simpler: just nil out index and let Retrieve rebuild.
 		s.index = nil
 	}
+	atomic.AddInt64(&s.generation, 1)
 }
 
 // rebuildIndex reconstructs the HNSW index from the current examples slice.
@@ -1126,6 +1123,27 @@ func (s *Store) rebuildIndex() {
 	}
 }
 
+// maybeRebuildIndex checks whether the HNSW index needs to be rebuilt
+// after an upsert/delete invalidated it, and rebuilds it synchronously
+// if the store is large enough to warrant indexing. This is the "lazy
+// rebuild on next Retrieve" that the upsertExample comment promises but
+// Retrieve never fulfilled (issue #829).
+//
+// The caller must not hold any lock. This function acquires and releases
+// the write lock internally.
+func (s *Store) maybeRebuildIndex() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.index != nil {
+		return
+	}
+	n := len(s.examples)
+	if n < indexThreshold {
+		return
+	}
+	s.rebuildIndex()
+}
+
 // removeExample drops a single example from the in-memory slice.
 // Caller is responsible for the DB write.
 func (s *Store) removeExample(filename string) {
@@ -1138,6 +1156,10 @@ func (s *Store) removeExample(filename string) {
 		}
 	}
 	s.examples = out
+	if s.index != nil {
+		s.index = nil
+	}
+	atomic.AddInt64(&s.generation, 1)
 }
 
 // snapshot returns a defensive copy of the examples slice. Used by
