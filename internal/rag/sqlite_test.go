@@ -224,6 +224,42 @@ func TestPersistentStoreUpsertValidatesFilename(t *testing.T) {
 	}
 }
 
+// TestPersistentStoreUpsertNilEmbedding verifies that Upsert returns an
+// error when given a nil or empty embedding, preventing silent data loss
+// (issue #941).
+func TestPersistentStoreUpsertNilEmbedding(t *testing.T) {
+	ps := newTestPersistentStore(t)
+
+	// Test nil embedding
+	if err := ps.Upsert(context.Background(), FewShotExample{
+		Filename:  "nil.go",
+		Content:   "content",
+		Embedding: nil,
+	}); err == nil {
+		t.Fatal("expected error for nil embedding")
+	}
+
+	// Test empty embedding
+	if err := ps.Upsert(context.Background(), FewShotExample{
+		Filename:  "empty.go",
+		Content:   "content",
+		Embedding: []float64{},
+	}); err == nil {
+		t.Fatal("expected error for empty embedding")
+	}
+
+	// Verify error message includes filename for operator diagnostics
+	if err := ps.Upsert(context.Background(), FewShotExample{
+		Filename:  "diagnostic.go",
+		Content:   "content",
+		Embedding: nil,
+	}); err == nil {
+		t.Fatal("expected error for nil embedding")
+	} else if !strings.Contains(err.Error(), "diagnostic.go") {
+		t.Errorf("error %q does not contain filename", err)
+	}
+}
+
 func TestPersistentStoreLoadEmpty(t *testing.T) {
 	ps := newTestPersistentStore(t)
 	n, err := ps.Load(context.Background())
@@ -1134,5 +1170,183 @@ func TestPersistentStoreIndexDir_BatchUpsertFailureLogsWarning(t *testing.T) {
 	logOutput := buf.String()
 	if !strings.Contains(logOutput, "upsert") {
 		t.Errorf("expected warning log containing 'upsert', got: %s", logOutput)
+	}
+}
+
+// TestPersistentStoreHNSWSerializeRoundTrip verifies that after Upserting
+// enough examples to build an HNSW index, the serialized blob is persisted
+// and Load restores the index via DeserializeHNSWIndex instead of rebuilding
+// from scratch (issue #939).
+func TestPersistentStoreHNSWSerializeRoundTrip(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	// Create enough examples to exceed indexThreshold (50) so the HNSW index is built.
+	const n = indexThreshold + 10
+	onDisk := filepath.Join(t.TempDir(), "rag_hnsw_serialize.db")
+
+	// Use a counting embedder to verify no embeddings happen on Load.
+	// The embedder returns a fixed vector that matches file0's embedding.
+	counter := &indexedCallCounter{
+		vecs: map[string][]float64{
+			"file0 content": {1, 0, 0, 0, 0, 0, 0, 0}, // matches file0's embedding
+		},
+	}
+
+	ps, err := OpenPersistentStore(onDisk, counter, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+
+	// Insert n examples with deterministic embeddings.
+	for i := 0; i < n; i++ {
+		vec := make([]float64, 8)
+		vec[i%8] = 1.0 // deterministic, non-zero in one dimension
+		if err := ps.Upsert(ctx, FewShotExample{
+			Filename:  fmt.Sprintf("file%d.go", i),
+			Content:   fmt.Sprintf("content %d", i),
+			Embedding: vec,
+		}); err != nil {
+			t.Fatalf("Upsert file%d: %v", i, err)
+		}
+	}
+	if ps.Size() != n {
+		t.Fatalf("Size = %d, want %d", ps.Size(), n)
+	}
+	if err := ps.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Reopen with the same counting embedder.
+	counter2 := &indexedCallCounter{
+		vecs: map[string][]float64{
+			"file0 content": {1, 0, 0, 0, 0, 0, 0, 0},
+		},
+	}
+	ps2, err := OpenPersistentStore(onDisk, counter2, 0.55)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = ps2.Close() })
+
+	// Load should NOT call the embedder since we have a serialized blob.
+	nLoaded, err := ps2.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if nLoaded != n {
+		t.Fatalf("Load returned %d, want %d", nLoaded, n)
+	}
+	if counter2.calls > 0 {
+		t.Errorf("Load called embedder %d times, want 0 (serialized blob should be used)", counter2.calls)
+	}
+
+	// Verify the index was actually restored by doing a Retrieve.
+	// Retrieve always calls the embedder to embed the prompt (that's normal),
+	// but with a restored HNSW index, it should use the index to find neighbors
+	// rather than doing a brute-force scan.
+	ex, _, path, err := ps2.Retrieve(ctx, "file0 content")
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if ex == nil {
+		t.Fatal("Retrieve returned nil, want a match")
+	}
+	// With a restored HNSW index, Retrieve should report HNSW path.
+	if path != IndexPathHNSW {
+		t.Errorf("Retrieve path = %q, want %q (index should be restored)", path, IndexPathHNSW)
+	}
+}
+
+// TestPersistentStoreHNSWFallbackRebuild verifies that Load falls back to
+// rebuildIndex when no serialized hnsw_index blob is present (backward
+// compatibility with pre-issue-#939 databases).
+func TestPersistentStoreHNSWFallbackRebuild(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	onDisk := filepath.Join(t.TempDir(), "rag_hnsw_fallback.db")
+
+	// Manually create a v2 schema (no hnsw_index column) to simulate
+	// a database created before issue #939.
+	{
+		db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=rwc", onDisk))
+		if err != nil {
+			t.Fatalf("open db: %v", err)
+		}
+		_, err = db.Exec(`
+			CREATE TABLE rag_examples (
+				filename TEXT PRIMARY KEY,
+				content TEXT NOT NULL,
+				embedding BLOB NOT NULL,
+				indexed_at DATETIME NOT NULL,
+				embedder_model TEXT NOT NULL DEFAULT '',
+				dims INTEGER NOT NULL DEFAULT 0
+			)`)
+		if err != nil {
+			t.Fatalf("create v2 schema: %v", err)
+		}
+		_, err = db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)`)
+		if err != nil {
+			t.Fatalf("create schema_version: %v", err)
+		}
+		_, err = db.Exec(`INSERT INTO schema_version (version) VALUES (2)`)
+		if err != nil {
+			t.Fatalf("insert version 2: %v", err)
+		}
+
+		// Insert enough rows to exceed indexThreshold.
+		for i := 0; i < indexThreshold+5; i++ {
+			vec := make([]float64, 8)
+			vec[i%8] = 1.0
+			embBlob, err := encodeEmbedding(vec)
+			if err != nil {
+				t.Fatalf("encode embedding: %v", err)
+			}
+			_, err = db.Exec(`
+				INSERT INTO rag_examples (filename, content, embedding, indexed_at, embedder_model, dims)
+				VALUES (?, ?, ?, ?, '', 8)`,
+				fmt.Sprintf("file%d.go", i), fmt.Sprintf("content %d", i), embBlob, time.Now().UTC())
+			if err != nil {
+				t.Fatalf("insert row %d: %v", i, err)
+			}
+		}
+		db.Close()
+	}
+
+	// Open the v2 database - it should run migration and fall back to rebuild.
+	// Use a dimEmbedder that returns a vector matching file0.
+	emb := &dimEmbedder{
+		model: "test",
+		dims:  8,
+		vecs: map[string][]float64{
+			"file0 content": {1, 0, 0, 0, 0, 0, 0, 0}, // matches file0's embedding
+		},
+	}
+	ps, err := OpenPersistentStore(onDisk, emb, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+
+	nLoaded, err := ps.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if nLoaded != indexThreshold+5 {
+		t.Fatalf("Load returned %d, want %d", nLoaded, indexThreshold+5)
+	}
+
+	// Verify the index was rebuilt by checking Retrieve works.
+	ex, _, path, err := ps.Retrieve(ctx, "file0 content")
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if ex == nil {
+		t.Fatal("Retrieve returned nil, want a result")
+	}
+	// Fallback path should still produce HNSW path after rebuild.
+	if path != IndexPathHNSW {
+		t.Errorf("Retrieve path = %q, want %q (fallback rebuild should use HNSW)", path, IndexPathHNSW)
 	}
 }

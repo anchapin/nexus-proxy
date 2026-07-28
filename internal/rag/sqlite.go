@@ -579,6 +579,9 @@ func (p *PersistentStore) Upsert(ctx context.Context, ex FewShotExample) error {
 	if ex.Filename == "" {
 		return errors.New("rag: empty filename")
 	}
+	if len(ex.Embedding) == 0 {
+		return fmt.Errorf("rag: empty embedding for %q", ex.Filename)
+	}
 	blob, err := encodeEmbedding(ex.Embedding)
 	if err != nil {
 		return fmt.Errorf("rag: encode embedding %q: %w", ex.Filename, err)
