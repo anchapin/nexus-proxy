@@ -896,7 +896,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_INJECTION_SCAN_ROLES"); v != "" {
 		roles, unrecognized := parseInjectionScanRoles(v)
 		cfg.InjectionScanRoles = roles
-		if len(unrecognized) > 0 && v != "system" {
+		if len(unrecognized) > 0 && len(roles) == 1 && roles[0] == "system" {
 			slog.Warn("unrecognised injection scan role(s): falling back to [system]",
 				slog.String("ignored", strings.Join(unrecognized, ",")),
 			)
@@ -1244,7 +1244,8 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 	}
 
 	// Warn if yaml had unrecognized injection scan roles (issue #845)
-	if len(yamlUnrecognized) > 0 && yamlRolesRaw != "system" {
+	// Only warn when unrecognized tokens exist AND the fallback is ["system"] (issue #879).
+	if len(yamlUnrecognized) > 0 && len(yamlRoles) == 1 && yamlRoles[0] == "system" {
 		slog.Warn("unrecognised injection scan role(s) in config.yaml: falling back to [system]",
 			slog.String("ignored", strings.Join(yamlUnrecognized, ",")),
 		)

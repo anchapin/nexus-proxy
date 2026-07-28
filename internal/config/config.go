@@ -1462,7 +1462,13 @@ func Load() (Config, error) {
 	rawRoles := getEnv("NEXUS_INJECTION_SCAN_ROLES", "system")
 	roles, unrecognized := parseInjectionScanRoles(rawRoles)
 	cfg.InjectionScanRoles = roles
-	if len(unrecognized) > 0 && rawRoles != "system" {
+	// Warn only when unrecognized tokens exist AND the fallback is ["system"].
+	// This means the user specified at least one invalid value that caused
+	// the parser to discard everything and fall back to the default.
+	// Cases like "system,user" (both valid) or "system,foo" (foo invalid,
+	// fallback to ["system"]) are distinguished by checking the resulting
+	// roles set, not the raw input string (issue #879).
+	if len(unrecognized) > 0 && len(roles) == 1 && roles[0] == "system" {
 		slog.Warn("unrecognised injection scan role(s): falling back to [system]",
 			slog.String("ignored", strings.Join(unrecognized, ",")),
 		)
