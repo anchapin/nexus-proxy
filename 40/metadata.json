@@ -1,0 +1,54 @@
+{
+  "cli_version": "0.9.0",
+  "checkpoint_id": "01KYM281JY30A8VC73RDQ116DE",
+  "session_id": "ses_0594f534fffeZT25VPmV6FLtxW",
+  "strategy": "manual-commit",
+  "created_at": "2026-07-28T09:53:42.212983885Z",
+  "branch": "docs/update-agents-md",
+  "checkpoints_count": 1,
+  "save_step_count": 1,
+  "files_touched": [],
+  "agent": "OpenCode",
+  "model": "MiniMax-M2.7",
+  "turn_id": "17e1fa6e9f69",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 73800,
+    "cache_creation_tokens": 80572,
+    "cache_read_tokens": 1029622,
+    "output_tokens": 7608,
+    "api_call_count": 10
+  },
+  "session_metrics": {
+    "turn_count": 1
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 1186,
+      "user_lines_removed": 151,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".opencode/plugins/entire.ts": 272,
+        "docs/internal/issue-discovery-prompt.md": 163,
+        "docs/internal/parallel-issue-discovery-prompt.md": 316,
+        "docs/internal/parallel-issue-discovery-short.md": 119,
+        "docs/internal/parallel-issue-discovery-v2.md": 316
+      },
+      "user_removed_per_file": {
+        "docs/internal/issue-discovery-prompt.md": 151
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 272,
+      "user_lines_removed": 0,
+      "agent_lines_added": 914,
+      "agent_lines_removed": 151,
+      "user_added_per_file": {
+        ".opencode/plugins/entire.ts": 272
+      }
+    }
+  ]
+}
