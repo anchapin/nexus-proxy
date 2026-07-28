@@ -1104,6 +1104,29 @@ func TestSLMCache_Stale_NilReceiver(t *testing.T) {
 	}
 }
 
+func TestSLMCache_StaleEntries_AfterTTL(t *testing.T) {
+	// StaleEntries must return 1 after a single entry's TTL has expired
+	// but before EvictExpired is called (issue #801).
+	c := NewSLMCache(50*time.Millisecond, 0)
+	ctx := context.Background()
+
+	c.Set(ctx, "a", RouteLocal)
+
+	time.Sleep(120 * time.Millisecond)
+
+	if stale := c.StaleEntries(); stale != 1 {
+		t.Errorf("StaleEntries() = %d after TTL expiry, want 1", stale)
+	}
+}
+
+func TestSLMCache_StaleEntries_NilReceiver(t *testing.T) {
+	// StaleEntries must not panic on a nil *SLMCache pointer.
+	var c *SLMCache
+	if stale := c.StaleEntries(); stale != 0 {
+		t.Errorf("StaleEntries() on nil = %d, want 0", stale)
+	}
+}
+
 func TestSLMCache_EvictExpired(t *testing.T) {
 	// EvictExpired must remove all expired entries and return the count.
 	c := NewSLMCache(50*time.Millisecond, 0)

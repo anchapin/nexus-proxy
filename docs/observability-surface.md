@@ -25,6 +25,7 @@ snake_case naming.
 | `nexus_slm_cache_evictions_total` | counter | `reason` | 2 (`ttl`, `lru`) | `routemetrics.go` |
 | `nexus_slm_cache_entries` | gauge | *(none)* | 1 | `prometheus.go` (issue #531) |
 | `nexus_slm_cache_max_entries` | gauge | *(none)* | 1 | `prometheus.go` (issue #531) |
+| `nexus_slm_cache_stale_entries` | gauge | *(none)* | 1 | `prometheus.go` (issue #801) |
 | `nexus_local_cooldown_active` | gauge | *(none)* | 1 | `prometheus.go` (issue #530) |
 | `nexus_local_cooldown_triggers_total` | counter | *(none)* | 1 | `routemetrics.go` (issue #530) |
 | `nexus_requests_rejected_total` | counter | `reason` | 4 | `routemetrics.go` |
@@ -347,6 +348,7 @@ effectiveness:
 |--------|------|----------------|---------|
 | `nexus_slm_cache_entries` | gauge | `SLMCache.Len()` | Current number of entries in the cache (including expired entries not yet evicted). |
 | `nexus_slm_cache_max_entries` | gauge | `SLMCache.MaxEntries()` | Configured maximum entry capacity. |
+| `nexus_slm_cache_stale_entries` | gauge | `SLMCache.StaleEntries()` | Number of entries that have passed their TTL but have not yet been evicted (issue #801). |
 
 Both gauges are unlabelled (cardinality 1 each) and are wired as
 `GaugeProvider` closures in `cmd/nexus/main.go`, reading from the
