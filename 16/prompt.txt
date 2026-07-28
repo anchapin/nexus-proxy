@@ -1,0 +1,24 @@
+You are implementing GitHub issue #883 in a dedicated worktree.
+
+**Issue #883: Judge SQLite store uses fmt.Printf instead of slog**
+
+**Area:** area:judge, phase:5-dx
+
+**Problem:** `writeOne` in `sqlite.go` uses `fmt.Printf` for a WARN-level error message (line 179), breaking log aggregation pipelines that expect structured JSON output.
+
+**Acceptance criteria:**
+- `writeOne` uses `slog.Warn` instead of `fmt.Printf`
+- `judge_stats_test.go` continues to pass
+- golangci-lint reports no new violations in `internal/judge/`
+
+**Worktree:** `/home/alex/AI/worktrees/issue-883-judge-slog`
+
+**Your task:**
+1. Find `writeOne` in `internal/judge/sqlite.go` around line 179
+2. Replace `fmt.Printf("WARN: judge: insert request_id=%s: %v\n", score.RequestID, err)` with `slog.Warn("judge: insert failed", slog.String("request_id", score.RequestID), slog.Any("err", err))`
+3. Add `log/slog` to imports if needed
+4. Run `make build && go test ./internal/judge && make lint` to verify
+5. Commit: `fix: resolve #883 — replace fmt.Printf with slog.Warn in judge sqlite writeOne`
+6. Push: `git push -u origin fix/issue-883-judge-slog`
+7. Create PR targeting `develop`: `Closes #883`
+8. Report PR number
