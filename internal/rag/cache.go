@@ -168,3 +168,19 @@ func (c *CachedEmbedder) RecordBreakerSuccess() {
 		e.RecordBreakerSuccess()
 	}
 }
+
+// CacheStats forwards to the inner *EmbedCache when present (issue #794).
+func (c *CachedEmbedder) CacheStats() (hits, misses int64) {
+	if ec, ok := c.inner.(*EmbedCache); ok {
+		return ec.CacheStats()
+	}
+	return 0, 0
+}
+
+// EmbedHitCount forwards to the inner *EmbedCache.HitCount when present (issue #794).
+func (c *CachedEmbedder) EmbedHitCount() int64 {
+	if ec, ok := c.inner.(*EmbedCache); ok {
+		return ec.HitCount()
+	}
+	return 0
+}
