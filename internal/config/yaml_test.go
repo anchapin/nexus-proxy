@@ -55,6 +55,15 @@ func TestLoadYAMLDefaults(t *testing.T) {
 	if cfg.LocalCooldown != 10*time.Second {
 		t.Errorf("LocalCooldown = %v, want 10s", cfg.LocalCooldown)
 	}
+	if cfg.AuthRateLimitRPM != 5 {
+		t.Errorf("AuthRateLimitRPM = %d, want 5", cfg.AuthRateLimitRPM)
+	}
+	if cfg.AuthRateLimitBurst != 3 {
+		t.Errorf("AuthRateLimitBurst = %d, want 3", cfg.AuthRateLimitBurst)
+	}
+	if cfg.AuthRateLimitWindow != 5*time.Minute {
+		t.Errorf("AuthRateLimitWindow = %v, want 5m", cfg.AuthRateLimitWindow)
+	}
 }
 
 func TestLoadYAMLYAMLOverrides(t *testing.T) {
@@ -91,6 +100,9 @@ models_cache_ttl: "10m"
 rate_limit_rpm: 120
 rate_limit_burst: 30
 trusted_proxies: "10.0.0.0/8"
+auth_rate_limit_rpm: 20
+auth_rate_limit_burst: 10
+auth_rate_limit_window: "3m"
 `
 	if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
@@ -183,6 +195,15 @@ trusted_proxies: "10.0.0.0/8"
 	}
 	if cfg.RateLimitBurst != 30 {
 		t.Errorf("RateLimitBurst = %d", cfg.RateLimitBurst)
+	}
+	if cfg.AuthRateLimitRPM != 20 {
+		t.Errorf("AuthRateLimitRPM = %d, want 20", cfg.AuthRateLimitRPM)
+	}
+	if cfg.AuthRateLimitBurst != 10 {
+		t.Errorf("AuthRateLimitBurst = %d, want 10", cfg.AuthRateLimitBurst)
+	}
+	if cfg.AuthRateLimitWindow != 3*time.Minute {
+		t.Errorf("AuthRateLimitWindow = %v, want 3m", cfg.AuthRateLimitWindow)
 	}
 	if len(cfg.TrustedProxies) != 1 {
 		t.Errorf("TrustedProxies len = %d, want 1", len(cfg.TrustedProxies))
@@ -866,6 +887,37 @@ max_response_bytes: 10000000
 	}
 	if cfg.MaxResponseBytes != 20000000 {
 		t.Errorf("MaxResponseBytes = %d, want 20000000 (env overrides YAML 10000000)", cfg.MaxResponseBytes)
+	}
+}
+
+func TestLoadYAMLAuthRateLimitEnvOverridesYAML(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	yamlContent := `
+auth_rate_limit_rpm: 10
+auth_rate_limit_burst: 5
+auth_rate_limit_window: 3m
+`
+	if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	t.Setenv("NEXUS_AUTH_RATE_LIMIT_RPM", "20")
+	t.Setenv("NEXUS_AUTH_RATE_LIMIT_BURST", "15")
+	t.Setenv("NEXUS_AUTH_RATE_LIMIT_WINDOW", "7m")
+
+	cfg, err := LoadYAML(path)
+	if err != nil {
+		t.Fatalf("LoadYAML: %v", err)
+	}
+	if cfg.AuthRateLimitRPM != 20 {
+		t.Errorf("AuthRateLimitRPM = %d, want 20 (env overrides YAML 10)", cfg.AuthRateLimitRPM)
+	}
+	if cfg.AuthRateLimitBurst != 15 {
+		t.Errorf("AuthRateLimitBurst = %d, want 15 (env overrides YAML 5)", cfg.AuthRateLimitBurst)
+	}
+	if cfg.AuthRateLimitWindow != 7*time.Minute {
+		t.Errorf("AuthRateLimitWindow = %v, want 7m (env overrides YAML 3m)", cfg.AuthRateLimitWindow)
 	}
 }
 
