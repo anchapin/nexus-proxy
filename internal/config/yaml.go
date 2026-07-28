@@ -181,6 +181,11 @@ type YAMLConfig struct {
 	RateLimitBurst    int    `yaml:"rate_limit_burst"`
 	RateLimitByAPIKey bool   `yaml:"rate_limit_by_api_key"`
 
+	// Auth brute-force protection (issue #840)
+	AuthRateLimitRPM    int    `yaml:"auth_rate_limit_rpm"`
+	AuthRateLimitBurst  int    `yaml:"auth_rate_limit_burst"`
+	AuthRateLimitWindow string `yaml:"auth_rate_limit_window"`
+
 	// Tracing
 	TracingEndpoint   string  `yaml:"tracing_endpoint"`
 	TracingTimeout    string  `yaml:"tracing_timeout"`
@@ -968,6 +973,38 @@ func LoadYAML(path string) (Config, error) {
 		cfg.RateLimitByAPIKey = strings.ToLower(v) == "true" || v == "1"
 	}
 
+	// Auth brute-force protection (issue #840)
+	if v := os.Getenv("NEXUS_AUTH_RATE_LIMIT_RPM"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_AUTH_RATE_LIMIT_RPM: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.AuthRateLimitRPM = n
+	}
+	if v := os.Getenv("NEXUS_AUTH_RATE_LIMIT_BURST"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_AUTH_RATE_LIMIT_BURST: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.AuthRateLimitBurst = n
+	}
+	if v := os.Getenv("NEXUS_AUTH_RATE_LIMIT_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_AUTH_RATE_LIMIT_WINDOW: %w", err)
+		}
+		if d < 0 {
+			d = 0
+		}
+		cfg.AuthRateLimitWindow = d
+	}
+
 	// Tracing
 	if v := os.Getenv("NEXUS_TRACING_ENDPOINT"); v != "" {
 		cfg.TracingEndpoint = v
@@ -1148,6 +1185,10 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		RateLimitRPM:      yc.intDefault(yc.RateLimitRPM, 0),
 		RateLimitBurst:    yc.intDefault(yc.RateLimitBurst, 0),
 		RateLimitByAPIKey: yc.RateLimitByAPIKey,
+
+		AuthRateLimitRPM:    yc.intDefault(yc.AuthRateLimitRPM, 5),
+		AuthRateLimitBurst:  yc.intDefault(yc.AuthRateLimitBurst, 3),
+		AuthRateLimitWindow: yc.durationDefault(yc.AuthRateLimitWindow, 5*time.Minute),
 
 		TracingEndpoint:   yc.stringDefault(yc.TracingEndpoint, ""),
 		TracingTimeout:    yc.durationDefault(yc.TracingTimeout, 10*time.Second),
