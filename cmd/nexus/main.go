@@ -725,6 +725,17 @@ func main() {
 				Value: float64(v),
 			}}
 		}),
+		// Judge dropped counter (issue #892).
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var v uint64
+			if judgeEval != nil {
+				v = judgeEval.Dropped()
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_judge_dropped_total",
+				Value: float64(v),
+			}}
+		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
 			var v uint64
 			if ms, ok := metricsStore.(*metrics.SQLiteStore); ok {
