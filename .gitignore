@@ -45,4 +45,8 @@ Thumbs.db
 nexus-telemetry.jsonl
 
 # Agent orchestration artifacts (local-only, never source-controlled)
-.agents/
+# Wave orchestrator skill is tracked in the repo (see .agents/skills/github-wave-orchestrator/)
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/github-wave-orchestrator/
