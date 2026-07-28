@@ -1,0 +1,30 @@
+You are shepherding PR #858 through CI to merge.
+
+Repository: anchapin/nexus-proxy
+PR: https://github.com/anchapin/nexus-proxy/pull/858
+Branch: fix/issue-837-panel-slog
+Workdir: /home/alex/AI/worktrees/issue-837-panel-slog
+
+Steps:
+1. Check CI status: gh pr checks 858
+2. IF CI is green:
+   a. Check mergeable: gh pr view 858 --json mergeable
+   b. If CONFLICTING → follow the merge conflict protocol
+   c. If MERGEABLE → merge: gh pr merge 858 --squash --delete-branch
+      Verify: gh pr view 858 --json mergedAt --jq '.mergedAt'
+      If null after retry → report BLOCKED
+   d. Clean up: git worktree remove ../worktrees/issue-837-panel-slog
+3. IF CI is failing:
+   a. gh run list --branch fix/issue-837-panel-slog --limit 1
+   b. gh run view <RUN_ID> --log
+   c. Apply minimal fix in the worktree
+   d. git add -A && git commit -m "fix: resolve CI failure" && git push
+   e. Wait for CI (poll every 30s, max 10 iterations)
+   f. If still failing → report blocker and STOP
+4. IF merge conflict:
+   a. git fetch origin develop && git rebase origin/develop
+   b. Auto-resolve; if unresolvable → STOP and report
+   c. git push --force-with-lease origin fix/issue-837-panel-slog
+   d. Re-trigger CI
+
+Report back: final status (MERGED / BLOCKED / CONFLICT), iterations used.
