@@ -725,6 +725,32 @@ func main() {
 				Value: float64(v),
 			}}
 		}),
+		// Judge queue-depth and concurrency gauges (issue #890).
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var qd int
+			var cc int
+			if judgeEval != nil {
+				qd = judgeEval.QueueDepth()
+				cc = judgeEval.Concurrency()
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_judge_queue_depth", Value: float64(qd)},
+				{Name: "nexus_judge_concurrency", Value: float64(cc)},
+			}
+		}),
+		// Quality queue-depth and concurrency gauges (issue #890).
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var qd int
+			var cc int
+			if verifier != nil {
+				qd = verifier.QueueDepth()
+				cc = verifier.Concurrency()
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_quality_queue_depth", Value: float64(qd)},
+				{Name: "nexus_quality_concurrency", Value: float64(cc)},
+			}
+		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
 			var v uint64
 			if ms, ok := metricsStore.(*metrics.SQLiteStore); ok {
