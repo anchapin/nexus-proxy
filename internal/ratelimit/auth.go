@@ -20,12 +20,12 @@ type AuthLimiter struct {
 	burst  int           // max failures before block
 	window time.Duration // sliding window for failure tracking
 
-	onBlock  func()          // called when a client is blocked; must not block
+	onBlock  func()            // called when a client is blocked; must not block
 	resolver *ClientIPResolver // resolves client IP for rate-limit bucketing
 
 	mu       sync.Mutex
 	failures map[string]*authFailure // keyed by resolved client IP
-	stopCh   chan struct{}            // closed when reaper should exit
+	stopCh   chan struct{}           // closed when reaper should exit
 }
 
 // authFailure tracks failure timestamps for one client IP.
