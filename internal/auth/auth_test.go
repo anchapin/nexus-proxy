@@ -253,10 +253,12 @@ func TestConstantTimeComparisonRegression(t *testing.T) {
 
 // mockObserver implements AuthObserver for testing (issue #295).
 type mockObserver struct {
+	accepted        int
 	rejectedInvalid int
 	rejectedMissing int
 }
 
+func (m *mockObserver) IncAuthAccepted()        { m.accepted++ }
 func (m *mockObserver) IncAuthRejectedInvalid() { m.rejectedInvalid++ }
 func (m *mockObserver) IncAuthRejectedMissing() { m.rejectedMissing++ }
 
@@ -316,6 +318,31 @@ func TestAuthObserverNoCallbackOnSuccess(t *testing.T) {
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if obs.rejectedInvalid != 0 {
+		t.Errorf("IncAuthRejectedInvalid call count = %d, want 0", obs.rejectedInvalid)
+	}
+	if obs.rejectedMissing != 0 {
+		t.Errorf("IncAuthRejectedMissing call count = %d, want 0", obs.rejectedMissing)
+	}
+}
+
+// TestAuthObserverAccepted verifies that IncAuthAccepted is called
+// when auth succeeds (issue #847).
+func TestAuthObserverAccepted(t *testing.T) {
+	obs := &mockObserver{}
+	m := NewMiddleware("secret-key", nil, nil, obs)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer secret-key")
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if obs.accepted != 1 {
+		t.Errorf("IncAuthAccepted call count = %d, want 1", obs.accepted)
 	}
 	if obs.rejectedInvalid != 0 {
 		t.Errorf("IncAuthRejectedInvalid call count = %d, want 0", obs.rejectedInvalid)

@@ -26,6 +26,7 @@ import (
 // AuthObserver is the interface for receiving auth lifecycle callbacks.
 // The observability.Collector implements this interface (issue #295).
 type AuthObserver interface {
+	IncAuthAccepted()
 	IncAuthRejectedInvalid()
 	IncAuthRejectedMissing()
 }
@@ -124,6 +125,9 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			return
 		}
 		next.ServeHTTP(w, r)
+		if m.observer != nil {
+			m.observer.IncAuthAccepted()
+		}
 	})
 }
 
