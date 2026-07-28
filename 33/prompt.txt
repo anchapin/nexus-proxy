@@ -1,0 +1,26 @@
+You are implementing GitHub issue #897 in a dedicated worktree.
+
+**Issue #897: ShutdownTimeout warning only fires in env-path, not YAML-path**
+
+**Area:** area:config, phase:5-dx
+
+**Problem:** If an operator sets `NEXUS_SHUTDOWN_TIMEOUT=1s` (valid but dangerous), the boot warning fires in the env path (`main.go:382`) but not in the `LoadYAML()` path. Operators loading from YAML never see the warning. Additionally, `ShutdownTimeout` is excluded from `ReloadHotReloadable()`.
+
+**Acceptance criteria:**
+- `ShutdownTimeout` is included in SIGHUP hot-reloadable checks
+- `ValidateShutdownTimeout` (or equivalent) is called from both `Load()` and `LoadYAML()` paths
+- `.env.example` includes `NEXUS_SHUTDOWN_TIMEOUT` in the hot-reloadable list
+
+**Worktree:** `/home/alex/AI/worktrees/issue-897-shutdown-timeout`
+
+**Your task:**
+1. In the worktree at `/home/alex/AI/worktrees/issue-897-shutdown-timeout`, implement the fix
+2. Examine `internal/config/config.go` and `internal/config/yaml.go` to understand the current structure
+3. Add `ShutdownTimeout` to `ReloadHotReloadable()` in config.go
+4. Add a `ValidateShutdownTimeout()` helper called from both `Load()` and `LoadYAML()` paths
+5. Add `NEXUS_SHUTDOWN_TIMEOUT` to `.env.example` hot-reloadable list with appropriate annotation
+6. Run `make ci` or at minimum `make build && make test` to verify
+7. Commit your changes with a conventional commit message: `fix: resolve #897 — ShutdownTimeout warning fires in both env and YAML paths`
+8. Push the branch: `git push -u origin fix/issue-897-shutdown-timeout`
+9. Create a PR with body: `Closes #897`
+10. Report the PR number when done
