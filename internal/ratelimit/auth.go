@@ -85,6 +85,48 @@ func (al *AuthLimiter) SetOnReap(fn func()) {
 	al.onReap = fn
 }
 
+// SetRPM updates the steady-state failures per minute. A value <= 0
+// disables the limiter (all IsBlocked calls return false). Safe to call
+// while the server is running. Exposed for SIGHUP-based config hot reload
+// (issue #895).
+func (al *AuthLimiter) SetRPM(rpm int) {
+	if al == nil {
+		return
+	}
+	al.mu.Lock()
+	defer al.mu.Unlock()
+	al.rpm = rpm
+}
+
+// SetBurst updates the maximum failures before a block. A value <= 0
+// leaves the burst unchanged. Safe to call while the server is running.
+// Exposed for SIGHUP-based config hot reload (issue #895).
+func (al *AuthLimiter) SetBurst(burst int) {
+	if al == nil {
+		return
+	}
+	al.mu.Lock()
+	defer al.mu.Unlock()
+	if burst > 0 {
+		al.burst = burst
+	}
+}
+
+// SetWindow updates the sliding window duration for failure tracking.
+// A value <= 0 leaves the window unchanged. Safe to call while the
+// server is running. Exposed for SIGHUP-based config hot reload
+// (issue #895).
+func (al *AuthLimiter) SetWindow(window time.Duration) {
+	if al == nil {
+		return
+	}
+	al.mu.Lock()
+	defer al.mu.Unlock()
+	if window > 0 {
+		al.window = window
+	}
+}
+
 // IsBlocked reports whether the client at ip is currently blocked due to
 // too many auth failures.
 func (al *AuthLimiter) IsBlocked(ip string) bool {
