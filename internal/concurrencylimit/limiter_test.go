@@ -646,12 +646,16 @@ func TestNewVRAMLimiterFallbackExhaustedGPU(t *testing.T) {
 
 func TestNewVRAMLimiterContextCancelReleasesBlocked(t *testing.T) {
 	// Uses a 1-GPU limiter so timing is deterministic: 1 slot taken,
-	// 1 blocked, timeout cancels → blocked goroutine must wake and return.
+	// 1 blocked, timeout cancels -> blocked goroutine must wake and return.
 	//
-	// Both Canceled (explicit cancel) and DeadlineExceeded (timeout) are
-	// acceptable because context.AfterFunc fires when either the explicit
-	// cancel() is called or the timeout fires, and ctx.Err() at that point
-	// is what the waiter observes after waking from cond.Wait.
+	// The waiter is guaranteed to be parked in cond.Wait() before cancel()
+	// is called because we use the gpuLimiter's onWait hook (set before the
+	// cond.Wait() call) to signal a ready channel that the test waits on.
+	// Because cancel() is called after the waiter is in cond.Wait(), the
+	// ctx.Err() observed after waking is context.Canceled (explicit cancel),
+	// NOT context.DeadlineExceeded (which would mean the 50 ms timeout
+	// fired before cancel was called, indicating the waiter had not yet
+	// entered cond.Wait() -- the race this fix eliminates).
 	freeVRAM, _ := vramFnPerGPU([]int64{8 << 30})
 	l := NewVRAMLimiter(1, 1<<30, freeVRAM, 1)
 
@@ -667,17 +671,25 @@ func TestNewVRAMLimiterContextCancelReleasesBlocked(t *testing.T) {
 		errCh <- gerr
 	}()
 
-	// Give the waiter time to park in cond.Wait. On loaded CI runners
-	// the scheduler may not have parked the waiter within 50 ms; 500 ms
-	// is sufficient.
-	time.Sleep(500 * time.Millisecond)
+	// The waiter signals on l.onWait (called just before cond.Wait()) so
+	// we know it has entered cond.Wait() before we call cancel(). This
+	// eliminates the scheduler-dependent sleep that caused flakiness.
+	ready := make(chan struct{})
+	l.onWait.Store(func() { close(ready) })
+
+	select {
+	case <-ready:
+		// Waiter has entered cond.Wait(); safe to call cancel().
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiter did not enter cond.Wait() within 5 s")
+	}
 	cancel()
 	holder()
 
 	select {
 	case err := <-errCh:
-		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("err = %v, want Canceled or DeadlineExceeded", err)
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v, want Canceled (explicit cancel after waiter in cond.Wait)", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("blocked acquire hung past cancellation")
