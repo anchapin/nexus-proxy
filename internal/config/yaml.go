@@ -164,6 +164,11 @@ type YAMLConfig struct {
 	// table. 0 = disabled (grow without bound). Not hot-reloadable.
 	MetricsRetentionDays int `yaml:"metrics_retention_days"`
 
+	// OTLP retry/back-off parameters (issue #803).
+	TracerMaxRetries     int    `yaml:"tracer_max_retries"`
+	TracerRetryBaseDelay string `yaml:"tracer_retry_base_delay"`
+	TracerRetryMaxDelay  string `yaml:"tracer_retry_max_delay"`
+
 	// Models
 	ModelsEndpointEnabled bool   `yaml:"models_endpoint_enabled"`
 	ModelsCacheTTL        string `yaml:"models_cache_ttl"`
@@ -857,6 +862,23 @@ func LoadYAML(path string) (Config, error) {
 		}
 	}
 
+	// OTLP retry/back-off parameters (issue #803).
+	if v := os.Getenv("NEXUS_TRACING_MAX_RETRIES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.TracerMaxRetries = n
+		}
+	}
+	if v := os.Getenv("NEXUS_TRACING_RETRY_BASE_DELAY"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.TracerRetryBaseDelay = d
+		}
+	}
+	if v := os.Getenv("NEXUS_TRACING_RETRY_MAX_DELAY"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.TracerRetryMaxDelay = d
+		}
+	}
+
 	// Models
 	if v := os.Getenv("NEXUS_MODELS_ENDPOINT"); v != "" {
 		cfg.ModelsEndpointEnabled = parseBoolEnvStr(v, true)
@@ -941,6 +963,11 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		TelemetryFlushInterval: yc.durationDefault(yc.TelemetryFlushInterval, 5*time.Second),
 		MetricsDBPath:          yc.stringDefault(yc.MetricsDBPath, DefaultMetricsDBPath()),
 		MetricsRetentionDays:   yc.intDefault(yc.MetricsRetentionDays, 0),
+
+		// OTLP retry/back-off parameters (issue #803).
+		TracerMaxRetries:     yc.intDefault(yc.TracerMaxRetries, 0),
+		TracerRetryBaseDelay: yc.durationDefault(yc.TracerRetryBaseDelay, 0),
+		TracerRetryMaxDelay:  yc.durationDefault(yc.TracerRetryMaxDelay, 0),
 
 		// Non-string fields with defaults
 		RAGThreshold:              yc.floatDefault(yc.RAGThreshold, 0.55),

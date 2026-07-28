@@ -58,6 +58,11 @@ type Exporter struct {
 	// nexus_tracing_flush_failures_total so operators can alert on
 	// silent trace loss that dropped does not capture (issue #484).
 	flushFailures atomic.Uint64
+
+	// Retry parameters for OTLP POST retries with exponential backoff.
+	maxRetries     int
+	retryBaseDelay time.Duration
+	maxRetryDelay  time.Duration
 }
 
 // ExporterConfig is the input to NewExporter.
@@ -86,6 +91,23 @@ type ExporterConfig struct {
 	// to AlwaysSample. The probability sampler hashes the trace
 	// id so the decision is deterministic across processes.
 	Sampler Sampler
+
+	// MaxRetries is the maximum number of retry attempts after
+	// the initial POST fails with a 5xx status. A value <= 0
+	// falls back to defaultMaxRetries.
+	MaxRetries int
+
+	// RetryBaseDelay is the initial back-off delay between
+	// retries. The actual delay follows exponential growth:
+	// base * 2^(attempt-1). A value <= 0 falls back to
+	// defaultRetryBaseDelay.
+	RetryBaseDelay time.Duration
+
+	// MaxRetryDelay caps the exponential back-off ceiling so
+	// retries do not exceed a reasonable interval even with
+	// many failures. A value <= 0 falls back to
+	// defaultMaxRetryDelay.
+	MaxRetryDelay time.Duration
 }
 
 const (
@@ -98,11 +120,11 @@ const (
 	batchCap = 64
 )
 
-// Retry constants for OTLP POST retries with exponential backoff.
+// Default retry constants for OTLP POST retries with exponential backoff.
 const (
-	maxRetries     = 3 // retry attempts after the initial attempt
-	retryBaseDelay = 100 * time.Millisecond
-	maxRetryDelay  = 2 * time.Second
+	defaultMaxRetries     = 3 // retry attempts after the initial attempt
+	defaultRetryBaseDelay = 100 * time.Millisecond
+	defaultMaxRetryDelay  = 2 * time.Second
 )
 
 // NewExporter starts the background POST loop and returns a ready
@@ -134,12 +156,27 @@ func NewExporter(cfg ExporterConfig) *Exporter {
 	if sampler == nil {
 		sampler = AlwaysSample{}
 	}
+	maxRetries := cfg.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = defaultMaxRetries
+	}
+	retryBaseDelay := cfg.RetryBaseDelay
+	if retryBaseDelay <= 0 {
+		retryBaseDelay = defaultRetryBaseDelay
+	}
+	maxRetryDelay := cfg.MaxRetryDelay
+	if maxRetryDelay <= 0 {
+		maxRetryDelay = defaultMaxRetryDelay
+	}
 	e := &Exporter{
-		endpoint: cfg.Endpoint,
-		client:   client,
-		timeout:  cfg.Timeout,
-		sampler:  sampler,
-		queue:    make(chan *Span, cfg.QueueSize),
+		endpoint:       cfg.Endpoint,
+		client:         client,
+		timeout:        cfg.Timeout,
+		sampler:        sampler,
+		queue:          make(chan *Span, cfg.QueueSize),
+		maxRetries:     maxRetries,
+		retryBaseDelay: retryBaseDelay,
+		maxRetryDelay:  maxRetryDelay,
 	}
 	e.wg.Add(1)
 	go e.run()
@@ -304,11 +341,11 @@ func (e *Exporter) flush(batch []*Span) error {
 	defer cancel()
 
 	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := 0; attempt <= e.maxRetries; attempt++ {
 		if attempt > 0 {
-			delay := retryBaseDelay * time.Duration(1<<(attempt-1))
-			if delay > maxRetryDelay {
-				delay = maxRetryDelay
+			delay := e.retryBaseDelay * time.Duration(1<<(attempt-1))
+			if delay > e.maxRetryDelay {
+				delay = e.maxRetryDelay
 			}
 			select {
 			case <-ctx.Done():
@@ -340,7 +377,7 @@ func (e *Exporter) flush(batch []*Span) error {
 				return lastErr
 			}
 			// 5xx: retryable collector errors
-			if attempt < maxRetries {
+			if attempt < e.maxRetries {
 				continue
 			}
 			break // retries exhausted
