@@ -1,0 +1,39 @@
+You are implementing a fix for GitHub issue #846: [P3] Store.IsBreakerOpen/RecordBreakerSuccess at 0% coverage — delegation correctness invisible
+
+Repository: anchapin/nexus-proxy
+Branch: fix/issue-846-rag-coverage (already checked out)
+Workdir: /home/alex/AI/worktrees/issue-846-rag-coverage
+
+Steps:
+1. Read the full issue: gh issue view 846
+2. Read the issue comments for additional context: gh issue view 846 --comments
+3. Analyze what code needs to change
+4. Implement the fix/feature with tests
+5. Run local checks if available (make test-fast, make lint)
+6. Commit: git add -A && git commit -m "{fix|feat}: resolve #846 — add coverage for Store.IsBreakerOpen/RecordBreakerSuccess"
+7. Push: git push -u origin fix/issue-846-rag-coverage
+8. Open PR with an EXPLICIT body (no `--fill` — see PR-body conventions):
+   ```
+   gh pr create --base develop \
+     --title "fix: resolve #846 — add coverage for Store.IsBreakerOpen/RecordBreakerSuccess" \
+     --body "$(cat <<'EOF'
+Closes #846
+
+Add tests to cover the Store.IsBreakerOpen and RecordBreakerSuccess methods which currently have 0% coverage, making delegation correctness unverifiable.
+EOF
+   )"
+   The body must contain exactly one `Closes #N` line. Do NOT include other `#NNNN` references in the body or title.
+9. Verify closingReferences count is exactly 1:
+   ```
+   bash /home/alex/AI/nexus-proxy/scripts/check_pr_closing_refs.sh <PR_NUMBER> 1
+   ```
+   If the check fails, run `gh pr edit <PR> --body "Closes #846\n\n<minimal body>"`
+   to strip the spurious references, then re-run the check.
+
+Rules:
+- Work ONLY in your assigned worktree (/home/alex/AI/worktrees/issue-846-rag-coverage)
+- Do NOT modify files outside the scope of this issue
+- Include tests for the fix/feature if the repo has a test suite
+- Follow the repo's AGENTS.md and code style conventions
+- If the issue is unclear, add a comment asking for clarification: gh issue comment 846 -b "..."
+- Report back: PR number, files changed, any blockers encountered
