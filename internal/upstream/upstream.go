@@ -1151,10 +1151,7 @@ func streamPanelResultAsSSE(w http.ResponseWriter, r PanelResult) error {
 // streamed as a single delta chunk followed by [DONE]. This function
 // sets SSE headers and commits WriteHeader itself (issue #532) so it
 // is safe to call from any code path that has not yet written headers.
-func streamCachedArbiterSynthesis(w http.ResponseWriter, synthesis string) error {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
+func streamCachedArbiterSynthesis(w http.ResponseWriter, synthesis any) error {
 	chunk := map[string]interface{}{
 		"object": "chat.completion.chunk",
 		"nexus":  map[string]string{"source": "arbiter-cached"},
@@ -1166,6 +1163,9 @@ func streamCachedArbiterSynthesis(w http.ResponseWriter, synthesis string) error
 	if err != nil {
 		return fmt.Errorf("fusion: marshal cached arbiter chunk: %w", err)
 	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write([]byte("data: ")); err != nil {
 		if IsClientAbort(err) {
 			return ErrClientAbort
