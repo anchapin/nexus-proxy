@@ -241,6 +241,11 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total idle IPs evicted from the auth limiter's failures map by the reaper (issue #839).",
 		typ:  "counter",
 	},
+	// Auth limiter blocked counter (issue #831).
+	"nexus_auth_limiter_blocked_total": {
+		help: "Total IPs blocked by the auth brute-force limiter (burst threshold crossed) (issue #831).",
+		typ:  "counter",
+	},
 }
 
 // RenderPrometheus writes the full /metrics body in Prometheus
@@ -386,6 +391,11 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	writeCounter(w, "nexus_auth_limiter_reaper_evictions_total",
 		"Total idle IPs evicted from the auth limiter's failures map by the reaper (issue #839).",
 		c.authReaperEvictions.Load())
+
+	// Auth limiter blocked counter (issue #831).
+	writeCounter(w, "nexus_auth_limiter_blocked_total",
+		"Total IPs blocked by the auth brute-force limiter (burst threshold crossed) (issue #831).",
+		c.authBlockedTotal.Load())
 
 	// --- Histograms -----------------------------------------------------
 
