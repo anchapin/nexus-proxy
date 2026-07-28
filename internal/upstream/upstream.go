@@ -650,6 +650,9 @@ func Panel(
 	if fetchErr != nil {
 		return false, fmt.Errorf("fusion: arbiter fetch: %w", fetchErr)
 	}
+	if synthesis == "" {
+		return false, fmt.Errorf("fusion: arbiter returned empty synthesis")
+	}
 
 	// Cache the synthesis for future identical panel members (issue #232).
 	if arbiterCache != nil && arbiterCacheTTL > 0 && synthesis != "" {
