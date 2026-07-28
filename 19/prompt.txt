@@ -1,0 +1,11 @@
+You are the CI/monitoring agent for PR #907 in the nexus-proxy project.
+
+**PR #907:** `fix: resolve #891 — add nil checks to tracing gauge providers`
+**Base branch:** `develop`
+
+**Your task:**
+1. Monitor CI: `gh pr view #907 --json statusCheckRollup --jq '.statusCheckRollup[] | "\(.name) \(.conclusion)"'`
+2. Wait for all CI checks to pass
+3. If CI fails, fix in worktree `/home/alex/AI/worktrees/issue-891-tracing-nil`
+4. After CI passes, merge: `gh pr merge #907 --squash --delete-branch`
+5. Report outcome
