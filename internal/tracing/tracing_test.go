@@ -350,6 +350,52 @@ func TestStartSpanFromContextWithParent(t *testing.T) {
 	}
 }
 
+func TestWithRootSpanAndRootSpanFromContext(t *testing.T) {
+	_, rootSpan := StartSpan(Context{}, "root")
+	rootSpan.SetAttr("initial", "value")
+
+	ctx := WithRootSpan(context.Background(), rootSpan)
+
+	got, ok := RootSpanFromContext(ctx)
+	if !ok {
+		t.Fatal("RootSpanFromContext returned ok=false, want true")
+	}
+	if got != rootSpan {
+		t.Errorf("RootSpanFromContext returned %v, want %v", got, rootSpan)
+	}
+	if got.Attributes["initial"] != "value" {
+		t.Errorf("root span attr[initial] = %v, want 'value'", got.Attributes["initial"])
+	}
+
+	//nolint:staticcheck
+	got, ok = RootSpanFromContext(nil)
+	if ok || got != nil {
+		t.Errorf("RootSpanFromContext(nil) = (%v, %v), want (nil, false)", got, ok)
+	}
+
+	// missing root span returns ok=false
+	got, ok = RootSpanFromContext(context.Background())
+	if ok {
+		t.Errorf("RootSpanFromContext(plain ctx) = (%v, %v), want (nil, false)", got, ok)
+	}
+}
+
+func TestRootSpanFromContextNotOverwrittenByWithSpanContext(t *testing.T) {
+	_, rootSpan := StartSpan(Context{}, "root")
+	ctx := WithRootSpan(context.Background(), rootSpan)
+
+	parent := Context{TraceID: "0af7651916cd43dd8448eb211c80319c", SpanID: "b7ad6b7169203331"}
+	ctx = WithSpanContext(ctx, parent)
+
+	got, ok := RootSpanFromContext(ctx)
+	if !ok {
+		t.Fatal("RootSpanFromContext returned ok=false after WithSpanContext")
+	}
+	if got != rootSpan {
+		t.Errorf("RootSpanFromContext returned %v, want rootSpan %v", got, rootSpan)
+	}
+}
+
 func TestEnabledFalse(t *testing.T) {
 	RegisterExporter(nil)
 	if Enabled() {

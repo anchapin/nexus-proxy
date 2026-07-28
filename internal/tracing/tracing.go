@@ -291,6 +291,11 @@ func GlobalExporter() *Exporter {
 // packages cannot collide on the same key.
 type ctxKey struct{}
 
+// spanCtxKey is the unexported type used as the context.Context key
+// for storing the root tracing Span. Unexported so external
+// packages cannot collide on the same key.
+type spanCtxKey struct{}
+
 // WithSpanContext returns a derived context carrying tc as the
 // active parent tracing context. Downstream handlers retrieve it
 // via SpanContextFromContext to create child spans attached to
@@ -303,6 +308,17 @@ func WithSpanContext(parent context.Context, tc Context) context.Context {
 	return context.WithValue(parent, ctxKey{}, tc)
 }
 
+// WithRootSpan returns a derived context carrying s as the root
+// span. The span can be retrieved via RootSpanFromContext by the
+// chat handler after the routing decision is made, so it can
+// annotate the root span with route and model attributes.
+func WithRootSpan(parent context.Context, s *Span) context.Context {
+	if parent == nil {
+		return nil
+	}
+	return context.WithValue(parent, spanCtxKey{}, s)
+}
+
 // SpanContextFromContext returns the tracing Context previously
 // stored via WithSpanContext, or the zero value + false when
 // none has been set. Use the ok result to decide whether a child
@@ -312,6 +328,18 @@ func SpanContextFromContext(ctx context.Context) (Context, bool) {
 		return Context{}, false
 	}
 	v, ok := ctx.Value(ctxKey{}).(Context)
+	return v, ok
+}
+
+// RootSpanFromContext returns the root span previously stored via
+// WithRootSpan, or nil + false when none has been set. Used by
+// the chat handler to annotate the root span with route and model
+// after the routing decision is made.
+func RootSpanFromContext(ctx context.Context) (*Span, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	v, ok := ctx.Value(spanCtxKey{}).(*Span)
 	return v, ok
 }
 
