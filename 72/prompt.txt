@@ -1,0 +1,45 @@
+You are implementing a fix for GitHub issue #804: P3: OTLP exporter timeout hardcoded at 10s — high-latency collectors trigger premature retry exhaustion
+
+Repository: anchapin/nexus-proxy
+Branch: fix/issue-804-otlp-exporter-timeout (already checked out)
+Workdir: /home/alex/AI/worktrees/issue-804-otlp-exporter-timeout
+
+Steps:
+1. Read the full issue: gh issue view 804
+2. Read the issue comments for additional context: gh issue view 804 --comments
+3. Analyze what code needs to change
+4. Implement the fix/feature with tests
+5. Run local checks if available (make test-race, make lint)
+6. Commit: git add -A && git commit -m "feat: resolve #804 — add NEXUS_TRACING_TIMEOUT env var to OTLP exporter"
+7. Push: git push -u origin fix/issue-804-otlp-exporter-timeout
+8. Open PR with an EXPLICIT body (no `--fill`):
+   ```
+   gh pr create --base develop \
+     --title "feat: resolve #804 — add NEXUS_TRACING_TIMEOUT env var to OTLP exporter" \
+     --body "$(cat <<'EOF'
+   Closes #804
+
+   Add NEXUS_TRACING_TIMEOUT env var (default 10s) to allow operators to
+   configure a longer deadline for OTLP POST attempts, preventing premature
+   retry exhaustion on high-latency collectors.
+   EOF
+   )"
+   ```
+   The body must contain exactly one `Closes #N` line. Do NOT include other `#NNNN` references.
+9. Verify closingReferences count is exactly 1:
+   ```
+   bash scripts/check_pr_closing_refs.sh <PR_NUMBER> 1
+   ```
+   If the check fails, run `gh pr edit <PR> --body "Closes #N\n\n<minimal body>"` to strip spurious references, then re-run the check.
+
+Rules:
+- Work ONLY in your assigned worktree (/home/alex/AI/worktrees/issue-804-otlp-exporter-timeout)
+- Do NOT modify files outside the scope of this issue
+- Include tests for the fix/feature
+- Follow the repo's AGENTS.md and code style conventions
+- If the issue is unclear, add a comment asking for clarification: gh issue comment 804 -b "..."
+- Report back: PR number, files changed, any blockers encountered
+
+---
+
+Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.
