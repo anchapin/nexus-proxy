@@ -399,11 +399,10 @@ func (c *EmbedCache) EmbedBatch(ctx context.Context, texts []string) ([][]float6
 }
 
 // CacheStats returns the cumulative hit and miss counts since the cache was
-// created. Used for observability; not thread-safe with concurrent access.
+// created. Used for observability; safe to call concurrently with
+// Embed, EmbedBatch, and Retrieve.
 func (c *EmbedCache) CacheStats() (hits, misses int64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.hits, c.misses
+	return atomic.LoadInt64(&c.hits), atomic.LoadInt64(&c.misses)
 }
 
 // HitCount returns the current total hit count atomically. Used by the
