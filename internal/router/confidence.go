@@ -1,5 +1,7 @@
 package router
 
+import "regexp"
+
 // confidence.go closes the feedback loop between the async LLM-as-a-judge
 // evaluator (internal/judge, issue #15) and the routing decision (issue #47).
 //
@@ -140,6 +142,27 @@ var categoryKeywords = []struct {
 	}},
 }
 
+// categoryPatterns is the pre-compiled equivalent of categoryKeywords.
+// Each keyword gets its own compiled (?i)\b<kw>\b regex at package init.
+// Categorize iterates these directly to avoid per-call regexp compilation
+// (issue #877).
+var categoryPatterns []struct {
+	category string
+	re       *regexp.Regexp
+}
+
+func init() {
+	for _, group := range categoryKeywords {
+		for _, kw := range group.keywords {
+			pattern := `(?i)\b` + regexp.QuoteMeta(kw) + `\b`
+			categoryPatterns = append(categoryPatterns, struct {
+				category string
+				re       *regexp.Regexp
+			}{group.category, regexp.MustCompile(pattern)})
+		}
+	}
+}
+
 // Categorize buckets prompt into one of the fixed Category* constants using
 // a lightweight keyword classifier. It never calls out to an embedding
 // model — it is a pure, cheap function on the prompt text so it is safe to
@@ -147,11 +170,9 @@ var categoryKeywords = []struct {
 // CategoryOther.
 func Categorize(prompt string) string {
 	lower := toUnicodeLower(prompt)
-	for _, group := range categoryKeywords {
-		for _, kw := range group.keywords {
-			if containsWord(lower, kw) {
-				return group.category
-			}
+	for _, cp := range categoryPatterns {
+		if cp.re.MatchString(lower) {
+			return cp.category
 		}
 	}
 	return CategoryOther
