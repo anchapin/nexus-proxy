@@ -787,32 +787,48 @@ func main() {
 			}}
 		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			exp := tracing.GlobalExporter()
+			if exp == nil {
+				return nil
+			}
 			return []observability.GaugeSample{{
 				Name:  "nexus_tracing_dropped_total",
-				Value: float64(tracing.GlobalExporter().Dropped()),
+				Value: float64(exp.Dropped()),
 			}}
 		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			exp := tracing.GlobalExporter()
+			if exp == nil {
+				return nil
+			}
 			return []observability.GaugeSample{{
 				Name:  "nexus_tracing_flush_failures_total",
-				Value: float64(tracing.GlobalExporter().FlushFailures()),
+				Value: float64(exp.FlushFailures()),
 			}}
 		}),
 		// Tracing queue-depth gauge (issue #596). Exposes the live
 		// number of spans buffered in the export queue so operators
 		// can alert on exporter saturation before spans are dropped.
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			exp := tracing.GlobalExporter()
+			if exp == nil {
+				return nil
+			}
 			return []observability.GaugeSample{{
 				Name:  "nexus_tracing_queue_depth",
-				Value: float64(tracing.GlobalExporter().QueueDepth()),
+				Value: float64(exp.QueueDepth()),
 			}}
 		}),
 		// Tracing batch-size gauge (issue #826). Exposes the configured
 		// batch cap so operators can see what's set at a glance.
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			exp := tracing.GlobalExporter()
+			if exp == nil {
+				return nil
+			}
 			return []observability.GaugeSample{{
 				Name:  "nexus_tracing_batch_size",
-				Value: float64(tracing.GlobalExporter().BatchCap()),
+				Value: float64(exp.BatchCap()),
 			}}
 		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
