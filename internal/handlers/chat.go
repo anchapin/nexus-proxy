@@ -1498,13 +1498,13 @@ func Chat(d Deps) http.Handler {
 				if d.ArbiterCacheObserver != nil {
 					d.ArbiterCacheObserver(cacheHit)
 				}
-			if d.FusionOutcomeObserver != nil {
-				d.FusionOutcomeObserver.ObserveFusionOutcome(FusionOutcomeEvent{
-					RequestID:      reqID,
-					ArbiterSkipped: outcome.ArbiterSkipped,
-					SkipReason:     outcome.SkipReason,
-				})
-			}
+				if d.FusionOutcomeObserver != nil {
+					d.FusionOutcomeObserver.ObserveFusionOutcome(FusionOutcomeEvent{
+						RequestID:      reqID,
+						ArbiterSkipped: outcome.ArbiterSkipped,
+						SkipReason:     outcome.SkipReason,
+					})
+				}
 			}
 			if upErr != nil {
 				slog.Error("fusion error",

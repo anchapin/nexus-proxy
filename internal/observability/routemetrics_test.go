@@ -401,7 +401,7 @@ func TestRAGCountersSingleHitSeriesRegardlessOfFilenames(t *testing.T) {
 // Prometheus diff alerts are not triggered by reordering.
 func TestRouteCountersFusionOutcomeDeterministicOrder(t *testing.T) {
 	rc := NewRouteCounters()
-	rc.ObserveFusionOutcome("")        // invoked (empty reason)
+	rc.ObserveFusionOutcome("")          // invoked (empty reason)
 	rc.ObserveFusionOutcome("agreement") // skipped
 
 	var first, second strings.Builder
