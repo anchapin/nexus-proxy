@@ -251,6 +251,7 @@ they are intentionally excluded from hot-reload.
 |--------|--------|-------|
 | `nexus_telemetry_rotations_total` | `JSONLRecorder.Rotations()` | Counter; always 0 when rotation is disabled. Confirm operators can see this climbing to verify rotation is firing. |
 | `nexus_telemetry_dropped_total` | `JSONLRecorder.Dropped()` | Counter; buffer-full drops (unchanged by #485). |
+| `nexus_telemetry_write_errors_total` | `JSONLRecorder.WriteErrors()` | Counter; write/flush error events in the JSONL background loop (issue #795). Distinct from `nexus_telemetry_dropped_total`: operators can distinguish disk/filesystem trouble from buffer back-pressure. |
 
 ## Response headers (`X-Nexus-Route-*`)
 

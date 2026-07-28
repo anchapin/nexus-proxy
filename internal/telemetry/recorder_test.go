@@ -21,6 +21,13 @@ func TestNoopRecorderSafe(t *testing.T) {
 	}
 }
 
+func TestNoopWriteErrorsZero(t *testing.T) {
+	n := Noop{}
+	if got := n.WriteErrors(); got != 0 {
+		t.Errorf("Noop.WriteErrors() = %d, want 0", got)
+	}
+}
+
 func TestEstimateTokens(t *testing.T) {
 	cases := map[string]struct{ min, max int }{
 		"":         {0, 0},
@@ -690,5 +697,37 @@ func TestJSONLRecorderRotationConcurrentSafe(t *testing.T) {
 	}
 	if count != total {
 		t.Errorf("total valid lines = %d, want %d", count, total)
+	}
+}
+
+// TestJSONLRecorderWriteErrorIncrementsWriteErrors (issue #795): a disk write
+// failure in the background loop increments WriteErrors but not Dropped.
+func TestJSONLRecorderWriteErrorIncrementsWriteErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tel.jsonl")
+	r, err := NewJSONLRecorder(path, 0, 0, 0, 0)
+	if err != nil {
+		t.Fatalf("NewJSONLRecorder: %v", err)
+	}
+	// Put at least one record so the background goroutine has a live file handle.
+	r.Record(Record{RequestID: "warmup"})
+	time.Sleep(50 * time.Millisecond) // let the goroutine flush
+
+	// Close the file to simulate a subsequent write failure.
+	r.file.Close()
+	// Trigger a flush via sync so the background loop attempts to write to
+	// the now-closed file handle.
+	r.Sync()
+	time.Sleep(100 * time.Millisecond) // let the flush attempt complete
+
+	if got := r.WriteErrors(); got == 0 {
+		t.Errorf("WriteErrors = 0, want >= 1 after closed-file write")
+	}
+	// Buffer-full drops should be unaffected.
+	if got := r.Dropped(); got != 0 {
+		t.Errorf("Dropped = %d, want 0 (write error is not a buffer-full drop)", got)
+	}
+
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }

@@ -730,6 +730,16 @@ func main() {
 			}}
 		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var v uint64
+			if w, ok := recorder.(interface{ WriteErrors() uint64 }); ok {
+				v = w.WriteErrors()
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_telemetry_write_errors_total",
+				Value: float64(v),
+			}}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
 			return []observability.GaugeSample{{
 				Name:  "nexus_tracing_dropped_total",
 				Value: float64(tracing.GlobalExporter().Dropped()),

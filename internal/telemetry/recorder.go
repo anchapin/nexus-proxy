@@ -179,6 +179,9 @@ func (Noop) Dropped() uint64 { return 0 }
 // Rotations returns 0. Noop never rotates.
 func (Noop) Rotations() uint64 { return 0 }
 
+// WriteErrors returns 0. Noop never encounters write errors.
+func (Noop) WriteErrors() uint64 { return 0 }
+
 // Sync is a no-op for Noop.
 func (Noop) Sync() {}
 
@@ -207,6 +210,7 @@ type JSONLRecorder struct {
 	bw            *bufio.Writer
 	wg            sync.WaitGroup
 	dropped       atomic.Uint64
+	writeErrors   atomic.Uint64
 	closed        atomic.Bool
 	done          chan struct{} // closed by run() on exit
 	maxBytes      int64         // 0 = rotation disabled (append-only)
@@ -297,6 +301,11 @@ func (r *JSONLRecorder) Dropped() uint64 { return r.dropped.Load() }
 // rotation is disabled (maxBytes == 0).
 func (r *JSONLRecorder) Rotations() uint64 { return r.rotations.Load() }
 
+// WriteErrors returns the number of records dropped because a disk write
+// or flush error occurred in the background loop (issue #795). Distinct
+// from Dropped(), which counts buffer-full rejections in the request path.
+func (r *JSONLRecorder) WriteErrors() uint64 { return r.writeErrors.Load() }
+
 // Sync signals the background goroutine to flush any buffered writes to
 // disk immediately. It is called by callers who need guaranteed persistence
 // (e.g. during graceful shutdown). It is a no-op when the recorder is
@@ -343,6 +352,7 @@ func (r *JSONLRecorder) run() {
 				}
 			}
 			r.dropped.Add(uint64(droppedCount))
+			r.writeErrors.Add(1) // issue #795: distinguish write errors from buffer-full drops
 			slog.Warn("telemetry: dropped records due to write failure",
 				slog.Int("count", droppedCount),
 				slog.String("path", r.path),
@@ -365,6 +375,7 @@ func (r *JSONLRecorder) run() {
 				slog.Any("err", err),
 			)
 			// On flush failure, try to recover via rotation.
+			r.writeErrors.Add(1) // issue #795: distinguish write errors from buffer-full drops
 			if r.maxBytes > 0 {
 				if rotErr := r.rotate(); rotErr != nil {
 					slog.Error("telemetry rotate after flush failure",
