@@ -490,7 +490,7 @@ func TestRecover_FlusherResponseWriterUsesSSEPath(t *testing.T) {
 func TestDebug(t *testing.T) {
 	result, _ := redactPanicValue("auth_token=ghp_xxx yyy")
 	t.Logf("Result: %q", result)
-	
+
 	// Also print the regex
 	t.Logf("genericSecretRe pattern: %s", genericSecretRe.String())
 }
