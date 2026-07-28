@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -176,7 +177,7 @@ func (s *SQLiteStore) writeOne(score JudgeScore) {
 	if err != nil {
 		// Best-effort: log and continue. Judge scores are
 		// telemetry, not correctness-critical.
-		fmt.Printf("WARN: judge: insert request_id=%s: %v\n", score.RequestID, err)
+		slog.Warn("judge: insert failed", slog.String("request_id", score.RequestID), slog.Any("err", err))
 	}
 }
 
