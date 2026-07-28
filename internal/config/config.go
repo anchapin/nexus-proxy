@@ -1444,9 +1444,14 @@ func Load() (Config, error) {
 	// Injection scan roles (issue #481). Defaults to "system" so today's
 	// system-only scan is byte-for-byte unchanged. Empty / unrecognised
 	// values fall back to ["system"]. Not hot-reloadable — read once at boot.
-	cfg.InjectionScanRoles = parseInjectionScanRoles(
-		getEnv("NEXUS_INJECTION_SCAN_ROLES", "system"),
-	)
+	rawRoles := getEnv("NEXUS_INJECTION_SCAN_ROLES", "system")
+	roles, unrecognized := parseInjectionScanRoles(rawRoles)
+	cfg.InjectionScanRoles = roles
+	if len(unrecognized) > 0 && rawRoles != "system" {
+		slog.Warn("unrecognised injection scan role(s): falling back to [system]",
+			slog.String("ignored", strings.Join(unrecognized, ",")),
+		)
+	}
 	// Trusted-proxy enforcement + rate limiting (issue #75).
 	//
 	// NEXUS_TRUSTED_PROXIES is a comma-separated CIDR list. Empty
@@ -2015,23 +2020,33 @@ func getEnv(key, def string) string {
 // deduplicates, and keeps only recognised roles ("system", "user"). An
 // empty or fully-unrecognised input returns []string{"system"} so the
 // default scan scope is byte-for-byte identical to the pre-#481 path.
-func parseInjectionScanRoles(raw string) []string {
+//
+// The second return value is the list of tokens that were not recognised.
+// Callers should log a warning when this is non-empty and the resulting
+// roles are ["system"] (silent fallback), indicating a possible typo.
+func parseInjectionScanRoles(raw string) ([]string, []string) {
 	seen := make(map[string]bool)
 	var roles []string
+	var unrecognized []string
 	for _, r := range strings.Split(raw, ",") {
 		r = strings.ToLower(strings.TrimSpace(r))
+		if r == "" {
+			continue
+		}
 		switch r {
 		case "system", "user":
 			if !seen[r] {
 				seen[r] = true
 				roles = append(roles, r)
 			}
+		default:
+			unrecognized = append(unrecognized, r)
 		}
 	}
 	if len(roles) == 0 {
-		return []string{"system"}
+		return []string{"system"}, unrecognized
 	}
-	return roles
+	return roles, unrecognized
 }
 
 // getEnvAllowEmpty is like getEnv but returns the empty string when the
