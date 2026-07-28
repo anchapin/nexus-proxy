@@ -1218,5 +1218,5 @@ func TestOllamaEmbedderIsHealthy_NilCtxUsesDefaultTimeout(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	emb := NewOllamaEmbedder(srv.URL, "test-model", nil, BreakerConfig{})
-	_ = emb.IsHealthy(nil)
+	_ = emb.IsHealthy(context.TODO())
 }
