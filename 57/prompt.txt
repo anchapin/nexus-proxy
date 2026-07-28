@@ -1,0 +1,40 @@
+You are implementing a fix for GitHub issue #789: P1: MaxResponseBytes missing from yaml.go — cannot be set via YAML config
+
+Repository: anchapin/nexus-proxy
+Branch: fix/issue-789-max-response-bytes (already checked out)
+Workdir: /home/alex/AI/worktrees/issue-789-max-response-bytes
+
+Steps:
+1. Read the full issue: gh issue view 789
+2. Read the issue comments for additional context: gh issue view 789 --comments
+3. Analyze what code needs to change
+4. Implement the fix/feature with tests
+5. Run local checks if available (make test-race, make lint)
+6. Commit: git add -A && git commit -m "fix: resolve #789 — add MaxResponseBytes to YAMLConfig and env override in LoadYAML"
+7. Push: git push -u origin fix/issue-789-max-response-bytes
+8. Open PR with an EXPLICIT body (no `--fill`):
+   ```
+   gh pr create --base develop \
+     --title "fix: resolve #789 — add MaxResponseBytes to YAMLConfig and env override" \
+     --body "$(cat <<'EOF'
+   Closes #789
+
+   Add max_response_bytes key to YAMLConfig and NEXUS_MAX_RESPONSE_BYTES
+   env override in LoadYAML(), completing the config contract.
+   EOF
+   )"
+   ```
+   The body must contain exactly one `Closes #N` line. Do NOT include other `#NNNN` references.
+9. Verify closingReferences count is exactly 1:
+   ```
+   bash scripts/check_pr_closing_refs.sh <PR_NUMBER> 1
+   ```
+   If the check fails, run `gh pr edit <PR> --body "Closes #N\n\n<minimal body>"` to strip spurious references, then re-run the check.
+
+Rules:
+- Work ONLY in your assigned worktree (/home/alex/AI/worktrees/issue-789-max-response-bytes)
+- Do NOT modify files outside the scope of this issue
+- Include tests for the fix/feature
+- Follow the repo's AGENTS.md and code style conventions
+- If the issue is unclear, add a comment asking for clarification: gh issue comment 789 -b "..."
+- Report back: PR number, files changed, any blockers encountered
