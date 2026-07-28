@@ -1,0 +1,25 @@
+You are implementing GitHub issue #882 in a dedicated worktree.
+
+**Issue #882: FusionOutcomeObserver conflates all arbiter-skip reasons into one metric bucket**
+
+**Area:** area:upstream, phase:2-observability
+
+**Problem:** `ObserveFusionOutcome(arbiterSkipped bool)` increments only `skipped` or `invoked`, making it impossible to distinguish agreement-based skips from tool-call skips, one-member skips, or arbiter-cache hits. `FusionOutcomeEvent` should have a `SkipReason string` field.
+
+**Acceptance criteria:**
+- `nexus_fusion_arbiter_total` gains a `reason` label with values `"agreement"`,`"tool_calls"`,`"one_member"`,`"cache_hit"`, or `""` for arbiter-invoked
+- `PanelStreaming` on agreement sets `SkipReason = "agreement"` before the return
+- Existing tests for `ObserveFusionOutcome` continue to pass (backward compat)
+
+**Worktree:** `/home/alex/AI/worktrees/issue-882-fusion-skip`
+
+**Your task:**
+1. Examine `internal/upstream/upstream.go` — find `FusionOutcomeEvent` struct and `ObserveFusionOutcome` function
+2. Add `SkipReason string` field to `FusionOutcomeEvent`
+3. Update `ObserveFusionOutcome` to accept a reason string and emit it as a `reason` label
+4. Update call sites to pass the appropriate reason
+5. Run `make build && make test` to verify
+6. Commit: `fix: resolve #882 — add reason label to fusion arbiter metric`
+7. Push: `git push -u origin fix/issue-882-fusion-skip`
+8. Create PR targeting `develop`: `Closes #882`
+9. Report PR number
