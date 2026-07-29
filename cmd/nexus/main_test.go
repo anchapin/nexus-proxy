@@ -749,8 +749,8 @@ func (s *stubJudgeStorage) Close() error { return nil }
 // stubConfidenceStore is a minimal router.ConfidenceStore implementation
 // for testing confidenceBridge.
 type stubConfidenceStore struct {
-	outcomeErr    error
-	outcomeCalls  []struct {
+	outcomeErr   error
+	outcomeCalls []struct {
 		category   string
 		route      router.Route
 		judgeScore int
@@ -868,16 +868,15 @@ func TestConfidenceBridgeRecordNoCategory(t *testing.T) {
 	}
 }
 
-
 // TestConfidenceBridgeRecordRoute (issue #970) verifies that the Route field
 // from JudgeScore is passed to RecordOutcome instead of always being hardcoded
 // to RouteLocal. This ensures fusion route quality is fed into the confidence
 // store for adaptive routing decisions.
 func TestConfidenceBridgeRecordRoute(t *testing.T) {
 	tests := []struct {
-		name       string
-		route      string
-		wantRoute  router.Route
+		name      string
+		route     string
+		wantRoute router.Route
 	}{
 		{
 			name:      "fusion route",

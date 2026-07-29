@@ -523,7 +523,7 @@ func main() {
 				Instruction: c.Instruction,
 				Output:      c.Output,
 				LocalModel:  c.LocalModel,
-				Route:      c.Route,
+				Route:       c.Route,
 				TraceParent: c.TraceParent,
 				TraceState:  c.TraceState,
 			}) {
@@ -1655,11 +1655,6 @@ func (b *confidenceBridge) Record(s judge.JudgeScore) error {
 	if ok && s.Err == nil && s.Score >= 1 {
 		if s.Score > 5 {
 			slog.Warn("confidence: judge score out of range, dropped",
-				slog.String("request_id", s.RequestID),
-				slog.Int("score", s.Score),
-			)
-		} else if err := b.conf.RecordOutcome(cat, router.RouteLocal, s.Score); err != nil {
-			slog.Warn("confidence: record outcome rejected",
 				slog.String("request_id", s.RequestID),
 				slog.Int("score", s.Score),
 			)

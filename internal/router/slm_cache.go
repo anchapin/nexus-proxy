@@ -52,11 +52,11 @@ type Embedder interface {
 // Zero value is ready to use with default TTL (DefaultSLMCacheTTL).
 // Construct with NewSLMCache to override TTL.
 type SLMCache struct {
-	ttl            time.Duration
-	maxEntries     int
-	maxStale       int // proactive eviction threshold (0 = disabled, issue #835)
-	embedder       Embedder
-	semThreshold   float64 // cosine similarity floor for semantic match (0.0..1.0)
+	ttl          time.Duration
+	maxEntries   int
+	maxStale     int // proactive eviction threshold (0 = disabled, issue #835)
+	embedder     Embedder
+	semThreshold float64 // cosine similarity floor for semantic match (0.0..1.0)
 
 	mu      sync.RWMutex
 	entries map[string]cachedDecision

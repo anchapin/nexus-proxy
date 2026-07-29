@@ -1445,7 +1445,7 @@ func TestSLMCache_SemanticScanDeterministic(t *testing.T) {
 	// valid-b has embedding far from query, should not match above threshold.
 	stub.embeddings["valid-a"] = []float64{1.0, 0.0, 0.0, 0.0}
 	stub.embeddings["valid-b"] = []float64{0.0, 1.0, 0.0, 0.0} // orthogonal to valid-a
-	stub.embeddings["query"] = []float64{0.99, 0.01, 0.0, 0.0}   // very close to valid-a
+	stub.embeddings["query"] = []float64{0.99, 0.01, 0.0, 0.0} // very close to valid-a
 
 	c.SetEmbedding("valid-a", RouteLocal, []float64{1.0, 0.0, 0.0, 0.0})
 	c.SetEmbedding("valid-b", RouteFrontier, []float64{0.0, 1.0, 0.0, 0.0})
@@ -1459,4 +1459,3 @@ func TestSLMCache_SemanticScanDeterministic(t *testing.T) {
 		}
 	}
 }
-
