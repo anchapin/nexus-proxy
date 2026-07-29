@@ -49,7 +49,7 @@ Filter out issues that are:
 
 ```bash
 gh issue list --state open --json number,title,body,labels \
-  | node ~/.agents/skills/github-wave-orchestrator/scripts/wave-planner.js
+  | node .agents/skills/github-wave-orchestrator/scripts/wave-planner.js
 ```
 
 **Present the plan to the user before executing.** Wait for confirmation.
