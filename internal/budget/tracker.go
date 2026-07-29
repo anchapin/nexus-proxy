@@ -16,6 +16,11 @@ import (
 // spec: "rolling daily spend cap".
 const defaultWindow = 24 * time.Hour
 
+// ringCapacity is the initial and maximum capacity of the ring buffer.
+// 16384 entries can absorb ~1700 frontier requests/hour for 24 hours —
+// far beyond any realistic deployment (issue #987).
+const ringCapacity = 16384
+
 // entry is a single spend record inside the rolling window.
 type entry struct {
 	at     time.Time
@@ -48,12 +53,25 @@ const (
 // "disabled" everywhere it is referenced, so the chat handler can
 // leave Deps.SpendGuard unset (preserving the pre-issue-#38
 // behaviour) and tests can opt in per-case.
+//
+// Internally a ring buffer with head/tail indices (issue #987):
+// - head: index of oldest entry (advances during prune — O(1))
+// - tail: index for next write (advances after each Record)
+// - count: number of active entries in the ring
+//
+// The ring stores entries in chronological order starting at head,
+// wrapping via modulo. This means pruning is O(1) — just advance head —
 type SpendTracker struct {
 	mu       sync.Mutex
 	window   time.Duration
 	budget   float64
-	entries  []entry
 	observer BudgetObserverFunc
+
+	// Ring buffer fields (issue #987).
+	entries []entry // backing store; len=capacity, first count slots are active
+	head    int     // index of oldest active entry (0 when count==0)
+	tail    int     // index for the next write (mod cap(entries))
+	count   int     // number of active entries (0 when empty)
 }
 
 // SetObserver installs an observer hook. A nil hook clears any prior
@@ -87,36 +105,47 @@ func NewSpendTracker(dailyBudgetUSD float64) *SpendTracker {
 	return &SpendTracker{
 		window:  defaultWindow,
 		budget:  dailyBudgetUSD,
-		entries: make([]entry, 0, 128),
+		entries: make([]entry, ringCapacity), // pre-allocated ring buffer
 	}
 }
 
 // pruneLocked removes entries older than the rolling window. Must be
-// called with the mutex held. After pruning, entries[0] is the oldest
-// surviving record (or the slice is empty). Uses a simple forward
-// scan rather than a ring buffer: the entry count is bounded by the
-// request rate, which for a local-development proxy is at most a few
-// thousand per day.
+// called with the mutex held. After pruning, the entry at head is the
+// oldest surviving record (or the ring is empty).
+//
+// Ring-buffer pruning is O(1) — just advance the head pointer — vs
+// the original O(n) forward scan + copy (issue #987).
 func (st *SpendTracker) pruneLocked(now time.Time) {
-	cutoff := now.Add(-st.window)
-	// Find the first surviving entry.
-	idx := 0
-	for idx < len(st.entries) && st.entries[idx].at.Before(cutoff) {
-		idx++
+	if st.count == 0 {
+		return
 	}
-	if idx > 0 {
-		// Shift surviving entries to the front and reslice.
-		copy(st.entries, st.entries[idx:])
-		st.entries = st.entries[:len(st.entries)-idx]
+	cutoff := now.Add(-st.window)
+
+	// Count how many expired entries are at the head of the ring.
+	expired := 0
+	for expired < st.count {
+		idx := (st.head + expired) % cap(st.entries)
+		if !st.entries[idx].at.Before(cutoff) {
+			break
+		}
+		expired++
+	}
+	if expired > 0 {
+		st.head = (st.head + expired) % cap(st.entries)
+		st.count -= expired
 	}
 }
 
 // sumLocked returns the total spend inside the rolling window. Must
 // be called with the mutex held and after pruneLocked.
 func (st *SpendTracker) sumLocked() float64 {
+	if st.count == 0 {
+		return 0
+	}
 	var total float64
-	for _, e := range st.entries {
-		total += e.amount
+	for i := 0; i < st.count; i++ {
+		idx := (st.head + i) % cap(st.entries)
+		total += st.entries[idx].amount
 	}
 	return total
 }
@@ -171,10 +200,36 @@ func (st *SpendTracker) Record(amount float64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.pruneLocked(now)
-	st.entries = append(st.entries, entry{at: now, amount: amount})
+
+	// Grow ring if at capacity (rare — only pathological traffic exceeds ringCapacity).
+	if st.count == cap(st.entries) {
+		st.growLocked()
+	}
+
+	st.entries[st.tail] = entry{at: now, amount: amount}
+	st.tail = (st.tail + 1) % cap(st.entries)
+	st.count++
+
 	if st.observer != nil {
 		st.observer(ObserverEventSpent, amount)
 	}
+}
+
+// growLocked doubles the ring capacity and copies existing entries in
+// chronological order to the new backing array. Must be called with
+// the mutex held.
+func (st *SpendTracker) growLocked() {
+	newCap := cap(st.entries) * 2
+	newEntries := make([]entry, newCap)
+
+	// Copy entries in logical order (head → oldest, wrapping).
+	for i := 0; i < st.count; i++ {
+		oldIdx := (st.head + i) % cap(st.entries)
+		newEntries[i] = st.entries[oldIdx]
+	}
+	st.entries = newEntries
+	st.head = 0
+	st.tail = st.count
 }
 
 // CurrentSpend returns the sum of all entries inside the rolling
@@ -208,10 +263,10 @@ func (st *SpendTracker) RetryAfter() time.Duration {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.pruneLocked(time.Now())
-	if len(st.entries) == 0 {
+	if st.count == 0 {
 		return 0
 	}
-	oldest := st.entries[0].at
+	oldest := st.entries[st.head].at
 	reset := oldest.Add(st.window)
 	d := time.Until(reset)
 	if d < 0 {
