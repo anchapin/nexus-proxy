@@ -14,7 +14,7 @@ LINT        ?= golangci-lint
 VERSION     ?= dev
 LDFLAGS     := -s -w -X main.version=$(VERSION)
 
-.PHONY: help build run test test-race bench bench-short vet fmt lint tidy ci clean docker-build
+.PHONY: help build run test test-race bench bench-short vet fmt lint tidy ci clean docker-build install-hooks
 
 help:
 	@echo "Targets:"
@@ -31,6 +31,7 @@ help:
 	@echo "  ci          - vet + build + test + test-race + lint (what CI runs)"
 	@echo "  docker-build - build the container image (smoke; needs Docker)"
 	@echo "  clean       - remove ./bin/ and coverage files"
+	@echo "  install-hooks - install git pre-commit hook (gofmt check)"
 
 build:
 	@mkdir -p bin
@@ -86,3 +87,10 @@ docker-build:
 
 clean:
 	rm -rf bin/ coverage.txt coverage.html
+
+# install-hooks configures Git's hooksPath to point to .githooks/, then
+# marks the pre-commit hook as executable. Run 'make install-hooks' once
+# after cloning; no need to re-run unless .githooks/ is updated.
+install-hooks:
+	git config core.hooksPath .githooks
+	chmod +x .githooks/pre-commit

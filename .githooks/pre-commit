@@ -1,0 +1,11 @@
+#!/bin/sh
+# Pre-commit hook: fail if any staged .go file needs formatting
+# Installed via: make install-hooks
+unformatted=$(gofmt -l $(git diff --cached --name-only --diff-filter=ACM -- "*.go"))
+if [ -n "$unformatted" ]; then
+	echo "gofmt: the following files need formatting:" >&2
+	echo "$unformatted" >&2
+	echo "Run 'make fmt' to format them, then re-stage and commit." >&2
+	exit 1
+fi
+exit 0
