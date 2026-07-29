@@ -352,6 +352,7 @@ func (al *AuthLimiter) Wrap(next http.Handler, resolver *ClientIPResolver) http.
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Retry-After", "60")
+			w.Header().Set("X-Nexus-RateLimit-Key-Type", "auth-brute-force")
 			w.WriteHeader(http.StatusTooManyRequests)
 			enc := json.NewEncoder(w)
 			_ = enc.Encode(map[string]any{

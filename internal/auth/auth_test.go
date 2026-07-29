@@ -384,6 +384,10 @@ func TestAuthLimiterBlockedIP(t *testing.T) {
 	if rr.Header().Get("Content-Type") != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", rr.Header().Get("Content-Type"))
 	}
+	// X-Nexus-RateLimit-Key-Type header is set to "auth-brute-force" (issue #983)
+	if got := rr.Header().Get("X-Nexus-RateLimit-Key-Type"); got != "auth-brute-force" {
+		t.Errorf("X-Nexus-RateLimit-Key-Type = %q, want %q", got, "auth-brute-force")
+	}
 }
 
 // TestAuthLimiterFailureIncrementsMap verifies that auth failures are recorded
