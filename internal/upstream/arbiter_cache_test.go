@@ -31,6 +31,89 @@ func TestCacheKeySymmetric(t *testing.T) {
 	}
 }
 
+// TestCacheKeyIdenticalContentNotZero verifies that cacheKey(a, a) does not
+// produce an all-zeros key, which was the zero-key collision bug in issue #966.
+// All perfect-agreement responses must have distinct cache keys so they do not
+// share an LRU slot.
+func TestCacheKeyIdenticalContentNotZero(t *testing.T) {
+	var zeroKey [32]byte
+
+	// sha256("x|SAME") is not all zeros
+	k := cacheKey("x", "x")
+	if k == zeroKey {
+		t.Error("cacheKey(\"x\", \"x\") = all-zeros, want non-zero key")
+	}
+
+	// Different identical-content pairs must have different keys
+	k1 := cacheKey("alpha", "alpha")
+	k2 := cacheKey("beta", "beta")
+	if k1 == k2 {
+		t.Error("cacheKey(\"alpha\", \"alpha\") = cacheKey(\"beta\", \"beta\"), want distinct keys")
+	}
+	if k1 == zeroKey || k2 == zeroKey {
+		t.Error("identical-content key is all-zeros, want non-zero key")
+	}
+
+	// Empty string identical content
+	k3 := cacheKey("", "")
+	if k3 == zeroKey {
+		t.Error("cacheKey(\"\", \"\") = all-zeros, want non-zero key")
+	}
+}
+
+// TestArbiterCacheIdenticalContentDistinctEntries verifies that perfect-agreement
+// responses (r1Content == r2Content) are cached as distinct entries and do not
+// collide at the zero key slot (issue #966).
+func TestArbiterCacheIdenticalContentDistinctEntries(t *testing.T) {
+	cache := NewArbiterCache(5*time.Minute, 0)
+	ttl := 5 * time.Minute
+
+	// Set two distinct identical-content pairs
+	cache.Set("alpha", "alpha", "synthesis alpha", ttl)
+	cache.Set("beta", "beta", "synthesis beta", ttl)
+
+	if cache.Len() != 2 {
+		t.Errorf("cache.Len() = %d, want 2 distinct entries", cache.Len())
+	}
+
+	// Both should be retrievable independently
+	got, ok := cache.Get("alpha", "alpha")
+	if !ok {
+		t.Error("cache.Get(\"alpha\", \"alpha\") = miss, want hit")
+	}
+	if got != "synthesis alpha" {
+		t.Errorf("cache.Get(\"alpha\", \"alpha\") = %q, want %q", got, "synthesis alpha")
+	}
+
+	got, ok = cache.Get("beta", "beta")
+	if !ok {
+		t.Error("cache.Get(\"beta\", \"beta\") = miss, want hit")
+	}
+	if got != "synthesis beta" {
+		t.Errorf("cache.Get(\"beta\", \"beta\") = %q, want %q", got, "synthesis beta")
+	}
+
+	// Overwriting one identical-content entry must not affect the other
+	cache.Set("alpha", "alpha", "synthesis alpha v2", ttl)
+
+	got, ok = cache.Get("alpha", "alpha")
+	if !ok {
+		t.Error("cache.Get(\"alpha\", \"alpha\") = miss after overwrite, want hit")
+	}
+	if got != "synthesis alpha v2" {
+		t.Errorf("cache.Get(\"alpha\", \"alpha\") = %q, want %q", got, "synthesis alpha v2")
+	}
+
+	// beta should be unaffected
+	got, ok = cache.Get("beta", "beta")
+	if !ok {
+		t.Error("cache.Get(\"beta\", \"beta\") = miss after alpha overwrite, want hit")
+	}
+	if got != "synthesis beta" {
+		t.Errorf("cache.Get(\"beta\", \"beta\") = %q, want %q", got, "synthesis beta")
+	}
+}
+
 func TestArbiterCacheGetSetOrderIndependent(t *testing.T) {
 	cache := NewArbiterCache(5*time.Minute, 0)
 	ttl := 5 * time.Minute

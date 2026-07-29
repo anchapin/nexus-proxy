@@ -82,7 +82,19 @@ func NewArbiterCache(ttl time.Duration, maxEntries int) *ArbiterCache {
 // (commutative): cacheKey(a, b) == cacheKey(b, a). This is critical
 // because panel members write to a shared channel in non-deterministic
 // goroutine-arrival order.
+//
+// When r1Content == r2Content (perfect agreement), XORing the same hash
+// produces an all-zeros key, causing all perfect-agreement responses to
+// share one cache slot and breaking LRU ordering. In this case a sentinel
+// is appended before hashing to preserve distinct entries per content.
 func cacheKey(r1Content, r2Content string) [32]byte {
+	if r1Content == r2Content {
+		// Use a sentinel to avoid zero-key collision when both panels agree.
+		// sha256(a) XOR sha256(a) = all-zeros, so all perfect-agreement
+		// responses would share one cache slot without this guard.
+		h := sha256.Sum256([]byte(r1Content + "|SAME|"))
+		return h
+	}
 	h1 := sha256.Sum256([]byte(r1Content))
 	h2 := sha256.Sum256([]byte(r2Content))
 	var key [32]byte
