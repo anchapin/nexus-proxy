@@ -1416,6 +1416,21 @@ func (yc YAMLConfig) validate() error {
 			return fmt.Errorf("config: shutdown_timeout must not be negative, got %s", d)
 		}
 	}
+
+	// Fractional fields (0..1 range)
+	if yc.BudgetAlertThreshold < 0 || yc.BudgetAlertThreshold > 1 {
+		return fmt.Errorf("config: budget_alert_threshold must be in range [0,1], got %f", yc.BudgetAlertThreshold)
+	}
+	if yc.FusionAgreementThreshold < 0 || yc.FusionAgreementThreshold > 1 {
+		return fmt.Errorf("config: fusion_agreement_threshold must be in range [0,1], got %f", yc.FusionAgreementThreshold)
+	}
+	if yc.ProviderTailWeight < 0 || yc.ProviderTailWeight > 1 {
+		return fmt.Errorf("config: provider_tail_weight must be in range [0,1], got %f", yc.ProviderTailWeight)
+	}
+	if yc.TracingSampleRate < 0 || yc.TracingSampleRate > 1 {
+		return fmt.Errorf("config: tracing_sample_rate must be in range [0,1], got %f", yc.TracingSampleRate)
+	}
+
 	return nil
 }
 
