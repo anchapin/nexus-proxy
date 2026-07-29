@@ -666,6 +666,49 @@ func TestEmbedCacheHitCount(t *testing.T) {
 	}
 }
 
+// TestEmbedCacheEmbedBatchDefensiveCopy verifies that EmbedCache.EmbedBatch
+// returns a defensive copy for cached entries, so that caller mutation does not
+// corrupt the cache entry (issue #973).
+func TestEmbedCacheEmbedBatchDefensiveCopy(t *testing.T) {
+	inner := &stubEmbedder{vecs: map[string][]float64{"key": {1.0, 2.0, 3.0}}}
+	cache := NewEmbedCache(inner, 10, 5*time.Minute, 5*time.Second)
+
+	// First call — populates cache.
+	_, err := cache.EmbedBatch(context.Background(), []string{"key"})
+	if err != nil {
+		t.Fatalf("first EmbedBatch: %v", err)
+	}
+	if inner.callCount != 1 {
+		t.Fatalf("first call: inner.callCount = %d, want 1", inner.callCount)
+	}
+
+	// Second call — cache hit, returns defensive copy.
+	result2, err := cache.EmbedBatch(context.Background(), []string{"key"})
+	if err != nil {
+		t.Fatalf("second EmbedBatch: %v", err)
+	}
+	if inner.callCount != 1 {
+		t.Fatalf("second call: inner.callCount = %d, want 1 (cached)", inner.callCount)
+	}
+
+	// Mutate the result returned from the second call.
+	origVec := result2[0]
+	result2[0][0] = 999.0
+
+	// Third call — cache hit, must return original vector unchanged.
+	result3, err := cache.EmbedBatch(context.Background(), []string{"key"})
+	if err != nil {
+		t.Fatalf("third EmbedBatch: %v", err)
+	}
+	if result3[0][0] != 1.0 || result3[0][1] != 2.0 || result3[0][2] != 3.0 {
+		t.Errorf("third EmbedBatch returned %v, want [1 2 3] (cache entry was corrupted)", result3[0])
+	}
+	// Verify the returned slice is not the same underlying array as our mutation target.
+	if &result3[0][0] == &origVec[0] {
+		t.Errorf("third EmbedBatch returned same slice as result2 — defensive copy was not made")
+	}
+}
+
 // embedCacheBreakerStub is a stub that tracks breaker calls for testing
 // EmbedCache delegation (issue #670).
 type embedCacheBreakerStub struct {
