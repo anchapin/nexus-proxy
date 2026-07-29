@@ -1406,7 +1406,6 @@ func TestSLMCache_SemanticScanLimit_ZeroLimitAllScanned(t *testing.T) {
 	}
 }
 
-
 func TestSLMCache_SemanticScanLimit_LimitExhaustedAfterValidHit(t *testing.T) {
 	// SetMaxScanEntries is now a no-op (issue #969); semantic scan is always unlimited.
 	// With one valid entry, it is scanned and a semantic hit is returned.
