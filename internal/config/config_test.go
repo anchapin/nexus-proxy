@@ -1,8 +1,11 @@
 package config
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
@@ -1107,6 +1110,96 @@ func TestReloadHotReloadable_PreservesNonReloadable(t *testing.T) {
 	}
 	// Reload would be called with a fresh prev in the SIGHUP handler,
 	// so we verify the returned cfg preserves non-reloadable fields.
+}
+
+// captureSlog swaps slog.Default for a JSON handler bound to a buffer
+// that captures every line. Returns the captured buffer contents as a
+// JSON-decoded slice (one map per line) plus the raw string.
+func captureSlog(t *testing.T) func() ([]map[string]any, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return func() ([]map[string]any, string) {
+		raw := buf.String()
+		lines := strings.Split(strings.TrimSpace(raw), "\n")
+		out := make([]map[string]any, 0, len(lines))
+		for _, line := range lines {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			var rec map[string]any
+			if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				t.Fatalf("invalid slog line %q: %v", line, err)
+			}
+			out = append(out, rec)
+		}
+		return out, raw
+	}
+}
+
+// TestReloadHotReloadable_ShutdownTimeoutWarning verifies that a SIGHUP
+// reload that sets ShutdownTimeout below ReadTimeout emits a warning
+// (issue #990).
+func TestReloadHotReloadable_ShutdownTimeoutWarning(t *testing.T) {
+	// prev simulates the boot config: ReadTimeout=60s, ShutdownTimeout=45s
+	prev := Config{
+		ReadTimeout:     60 * time.Second,
+		ShutdownTimeout: 45 * time.Second,
+	}
+	// SIGHUP reduces ShutdownTimeout to 10s, below ReadTimeout=60s
+	t.Setenv("NEXUS_SHUTDOWN_TIMEOUT", "10s")
+
+	stop := captureSlog(t)
+	_, _ = ReloadHotReloadable(prev)
+	lines, _ := stop()
+
+	// Find the shutdown-timeout warning.
+	var found bool
+	for _, line := range lines {
+		msg, _ := line["msg"].(string)
+		if strings.Contains(msg, "shutdown drain shorter than read timeout") {
+			found = true
+			// Verify the durations are reflected correctly in the log.
+			gotShutdown, _ := line["shutdown_timeout"].(float64)
+			wantShutdown := 10 * float64(time.Second)
+			if gotShutdown != wantShutdown {
+				t.Errorf("shutdown_timeout = %v, want %v", gotShutdown, wantShutdown)
+			}
+			gotRead, _ := line["read_timeout"].(float64)
+			wantRead := 60 * float64(time.Second)
+			if gotRead != wantRead {
+				t.Errorf("read_timeout = %v, want %v", gotRead, wantRead)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("expected shutdown-timeout warning to be logged during ReloadHotReloadable")
+	}
+}
+
+// TestReloadHotReloadable_ShutdownTimeoutOK verifies no warning is logged
+// when ShutdownTimeout >= ReadTimeout after reload.
+func TestReloadHotReloadable_ShutdownTimeoutOK(t *testing.T) {
+	prev := Config{
+		ReadTimeout:     30 * time.Second,
+		ShutdownTimeout: 45 * time.Second,
+	}
+	// SIGHUP keeps ShutdownTimeout=45s, which is still >= ReadTimeout=30s
+	t.Setenv("NEXUS_SHUTDOWN_TIMEOUT", "45s")
+
+	stop := captureSlog(t)
+	_, _ = ReloadHotReloadable(prev)
+	lines, _ := stop()
+
+	for _, line := range lines {
+		msg, _ := line["msg"].(string)
+		if strings.Contains(msg, "shutdown drain shorter than read timeout") {
+			t.Error("unexpected shutdown-timeout warning: ShutdownTimeout (45s) >= ReadTimeout (30s)")
+		}
+	}
 }
 
 func TestReadinessModeValidation(t *testing.T) {
