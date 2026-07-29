@@ -2120,6 +2120,18 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 	}
 	next.ShutdownTimeout = shutdownTimeout
 
+	// Re-validate shutdown vs read-timeout ordering after the reload
+	// (issue #990). The boot check in ValidateShutdownTimeout only runs
+	// once; a SIGHUP that shrinks ShutdownTimeout below ReadTimeout
+	// would otherwise go unnoticed.
+	if prev.ReadTimeout > 0 && next.ShutdownTimeout < prev.ReadTimeout {
+		slog.Warn("shutdown drain shorter than read timeout: in-flight uploads may be truncated mid-read",
+			slog.Duration("shutdown_timeout", next.ShutdownTimeout),
+			slog.Duration("read_timeout", prev.ReadTimeout),
+			slog.String("hint", "set NEXUS_SHUTDOWN_TIMEOUT >= server read timeout"),
+		)
+	}
+
 	return next, result
 }
 
