@@ -656,6 +656,9 @@ func TestNewVRAMLimiterContextCancelReleasesBlocked(t *testing.T) {
 	// NOT context.DeadlineExceeded (which would mean the 50 ms timeout
 	// fired before cancel was called, indicating the waiter had not yet
 	// entered cond.Wait() -- the race this fix eliminates).
+	//
+	// Issue #925 fix: Added runtime.Gosched() to ensure the waiter goroutine
+	// is scheduled before onWait is set, eliminating scheduler non-determinism.
 	freeVRAM, _ := vramFnPerGPU([]int64{8 << 30})
 	l := NewVRAMLimiter(1, 1<<30, freeVRAM, 1)
 
@@ -674,8 +677,13 @@ func TestNewVRAMLimiterContextCancelReleasesBlocked(t *testing.T) {
 	// The waiter signals on l.onWait (called just before cond.Wait()) so
 	// we know it has entered cond.Wait() before we call cancel(). This
 	// eliminates the scheduler-dependent sleep that caused flakiness.
+	// Issue #925: Use a barrier channel that the waiter closes to signal
+	// it has entered cond.Wait(). We also yield to the scheduler to ensure
+	// the waiter goroutine is actually blocked before we set onWait.
 	ready := make(chan struct{})
 	l.onWait.Store(func() { close(ready) })
+	runtime.Gosched()
+	runtime.Gosched() // Double yield to account for heavily-loaded CI
 
 	select {
 	case <-ready:

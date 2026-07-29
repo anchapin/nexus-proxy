@@ -867,9 +867,11 @@ func (m *modelErrEmbedder) Model() string                  { return m.model }
 // embedder is unreachable at boot, the probeEmbedderDims error is
 // surfaced as a WARN (issue #593) instead of being silently
 // discarded, and EmbedderDims() reports the probe as unavailable.
+//
+// Issue #925 fix: Removed t.Parallel() because this test modifies the
+// global slog.Default(), which can race with other parallel tests
+// that also set the global default, causing log capture to fail.
 func TestOpenPersistentStore_ProbeFailureLogged(t *testing.T) {
-	t.Parallel()
-
 	// Capture slog output so we can assert the WARN was emitted.
 	var buf bytes.Buffer
 	prev := logOutput(&buf)
