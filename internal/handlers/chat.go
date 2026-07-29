@@ -1171,6 +1171,9 @@ func Chat(d Deps) http.Handler {
 		}
 		ragRetrievalMs = time.Since(started).Milliseconds() - promptEngineeringMs
 		trace.Transforms.RAGInjected = ragInjected
+		if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
+			rootSpan.SetAttr("rag_hits", ragInjected)
+		}
 		trace.Transforms.RAGFilename = ragFilename
 		trace.Transforms.RAGCacheHit = cacheHit
 		trace.Transforms.RAGScore = ragScore
@@ -1293,10 +1296,14 @@ func Chat(d Deps) http.Handler {
 			d.RouteDecisionObserver.Observe(routeEvent)
 		}
 
-		// Stamp the route attribute on the root span so OTLP backends
-		// can filter traces by route (issue #825).
+		// Stamp observability attributes on the root span so OTLP backends
+		// can filter traces by route (issue #825) and correlate with slog
+		// logs that already carry request_id (issue #985).
 		if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
 			rootSpan.SetAttr("route", string(route))
+			rootSpan.SetAttr("request_id", reqID)
+			rootSpan.SetAttr("route_reason", decision.Source.TraceReason())
+			rootSpan.SetAttr("token_count", int64(trace.Request.EstimatedTokens))
 		}
 
 		// Emit the slog lines the pre-extraction handler produced, so
@@ -1566,6 +1573,7 @@ func Chat(d Deps) http.Handler {
 			model = d.Config.FrontierModel
 			if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
 				rootSpan.SetAttr("ai.model", model)
+				rootSpan.SetAttr("upstream_target", trace.Upstream.TargetHost)
 			}
 
 		case router.RouteLocal:
@@ -1822,6 +1830,7 @@ func Chat(d Deps) http.Handler {
 			}
 			if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
 				rootSpan.SetAttr("ai.model", model)
+				rootSpan.SetAttr("upstream_target", trace.Upstream.TargetHost)
 			}
 
 		default:
@@ -1884,6 +1893,7 @@ func Chat(d Deps) http.Handler {
 			trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
 			if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
 				rootSpan.SetAttr("ai.model", model)
+				rootSpan.SetAttr("upstream_target", trace.Upstream.TargetHost)
 			}
 		}
 
