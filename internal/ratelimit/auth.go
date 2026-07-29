@@ -20,9 +20,9 @@ type AuthLimiter struct {
 	burst  int           // max failures before block
 	window time.Duration // sliding window for failure tracking
 
-	onBlock   func(reason string) // called when a client is blocked with reason "missing" or "invalid"; must not block
-	onReap    func()              // called when the reaper evicts an idle IP; must not block
-	resolver  *ClientIPResolver   // resolves client IP for rate-limit bucketing
+	onBlock  func(reason string) // called when a client is blocked with reason "missing" or "invalid"; must not block
+	onReap   func()              // called when the reaper evicts an idle IP; must not block
+	resolver *ClientIPResolver   // resolves client IP for rate-limit bucketing
 
 	mu       sync.Mutex
 	failures map[string]*authFailure // keyed by resolved client IP
