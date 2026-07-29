@@ -93,19 +93,38 @@ instead of passively waiting for a done signal:
    If exceeded, enter the worktree directly, verify state, push if needed,
    and create the PR — bypassing the sub-agent entirely.
 
-2. **PR verification loop** (while timer is active):
-   After the sub-agent reports "done", poll every 10s for up to 60s:
-   ```bash
-   gh pr list --search "fix/issue-{N}" --json number,title,state --jq '.[] | select(.state=="OPEN") | .number'
-   ```
-   - **PR found** → record PR number in wave-state.json, move to next issue
-   - **PR NOT found after 60s** → enter recovery sequence below
+2. **Sub-agent done signal with heartbeat**:
+   When a sub-agent reports "done":
+   - **Step A: Capture the done signal and start a 60s heartbeat timer**
+   - **Step B: Immediately verify commit existence** (before any other action):
+     ```bash
+     cd ../worktrees/issue-{N}-{slug}
+     if ! git log origin/develop..HEAD --oneline | head -1 > /dev/null 2>&1; then
+       # No new commits — sub-agent reported done without committing
+       echo "WARNING: Sub-agent reported done but no commits found. Entering recovery."
+       enter_recovery_sequence
+     fi
+     ```
+   - **Step C: PR verification loop** (while heartbeat timer is active):
+     Poll every 10s for up to 60s:
+     ```bash
+     gh pr list --search "fix/issue-{N}" --json number,title,state --jq '.[] | select(.state=="OPEN") | .number'
+     ```
+     - **PR found** → record PR number in wave-state.json, move to next issue
+     - **Heartbeat timeout (60s) or PR NOT found** → enter recovery sequence below
 
-3. **Recovery sequence** (when PR missing or timeout):
+3. **Recovery sequence** (when commit check fails, PR missing, or heartbeat timeout):
    ```bash
    cd ../worktrees/issue-{N}-{slug}
 
-   # Step A: check if branch was pushed
+   # Step A: verify commit existence (safety net — catches silent failure)
+   if ! git log origin/develop..HEAD --oneline | head -1 > /dev/null 2>&1; then
+     echo "RECOVERY: No commits found in worktree. Worktree may be stale."
+     git fetch origin develop
+     git rebase origin/develop || true  # rebase to get latest changes
+   fi
+
+   # Step B: check if branch was pushed
    git fetch origin
    if git branch --list origin/fix/issue-{N}-{slug} > /dev/null 2>&1; then
      # Branch exists remotely — PR was not created
@@ -122,7 +141,7 @@ instead of passively waiting for a done signal:
        --head fix/issue-{N}-{slug}
    fi
 
-   # Step B: verify PR was created
+   # Step C: verify PR was created
    gh pr list --search "fix/issue-{N}" --json number --jq 'length'
    # Must return 1 — if 0, escalate to user with worktree path
    ```
