@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -2099,6 +2100,51 @@ func TestStreamCachedArbiterSynthesis_EmitsSSEChunkAndDone(t *testing.T) {
 	}
 	if !rw.flushed {
 		t.Errorf("expected at least one flush")
+	}
+}
+
+func TestStreamCachedArbiterSynthesis_HasCreatedAndModelFields(t *testing.T) {
+	rw := newSSERW()
+	err := streamCachedArbiterSynthesis(rw, "synthesized answer")
+	if err != nil {
+		t.Fatalf("streamCachedArbiterSynthesis: %v", err)
+	}
+	body := rw.body.String()
+
+	// Extract the JSON chunk (skip "data: " prefix)
+	prefix := "data: "
+	if !strings.HasPrefix(body, prefix) {
+		t.Fatalf("body does not have SSE data prefix: %q", body)
+	}
+	jsonStr := strings.TrimPrefix(body, prefix)
+	jsonStr = strings.TrimSuffix(jsonStr, "data: [DONE]\n\n")
+
+	var chunk map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &chunk); err != nil {
+		t.Fatalf("failed to parse SSE chunk JSON: %v", err)
+	}
+
+	// Verify required OpenAI fields are present
+	if _, ok := chunk["created"]; !ok {
+		t.Error("chunk missing required 'created' field")
+	}
+	created, ok := chunk["created"].(float64)
+	if !ok {
+		t.Error("chunk 'created' field is not a number")
+	}
+	if created == 0 {
+		t.Error("chunk 'created' field is zero (should be a valid Unix timestamp)")
+	}
+
+	if _, ok := chunk["model"]; !ok {
+		t.Error("chunk missing required 'model' field")
+	}
+	model, ok := chunk["model"].(string)
+	if !ok {
+		t.Error("chunk 'model' field is not a string")
+	}
+	if model != "arbiter" {
+		t.Errorf("chunk 'model' = %q, want %q", model, "arbiter")
 	}
 }
 
