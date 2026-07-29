@@ -61,7 +61,9 @@ func (c *CachedEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 		c.ll.MoveToFront(el)
 		vec := el.Value.(*cacheEntry).vec
 		c.mu.Unlock()
-		return vec, nil
+		out := make([]float64, len(vec))
+		copy(out, vec)
+		return out, nil
 	}
 	c.mu.Unlock()
 
@@ -77,7 +79,10 @@ func (c *CachedEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 	defer c.mu.Unlock()
 	if el, ok := c.cache[text]; ok {
 		c.ll.MoveToFront(el)
-		return el.Value.(*cacheEntry).vec, nil
+		vec := el.Value.(*cacheEntry).vec
+		out := make([]float64, len(vec))
+		copy(out, vec)
+		return out, nil
 	}
 	entry := &cacheEntry{key: text, vec: vec}
 	el := c.ll.PushFront(entry)
@@ -102,7 +107,10 @@ func (c *CachedEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 	for i, text := range texts {
 		if el, ok := c.cache[text]; ok {
 			c.ll.MoveToFront(el)
-			result[i] = el.Value.(*cacheEntry).vec
+			vec := el.Value.(*cacheEntry).vec
+			out := make([]float64, len(vec))
+			copy(out, vec)
+			result[i] = out
 		} else {
 			uncached = append(uncached, i)
 		}

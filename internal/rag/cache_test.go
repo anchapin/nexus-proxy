@@ -108,6 +108,47 @@ func TestCachedEmbedderSkipsInnerOnHit(t *testing.T) {
 	}
 }
 
+// TestCachedEmbedderCacheHitReturnsCopy verifies that on a cache hit,
+// CachedEmbedder.Embed returns a defensive copy so that mutating the
+// returned vector does not corrupt the cache entry (issue #972).
+func TestCachedEmbedderCacheHitReturnsCopy(t *testing.T) {
+	inner := newCountingEmbedder()
+	cached := NewCachedEmbedder(inner, 64)
+	ctx := context.Background()
+	prompt := "hello world"
+
+	// First call: cache miss — populate the cache.
+	vec1, err := cached.Embed(ctx, prompt)
+	if err != nil {
+		t.Fatalf("first Embed: %v", err)
+	}
+	if inner.callCount(prompt) != 1 {
+		t.Errorf("after first Embed, inner calls = %d, want 1", inner.callCount(prompt))
+	}
+	originalFirstElement := vec1[0]
+
+	// Second call: cache hit — returns a vector.
+	vec2, err := cached.Embed(ctx, prompt)
+	if err != nil {
+		t.Fatalf("second Embed (cache hit): %v", err)
+	}
+	if inner.callCount(prompt) != 1 {
+		t.Errorf("after second Embed (cache hit), inner calls = %d, want 1", inner.callCount(prompt))
+	}
+
+	// Mutate the returned vector — this must NOT affect the cache entry.
+	vec2[0] = 9999
+
+	// Third call: cache hit — the cached vector must be unchanged.
+	vec3, err := cached.Embed(ctx, prompt)
+	if err != nil {
+		t.Fatalf("third Embed (cache hit): %v", err)
+	}
+	if vec3[0] != originalFirstElement {
+		t.Errorf("after mutating vec2, vec3[0] = %v, want original %v — cache entry was corrupted", vec3[0], originalFirstElement)
+	}
+}
+
 func TestCachedEmbedderDifferentPrompts(t *testing.T) {
 	inner := newCountingEmbedder()
 	cached := NewCachedEmbedder(inner, 64)
@@ -263,6 +304,50 @@ func TestCachedEmbedderEmbedBatch_AllCached(t *testing.T) {
 			if result[i][j] != v {
 				t.Errorf("result[%d][%d] = %v, want %v", i, j, result[i][j], v)
 			}
+		}
+	}
+}
+
+// TestCachedEmbedderEmbedBatchCacheHitReturnsCopy verifies that on a cache hit
+// within EmbedBatch, the returned vectors are defensive copies so that
+// mutating them does not corrupt the cache entry (issue #972).
+func TestCachedEmbedderEmbedBatchCacheHitReturnsCopy(t *testing.T) {
+	inner := newCountingEmbedder()
+	cached := NewCachedEmbedder(inner, 64)
+	ctx := context.Background()
+	texts := []string{"alpha", "beta", "gamma"}
+
+	// Seed the cache first.
+	for _, text := range texts {
+		_, _ = cached.Embed(ctx, text)
+	}
+	if inner.totalCalls() != 3 {
+		t.Fatalf("after seeding cache: inner calls = %d, want 3", inner.totalCalls())
+	}
+
+	// First EmbedBatch call — all hits, returns copies.
+	result1, err := cached.EmbedBatch(ctx, texts)
+	if err != nil {
+		t.Fatalf("first EmbedBatch: %v", err)
+	}
+	if inner.batchCallCount() != 0 {
+		t.Errorf("after first EmbedBatch: batch calls = %d, want 0", inner.batchCallCount())
+	}
+
+	// Mutate all returned vectors.
+	for i := range result1 {
+		result1[i][0] = 9999
+	}
+
+	// Second EmbedBatch call — all hits, must return original values.
+	result2, err := cached.EmbedBatch(ctx, texts)
+	if err != nil {
+		t.Fatalf("second EmbedBatch: %v", err)
+	}
+	for i, text := range texts {
+		expected := float64(len(text))
+		if result2[i][0] != expected {
+			t.Errorf("after mutating result1, result2[%d][0] = %v, want original %v — cache entry was corrupted", i, result2[i][0], expected)
 		}
 	}
 }
