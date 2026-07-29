@@ -930,6 +930,13 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 			slog.Info("rag indexed", slog.String("filename", fi.name))
 		}
 	}
+
+	// If EmbedBatch failed mid-way, s.index was invalidated but later batches
+	// still appended to s.examples. Rebuild synchronously now so IndexDir
+	// returns with a consistent state instead of leaving the index incomplete
+	// until the next Retrieve call (issue #976).
+	s.maybeRebuildIndex()
+
 	return nil
 }
 

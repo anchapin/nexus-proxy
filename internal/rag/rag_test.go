@@ -1363,3 +1363,100 @@ func (d *delayedEmbedderWithDelay) EmbedBatch(ctx context.Context, texts []strin
 func (d *delayedEmbedderWithDelay) IsHealthy(context.Context) bool { return true }
 func (d *delayedEmbedderWithDelay) IsBreakerOpen() bool            { return false }
 func (d *delayedEmbedderWithDelay) RecordBreakerSuccess()          {}
+
+// failingAfterBatchEmbedder returns embeddings normally for the first N batches,
+// then returns an error, then succeeds again for subsequent batches.
+// This simulates a transient embedder failure mid-way through IndexDir.
+type failingAfterBatchEmbedder struct {
+	mu             sync.Mutex
+	batchCount     int
+	failAtBatch    int // fail when batchCount == failAtBatch
+	restoreAtBatch int // restore normal operation at this batch (inclusive); 0 = never restore
+	vecs           map[string][]float64
+}
+
+func (f *failingAfterBatchEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
+	if v, ok := f.vecs[text]; ok {
+		return v, nil
+	}
+	return []float64{0, 0, 0}, nil
+}
+
+func (f *failingAfterBatchEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float64, error) {
+	f.mu.Lock()
+	f.batchCount++
+	currentBatch := f.batchCount
+	f.mu.Unlock()
+
+	// Fail on the target batch
+	if currentBatch == f.failAtBatch {
+		return nil, fmt.Errorf("transient embedder failure on batch %d", currentBatch)
+	}
+
+	result := make([][]float64, len(texts))
+	for i, text := range texts {
+		if v, ok := f.vecs[text]; ok {
+			result[i] = v
+		} else {
+			result[i] = []float64{0, 0, 0}
+		}
+	}
+	return result, nil
+}
+
+func (f *failingAfterBatchEmbedder) IsHealthy(context.Context) bool { return true }
+func (f *failingAfterBatchEmbedder) IsBreakerOpen() bool            { return false }
+func (f *failingAfterBatchEmbedder) RecordBreakerSuccess()          {}
+func (f *failingAfterBatchEmbedder) BatchCount() int                { return f.batchCount }
+
+// TestIndexDirBatchFailureStillBuildsIndex verifies that when EmbedBatch fails
+// mid-way through IndexDir, the HNSW index is rebuilt synchronously after all
+// batches complete (issue #976). Previously, a batch failure invalidated the
+// index and subsequent successful batches would append to examples without
+// rebuilding the index, leaving it incomplete until the next Retrieve call.
+func TestIndexDirBatchFailureStillBuildsIndex(t *testing.T) {
+	// Create enough files to exceed indexThreshold (50) with batch size 20.
+	// With 120 files and batch size 20: batches are [20,20,20,20,20,20] = 6 batches.
+	// Batch 3 (files 40-59) fails, so those entries are not added.
+	// Batches 1,2,4,5,6 succeed: 20+20+20+20+20 = 100 entries.
+	// 100 >= 50, so maybeRebuildIndex should rebuild the index synchronously.
+	const totalFiles = 120
+	const batchSize = 20
+	dir := t.TempDir()
+	for i := 0; i < totalFiles; i++ {
+		content := fmt.Sprintf("content %d", i)
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("file%d.txt", i)), []byte(content), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+
+	// Embedder fails on batch 3, succeeds on all others.
+	emb := &failingAfterBatchEmbedder{
+		failAtBatch:    3, // 3rd batch call (0-indexed: batch 2) fails
+		restoreAtBatch: 0, // don't restore - subsequent batches still succeed
+		vecs:           map[string][]float64{},
+	}
+
+	store := NewStore(emb, 0.0, WithBatchSize(batchSize))
+
+	// IndexDir should complete without error despite the batch failure.
+	if err := store.IndexDir(context.Background(), dir); err != nil {
+		t.Fatalf("IndexDir: %v", err)
+	}
+
+	// 100 examples indexed (5 successful batches * 20 = 100).
+	// The 3rd batch (20 files) failed and was skipped.
+	if g := store.Size(); g != 100 {
+		t.Errorf("store.Size() = %d, want 100 (one batch of 20 failed)", g)
+	}
+
+	// The index should be built (IndexMode should be HNSW, not brute-force).
+	// Before the fix: IndexMode would be IndexModeBruteForce because the index
+	// was invalidated on batch 3 failure and never rebuilt synchronously.
+	// With the fix: maybeRebuildIndex is called after all batches, sees
+	// 100 >= 50, and rebuilds the index synchronously.
+	mode := store.IndexMode()
+	if mode != IndexModeHNSW {
+		t.Errorf("IndexMode = %q, want %q (index should be rebuilt after batch failure)", mode, IndexModeHNSW)
+	}
+}
