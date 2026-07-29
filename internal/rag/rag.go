@@ -352,7 +352,8 @@ func (c *EmbedCache) EmbedBatch(ctx context.Context, texts []string) ([][]float6
 			if now.Before(ent.expire) {
 				c.lru.MoveToFront(el)
 				vec := ent.vec
-				result[i] = vec
+				// Defensive copy: caller may modify result[i], which must not corrupt the cache entry.
+				result[i] = append(make([]float64, 0, len(vec)), vec...)
 				continue
 			}
 			c.lru.Remove(el)
