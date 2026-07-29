@@ -20,9 +20,9 @@ type AuthLimiter struct {
 	burst  int           // max failures before block
 	window time.Duration // sliding window for failure tracking
 
-	onBlock  func(reason string) // called when a client is blocked with reason "missing" or "invalid"; must not block
-	onReap   func()            // called when the reaper evicts an idle IP; must not block
-	resolver *ClientIPResolver // resolves client IP for rate-limit bucketing
+	onBlock   func(reason string) // called when a client is blocked with reason "missing" or "invalid"; must not block
+	onReap    func()              // called when the reaper evicts an idle IP; must not block
+	resolver  *ClientIPResolver   // resolves client IP for rate-limit bucketing
 
 	mu       sync.Mutex
 	failures map[string]*authFailure // keyed by resolved client IP
@@ -31,11 +31,11 @@ type AuthLimiter struct {
 
 // authFailure tracks failure timestamps for one client IP.
 type authFailure struct {
-	mu           sync.Mutex
-	missingTs    []time.Time // missing-token failure timestamps within the window
-	invalidTs    []time.Time // invalid-token failure timestamps within the window
-	blockReason  string      // reason that triggered the block: "missing" or "invalid"
-	lastSeen     time.Time   // for idle reaping
+	mu          sync.Mutex
+	missingTs   []time.Time // missing-token failure timestamps within the window
+	invalidTs   []time.Time // invalid-token failure timestamps within the window
+	blockReason string      // reason that triggered the block: "missing" or "invalid"
+	lastSeen    time.Time   // for idle reaping
 }
 
 // NewAuthLimiter constructs an AuthLimiter. A non-positive rpm produces

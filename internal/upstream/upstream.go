@@ -163,6 +163,14 @@ func Stream(w http.ResponseWriter, client Client, targetURL, apiKey string, payl
 // record the truncation via its observability hook.
 var ErrUpstreamTruncated = errors.New("upstream: stream truncated")
 
+// ErrUpstreamContentTypeMismatch is returned by BufferedFetchWithContext
+// (issue #930) and by StreamWithContext (issue #934) when the upstream
+// responds with 200 OK but declares a Content-Type that is neither
+// application/json nor text/event-stream. This prevents HTML or other
+// non-compliant bodies from being forwarded as SSE frames or being
+// unmarshalled as JSON.
+var ErrUpstreamContentTypeMismatch = errors.New("upstream: content-type mismatch")
+
 // sseDoneMarker is the OpenAI SSE stream terminator, recognised as a
 // standalone frame so a [DONE] embedded inside a JSON content chunk
 // never falsely marks the stream complete.
@@ -198,6 +206,21 @@ func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client
 		return fmt.Errorf("upstream: do: %w", err)
 	}
 	defer resp.Body.Close()
+
+	// Issue #934: validate Content-Type before any data is written to the
+	// client. A 200 response with text/html would otherwise have its body
+	// forwarded line-by-line as SSE data, corrupting the response stream.
+	if resp.StatusCode == http.StatusOK {
+		ct := resp.Header.Get("Content-Type")
+		if ct != "text/event-stream" && ct != "application/json" {
+			slog.Warn("upstream Content-Type mismatch",
+				"status", resp.StatusCode,
+				"content_type", ct,
+				"target", targetURL,
+			)
+			return ErrUpstreamContentTypeMismatch
+		}
+	}
 
 	// Forward only allowlisted upstream headers so the proxy does not
 	// leak upstream identity (Server), session state (Set-Cookie), or
@@ -356,6 +379,21 @@ func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client
 	// had more data we did not receive.
 	if err != nil || int64(len(respBody)) >= maxResponseBytes {
 		return fmt.Errorf("upstream: read response: %w", err)
+	}
+
+	// Reject 200 responses with wrong Content-Type before JSON unmarshal.
+	// A misbehaving upstream returning e.g. text/html would otherwise be
+	// forwarded as application/json and confuse the harness. Issue #930.
+	if resp.StatusCode == http.StatusOK {
+		ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
+		if ct != "application/json" && ct != "text/event-stream" {
+			slog.Warn("upstream content-type mismatch",
+				"status", resp.StatusCode,
+				"content_type", ct,
+				"target", targetURL,
+			)
+			return ErrUpstreamContentTypeMismatch
+		}
 	}
 
 	// Validate the upstream body is a single JSON object. A misbehaving

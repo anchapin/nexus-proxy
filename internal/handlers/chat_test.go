@@ -22,6 +22,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/middleware"
+	"github.com/anchapin/nexus-proxy/internal/providers"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
@@ -407,6 +408,54 @@ func TestChatRouteLocalCascadeAllFail(t *testing.T) {
 	}
 	if len(rt.Calls()) != 2 {
 		t.Errorf("expected 2 calls (all steps), got %d", len(rt.Calls()))
+	}
+}
+
+// TestChatProviderCascadeRespectsCascadeMaxResponseBytes verifies issue #929:
+// when the provider-based cascade path is used (Providers registry is set),
+// the handler honours NEXUS_CASCADE_MAX_RESPONSE_BYTES (via EffectiveCascadeMaxResponseBytes)
+// rather than the general NEXUS_MAX_RESPONSE_BYTES (via EffectiveMaxResponseBytes).
+func TestChatProviderCascadeRespectsCascadeMaxResponseBytes(t *testing.T) {
+	deps, rt := baseDeps(t)
+	// Populate the providers registry so the handler takes the provider-based
+	// cascade path instead of the legacy BuildLocalCascade path.
+	deps.Providers = providers.NewProviderRegistry()
+	deps.Providers.Register(providers.ProviderConfig{
+		NameVal:    "test-frontier",
+		BaseURLVal: "http://frontier.local",
+		ModelVal:   "gpt-4o",
+		APIKeyVal:  "sk-test",
+	})
+	// Set CascadeMaxResponseBytes to a small value (512) so a large upstream
+	// response triggers the bound and causes the cascade to fail.
+	deps.Config.CascadeMaxResponseBytes = 512
+	// Ensure the general MaxResponseBytes is much larger so the test would
+	// fail differently if the handler accidentally used EffectiveMaxResponseBytes().
+	deps.Config.MaxResponseBytes = 1024 * 1024 // 1 MiB — far above the 512-byte cascade cap
+
+	// The upstream returns a response larger than 512 bytes.
+	largeContent := strings.Repeat("x", 1024) // 1 KiB
+	rt.On("POST", "http://frontier.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"`+largeContent+`"},"finish_reason":"stop"}]}`)
+	})
+	// Also register local so we can verify it was attempted.
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `not openai json`)
+	})
+
+	// A formatting request triggers route=local → cascade → provider-based fallback.
+	body := `{"messages":[{"role":"user","content":"format this css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	// The cascade should fail because the response exceeds CascadeMaxResponseBytes (512).
+	// This results in a 502 Bad Gateway.
+	if rw.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502 (cascade failed due to MaxResponseBytes); body=%q", rw.Code, rw.Body.String())
 	}
 }
 

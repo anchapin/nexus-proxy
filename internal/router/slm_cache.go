@@ -52,11 +52,12 @@ type Embedder interface {
 // Zero value is ready to use with default TTL (DefaultSLMCacheTTL).
 // Construct with NewSLMCache to override TTL.
 type SLMCache struct {
-	ttl          time.Duration
-	maxEntries   int
-	maxStale     int // proactive eviction threshold (0 = disabled, issue #835)
-	embedder     Embedder
-	semThreshold float64 // cosine similarity floor for semantic match (0.0..1.0)
+	ttl            time.Duration
+	maxEntries     int
+	maxStale       int // proactive eviction threshold (0 = disabled, issue #835)
+	maxScanEntries int // max entries scanned in getSemantic; 0 = unlimited (issue #933)
+	embedder       Embedder
+	semThreshold   float64 // cosine similarity floor for semantic match (0.0..1.0)
 
 	mu      sync.RWMutex
 	entries map[string]cachedDecision
@@ -313,7 +314,12 @@ func (c *SLMCache) getSemantic(ctx context.Context, prompt string) (Route, bool,
 	var bestScore float64 = -1
 
 	now := time.Now()
+	scanned := 0
 	for _, entry := range c.entries {
+		if c.maxScanEntries > 0 && scanned >= c.maxScanEntries {
+			break
+		}
+		scanned++
 		if now.Sub(entry.stamp) > c.ttl {
 			continue
 		}
@@ -467,6 +473,20 @@ func (c *SLMCache) SetMaxStale(maxStale int) {
 	}
 	c.mu.Lock()
 	c.maxStale = maxStale
+	c.mu.Unlock()
+}
+
+// SetMaxScanEntries sets the maximum number of entries scanned during
+// semantic deduplication in getSemantic (issue #933). When maxScanEntries > 0,
+// getSemantic stops scanning after examining maxScanEntries entries. A value
+// of 0 (the default) means unlimited — all entries are scanned.
+// SetMaxScanEntries is safe to call concurrently with Get/Set.
+func (c *SLMCache) SetMaxScanEntries(maxScanEntries int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.maxScanEntries = maxScanEntries
 	c.mu.Unlock()
 }
 

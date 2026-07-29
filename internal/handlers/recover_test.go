@@ -283,31 +283,55 @@ func (e testError) Error() string {
 }
 
 // TestRedactPanicValue_PartialSecretRedaction verifies that genericSecretRe
-// only redacts up to the first whitespace when a secret value contains spaces.
-// This is a known limitation: regex cannot distinguish between a space that
-// terminates a secret value and a space that is part of an error message
-// containing multiple tokens. See issue #687.
+// redacts the full secret value including any trailing content up to whitespace
+// or end-of-string. The previous \S+-based pattern only matched non-whitespace
+// characters, leaving trailing content (e.g., "def" in "token=sk-abc def") in the
+// log. The fix uses a character class that includes space to capture the full
+// secret value. The \b word boundary before the keyword prevents partial matches
+// (e.g., "token" inside "auth_token") and ensures only whole keywords trigger
+// redaction. See issue #931.
 func TestRedactPanicValue_PartialSecretRedaction(t *testing.T) {
 	tests := []struct {
-		name          string
-		panics        any
-		wantRedact    bool
-		wantRemaining string // substring that should remain after redaction
-		wantRedacted  string // substring that should be redacted
+		name       string
+		panics     any
+		wantRedact bool
+		wantAbsent string // substring that should NOT be present after redaction
 	}{
 		{
-			name:          "token with space-separated trailing text",
-			panics:        "token=sk-abc def",
-			wantRedact:    true,
-			wantRemaining: "def",    // trailing content after space
-			wantRedacted:  "sk-abc", // only the non-space part is redacted
+			name:       "token with space-separated trailing text",
+			panics:     "token=sk-abc def",
+			wantRedact: true,
+			wantAbsent: "def",
 		},
 		{
-			name:          "auth_token with space-separated trailing text",
-			panics:        "auth_token=ghp_xxx yyy",
-			wantRedact:    true,
-			wantRemaining: "yyy",     // trailing content after space
-			wantRedacted:  "ghp_xxx", // only the non-space part is redacted
+			name:       "auth_token with space-separated trailing text",
+			panics:     "auth_token=ghp_xxx yyy",
+			wantRedact: true,
+			wantAbsent: "yyy",
+		},
+		{
+			name:       "token at end of string with no trailing content",
+			panics:     "token=sk-abc",
+			wantRedact: true,
+			wantAbsent: "sk-abc",
+		},
+		{
+			name:       "token with slash in value and trailing text",
+			panics:     "token=ghp_abc/def ghi",
+			wantRedact: true,
+			wantAbsent: "ghi",
+		},
+		{
+			name:       "password with space in value",
+			panics:     "password=secret pass word",
+			wantRedact: true,
+			wantAbsent: "pass word",
+		},
+		{
+			name:       "credential key with dash and trailing text",
+			panics:     "credential=key-123 abc",
+			wantRedact: true,
+			wantAbsent: "abc",
 		},
 	}
 	for _, tt := range tests {
@@ -316,14 +340,9 @@ func TestRedactPanicValue_PartialSecretRedaction(t *testing.T) {
 			if wasRedacted != tt.wantRedact {
 				t.Errorf("redactPanicValue(%v) wasRedacted=%v, want %v", tt.panics, wasRedacted, tt.wantRedact)
 			}
-			if wasRedacted {
-				// The secret portion should be redacted
-				if strings.Contains(redacted, tt.wantRedacted) {
-					t.Errorf("redactPanicValue(%v) = %q, still contains redacted portion %q", tt.panics, redacted, tt.wantRedacted)
-				}
-				// The non-secret trailing portion should remain
-				if !strings.Contains(redacted, tt.wantRemaining) {
-					t.Errorf("redactPanicValue(%v) = %q, should contain remaining portion %q", tt.panics, redacted, tt.wantRemaining)
+			if wasRedacted && tt.wantAbsent != "" {
+				if strings.Contains(redacted, tt.wantAbsent) {
+					t.Errorf("redactPanicValue(%v) = %q, should NOT contain absent portion %q", tt.panics, redacted, tt.wantAbsent)
 				}
 			}
 		})
@@ -466,4 +485,12 @@ func TestRecover_FlusherResponseWriterUsesSSEPath(t *testing.T) {
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Errorf("body missing trailing [DONE] sentinel:\n%s", body)
 	}
+}
+
+func TestDebug(t *testing.T) {
+	result, _ := redactPanicValue("auth_token=ghp_xxx yyy")
+	t.Logf("Result: %q", result)
+
+	// Also print the regex
+	t.Logf("genericSecretRe pattern: %s", genericSecretRe.String())
 }
