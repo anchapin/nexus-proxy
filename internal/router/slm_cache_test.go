@@ -1374,10 +1374,8 @@ func TestSLMCache_SemanticScanLimit_TwoEntriesOneSkipped(t *testing.T) {
 	c.SetEmbedding("nil-entry", RouteLocal, nil)
 	c.SetEmbedding("valid-entry", RouteFrontier, []float64{1.0, 0.0, 0.0, 0.0})
 
-	// SetMaxScanEntries is now a no-op (issue #969); semantic scan is always unlimited.
+	// Semantic scan is always unlimited (maxScanEntries=0 by default).
 	// All entries are scanned: nil-entry is skipped (nil emb), valid-entry is matched.
-	c.SetMaxScanEntries(1) // Setting it does nothing, but we call it for coverage.
-
 	got, ok, kind := c.Get(ctx, "query-two")
 	if !ok || got != RouteFrontier || kind != CacheHitSemantic {
 		t.Errorf("unlimited scan with nil+valid: got (%v, %v, %v), want (RouteFrontier, true, CacheHitSemantic)", got, ok, kind)
