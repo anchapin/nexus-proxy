@@ -238,6 +238,24 @@ func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
+			// Issue #980: validate SSE data lines as JSON before forwarding.
+			// isSSEDoneLine already passes through the [DONE] sentinel
+			// unchanged. For non-DONE data: lines we extract the JSON
+			// payload and validate it; malformed content is not forwarded —
+			// we terminate the stream cleanly instead.
+			if !isSSEDoneLine(line) && isSSEDataLine(line) {
+				if !validSSELineJSON(line) {
+					slog.Warn("upstream sent malformed SSE data, terminating stream",
+						"target", targetURL,
+						"line", string(line),
+					)
+					if !seenDone {
+						io.WriteString(w, "data: [DONE]\n\n")
+						flusher.Flush()
+					}
+					return nil
+				}
+			}
 			if _, werr := w.Write(line); werr != nil {
 				return werr
 			}
@@ -287,6 +305,31 @@ func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client
 // payload after `data: `, not the bare token.
 func isSSEDoneLine(line []byte) bool {
 	return strings.TrimSpace(string(line)) == sseDoneMarker
+}
+
+// isSSEDataLine reports whether line is an SSE data field (data: <content>).
+// Lines that are the done marker, blank lines, comment lines, or other SSE
+// fields (event:, id:, retry:) are not data lines and are forwarded as-is.
+func isSSEDataLine(line []byte) bool {
+	trimmed := strings.TrimSpace(string(line))
+	// The [DONE] sentinel starts with "data: " but is not a JSON data field.
+	if trimmed == sseDoneMarker {
+		return false
+	}
+	return strings.HasPrefix(trimmed, "data: ") && len(trimmed) > 6
+}
+
+// validSSELineJSON reports whether the JSON payload in an SSE data: line is
+// valid JSON. The "data: " prefix is stripped before validation so json.Valid
+// sees only the raw payload. Non-JSON content (plain text, error messages,
+// partial fragments) returns false.
+func validSSELineJSON(line []byte) bool {
+	trimmed := strings.TrimSpace(string(line))
+	if !strings.HasPrefix(trimmed, "data: ") {
+		return true // not a data line — forward unchanged
+	}
+	payload := trimmed[6:] // strip "data: "
+	return json.Valid([]byte(payload))
 }
 
 // emitTruncationTerminator writes the SSE signal the downstream
