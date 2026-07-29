@@ -67,6 +67,10 @@ func TestAuthLimiter_BlockedAfterBurst(t *testing.T) {
 	if rec.Header().Get("Retry-After") == "" {
 		t.Error("Retry-After header not set on 429")
 	}
+	// X-Nexus-RateLimit-Key-Type header is set to "auth-brute-force" (issue #983)
+	if got := rec.Header().Get("X-Nexus-RateLimit-Key-Type"); got != "auth-brute-force" {
+		t.Errorf("X-Nexus-RateLimit-Key-Type = %q, want %q", got, "auth-brute-force")
+	}
 }
 
 // Different IPs get independent failure tracking.

@@ -15,8 +15,10 @@ import (
 
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/handlers"
+	"github.com/anchapin/nexus-proxy/internal/judge"
 	"github.com/anchapin/nexus-proxy/internal/probe"
 	"github.com/anchapin/nexus-proxy/internal/rag"
+	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
 )
 
@@ -727,5 +729,141 @@ func TestPublicPathExempt(t *testing.T) {
 	// immediately exempts /status.
 	if !publicPathExempt(config.Config{StatusPublic: true})(httptest.NewRequest(http.MethodGet, "/status", nil)) {
 		t.Error("predicate built with StatusPublic=true must exempt /status")
+	}
+}
+
+// stubJudgeStorage is a minimal judge.Storage implementation for testing
+// confidenceBridge without hitting any real storage.
+type stubJudgeStorage struct {
+	recordErr error
+	calls     []judge.JudgeScore
+}
+
+func (s *stubJudgeStorage) Record(score judge.JudgeScore) error {
+	s.calls = append(s.calls, score)
+	return s.recordErr
+}
+
+func (s *stubJudgeStorage) Close() error { return nil }
+
+// stubConfidenceStore is a minimal router.ConfidenceStore implementation
+// for testing confidenceBridge.
+type stubConfidenceStore struct {
+	outcomeErr   error
+	outcomeCalls []struct {
+		category   string
+		route      router.Route
+		judgeScore int
+	}
+}
+
+func (s *stubConfidenceStore) RecordOutcome(category string, route router.Route, judgeScore int) error {
+	s.outcomeCalls = append(s.outcomeCalls, struct {
+		category   string
+		route      router.Route
+		judgeScore int
+	}{category, route, judgeScore})
+	return s.outcomeErr
+}
+
+func (s *stubConfidenceStore) LocalConfidence(category string) (float64, error) {
+	return 0.5, nil // neutral confidence for tests
+}
+
+func (s *stubConfidenceStore) Close() error { return nil }
+
+// TestConfidenceBridgeRecordOutOfRangeScore (issue #981) verifies that
+// confidenceBridge.Record logs a warning when a judge score exceeds the
+// valid 1..5 range instead of silently dropping it. Scores within range
+// are recorded normally; scores outside range are dropped but a warning
+// is emitted so operators can detect this anomalous condition.
+func TestConfidenceBridgeRecordOutOfRangeScore(t *testing.T) {
+	inner := &stubJudgeStorage{}
+	conf := &stubConfidenceStore{}
+	bridge := newConfidenceBridge(inner, conf)
+
+	// Issue #981: score > 5 should log a warning, not silently drop.
+	bridge.note("req-6", "css")
+	score := judge.JudgeScore{RequestID: "req-6", Score: 6, Err: nil}
+	if err := bridge.Record(score); err != nil {
+		t.Fatalf("Record with score 6: unexpected error: %v", err)
+	}
+	// inner.Record is always called so the score is persisted.
+	if len(inner.calls) != 1 || inner.calls[0].Score != 6 {
+		t.Errorf("inner.Record: got %v, want one call with Score=6", inner.calls)
+	}
+	// conf.RecordOutcome is NOT called for out-of-range scores.
+	if len(conf.outcomeCalls) != 0 {
+		t.Errorf("RecordOutcome: got %d calls, want 0 for score 6", len(conf.outcomeCalls))
+	}
+}
+
+// TestConfidenceBridgeRecordInRangeScore verifies that scores within the
+// valid 1..5 range are passed to RecordOutcome without warning.
+func TestConfidenceBridgeRecordInRangeScore(t *testing.T) {
+	inner := &stubJudgeStorage{}
+	conf := &stubConfidenceStore{}
+	bridge := newConfidenceBridge(inner, conf)
+
+	bridge.note("req-3", "css")
+	score := judge.JudgeScore{RequestID: "req-3", Score: 3, Err: nil}
+	if err := bridge.Record(score); err != nil {
+		t.Fatalf("Record with score 3: unexpected error: %v", err)
+	}
+	// inner.Record is called.
+	if len(inner.calls) != 1 {
+		t.Errorf("inner.Record: got %d calls, want 1", len(inner.calls))
+	}
+	// conf.RecordOutcome IS called for in-range scores.
+	if len(conf.outcomeCalls) != 1 {
+		t.Errorf("RecordOutcome: got %d calls, want 1 for score 3", len(conf.outcomeCalls))
+	}
+	if conf.outcomeCalls[0].judgeScore != 3 {
+		t.Errorf("RecordOutcome judgeScore: got %d, want 3", conf.outcomeCalls[0].judgeScore)
+	}
+}
+
+// TestConfidenceBridgeRecordZeroScore verifies that score == 0 (parse
+// failure) is NOT recorded in the confidence store but IS persisted via
+// inner.Record, matching the documented contract.
+func TestConfidenceBridgeRecordZeroScore(t *testing.T) {
+	inner := &stubJudgeStorage{}
+	conf := &stubConfidenceStore{}
+	bridge := newConfidenceBridge(inner, conf)
+
+	bridge.note("req-0", "css")
+	score := judge.JudgeScore{RequestID: "req-0", Score: 0, Err: nil}
+	if err := bridge.Record(score); err != nil {
+		t.Fatalf("Record with score 0: unexpected error: %v", err)
+	}
+	// inner.Record is called (parse failure is persisted).
+	if len(inner.calls) != 1 {
+		t.Errorf("inner.Record: got %d calls, want 1", len(inner.calls))
+	}
+	// conf.RecordOutcome is NOT called for score 0.
+	if len(conf.outcomeCalls) != 0 {
+		t.Errorf("RecordOutcome: got %d calls, want 0 for score 0", len(conf.outcomeCalls))
+	}
+}
+
+// TestConfidenceBridgeRecordNoCategory verifies that a score arriving
+// with no registered category (not noted) is not recorded in confidence.
+func TestConfidenceBridgeRecordNoCategory(t *testing.T) {
+	inner := &stubJudgeStorage{}
+	conf := &stubConfidenceStore{}
+	bridge := newConfidenceBridge(inner, conf)
+
+	// No bridge.note call — no category registered.
+	score := judge.JudgeScore{RequestID: "req-nocat", Score: 3, Err: nil}
+	if err := bridge.Record(score); err != nil {
+		t.Fatalf("Record with no category: unexpected error: %v", err)
+	}
+	// inner.Record is called (the score is always persisted).
+	if len(inner.calls) != 1 {
+		t.Errorf("inner.Record: got %d calls, want 1", len(inner.calls))
+	}
+	// conf.RecordOutcome is NOT called when category is unknown.
+	if len(conf.outcomeCalls) != 0 {
+		t.Errorf("RecordOutcome: got %d calls, want 0 when no category", len(conf.outcomeCalls))
 	}
 }
