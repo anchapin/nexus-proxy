@@ -1361,5 +1361,5 @@ func (d *delayedEmbedderWithDelay) EmbedBatch(ctx context.Context, texts []strin
 }
 
 func (d *delayedEmbedderWithDelay) IsHealthy(context.Context) bool { return true }
-func (d *delayedEmbedderWithDelay) IsBreakerOpen() bool        { return false }
-func (d *delayedEmbedderWithDelay) RecordBreakerSuccess()      {}
+func (d *delayedEmbedderWithDelay) IsBreakerOpen() bool            { return false }
+func (d *delayedEmbedderWithDelay) RecordBreakerSuccess()          {}
