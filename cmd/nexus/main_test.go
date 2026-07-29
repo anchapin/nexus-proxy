@@ -321,9 +321,10 @@ func (s *testStubEmbedder) EmbedBatch(_ context.Context, _ []string) ([][]float6
 	return [][]float64{{0, 0, 0}}, nil
 }
 
-func (s *testStubEmbedder) IsHealthy(context.Context) bool { return true }
-func (s *testStubEmbedder) IsBreakerOpen() bool            { return false }
-func (s *testStubEmbedder) RecordBreakerSuccess()          {}
+func (s *testStubEmbedder) IsHealthy(context.Context) bool            { return true }
+func (s *testStubEmbedder) IsBreakerOpen() bool                       { return false }
+func (s *testStubEmbedder) RecordBreakerSuccess()                     {}
+func (s *testStubEmbedder) SetTripCallback(string, func(kind string)) {}
 
 // TestBuildRAGStore verifies the RAG store constructor falls back to an
 // in-memory store when persistence is disabled.
@@ -344,7 +345,7 @@ func TestBuildRAGStore(t *testing.T) {
 	// We explicitly set it to empty to ensure the in-memory fallback.
 	cfg.RAGDBPath = ""
 
-	store, ps, watcher := buildRAGStore(cfg, emb, ctx)
+	store, ps, watcher, _ := buildRAGStore(cfg, emb, ctx)
 	if ps != nil || watcher != nil {
 		t.Error("expected nil persistentStore and watcher for in-memory store")
 	}
@@ -378,7 +379,7 @@ func TestBuildRAGStore_InvalidDBPath(t *testing.T) {
 		RAGDBPath:    invalidPath,
 	}
 
-	store, ps, watcher := buildRAGStore(cfg, emb, ctx)
+	store, ps, watcher, _ := buildRAGStore(cfg, emb, ctx)
 	if ps != nil {
 		t.Error("expected nil persistentStore for invalid DB path")
 	}
@@ -413,7 +414,7 @@ func TestBuildRAGStore_LoadOrIndexFails(t *testing.T) {
 		RAGDBPath:    dbPath,
 	}
 
-	store, ps, watcher := buildRAGStore(cfg, emb, ctx)
+	store, ps, watcher, _ := buildRAGStore(cfg, emb, ctx)
 	if ps != nil {
 		t.Error("expected nil persistentStore after LoadOrIndex failure")
 	}
@@ -444,7 +445,7 @@ func TestBuildRAGStore_WatcherEnabled(t *testing.T) {
 		RAGPollInterval: 1 * time.Second,
 	}
 
-	store, ps, watcher := buildRAGStore(cfg, emb, ctx)
+	store, ps, watcher, _ := buildRAGStore(cfg, emb, ctx)
 	if ps == nil {
 		t.Error("expected non-nil persistentStore when watcher is enabled")
 	}
@@ -475,7 +476,7 @@ func TestBuildRAGStore_WatcherDisabled(t *testing.T) {
 		RAGPollInterval: 0, // disabled
 	}
 
-	store, ps, watcher := buildRAGStore(cfg, emb, ctx)
+	store, ps, watcher, _ := buildRAGStore(cfg, emb, ctx)
 	if ps == nil {
 		t.Error("expected non-nil persistentStore when persistence is enabled")
 	}

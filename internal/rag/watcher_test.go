@@ -44,6 +44,7 @@ func (r *recordingEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]f
 func (r *recordingEmbedder) IsHealthy(context.Context) bool { return true }
 func (r *recordingEmbedder) IsBreakerOpen() bool            { return false }
 func (r *recordingEmbedder) RecordBreakerSuccess()          {}
+func (r *recordingEmbedder) SetTripCallback(string, func(kind string)) {}
 
 func (r *recordingEmbedder) Called() []string {
 	r.mu.Lock()

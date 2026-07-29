@@ -319,3 +319,54 @@ func TestBreakerIsOpenInvalidState(t *testing.T) {
 		t.Fatal("IsOpen must return true for invalid state 99")
 	}
 }
+
+// TestBreakerTripCallback verifies that the TripCallback is called synchronously
+// when the breaker trips (issue #971).
+func TestBreakerTripCallback(t *testing.T) {
+	b := newTestBreaker(3, 50*time.Millisecond)
+
+	var called bool
+	var capturedKind string
+	b.SetTripCallback("ollama", func(kind string) {
+		called = true
+		capturedKind = kind
+	})
+
+	// Sub-threshold failures should not trigger the callback.
+	b.RecordFailure()
+	b.RecordFailure()
+	if called {
+		t.Fatal("callback should not fire below threshold")
+	}
+
+	// Threshold failure should fire the callback.
+	b.RecordFailure()
+	if !called {
+		t.Fatal("callback must fire when breaker trips")
+	}
+	if capturedKind != "ollama" {
+		t.Fatalf("capturedKind = %q, want %q", capturedKind, "ollama")
+	}
+
+	// Second trip should not fire again (already open).
+	called = false
+	b.RecordFailure()
+	if called {
+		t.Fatal("callback should not fire again while breaker is open")
+	}
+
+	// Wait for cooldown, transition to half-open.
+	time.Sleep(60 * time.Millisecond)
+	_ = b.IsOpen()
+
+	// Probe failure in half-open should re-trip and fire callback again.
+	called = false
+	b.failureCount.Store(0) // reset count since half-open entry resets it
+	b.RecordFailure()
+	if !called {
+		t.Fatal("callback must fire on re-trip from half-open")
+	}
+	if capturedKind != "ollama" {
+		t.Fatalf("capturedKind = %q, want %q", capturedKind, "ollama")
+	}
+}

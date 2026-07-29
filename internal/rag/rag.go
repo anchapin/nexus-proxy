@@ -104,6 +104,9 @@ type Embedder interface {
 	// RecordBreakerSuccess resets the OllamaEmbedder failure counter on a
 	// successful embedding. No-op for embedders without a breaker.
 	RecordBreakerSuccess()
+	// SetTripCallback sets a function to be called synchronously when the
+	// circuit breaker trips (issue #971). No-op for embedders without a breaker.
+	SetTripCallback(kind string, cb func(kind string))
 }
 
 // embedCacheEntry pairs a prompt embedding with its expiry time so TTL-based
@@ -443,6 +446,15 @@ func (c *EmbedCache) IsBreakerOpen() bool {
 func (c *EmbedCache) RecordBreakerSuccess() {
 	if e, ok := c.inner.(interface{ RecordBreakerSuccess() }); ok {
 		e.RecordBreakerSuccess()
+	}
+}
+
+// SetTripCallback sets a function to be called synchronously when the
+// wrapped embedder's circuit breaker trips (issue #971). No-op when the
+// inner embedder does not implement the method.
+func (c *EmbedCache) SetTripCallback(kind string, cb func(kind string)) {
+	if e, ok := c.inner.(interface{ SetTripCallback(string, func(kind string)) }); ok {
+		e.SetTripCallback(kind, cb)
 	}
 }
 
@@ -1107,6 +1119,15 @@ func (s *Store) RecordBreakerSuccess() {
 	s.lastSuccessfulKind = embedderKind(s.embedder)
 }
 
+// SetTripCallback sets a function to be called synchronously when the
+// underlying embedder's circuit breaker trips (issue #971). No-op when the
+// embedder does not implement the method.
+func (s *Store) SetTripCallback(kind string, cb func(kind string)) {
+	if e, ok := s.embedder.(interface{ SetTripCallback(string, func(kind string)) }); ok {
+		e.SetTripCallback(kind, cb)
+	}
+}
+
 // embedderKind returns the circuit kind string for the given embedder.
 // Returns "" for unknown embedder types.
 func embedderKind(e Embedder) string {
@@ -1584,6 +1605,12 @@ func (o *OpenAIEmbedder) RecordBreakerSuccess() {
 	o.breaker.RecordSuccess()
 }
 
+// SetTripCallback sets a function to be called synchronously when the
+// circuit breaker trips (issue #971).
+func (o *OpenAIEmbedder) SetTripCallback(kind string, cb func(kind string)) {
+	o.breaker.SetTripCallback(kind, cb)
+}
+
 // Kind returns the circuit kind string for this embedder ("openai").
 // Used for RAG circuit breaker observability (issue #886).
 func (o *OpenAIEmbedder) Kind() string {
@@ -1753,6 +1780,12 @@ func (c *CohereEmbedder) RecordBreakerSuccess() {
 	c.breaker.RecordSuccess()
 }
 
+// SetTripCallback sets a function to be called synchronously when the
+// circuit breaker trips (issue #971).
+func (c *CohereEmbedder) SetTripCallback(kind string, cb func(kind string)) {
+	c.breaker.SetTripCallback(kind, cb)
+}
+
 // Kind returns the circuit kind string for this embedder ("cohere").
 // Used for RAG circuit breaker observability (issue #886).
 func (c *CohereEmbedder) Kind() string {
@@ -1808,6 +1841,12 @@ func (o *OllamaEmbedder) RecordBreakerSuccess() {
 // (cooldown) state. Exported for tests and operational dashboards.
 func (o *OllamaEmbedder) IsBreakerOpen() bool {
 	return o.breaker.IsOpen()
+}
+
+// SetTripCallback sets a function to be called synchronously when the
+// circuit breaker trips (issue #971).
+func (o *OllamaEmbedder) SetTripCallback(kind string, cb func(kind string)) {
+	o.breaker.SetTripCallback(kind, cb)
 }
 
 // Kind returns the circuit kind string for this embedder ("ollama").

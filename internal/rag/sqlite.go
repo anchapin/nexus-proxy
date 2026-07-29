@@ -309,6 +309,15 @@ func (p *PersistentStore) EmbedderDims() (int, bool) {
 	return p.embedderDims, p.embedderDims > 0
 }
 
+// SetTripCallback sets a function to be called synchronously when the
+// underlying embedder's circuit breaker trips (issue #971). Delegates
+// to the embedded Store.
+func (p *PersistentStore) SetTripCallback(kind string, cb func(kind string)) {
+	if p != nil && p.Store != nil {
+		p.Store.SetTripCallback(kind, cb)
+	}
+}
+
 // Load reads every row from the DB and replaces the in-memory
 // examples slice in a single atomic swap. Returns the number of rows
 // loaded. Ollama is not contacted — this is the headline win for

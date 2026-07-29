@@ -484,6 +484,7 @@ func (c *countingErrEmbedder) EmbedBatch(_ context.Context, _ []string) ([][]flo
 func (c *countingErrEmbedder) IsHealthy(context.Context) bool { return true }
 func (c *countingErrEmbedder) IsBreakerOpen() bool            { return false }
 func (c *countingErrEmbedder) RecordBreakerSuccess()          {}
+func (c *countingErrEmbedder) SetTripCallback(string, func(kind string)) {}
 
 // Calls returns the number of Embed invocations observed by this
 // embedder. Safe for concurrent use.
@@ -538,6 +539,7 @@ func (v *vectorEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]floa
 func (v *vectorEmbedder) IsHealthy(context.Context) bool { return true }
 func (v *vectorEmbedder) IsBreakerOpen() bool            { return false }
 func (v *vectorEmbedder) RecordBreakerSuccess()          {}
+func (v *vectorEmbedder) SetTripCallback(string, func(kind string)) {}
 
 // indexedCallCounter counts every Embed call so tests can
 // distinguish the disk-cache fast path (1 call — only the
@@ -583,6 +585,7 @@ func (c *indexedCallCounter) IsHealthy(context.Context) bool { return true }
 func (c *indexedCallCounter) IsBreakerOpen() bool            { return false }
 func (c *indexedCallCounter) Model() string                  { return c.model }
 func (c *indexedCallCounter) RecordBreakerSuccess()          {}
+func (c *indexedCallCounter) SetTripCallback(string, func(kind string)) {}
 
 func (c *indexedCallCounter) totalCalls() int {
 	c.mu.Lock()
@@ -622,6 +625,7 @@ func (d *dimEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float64
 func (d *dimEmbedder) IsHealthy(context.Context) bool { return true }
 func (d *dimEmbedder) IsBreakerOpen() bool            { return false }
 func (d *dimEmbedder) RecordBreakerSuccess()          {}
+func (d *dimEmbedder) SetTripCallback(string, func(kind string)) {}
 func (d *dimEmbedder) Model() string                  { return d.model }
 
 // TestRunRAGMigrations_SchemaVersionIntegrity checks that if schema_version
@@ -861,6 +865,7 @@ func (m *modelErrEmbedder) EmbedBatch(context.Context, []string) ([][]float64, e
 func (m *modelErrEmbedder) IsHealthy(context.Context) bool { return false }
 func (m *modelErrEmbedder) IsBreakerOpen() bool            { return false }
 func (m *modelErrEmbedder) RecordBreakerSuccess()          {}
+func (m *modelErrEmbedder) SetTripCallback(string, func(kind string)) {}
 func (m *modelErrEmbedder) Model() string                  { return m.model }
 
 // TestOpenPersistentStore_ProbeFailureLogged verifies that when the
@@ -1058,6 +1063,7 @@ func (b *batchCounterEmbedder) EmbedBatch(_ context.Context, texts []string) ([]
 func (b *batchCounterEmbedder) IsHealthy(context.Context) bool { return true }
 func (b *batchCounterEmbedder) IsBreakerOpen() bool            { return false }
 func (b *batchCounterEmbedder) RecordBreakerSuccess()          {}
+func (b *batchCounterEmbedder) SetTripCallback(string, func(kind string)) {}
 
 func (b *batchCounterEmbedder) EmbedCalls() int {
 	b.mu.Lock()

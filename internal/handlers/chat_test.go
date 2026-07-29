@@ -39,9 +39,10 @@ func (s stubEmbedder) EmbedBatch(_ context.Context, _ []string) ([][]float64, er
 	return [][]float64{s.vec}, nil
 }
 
-func (s stubEmbedder) IsHealthy(context.Context) bool { return true }
-func (s stubEmbedder) IsBreakerOpen() bool            { return false }
-func (s stubEmbedder) RecordBreakerSuccess()          {}
+func (s stubEmbedder) IsHealthy(context.Context) bool                    { return true }
+func (s stubEmbedder) IsBreakerOpen() bool                               { return false }
+func (s stubEmbedder) RecordBreakerSuccess()                             {}
+func (s stubEmbedder) SetTripCallback(kind string, cb func(kind string)) {}
 
 func baseDeps(t *testing.T) (Deps, *upstream.RecordingTransport) {
 	t.Helper()

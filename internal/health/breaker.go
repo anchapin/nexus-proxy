@@ -38,6 +38,14 @@ type Breaker struct {
 	// to half-open.
 	Cooldown time.Duration
 
+	// tripKind is the embedder kind (e.g. "ollama", "openai", "cohere")
+	// set by SetTripCallback and passed to TripCallback when the breaker trips.
+	tripKind string
+
+	// TripCallback is called synchronously when the breaker trips (issue #971).
+	// It receives the tripKind as argument. A nil callback is a no-op.
+	TripCallback func(kind string)
+
 	// Internal state (atomic):
 	//   state: 0=closed, 1=half_open, 2=open
 	//   failureCount: consecutive failures since last success
@@ -94,6 +102,8 @@ func (b *Breaker) RecordFailure() {
 	}
 	count := b.failureCount.Add(1)
 	if b.state.Load() == breakerStateHalfOpen || count >= int32(b.Threshold) {
+		// Capture previous state to detect actual trip transitions.
+		prevState := b.state.Load()
 		// Trip: set the cooldown deadline. We add one nanosecond so that
 		// the comparison in IsOpen is strict (deadline > now, not >=).
 		b.cooldownUntil.Store(time.Now().Add(b.Cooldown).UnixNano() + 1)
@@ -103,6 +113,11 @@ func (b *Breaker) RecordFailure() {
 			slog.Int("threshold", b.Threshold),
 			slog.Duration("cooldown", b.Cooldown),
 		)
+		// Emit the trip counter synchronously only on actual transitions
+		// to open state, not on re-trips from half-open (issue #971).
+		if prevState != breakerStateOpen && b.TripCallback != nil {
+			b.TripCallback(b.tripKind)
+		}
 	}
 }
 
@@ -125,6 +140,12 @@ func (b *Breaker) State() int32 {
 // FailureCount returns the current consecutive-failure count.
 func (b *Breaker) FailureCount() int32 {
 	return b.failureCount.Load()
+}
+
+// SetTripCallback sets the callback and kind for when the breaker trips (issue #971).
+func (b *Breaker) SetTripCallback(kind string, cb func(kind string)) {
+	b.tripKind = kind
+	b.TripCallback = cb
 }
 
 // breakers is the internal registry of per-kind embedder circuit breakers.

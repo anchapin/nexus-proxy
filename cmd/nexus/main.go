@@ -200,7 +200,7 @@ func main() {
 	// in-memory-only Store with the original IndexDir semantics —
 	// the proxy is byte-for-byte identical to the pre-issue-46
 	// behaviour.
-	store, persistentStore, ragWatcher := buildRAGStore(cfg, ragEmbedder, bootCtx)
+	store, persistentStore, ragWatcher, ragEmbed := buildRAGStore(cfg, ragEmbedder, bootCtx)
 
 	slm := router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, cfg.SLMTimeout, httpClient)
 	// Judge-guided adaptive routing (issue #47): the confidence
@@ -1155,6 +1155,18 @@ func main() {
 		incRAGCircuitRecov: circuitCollector.IncRAGCircuitRecover,
 	}
 
+	// Set the RAG circuit breaker trip callback so trips are counted
+	// synchronously when the threshold is crossed, not lazily on the next
+	// request (issue #971).
+	if ragEmbed != nil {
+		// Determine the embedder kind from config.
+		kind := string(cfg.EmbedderType)
+		if kind == "" {
+			kind = "ollama" // default
+		}
+		ragEmbed.SetTripCallback(kind, circuitBreakerObs.IncRAGCircuitTrip)
+	}
+
 	chatHandler := handlers.Chat(handlers.Deps{
 		Config:                  cfg,
 		Client:                  httpClient,
@@ -1701,7 +1713,7 @@ func (b *confidenceBridge) Close() error { return b.inner.Close() }
 // The watcher is started only when persistence is enabled AND
 // NEXUS_RAG_POLL_INTERVAL > 0; an interval of zero leaves
 // persistence on but disables runtime updates (boot-only load).
-func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context) (rag.RAGStore, *rag.PersistentStore, *rag.Watcher) {
+func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context) (rag.RAGStore, *rag.PersistentStore, *rag.Watcher, rag.Embedder) {
 	// emb is already wrapped with EmbedCache by the caller (issue #115, #303)
 	cachedEmb := emb
 	if !cfg.RAGPersistentEnabled() {
@@ -1710,7 +1722,7 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
-		return store, nil, nil
+		return store, nil, nil, cachedEmb
 	}
 
 	ps, err := rag.OpenPersistentStore(cfg.RAGDBPath, cachedEmb, cfg.RAGThreshold, rag.WithBatchSize(cfg.RAGBatchSize))
@@ -1727,7 +1739,7 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
-		return store, nil, nil
+		return store, nil, nil, cachedEmb
 	}
 
 	n, err := ps.LoadOrIndex(bootCtx, cfg.ExamplesDir)
@@ -1744,7 +1756,7 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
-		return store, nil, nil
+		return store, nil, nil, cachedEmb
 	}
 	slog.Info("rag persistent store ready",
 		slog.String("path", cfg.RAGDBPath),
@@ -1763,7 +1775,7 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 		slog.Info("rag file watcher disabled (NEXUS_RAG_POLL_INTERVAL=0); boot-time load only")
 	}
 
-	return ps, ps, watcher
+	return ps, ps, watcher, cachedEmb
 }
 
 // buildRecorder constructs the telemetry recorder from config. A disabled
