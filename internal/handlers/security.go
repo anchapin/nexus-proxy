@@ -20,7 +20,7 @@ const permissionsPolicyValue = "accelerometer=(), autoplay=(), camera=(), " +
 	"usb=(), interest-cohort=()"
 
 // SecurityHeaders returns middleware that stamps standard security
-// response headers on every response (issue #39):
+// response headers on every response (issue #39, #965):
 //
 //   - X-Content-Type-Options: nosniff — blocks MIME sniffing.
 //   - X-Frame-Options: DENY — blocks clickjacking via framing.
@@ -36,6 +36,9 @@ const permissionsPolicyValue = "accelerometer=(), autoplay=(), camera=(), " +
 //     no-cors requests from reading the response (issue #605).
 //   - Permissions-Policy — disables privacy-sensitive browser features
 //     the proxy never uses (issue #605).
+//   - Content-Security-Policy: default-src 'none'; frame-ancestors 'none';
+//     script-src 'none'; object-src 'none' — locks down script and object
+//     sources to prevent XSS via upstream injection (issue #965).
 //
 // When tlsActive is true, Strict-Transport-Security is added with a
 // one-year max-age so clients pin HTTPS and refuse plaintext fallbacks.
@@ -70,6 +73,7 @@ func SecurityHeaders(tlsActive bool) func(http.Handler) http.Handler {
 			h.Set("Cross-Origin-Embedder-Policy", "require-corp")
 			h.Set("Cross-Origin-Resource-Policy", "same-origin")
 			h.Set("Permissions-Policy", permissionsPolicyValue)
+			h.Set("Content-Security-Policy", `default-src 'none'; frame-ancestors 'none'; script-src 'none'; object-src 'none'`)
 			if tlsActive {
 				h.Set("Strict-Transport-Security", "max-age=31536000")
 			}
