@@ -423,6 +423,11 @@ func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client
 	// the body length equals the limit — if so, the upstream may have
 	// had more data we did not receive.
 	if err != nil || int64(len(respBody)) >= maxResponseBytes {
+		// Preserve the upstream status code before returning a truncation
+		// error so the harness receives the actual upstream response code
+		// (e.g. 429 with {"error":"rate limited"}) instead of a blank 500.
+		// Issue #967.
+		w.WriteHeader(resp.StatusCode)
 		return fmt.Errorf("upstream: read response: %w", err)
 	}
 

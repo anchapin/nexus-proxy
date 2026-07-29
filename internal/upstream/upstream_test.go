@@ -880,8 +880,40 @@ func TestBufferedFetchWithContextRespectsMaxResponseBytesLimit(t *testing.T) {
 	if !strings.Contains(err.Error(), "read response") {
 		t.Errorf("error = %v, want error mentioning 'read response'", err)
 	}
-	if rw.status != 0 {
-		t.Errorf("status written before limit error: %d", rw.status)
+	// The upstream status code is written before the truncation error
+	// is returned, so the harness receives the actual upstream status
+	// instead of a fabricated error code (issue #967).
+	if rw.status != 200 {
+		t.Errorf("status = %d, want 200", rw.status)
+	}
+}
+
+// TestBufferedFetchTruncationPreservesNonOKStatus tests issue #967: when
+// BufferedFetchWithContext hits the MaxResponseBytes limit and the upstream
+// returned a non-OK status (e.g. 429 rate limit), the harness must receive
+// that upstream status code even though the truncated body is not forwarded.
+func TestBufferedFetchTruncationPreservesNonOKStatus(t *testing.T) {
+	ConfigureMaxResponseBytes(10) // truncate after 10 bytes
+	defer ResetMaxResponseBytesForTest()
+
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"rate limited"}}`)),
+		}, nil
+	})}
+	rw := newJSONRW()
+	err := BufferedFetchWithContext(context.Background(), rw, client, "http://x", "", map[string]interface{}{"model": "m"})
+	if err == nil {
+		t.Fatal("expected error when response exceeds MaxResponseBytes limit")
+	}
+	if !strings.Contains(err.Error(), "read response") {
+		t.Errorf("error = %v, want error mentioning 'read response'", err)
+	}
+	// The upstream 429 status must be written before returning the
+	// truncation error, so the harness can see the rate limit response.
+	if rw.status != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429 (rate limited)", rw.status)
 	}
 }
 
