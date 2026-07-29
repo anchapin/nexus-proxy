@@ -874,9 +874,9 @@ func TestConfidenceBridgeRecordNoCategory(t *testing.T) {
 // store for adaptive routing decisions.
 func TestConfidenceBridgeRecordRoute(t *testing.T) {
 	tests := []struct {
-		name       string
-		route      string
-		wantRoute  router.Route
+		name      string
+		route     string
+		wantRoute router.Route
 	}{
 		{
 			name:      "fusion route",
