@@ -44,9 +44,9 @@ func (c *countingEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]fl
 	return result, nil
 }
 
-func (c *countingEmbedder) IsHealthy(context.Context) bool { return true }
-func (c *countingEmbedder) IsBreakerOpen() bool            { return false }
-func (c *countingEmbedder) RecordBreakerSuccess()          {}
+func (c *countingEmbedder) IsHealthy(context.Context) bool            { return true }
+func (c *countingEmbedder) IsBreakerOpen() bool                       { return false }
+func (c *countingEmbedder) RecordBreakerSuccess()                     {}
 func (c *countingEmbedder) SetTripCallback(string, func(kind string)) {}
 
 func (c *countingEmbedder) callCount(text string) int {
