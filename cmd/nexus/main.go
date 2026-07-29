@@ -523,6 +523,7 @@ func main() {
 				Instruction: c.Instruction,
 				Output:      c.Output,
 				LocalModel:  c.LocalModel,
+				Route:      c.Route,
 				TraceParent: c.TraceParent,
 				TraceState:  c.TraceState,
 			}) {
@@ -1642,7 +1643,7 @@ func (b *confidenceBridge) forget(requestID string) {
 	b.mu.Unlock()
 }
 
-// Record resolves the category for the scored request and feeds a local
+// Record resolves the category for the scored request and feeds the
 // outcome into the confidence store, then delegates to the inner storage.
 // Parse-failure scores (Err set, or Score outside 1..5) are persisted by
 // the inner storage but excluded from the confidence aggregate.
@@ -1657,11 +1658,17 @@ func (b *confidenceBridge) Record(s judge.JudgeScore) error {
 				slog.String("request_id", s.RequestID),
 				slog.Int("score", s.Score),
 			)
-		} else if err := b.conf.RecordOutcome(cat, router.RouteLocal, s.Score); err != nil {
-			slog.Warn("confidence: record outcome rejected",
-				slog.String("request_id", s.RequestID),
-				slog.Any("err", err),
-			)
+		} else {
+			route := s.Route
+			if route == "" {
+				route = string(router.RouteLocal) // safety default; empty Route should not occur
+			}
+			if err := b.conf.RecordOutcome(cat, router.Route(route), s.Score); err != nil {
+				slog.Warn("confidence: record outcome rejected",
+					slog.String("request_id", s.RequestID),
+					slog.Any("err", err),
+				)
+			}
 		}
 	}
 	return b.inner.Record(s)

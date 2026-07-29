@@ -59,6 +59,12 @@ type Sample struct {
 	Output      string // full streamed local-model response
 	LocalModel  string // which local model produced Output
 
+	// Route is which routing path produced Output: "local", "fusion", or
+	// "frontier". It is fed into JudgeScore so callers (notably the
+	// confidenceBridge in cmd/nexus) can record outcome quality against
+	// the correct route instead of always defaulting to RouteLocal.
+	Route string
+
 	// TraceParent and TraceState carry the W3C trace context from the
 	// inbound request so the async worker can create a child span (issue #233).
 	TraceParent string
@@ -78,6 +84,11 @@ type JudgeScore struct {
 	OutputTok   int
 	Err         error
 	Timestamp   time.Time
+
+	// Route records which routing path produced the response that was
+	// scored. This lets the confidenceBridge record the outcome against
+	// the correct route instead of always defaulting to RouteLocal (issue #970).
+	Route string
 }
 
 // Storage persists JudgeScore records. A future PR will supply a
@@ -334,7 +345,7 @@ func (e *Evaluator) evaluate(s Sample) JudgeScore {
 }
 
 func (e *Evaluator) evaluateCtx(ctx context.Context, s Sample) JudgeScore {
-	score := JudgeScore{RequestID: s.RequestID, Timestamp: time.Now().UTC()}
+	score := JudgeScore{RequestID: s.RequestID, Timestamp: time.Now().UTC(), Route: s.Route}
 
 	prompt := PromptFor(s)
 	// Use a struct so the JSON field order is deterministic — Go's
