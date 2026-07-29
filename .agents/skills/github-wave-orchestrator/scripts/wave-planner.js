@@ -190,12 +190,23 @@ Usage:
   gh issue list --json number,title,body,labels,state | node wave-planner.js [FILE]
   node wave-planner.js issues.json
 
+Options:
+  --dry-run, -n   Show affected_files analysis without generating wave plans.
+                  Use this to review file-reference extraction before execution.
+  --help, -h      Show this help message.
+
 Reads JSON from stdin or a file (accepts raw array or {issues: [...]} wrapper).
 Filters out already-closed issues, groups remaining issues by file-conflict graph,
 and outputs up to MAX_PER_WAVE (=3) issues per wave.
 
 Examples:
+  # Plan waves for all open issues
   gh issue list --state open --json number,title,body,labels | node wave-planner.js
+
+  # Review affected_files before planning
+  gh issue list --state open --json number,title,body,labels | node wave-planner.js --dry-run
+
+  # Plan waves from a file
   node wave-planner.js /tmp/my-issues.json
 `;
 
@@ -204,6 +215,8 @@ function main() {
     process.stdout.write(USAGE);
     return;
   }
+
+  const isDryRun = process.argv.includes("--dry-run") || process.argv.includes("-n");
   const input = readInput();
   let issues = Array.isArray(input) ? input : input.issues || [];
   // Filter out already-closed issues
@@ -213,6 +226,27 @@ function main() {
     return state.toLowerCase() !== "closed";
   });
   const filtered = before - issues.length;
+
+  if (isDryRun) {
+    // --dry-run: output affected_files analysis without generating wave plans
+    const analyzed = issues.map(analyzeIssue);
+    const dryRunResult = {
+      _meta: {
+        filtered_closed: filtered,
+        mode: "dry-run",
+        total_issues: analyzed.length,
+      },
+      issues: analyzed.map((a) => ({
+        number: a.number,
+        title: a.title,
+        affected_files: a.affected_files,
+        has_known_deps: a.has_known_deps,
+      })),
+    };
+    console.log(JSON.stringify(dryRunResult, null, 2));
+    return;
+  }
+
   const plan = planWaves(issues);
   plan._meta = { filtered_closed: filtered };
   console.log(JSON.stringify(plan, null, 2));
