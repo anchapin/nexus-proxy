@@ -250,7 +250,9 @@ func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client
 						"line", string(line),
 					)
 					if !seenDone {
-						io.WriteString(w, "data: [DONE]\n\n")
+						if _, werr := io.WriteString(w, "data: [DONE]\n\n"); werr != nil {
+							return werr
+						}
 						flusher.Flush()
 					}
 					return nil
