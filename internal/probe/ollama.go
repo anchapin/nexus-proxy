@@ -65,6 +65,12 @@ type OllamaProbe struct {
 	// warning so a missing chat model does not spam the log on every
 	// poll cycle. The zero value is ready to use.
 	chatModelWarnOnce sync.Once
+
+	// staticFallbackWarnOnce guards the one-shot "both signals failed,
+	// falling back to static guardrail" info log so the message appears
+	// exactly once per startup cycle instead of on every poll (issue
+	// #989). The zero value is ready to use.
+	staticFallbackWarnOnce sync.Once
 }
 
 // NewOllamaProbe constructs a probe with safe defaults. Pass nil for
@@ -117,6 +123,15 @@ func (p *OllamaProbe) Budget(ctx context.Context) (Budget, error) {
 
 	switch {
 	case err != nil && sysfsErr != nil:
+		// Both signals failed. Log once per startup cycle so operators
+		// can tell the difference between "normal operation" and "VRAM
+		// probe degraded" without spamming every poll cycle (issue #989).
+		p.staticFallbackWarnOnce.Do(func() {
+			slog.Info("vram probe: no signal, falling back to static guardrail",
+				slog.String("ollama_err", err.Error()),
+				slog.String("sysfs_err", sysfsErr.Error()),
+			)
+		})
 		return Budget{Source: SourceStatic, BytesPerToken: bpt},
 			fmt.Errorf("%w: ollama=%w sysfs=%w", ErrNoSignal, err, sysfsErr)
 	case err != nil:
