@@ -1270,3 +1270,96 @@ func TestThresholdFor_CaseInsensitive(t *testing.T) {
 		}
 	}
 }
+
+// TestEmbedCacheTimeoutSuccessPathRace verifies that when a waiting goroutine
+// times out and falls through, and then the original loading goroutine completes,
+// there is no goroutine leak (issue #975). This test uses a delayedEmbedder
+// with a delay longer than the waiter's timeout to widen the race window.
+func TestEmbedCacheTimeoutSuccessPathRace(t *testing.T) {
+	unblock := make(chan struct{})
+	inner := &delayedEmbedderWithDelay{
+		unblock: unblock,
+		delay:   100 * time.Millisecond,
+	}
+	cache := NewEmbedCache(inner, 100, 5*time.Minute, 50*time.Millisecond)
+
+	ctx := context.Background()
+
+	// First goroutine: starts loading and will take 100ms.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var firstErr error
+	go func() {
+		defer wg.Done()
+		_, firstErr = cache.Embed(ctx, "key")
+	}()
+
+	// Give the first goroutine time to register in c.loading.
+	time.Sleep(10 * time.Millisecond)
+
+	// Second goroutine: arrives while first is loading, times out waiting after 50ms.
+	wg.Add(1)
+	var waiterErr error
+	go func() {
+		defer wg.Done()
+		_, waiterErr = cache.Embed(ctx, "key")
+	}()
+
+	// Wait for both goroutines. The second should timeout (50ms) while the first
+	// is still loading (100ms). When the waiter falls through and calls inner.Embed,
+	// it will also block on unblock (which we close after 150ms).
+	time.Sleep(60 * time.Millisecond) // Let waiter timeout
+	close(unblock)                    // Now both inner.Embed calls can complete
+
+	wg.Wait()
+
+	// Both should succeed.
+	if firstErr != nil {
+		t.Errorf("first goroutine: %v", firstErr)
+	}
+	if waiterErr != nil {
+		t.Errorf("waiter goroutine: %v", waiterErr)
+	}
+
+	// Verify no stale entry.
+	cache.mu.Lock()
+	_, hasStale := cache.loading["key"]
+	cache.mu.Unlock()
+
+	if hasStale {
+		t.Error("c.loading[\"key\"] still present — stale entry leak")
+	}
+}
+
+type delayedEmbedderWithDelay struct {
+	unblock chan struct{}
+	delay   time.Duration
+}
+
+func (d *delayedEmbedderWithDelay) Embed(ctx context.Context, text string) ([]float64, error) {
+	select {
+	case <-time.After(d.delay):
+	case <-d.unblock:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return []float64{0, 0, 0}, nil
+}
+
+func (d *delayedEmbedderWithDelay) EmbedBatch(ctx context.Context, texts []string) ([][]float64, error) {
+	select {
+	case <-time.After(d.delay):
+	case <-d.unblock:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	result := make([][]float64, len(texts))
+	for i := range texts {
+		result[i] = []float64{0, 0, 0}
+	}
+	return result, nil
+}
+
+func (d *delayedEmbedderWithDelay) IsHealthy(context.Context) bool { return true }
+func (d *delayedEmbedderWithDelay) IsBreakerOpen() bool        { return false }
+func (d *delayedEmbedderWithDelay) RecordBreakerSuccess()      {}
