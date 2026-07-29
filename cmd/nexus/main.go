@@ -1659,6 +1659,12 @@ func (b *confidenceBridge) forget(requestID string) {
 // outcome into the confidence store, then delegates to the inner storage.
 // Parse-failure scores (Err set, or Score outside 1..5) are persisted by
 // the inner storage but excluded from the confidence aggregate.
+//
+// NOTE(issue #1017): A previous version of this function had an "else if"
+// branch that called RecordOutcome with a hardcoded RouteLocal before the
+// route-aware call, causing duplicate RecordOutcome invocations for in-range
+// scores (1-5). The fix consolidates into a single RecordOutcome call
+// inside the else block, with empty s.Route defaulting to RouteLocal.
 func (b *confidenceBridge) Record(s judge.JudgeScore) error {
 	b.mu.Lock()
 	cat, ok := b.cats[s.RequestID]
