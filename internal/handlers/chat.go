@@ -43,6 +43,7 @@ type LocalCompletion struct {
 	Instruction string
 	Output      string
 	LocalModel  string
+	Route       string // routing path that produced this output: "local", "fusion", or "frontier"
 }
 
 // JudgeObserver is the hook the chat handler invokes when a
@@ -1726,6 +1727,7 @@ func Chat(d Deps) http.Handler {
 								Instruction: latestPrompt,
 								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
+								Route:       string(route),
 							})
 						}
 						if d.QualityObserver != nil {
@@ -1801,6 +1803,7 @@ func Chat(d Deps) http.Handler {
 								Instruction: latestPrompt,
 								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
+								Route:       string(route),
 							})
 						}
 						if d.QualityObserver != nil {
