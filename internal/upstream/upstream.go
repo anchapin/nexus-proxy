@@ -1286,8 +1286,10 @@ func streamPanelResultAsSSE(w http.ResponseWriter, r PanelResult) error {
 // is safe to call from any code path that has not yet written headers.
 func streamCachedArbiterSynthesis(w http.ResponseWriter, synthesis any) error {
 	chunk := map[string]interface{}{
-		"object": "chat.completion.chunk",
-		"nexus":  map[string]string{"source": "arbiter-cached"},
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   "arbiter",
+		"nexus":   map[string]string{"source": "arbiter-cached"},
 		"choices": []map[string]interface{}{
 			{"index": 0, "delta": map[string]interface{}{"content": synthesis}, "finish_reason": "stop"},
 		},
