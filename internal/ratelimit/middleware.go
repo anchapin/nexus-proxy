@@ -35,10 +35,11 @@ import (
 // (RPM <= 0); always construct via NewMiddleware.
 type Middleware struct {
 	resolver *ClientIPResolver
-	rpm      int           // steady-state requests per minute
-	burst    int           // bucket capacity
-	ttl      time.Duration // idle bucket retention before reaping
-	stopCh   chan struct{} // closed when reaper should exit
+	rpm      int            // steady-state requests per minute
+	burst    int            // bucket capacity
+	ttl      time.Duration  // idle bucket retention before reaping
+	stopCh   chan struct{}  // closed when reaper should exit
+	reaperWG sync.WaitGroup // tracks reaper goroutine for deterministic exit (issue #960)
 
 	// keyFn computes the bucket key from an inbound request. It composes
 	// on top of the ClientIPResolver. The default (nil) uses IP-only;
@@ -118,6 +119,7 @@ func NewMiddleware(rpm, burst int, resolver *ClientIPResolver, keyFn func(*http.
 		keyFn:    keyFn,
 		keyType:  keyType,
 	}
+	m.reaperWG.Add(1)
 	go m.reaper()
 	return m
 }
@@ -301,6 +303,7 @@ func (m *Middleware) bucketFor(bucketKey string, now time.Time) *bucket {
 // only goroutine that deletes from the map outside of allow (which
 // only ever adds).
 func (m *Middleware) reaper() {
+	defer m.reaperWG.Done()
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
 	for {
@@ -337,6 +340,7 @@ func (m *Middleware) Stop() {
 		return
 	}
 	close(m.stopCh)
+	m.reaperWG.Wait()
 }
 
 // Close is an alias for Stop, provided to mirror the closer interface

@@ -17,6 +17,12 @@ Repository: {OWNER}/{REPO}
 Branch: fix/issue-{NUMBER}-{SLUG} (already checked out)
 Workdir: ../worktrees/issue-{NUMBER}-{SLUG}
 
+IMPORTANT — Silent Failure Prevention:
+- You MUST output your PR number as the VERY LAST LINE of your output.
+- If you do not output a PR number, the orchestrator will treat your run as FAILED.
+- The orchestrator verifies git log origin/develop..HEAD is non-empty before accepting "done".
+- If your worktree is unchanged after you report done, recovery will be triggered.
+
 Steps:
 1. Read the full issue: gh issue view {NUMBER}
 2. Read the issue comments for additional context: gh issue view {NUMBER} --comments
@@ -25,24 +31,24 @@ Steps:
 5. Run local checks if available (make test-fast, make lint)
  6. Commit: git add -A && git commit -m "{fix|feat}: resolve #{NUMBER} — {brief description}"
  7. Push: git push -u origin fix/issue-{NUMBER}-{SLUG} --force-with-lease
-    NOTE: If push fails (e.g., remote branch exists with newer commits), use
-    `git pull --rebase origin develop` first, then push again with --force-with-lease.
+     NOTE: If push fails (e.g., remote branch exists with newer commits), use
+     `git pull --rebase origin develop` first, then push again with --force-with-lease.
  8. Open PR with an EXPLICIT body (no `--fill` — see PR-body conventions):
-   ```
-   gh pr create --base develop \
-     --title "{fix|feat}: resolve #{NUMBER} — {TITLE}" \
-     --body "$(cat <<'EOF'
+    ```
+    gh pr create --base develop \
+      --title "{fix|feat}: resolve #{NUMBER} — {TITLE}" \
+      --body "$(cat <<'EOF'
    Closes #{NUMBER}
 
    <one-paragraph description of the change>
    EOF
    )"
-   ```
-   The body must list ALL issues that this PR resolves (issue #961). If the
-   commit also fixes a related issue, add a second `Closes #N` line.
-   Do NOT include issue numbers in the title — see
-   `docs/orchestration/pr-body-conventions.md` for the rationale.
- 9. Verify closingReferences count matches the number of issues this PR resolves:
+    ```
+    The body must list ALL issues that this PR resolves (issue #961). If the
+    commit also fixes a related issue, add a second `Closes #N` line.
+    Do NOT include issue numbers in the title — see
+    `docs/orchestration/pr-body-conventions.md` for the rationale.
+  9. Verify closingReferences count matches the number of issues this PR resolves:
     ```
     bash scripts/check_pr_closing_refs.sh <PR_NUMBER> <COUNT>
     ```
@@ -53,6 +59,12 @@ Steps:
     If the sub-agent exits before completing step 7 or 8, the orchestrator's
     wave-level recovery sequence (see SKILL.md Phase 3c § Recovery) will push
     the branch and create the PR directly using --force-with-lease.
+10. **FINAL OUTPUT**: Your last line of output MUST be:
+    ```
+    PR: {PR_NUMBER}
+    ```
+    Do NOT say "done", "complete", or anything else after the PR number.
+    The orchestrator parses this line to confirm success.
 
 Rules:
 - Work ONLY in your assigned worktree ({WORKDIR})
