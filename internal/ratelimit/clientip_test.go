@@ -200,17 +200,55 @@ func TestResolve_IPv6(t *testing.T) {
 	}
 }
 
-// A malformed token in the middle of the chain stops the walk (no valid
-// IP returned by rightmostUntrusted), so we fall back to the peer
-// rather than skipping past the malformed entry (injection guard).
-func TestResolve_MalformedMiddleToken_StopsWalk(t *testing.T) {
+// Issue #979: leftmost untrusted correctly resolves the original client
+// when all intervening proxies are trusted.  Rightmost-untrusted would
+// return 10.0.0.2 (the trusted peer) instead of the original client.
+func TestResolve_LeftmostUntrusted_ReturnsOriginalClient(t *testing.T) {
+	r := NewClientIPResolver(mustCIDRs(t, "10.0.0.2/32"))
+	// NEXUS_TRUSTED_PROXIES=10.0.0.2, XFF=1.2.3.4,10.0.0.2, peer=10.0.0.2
+	got := r.Resolve(mkReq("10.0.0.2:4000", "1.2.3.4, 10.0.0.2", ""))
+	if got != "1.2.3.4" {
+		t.Errorf("expected original client 1.2.3.4, got %q", got)
+	}
+}
+
+// Issue #979: leftmost untrusted returns the first untrusted hop when an
+// attacker-controlled proxy appears before the original client in the
+// chain. This correctly attributes the request to the first suspicious
+// hop rather than the actual client (which may be legitimate).
+func TestResolve_LeftmostUntrusted_ReturnsFirstUntrustedHop(t *testing.T) {
+	r := NewClientIPResolver(mustCIDRs(t, "10.0.0.2/32"))
+	// XFF=client, attackerProxy, trustedPeer; peer=trustedPeer
+	// The attacker puts their IP first in the chain, before the client.
+	got := r.Resolve(mkReq("10.0.0.2:4000", "203.0.113.5, 5.6.7.8, 10.0.0.2", ""))
+	if got != "203.0.113.5" {
+		t.Errorf("expected first untrusted hop 203.0.113.5, got %q", got)
+	}
+}
+
+// Issue #979: split-trust chain where only the rightmost proxy is trusted.
+// rightmost-untrusted returns the trusted peer (10.0.0.2) and never reaches
+// the original client. leftmost-untrusted correctly returns the original
+// client when all intervening hops are trusted.
+func TestResolve_SplitTrustChain_LeftmostUntrusted(t *testing.T) {
+	r := NewClientIPResolver(mustCIDRs(t, "10.0.0.2/32"))
+	// peer is trusted (10.0.0.2); chain: originalClient(1.2.3.4), middleProxy(10.0.0.1), trustedPeer(10.0.0.2)
+	got := r.Resolve(mkReq("10.0.0.2:4000", "1.2.3.4, 10.0.0.1, 10.0.0.2", ""))
+	if got != "1.2.3.4" {
+		t.Errorf("expected original client 1.2.3.4, got %q", got)
+	}
+}
+
+// A malformed token in the middle of the chain is skipped by
+// leftmostUntrusted (we keep walking to find the first untrusted valid
+// IP). The first untrusted IP in the chain is returned.
+func TestResolve_MalformedMiddleToken_SkipsAndContinues(t *testing.T) {
 	r := NewClientIPResolver(mustCIDRs(t, "10.0.0.0/8"))
 	// peer 10.0.0.1 trusted; chain "client, bogus, 10.0.0.1".
-	// Walking right-to-left: skip 10.0.0.1 (trusted), hit "bogus"
-	// (invalid) -> rightmostUntrusted returns "" -> fall back to peer.
+	// Walking left-to-right: 203.0.113.5 is untrusted -> return it.
 	got := r.Resolve(mkReq("10.0.0.1:4000", "203.0.113.5, bogus, 10.0.0.1", ""))
-	if got != "10.0.0.1" {
-		t.Errorf("expected peer fallback on malformed middle token, got %q", got)
+	if got != "203.0.113.5" {
+		t.Errorf("expected first untrusted hop, got %q", got)
 	}
 }
 

@@ -523,7 +523,7 @@ func main() {
 				Instruction: c.Instruction,
 				Output:      c.Output,
 				LocalModel:  c.LocalModel,
-				Route:      c.Route,
+				Route:       c.Route,
 				TraceParent: c.TraceParent,
 				TraceState:  c.TraceState,
 			}) {
