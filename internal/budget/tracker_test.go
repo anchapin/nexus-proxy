@@ -239,7 +239,7 @@ func TestRingBufferWrap(t *testing.T) {
 	st := NewSpendTracker(100.0)
 	// Small ring capacity for test: create a tracker and manually set
 	// entries to a small capacity to test wrapping.
-	st.entries = make([]entry, 4, 4) // 4-slot ring
+	st.entries = make([]entry, 4) // 4-slot ring
 	st.head = 0
 	st.tail = 0
 	st.count = 0
@@ -280,7 +280,7 @@ func TestRingBufferWrap(t *testing.T) {
 func TestRingBufferGrow(t *testing.T) {
 	st := NewSpendTracker(100.0)
 	// Use tiny ring to trigger grow.
-	st.entries = make([]entry, 4, 4)
+	st.entries = make([]entry, 4)
 	st.head = 0
 	st.tail = 0
 	st.count = 0

@@ -105,7 +105,7 @@ func NewSpendTracker(dailyBudgetUSD float64) *SpendTracker {
 	return &SpendTracker{
 		window:  defaultWindow,
 		budget:  dailyBudgetUSD,
-		entries: make([]entry, ringCapacity, ringCapacity), // pre-allocated ring buffer
+		entries: make([]entry, ringCapacity), // pre-allocated ring buffer
 	}
 }
 
@@ -220,7 +220,7 @@ func (st *SpendTracker) Record(amount float64) {
 // the mutex held.
 func (st *SpendTracker) growLocked() {
 	newCap := cap(st.entries) * 2
-	newEntries := make([]entry, newCap, newCap)
+	newEntries := make([]entry, newCap)
 
 	// Copy entries in logical order (head → oldest, wrapping).
 	for i := 0; i < st.count; i++ {
