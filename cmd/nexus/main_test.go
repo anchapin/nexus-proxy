@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -866,6 +867,37 @@ func TestConfidenceBridgeRecordNoCategory(t *testing.T) {
 	// conf.RecordOutcome is NOT called when category is unknown.
 	if len(conf.outcomeCalls) != 0 {
 		t.Errorf("RecordOutcome: got %d calls, want 0 when no category", len(conf.outcomeCalls))
+	}
+}
+
+// TestConfidenceBridgeRecordNoDuplicateCalls (issue #1017) verifies that
+// RecordOutcome is called exactly once per in-range score. A previous merge
+// conflict (PR #1007) incorrectly combined changes from #970 and #981,
+// resulting in two RecordOutcome calls for scores 1-5: one with hardcoded
+// RouteLocal and one with the actual route. The fix consolidates into a
+// single call inside the else block.
+func TestConfidenceBridgeRecordNoDuplicateCalls(t *testing.T) {
+	inner := &stubJudgeStorage{}
+	conf := &stubConfidenceStore{}
+	bridge := newConfidenceBridge(inner, conf)
+
+	// Test all in-range scores (1-5) to ensure no duplicate calls
+	for score := 1; score <= 5; score++ {
+		conf.outcomeCalls = nil // reset
+		reqID := fmt.Sprintf("req-%d", score)
+
+		bridge.note(reqID, "css")
+		s := judge.JudgeScore{RequestID: reqID, Score: score, Route: "fusion", Err: nil}
+		if err := bridge.Record(s); err != nil {
+			t.Fatalf("Record with score %d: unexpected error: %v", score, err)
+		}
+
+		if len(conf.outcomeCalls) != 1 {
+			t.Errorf("score %d: RecordOutcome called %d times, want exactly 1", score, len(conf.outcomeCalls))
+		}
+		if len(conf.outcomeCalls) > 0 && conf.outcomeCalls[0].judgeScore != score {
+			t.Errorf("score %d: judgeScore=%d, want %d", score, conf.outcomeCalls[0].judgeScore, score)
+		}
 	}
 }
 
