@@ -270,20 +270,13 @@ func OpenPersistentStore(path string, embedder Embedder, threshold float64, opts
 	if path == ":memory:" {
 		storePath = ""
 	}
-	p := &PersistentStore{
+	return &PersistentStore{
 		Store:         NewStore(embedder, threshold, opts...),
 		db:            db,
 		path:          storePath,
 		embedderModel: embedderModel,
 		embedderDims:  embedderDims,
-	}
-	// Wire the probed embedder dimension into the HNSW config so that
-	// restoreIndex (DeserializeHNSWIndex) can validate vector dimensions
-	// and reject dimension-mismatched blobs (issue #964).
-	if embedderDims > 0 {
-		p.Store.indexConfig.Dimension = embedderDims
-	}
-	return p, nil
+	}, nil
 }
 
 // ragDSN mirrors the metrics store's DSN: WAL journalling for
