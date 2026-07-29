@@ -35,11 +35,11 @@ import (
 // (RPM <= 0); always construct via NewMiddleware.
 type Middleware struct {
 	resolver *ClientIPResolver
-	rpm      int           // steady-state requests per minute
-	burst    int           // bucket capacity
-	ttl      time.Duration // idle bucket retention before reaping
-	stopCh   chan struct{} // closed when reaper should exit
-	reaperWG sync.WaitGroup // tracks the reaper goroutine for确定性 (issue #960)
+	rpm      int            // steady-state requests per minute
+	burst    int            // bucket capacity
+	ttl      time.Duration  // idle bucket retention before reaping
+	stopCh   chan struct{}  // closed when reaper should exit
+	reaperWG sync.WaitGroup // tracks reaper goroutine for deterministic exit (issue #960)
 
 	// keyFn computes the bucket key from an inbound request. It composes
 	// on top of the ClientIPResolver. The default (nil) uses IP-only;
