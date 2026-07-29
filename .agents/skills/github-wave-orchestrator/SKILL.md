@@ -17,7 +17,7 @@ monitors CI, merges PRs, then proceeds to the next wave.
 ## Quick Start
 
 ```
-0. Pre-flight     →  verify gh auth, worktrees/ writable
+0. Pre-flight     →  verify gh auth, worktrees/ writable, skill sync check
 1. Discover       →  gh issue list --json number,title,body,labels
 2. Plan waves     →  node scripts/wave-planner.js < issues.json
 3. Execute waves  →  worktree → implement → PR → CI → merge → cleanup
@@ -30,6 +30,17 @@ monitors CI, merges PRs, then proceeds to the next wave.
 gh auth status                              # Must be authenticated
 git fetch origin develop                    # Base branch must be current
 mkdir -p ../worktrees && touch ../worktrees/.test && rm ../worktrees/.test  # Writable
+```
+
+**Skill sync check** — verify all skill resources exist before spawning sub-agents:
+```bash
+SKILL_DIR=".agents/skills/github-wave-orchestrator"
+for f in "$SKILL_DIR/SKILL.md" "$SKILL_DIR/REFERENCE.md" "$SKILL_DIR/scripts/wave-planner.js"; do
+  if [ ! -f "$f" ]; then
+    echo "FAIL: missing skill resource: $f" >&2
+    exit 1
+  fi
+done
 ```
 
 If any check fails, stop and report to the user.
@@ -116,16 +127,30 @@ instead of passively waiting for a done signal:
    # Must return 1 — if 0, escalate to user with worktree path
    ```
 
-4. **Idempotency**: All orchestrator push commands use `--force-with-lease`.
+4. **PR base verification** (after PR is found, before recording it):
+   ```bash
+   BASE_REF=$(gh pr view {PR_NUMBER} --json baseRefName --jq '.baseRefName')
+   if [ "$BASE_REF" != "develop" ]; then
+     # Auto-fix: close wrong-base PR and recreate targeting develop
+     gh pr close {PR_NUMBER}
+     gh pr create --base develop \
+       --title "$(gh pr view {PR_NUMBER} --json title --jq '.title')" \
+       --body "$(gh pr view {PR_NUMBER} --json body --jq '.body')" \
+       --head fix/issue-{N}-{slug}
+   fi
+   ```
+   This catches sub-agents that omit `--base develop` from `gh pr create`.
+
+5. **Idempotency**: All orchestrator push commands use `--force-with-lease`.
    All `gh pr create` calls are safe to re-run — GitHub returns error if PR
    already exists for that head branch, but the verification above prevents
    reaching that case.
 
-5. **Escalation**: If recovery sequence fails or PR still missing after push,
+6. **Escalation**: If recovery sequence fails or PR still missing after push,
    record issue as `escalated` in wave-state.json and report to user with
    worktree path so they can inspect and push manually.
 
-**Do not proceed to Phase 4 until every PR in the wave exists or is escalated.**
+**Do not proceed to Phase 4 until every PR in the wave exists (on develop) or is escalated.**
 
 ## Phase 4: CI and Merge
 

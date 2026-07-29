@@ -7,6 +7,12 @@ When spawning a Task sub-agent to implement an issue, use this prompt:
 ```
 You are implementing a fix for GitHub issue #{NUMBER}: {TITLE}
 
+IMPORTANT: The `--base develop` flag is MANDATORY. Omitting it causes the PR
+to target main (the repository default branch), which blocks the wave pipeline.
+The orchestrator has an auto-fix step, but always specify --base develop
+explicitly to avoid recovery overhead.
+```
+
 Repository: {OWNER}/{REPO}
 Branch: fix/issue-{NUMBER}-{SLUG} (already checked out)
 Workdir: ../worktrees/issue-{NUMBER}-{SLUG}
@@ -73,16 +79,33 @@ Steps:
 2. IF CI is green:
    a. Check mergeable: gh pr view {NUMBER} --json mergeable
    b. If CONFLICTING → follow the merge conflict protocol below
-   c. If MERGEABLE → merge: gh pr merge {NUMBER} --squash --delete-branch
-      Then verify the merge persisted:
-      ```
-      gh pr view {NUMBER} --json mergedAt --jq '.mergedAt'
-      ```
-      - If mergedAt is NOT null → merge succeeded, proceed to cleanup
-      - If mergedAt IS null → merge did NOT persist. Retry once:
-        `gh pr merge {NUMBER} --squash --delete-branch`
-        If second attempt also yields null mergedAt → report BLOCKED and STOP
-   d. Clean up: git worktree remove ../worktrees/issue-{NUMBER}-{SLUG}
+    c. If MERGEABLE → merge: gh pr merge {NUMBER} --squash
+       NOTE: Do NOT use --delete-branch here. The branch deletion must happen
+       AFTER worktree removal (see step 2d below) to avoid:
+       "error: cannot delete branch 'fix/issue-N' used by worktree at '../worktrees/issue-N'"
+
+       Then verify the merge persisted:
+       ```
+       gh pr view {NUMBER} --json mergedAt --jq '.mergedAt'
+       ```
+       - If mergedAt is NOT null → merge succeeded, proceed to step 2d
+       - If mergedAt IS null → merge did NOT persist. Retry once:
+         `gh pr merge {NUMBER} --squash`
+         If second attempt also yields null mergedAt → report BLOCKED and STOP
+    d. Clean up (ORDER MATTERS — worktree remove BEFORE branch delete):
+       ```bash
+       # Step 1: Remove worktree FIRST (branch must not be deleted yet)
+       git worktree remove ../worktrees/issue-{NUMBER}-{SLUG}
+
+       # Step 2: Delete local branch (safe now that worktree is gone)
+       git branch -d fix/issue-{NUMBER}-{SLUG}
+
+       # Step 3: Delete remote branch
+       git push origin --delete fix/issue-{NUMBER}-{SLUG}
+
+       # Step 4: Prune any stale worktree references
+       git worktree prune
+       ```
 3. IF CI is failing:
    a. Get failing run: gh run list --branch fix/issue-{NUMBER}-{SLUG} --limit 1
    b. Get logs: gh run view {RUN_ID} --log
@@ -131,7 +154,12 @@ Within a wave, merge PRs in a specific order to minimize conflicts:
 ```bash
 # Immediately after merging PR #{N}:
 git fetch origin develop
+
+# Cleanup (ORDER MATTERS: worktree remove BEFORE branch delete)
 git worktree remove ../worktrees/issue-{N}-{slug}
+git branch -d fix/issue-{N}-{slug}
+git push origin --delete fix/issue-{N}-{slug}
+git worktree prune
 
 # For each remaining PR in the wave:
 gh pr view {M} --json mergeable --jq '.mergeable'
@@ -378,6 +406,7 @@ After PR merge:
 ```bash
 git worktree remove ../worktrees/issue-{N}-{slug}
 git branch -d fix/issue-{N}-{slug}
+git push origin --delete fix/issue-{N}-{slug}
 git worktree prune
 ```
 
