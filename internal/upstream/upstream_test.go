@@ -2771,3 +2771,149 @@ func TestStreamCachedArbiterSynthesis_Success(t *testing.T) {
 		t.Errorf("body does not end with SSE done: %q", body)
 	}
 }
+
+// Issue #980 tests — SSE data line JSON validation.
+
+func TestIsSSEDataLine(t *testing.T) {
+	tests := []struct {
+		line   string
+		isData bool
+	}{
+		{"data: {\"a\":1}\n", true},
+		{"data: [DONE]\n", false},    // done line is NOT a data line
+		{"data:\n", false},           // no space after colon
+		{":comment\n", false},        // comment line
+		{"\n", false},                // blank line
+		{"event: message\n", false},  // other SSE field
+		{"data: plain text\n", true}, // plain text IS a data line (json.Valid returns false)
+	}
+	for _, tt := range tests {
+		got := isSSEDataLine([]byte(tt.line))
+		if got != tt.isData {
+			t.Errorf("isSSEDataLine(%q) = %v, want %v", tt.line, got, tt.isData)
+		}
+	}
+}
+
+func TestValidSSELineJSON(t *testing.T) {
+	tests := []struct {
+		line    string
+		isValid bool
+	}{
+		// Valid JSON data lines
+		{"data: {\"a\":1}\n", true},
+		{"data: [1,2,3]\n", true},
+		{"data: \"plain string\"\n", true},
+		{"data: true\n", true},
+		{"data: null\n", true},
+		{"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n", true},
+
+		// Invalid JSON data lines — issue #980
+		{"data: not json\n", false},
+		{"data: {invalid}\n", false},
+		{"data: plain text without json\n", false},
+
+		// Non-data lines — forwarded unchanged (valid=true)
+		{":comment\n", true},       // comment
+		{"\n", true},               // blank
+		{"event: message\n", true}, // other SSE field
+		// Note: "data: [DONE]\n" is NOT a data line (isSSEDataLine returns false)
+		// so it doesn't reach validSSELineJSON in the main loop
+	}
+	for _, tt := range tests {
+		got := validSSELineJSON([]byte(tt.line))
+		if got != tt.isValid {
+			t.Errorf("validSSELineJSON(%q) = %v, want %v", tt.line, got, tt.isValid)
+		}
+	}
+}
+
+func TestStreamWithContext_MalformedSSEDataTerminatesCleanly(t *testing.T) {
+	// Upstream sends valid JSON first, then a malformed data line.
+	chunks := []string{
+		"data: {\"a\":1}\n\n",
+		"data: not json\n\n",
+	}
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(strings.Join(chunks, ""))),
+		}, nil
+	})}
+	rw := newRW()
+	err := Stream(rw, client, "http://x", "", map[string]interface{}{"model": "m"})
+	// Stream should return nil (clean termination, not an error)
+	if err != nil {
+		t.Fatalf("Stream: unexpected error: %v", err)
+	}
+	// The malformed line should NOT be forwarded; instead we should see [DONE]
+	body := rw.body.String()
+	if strings.Contains(body, "not json") {
+		t.Errorf("malformed data was forwarded: %q", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("expected [DONE] terminator, got: %q", body)
+	}
+	// The valid first chunk should have been forwarded
+	if !strings.Contains(body, "data: {\"a\":1}") {
+		t.Errorf("valid first chunk was not forwarded: %q", body)
+	}
+}
+
+func TestStreamWithContext_MultipleMalformedLines(t *testing.T) {
+	chunks := []string{
+		"data: {\"ok\":true}\n\n",
+		"data: bad\n\n",
+		"data: also bad\n\n",
+	}
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(strings.Join(chunks, ""))),
+		}, nil
+	})}
+	rw := newRW()
+	err := Stream(rw, client, "http://x", "", map[string]interface{}{"model": "m"})
+	if err != nil {
+		t.Fatalf("Stream: unexpected error: %v", err)
+	}
+	body := rw.body.String()
+	// First valid chunk should be present
+	if !strings.Contains(body, "data: {\"ok\":true}") {
+		t.Errorf("valid first chunk missing: %q", body)
+	}
+	// Malformed content should NOT appear
+	if strings.Contains(body, "bad") {
+		t.Errorf("malformed data was forwarded: %q", body)
+	}
+	// Should terminate with [DONE]
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("expected [DONE] terminator: %q", body)
+	}
+}
+
+func TestStreamWithContext_ValidSSEDataPassesThrough(t *testing.T) {
+	// Regression: valid SSE data should pass through unchanged
+	chunks := []string{
+		"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+		"data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n",
+		"data: [DONE]\n\n",
+	}
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(strings.Join(chunks, ""))),
+		}, nil
+	})}
+	rw := newRW()
+	err := Stream(rw, client, "http://x", "", map[string]interface{}{"model": "m"})
+	if err != nil {
+		t.Fatalf("Stream: unexpected error: %v", err)
+	}
+	if rw.body.String() != strings.Join(chunks, "") {
+		t.Errorf("body = %q, want %q", rw.body.String(), strings.Join(chunks, ""))
+	}
+}
