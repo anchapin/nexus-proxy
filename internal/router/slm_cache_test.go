@@ -1313,7 +1313,8 @@ func TestSLMCache_SemanticScanLimit_ZeroUnlimited(t *testing.T) {
 }
 
 func TestSLMCache_SemanticScanLimit_OneScansOne(t *testing.T) {
-	// With maxScanEntries=1 and one valid entry, the entry is scanned and found.
+	// SetMaxScanEntries is now a no-op (issue #969); semantic scan is always unlimited.
+	// With one valid entry, it is always found.
 	stub := newStubEmbedder()
 	c := NewSLMCacheWithEmbedder(time.Hour, 0, stub, 0.5)
 	ctx := context.Background()
@@ -1322,19 +1323,19 @@ func TestSLMCache_SemanticScanLimit_OneScansOne(t *testing.T) {
 	stub.embeddings["query-b"] = []float64{0.99, 0.01, 0.0, 0.0}
 
 	c.Set(ctx, "cached-b", RouteLocal)
-	c.SetMaxScanEntries(1)
+	c.SetMaxScanEntries(1) // Setting it does nothing, but we call it for coverage.
 
-	// maxScanEntries=1; only "cached-b" is scanned; cosine > 0.5 → hit.
+	// Semantic scan is unlimited; "cached-b" is scanned; cosine > 0.5 → hit.
 	got, ok, kind := c.Get(ctx, "query-b")
 	if !ok || got != RouteLocal || kind != CacheHitSemantic {
-		t.Errorf("maxScanEntries=1: got (%v, %v, %v), want (RouteLocal, true, CacheHitSemantic)", got, ok, kind)
+		t.Errorf("unlimited scan: got (%v, %v, %v), want (RouteLocal, true, CacheHitSemantic)", got, ok, kind)
 	}
 }
 
 func TestSLMCache_SemanticScanLimit_NilEmbedEntrySkipped(t *testing.T) {
-	// When the only cached entry has nil emb (SetEmbedding with nil), scanning
-	// skips it (nil emb → not cosine-scored). maxScanEntries=1 is exhausted on
-	// the nil entry → miss.
+	// SetMaxScanEntries is now a no-op (issue #969); semantic scan is always unlimited.
+	// When the only cached entry has nil emb, it is skipped (nil emb → not cosine-scored)
+	// and no other entries exist → miss.
 	stub := newStubEmbedder()
 	c := NewSLMCacheWithEmbedder(time.Hour, 0, stub, 0.5)
 	ctx := context.Background()
@@ -1344,10 +1345,9 @@ func TestSLMCache_SemanticScanLimit_NilEmbedEntrySkipped(t *testing.T) {
 
 	// SetEmbedding with nil: entry.emb=nil (embedder NOT called).
 	c.SetEmbedding("cached-nil", RouteLocal, nil)
-	c.SetMaxScanEntries(1)
+	c.SetMaxScanEntries(1) // Setting it does nothing, but we call it for coverage.
 
-	// Scan: entry.emb is nil → skipped (counts toward limit, no cosine call).
-	// Limit exhausted (1 scanned) → miss.
+	// Semantic scan is unlimited but entry.emb is nil → skipped → miss.
 	got, ok, kind := c.Get(ctx, "query-nil")
 	if ok {
 		t.Errorf("nil emb entry should be skipped; got (%v, %v, %v), want miss", got, ok, kind)
@@ -1355,8 +1355,12 @@ func TestSLMCache_SemanticScanLimit_NilEmbedEntrySkipped(t *testing.T) {
 }
 
 func TestSLMCache_SemanticScanLimit_TwoEntriesOneSkipped(t *testing.T) {
-	// With 2 entries and maxScanEntries=1: if the first scanned entry has nil emb,
-	// it is skipped (counts toward limit) and the second entry is never reached → miss.
+	// Issue #969: maxScanEntries was non-deterministic because Go map iteration
+	// order is arbitrary. With the limit removed, all entries are always scanned
+	// in getSemantic, making cache hits deterministic.
+	//
+	// This test verifies that nil emb entries are skipped but all valid entries
+	// are scanned, producing a deterministic semantic hit.
 	stub := newStubEmbedder()
 	c := NewSLMCacheWithEmbedder(time.Hour, 0, stub, 0.5)
 	ctx := context.Background()
@@ -1369,16 +1373,15 @@ func TestSLMCache_SemanticScanLimit_TwoEntriesOneSkipped(t *testing.T) {
 	// valid-entry: entry.emb=[1,0,0,0] (SetEmbedding with explicit emb).
 	c.SetEmbedding("nil-entry", RouteLocal, nil)
 	c.SetEmbedding("valid-entry", RouteFrontier, []float64{1.0, 0.0, 0.0, 0.0})
-	c.SetMaxScanEntries(1)
 
-	// Scan limit=1 is enforced — at most one entry is cosine-scored.
-	// Which entry wins the map iteration lottery is non-deterministic.
-	// The test verifies the call completes without panicking or hanging,
-	// and that the bounded-scan code path is exercised.
+	// SetMaxScanEntries is now a no-op (issue #969); semantic scan is always unlimited.
+	// All entries are scanned: nil-entry is skipped (nil emb), valid-entry is matched.
+	c.SetMaxScanEntries(1) // Setting it does nothing, but we call it for coverage.
+
 	got, ok, kind := c.Get(ctx, "query-two")
-	_ = got
-	_ = ok
-	_ = kind
+	if !ok || got != RouteFrontier || kind != CacheHitSemantic {
+		t.Errorf("unlimited scan with nil+valid: got (%v, %v, %v), want (RouteFrontier, true, CacheHitSemantic)", got, ok, kind)
+	}
 }
 
 func TestSLMCache_SemanticScanLimit_ZeroLimitAllScanned(t *testing.T) {
@@ -1404,8 +1407,8 @@ func TestSLMCache_SemanticScanLimit_ZeroLimitAllScanned(t *testing.T) {
 }
 
 func TestSLMCache_SemanticScanLimit_LimitExhaustedAfterValidHit(t *testing.T) {
-	// With maxScanEntries=1 and 1 valid entry, the entry is scanned and a
-	// semantic hit is returned immediately.
+	// SetMaxScanEntries is now a no-op (issue #969); semantic scan is always unlimited.
+	// With one valid entry, it is scanned and a semantic hit is returned.
 	stub := newStubEmbedder()
 	c := NewSLMCacheWithEmbedder(time.Hour, 0, stub, 0.5)
 	ctx := context.Background()
@@ -1414,10 +1417,46 @@ func TestSLMCache_SemanticScanLimit_LimitExhaustedAfterValidHit(t *testing.T) {
 	stub.embeddings["query-only"] = []float64{0.99, 0.01, 0.0, 0.0}
 
 	c.SetEmbedding("only-entry", RouteLocal, []float64{1.0, 0.0, 0.0, 0.0})
-	c.SetMaxScanEntries(1)
+	c.SetMaxScanEntries(1) // Setting it does nothing, but we call it for coverage.
 
 	got, ok, kind := c.Get(ctx, "query-only")
 	if !ok || got != RouteLocal || kind != CacheHitSemantic {
-		t.Errorf("valid hit with limit=1: got (%v, %v, %v), want (RouteLocal, true, CacheHitSemantic)", got, ok, kind)
+		t.Errorf("unlimited scan with valid entry: got (%v, %v, %v), want (RouteLocal, true, CacheHitSemantic)", got, ok, kind)
 	}
 }
+
+// TestSLMCache_SemanticScanDeterministic verifies the fix for issue #969:
+// non-deterministic cache hits with maxScanEntries limit.
+//
+// Before the fix, when maxScanEntries limited the semantic scan, entries
+// were iterated in Go's arbitrary map order. The "best" similarity match
+// was whichever entry happened to be visited first — not necessarily the
+// most similar. This caused non-deterministic cache hits across runs.
+//
+// After the fix (maxScanEntries removed), all entries are always scanned,
+// making cache hits deterministic for the same query.
+func TestSLMCache_SemanticScanDeterministic(t *testing.T) {
+	stub := newStubEmbedder()
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, stub, 0.5)
+	ctx := context.Background()
+
+	// Set up multiple entries with different embeddings and routes.
+	// valid-a has embedding very close to query, should be best match.
+	// valid-b has embedding far from query, should not match above threshold.
+	stub.embeddings["valid-a"] = []float64{1.0, 0.0, 0.0, 0.0}
+	stub.embeddings["valid-b"] = []float64{0.0, 1.0, 0.0, 0.0} // orthogonal to valid-a
+	stub.embeddings["query"] = []float64{0.99, 0.01, 0.0, 0.0}   // very close to valid-a
+
+	c.SetEmbedding("valid-a", RouteLocal, []float64{1.0, 0.0, 0.0, 0.0})
+	c.SetEmbedding("valid-b", RouteFrontier, []float64{0.0, 1.0, 0.0, 0.0})
+
+	// SetMaxScanEntries is a no-op (issue #969); scan is always unlimited.
+	// Verify deterministic hit by calling Get multiple times.
+	for i := 0; i < 10; i++ {
+		got, ok, kind := c.Get(ctx, "query")
+		if !ok || got != RouteLocal || kind != CacheHitSemantic {
+			t.Errorf("run %d: got (%v, %v, %v), want (RouteLocal, true, CacheHitSemantic)", i, got, ok, kind)
+		}
+	}
+}
+
