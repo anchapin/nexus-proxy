@@ -168,7 +168,15 @@ Spawn one sub-agent per PR using the prompt template in
 Each sub-agent monitors CI, fixes failures, resolves merge conflicts,
 and merges the PR.
 
-### 4c. Wait
+### 4c. Issue Close Verification
+
+After each PR merge, the CI sub-agent verifies that all issues mentioned
+in the PR body are actually closed (issue #961). This catches the case where
+GitHub's auto-close only matches some issues due to incorrect or incomplete
+`Closes #N` syntax in the PR body. If any linked issue remains open, the
+sub-agent reports BLOCKER and stops instead of proceeding.
+
+### 4d. Wait
 
 Monitor until ALL PRs in the wave are merged (or escalated).
 Then clean up worktrees: `git worktree prune`
