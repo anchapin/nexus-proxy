@@ -280,3 +280,32 @@ func TestHNSWIndexSerializeIdempotent(t *testing.T) {
 		}
 	}
 }
+
+// TestDeserializeHNSWIndex_DimensionMismatch verifies that DeserializeHNSWIndex
+// returns an error when the stored vector dimensions do not match the
+// expected dimension configured in HNSWConfig (issue #964).
+func TestDeserializeHNSWIndex_DimensionMismatch(t *testing.T) {
+	t.Parallel()
+
+	cfg := HNSWConfig{M: 8, efConstruction: 50, efSearch: 20, seed: 42}
+	const n, dim = 10, 16
+	idx := buildTestIndex(t, cfg, n, dim)
+
+	data, err := idx.Serialize()
+	if err != nil {
+		t.Fatalf("Serialize: %v", err)
+	}
+
+	// Deserializing with matching dimension should succeed.
+	_, err = DeserializeHNSWIndex(data, HNSWConfig{Dimension: dim})
+	if err != nil {
+		t.Fatalf("DeserializeHNSWIndex with matching dimension: %v", err)
+	}
+
+	// Deserializing with wrong dimension should fail.
+	wrongDim := dim + 4
+	_, err = DeserializeHNSWIndex(data, HNSWConfig{Dimension: wrongDim})
+	if err == nil {
+		t.Fatalf("DeserializeHNSWIndex with wrong dimension: expected error, got nil")
+	}
+}
