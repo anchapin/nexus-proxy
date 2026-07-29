@@ -80,3 +80,35 @@ func containsSubstring(s, substr string) bool {
 	}
 	return false
 }
+
+// TestSecurityHeadersContentSecurityPolicy verifies the restrictive
+// Content-Security-Policy header is stamped on every response (issue #965).
+// The policy locks down default-src, frame-ancestors, script-src, and
+// object-src to 'none' so upstream injection cannot execute scripts or
+// load plugins in a client browser.
+func TestSecurityHeadersContentSecurityPolicy(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(SecurityHeaders(false)(inner))
+	defer srv.Close()
+
+	resp := getContextGet(t, http.DefaultClient, srv.URL)
+	defer resp.Body.Close()
+
+	csp := resp.Header.Get("Content-Security-Policy")
+	if csp == "" {
+		t.Fatal("Content-Security-Policy header is missing")
+	}
+	// Every directive must be set to 'none' — no allowances.
+	for _, want := range []string{
+		`default-src 'none'`,
+		`frame-ancestors 'none'`,
+		`script-src 'none'`,
+		`object-src 'none'`,
+	} {
+		if !containsSubstring(csp, want) {
+			t.Errorf("Content-Security-Policy %q missing directive %q", csp, want)
+		}
+	}
+}
