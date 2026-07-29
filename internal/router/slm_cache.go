@@ -76,6 +76,12 @@ type SLMCache struct {
 	// a non-nil error (issue #741). It is safe to read concurrently.
 	embedErrors uint64
 
+	// dimMismatch is a cumulative atomic counter bumped in getSemantic
+	// when a stored embedding has a different dimension than the
+	// incoming query embedding (issue #968). It is safe to read
+	// concurrently.
+	dimMismatch uint64
+
 	// embedBreaker is a fixed-size circular buffer of recent embed failure
 	// timestamps recorded in Set. It is used to detect sustained embedder
 	// failure and trip the circuit breaker (issue #982). A zeroed entry
@@ -353,6 +359,13 @@ func (c *SLMCache) getSemantic(ctx context.Context, prompt string) (Route, bool,
 		if entry.emb == nil {
 			continue
 		}
+		if len(emb) != len(entry.emb) {
+			// Dimension mismatch: skip this entry and record the mismatch
+			// so operators can detect embedder model version changes
+			// (issue #968).
+			atomic.AddUint64(&c.dimMismatch, 1)
+			continue
+		}
 		score := cosineSimilarity(emb, entry.emb)
 		if score > bestScore {
 			bestScore = score
@@ -599,12 +612,14 @@ func (c *SLMCache) EvictExpired() int {
 // (issue #449) and reflect removals that actually happened; entries
 // past TTL but not yet evicted are reflected by the Expired counter.
 // EmbedErrors is the cumulative count of embedder errors (issue #741).
+// DimMismatch is the cumulative count of dimension mismatches (issue #968).
 type SLMCacheStats struct {
 	Entries      int    // live (non-expired) entries
 	Expired      int    // entries past TTL (not yet evicted)
 	TTLEvictions uint64 // cumulative TTL removals
 	LRUEvictions uint64 // cumulative LRU removals (capacity pressure)
 	EmbedErrors  uint64 // cumulative embedder errors (issue #741)
+	DimMismatch  uint64 // cumulative dimension mismatches (issue #968)
 }
 
 // Stats returns a snapshot of cache entry counts and cumulative
@@ -629,6 +644,7 @@ func (c *SLMCache) Stats() SLMCacheStats {
 		TTLEvictions: atomic.LoadUint64(&c.ttlEvictions),
 		LRUEvictions: atomic.LoadUint64(&c.lruEvictions),
 		EmbedErrors:  atomic.LoadUint64(&c.embedErrors),
+		DimMismatch:  atomic.LoadUint64(&c.dimMismatch),
 	}
 }
 

@@ -1603,3 +1603,174 @@ func TestSLMCache_EmbedBreaker_SustainedFailureSkipsEmbed(t *testing.T) {
 		}
 	}
 }
+
+// --- Dimension mismatch detection (issue #968) ---
+
+// fixedDimEmbedder returns embeddings of a fixed dimension but with
+// content based on the text hash so different prompts produce different
+// vectors at the same dimension.
+type fixedDimEmbedder struct {
+	dim int
+	vec []float64
+}
+
+func (f *fixedDimEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
+	out := make([]float64, f.dim)
+	copy(out, f.vec)
+	// Modify based on text hash to get unique vectors per prompt.
+	h := uint64(0)
+	for i := 0; i < len(text); i++ {
+		h = h*31 + uint64(text[i])
+	}
+	for i := range out {
+		out[i] += float64((h >> uint(i)) & 1)
+	}
+	return out, nil
+}
+
+// changingDimEmbedder returns embeddings whose dimension changes after a
+// configurable number of calls. It simulates an embedder model version change.
+type changingDimEmbedder struct {
+	calls       int
+	dimA, dimB  int
+	vecA        []float64
+	switchAfter int // after this many calls, switch to dimB
+}
+
+func (c *changingDimEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
+	c.calls++
+	if c.calls <= c.switchAfter {
+		out := make([]float64, c.dimA)
+		copy(out, c.vecA)
+		return out, nil
+	}
+	// Generate a unique vector for each text at dimB.
+	out := make([]float64, c.dimB)
+	h := uint64(0)
+	for i := 0; i < len(text); i++ {
+		h = h*31 + uint64(text[i])
+	}
+	for i := range out {
+		out[i] = float64((h >> uint(i)) & 1)
+	}
+	return out, nil
+}
+
+func TestSLMCache_DimMismatch_getSemantic_SkipsMismatchedEntry(t *testing.T) {
+	// When a stored embedding has a different dimension than the incoming
+	// query embedding, getSemantic must skip that entry (treat it as a
+	// cache miss) and increment the DimMismatch counter (issue #968).
+	//
+	// Scenario: first prompt stored with 4-dim embedding, second prompt
+	// triggers getSemantic with a 2-dim embedding. The 4-dim entry must
+	// be skipped and not produce a misleading similarity score.
+	emb := &changingDimEmbedder{
+		dimA:        4,
+		dimB:        2,
+		vecA:        []float64{1.0, 0.0, 0.0, 0.0},
+		switchAfter: 1, // only first call returns dimA
+	}
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, emb, 0.5)
+	ctx := context.Background()
+
+	// Set first prompt — stores 4-dim embedding.
+	c.Set(ctx, "prompt-a", RouteLocal)
+
+	if stats := c.Stats(); stats.DimMismatch != 0 {
+		t.Errorf("DimMismatch after Set = %d, want 0", stats.DimMismatch)
+	}
+
+	// Set second prompt — stores 2-dim embedding (embedder switched to dimB).
+	c.Set(ctx, "prompt-b", RouteFrontier)
+
+	// Now get "prompt-b" — exact match (2-dim embedding vs itself).
+	got, ok, kind := c.Get(ctx, "prompt-b")
+	if !ok || got != RouteFrontier || kind != CacheHitExact {
+		t.Errorf("exact match failed: got (%v, %v, %v), want (RouteFrontier, true, CacheHitExact)", got, ok, kind)
+	}
+
+	// Trigger getSemantic with "prompt-c" — no exact match, triggers semantic scan.
+	// The stored entry for "prompt-a" has 4 dims, but the incoming query
+	// from emb.Embed will have 2 dims (dimB). The mismatch must be detected
+	// and the entry skipped.
+	_, ok, kind = c.Get(ctx, "prompt-c") // triggers getSemantic with 2-dim emb vs 4-dim stored
+
+	if ok || kind != "" {
+		t.Errorf("dim mismatch should produce miss: got (%v, %v, %v), want (\"\", false, \"\")", "", ok, kind)
+	}
+
+	// DimMismatch counter must be incremented for the skipped entry.
+	if stats := c.Stats(); stats.DimMismatch != 1 {
+		t.Errorf("DimMismatch = %d after one mismatch, want 1", stats.DimMismatch)
+	}
+}
+
+func TestSLMCache_DimMismatch_MultipleMismatches(t *testing.T) {
+	// When multiple stored entries have different dimensions than the incoming
+	// query, each should increment the DimMismatch counter (issue #968).
+	// Use a dim-changing embedder that returns dimA for first 2 calls, then dimB.
+	emb := &changingDimEmbedder{
+		dimA:        4,
+		dimB:        2,
+		vecA:        []float64{1.0, 0.0, 0.0, 0.0},
+		switchAfter: 2, // first 2 calls return dimA
+	}
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, emb, 0.5)
+	ctx := context.Background()
+
+	// Set two prompts with 4-dim embeddings (calls 1 and 2 return dimA).
+	c.Set(ctx, "prompt-a", RouteLocal)
+	c.Set(ctx, "prompt-b", RouteLocal)
+
+	// Set a third prompt — this triggers call 3 which returns dimB (2-dim).
+	c.Set(ctx, "prompt-c", RouteFrontier)
+
+	// Now trigger getSemantic with "prompt-d" — 2-dim query, but we have
+	// two 4-dim stored entries (prompt-a and prompt-b). Both should be
+	// skipped with DimMismatch incremented. The 2-dim entry (prompt-c)
+	// may or may not match depending on similarity threshold.
+	c.Get(ctx, "prompt-d")
+
+	// Two 4-dim entries were skipped, so DimMismatch should be 2.
+	if stats := c.Stats(); stats.DimMismatch != 2 {
+		t.Errorf("DimMismatch = %d after two mismatches, want 2", stats.DimMismatch)
+	}
+}
+
+func TestSLMCache_DimMismatch_StatsReporting(t *testing.T) {
+	// DimMismatch must be accurately reported in Stats() (issue #968).
+	emb := &changingDimEmbedder{
+		dimA:        3,
+		dimB:        5, // intentionally different
+		vecA:        []float64{1.0, 0.0, 0.0},
+		switchAfter: 1,
+	}
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, emb, 0.5)
+	ctx := context.Background()
+
+	// Set with 3-dim embedding.
+	c.Set(ctx, "first", RouteLocal)
+
+	// Set with 5-dim embedding (triggers dimB on second call).
+	c.Set(ctx, "second", RouteFrontier)
+
+	// Trigger getSemantic with "third" — query is 5-dim, stored "first" is 3-dim.
+	// This should be a mismatch.
+	c.Get(ctx, "third")
+
+	stats := c.Stats()
+	if stats.DimMismatch != 1 {
+		t.Errorf("DimMismatch = %d, want 1", stats.DimMismatch)
+	}
+
+	// Other counters should not be affected.
+	if stats.EmbedErrors != 0 {
+		t.Errorf("EmbedErrors = %d, want 0", stats.EmbedErrors)
+	}
+	if stats.TTLEvictions != 0 {
+		t.Errorf("TTLEvictions = %d, want 0", stats.TTLEvictions)
+	}
+	if stats.LRUEvictions != 0 {
+		t.Errorf("LRUEvictions = %d, want 0", stats.LRUEvictions)
+	}
+}
