@@ -69,34 +69,17 @@ func runConfigValidate(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// LoadFile returns a map on success, nil+error on failure.
-	fileCfg, err := config.LoadFile(filePath)
+	// LoadYAML runs the full validation pipeline (parse YAML → validate fields →
+	// toConfig → env override), catching out-of-range values like negative
+	// durations or invalid threshold ranges that LoadFile (which only parses
+	// indentation) would miss.
+	_, err := config.LoadYAML(filePath)
 	if err != nil {
 		fmt.Fprintf(stderr, "nexus config validate: %v\n", err)
 		return 1
 	}
 
-	// fileCfg == nil means the file does not exist or is empty.
-	// validateIndentation already ran inside LoadFile, so at this point
-	// the file is structurally valid.
-	if fileCfg == nil {
-		fmt.Fprintln(stderr, "nexus config validate: file is empty or does not exist")
-		return 1
-	}
-
-	// Print a summary of the resolved keys.
-	fmt.Fprintf(stdout, "✓ %s is valid (%d keys)\n", filePath, len(fileCfg))
-	fmt.Fprintln(stdout, "")
-	fmt.Fprintln(stdout, "Resolved configuration:")
-	for k, v := range fileCfg {
-		// Truncate long values for readability.
-		trunc := v
-		if len(trunc) > 60 {
-			trunc = trunc[:60] + "…"
-		}
-		fmt.Fprintf(stdout, "  %s = %s\n", k, trunc)
-	}
-
+	fmt.Fprintf(stdout, "✓ %s is valid\n", filePath)
 	return 0
 }
 

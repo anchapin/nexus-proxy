@@ -27,10 +27,23 @@ token_guardrail: 8000
 	}
 
 	// Create a file with a valid top-level key and valid nested under a section.
-	// Note: our flatten disallows any nested under a non-section, so this should fail.
 	nestedFile := filepath.Join(tmp, "nested.yaml")
 	if err := os.WriteFile(nestedFile, []byte(`frontier:
   nested: value
+`), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// Create a file with an invalid field value: negative shutdown timeout.
+	negativeShutdownFile := filepath.Join(tmp, "negative_shutdown.yaml")
+	if err := os.WriteFile(negativeShutdownFile, []byte(`shutdown_timeout: -5s
+`), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// Create a file with an invalid bool value.
+	invalidBoolFile := filepath.Join(tmp, "invalid_bool.yaml")
+	if err := os.WriteFile(invalidBoolFile, []byte(`toon_unfenced: maybe
 `), 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -48,28 +61,34 @@ token_guardrail: 8000
 			wantSubstr: "is valid",
 		},
 		{
-			name:       "valid file prints key count",
-			args:       []string{"validate", validFile},
-			wantExit:   0,
-			wantSubstr: "3 keys",
-		},
-		{
 			name:       "missing file exits 1",
 			args:       []string{"validate", "/nonexistent/path.yaml"},
 			wantExit:   1,
-			wantSubstr: "file is empty or does not exist",
+			wantSubstr: "cannot read",
 		},
 		{
 			name:       "bad indentation exits 1",
 			args:       []string{"validate", badFile},
 			wantExit:   1,
-			wantSubstr: "YAML parse error",
+			wantSubstr: "cannot unmarshal",
 		},
 		{
-			name:       "nested without section exits 1",
+			name:       "nested without section is valid",
 			args:       []string{"validate", nestedFile},
 			wantExit:   0,
 			wantSubstr: "is valid",
+		},
+		{
+			name:       "negative shutdown_timeout exits 1",
+			args:       []string{"validate", negativeShutdownFile},
+			wantExit:   1,
+			wantSubstr: "shutdown_timeout",
+		},
+		{
+			name:       "invalid bool value exits 1",
+			args:       []string{"validate", invalidBoolFile},
+			wantExit:   1,
+			wantSubstr: "toon_unfenced",
 		},
 		{
 			name:       "no args shows usage",
