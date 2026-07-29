@@ -166,11 +166,15 @@ func APIKeyAwareKeyFunc(ip string, r *http.Request) string {
 	if auth == "" {
 		return ip
 	}
-	// Strip "Bearer " prefix if present (case-insensitive); also normalise
-	// token to lowercase so "bearer MYKEY" and "Bearer mykey" share a bucket.
+	// Strip "Bearer " prefix if present (case-insensitive per RFC 6750).
+	// The raw token casing is preserved for bucket-key computation so that
+	// "Bearer MYKEY" and "Bearer mykey" occupy distinct buckets — consistent
+	// with auth.go using case-sensitive ConstantTimeCompare — preventing an
+	// attacker from bypassing a victim's per-key rate limit via token-casing
+	// variation (issue #977).
 	var key string
 	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
-		key = strings.ToLower(strings.TrimSpace(auth[7:]))
+		key = strings.TrimSpace(auth[7:])
 	} else {
 		key = auth
 	}

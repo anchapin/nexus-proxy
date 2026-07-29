@@ -730,37 +730,114 @@ func TestMiddleware_APIKeyAwareKeyFunc_NoAuth(t *testing.T) {
 	}
 }
 
-// TestMiddleware_APIKeyAwareKeyFunc_CaseInsensitiveBearer verifies that Bearer
-// prefix stripping is case-insensitive so the same token in different casings
-// occupies the same rate-limit bucket (issue #838).
-func TestMiddleware_APIKeyAwareKeyFunc_CaseInsensitiveBearer(t *testing.T) {
+// TestMiddleware_APIKeyAwareKeyFunc_CaseInsensitiveBearerPrefix verifies that the
+// Bearer prefix is matched case-insensitively so "bearer MYKEY", "Bearer MYKEY",
+// and "BEARER MYKEY" all correctly extract the token value (RFC 6750).
+// The token value itself is NOT lowercased; only the prefix is matched
+// case-insensitively. "Bearer mykey" and "bearer mykey" both extract token
+// "mykey" (same logical token) and therefore share a bucket.
+func TestMiddleware_APIKeyAwareKeyFunc_CaseInsensitiveBearerPrefix(t *testing.T) {
 	ip := "10.0.0.1"
 
+	// All of these should extract token "mykey" (same logical token) and therefore
+	// produce the same bucket key. "Bearer  mykey" has a double space which
+	// TrimSpace normalises away.
 	reqBearer := httptest.NewRequest(http.MethodPost, "/", nil)
 	reqBearer.Header.Set("Authorization", "Bearer mykey")
 
 	reqBearerLower := httptest.NewRequest(http.MethodPost, "/", nil)
 	reqBearerLower.Header.Set("Authorization", "bearer mykey")
 
-	reqBearerUpper := httptest.NewRequest(http.MethodPost, "/", nil)
-	reqBearerUpper.Header.Set("Authorization", "BEARER MYKEY")
-
 	reqBearerDoubleSpace := httptest.NewRequest(http.MethodPost, "/", nil)
 	reqBearerDoubleSpace.Header.Set("Authorization", "Bearer  mykey")
 
 	keyBearer := APIKeyAwareKeyFunc(ip, reqBearer)
 	keyBearerLower := APIKeyAwareKeyFunc(ip, reqBearerLower)
-	keyBearerUpper := APIKeyAwareKeyFunc(ip, reqBearerUpper)
 	keyBearerDoubleSpace := APIKeyAwareKeyFunc(ip, reqBearerDoubleSpace)
 
 	if keyBearer != keyBearerLower {
 		t.Errorf("Bearer mykey and bearer mykey should produce same key: got %q vs %q", keyBearer, keyBearerLower)
 	}
-	if keyBearer != keyBearerUpper {
-		t.Errorf("Bearer mykey and BEARER MYKEY should produce same key: got %q vs %q", keyBearer, keyBearerUpper)
-	}
 	if keyBearer != keyBearerDoubleSpace {
 		t.Errorf("Bearer mykey and Bearer  mykey (double space) should produce same key: got %q vs %q", keyBearer, keyBearerDoubleSpace)
+	}
+
+	// Different casing of the same logical token (mykey vs MYKEY) should produce
+	// different bucket keys because the token is case-sensitive.
+	reqMYKEY := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqMYKEY.Header.Set("Authorization", "Bearer MYKEY")
+	keyMYKEY := APIKeyAwareKeyFunc(ip, reqMYKEY)
+	if keyBearer == keyMYKEY {
+		t.Errorf("Bearer mykey and Bearer MYKEY should produce DIFFERENT keys (token is case-sensitive): got same %q", keyBearer)
+	}
+}
+
+// TestMiddleware_APIKeyAwareKeyFunc_CaseSensitiveToken verifies that different
+// casings of the same logical token produce different bucket keys, preventing
+// an attacker from bypassing a victim's per-key rate limit by changing token
+// casing (issue #977).
+func TestMiddleware_APIKeyAwareKeyFunc_CaseSensitiveToken(t *testing.T) {
+	ip := "10.0.0.1"
+
+	// Same logical token "MyKey" in different casings — these must NOT share
+	// a bucket because auth.go uses case-sensitive ConstantTimeCompare.
+	reqMyKey := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqMyKey.Header.Set("Authorization", "Bearer MyKey")
+
+	reqmykey := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqmykey.Header.Set("Authorization", "Bearer mykey")
+
+	reqMYKEY := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqMYKEY.Header.Set("Authorization", "Bearer MYKEY")
+
+	keyMyKey := APIKeyAwareKeyFunc(ip, reqMyKey)
+	keymykey := APIKeyAwareKeyFunc(ip, reqmykey)
+	keyMYKEY := APIKeyAwareKeyFunc(ip, reqMYKEY)
+
+	if keyMyKey == keymykey {
+		t.Errorf("Bearer MyKey and Bearer mykey should produce DIFFERENT keys (security fix #977): got same %q", keyMyKey)
+	}
+	if keyMyKey == keyMYKEY {
+		t.Errorf("Bearer MyKey and Bearer MYKEY should produce DIFFERENT keys (security fix #977): got same %q", keyMyKey)
+	}
+	if keymykey == keyMYKEY {
+		t.Errorf("Bearer mykey and Bearer MYKEY should produce DIFFERENT keys (security fix #977): got same %q", keymykey)
+	}
+}
+
+// TestMiddleware_APIKeyMode_DifferentCasingDifferentBuckets verifies at the
+// middleware integration level that two requests with different-cased versions
+// of the same logical API key are rate-limited independently (issue #977).
+func TestMiddleware_APIKeyMode_DifferentCasingDifferentBuckets(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	keyFn := func(r *http.Request) string {
+		ip := resolver.Resolve(r)
+		return APIKeyAwareKeyFunc(ip, r)
+	}
+	m := NewMiddleware(1, 1, resolver, keyFn) // burst 1 per bucket
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Exhaust victim's bucket with "Bearer MyKey".
+	reqVictim := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqVictim.RemoteAddr = "10.0.0.1:1000"
+	reqVictim.Header.Set("Authorization", "Bearer MyKey")
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, reqVictim)
+	}
+
+	// Attacker using "bearer mykey" (lowercase) should hit their own bucket and be allowed.
+	// If lowercase normalization existed (the bug), they would share the victim's bucket
+	// and be rate-limited. With the fix, they have separate buckets.
+	reqAttacker := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqAttacker.RemoteAddr = "10.0.0.1:1000"
+	reqAttacker.Header.Set("Authorization", "bearer mykey")
+	recAttacker := httptest.NewRecorder()
+	h.ServeHTTP(recAttacker, reqAttacker)
+	if recAttacker.Code != 200 {
+		t.Errorf("attacker using different-cased token (bearer mykey) should get own bucket, got %d", recAttacker.Code)
 	}
 }
 

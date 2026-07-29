@@ -126,9 +126,9 @@ panels race local + frontier, stream the faster as speculative SSE, and
 only invoke the arbiter when Jaccard similarity < `NEXUS_FUSION_AGREEMENT_THRESHOLD`
 (default 0.85).
 
-**Arbiter synthesis cache** (`NEXUS_ARBITER_CACHE_TTL`): when > 0, arbiter
+**Arbiter synthesis cache** (`NEXUS_ARBITER_CACHE_TTL`, default 5m): when > 0, arbiter
 responses are cached keyed by a hash of both panel members' content. Set to 0
-(default) to disable — every disagreement triggers a fresh frontier call.
+to disable — every disagreement triggers a fresh frontier call.
 
 ## Middleware order (do not reorder)
 
@@ -360,6 +360,9 @@ These are documented in `.env.example` with full context; key ones to know:
   SLM decisions below this confidence bypass the DSL/SLM pick and go to frontier.
 - **`NEXUS_SLMCACHE_MAX_STALE`** (default 0): proactive eviction threshold for
   SLM cache entries; 0 disables (stale entries accumulate until LRU eviction).
+- **`NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT`** (default 0 = unlimited): max entries
+  scanned during semantic deduplication in `getSemantic`; bounds O(n) cosine scans
+  on large caches (issue #933).
 - **`NEXUS_RAG_EMBED_CACHE_SIZE`** (default 256) + **`NEXUS_RAG_EMBED_CACHE_TTL`**
   (default 24h): LRU cache for prompt embeddings — repeat prompts skip Ollama
   round-trip entirely.
