@@ -40,9 +40,9 @@ func (e constEmbedder) EmbedBatch(_ context.Context, _ []string) ([][]float64, e
 	return [][]float64{e.vec}, nil
 }
 
-func (e constEmbedder) IsHealthy(context.Context) bool { return true }
-func (e constEmbedder) IsBreakerOpen() bool            { return false }
-func (e constEmbedder) RecordBreakerSuccess()          {}
+func (e constEmbedder) IsHealthy(context.Context) bool            { return true }
+func (e constEmbedder) IsBreakerOpen() bool                       { return false }
+func (e constEmbedder) RecordBreakerSuccess()                     {}
 func (e constEmbedder) SetTripCallback(string, func(kind string)) {}
 
 // BenchmarkCosineSimilarity measures the raw dot-product + norm

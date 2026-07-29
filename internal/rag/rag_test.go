@@ -72,9 +72,9 @@ func (s *stubEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float6
 	return result, nil
 }
 
-func (s *stubEmbedder) IsHealthy(context.Context) bool { return true }
-func (s *stubEmbedder) IsBreakerOpen() bool            { return false }
-func (s *stubEmbedder) RecordBreakerSuccess()          {}
+func (s *stubEmbedder) IsHealthy(context.Context) bool            { return true }
+func (s *stubEmbedder) IsBreakerOpen() bool                       { return false }
+func (s *stubEmbedder) RecordBreakerSuccess()                     {}
 func (s *stubEmbedder) SetTripCallback(string, func(kind string)) {}
 
 func TestRetrieveThreshold(t *testing.T) {
@@ -501,9 +501,9 @@ func (e *batchCountingEmbedder) EmbedBatch(_ context.Context, texts []string) ([
 	return result, nil
 }
 
-func (e *batchCountingEmbedder) IsHealthy(context.Context) bool { return true }
-func (e *batchCountingEmbedder) IsBreakerOpen() bool            { return false }
-func (e *batchCountingEmbedder) RecordBreakerSuccess()          {}
+func (e *batchCountingEmbedder) IsHealthy(context.Context) bool            { return true }
+func (e *batchCountingEmbedder) IsBreakerOpen() bool                       { return false }
+func (e *batchCountingEmbedder) RecordBreakerSuccess()                     {}
 func (e *batchCountingEmbedder) SetTripCallback(string, func(kind string)) {}
 
 // Tests for EmbedCache (issue #227).
@@ -1081,9 +1081,9 @@ func (d *delayedEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]f
 	return result, nil
 }
 
-func (d *delayedEmbedder) IsHealthy(context.Context) bool { return true }
-func (d *delayedEmbedder) IsBreakerOpen() bool            { return false }
-func (d *delayedEmbedder) RecordBreakerSuccess()          {}
+func (d *delayedEmbedder) IsHealthy(context.Context) bool            { return true }
+func (d *delayedEmbedder) IsBreakerOpen() bool                       { return false }
+func (d *delayedEmbedder) RecordBreakerSuccess()                     {}
 func (d *delayedEmbedder) SetTripCallback(string, func(kind string)) {}
 
 // TestEmbedCacheCtxCancelNoStaleEntry verifies that when a waiting goroutine's
@@ -1407,9 +1407,9 @@ func (d *delayedEmbedderWithDelay) EmbedBatch(ctx context.Context, texts []strin
 	return result, nil
 }
 
-func (d *delayedEmbedderWithDelay) IsHealthy(context.Context) bool { return true }
-func (d *delayedEmbedderWithDelay) IsBreakerOpen() bool            { return false }
-func (d *delayedEmbedderWithDelay) RecordBreakerSuccess()          {}
+func (d *delayedEmbedderWithDelay) IsHealthy(context.Context) bool            { return true }
+func (d *delayedEmbedderWithDelay) IsBreakerOpen() bool                       { return false }
+func (d *delayedEmbedderWithDelay) RecordBreakerSuccess()                     {}
 func (d *delayedEmbedderWithDelay) SetTripCallback(string, func(kind string)) {}
 
 // failingAfterBatchEmbedder returns embeddings normally for the first N batches,
@@ -1452,11 +1452,11 @@ func (f *failingAfterBatchEmbedder) EmbedBatch(_ context.Context, texts []string
 	return result, nil
 }
 
-func (f *failingAfterBatchEmbedder) IsHealthy(context.Context) bool { return true }
-func (f *failingAfterBatchEmbedder) IsBreakerOpen() bool            { return false }
-func (f *failingAfterBatchEmbedder) RecordBreakerSuccess()          {}
+func (f *failingAfterBatchEmbedder) IsHealthy(context.Context) bool            { return true }
+func (f *failingAfterBatchEmbedder) IsBreakerOpen() bool                       { return false }
+func (f *failingAfterBatchEmbedder) RecordBreakerSuccess()                     {}
 func (f *failingAfterBatchEmbedder) SetTripCallback(string, func(kind string)) {}
-func (f *failingAfterBatchEmbedder) BatchCount() int                { return f.batchCount }
+func (f *failingAfterBatchEmbedder) BatchCount() int                           { return f.batchCount }
 
 // TestIndexDirBatchFailureStillBuildsIndex verifies that when EmbedBatch fails
 // mid-way through IndexDir, the HNSW index is rebuilt synchronously after all

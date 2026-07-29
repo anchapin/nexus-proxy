@@ -453,7 +453,9 @@ func (c *EmbedCache) RecordBreakerSuccess() {
 // wrapped embedder's circuit breaker trips (issue #971). No-op when the
 // inner embedder does not implement the method.
 func (c *EmbedCache) SetTripCallback(kind string, cb func(kind string)) {
-	if e, ok := c.inner.(interface{ SetTripCallback(string, func(kind string)) }); ok {
+	if e, ok := c.inner.(interface {
+		SetTripCallback(string, func(kind string))
+	}); ok {
 		e.SetTripCallback(kind, cb)
 	}
 }
@@ -1123,7 +1125,9 @@ func (s *Store) RecordBreakerSuccess() {
 // underlying embedder's circuit breaker trips (issue #971). No-op when the
 // embedder does not implement the method.
 func (s *Store) SetTripCallback(kind string, cb func(kind string)) {
-	if e, ok := s.embedder.(interface{ SetTripCallback(string, func(kind string)) }); ok {
+	if e, ok := s.embedder.(interface {
+		SetTripCallback(string, func(kind string))
+	}); ok {
 		e.SetTripCallback(kind, cb)
 	}
 }

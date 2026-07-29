@@ -1606,28 +1606,6 @@ func TestSLMCache_EmbedBreaker_SustainedFailureSkipsEmbed(t *testing.T) {
 
 // --- Dimension mismatch detection (issue #968) ---
 
-// fixedDimEmbedder returns embeddings of a fixed dimension but with
-// content based on the text hash so different prompts produce different
-// vectors at the same dimension.
-type fixedDimEmbedder struct {
-	dim int
-	vec []float64
-}
-
-func (f *fixedDimEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
-	out := make([]float64, f.dim)
-	copy(out, f.vec)
-	// Modify based on text hash to get unique vectors per prompt.
-	h := uint64(0)
-	for i := 0; i < len(text); i++ {
-		h = h*31 + uint64(text[i])
-	}
-	for i := range out {
-		out[i] += float64((h >> uint(i)) & 1)
-	}
-	return out, nil
-}
-
 // changingDimEmbedder returns embeddings whose dimension changes after a
 // configurable number of calls. It simulates an embedder model version change.
 type changingDimEmbedder struct {
