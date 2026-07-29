@@ -606,6 +606,10 @@ func (p PanelResult) ErrStr() string {
 // HTTP handler). When the client disconnects, ctx is cancelled and the
 // in-flight upstream calls are cancelled within 1 second rather than
 // waiting for their individual timeouts (issue #297).
+//
+// When isFusion is true, Panel sets X-Nexus-Fusion-Progressive: true on
+// the response so downstream telemetry can distinguish a fusion fallback
+// from a regular non-fusion request (issue #984).
 func Panel(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -620,6 +624,7 @@ func Panel(
 	requestID string,
 	arbiterCache *ArbiterCache,
 	arbiterCacheTTL time.Duration,
+	isFusion bool,
 ) (outcome PanelOutcome, cacheHit bool, _ error) {
 	results := make(chan PanelResult, 2)
 	if skipLocal {
@@ -718,6 +723,9 @@ func Panel(
 			outcome.ArbiterSkipped = true
 			outcome.Similarity = SimilarityRatio(r1.Content, r2.Content)
 			outcome.SkipReason = "cache_hit"
+			if isFusion {
+				w.Header().Set("X-Nexus-Fusion-Progressive", "true")
+			}
 			if stream {
 				return outcome, true, streamCachedArbiterSynthesis(w, cached)
 			}
@@ -739,6 +747,9 @@ func Panel(
 	var fetchErr error
 	if stream {
 		// stream=true: SSE passthrough, no caching
+		if isFusion {
+			w.Header().Set("X-Nexus-Fusion-Progressive", "true")
+		}
 		fetchErr = StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody)
 		if fetchErr != nil {
 			return outcome, false, fmt.Errorf("fusion: arbiter stream: %w", fetchErr)
@@ -793,6 +804,9 @@ func Panel(
 		arbiterCache.Set(r1.Content, r2.Content, synthesis, arbiterCacheTTL)
 	}
 
+	if isFusion {
+		w.Header().Set("X-Nexus-Fusion-Progressive", "true")
+	}
 	return outcome, false, writeCachedArbiterJSON(w, synthesis, arbiterModel)
 }
 
@@ -917,7 +931,8 @@ func PanelStreaming(
 			localBaseURL, localModel, frontierURL, frontierKey, frontierModel,
 			arbiterURL, arbiterKey, arbiterModel,
 			body, latestPrompt, perFetchTimeout, arbiterTimeout,
-			skipLocal, requestID, arbiterCache, arbiterCacheTTL)
+			skipLocal, requestID, arbiterCache, arbiterCacheTTL,
+			true) // isFusion: set X-Nexus-Fusion-Progressive header (issue #984)
 		if err != nil {
 			return outcome, err
 		}

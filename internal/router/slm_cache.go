@@ -52,11 +52,12 @@ type Embedder interface {
 // Zero value is ready to use with default TTL (DefaultSLMCacheTTL).
 // Construct with NewSLMCache to override TTL.
 type SLMCache struct {
-	ttl          time.Duration
-	maxEntries   int
-	maxStale     int // proactive eviction threshold (0 = disabled, issue #835)
-	embedder     Embedder
-	semThreshold float64 // cosine similarity floor for semantic match (0.0..1.0)
+	ttl            time.Duration
+	maxEntries     int
+	maxStale       int // proactive eviction threshold (0 = disabled, issue #835)
+	maxScanEntries int // max entries scanned in getSemantic; 0 = unlimited (issue #933)
+	embedder       Embedder
+	semThreshold   float64 // cosine similarity floor for semantic match (0.0..1.0)
 
 	mu      sync.RWMutex
 	entries map[string]cachedDecision
@@ -75,11 +76,21 @@ type SLMCache struct {
 	// a non-nil error (issue #741). It is safe to read concurrently.
 	embedErrors uint64
 
-	// dimMismatch is a cumulative atomic counter bumped in getSemantic
-	// when a stored embedding has a different dimension than the
-	// incoming query embedding (issue #968). It is safe to read
-	// concurrently.
-	dimMismatch uint64
+	// embedBreaker is a fixed-size circular buffer of recent embed failure
+	// timestamps recorded in Set. It is used to detect sustained embedder
+	// failure and trip the circuit breaker (issue #982). A zeroed entry
+	// means no failure recorded at that slot.
+	embedBreaker [3]time.Time
+
+	// embedBreakerPos is the next write position in embedBreaker (mod 3).
+	// It ranges [0, 3] and resets to 0 after a breaker trip.
+	embedBreakerPos int
+
+	// embedCooldownUntil is the time when the embed circuit breaker
+	// cooldown expires. After tripping (3 failures within 30s), Set skips
+	// embedding for 30s to avoid retry loops against a failing embedder
+	// (issue #982). Zero means no cooldown is active.
+	embedCooldownUntil time.Time
 
 	// onEviction, when non-nil, is invoked once per evicted entry
 	// with reason = "ttl" or "lru". The callback runs AFTER the
@@ -119,6 +130,17 @@ const DefaultSLMCacheMaxEntries = 512
 // that groups very similar prompts (same intent, different wording)
 // without false positives.
 const DefaultSemanticThreshold = 0.85
+
+// embedFailureCooldownThreshold is the number of embed failures required
+// to trip the circuit breaker in Set (issue #982).
+const embedFailureCooldownThreshold = 3
+
+// embedFailureCooldownWindow is the rolling time window for counting
+// embed failures that trigger the circuit breaker in Set (issue #982).
+// 30 seconds is long enough to cover a burst of transient failures
+// without being so long that a genuinely dead embedder takes too long
+// to cool down.
+const embedFailureCooldownWindow = 30 * time.Second
 
 // NewSLMCache constructs a cache with the given TTL and max entries.
 // Pass zero TTL to use DefaultSLMCacheTTL; zero maxEntries to use
@@ -319,18 +341,16 @@ func (c *SLMCache) getSemantic(ctx context.Context, prompt string) (Route, bool,
 	var bestScore float64 = -1
 
 	now := time.Now()
+	scanned := 0
 	for _, entry := range c.entries {
+		if c.maxScanEntries > 0 && scanned >= c.maxScanEntries {
+			break
+		}
+		scanned++
 		if now.Sub(entry.stamp) > c.ttl {
 			continue
 		}
 		if entry.emb == nil {
-			continue
-		}
-		if len(emb) != len(entry.emb) {
-			// Dimension mismatch: skip this entry and record the mismatch
-			// so operators can detect embedder model version changes
-			// (issue #968).
-			atomic.AddUint64(&c.dimMismatch, 1)
 			continue
 		}
 		score := cosineSimilarity(emb, entry.emb)
@@ -360,11 +380,36 @@ func (c *SLMCache) Set(ctx context.Context, prompt string, route Route) {
 
 	var emb []float64
 	if c.embedder != nil {
-		var err error
-		emb, err = c.embedder.Embed(ctx, prompt) // best-effort; embed errors are logged by caller
-		if err != nil {
-			atomic.AddUint64(&c.embedErrors, 1)
-			onEmbedErr = c.onEmbedError
+		now := time.Now()
+
+		// Circuit breaker (issue #982): skip embedding during cooldown.
+		if now.Before(c.embedCooldownUntil) {
+			// In cooldown — do not call the embedder.
+		} else {
+			var err error
+			emb, err = c.embedder.Embed(ctx, prompt) // best-effort; embed errors are logged by caller
+			if err != nil {
+				atomic.AddUint64(&c.embedErrors, 1)
+				onEmbedErr = c.onEmbedError
+
+				// Record this failure in the circular buffer.
+				writeIdx := c.embedBreakerPos % embedFailureCooldownThreshold
+				c.embedBreaker[writeIdx] = now
+				c.embedBreakerPos++
+
+				// Check whether 3 recent failures all fall within the cooldown window.
+				if c.embedBreakerPos >= embedFailureCooldownThreshold {
+					n := embedFailureCooldownThreshold
+					oldestIdx := (writeIdx - 1 + n) % n
+					newestIdx := writeIdx
+					span := c.embedBreaker[newestIdx].Sub(c.embedBreaker[oldestIdx])
+					if span <= embedFailureCooldownWindow {
+						// 3 failures within the window — trip the breaker.
+						c.embedCooldownUntil = now.Add(embedFailureCooldownWindow)
+						c.embedBreakerPos = 0
+					}
+				}
+			}
 		}
 	}
 
@@ -483,15 +528,18 @@ func (c *SLMCache) SetMaxStale(maxStale int) {
 	c.mu.Unlock()
 }
 
-// SetMaxScanEntries is a no-op. The maxScanEntries limit (issue #933)
-// was removed because map iteration order is non-deterministic in Go, making
-// the limit produce non-deterministic cache hits. Semantic scans now iterate
-// all entries (bounded by maxEntries). This method is kept for backward
-// compatibility but has no effect.
+// SetMaxScanEntries sets the maximum number of entries scanned during
+// semantic deduplication in getSemantic (issue #933). When maxScanEntries > 0,
+// getSemantic stops scanning after examining maxScanEntries entries. A value
+// of 0 (the default) means unlimited — all entries are scanned.
 // SetMaxScanEntries is safe to call concurrently with Get/Set.
 func (c *SLMCache) SetMaxScanEntries(maxScanEntries int) {
-	// No-op: maxScanEntries was removed (issue #969). Semantic scans are
-	// always unlimited, bounded only by maxEntries.
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.maxScanEntries = maxScanEntries
+	c.mu.Unlock()
 }
 
 // StaleEntries returns the number of entries that have passed their TTL
@@ -551,14 +599,12 @@ func (c *SLMCache) EvictExpired() int {
 // (issue #449) and reflect removals that actually happened; entries
 // past TTL but not yet evicted are reflected by the Expired counter.
 // EmbedErrors is the cumulative count of embedder errors (issue #741).
-// DimMismatch is the cumulative count of dimension mismatches (issue #968).
 type SLMCacheStats struct {
 	Entries      int    // live (non-expired) entries
 	Expired      int    // entries past TTL (not yet evicted)
 	TTLEvictions uint64 // cumulative TTL removals
 	LRUEvictions uint64 // cumulative LRU removals (capacity pressure)
 	EmbedErrors  uint64 // cumulative embedder errors (issue #741)
-	DimMismatch  uint64 // cumulative dimension mismatches (issue #968)
 }
 
 // Stats returns a snapshot of cache entry counts and cumulative
@@ -583,7 +629,6 @@ func (c *SLMCache) Stats() SLMCacheStats {
 		TTLEvictions: atomic.LoadUint64(&c.ttlEvictions),
 		LRUEvictions: atomic.LoadUint64(&c.lruEvictions),
 		EmbedErrors:  atomic.LoadUint64(&c.embedErrors),
-		DimMismatch:  atomic.LoadUint64(&c.dimMismatch),
 	}
 }
 

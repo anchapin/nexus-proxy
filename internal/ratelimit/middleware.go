@@ -93,6 +93,10 @@ type bucket struct {
 // NEXUS_RATE_LIMIT_BY_API_KEY=true the caller passes APIKeyAwareKeyFunc
 // so different API keys behind the same IP occupy separate buckets
 // (issue #776).
+//
+// The background reaper goroutine is started here (issue #978), not in
+// Wrap(), so that even if Wrap() is called multiple times by mistake,
+// exactly one reaper runs and exits when Stop()/Close() is called.
 func NewMiddleware(rpm, burst int, resolver *ClientIPResolver, keyFn func(*http.Request) string) *Middleware {
 	if rpm <= 0 {
 		return &Middleware{rpm: 0}
@@ -104,7 +108,7 @@ func NewMiddleware(rpm, burst int, resolver *ClientIPResolver, keyFn func(*http.
 	if keyFn != nil {
 		keyType = "apikey"
 	}
-	return &Middleware{
+	m := &Middleware{
 		resolver: resolver,
 		rpm:      rpm,
 		burst:    burst,
@@ -114,6 +118,8 @@ func NewMiddleware(rpm, burst int, resolver *ClientIPResolver, keyFn func(*http.
 		keyFn:    keyFn,
 		keyType:  keyType,
 	}
+	go m.reaper()
+	return m
 }
 
 // SetRejectionHook installs a callback invoked once per 429 rejection
@@ -179,14 +185,12 @@ func APIKeyAwareKeyFunc(ip string, r *http.Request) string {
 // Wrap returns an http.Handler that applies the rate limit before
 // delegating to next. A disabled middleware (rpm <= 0) returns next
 // unchanged so the hot path is zero-cost when rate limiting is off.
+// The reaper is started in NewMiddleware (issue #978), not here, so
+// Wrap may be called any number of times without starting extra goroutines.
 func (m *Middleware) Wrap(next http.Handler) http.Handler {
 	if m == nil || m.rpm <= 0 {
 		return next
 	}
-	// Kick off the idle-bucket reaper once. It exits when Close() / Stop()
-	// is called (issue #739). The middleware lives for the lifetime of the
-	// server, so Wrap is called exactly once per middleware instance.
-	go m.reaper()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ip := m.resolver.Resolve(r)
 		bucketKey := ip
