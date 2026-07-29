@@ -215,19 +215,9 @@ func TestMiddleware_Reaper_Once(t *testing.T) {
 			afterWrap, baseline+1)
 	}
 
-	// Stop() should terminate the reaper.
+	// Stop() blocks until the reaper goroutine has exited (WaitGroup-based),
+	// so the goroutine count is guaranteed to be back at baseline immediately.
 	m.Stop()
-
-	// Poll until goroutines return to baseline (the reaper exits immediately on
-	// stopCh close, but the race detector can delay scheduling in CI).
-	// Fails after 2 seconds if the reaper goroutine has not exited.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if runtime.NumGoroutine() == baseline {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
 
 	afterStop := runtime.NumGoroutine()
 	if afterStop != baseline {
