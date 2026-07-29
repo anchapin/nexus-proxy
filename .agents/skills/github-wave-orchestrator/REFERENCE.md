@@ -38,12 +38,13 @@ Steps:
    EOF
    )"
    ```
-   The body must contain exactly one `Closes #N` line. Do NOT include other
-   `#NNNN` references in the body or title — see
+   The body must list ALL issues that this PR resolves (issue #961). If the
+   commit also fixes a related issue, add a second `Closes #N` line.
+   Do NOT include issue numbers in the title — see
    `docs/orchestration/pr-body-conventions.md` for the rationale.
- 9. Verify closingReferences count is exactly 1:
+ 9. Verify closingReferences count matches the number of issues this PR resolves:
     ```
-    bash scripts/check_pr_closing_refs.sh <PR_NUMBER> 1
+    bash scripts/check_pr_closing_refs.sh <PR_NUMBER> <COUNT>
     ```
     If the check fails, run `gh pr edit <PR> --body "Closes #N\n\n<minimal body>"`
     to strip the spurious references, then re-run the check.
@@ -79,33 +80,38 @@ Steps:
 2. IF CI is green:
    a. Check mergeable: gh pr view {NUMBER} --json mergeable
    b. If CONFLICTING → follow the merge conflict protocol below
-    c. If MERGEABLE → merge: gh pr merge {NUMBER} --squash
-       NOTE: Do NOT use --delete-branch here. The branch deletion must happen
-       AFTER worktree removal (see step 2d below) to avoid:
-       "error: cannot delete branch 'fix/issue-N' used by worktree at '../worktrees/issue-N'"
+   c. If MERGEABLE → merge: gh pr merge {NUMBER} --squash
+      NOTE: Do NOT use --delete-branch here. The branch deletion must happen
+      AFTER worktree removal (see step 2d below) to avoid:
+      "error: cannot delete branch 'fix/issue-N' used by worktree at '../worktrees/issue-N'"
 
-       Then verify the merge persisted:
-       ```
-       gh pr view {NUMBER} --json mergedAt --jq '.mergedAt'
-       ```
-       - If mergedAt is NOT null → merge succeeded, proceed to step 2d
-       - If mergedAt IS null → merge did NOT persist. Retry once:
-         `gh pr merge {NUMBER} --squash`
-         If second attempt also yields null mergedAt → report BLOCKED and STOP
-    d. Clean up (ORDER MATTERS — worktree remove BEFORE branch delete):
-       ```bash
-       # Step 1: Remove worktree FIRST (branch must not be deleted yet)
-       git worktree remove ../worktrees/issue-{NUMBER}-{SLUG}
+      Then verify the merge persisted:
+      ```
+      gh pr view {NUMBER} --json mergedAt --jq '.mergedAt'
+      ```
+      - If mergedAt is NOT null → merge succeeded, verify issues are closed:
+        ```
+        bash scripts/verify_issues_closed.sh {NUMBER}
+        ```
+        - If all issues closed → proceed to step 2d
+        - If any issue remains open → report BLOCKER and STOP
+      - If mergedAt IS null → merge did NOT persist. Retry once:
+        `gh pr merge {NUMBER} --squash`
+        If second attempt also yields null mergedAt → report BLOCKED and STOP
+   d. Clean up (ORDER MATTERS — worktree remove BEFORE branch delete):
+      ```bash
+      # Step 1: Remove worktree FIRST (branch must not be deleted yet)
+      git worktree remove ../worktrees/issue-{NUMBER}-{SLUG}
 
-       # Step 2: Delete local branch (safe now that worktree is gone)
-       git branch -d fix/issue-{NUMBER}-{SLUG}
+      # Step 2: Delete local branch (safe now that worktree is gone)
+      git branch -d fix/issue-{NUMBER}-{SLUG}
 
-       # Step 3: Delete remote branch
-       git push origin --delete fix/issue-{NUMBER}-{SLUG}
+      # Step 3: Delete remote branch
+      git push origin --delete fix/issue-{NUMBER}-{SLUG}
 
-       # Step 4: Prune any stale worktree references
-       git worktree prune
-       ```
+      # Step 4: Prune any stale worktree references
+      git worktree prune
+      ```
 3. IF CI is failing:
    a. Get failing run: gh run list --branch fix/issue-{NUMBER}-{SLUG} --limit 1
    b. Get logs: gh run view {RUN_ID} --log
@@ -128,8 +134,10 @@ Steps:
    f. Re-trigger CI and return to step 1
 
 Report back: final status (MERGED / BLOCKED / CONFLICT), iterations used, files fixed.
-   Note: MERGED status requires mergedAt to be non-null. If mergedAt is null after merge,
-   the merge did not persist — report BLOCKED instead.
+   Note: MERGED status requires (a) mergedAt to be non-null AND (b) all issues
+   mentioned in the PR body to be CLOSED after merge. If mergedAt is null, the
+   merge did not persist — report BLOCKED. If any linked issue remains open after
+   merge (issue #961), report BLOCKER with the open issue numbers.
 ```
 
 ## Merge Ordering Strategy
