@@ -51,6 +51,12 @@ type HNSWConfig struct {
 
 	// seed initialises the random generator for reproducible builds.
 	seed int64
+
+	// Dimension is the expected embedding vector dimension. When set to a
+	// positive value, DeserializeHNSWIndex validates that each stored vector
+	// has exactly this many dimensions, returning an error on mismatch.
+	// This guards against corrupted or dimension-mismatched index blobs.
+	Dimension int
 }
 
 // DefaultHNSWConfig returns sensible defaults for a RAG workload.
@@ -601,6 +607,10 @@ func DeserializeHNSWIndex(data []byte, cfg HNSWConfig) (*HNSWIndex, error) {
 		// Guard against corrupted/huge vecLen before allocating.
 		if vecLen > len(r)/8 {
 			return nil, fmt.Errorf("rag: hnsw index data truncated at entry %d (vec len %d, remaining %d bytes)", i, vecLen, len(r))
+		}
+		// Validate dimension when expected dimension is configured (issue #964).
+		if cfg.Dimension > 0 && vecLen != cfg.Dimension {
+			return nil, fmt.Errorf("rag: hnsw index entry %d dimension mismatch: got %d, want %d", i, vecLen, cfg.Dimension)
 		}
 		vec := make([]float64, vecLen)
 		for j := 0; j < vecLen; j++ {
