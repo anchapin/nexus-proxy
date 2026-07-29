@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -181,6 +182,49 @@ func TestMiddleware_ReaperExitsOnClose(t *testing.T) {
 		t.Error("reaper did not exit within 2 seconds of Close()")
 	default:
 		// passed — goroutine exited in time
+	}
+}
+
+// TestMiddleware_Reaper_Once verifies that exactly one reaper goroutine is
+// running per Middleware instance regardless of how many times Wrap() is
+// called (issue #978). The reaper starts in NewMiddleware, not in Wrap,
+// so calling Wrap() multiple times does not spawn multiple goroutines.
+func TestMiddleware_Reaper_Once(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+
+	// Baseline goroutine count before creating the middleware.
+	baseline := runtime.NumGoroutine()
+
+	m := NewMiddleware(60, 1, resolver, nil)
+
+	// After NewMiddleware, exactly one reaper goroutine should be running.
+	afterNew := runtime.NumGoroutine()
+	if afterNew != baseline+1 {
+		t.Errorf("after NewMiddleware: goroutines = %d, want %d (baseline %d + 1 reaper)",
+			afterNew, baseline+1, baseline)
+	}
+
+	// Calling Wrap() multiple times must not start additional reapers.
+	_ = m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	_ = m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	_ = m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	afterWrap := runtime.NumGoroutine()
+	if afterWrap != baseline+1 {
+		t.Errorf("after 3× Wrap: goroutines = %d, want %d (no extra reaper should start)",
+			afterWrap, baseline+1)
+	}
+
+	// Stop() should terminate the reaper.
+	m.Stop()
+
+	// The reaper exits when stopCh is closed; give it a moment.
+	time.Sleep(100 * time.Millisecond)
+
+	afterStop := runtime.NumGoroutine()
+	if afterStop != baseline {
+		t.Errorf("after Stop: goroutines = %d, want %d (reaper should have exited)",
+			afterStop, baseline)
 	}
 }
 
