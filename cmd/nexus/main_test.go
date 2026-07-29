@@ -736,7 +736,7 @@ func TestPublicPathExempt(t *testing.T) {
 // confidenceBridge without hitting any real storage.
 type stubJudgeStorage struct {
 	recordErr error
-	calls    []judge.JudgeScore
+	calls     []judge.JudgeScore
 }
 
 func (s *stubJudgeStorage) Record(score judge.JudgeScore) error {
