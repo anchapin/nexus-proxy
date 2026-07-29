@@ -1709,3 +1709,149 @@ func TestSLMCache_SemanticScanDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// --- Embed circuit breaker tests (issue #982) ---
+
+// failOnceEmbedder fails the first n calls, then succeeds.
+type failOnceEmbedder struct {
+	failCount int
+	calls     int
+	mu        sync.Mutex
+}
+
+func (f *failOnceEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
+	f.mu.Lock()
+	f.calls++
+	if f.calls <= f.failCount {
+		f.mu.Unlock()
+		return nil, errors.New("embedder unavailable")
+	}
+	f.mu.Unlock()
+	return []float64{1, 0, 0, 0}, nil
+}
+
+func TestSLMCache_EmbedBreaker_TripAndSkipEmbed(t *testing.T) {
+	// Three rapid embed failures must trip the circuit breaker; subsequent
+	// Sets must skip the embedder until the cooldown expires.
+	errEmbed := &failOnceEmbedder{failCount: 100} // always fails
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+	ctx := context.Background()
+
+	var embedCalls int
+	c.SetEmbedErrorObserver(func() { embedCalls++ })
+
+	// First two failures: breaker not yet active.
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteLocal)
+	if embedCalls != 2 {
+		t.Errorf("after 2 failures: embedCalls=%d, want 2", embedCalls)
+	}
+
+	// Third failure trips the breaker.
+	c.Set(ctx, "c", RouteLocal)
+	if embedCalls != 3 {
+		t.Errorf("after 3rd failure: embedCalls=%d, want 3", embedCalls)
+	}
+
+	// Now the breaker is active; next Set must skip embedding.
+	embedCallsBefore := embedCalls
+	c.Set(ctx, "d", RouteLocal)
+	if embedCalls != embedCallsBefore {
+		t.Errorf("Set during cooldown: embedCalls=%d, want %d (should skip embed)", embedCalls, embedCallsBefore)
+	}
+
+	// Exact matches still work without embedding.
+	got, ok, kind := c.Get(ctx, "a")
+	if !ok || got != RouteLocal || kind != CacheHitExact {
+		t.Errorf("exact match during cooldown: got (%v, %v, %v), want (RouteLocal, true, CacheHitExact)", got, ok, kind)
+	}
+}
+
+func TestSLMCache_EmbedBreaker_CooldownExpires(t *testing.T) {
+	// After the cooldown window expires, Set must call the embedder again.
+	errEmbed := &failOnceEmbedder{failCount: 100} // always fails
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+	ctx := context.Background()
+
+	// Trip the breaker.
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteLocal)
+	c.Set(ctx, "c", RouteLocal) // trips breaker
+
+	// Advance time past the cooldown window (30s) by manipulating embedCooldownUntil.
+	c.mu.Lock()
+	c.embedCooldownUntil = time.Now().Add(-1 * time.Second) // expired 1s ago
+	c.mu.Unlock()
+
+	// Next Set should attempt embedding (and fail again).
+	embedErrorsBefore := c.Stats().EmbedErrors
+	c.Set(ctx, "d", RouteLocal)
+	if c.Stats().EmbedErrors <= embedErrorsBefore {
+		t.Errorf("Set after cooldown: embed error count should increase, was %d before", embedErrorsBefore)
+	}
+}
+
+func TestSLMCache_EmbedBreaker_NilEmbedder(t *testing.T) {
+	// Cache without an embedder must not be affected by the breaker.
+	c := NewSLMCache(time.Hour, 0) // no embedder
+	ctx := context.Background()
+
+	c.Set(ctx, "a", RouteLocal)
+
+	got, ok, kind := c.Get(ctx, "a")
+	if !ok || got != RouteLocal || kind != CacheHitExact {
+		t.Errorf("Set without embedder: got (%v, %v, %v), want (RouteLocal, true, CacheHitExact)", got, ok, kind)
+	}
+}
+
+func TestSLMCache_EmbedBreaker_ThreeFailuresOutsideWindow(t *testing.T) {
+	// Three failures spread over more than 30s must NOT trip the breaker.
+	errEmbed := &failOnceEmbedder{failCount: 100} // always fails
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+	ctx := context.Background()
+
+	// Manually set three failure timestamps spaced 40s apart.
+	c.mu.Lock()
+	now := time.Now()
+	c.embedBreaker[0] = now.Add(-120 * time.Second) // 120s ago
+	c.embedBreaker[1] = now.Add(-80 * time.Second)  // 80s ago
+	c.embedBreaker[2] = now.Add(-40 * time.Second)  // 40s ago
+	c.embedBreakerPos = 3
+	c.mu.Unlock()
+
+	// The span is 80s (> 30s) — breaker must not trip.
+	embedErrorsBefore := c.Stats().EmbedErrors
+	c.Set(ctx, "a", RouteLocal)
+	if c.Stats().EmbedErrors <= embedErrorsBefore {
+		t.Errorf("Set with failures outside window: embed error count should increase, was %d before", embedErrorsBefore)
+	}
+}
+
+func TestSLMCache_EmbedBreaker_SustainedFailureSkipsEmbed(t *testing.T) {
+	// While the breaker is active, repeated Sets must not call the embedder.
+	errEmbed := &failOnceEmbedder{failCount: 1000} // always fails
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+	ctx := context.Background()
+
+	// Trip the breaker.
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteLocal)
+	c.Set(ctx, "c", RouteLocal) // trips breaker
+
+	// Subsequent Sets must skip embedding.
+	for i := 0; i < 5; i++ {
+		embedErrorsBefore := c.Stats().EmbedErrors
+		c.Set(ctx, fmt.Sprintf("key-%d", i), RouteLocal)
+		if c.Stats().EmbedErrors != embedErrorsBefore {
+			t.Errorf("Set #%d during cooldown: embedErrors increased unexpectedly", i)
+		}
+	}
+
+	// Exact matches still work.
+	for _, key := range []string{"a", "b", "c"} {
+		got, ok, kind := c.Get(ctx, key)
+		if !ok || got != RouteLocal || kind != CacheHitExact {
+			t.Errorf("exact match for %q: got (%v, %v, %v), want (RouteLocal, true, CacheHitExact)", key, got, ok, kind)
+		}
+	}
+}
