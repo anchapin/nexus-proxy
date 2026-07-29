@@ -1535,6 +1535,7 @@ func Chat(d Deps) http.Handler {
 					reqID,
 					d.ArbiterCache,
 					d.Config.ArbiterCacheTTL,
+					false, // isFusion: false when called directly (legacy path, issue #984)
 				)
 				if d.ArbiterCacheObserver != nil {
 					d.ArbiterCacheObserver(cacheHit)

@@ -472,6 +472,7 @@ func TestPanelArbiterTimeoutBoundsHangingCall(t *testing.T) {
 		false,         // skipLocal
 		"test-request-id",
 		nil, 0*time.Second,
+		false, // isFusion
 	)
 	elapsed := time.Since(start)
 
@@ -528,6 +529,7 @@ func TestPanelArbiterHappyPathNoRegression(t *testing.T) {
 		false,         // skipLocal
 		"test-request-id",
 		nil, 0*time.Second,
+		false, // isFusion
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -585,6 +587,7 @@ func TestPanelSkipLocalOmitsLocalFetch(t *testing.T) {
 		true,          // skipLocal
 		"test-request-id",
 		nil, 0*time.Second,
+		false, // isFusion
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -636,6 +639,7 @@ func TestPanelSkipLocalArbiterPromptHasDegradedMarker(t *testing.T) {
 		true, // skipLocal
 		"test-request-id",
 		nil, 0*time.Second,
+		false, // isFusion
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -927,6 +931,7 @@ func TestPanelArbiterHonorsStreamFlagFalse(t *testing.T) {
 		false, // skipLocal (issue #8)
 		"test-request-id",
 		nil, 0*time.Second,
+		false, // isFusion
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -990,6 +995,7 @@ func TestPanelArbiterHonorsStreamFlagTrueRegression(t *testing.T) {
 		false, // skipLocal (issue #8)
 		"test-request-id",
 		nil, 0*time.Second,
+		false, // isFusion
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -1036,6 +1042,7 @@ func TestPanelForwardsFrontierBearerToken(t *testing.T) {
 		"test prompt",
 		5*time.Second, 5*time.Second,
 		false, "test-request-id", nil, 0*time.Second,
+		false, // isFusion
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -2204,6 +2211,7 @@ func TestPanelCacheHitStream_SetsSSEContentType(t *testing.T) {
 		false,
 		"test-request-id",
 		cache, 5*time.Minute,
+		false, // isFusion
 	)
 	if err != nil {
 		t.Fatalf("Panel: %v", err)
@@ -2272,6 +2280,7 @@ func TestPanelCacheMissWithExpiredEntry_FallsBackToFetch(t *testing.T) {
 		false,
 		"test-request-id",
 		cache, 1*time.Millisecond,
+		false, // isFusion
 	)
 	if err != nil {
 		t.Fatalf("Panel: %v", err)
@@ -2329,6 +2338,7 @@ func TestPanelCacheHitNonStream_SetsJSONContentType(t *testing.T) {
 		false,
 		"test-request-id",
 		cache, 5*time.Minute,
+		false, // isFusion
 	)
 	if err != nil {
 		t.Fatalf("Panel: %v", err)
@@ -2659,6 +2669,7 @@ func TestPanel_MalformedArbiterEmptyChoices_ReturnsError(t *testing.T) {
 		false,
 		"test-request-id",
 		nil, 0*time.Second,
+		false, // isFusion
 	)
 	if err == nil {
 		t.Fatalf("Panel: expected error for empty choices, got nil")
@@ -2706,6 +2717,7 @@ func TestPanel_ValidArbiterResponse_ReturnsNoError(t *testing.T) {
 		false,
 		"test-request-id",
 		nil, 0*time.Second,
+		false, // isFusion
 	)
 	if err != nil {
 		t.Fatalf("Panel: unexpected error: %v", err)
@@ -2757,9 +2769,10 @@ func TestPanel_CacheHit_ReturnsNoError(t *testing.T) {
 		false,
 		"test-request-id",
 		cache, 5*time.Minute,
+		false, // isFusion
 	)
 	if err != nil {
-		t.Fatalf("Panel: unexpected error: %v", err)
+		t.Fatalf("Panel: %v", err)
 	}
 	if !cacheHit {
 		t.Errorf("cacheHit = false, want true")
