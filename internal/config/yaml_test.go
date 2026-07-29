@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -289,6 +290,70 @@ shutdown_timeout: "-5s"
 	_, err := LoadYAML(path)
 	if err == nil {
 		t.Error("expected error for negative shutdown timeout")
+	}
+}
+
+// issue #986: fractional fields must be validated in 0..1 range
+func TestLoadYAMLFractionalFieldRangeValidation(t *testing.T) {
+	fractionalFields := []struct {
+		yamlKey string
+		yamlVal string
+		wantErr string
+	}{
+		{"budget_alert_threshold", "5.0", "budget_alert_threshold must be in range [0,1]"},
+		{"budget_alert_threshold", "-0.5", "budget_alert_threshold must be in range [0,1]"},
+		{"fusion_agreement_threshold", "2.0", "fusion_agreement_threshold must be in range [0,1]"},
+		{"fusion_agreement_threshold", "-0.1", "fusion_agreement_threshold must be in range [0,1]"},
+		{"provider_tail_weight", "1.5", "provider_tail_weight must be in range [0,1]"},
+		{"provider_tail_weight", "-0.1", "provider_tail_weight must be in range [0,1]"},
+		{"tracing_sample_rate", "3.0", "tracing_sample_rate must be in range [0,1]"},
+		{"tracing_sample_rate", "-0.1", "tracing_sample_rate must be in range [0,1]"},
+	}
+
+	for _, tc := range fractionalFields {
+		t.Run(tc.yamlKey+"_"+tc.yamlVal, func(t *testing.T) {
+			tmp := t.TempDir()
+			path := filepath.Join(tmp, "config.yaml")
+			yamlContent := tc.yamlKey + ": " + tc.yamlVal + "\n"
+			if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			_, err := LoadYAML(path)
+			if err == nil {
+				t.Errorf("LoadYAML: expected error for %s=%s, got nil", tc.yamlKey, tc.yamlVal)
+			}
+			if err != nil && !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("LoadYAML error = %q, want containing %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadYAMLFractionalFieldBoundaryValues(t *testing.T) {
+	// Boundary values 0.0 and 1.0 should be accepted
+	validValues := []string{"0.0", "0", "1.0", "1", "0.5", "0.85"}
+	fractionalFields := []string{
+		"budget_alert_threshold",
+		"fusion_agreement_threshold",
+		"provider_tail_weight",
+		"tracing_sample_rate",
+	}
+
+	for _, field := range fractionalFields {
+		for _, val := range validValues {
+			t.Run(field+"_"+val, func(t *testing.T) {
+				tmp := t.TempDir()
+				path := filepath.Join(tmp, "config.yaml")
+				yamlContent := field + ": " + val + "\n"
+				if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+				_, err := LoadYAML(path)
+				if err != nil {
+					t.Errorf("LoadYAML: unexpected error for %s=%s: %v", field, val, err)
+				}
+			})
+		}
 	}
 }
 
