@@ -1240,7 +1240,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		QualityQueueDepth:      yc.intDefault(yc.QualityQueueDepth, 64),
 		QualityTimeout:         yc.durationDefault(yc.QualityTimeout, 60*time.Second),
 		QualityStderrCap:       yc.intDefault(yc.QualityStderrCap, 2*1024),
-		QualityDroppedRingSize: yc.intDefault(yc.QualityDroppedRingSize, 16),
+		QualityDroppedRingSize: yc.intDefault(yc.QualityDroppedRingSize, 256),
 		QualityEnabled:         yc.intDefault(yc.QualityConcurrency, 2) > 0,
 
 		PromptInjectionMode: middleware.ParseInjectionMode(yc.PromptInjectionMode),

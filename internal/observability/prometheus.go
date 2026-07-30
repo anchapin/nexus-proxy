@@ -100,6 +100,10 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total quality events dropped because the verifier queue was full.",
 		typ:  "counter",
 	},
+	"nexus_quality_dropped_ring_capacity": {
+		help: "Maximum number of dropped events retained in the ring buffer for inspection (issue #1066).",
+		typ:  "gauge",
+	},
 	"nexus_judge_dropped_total": {
 		help: "Total judge samples dropped because the judge queue was full (issue #892).",
 		typ:  "counter",

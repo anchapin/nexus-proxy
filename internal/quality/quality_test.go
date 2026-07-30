@@ -519,6 +519,9 @@ func TestDefaultsApplied(t *testing.T) {
 	if cfg.Now == nil {
 		t.Error("Now default = nil, want time.Now")
 	}
+	if cfg.DroppedRingSize != 256 {
+		t.Errorf("DroppedRingSize default = %d, want 256 (issue #1066)", cfg.DroppedRingSize)
+	}
 }
 
 // TestNilVerifierSafe confirms the package treats a nil *ShellVerifier
@@ -533,6 +536,9 @@ func TestNilVerifierSafe(t *testing.T) {
 	}
 	if v.QueueDepth() != 0 {
 		t.Error("nil ver.QueueDepth() != 0")
+	}
+	if v.DroppedRingCapacity() != 0 {
+		t.Error("nil ver.DroppedRingCapacity() != 0")
 	}
 	if err := v.Close(); err != nil {
 		t.Errorf("nil Close: %v", err)
