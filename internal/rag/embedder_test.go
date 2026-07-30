@@ -657,6 +657,31 @@ func TestOllamaEmbedder_EmbedBatch_ShortResponse(t *testing.T) {
 	}
 }
 
+// TestOllamaEmbedder_EmbedBatch_DimensionMismatch verifies that EmbedBatch returns
+// an error when embeddings have inconsistent dimensions (issue #1039).
+func TestOllamaEmbedder_EmbedBatch_DimensionMismatch(t *testing.T) {
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"embeddings": [][]float64{
+				{0.1, 0.2, 0.3},
+				{0.4, 0.5},            // dim=2, inconsistent with first (dim=3)
+				{0.7, 0.8, 0.9, 0.10}, // dim=4, also inconsistent
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer svr.Close()
+
+	emb := NewOllamaEmbedder(svr.URL, "nomic-embed-text", svr.Client(), BreakerConfig{})
+	_, err := emb.EmbedBatch(context.Background(), []string{"a", "b", "c"})
+	if err == nil {
+		t.Fatal("expected error for dimension mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "embedding at index 1 has dimension 2, want 3") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
 // TestOpenAIEmbedder_EmbedBatch verifies that EmbedBatch correctly sends
 // an array input and unpacks the batch response.
 func TestOpenAIEmbedder_EmbedBatch(t *testing.T) {
@@ -694,6 +719,30 @@ func TestOpenAIEmbedder_EmbedBatch(t *testing.T) {
 	}
 }
 
+// TestOpenAIEmbedder_EmbedBatch_DimensionMismatch verifies that EmbedBatch returns
+// an error when embeddings have inconsistent dimensions (issue #1039).
+func TestOpenAIEmbedder_EmbedBatch_DimensionMismatch(t *testing.T) {
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"data": []map[string]any{
+				{"embedding": []float64{0.1, 0.2, 0.3}},
+				{"embedding": []float64{0.4, 0.5}}, // dim=2, inconsistent with first (dim=3)
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer svr.Close()
+
+	emb := NewOpenAIEmbedder(svr.URL, "text-embedding-3-small", "sk-test", svr.Client(), BreakerConfig{})
+	_, err := emb.EmbedBatch(context.Background(), []string{"hello", "world"})
+	if err == nil {
+		t.Fatal("expected error for dimension mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "embedding at index 1 has dimension 2, want 3") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
 // TestCohereEmbedder_EmbedBatch verifies that EmbedBatch correctly sends
 // a texts array and unpacks the batch response.
 func TestCohereEmbedder_EmbedBatch(t *testing.T) {
@@ -728,5 +777,30 @@ func TestCohereEmbedder_EmbedBatch(t *testing.T) {
 	}
 	if vecs[0][0] != 0.1 || vecs[1][2] != 0.6 {
 		t.Errorf("unexpected vector values: %v", vecs)
+	}
+}
+
+// TestCohereEmbedder_EmbedBatch_DimensionMismatch verifies that EmbedBatch returns
+// an error when embeddings have inconsistent dimensions (issue #1039).
+func TestCohereEmbedder_EmbedBatch_DimensionMismatch(t *testing.T) {
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"embeddings": [][]float64{
+				{0.1, 0.2, 0.3},
+				{0.4, 0.5},           // dim=2, inconsistent with first (dim=3)
+				{0.6, 0.7, 0.8, 0.9}, // dim=4, also inconsistent
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer svr.Close()
+
+	emb := NewCohereEmbedder(svr.URL, "embed-english-v3.0", "cohere-key", svr.Client(), BreakerConfig{})
+	_, err := emb.EmbedBatch(context.Background(), []string{"hello", "world", "foo"})
+	if err == nil {
+		t.Fatal("expected error for dimension mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "embedding at index 1 has dimension 2, want 3") {
+		t.Errorf("unexpected error message: %v", err)
 	}
 }

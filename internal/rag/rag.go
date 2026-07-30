@@ -1422,6 +1422,15 @@ func (o *OllamaEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 			return nil, fmt.Errorf("ollama embed batch: empty embedding at index %d for model %s", i, o.Model)
 		}
 	}
+	for i, emb := range raw.Embeddings {
+		if i == 0 {
+			continue
+		}
+		if len(emb) != len(raw.Embeddings[0]) {
+			o.breaker.RecordFailure()
+			return nil, fmt.Errorf("ollama embed batch: embedding at index %d has dimension %d, want %d", i, len(emb), len(raw.Embeddings[0]))
+		}
+	}
 	o.breaker.RecordSuccess()
 	return raw.Embeddings, nil
 }
@@ -1569,6 +1578,15 @@ func (o *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 		if len(d.Embedding) == 0 {
 			o.breaker.RecordFailure()
 			return nil, fmt.Errorf("openai embed batch: empty embedding at index %d for model %s", i, o.Model)
+		}
+	}
+	for i, d := range raw.Data {
+		if i == 0 {
+			continue
+		}
+		if len(d.Embedding) != len(raw.Data[0].Embedding) {
+			o.breaker.RecordFailure()
+			return nil, fmt.Errorf("openai embed batch: embedding at index %d has dimension %d, want %d", i, len(d.Embedding), len(raw.Data[0].Embedding))
 		}
 	}
 	o.breaker.RecordSuccess()
@@ -1748,6 +1766,15 @@ func (c *CohereEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 		if len(emb) == 0 {
 			c.breaker.RecordFailure()
 			return nil, fmt.Errorf("cohere embed batch: empty embedding at index %d for model %s", i, c.Model)
+		}
+	}
+	for i, emb := range raw.Embeddings {
+		if i == 0 {
+			continue
+		}
+		if len(emb) != len(raw.Embeddings[0]) {
+			c.breaker.RecordFailure()
+			return nil, fmt.Errorf("cohere embed batch: embedding at index %d has dimension %d, want %d", i, len(emb), len(raw.Embeddings[0]))
 		}
 	}
 	c.breaker.RecordSuccess()
