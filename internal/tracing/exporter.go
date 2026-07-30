@@ -444,16 +444,23 @@ type otlpStatus struct {
 	Description string `json:"description,omitempty"`
 }
 
+type otlpEvent struct {
+	Name                  string     `json:"name"`
+	TimestampUnixNanoNano string     `json:"timestampUnixNano"`
+	Attributes            []otlpAttr `json:"attributes,omitempty"`
+}
+
 type otlpSpan struct {
-	TraceID           string     `json:"traceId"`
-	SpanID            string     `json:"spanId"`
-	ParentSpanID      string     `json:"parentSpanId,omitempty"`
-	Name              string     `json:"name"`
-	Kind              string     `json:"kind"`
-	StartTimeUnixNano string     `json:"startTimeUnixNano"`
-	EndTimeUnixNano   string     `json:"endTimeUnixNano"`
-	Attributes        []otlpAttr `json:"attributes,omitempty"`
-	Status            otlpStatus `json:"status"`
+	TraceID           string      `json:"traceId"`
+	SpanID            string      `json:"spanId"`
+	ParentSpanID      string      `json:"parentSpanId,omitempty"`
+	Name              string      `json:"name"`
+	Kind              string      `json:"kind"`
+	StartTimeUnixNano string      `json:"startTimeUnixNano"`
+	EndTimeUnixNano   string      `json:"endTimeUnixNano"`
+	Attributes        []otlpAttr  `json:"attributes,omitempty"`
+	Events            []otlpEvent `json:"events,omitempty"`
+	Status            otlpStatus  `json:"status"`
 }
 
 type otlpScope struct {
@@ -533,6 +540,25 @@ func toOTLPSpan(s *Span) otlpSpan {
 				Key:   k,
 				Value: encodeAttr(v),
 			})
+		}
+	}
+	if len(s.Events) > 0 {
+		out.Events = make([]otlpEvent, 0, len(s.Events))
+		for _, e := range s.Events {
+			ev := otlpEvent{
+				Name:                  e.Name,
+				TimestampUnixNanoNano: fmt.Sprintf("%d", e.Timestamp.UnixNano()),
+			}
+			if len(e.Attributes) > 0 {
+				ev.Attributes = make([]otlpAttr, 0, len(e.Attributes))
+				for k, v := range e.Attributes {
+					ev.Attributes = append(ev.Attributes, otlpAttr{
+						Key:   k,
+						Value: encodeAttr(v),
+					})
+				}
+			}
+			out.Events = append(out.Events, ev)
 		}
 	}
 	return out
