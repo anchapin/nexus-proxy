@@ -411,6 +411,14 @@ func (p *PersistentStore) Load(ctx context.Context) (int, error) {
 	if hnswIndexBlob != nil {
 		if err := p.restoreIndex(hnswIndexBlob); err != nil {
 			slog.Warn("rag: restore hnsw index, will rebuild lazily", slog.Any("err", err))
+		} else if p.embedderDims > 0 {
+			if dims := p.index.Dims(); dims != p.embedderDims {
+				slog.Warn("rag: hnsw index dimension mismatch, will rebuild lazily",
+					slog.Int("index_dims", dims),
+					slog.Int("embedder_dims", p.embedderDims),
+				)
+				p.index = nil
+			}
 		}
 	}
 	return len(out), nil

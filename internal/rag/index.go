@@ -122,6 +122,18 @@ func (h *HNSWIndex) Size() int {
 	return h.size
 }
 
+// Dims returns the dimension of the vectors in the index, or 0 if the
+// index is empty. Used to validate that a deserialized index matches the
+// current embedder's expected dimension (issue #1040).
+func (h *HNSWIndex) Dims() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.size == 0 || len(h.layers) == 0 || len(h.layers[0]) == 0 {
+		return 0
+	}
+	return len(h.layers[0][0].vec)
+}
+
 // Add inserts a vector into the index. The id is used to identify the vector
 // in search results — callers typically pass the index into the examples slice.
 func (h *HNSWIndex) Add(id int, vec []float64) {
