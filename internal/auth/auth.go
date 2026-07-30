@@ -19,6 +19,8 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/ratelimit"
 	"github.com/anchapin/nexus-proxy/internal/tracing"
@@ -32,6 +34,15 @@ type AuthObserver interface {
 	IncAuthRejectedMissing()
 }
 
+// clientSlot tracks an in-progress auth attempt for one client IP.
+// The channel is closed when the auth attempt completes, allowing
+// a new slot to be acquired. This prevents a slow attacker from
+// holding a slot indefinitely and blocking other IPs (issue #1062).
+type clientSlot struct {
+	ch       chan struct{} // closed when auth attempt completes
+	lastSeen time.Time
+}
+
 // Middleware gates HTTP requests behind a bearer token. When key is
 // empty the middleware is a pass-through (auth disabled), so a
 // development proxy with no NEXUS_PROXY_API_KEY behaves identically
@@ -42,6 +53,9 @@ type Middleware struct {
 	authLimiter *ratelimit.AuthLimiter
 	observer    AuthObserver
 	resolver    *ratelimit.ClientIPResolver
+
+	mu    sync.Mutex
+	slots map[string]*clientSlot // keyed by client IP
 }
 
 // NewMiddleware returns a middleware that rejects requests without a
@@ -57,11 +71,57 @@ func NewMiddleware(key string, exempt func(*http.Request) bool, authLimiter *rat
 	if authLimiter != nil {
 		resolver = authLimiter.Resolver()
 	}
-	return &Middleware{key: key, exempt: exempt, authLimiter: authLimiter, observer: observer, resolver: resolver}
+	if resolver == nil {
+		resolver = ratelimit.NewClientIPResolver(nil)
+	}
+	return &Middleware{
+		key:         key,
+		exempt:      exempt,
+		authLimiter: authLimiter,
+		observer:    observer,
+		resolver:    resolver,
+		slots:       make(map[string]*clientSlot),
+	}
 }
 
 // Enabled reports whether the middleware actually enforces auth.
 func (m *Middleware) Enabled() bool { return m.key != "" }
+
+// acquireSlot acquires an auth slot for the given IP. If the IP already has
+// a slot with an open channel (previous auth attempt still in progress),
+// the old channel is closed and a new slot is created. This prevents a slow
+// attacker from holding a slot indefinitely and blocking other IPs (issue #1062).
+func (m *Middleware) acquireSlot(ip string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if slot, ok := m.slots[ip]; ok {
+		select {
+		case <-slot.ch:
+			delete(m.slots, ip)
+		default:
+			close(slot.ch)
+			m.slots[ip] = &clientSlot{ch: make(chan struct{}), lastSeen: time.Now()}
+		}
+	} else {
+		m.slots[ip] = &clientSlot{ch: make(chan struct{}), lastSeen: time.Now()}
+	}
+}
+
+// renewSlot closes the current auth slot for the given IP and creates a new one.
+// Called when auth completes (success or failure) so subsequent requests
+// from the same IP can proceed.
+func (m *Middleware) renewSlot(ip string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if slot, ok := m.slots[ip]; ok {
+		select {
+		case <-slot.ch:
+		default:
+			close(slot.ch)
+		}
+		m.slots[ip] = &clientSlot{ch: make(chan struct{}), lastSeen: time.Now()}
+	}
+}
 
 // Wrap returns an http.Handler that enforces the bearer-token gate.
 // When auth is disabled (empty key) the handler is returned as-is.
@@ -78,6 +138,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			defer span.End()
 		}
 
+		ip := m.resolver.Resolve(r)
 		exempt := m.exempt != nil && m.exempt(r)
 		token := BearerToken(r)
 		tokenPresent := token != ""
@@ -88,7 +149,6 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		}
 
 		if m.authLimiter != nil && m.authLimiter.Enabled() {
-			ip := m.resolver.Resolve(r)
 			if m.authLimiter.IsBlocked(ip) {
 				if span != nil {
 					span.SetAttr("auth.outcome", "reject")
@@ -111,11 +171,14 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			}
 		}
 
+		m.acquireSlot(ip)
+
 		if exempt {
 			if span != nil {
 				span.SetAttr("auth.outcome", "accept")
 			}
 			next.ServeHTTP(w, r)
+			m.renewSlot(ip)
 			return
 		}
 		if token == "" {
@@ -130,9 +193,9 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 				m.observer.IncAuthRejectedMissing()
 			}
 			if m.authLimiter != nil && m.authLimiter.Enabled() {
-				ip := m.resolver.Resolve(r)
 				m.authLimiter.RecordFailure(ip, "missing")
 			}
+			m.renewSlot(ip)
 			return
 		}
 		// Use crypto/subtle.ConstantTimeCompare to prevent timing attacks
@@ -149,9 +212,9 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 				m.observer.IncAuthRejectedInvalid()
 			}
 			if m.authLimiter != nil && m.authLimiter.Enabled() {
-				ip := m.resolver.Resolve(r)
 				m.authLimiter.RecordFailure(ip, "invalid")
 			}
+			m.renewSlot(ip)
 			return
 		}
 		if span != nil {
@@ -161,6 +224,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		if m.observer != nil {
 			m.observer.IncAuthAccepted()
 		}
+		m.renewSlot(ip)
 	})
 }
 

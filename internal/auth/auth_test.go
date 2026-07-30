@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -722,5 +723,92 @@ func TestAuthSpanAttributesOnExempt(t *testing.T) {
 	}
 	if outcome := tracingtest.AttrString(span, "auth.outcome"); outcome != "accept" {
 		t.Errorf("auth.outcome = %q, want %q", outcome, "accept")
+	}
+}
+
+// TestAuthSlotPerIPNotBlocking verifies that concurrent auth attempts from
+// different IPs don't block each other. A slow attacker holding a slot on
+// their IP should not prevent other IPs from being authenticated (issue #1062).
+func TestAuthSlotPerIPNotBlocking(t *testing.T) {
+	m := NewMiddleware("secret-key", nil, nil, nil)
+	h := m.Wrap(okHandler())
+
+	ip1 := "192.0.2.10"
+	ip2 := "192.0.2.20"
+	ip3 := "192.0.2.30"
+
+	type result struct {
+		ip   string
+		code int
+	}
+
+	results := make(chan result, 3)
+	var wg sync.WaitGroup
+
+	for _, ip := range []string{ip1, ip2, ip3} {
+		wg.Add(1)
+		go func(clientIP string) {
+			defer wg.Done()
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			req.Header.Set("X-Real-IP", clientIP)
+			req.Header.Set("Authorization", "Bearer secret-key")
+			h.ServeHTTP(rr, req)
+			results <- result{ip: clientIP, code: rr.Code}
+		}(ip)
+	}
+
+	wg.Wait()
+	close(results)
+
+	found := make(map[string]bool)
+	for r := range results {
+		found[r.ip] = true
+		if r.code != http.StatusOK {
+			t.Errorf("IP %s: status = %d, want 200", r.ip, r.code)
+		}
+	}
+	if len(found) != 3 {
+		t.Errorf("expected 3 results, got %d", len(found))
+	}
+}
+
+// TestAuthSlotRenewedOnSuccess verifies that a successful auth renews the slot
+// so subsequent requests from the same IP can proceed.
+func TestAuthSlotRenewedOnSuccess(t *testing.T) {
+	m := NewMiddleware("secret-key", nil, nil, nil)
+	h := m.Wrap(okHandler())
+
+	ip := "198.51.100.50"
+
+	for i := 0; i < 3; i++ {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+		req.Header.Set("X-Real-IP", ip)
+		req.Header.Set("Authorization", "Bearer secret-key")
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Errorf("attempt %d: status = %d, want 200", i+1, rr.Code)
+		}
+	}
+}
+
+// TestAuthSlotRenewedOnFailure verifies that a failed auth renews the slot
+// so subsequent requests from the same IP can proceed.
+func TestAuthSlotRenewedOnFailure(t *testing.T) {
+	m := NewMiddleware("secret-key", nil, nil, nil)
+	h := m.Wrap(okHandler())
+
+	ip := "198.51.100.51"
+
+	for i := 0; i < 3; i++ {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+		req.Header.Set("X-Real-IP", ip)
+		req.Header.Set("Authorization", "Bearer wrong-key")
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("attempt %d: status = %d, want 401", i+1, rr.Code)
+		}
 	}
 }
