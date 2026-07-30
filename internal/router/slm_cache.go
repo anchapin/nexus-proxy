@@ -72,6 +72,13 @@ type SLMCache struct {
 	ttlEvictions uint64
 	lruEvictions uint64
 
+	// staleCount atomically tracks the number of entries that have
+	// passed their TTL but have not yet been evicted (issue #1034).
+	// It is incremented on Set (entry becomes stale after TTL) and
+	// decremented on EvictExpired. Using an atomic counter eliminates
+	// the O(n) scan that previously happened on every getSemantic call.
+	staleCount atomic.Int64
+
 	// embedErrors is a cumulative atomic counter bumped inside the
 	// embedder call in Set and getSemantic when the embedder returns
 	// a non-nil error (issue #741). It is safe to read concurrently.
@@ -214,9 +221,10 @@ func (c *SLMCache) sortExpiry() {
 }
 
 // evictExpired removes all entries whose TTL has expired and bumps the
-// TTL eviction counter once per removed entry (issue #449). It returns
-// the number of entries removed so the caller can dispatch the
-// eviction observer after unlocking. Caller must hold c.mu.
+// TTL eviction counter once per removed entry (issue #449). It also
+// decrements the staleCount by the number removed (issue #1034).
+// It returns the number of entries removed so the caller can dispatch
+// the eviction observer after unlocking. Caller must hold c.mu.
 func (c *SLMCache) evictExpired() int {
 	now := time.Now()
 	var keep []string
@@ -237,6 +245,7 @@ func (c *SLMCache) evictExpired() int {
 	c.sortExpiry()
 	if removed > 0 {
 		atomic.AddUint64(&c.ttlEvictions, uint64(removed))
+		c.staleCount.Add(-int64(removed))
 	}
 	return removed
 }
@@ -353,24 +362,18 @@ func (c *SLMCache) getSemantic(ctx context.Context, prompt string) (Route, bool,
 		return "", false, ""
 	}
 
-	c.mu.RLock()
-	var stale int
-	staleNow := time.Now()
-	if c.maxStale > 0 {
-		for _, entry := range c.entries {
-			if staleNow.Sub(entry.stamp) > c.ttl {
-				stale++
-			}
-		}
-	}
-	c.mu.RUnlock()
-
 	// Proactive eviction: if stale entries exceed the threshold (issue #835),
 	// dispatch a background goroutine to remove them without blocking the
 	// read path. The goroutine is fire-and-forget — eviction observers run
 	// after the lock is released so re-entrancy is safe.
-	if stale > c.maxStale {
-		go c.EvictExpired()
+	// Only check when maxStale > 0, matching the original O(n) scan guard.
+	if c.maxStale > 0 {
+		c.mu.RLock()
+		stale := int(c.staleCount.Load())
+		c.mu.RUnlock()
+		if stale > c.maxStale {
+			go c.EvictExpired()
+		}
 	}
 
 	c.mu.RLock()
@@ -426,6 +429,10 @@ func (c *SLMCache) Set(ctx context.Context, prompt string, route Route) {
 	var onEmbedErr func()
 
 	c.mu.Lock()
+
+	// Increment staleCount for every entry added (issue #1034).
+	// EvictExpired will decrement when entries are removed.
+	c.staleCount.Add(1)
 
 	var emb []float64
 	if c.embedder != nil {
@@ -501,6 +508,9 @@ func (c *SLMCache) SetEmbedding(prompt string, route Route, emb []float64) {
 	var onEvict func(reason string)
 
 	c.mu.Lock()
+
+	// Every entry will eventually become stale after TTL (issue #1034).
+	c.staleCount.Add(1)
 
 	if c.maxEntries > 0 && len(c.entries) >= c.maxEntries {
 		ttlRemoved = c.evictExpired()
