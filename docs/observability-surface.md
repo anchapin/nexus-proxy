@@ -32,10 +32,11 @@ snake_case naming.
 | `nexus_cascade_fallback_total` | counter | `reason` | 6 (`timeout`, `transport_error`, `rate_limited`, `http_error`, `malformed_toolcall`, `malformed_response`) | `routemetrics.go` |
 | `nexus_rag_retrieval_total` | counter | `hit`, `reason` (miss only) | 1 + 3 = 4 | `routemetrics.go` |
 | `nexus_judge_dropped_total` | counter | *(none)* | 1 | `routemetrics.go` |
+| `nexus_fusion_client_abort_total` | counter | *(none)* | 1 | `prometheus.go` (issue #1046) |
 | `nexus_rate_limit_bucket_utilization` | histogram | `bucket_id` | dynamic (≤ concurrent client IPs) | `prometheus.go` (issue #746) |
 | `nexus_build_info` | gauge | `version`, `commit`, `go_version` | 1 | `prometheus.go` (issue #529) |
 
-**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 1 + 1 + 4 + 6 + 4 + 1 + 1 + 1 = 143 series.
+**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 1 + 1 + 4 + 6 + 4 + 1 + 1 + 1 + 1 = 144 series.
 
 > **Note (issue #486):** `nexus_rag_retrieval_total` previously carried
 > a `filename` label whose value was the raw RAG source filename, which
