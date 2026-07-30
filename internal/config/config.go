@@ -2058,12 +2058,13 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 	// updated list into the live ipResolver without a restart (issue #896).
 	next.TrustedProxiesRaw = strings.TrimSpace(os.Getenv("NEXUS_TRUSTED_PROXIES"))
 	if parsed, err := parseTrustedProxies(next.TrustedProxiesRaw); err != nil {
-		// Bogus value after boot: warn but keep the previous parsed list so
-		// the proxy stays operational rather than silently falling back to
-		// "trust nobody" on a typo.
-		slog.Warn("invalid NEXUS_TRUSTED_PROXIES, keeping previous value",
+		// Bogus value after boot: add to NeedsRestart so the operator is told
+		// a restart is required instead of silently preserving the previous
+		// value (issue #1055).
+		slog.Warn("invalid NEXUS_TRUSTED_PROXIES, restart required to apply change",
 			slog.String("reason", err.Error()))
 		next.TrustedProxies = prev.TrustedProxies
+		result.NeedsRestart = append(result.NeedsRestart, "NEXUS_TRUSTED_PROXIES")
 	} else {
 		next.TrustedProxies = parsed
 	}

@@ -1112,6 +1112,41 @@ func TestReloadHotReloadable_PreservesNonReloadable(t *testing.T) {
 	// so we verify the returned cfg preserves non-reloadable fields.
 }
 
+// TestReloadHotReloadable_TrustedProxiesInvalid verifies that an invalid
+// NEXUS_TRUSTED_PROXIES value after boot adds NEXUS_TRUSTED_PROXIES to
+// NeedsRestart so the operator is told a restart is required (issue #1055).
+func TestReloadHotReloadable_TrustedProxiesInvalid(t *testing.T) {
+	prev := Config{
+		TrustedProxiesRaw: "10.0.0.0/8",
+	}
+	// Set an invalid CIDR that will fail parsing.
+	t.Setenv("NEXUS_TRUSTED_PROXIES", "not-a-valid-cidr")
+	stop := captureSlog(t)
+	_, result := ReloadHotReloadable(prev)
+	lines, _ := stop()
+
+	// Verify NEXUS_TRUSTED_PROXIES is in NeedsRestart.
+	if len(result.NeedsRestart) != 1 {
+		t.Errorf("expected 1 restart-required setting, got %d: %v", len(result.NeedsRestart), result.NeedsRestart)
+	}
+	if result.NeedsRestart[0] != "NEXUS_TRUSTED_PROXIES" {
+		t.Errorf("NeedsRestart[0] = %q, want NEXUS_TRUSTED_PROXIES", result.NeedsRestart[0])
+	}
+
+	// Verify a warning was logged.
+	var found bool
+	for _, line := range lines {
+		msg, _ := line["msg"].(string)
+		if strings.Contains(msg, "invalid NEXUS_TRUSTED_PROXIES") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected warning about invalid NEXUS_TRUSTED_PROXIES to be logged")
+	}
+}
+
 // captureSlog swaps slog.Default for a JSON handler bound to a buffer
 // that captures every line. Returns the captured buffer contents as a
 // JSON-decoded slice (one map per line) plus the raw string.
