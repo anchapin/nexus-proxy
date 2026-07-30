@@ -1266,6 +1266,73 @@ func TestPersistentStoreHNSWSerializeRoundTrip(t *testing.T) {
 	}
 }
 
+// TestPersistentStoreIndexDir_BatchUpsertFailureInvalidatesHNSW (issue #1042)
+// verifies that when EmbedBatch succeeds but an individual Upsert fails within
+// a batch, the HNSW index is invalidated so subsequent Retrieve calls fall back
+// to brute-force instead of returning stale HNSW IDs.
+func TestPersistentStoreIndexDir_BatchUpsertFailureInvalidatesHNSW(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	// Use batch size > 0 to exercise the batch code path.
+	ps, err := OpenPersistentStore(":memory:", &stubEmbedder{}, 0.55, WithBatchSize(4))
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+
+	// Add enough examples via individual Upserts to exceed indexThreshold (50)
+	// so the HNSW index is built. Use a non-zero vector so cosine similarity
+	// is well-defined.
+	const n = indexThreshold + 5
+	vec := []float64{1, 0, 0, 0, 0, 0, 0, 0}
+	for i := 0; i < n; i++ {
+		if err := ps.Upsert(ctx, FewShotExample{
+			Filename:  fmt.Sprintf("file%d.go", i),
+			Content:   fmt.Sprintf("content %d", i),
+			Embedding: vec,
+		}); err != nil {
+			t.Fatalf("Upsert file%d: %v", i, err)
+		}
+	}
+
+	// Trigger lazy HNSW index build via Retrieve (Upsert invalidates after
+	// each call, so Retrieve is the first call that rebuilds it).
+	_, _, _, err = ps.Retrieve(ctx, "content 0")
+	if err != nil {
+		t.Fatalf("Retrieve to build index: %v", err)
+	}
+
+	// Verify HNSW index is active before the failure.
+	if mode := ps.IndexMode(); mode != IndexModeHNSW {
+		t.Fatalf("before failure: IndexMode = %q, want %q", mode, IndexModeHNSW)
+	}
+
+	// Close the DB so subsequent Upsert calls fail (but EmbedBatch still succeeds
+	// because the embedder doesn't need the DB).
+	if err := ps.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// IndexDir: EmbedBatch succeeds (embedder doesn't need DB), but Upsert fails
+	// because DB is closed. The code must invalidate the HNSW index to prevent
+	// stale IDs from being returned by subsequent Retrieve calls.
+	dir := t.TempDir()
+	for i := 0; i < 3; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("new%d.go", i)), []byte(fmt.Sprintf("new content %d", i)), 0o644); err != nil {
+			t.Fatalf("write new%d: %v", i, err)
+		}
+	}
+	if err := ps.IndexDir(ctx, dir); err != nil {
+		t.Fatalf("IndexDir after close: %v", err)
+	}
+
+	// After the Upsert failure, the HNSW index must be invalidated so
+	// Retrieve falls back to brute-force instead of returning stale HNSW IDs.
+	if mode := ps.IndexMode(); mode != IndexModeBruteForce {
+		t.Errorf("after upsert failure: IndexMode = %q, want %q (HNSW should be invalidated)", mode, IndexModeBruteForce)
+	}
+}
+
 // TestPersistentStoreHNSWFallbackRebuild verifies that Load falls back to
 // rebuildIndex when no serialized hnsw_index blob is present (backward
 // compatibility with pre-issue-#939 databases).
