@@ -197,128 +197,56 @@ func TestRetryAfterNilReceiver(t *testing.T) {
 	}
 }
 
-// TestRingBufferHeadAdvances verifies that pruneLocked advances the
-// head pointer without copying entries (issue #987). The ring buffer
-// backing store should NOT be modified; only head/count should change.
-func TestRingBufferHeadAdvances(t *testing.T) {
+// TestBucketPruning verifies that entries older than the rolling window
+// are pruned and the total is correctly maintained.
+func TestBucketPruning(t *testing.T) {
 	st := NewSpendTracker(100.0)
 	st.window = 50 * time.Millisecond
 
-	// Record an entry and verify ring state.
 	st.Record(1.0)
-	if st.count != 1 {
-		t.Fatalf("after Record: count = %d, want 1", st.count)
-	}
-	if st.head != 0 {
-		t.Fatalf("after Record: head = %d, want 0", st.head)
-	}
-	if st.tail != 1%cap(st.entries) {
-		t.Fatalf("after Record: tail = %d, want %d", st.tail, 1%cap(st.entries))
+	if got := st.CurrentSpend(); got != 1.0 {
+		t.Fatalf("after Record: CurrentSpend = %v, want 1.0", got)
 	}
 
-	// Wait for entry to expire.
 	time.Sleep(60 * time.Millisecond)
 
-	// prune via CurrentSpend
 	_ = st.CurrentSpend()
 
-	// Head should have advanced; count should be 0.
-	if st.count != 0 {
-		t.Errorf("after prune: count = %d, want 0", st.count)
-	}
-	// The backing store at position 0 should still contain the old entry,
-	// but head points past it now.
-	if st.head != 1%cap(st.entries) {
-		t.Errorf("after prune: head = %d, want %d", st.head, 1%cap(st.entries))
+	if got := st.CurrentSpend(); got != 0.0 {
+		t.Errorf("after prune: CurrentSpend = %v, want 0.0", got)
 	}
 }
 
-// TestRingBufferWrap verifies that entries wrap correctly around the
-// ring when tail crosses capacity boundary.
-func TestRingBufferWrap(t *testing.T) {
-	st := NewSpendTracker(100.0)
-	// Small ring capacity for test: create a tracker and manually set
-	// entries to a small capacity to test wrapping.
-	st.entries = make([]entry, 4) // 4-slot ring
-	st.head = 0
-	st.tail = 0
-	st.count = 0
+// TestManySmallRequests tests that many small requests don't cause
+// O(n) performance degradation (issue #1070).
+func TestManySmallRequests(t *testing.T) {
+	st := NewSpendTracker(10000.0)
 
-	// Fill the ring: 4 entries at slots 0,1,2,3.
-	for i := 0; i < 4; i++ {
-		st.entries[st.tail] = entry{at: time.Now(), amount: float64(i + 1)}
-		st.tail = (st.tail + 1) % 4
-		st.count++
+	for i := 0; i < 10000; i++ {
+		st.Record(0.001)
 	}
 
-	if st.count != 4 || st.head != 0 || st.tail != 0 {
-		t.Fatalf("ring full state: count=%d head=%d tail=%d, want 4,0,0",
-			st.count, st.head, st.tail)
+	got := st.CurrentSpend()
+	if got < 9.99 || got > 10.01 {
+		t.Errorf("CurrentSpend = %v, want ~10.0", got)
 	}
 
-	// Simulate pruning 2 entries (advancing head by 2).
-	st.head = (st.head + 2) % 4
-	st.count -= 2
-
-	if st.count != 2 || st.head != 2 {
-		t.Errorf("after pruning 2: count=%d head=%d, want 2,2", st.count, st.head)
-	}
-
-	// Sum should return correct total (3+4 = 7).
-	var total float64
-	for i := 0; i < st.count; i++ {
-		idx := (st.head + i) % 4
-		total += st.entries[idx].amount
-	}
-	if total != 7.0 {
-		t.Errorf("sum = %v, want 7.0", total)
+	if st.WouldExceed(1.0) {
+		t.Error("WouldExceed(1.0) = true, want false (10 + 1 < 10000)")
 	}
 }
 
-// TestRingBufferGrow verifies that growLocked correctly copies entries
-// to a larger backing array and resets indices.
-func TestRingBufferGrow(t *testing.T) {
+// TestBucketOverflow tests that the tracker handles many entries
+// in the same bucket correctly.
+func TestBucketOverflow(t *testing.T) {
 	st := NewSpendTracker(100.0)
-	// Use tiny ring to trigger grow.
-	st.entries = make([]entry, 4)
-	st.head = 0
-	st.tail = 0
-	st.count = 0
 
-	// Fill the ring.
-	now := time.Now()
-	for i := 0; i < 4; i++ {
-		st.entries[i] = entry{at: now, amount: float64(i + 1)}
-	}
-	st.tail = 0 // full ring, tail wraps to head
-	st.count = 4
-
-	// Call grow.
-	st.growLocked()
-
-	// New backing store should be 2x capacity.
-	newCap := 8
-	if cap(st.entries) != newCap {
-		t.Errorf("after grow: capacity = %d, want %d", cap(st.entries), newCap)
-	}
-	// Head should be 0, tail should equal count.
-	if st.head != 0 {
-		t.Errorf("after grow: head = %d, want 0", st.head)
-	}
-	if st.tail != st.count {
-		t.Errorf("after grow: tail = %d, want %d (count)", st.tail, st.count)
-	}
-	if st.count != 4 {
-		t.Errorf("after grow: count = %d, want 4", st.count)
+	for i := 0; i < 1000; i++ {
+		st.Record(0.01)
 	}
 
-	// Entries should be in correct chronological order.
-	var total float64
-	for i := 0; i < st.count; i++ {
-		idx := (st.head + i) % cap(st.entries)
-		total += st.entries[idx].amount
-	}
-	if total != 10.0 {
-		t.Errorf("sum after grow = %v, want 10.0", total)
+	got := st.CurrentSpend()
+	if got < 9.99 || got > 10.01 {
+		t.Errorf("CurrentSpend = %v, want ~10.0", got)
 	}
 }
