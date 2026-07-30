@@ -373,6 +373,58 @@ func TestFetchPanelRespectsMaxResponseBytesLimit(t *testing.T) {
 	}
 }
 
+// TestFetchPanelExactLimitReturnsErrResponseTruncated verifies that when the
+// response body equals MaxResponseBytes (exact limit), FetchPanel returns
+// ErrResponseTruncated to distinguish from a generic error (issue #1047).
+func TestFetchPanelExactLimitReturnsErrResponseTruncated(t *testing.T) {
+	ConfigureMaxResponseBytes(1024)
+	defer ResetMaxResponseBytesForTest()
+
+	body := strings.Repeat("x", 1024)
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})}
+	_, err := FetchPanel(context.Background(), client, "http://x", "", "m", nil)
+	if err == nil {
+		t.Fatal("expected error for exact-limit response")
+	}
+	if !errors.Is(err, ErrResponseTruncated) {
+		t.Errorf("error = %v, want ErrResponseTruncated", err)
+	}
+	if !strings.Contains(err.Error(), "read response") {
+		t.Errorf("error = %v, want error mentioning 'read response'", err)
+	}
+}
+
+// TestFetchPanelActualTruncation verifies that when io.LimitReader hits the
+// limit and io.EOF is returned (upstream had more data), FetchPanel returns
+// ErrResponseTruncated (issue #1047).
+func TestFetchPanelActualTruncation(t *testing.T) {
+	ConfigureMaxResponseBytes(1024)
+	defer ResetMaxResponseBytesForTest()
+
+	body := strings.Repeat("x", 2048)
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})}
+	_, err := FetchPanel(context.Background(), client, "http://x", "", "m", nil)
+	if err == nil {
+		t.Fatal("expected error for truncated response")
+	}
+	if !errors.Is(err, ErrResponseTruncated) {
+		t.Errorf("error = %v, want ErrResponseTruncated", err)
+	}
+	if !strings.Contains(err.Error(), "read response") {
+		t.Errorf("error = %v, want error mentioning 'read response'", err)
+	}
+}
+
 func TestSynthesisPrompt(t *testing.T) {
 	prompt := SynthesisPrompt("the user said",
 		PanelResult{Source: "local", Content: "L1"},
