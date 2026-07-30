@@ -30,6 +30,27 @@ func TestBucketConfidence(t *testing.T) {
 	}
 }
 
+func TestNormalizeRouteLabel(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"/v1/chat/completions", "/v1/chat/completions"},
+		{"/healthz", "/healthz"},
+		{"/v1/models/{id}", "/v1/models/xxx"},
+		{"/v1/models/{other_id}", "/v1/models/xxx"},
+		{"/v1/users/{user_id}", "/v1/users/xxx"},
+		{"/v1/{resource}/{id}", "/v1/xxx/xxx"},
+		{"{wildcard}", "xxx"},
+		{"no-wildcards-here", "no-wildcards-here"},
+	}
+	for _, c := range cases {
+		if got := normalizeRouteLabel(c.in); got != c.want {
+			t.Errorf("normalizeRouteLabel(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestRouteCountersObserveRouteDecisions(t *testing.T) {
 	rc := NewRouteCounters()
 	rc.Observe("frontier", "guardrail", 0, "", "")
@@ -1109,9 +1130,10 @@ func TestObservePromptInjectionHitCleanRequest(t *testing.T) {
 	}
 }
 
-// TestRouteCountersHandlerPanics verifies the issue #480 handler-panic
+// TestRouteCountersHandlerPanics verifies the issue #480/#1053 handler-panic
 // counter family: ObserveHandlerPanic increments a per-path counter and
-// WriteTo emits nexus_handler_panics_total{path} lines.
+// WriteTo emits nexus_handler_panics_total{path,path_template} lines.
+// Wildcard routes are normalized so cardinality stays bounded.
 func TestRouteCountersHandlerPanics(t *testing.T) {
 	rc := NewRouteCounters()
 	rc.ObserveHandlerPanic("/v1/chat/completions")
@@ -1130,8 +1152,8 @@ func TestRouteCountersHandlerPanics(t *testing.T) {
 	}{
 		{"nexus_handler_panics_total", "metric family header"},
 		{"# TYPE nexus_handler_panics_total counter", "counter type line"},
-		{`nexus_handler_panics_total{path="/v1/chat/completions"} 2`, "chat completions counted twice"},
-		{`nexus_handler_panics_total{path="/healthz"} 1`, "healthz counted once"},
+		{`nexus_handler_panics_total{path="/v1/chat/completions",path_template="/v1/chat/completions"} 2`, "chat completions counted twice"},
+		{`nexus_handler_panics_total{path="/healthz",path_template="/healthz"} 1`, "healthz counted once"},
 	}
 	for _, c := range checks {
 		if !strings.Contains(out, c.fragment) {
@@ -1147,6 +1169,43 @@ func TestRouteCountersHandlerPanicNilSafe(t *testing.T) {
 	rc.ObserveHandlerPanic("/v1/chat/completions") // must not panic
 }
 
+// TestRouteCountersHandlerPanicWildcardNormalization verifies that wildcard
+// routes are normalized to bound label cardinality (issue #1053). Multiple
+// distinct wildcard paths that share the same template structure should
+// map to a single bounded series while preserving the original template.
+func TestRouteCountersHandlerPanicWildcardNormalization(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveHandlerPanic("/v1/models/{id}")
+	rc.ObserveHandlerPanic("/v1/models/{id}")
+	rc.ObserveHandlerPanic("/v1/models/{other_id}")
+	rc.ObserveHandlerPanic("/v1/users/{user_id}")
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	checks := []struct {
+		fragment string
+		desc     string
+	}{
+		{"nexus_handler_panics_total{path=\"/v1/models/xxx\",path_template=\"/v1/models/{id}\"} 3",
+			"v1/models/{id} normalized to v1/models/xxx with count 3"},
+		{`nexus_handler_panics_total{path="/v1/users/xxx",path_template="/v1/users/{user_id}"} 1`,
+			"v1/users/{user_id} normalized to v1/users/xxx with count 1"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(out, c.fragment) {
+			t.Errorf("%s: output missing %q\nfull output:\n%s", c.desc, c.fragment, out)
+		}
+	}
+
+	if strings.Contains(out, "/v1/models/abc123") || strings.Contains(out, "/v1/models/xyz789") {
+		t.Errorf("wildcard output should not contain raw path values, got:\n%s", out)
+	}
+}
+
 // TestHandlerPanicMetricInScrapeOutput verifies the full /metrics scrape
 // handler emits the handler-panic series after a forced panic (issue #480
 // acceptance criterion).
@@ -1159,7 +1218,7 @@ func TestHandlerPanicMetricInScrapeOutput(t *testing.T) {
 	rc.Handler().ServeHTTP(rec, req)
 
 	body := rec.Body.String()
-	want := `nexus_handler_panics_total{path="/v1/chat/completions"} 1`
+	want := `nexus_handler_panics_total{path="/v1/chat/completions",path_template="/v1/chat/completions"} 1`
 	if !strings.Contains(body, want) {
 		t.Errorf("/metrics output missing %q\nfull output:\n%s", want, body)
 	}
