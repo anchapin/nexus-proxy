@@ -2024,6 +2024,9 @@ type HotReloadResult struct {
 	// NeedsRestart is the list of env vars that were changed but require
 	// a full proxy restart to take effect.
 	NeedsRestart []string
+	// Warnings contains messages for values that were adjusted (e.g. out-of-range
+	// floats clamped to their valid bounds).
+	Warnings []string
 }
 
 // ReloadHotReloadable re-reads environment variables for settings that are
@@ -2141,6 +2144,41 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 			slog.String("hint", "set NEXUS_SHUTDOWN_TIMEOUT >= NEXUS_SERVER_READ_TIMEOUT"),
 		)
 	}
+
+	// Hot-reloadable float fields: re-read from env and clamp to valid range [0,1].
+	// Emit a warning when the raw value was out of bounds (issue #1054).
+	budgetAlertThreshold, _ := getEnvFloat("NEXUS_BUDGET_ALERT_THRESHOLD", prev.BudgetAlertThreshold)
+	if budgetAlertThreshold < 0 || budgetAlertThreshold > 1 {
+		clamped := clampFloat(budgetAlertThreshold, 0, 1)
+		warn := fmt.Sprintf("NEXUS_BUDGET_ALERT_THRESHOLD value %g is outside valid range [0,1]; clamped to %g",
+			budgetAlertThreshold, clamped)
+		result.Warnings = append(result.Warnings, warn)
+		slog.Warn(warn)
+		budgetAlertThreshold = clamped
+	}
+	next.BudgetAlertThreshold = budgetAlertThreshold
+
+	agreementThreshold, _ := getEnvFloat("NEXUS_FUSION_AGREEMENT_THRESHOLD", prev.FusionAgreementThreshold)
+	if agreementThreshold < 0 || agreementThreshold > 1 {
+		clamped := clampFloat(agreementThreshold, 0, 1)
+		warn := fmt.Sprintf("NEXUS_FUSION_AGREEMENT_THRESHOLD value %g is outside valid range [0,1]; clamped to %g",
+			agreementThreshold, clamped)
+		result.Warnings = append(result.Warnings, warn)
+		slog.Warn(warn)
+		agreementThreshold = clamped
+	}
+	next.FusionAgreementThreshold = agreementThreshold
+
+	tracingSampleRate, _ := getEnvFloat("NEXUS_TRACING_SAMPLE_RATE", prev.TracingSampleRate)
+	if tracingSampleRate < 0 || tracingSampleRate > 1 {
+		clamped := clampFloat(tracingSampleRate, 0, 1)
+		warn := fmt.Sprintf("NEXUS_TRACING_SAMPLE_RATE value %g is outside valid range [0,1]; clamped to %g",
+			tracingSampleRate, clamped)
+		result.Warnings = append(result.Warnings, warn)
+		slog.Warn(warn)
+		tracingSampleRate = clamped
+	}
+	next.TracingSampleRate = tracingSampleRate
 
 	return next, result
 }
