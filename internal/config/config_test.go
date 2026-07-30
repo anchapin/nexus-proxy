@@ -1237,6 +1237,148 @@ func TestReloadHotReloadable_ShutdownTimeoutOK(t *testing.T) {
 	}
 }
 
+// TestReloadHotReloadable_OutOfRangeValues verifies that out-of-range float
+// values for hot-reloadable fields are clamped and produce warnings (issue #1054).
+func TestReloadHotReloadable_OutOfRangeValues(t *testing.T) {
+	tests := []struct {
+		name              string
+		envKey            string
+		envValue          string
+		prevValue         float64
+		wantClamped       float64
+		wantWarningPrefix string
+	}{
+		{
+			name:              "BudgetAlertThreshold above 1",
+			envKey:            "NEXUS_BUDGET_ALERT_THRESHOLD",
+			envValue:          "1.5",
+			prevValue:         0.8,
+			wantClamped:       1.0,
+			wantWarningPrefix: "NEXUS_BUDGET_ALERT_THRESHOLD value 1.5 is outside valid range [0,1]",
+		},
+		{
+			name:              "BudgetAlertThreshold below 0",
+			envKey:            "NEXUS_BUDGET_ALERT_THRESHOLD",
+			envValue:          "-0.3",
+			prevValue:         0.8,
+			wantClamped:       0.0,
+			wantWarningPrefix: "NEXUS_BUDGET_ALERT_THRESHOLD value -0.3 is outside valid range [0,1]",
+		},
+		{
+			name:              "FusionAgreementThreshold above 1",
+			envKey:            "NEXUS_FUSION_AGREEMENT_THRESHOLD",
+			envValue:          "2.0",
+			prevValue:         0.85,
+			wantClamped:       1.0,
+			wantWarningPrefix: "NEXUS_FUSION_AGREEMENT_THRESHOLD value 2 is outside valid range [0,1]",
+		},
+		{
+			name:              "FusionAgreementThreshold below 0",
+			envKey:            "NEXUS_FUSION_AGREEMENT_THRESHOLD",
+			envValue:          "-0.1",
+			prevValue:         0.85,
+			wantClamped:       0.0,
+			wantWarningPrefix: "NEXUS_FUSION_AGREEMENT_THRESHOLD value -0.1 is outside valid range [0,1]",
+		},
+		{
+			name:              "TracingSampleRate above 1",
+			envKey:            "NEXUS_TRACING_SAMPLE_RATE",
+			envValue:          "1.5",
+			prevValue:         1.0,
+			wantClamped:       1.0,
+			wantWarningPrefix: "NEXUS_TRACING_SAMPLE_RATE value 1.5 is outside valid range [0,1]",
+		},
+		{
+			name:              "TracingSampleRate below 0",
+			envKey:            "NEXUS_TRACING_SAMPLE_RATE",
+			envValue:          "-0.5",
+			prevValue:         1.0,
+			wantClamped:       0.0,
+			wantWarningPrefix: "NEXUS_TRACING_SAMPLE_RATE value -0.5 is outside valid range [0,1]",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.envKey, tc.envValue)
+			prev := Config{
+				BudgetAlertThreshold:      tc.prevValue,
+				FusionAgreementThreshold: tc.prevValue,
+				TracingSampleRate:         tc.prevValue,
+			}
+
+			stop := captureSlog(t)
+			next, result := ReloadHotReloadable(prev)
+			lines, _ := stop()
+
+			// Check the clamped value.
+			switch tc.envKey {
+			case "NEXUS_BUDGET_ALERT_THRESHOLD":
+				if next.BudgetAlertThreshold != tc.wantClamped {
+					t.Errorf("BudgetAlertThreshold = %g, want %g", next.BudgetAlertThreshold, tc.wantClamped)
+				}
+			case "NEXUS_FUSION_AGREEMENT_THRESHOLD":
+				if next.FusionAgreementThreshold != tc.wantClamped {
+					t.Errorf("FusionAgreementThreshold = %g, want %g", next.FusionAgreementThreshold, tc.wantClamped)
+				}
+			case "NEXUS_TRACING_SAMPLE_RATE":
+				if next.TracingSampleRate != tc.wantClamped {
+					t.Errorf("TracingSampleRate = %g, want %g", next.TracingSampleRate, tc.wantClamped)
+				}
+			}
+
+			// Check warning was produced.
+			if len(result.Warnings) == 0 {
+				t.Errorf("expected a warning for out-of-range value, got none")
+				return
+			}
+			found := false
+			for _, w := range result.Warnings {
+				if strings.HasPrefix(w, tc.wantWarningPrefix) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("warning %q not found in result.Warnings: %v", tc.wantWarningPrefix, result.Warnings)
+			}
+
+			// Also verify the warning was logged via slog.
+			var slogFound bool
+			for _, line := range lines {
+				msg, _ := line["msg"].(string)
+				if strings.HasPrefix(msg, tc.wantWarningPrefix) {
+					slogFound = true
+					break
+				}
+			}
+			if !slogFound {
+				t.Errorf("warning not found in slog output: %v", lines)
+			}
+		})
+	}
+}
+
+// TestReloadHotReloadable_FloatInRange verifies that in-range float values
+// are accepted without warnings.
+func TestReloadHotReloadable_FloatInRange(t *testing.T) {
+	t.Setenv("NEXUS_BUDGET_ALERT_THRESHOLD", "0.5")
+	t.Setenv("NEXUS_FUSION_AGREEMENT_THRESHOLD", "0.9")
+	t.Setenv("NEXUS_TRACING_SAMPLE_RATE", "0.75")
+
+	prev := Config{
+		BudgetAlertThreshold:      0.8,
+		FusionAgreementThreshold: 0.85,
+		TracingSampleRate:        1.0,
+	}
+
+	_, result := ReloadHotReloadable(prev)
+
+	if len(result.Warnings) != 0 {
+		t.Errorf("expected no warnings for in-range values, got %v", result.Warnings)
+	}
+}
+
 func TestReadinessModeValidation(t *testing.T) {
 	tests := []struct {
 		name     string

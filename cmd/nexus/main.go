@@ -1603,6 +1603,9 @@ func main() {
 					slog.String("hint", "send SIGTERM/SIGINT to gracefully restart"),
 				)
 			}
+			for _, warn := range result.Warnings {
+				slog.Warn("config reload warning", slog.String("warning", warn))
+			}
 		}
 	}()
 
