@@ -90,18 +90,19 @@ type YAMLConfig struct {
 	RAGBatchSize             int     `yaml:"rag_batch_size"`
 
 	// Routing
-	TokenGuardrail            int     `yaml:"token_guardrail"`
-	SLMTimeout                string  `yaml:"slm_timeout"`
-	SLMCacheMaxEntries        int     `yaml:"slm_cache_max_entries"`
-	SLMCacheTTL               string  `yaml:"slm_cache_ttl"`
-	SLMCacheSemanticThreshold float64 `yaml:"slm_cache_similarity_threshold"`
-	SLMCacheMaxStale          int     `yaml:"slm_cache_max_stale"`           // issue #835
-	SLMCacheSemanticScanLimit int     `yaml:"slm_cache_semantic_scan_limit"` // issue #933
-	FusionTimeout             string  `yaml:"fusion_timeout"`
-	CascadeTimeout            string  `yaml:"cascade_timeout"`
-	ArbiterTimeout            string  `yaml:"arbiter_timeout"`
-	CascadeMaxResponseBytes   int     `yaml:"cascade_max_response_bytes"`
-	MaxResponseBytes          int     `yaml:"max_response_bytes"`
+	TokenGuardrail                int     `yaml:"token_guardrail"`
+	SLMTimeout                    string  `yaml:"slm_timeout"`
+	SLMCacheMaxEntries            int     `yaml:"slm_cache_max_entries"`
+	SLMCacheTTL                   string  `yaml:"slm_cache_ttl"`
+	SLMCacheSemanticThreshold     float64 `yaml:"slm_cache_similarity_threshold"`
+	SLMCacheMaxStale              int     `yaml:"slm_cache_max_stale"`               // issue #835
+	SLMCacheStaleCleanupThreshold int     `yaml:"slm_cache_stale_cleanup_threshold"` // issue #1037
+	SLMCacheSemanticScanLimit     int     `yaml:"slm_cache_semantic_scan_limit"`     // issue #933
+	FusionTimeout                 string  `yaml:"fusion_timeout"`
+	CascadeTimeout                string  `yaml:"cascade_timeout"`
+	ArbiterTimeout                string  `yaml:"arbiter_timeout"`
+	CascadeMaxResponseBytes       int     `yaml:"cascade_max_response_bytes"`
+	MaxResponseBytes              int     `yaml:"max_response_bytes"`
 
 	// Fusion
 	FusionProgressiveDelivery bool    `yaml:"fusion_progressive_delivery"`
@@ -615,6 +616,16 @@ func LoadYAML(path string) (Config, error) {
 			n = 0
 		}
 		cfg.SLMCacheMaxStale = n
+	}
+	if v := os.Getenv("NEXUS_SLMCACHE_STALE_CLEANUP_THRESHOLD"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_SLMCACHE_STALE_CLEANUP_THRESHOLD: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.SLMCacheStaleCleanupThreshold = n
 	}
 	if v := os.Getenv("NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -1159,24 +1170,25 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		TracerRetryMaxDelay:  yc.durationDefault(yc.TracerRetryMaxDelay, 0),
 
 		// Non-string fields with defaults
-		RAGThreshold:              yc.floatDefault(yc.RAGThreshold, 0.55),
-		RAGDBPath:                 yc.stringDefault(yc.RAGDBPath, DefaultRAGDBPath()),
-		RAGEmbedCacheSize:         yc.intDefault(yc.RAGEmbedCacheSize, 256),
-		RAGEmbedCacheTTL:          yc.durationDefault(yc.RAGEmbedCacheTTL, 24*time.Hour),
-		RAGEmbedCacheWaitTimeout:  yc.durationDefault(yc.RAGEmbedCacheWaitTimeout, 5*time.Second),
-		RAGBatchSize:              yc.intDefault(yc.RAGBatchSize, 32),
-		TokenGuardrail:            yc.intDefault(yc.TokenGuardrail, 6000),
-		SLMTimeout:                yc.durationDefault(yc.SLMTimeout, 8*time.Second),
-		SLMCacheMaxEntries:        yc.intDefault(yc.SLMCacheMaxEntries, 512),
-		SLMCacheTTL:               yc.durationDefault(yc.SLMCacheTTL, 30*time.Second),
-		SLMCacheSemanticThreshold: clampFloat(yc.floatDefault(yc.SLMCacheSemanticThreshold, 0.0), 0, 1),
-		SLMCacheMaxStale:          yc.intDefault(yc.SLMCacheMaxStale, 0),          // issue #835
-		SLMCacheSemanticScanLimit: yc.intDefault(yc.SLMCacheSemanticScanLimit, 0), // issue #933
-		FusionTimeout:             yc.durationDefault(yc.FusionTimeout, 120*time.Second),
-		CascadeTimeout:            yc.durationDefault(yc.CascadeTimeout, 30*time.Second),
-		ArbiterTimeout:            yc.durationDefault(yc.ArbiterTimeout, 60*time.Second),
-		CascadeMaxResponseBytes:   yc.intDefault(yc.CascadeMaxResponseBytes, DefaultMaxResponseBytes),
-		MaxResponseBytes:          yc.intDefault(yc.MaxResponseBytes, DefaultMaxResponseBytes),
+		RAGThreshold:                  yc.floatDefault(yc.RAGThreshold, 0.55),
+		RAGDBPath:                     yc.stringDefault(yc.RAGDBPath, DefaultRAGDBPath()),
+		RAGEmbedCacheSize:             yc.intDefault(yc.RAGEmbedCacheSize, 256),
+		RAGEmbedCacheTTL:              yc.durationDefault(yc.RAGEmbedCacheTTL, 24*time.Hour),
+		RAGEmbedCacheWaitTimeout:      yc.durationDefault(yc.RAGEmbedCacheWaitTimeout, 5*time.Second),
+		RAGBatchSize:                  yc.intDefault(yc.RAGBatchSize, 32),
+		TokenGuardrail:                yc.intDefault(yc.TokenGuardrail, 6000),
+		SLMTimeout:                    yc.durationDefault(yc.SLMTimeout, 8*time.Second),
+		SLMCacheMaxEntries:            yc.intDefault(yc.SLMCacheMaxEntries, 512),
+		SLMCacheTTL:                   yc.durationDefault(yc.SLMCacheTTL, 30*time.Second),
+		SLMCacheSemanticThreshold:     clampFloat(yc.floatDefault(yc.SLMCacheSemanticThreshold, 0.0), 0, 1),
+		SLMCacheMaxStale:              yc.intDefault(yc.SLMCacheMaxStale, 0),              // issue #835
+		SLMCacheStaleCleanupThreshold: yc.intDefault(yc.SLMCacheStaleCleanupThreshold, 0), // issue #1037
+		SLMCacheSemanticScanLimit:     yc.intDefault(yc.SLMCacheSemanticScanLimit, 0),     // issue #933
+		FusionTimeout:                 yc.durationDefault(yc.FusionTimeout, 120*time.Second),
+		CascadeTimeout:                yc.durationDefault(yc.CascadeTimeout, 30*time.Second),
+		ArbiterTimeout:                yc.durationDefault(yc.ArbiterTimeout, 60*time.Second),
+		CascadeMaxResponseBytes:       yc.intDefault(yc.CascadeMaxResponseBytes, DefaultMaxResponseBytes),
+		MaxResponseBytes:              yc.intDefault(yc.MaxResponseBytes, DefaultMaxResponseBytes),
 
 		FusionProgressiveDelivery: yc.boolFieldDefault(yc.FusionProgressiveDelivery, true),
 		FusionAgreementThreshold:  yc.floatDefault(yc.FusionAgreementThreshold, 0.85),

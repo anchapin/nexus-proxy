@@ -1124,8 +1124,9 @@ func main() {
 		slmCache.SetEmbedErrorObserver(func() {
 			routeCounters.ObserveSLMCacheEmbedError()
 		})
-		slmCache.SetMaxStale(cfg.SLMCacheMaxStale)                // issue #835
-		slmCache.SetMaxScanEntries(cfg.SLMCacheSemanticScanLimit) // issue #933
+		slmCache.SetMaxStale(cfg.SLMCacheMaxStale)                           // issue #835
+		slmCache.SetStaleCleanupThreshold(cfg.SLMCacheStaleCleanupThreshold) // issue #1037
+		slmCache.SetMaxScanEntries(cfg.SLMCacheSemanticScanLimit)            // issue #933
 	} else {
 		slog.Info("slm decision cache disabled (NEXUS_SLMCACHE_TTL<=0)")
 	}
