@@ -182,6 +182,13 @@ var ErrUpstreamTruncated = errors.New("upstream: stream truncated")
 // unmarshalled as JSON.
 var ErrUpstreamContentTypeMismatch = errors.New("upstream: content-type mismatch")
 
+// ErrResponseTruncated is returned by FetchPanel when the upstream
+// response body equals MaxResponseBytes (issue #1047). It indicates
+// the response was truncated at the limit but no I/O error occurred.
+// This distinguishes exact-limit responses (not an error) from actual
+// truncation errors (upstream had more data).
+var ErrResponseTruncated = errors.New("fusion: response truncated at max response bytes")
+
 // sseDoneMarker is the OpenAI SSE stream terminator, recognised as a
 // standalone frame so a [DONE] embedded inside a JSON content chunk
 // never falsely marks the stream complete.
@@ -512,7 +519,11 @@ func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
-	if err != nil || int64(len(respBody)) >= maxResponseBytes {
+	truncated := int64(len(respBody)) >= maxResponseBytes
+	if err != nil || truncated {
+		if err == nil && truncated {
+			err = ErrResponseTruncated
+		}
 		return AssistantMessage{}, fmt.Errorf("fusion: read response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
