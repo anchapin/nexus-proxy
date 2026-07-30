@@ -258,8 +258,8 @@ func TestLoadConfigFromEnv_AllDefaults(t *testing.T) {
 	if cfg.MaxIdleConnsPerHost != DefaultMaxIdleConnsPerHost {
 		t.Errorf("MaxIdleConnsPerHost = %d, want %d", cfg.MaxIdleConnsPerHost, DefaultMaxIdleConnsPerHost)
 	}
-	if cfg.MaxConnsPerHost != 0 {
-		t.Errorf("MaxConnsPerHost = %d, want 0", cfg.MaxConnsPerHost)
+	if cfg.MaxConnsPerHost != DefaultMaxConnsPerHost {
+		t.Errorf("MaxConnsPerHost = %d, want %d", cfg.MaxConnsPerHost, DefaultMaxConnsPerHost)
 	}
 	if cfg.IdleConnTimeout != DefaultIdleConnTimeout {
 		t.Errorf("IdleConnTimeout = %v, want %v", cfg.IdleConnTimeout, DefaultIdleConnTimeout)
@@ -585,5 +585,80 @@ func generateTestCert(t *testing.T, certFile, keyFile, caFile string) {
 	}
 	if err := os.WriteFile(caFile, certPEM, 0600); err != nil {
 		t.Fatalf("failed to write ca file: %v", err)
+	}
+}
+
+func TestNew_MaxConnsPerHostDefaultIsSet(t *testing.T) {
+	client := New(Config{})
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected *http.Transport, got %T", client.Transport)
+	}
+
+	if tr.MaxConnsPerHost != DefaultMaxConnsPerHost {
+		t.Errorf("MaxConnsPerHost = %d, want %d", tr.MaxConnsPerHost, DefaultMaxConnsPerHost)
+	}
+	if tr.MaxConnsPerHost == 0 {
+		t.Error("MaxConnsPerHost must not be 0 (unlimited) to prevent connection explosion")
+	}
+}
+
+func TestNew_MaxConnsPerHostBoundsConnections(t *testing.T) {
+	cfg := Config{
+		MaxConnsPerHost: 10,
+	}
+	client := New(cfg)
+	tr := client.Transport.(*http.Transport)
+
+	if tr.MaxConnsPerHost != 10 {
+		t.Errorf("MaxConnsPerHost = %d, want 10", tr.MaxConnsPerHost)
+	}
+}
+
+func TestConfig_ApplyDefaults_SetsMaxConnsPerHost(t *testing.T) {
+	cfg := Config{
+		MaxConnsPerHost: 0,
+	}
+	cfg.applyDefaults()
+
+	if cfg.MaxConnsPerHost != DefaultMaxConnsPerHost {
+		t.Errorf("MaxConnsPerHost = %d, want default %d", cfg.MaxConnsPerHost, DefaultMaxConnsPerHost)
+	}
+}
+
+func TestConfig_ApplyDefaults_PreservesPositiveMaxConnsPerHost(t *testing.T) {
+	cfg := Config{
+		MaxConnsPerHost: 50,
+	}
+	cfg.applyDefaults()
+
+	if cfg.MaxConnsPerHost != 50 {
+		t.Errorf("MaxConnsPerHost = %d, want 50", cfg.MaxConnsPerHost)
+	}
+}
+
+func TestLoadConfigFromEnv_MaxConnsPerHostHasDefault(t *testing.T) {
+	restore := func() { os.Unsetenv("NEXUS_HTTP_MAX_CONNS_PER_HOST") }
+	restore()
+	defer restore()
+
+	os.Unsetenv("NEXUS_HTTP_MAX_CONNS_PER_HOST")
+	cfg := loadConfigFromEnv()
+
+	if cfg.MaxConnsPerHost != DefaultMaxConnsPerHost {
+		t.Errorf("MaxConnsPerHost = %d, want default %d", cfg.MaxConnsPerHost, DefaultMaxConnsPerHost)
+	}
+}
+
+func TestLoadConfigFromEnv_MaxConnsPerHostEnvOverride(t *testing.T) {
+	restore := func() { os.Unsetenv("NEXUS_HTTP_MAX_CONNS_PER_HOST") }
+	restore()
+	defer restore()
+
+	os.Setenv("NEXUS_HTTP_MAX_CONNS_PER_HOST", "500")
+	cfg := loadConfigFromEnv()
+
+	if cfg.MaxConnsPerHost != 500 {
+		t.Errorf("MaxConnsPerHost = %d, want 500", cfg.MaxConnsPerHost)
 	}
 }
