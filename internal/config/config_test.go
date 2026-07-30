@@ -1322,9 +1322,9 @@ func TestReloadHotReloadable_OutOfRangeValues(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(tc.envKey, tc.envValue)
 			prev := Config{
-				BudgetAlertThreshold:      tc.prevValue,
+				BudgetAlertThreshold:     tc.prevValue,
 				FusionAgreementThreshold: tc.prevValue,
-				TracingSampleRate:         tc.prevValue,
+				TracingSampleRate:        tc.prevValue,
 			}
 
 			stop := captureSlog(t)
@@ -1387,7 +1387,7 @@ func TestReloadHotReloadable_FloatInRange(t *testing.T) {
 	t.Setenv("NEXUS_TRACING_SAMPLE_RATE", "0.75")
 
 	prev := Config{
-		BudgetAlertThreshold:      0.8,
+		BudgetAlertThreshold:     0.8,
 		FusionAgreementThreshold: 0.85,
 		TracingSampleRate:        1.0,
 	}
