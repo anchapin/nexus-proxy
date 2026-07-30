@@ -239,9 +239,14 @@ type ShellVerifier struct {
 // root landed and which Kind of project it is. The (root == "") case
 // is cached too — the same falsey answer avoids re-stat'ing a deep
 // non-project tree for every edit.
+//
+// mtime records the modification time of the discovered manifest file
+// at cache-prime time so we can detect when a manifest is created or
+// deleted after the entry was cached (issue #1067).
 type projectHint struct {
-	root string
-	kind Kind
+	root  string
+	kind  Kind
+	mtime int64 // UnixNano of the manifest at cache-prime; 0 for negative entries
 }
 
 // Compile-time assertion: ShellVerifier satisfies the Verifier interface.
@@ -410,6 +415,11 @@ func (v *ShellVerifier) Verify(e Event) Verdict {
 // lookupProject walks up from filePath's directory looking for a
 // recognised manifest. Returns (root, kind, nil); returns ("", "", err)
 // only on a context-like cancellation — currently always nil.
+//
+// Cache entries store the mtime of the discovered manifest so that
+// future calls detect when the manifest file is created or deleted
+// after cache prime (issue #1067). Negative entries (no manifest) have
+// mtime=0 and are invalidated by checking whether any manifest now exists.
 func (v *ShellVerifier) lookupProject(filePath string) (string, Kind, error) {
 	if filePath == "" {
 		return "", KindUnknown, nil
@@ -432,7 +442,28 @@ func (v *ShellVerifier) lookupProject(filePath string) (string, Kind, error) {
 		cacheKey := dir
 		if cached, ok := v.cache.Load(cacheKey); ok {
 			h := cached.(projectHint)
-			return h.root, h.kind, nil
+			// mtime-based invalidation: rewalk if manifest changed.
+			if h.root != "" && h.kind != KindUnknown {
+				marker := h.kind.Marker()
+				if marker == "" {
+					return h.root, h.kind, nil
+				}
+				candidate := filepath.Join(h.root, marker)
+				fi, err := os.Stat(candidate)
+				if err != nil || fi.ModTime().UnixNano() != h.mtime {
+					// Manifest missing or mtime changed — invalidate and rewalk.
+					v.cache.Delete(cacheKey)
+				} else {
+					return h.root, h.kind, nil
+				}
+			} else {
+				// Negative entry: rewalk only if a manifest now exists.
+				if hasAnyManifest(dir) {
+					v.cache.Delete(cacheKey)
+				} else {
+					return h.root, h.kind, nil
+				}
+			}
 		}
 		for _, k := range AllKinds {
 			marker := k.Marker()
@@ -440,8 +471,9 @@ func (v *ShellVerifier) lookupProject(filePath string) (string, Kind, error) {
 				continue
 			}
 			candidate := filepath.Join(dir, marker)
-			if _, err := os.Stat(candidate); err == nil {
-				v.cache.Store(cacheKey, projectHint{root: dir, kind: k})
+			fi, err := os.Stat(candidate)
+			if err == nil {
+				v.cache.Store(cacheKey, projectHint{root: dir, kind: k, mtime: fi.ModTime().UnixNano()})
 				return dir, k, nil
 			}
 		}
@@ -455,6 +487,22 @@ func (v *ShellVerifier) lookupProject(filePath string) (string, Kind, error) {
 		dir = parent
 	}
 	return "", KindUnknown, nil
+}
+
+// hasAnyManifest returns true if any recognised project manifest
+// exists in dir. Used to invalidate negative cache entries when a
+// manifest is created after cache prime.
+func hasAnyManifest(dir string) bool {
+	for _, k := range AllKinds {
+		marker := k.Marker()
+		if marker == "" {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // runCheck executes the project's check command inside repoRoot. The
