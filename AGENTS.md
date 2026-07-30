@@ -349,9 +349,8 @@ hot-reloadable var will fail the test.
 - **Conventional Commits:** `feat:`, `fix:`, `docs:`, etc. Reference the
   issue in the subject (e.g. `feat: resolve #123 — …`)
 - **PR body must link the issue** with `Fixes #N` / `Closes #N` /
-  `Resolves #N`. Use
-  `scripts/check_pr_closing_refs.sh <PR_NUMBER> <EXPECTED_COUNT>` to
-  verify the count is exact.
+  `Resolves #N`. Run `scripts/check_pr_closing_refs.sh <PR_NUMBER> <EXPECTED_COUNT>`
+  to verify the link count is exact before merging.
 
 ## Logging
 
@@ -364,12 +363,15 @@ production paths.
 Tests use `httptest` + `RecordingTransport` in `internal/upstream/recording.go`
 to record/replay HTTP calls. All tests run in <2s with `-race`.
 
-`make test-race` is required to pass before merging — race conditions in
-transport, metrics, budget tracker, and VRAM limiter are easy to miss
-in manual testing.
+`make test-race` is required to pass before merging.
 
-**Focused testing:** `go test ./internal/packagename` runs a single package
-(the Makefile only exposes `./...`). Prefix with `-v` for verbose output.
+**Focused testing:** `go test ./internal/packagename` runs a single package.
+Prefix with `-v` for verbose output.
+
+**Pre-commit hook** (`make install-hooks` once after cloning): runs `gofmt -l`
+on staged `.go` files and fails the commit if any need formatting. The hook
+lives in `.githooks/pre-commit`; `make install-hooks` sets `git
+core.hooksPath` to point at it.
 
 ## Local-route cooldown (issue #80)
 
@@ -377,32 +379,16 @@ After the cascade detects an Ollama failure and falls back, `circuit.Cooldown`
 arms a short cooldown so subsequent requests skip local and go directly to
 fallback. Set `NEXUS_LOCAL_COOLDOWN=0` to disable (pre-issue-#80 behaviour).
 
-## Newer routing and RAG knobs (verify against `.env.example` for defaults)
+## Newer routing and RAG knobs
 
-These are documented in `.env.example` with full context; key ones to know:
-
-- **`NEXUS_SLM_CONFIDENCE_THRESHOLD`** (default 0.3): hard-escalation floor —
-  SLM decisions below this confidence bypass the DSL/SLM pick and go to frontier.
-- **`NEXUS_SLMCACHE_MAX_STALE`** (default 0): proactive eviction threshold for
-  SLM cache entries; 0 disables (stale entries accumulate until LRU eviction).
-- **`NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT`** (default 0 = unlimited): max entries
-  scanned during semantic deduplication in `getSemantic`; bounds O(n) cosine scans
-  on large caches (issue #933).
-- **`NEXUS_RAG_EMBED_CACHE_SIZE`** (default 256) + **`NEXUS_RAG_EMBED_CACHE_TTL`**
-  (default 24h): LRU cache for prompt embeddings — repeat prompts skip Ollama
-  round-trip entirely.
-- **`NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT`** (default 5s): max time a waiter goroutine
-  waits for a concurrent in-flight Embed call before falling through to a direct call
-  (issue #800). Set to 0 to disable (waiters wait indefinitely).
-- **`NEXUS_RAG_BATCH_SIZE`** (default 32): batch embedding in `IndexDir` to
-  reduce HTTP round-trips by ~60–80%.
-- **`NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD`** (default 3) + **`NEXUS_RAG_CIRCUIT_BREAKER_COOLDOWN`**
-  (default 30s): RAG embedder circuit breaker — trips after N consecutive
-  failures, auto-recloses after cooldown.
-- **`NEXUS_ARBITER_CACHE_MAX_ENTRIES`** (default 512): LRU cap for the arbiter
-  synthesis cache.
-- **`NEXUS_READINESS_MODE`** (`degraded`|`strict`): `/readyz` behavior.
-  `degraded` (default) always returns 200; `strict` returns 503 when Ollama is down.
+Key knobs not covered elsewhere (verify defaults in `.env.example`):
+- **`NEXUS_SLM_CONFIDENCE_THRESHOLD`** (default 0.3): SLM decisions below this bypass DSL/SLM and go to frontier.
+- **`NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT`** (default 0 = unlimited): bounds O(n) cosine scan during semantic dedup in `getSemantic` (issue #933).
+- **`NEXUS_RAG_EMBED_CACHE_*`** (size 256, TTL 24h): LRU cache for prompt embeddings — repeat prompts skip Ollama entirely.
+- **`NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT`** (default 5s): max waiter time for concurrent in-flight Embeds; 0 = wait indefinitely (issue #800).
+- **`NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD`** (default 3): consecutive embed failures before RAG circuit trips.
+- **`NEXUS_ARBITER_CACHE_MAX_ENTRIES`** (default 512): LRU cap for arbiter synthesis cache.
+- **`NEXUS_READINESS_MODE`** (`degraded`|`strict`): `/readyz` returns 503 in `strict` mode when Ollama is down.
 
 ## `nexus check` exit codes
 
