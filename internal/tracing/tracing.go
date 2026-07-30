@@ -178,6 +178,15 @@ func (s Status) String() string {
 	}
 }
 
+// SpanEvent is a timestamped annotation recorded during a span's
+// lifetime (issue #1052). It enables TTFT and streaming duration
+// measurement directly in OTLP backends.
+type SpanEvent struct {
+	Name       string
+	Timestamp  time.Time
+	Attributes map[string]any
+}
+
 // Span is one traced operation. Spans form a tree via ParentSpanID;
 // the root span has an empty ParentSpanID.
 //
@@ -196,6 +205,7 @@ type Span struct {
 	StartTime     time.Time
 	EndTime       time.Time
 	Attributes    map[string]any
+	Events        []SpanEvent // timestamped annotations (issue #1052)
 	Status        Status
 	StatusMessage string
 
@@ -396,6 +406,25 @@ func (s *Span) RecordError(err error) {
 	s.mu.Lock()
 	s.Status = StatusError
 	s.StatusMessage = err.Error()
+	s.mu.Unlock()
+}
+
+// AddEvent records a timestamped event on the span (issue #1052).
+// This enables TTFT and streaming duration measurement directly in
+// OTLP backends. Nil-receiver safe.
+func (s *Span) AddEvent(name string, attrs ...map[string]any) {
+	if s == nil {
+		return
+	}
+	event := SpanEvent{
+		Name:      name,
+		Timestamp: time.Now(),
+	}
+	if len(attrs) > 0 && attrs[0] != nil {
+		event.Attributes = attrs[0]
+	}
+	s.mu.Lock()
+	s.Events = append(s.Events, event)
 	s.mu.Unlock()
 }
 

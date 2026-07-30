@@ -197,6 +197,42 @@ func TestSpanRecordErrorSetsStatus(t *testing.T) {
 	}
 }
 
+func TestSpanAddEvent(t *testing.T) {
+	_, s := StartSpan(Context{}, "op")
+	s.AddEvent("first_token")
+	s.AddEvent("stream_complete")
+	s.End()
+	if len(s.Events) != 2 {
+		t.Errorf("event count = %d, want 2", len(s.Events))
+	}
+	if s.Events[0].Name != "first_token" {
+		t.Errorf("event[0].name = %q, want first_token", s.Events[0].Name)
+	}
+	if s.Events[1].Name != "stream_complete" {
+		t.Errorf("event[1].name = %q, want stream_complete", s.Events[1].Name)
+	}
+	if s.Events[0].Timestamp.IsZero() {
+		t.Error("event[0].timestamp not set")
+	}
+}
+
+func TestSpanAddEventWithAttributes(t *testing.T) {
+	_, s := StartSpan(Context{}, "op")
+	s.AddEvent("first_token", map[string]any{"ttft_ms": 42.5})
+	s.End()
+	if len(s.Events) != 1 {
+		t.Errorf("event count = %d, want 1", len(s.Events))
+	}
+	if s.Events[0].Attributes["ttft_ms"] != 42.5 {
+		t.Errorf("event attr ttft_ms = %v, want 42.5", s.Events[0].Attributes["ttft_ms"])
+	}
+}
+
+func TestSpanNilAddEvent(t *testing.T) {
+	var s *Span
+	s.AddEvent("first_token") // must not panic
+}
+
 func TestSpanEndTwiceIdempotent(t *testing.T) {
 	_, s := StartSpan(Context{}, "op")
 	first := time.Now()

@@ -1377,11 +1377,17 @@ func Chat(d Deps) http.Handler {
 		// the debug log reflects what the handler actually used.
 		trace.Request.Stream = streaming
 
+		// Capture root span for TTFT and stream_complete events (issue #1052).
+		// Nil-safe: AddEvent is a no-op when span is nil.
+		rootSpanForEvents, _ := tracing.RootSpanFromContext(r.Context())
+
 		// Wrap the response writer so we can capture TTFT and byte counts
 		// without affecting upstream.Stream's flusher contract.
 		var firstWriteAt atomic.Int64 // unix nano; 0 means "no write yet"
 		obs := telemetry.NewObservingWriter(w, func(t time.Time) {
-			firstWriteAt.CompareAndSwap(0, t.UnixNano())
+			if firstWriteAt.CompareAndSwap(0, t.UnixNano()) {
+				rootSpanForEvents.AddEvent("first_token")
+			}
 		})
 
 		// Graceful degradation (issue #8) + local-route cooldown
@@ -2059,6 +2065,12 @@ func Chat(d Deps) http.Handler {
 				trace.Response.BodyTruncated = false
 			}
 			trace.Emit(slog.Default())
+		}
+
+		// stream_complete event marks the end of streaming (issue #1052).
+		// Nil-safe: AddEvent is a no-op when span is nil.
+		if streaming {
+			rootSpanForEvents.AddEvent("stream_complete")
 		}
 	})
 }

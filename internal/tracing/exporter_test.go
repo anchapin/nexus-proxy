@@ -298,6 +298,53 @@ func TestExporterOTLPBodyShape(t *testing.T) {
 	}
 }
 
+func TestExporterSpanEventsInOTLP(t *testing.T) {
+	var raw []byte
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		raw, _ = io.ReadAll(r.Body)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{Endpoint: srv.URL})
+	defer e.Close()
+
+	_, s := e.StartSpan(Context{}, "nexus.chat_completions")
+	s.AddEvent("first_token")
+	s.AddEvent("stream_complete")
+	s.End()
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(raw) == 0 {
+		t.Fatal("collector received no body")
+	}
+	var payload otlpPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal: %v\nbody=%s", err, raw)
+	}
+	sp := payload.ResourceSpans[0].ScopeSpans[0].Spans[0]
+	if len(sp.Events) != 2 {
+		t.Fatalf("span events = %d, want 2", len(sp.Events))
+	}
+	if sp.Events[0].Name != "first_token" {
+		t.Errorf("event[0].name = %q, want first_token", sp.Events[0].Name)
+	}
+	if sp.Events[1].Name != "stream_complete" {
+		t.Errorf("event[1].name = %q, want stream_complete", sp.Events[1].Name)
+	}
+	if sp.Events[0].TimestampUnixNanoNano == "" {
+		t.Error("event[0].timestamp not set")
+	}
+}
+
 func TestExporterErrorPropagatesFromCollector(t *testing.T) {
 	// A 500 from the collector must NOT block the request path;
 	// it is logged and dropped inside the export goroutine.
