@@ -786,6 +786,37 @@ routing_confidence_window: "336h"
 	}
 }
 
+func TestLoadYAMLRoutingConfidenceOutOfRange(t *testing.T) {
+	routingConfidenceFields := []struct {
+		yamlKey string
+		yamlVal string
+		wantErr string
+	}{
+		{"routing_confidence_floor", "1.5", "routing_confidence_floor must be in range [0,1]"},
+		{"routing_confidence_floor", "-0.2", "routing_confidence_floor must be in range [0,1]"},
+		{"routing_confidence_ceiling", "1.5", "routing_confidence_ceiling must be in range [0,1]"},
+		{"routing_confidence_ceiling", "-0.2", "routing_confidence_ceiling must be in range [0,1]"},
+	}
+
+	for _, tc := range routingConfidenceFields {
+		t.Run(tc.yamlKey+"_"+tc.yamlVal, func(t *testing.T) {
+			tmp := t.TempDir()
+			path := filepath.Join(tmp, "config.yaml")
+			yamlContent := tc.yamlKey + ": " + tc.yamlVal + "\n"
+			if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			_, err := LoadYAML(path)
+			if err == nil {
+				t.Errorf("LoadYAML: expected error for %s=%s, got nil", tc.yamlKey, tc.yamlVal)
+			}
+			if err != nil && !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("LoadYAML error = %q, want containing %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestLoadYAMLSLMCacheSettings(t *testing.T) {
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "config.yaml")
