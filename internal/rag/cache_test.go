@@ -11,9 +11,9 @@ import (
 // tripCallbackEmbedder is an embedder that records the callback passed to
 // SetTripCallback and exposes a Trip method to invoke it.
 type tripCallbackEmbedder struct {
-	mu       sync.Mutex
-	cb       func(kind string)
-	calls    map[string]int
+	mu         sync.Mutex
+	cb         func(kind string)
+	calls      map[string]int
 	batchCalls int
 }
 
@@ -43,8 +43,8 @@ func (e *tripCallbackEmbedder) EmbedBatch(_ context.Context, texts []string) ([]
 }
 
 func (e *tripCallbackEmbedder) IsHealthy(context.Context) bool { return true }
-func (e *tripCallbackEmbedder) IsBreakerOpen() bool          { return false }
-func (e *tripCallbackEmbedder) RecordBreakerSuccess()        {}
+func (e *tripCallbackEmbedder) IsBreakerOpen() bool            { return false }
+func (e *tripCallbackEmbedder) RecordBreakerSuccess()          {}
 
 func (e *tripCallbackEmbedder) SetTripCallback(_ string, cb func(kind string)) {
 	e.mu.Lock()
@@ -59,12 +59,6 @@ func (e *tripCallbackEmbedder) Trip() {
 	if cb != nil {
 		cb("rag")
 	}
-}
-
-func (e *tripCallbackEmbedder) callCount(text string) int {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.calls[text]
 }
 
 // countingEmbedder tracks how many times Embed is actually called,

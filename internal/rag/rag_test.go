@@ -824,9 +824,9 @@ func (s *slowEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]floa
 	return result, nil
 }
 
-func (s *slowEmbedder) IsHealthy(context.Context) bool              { return true }
+func (s *slowEmbedder) IsHealthy(context.Context) bool            { return true }
 func (s *slowEmbedder) IsBreakerOpen() bool                       { return false }
-func (s *slowEmbedder) RecordBreakerSuccess()                      {}
+func (s *slowEmbedder) RecordBreakerSuccess()                     {}
 func (s *slowEmbedder) SetTripCallback(string, func(kind string)) {}
 
 // TestEmbedCacheWaiterTimeoutInnerStillRunning (issue #1043) verifies that
