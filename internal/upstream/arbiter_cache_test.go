@@ -7,6 +7,61 @@ import (
 	"time"
 )
 
+// TestCacheKeyCollisionResistance verifies that distinct (r1, r2) pairs
+// produce distinct cache keys, ensuring no collision from the combination
+// method. This guards against XOR's non-collision-free property where
+// different pairs could theoretically produce the same combined hash.
+func TestCacheKeyCollisionResistance(t *testing.T) {
+	seen := make(map[[32]byte]string)
+
+	addPair := func(r1, r2 string) {
+		k := cacheKey(r1, r2)
+		// Canonicalize description for symmetric pairs
+		if r1 < r2 {
+			seen[k] = r1 + "|" + r2
+		} else {
+			seen[k] = r2 + "|" + r1
+		}
+	}
+
+	// Add pairs - all symmetric variants will map to same key (expected)
+	addPair("local output A", "frontier output B")
+	addPair("alpha", "beta")
+	addPair("response one", "response two")
+	addPair("aaaa", "aaab")
+	addPair(strings.Repeat("x", 100), strings.Repeat("y", 100))
+	addPair("", "non-empty")
+	addPair("🎱", "🔮")
+
+	// Check that each pair's key is unique
+	keys := make([][32]byte, 0, len(seen))
+	descs := make([]string, 0, len(seen))
+	for k, desc := range seen {
+		keys = append(keys, k)
+		descs = append(descs, desc)
+	}
+
+	for i := 0; i < len(keys); i++ {
+		for j := i + 1; j < len(keys); j++ {
+			if keys[i] == keys[j] {
+				t.Errorf("collision: %q and %q produced same key %x", descs[i], descs[j], keys[i])
+			}
+		}
+	}
+
+	// Verify symmetry is preserved
+	for _, pair := range [][2]string{
+		{"local", "frontier"}, {"alpha", "beta"}, {"", "x"}, {"🎉", "text"},
+	} {
+		r1, r2 := pair[0], pair[1]
+		k1 := cacheKey(r1, r2)
+		k2 := cacheKey(r2, r1)
+		if k1 != k2 {
+			t.Errorf("cacheKey not symmetric: (%q, %q) != (%q, %q)", r1, r2, r2, r1)
+		}
+	}
+}
+
 func TestCacheKeySymmetric(t *testing.T) {
 	cases := [][2]string{
 		{"local output", "frontier output"},

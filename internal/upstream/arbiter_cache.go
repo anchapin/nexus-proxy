@@ -2,6 +2,7 @@
 package upstream
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"sync"
 	"time"
@@ -78,30 +79,39 @@ func NewArbiterCache(ttl time.Duration, maxEntries int) *ArbiterCache {
 
 // cacheKey computes a deterministic SHA-256 hash of the two panel-member
 // contents. Each content is hashed independently and the two 32-byte
-// hashes are XORed together, making the key provably order-independent
-// (commutative): cacheKey(a, b) == cacheKey(b, a). This is critical
-// because panel members write to a shared channel in non-deterministic
-// goroutine-arrival order.
+// hashes are concatenated in sorted order and re-hashed to produce a
+// collision-resistant key while preserving order-independence:
+// cacheKey(a, b) == cacheKey(b, a). This is critical because panel
+// members write to a shared channel in non-deterministic goroutine-arrival
+// order.
 //
-// When r1Content == r2Content (perfect agreement), XORing the same hash
-// produces an all-zeros key, causing all perfect-agreement responses to
-// share one cache slot and breaking LRU ordering. In this case a sentinel
-// is appended before hashing to preserve distinct entries per content.
+// When r1Content == r2Content (perfect agreement), the sentinel prefix
+// avoids any key collision by ensuring distinct entries per content even
+// when both panels agree perfectly.
 func cacheKey(r1Content, r2Content string) [32]byte {
 	if r1Content == r2Content {
-		// Use a sentinel to avoid zero-key collision when both panels agree.
-		// sha256(a) XOR sha256(a) = all-zeros, so all perfect-agreement
-		// responses would share one cache slot without this guard.
 		h := sha256.Sum256([]byte(r1Content + "|SAME|"))
 		return h
 	}
 	h1 := sha256.Sum256([]byte(r1Content))
 	h2 := sha256.Sum256([]byte(r2Content))
-	var key [32]byte
-	for i := range key {
-		key[i] = h1[i] ^ h2[i]
+	combined := canonicalize(&h1, &h2)
+	return sha256.Sum256(combined[:])
+}
+
+// canonicalize returns the two 32-byte hashes in a fixed byte order so
+// that cacheKey(a, b) == cacheKey(b, a) regardless of arrival order.
+func canonicalize(h1, h2 *[32]byte) [64]byte {
+	var a, b [32]byte
+	if bytes.Compare(h1[:], h2[:]) < 0 {
+		a, b = *h1, *h2
+	} else {
+		a, b = *h2, *h1
 	}
-	return key
+	var combined [64]byte
+	copy(combined[:32], a[:])
+	copy(combined[32:], b[:])
+	return combined
 }
 
 // touch moves the given key to the end of the LRU list (most recently used).
