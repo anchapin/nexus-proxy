@@ -467,7 +467,7 @@ func main() {
 					slog.String("path", cfg.JudgeDBPath),
 					slog.Any("err", err),
 				)
-				storage = judge.NewMemoryStorage()
+				storage = judge.NewMemoryStorage(0)
 			} else {
 				storage = store
 				slog.Info("judge SQLite store opened",
@@ -475,7 +475,7 @@ func main() {
 				)
 			}
 		} else {
-			storage = judge.NewMemoryStorage()
+			storage = judge.NewMemoryStorage(0)
 			slog.Info("judge SQLite store disabled (NEXUS_JUDGE_DB is empty); using in-memory store")
 		}
 
