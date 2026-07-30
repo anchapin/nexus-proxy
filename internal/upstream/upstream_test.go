@@ -2666,6 +2666,29 @@ func TestStreamCachedArbiterSynthesisSecondWriteClientAbort(t *testing.T) {
 	}
 }
 
+func TestStreamCachedArbiterSynthesisRejectsNonStringContent(t *testing.T) {
+	w := newJSONRW()
+	err := streamCachedArbiterSynthesis(w, 42)
+	if err == nil {
+		t.Fatalf("streamCachedArbiterSynthesis: expected error for non-string content, got nil")
+	}
+	if !strings.Contains(err.Error(), "not a string") {
+		t.Errorf("err = %v, want error containing 'not a string'", err)
+	}
+}
+
+func TestStreamCachedArbiterSynthesisRejectsSSEInjection(t *testing.T) {
+	w := newJSONRW()
+	injected := "normal text\ndata: fake event\nevent: hack"
+	err := streamCachedArbiterSynthesis(w, injected)
+	if err == nil {
+		t.Fatalf("streamCachedArbiterSynthesis: expected error for SSE injection, got nil")
+	}
+	if !strings.Contains(err.Error(), "SSE framing") {
+		t.Errorf("err = %v, want error containing 'SSE framing'", err)
+	}
+}
+
 func TestPanel_MalformedArbiterEmptyChoices_ReturnsError(t *testing.T) {
 	const (
 		localURL    = "http://local.local/v1/chat/completions"
@@ -2814,32 +2837,6 @@ func TestPanel_CacheHit_ReturnsNoError(t *testing.T) {
 	}
 	if arbiterCalled > 0 {
 		t.Errorf("arbiter called %d times, want 0 (cache hit)", arbiterCalled)
-	}
-}
-
-// failingMarshal is a json.Marshaler that always returns an error.
-// Used to exercise the marshal-before-WriteHeader ordering in
-// streamCachedArbiterSynthesis (issue #788).
-type failingMarshal struct{ s string }
-
-func (failingMarshal) MarshalJSON() ([]byte, error) {
-	return nil, errors.New("synthetic marshal error for test")
-}
-
-// TestStreamCachedArbiterSynthesis_MarshalFailureBeforeHeaders verifies that
-// when json.Marshal fails, WriteHeader is never called and the error is
-// returned to the caller (issue #788).
-func TestStreamCachedArbiterSynthesis_MarshalFailureBeforeHeaders(t *testing.T) {
-	rw := newSSERW()
-	err := streamCachedArbiterSynthesis(rw, failingMarshal{s: "test"})
-	if err == nil {
-		t.Fatal("expected marshal error, got nil")
-	}
-	if !strings.Contains(err.Error(), "marshal") {
-		t.Errorf("error = %v, want error mentioning 'marshal'", err)
-	}
-	if rw.status != 0 {
-		t.Errorf("WriteHeader called with status %d on marshal error; expected no WriteHeader", rw.status)
 	}
 }
 
