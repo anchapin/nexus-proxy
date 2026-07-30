@@ -181,7 +181,9 @@ func (c *CachedEmbedder) RecordBreakerSuccess() {
 // the method, enabling circuit-breaker trip callbacks to reach the
 // underlying Ollama/OpenAI/Cohere embedder (issue #1041).
 func (c *CachedEmbedder) SetTripCallback(kind string, cb func(kind string)) {
-	if e, ok := c.inner.(interface{ SetTripCallback(string, func(kind string)) }); ok {
+	if e, ok := c.inner.(interface {
+		SetTripCallback(string, func(kind string))
+	}); ok {
 		e.SetTripCallback(kind, cb)
 	}
 }

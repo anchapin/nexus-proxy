@@ -28,9 +28,9 @@ const (
 )
 
 type bucket struct {
-	entries    []entry
-	sum        float64
-	oldestAt   time.Time
+	entries  []entry
+	sum      float64
+	oldestAt time.Time
 }
 
 type SpendTracker struct {
