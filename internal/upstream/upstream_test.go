@@ -249,6 +249,7 @@ func TestFetchPanelHappyPath(t *testing.T) {
 	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
 			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"hello"}}]}`)),
 		}, nil
 	})}
@@ -268,6 +269,7 @@ func TestFetchPanelOverwritesModelAndStream(t *testing.T) {
 		seenBody = string(b)
 		return &http.Response{
 			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
 			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"x"}}]}`)),
 		}, nil
 	})}
@@ -290,6 +292,7 @@ func TestFetchPanelEmptyChoices(t *testing.T) {
 	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
 			Body:       io.NopCloser(strings.NewReader(`{"choices":[]}`)),
 		}, nil
 	})}
@@ -1920,6 +1923,7 @@ func TestFetchPanelPreservesToolCalls(t *testing.T) {
 	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
 			Body: io.NopCloser(strings.NewReader(
 				`{"choices":[{"message":{"content":"running it","tool_calls":[{"id":"c1","type":"function","function":{"name":"exec","arguments":"{}"}}]}}]}`,
 			)),
@@ -1937,6 +1941,23 @@ func TestFetchPanelPreservesToolCalls(t *testing.T) {
 	}
 	if got.ToolCalls[0].Function.Name != "exec" {
 		t.Errorf("name = %q", got.ToolCalls[0].Function.Name)
+	}
+}
+
+// TestFetchPanelRejectsContentTypeMismatch reproduces issue #1044: a 200 OK
+// response with Content-Type: text/html must be rejected before JSON parsing
+// and return ErrUpstreamContentTypeMismatch.
+func TestFetchPanelRejectsContentTypeMismatch(t *testing.T) {
+	client := &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/html"}},
+			Body:       io.NopCloser(strings.NewReader("<html>oops</html>")),
+		}, nil
+	})}
+	_, err := FetchPanel(context.Background(), client, "http://x", "", "m", nil)
+	if !errors.Is(err, ErrUpstreamContentTypeMismatch) {
+		t.Fatalf("FetchPanel error = %v, want ErrUpstreamContentTypeMismatch", err)
 	}
 }
 

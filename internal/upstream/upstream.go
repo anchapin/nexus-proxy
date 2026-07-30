@@ -508,6 +508,16 @@ func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName
 		return AssistantMessage{}, fmt.Errorf("fusion: %s status %d: %s", modelName, resp.StatusCode, truncateForLog(respBody, 200))
 	}
 
+	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if ct != "application/json" && ct != "text/event-stream" {
+		slog.Warn("upstream content-type mismatch",
+			"status", resp.StatusCode,
+			"content_type", ct,
+			"target", targetURL,
+		)
+		return AssistantMessage{}, ErrUpstreamContentTypeMismatch
+	}
+
 	var raw struct {
 		Choices []struct {
 			Message struct {
