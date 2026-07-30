@@ -282,6 +282,15 @@ func (e *Exporter) StartSpan(parent Context, name string) (Context, *Span) {
 		ctx.TraceID = NewTraceID()
 	}
 	sid := NewSpanID()
+	if e == nil || e.endpoint == "" || !e.sampler.ShouldSample(ctx.TraceID) {
+		return ctx.WithSpanID(sid), &Span{
+			TraceID:      ctx.TraceID,
+			SpanID:       sid,
+			ParentSpanID: parent.SpanID,
+			Name:         name,
+			ended:        true,
+		}
+	}
 	s := &Span{
 		TraceID:      ctx.TraceID,
 		SpanID:       sid,
@@ -290,9 +299,7 @@ func (e *Exporter) StartSpan(parent Context, name string) (Context, *Span) {
 		StartTime:    time.Now(),
 		Attributes:   make(map[string]any, 4),
 		Status:       StatusUnset,
-	}
-	if e != nil && e.endpoint != "" && e.sampler.ShouldSample(ctx.TraceID) {
-		s.exporter = e
+		exporter:     e,
 	}
 	return ctx.WithSpanID(sid), s
 }

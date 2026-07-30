@@ -869,3 +869,110 @@ func TestExporterCustomBatchSizeFlush(t *testing.T) {
 			batches.Load(), customBatchSize, customBatchSize)
 	}
 }
+
+func TestExporterStartSpanNoopOnNonSampled(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{
+		Endpoint: srv.URL,
+		Sampler:  NeverSample{},
+	})
+	if e == nil {
+		t.Fatal("NewExporter returned nil")
+	}
+	defer e.Close()
+
+	traceID := NewTraceID()
+	ctx, s := e.StartSpan(Context{TraceID: traceID}, "non-sampled-op")
+
+	if ctx.TraceID != traceID {
+		t.Errorf("TraceID = %q, want %q", ctx.TraceID, traceID)
+	}
+	if s.TraceID != traceID {
+		t.Errorf("span TraceID = %q, want %q", s.TraceID, traceID)
+	}
+	if s.ParentSpanID != "" {
+		t.Errorf("ParentSpanID = %q, want empty", s.ParentSpanID)
+	}
+	if s.ended != true {
+		t.Errorf("ended = false, want true for non-sampled span")
+	}
+	if s.Attributes != nil {
+		t.Errorf("Attributes = %v, want nil for non-sampled span (no map allocation)", s.Attributes)
+	}
+
+	s.End()
+
+	if hits.Load() != 0 {
+		t.Errorf("hits = %d, want 0 (non-sampled span End must not submit)", hits.Load())
+	}
+	if e.Dropped() != 0 {
+		t.Errorf("Dropped = %d, want 0", e.Dropped())
+	}
+}
+
+func TestExporterStartSpanNoopOnProbabilityZero(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{
+		Endpoint: srv.URL,
+		Sampler:  NewProbabilitySampler(0),
+	})
+	if e == nil {
+		t.Fatal("NewExporter returned nil")
+	}
+	defer e.Close()
+
+	for i := 0; i < 32; i++ {
+		_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "zero-rate-op")
+		if s.ended != true {
+			t.Errorf("span %d: ended = false, want true for zero-rate-sampled span", i)
+		}
+		if s.Attributes != nil {
+			t.Errorf("span %d: Attributes = %v, want nil (no map allocation)", i, s.Attributes)
+		}
+		s.End()
+	}
+
+	if hits.Load() != 0 {
+		t.Errorf("hits = %d, want 0 (zero-rate spans must not export)", hits.Load())
+	}
+}
+
+func TestExporterStartSpanSampledAllocatesMap(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{
+		Endpoint: srv.URL,
+		Sampler:  AlwaysSample{},
+	})
+	if e == nil {
+		t.Fatal("NewExporter returned nil")
+	}
+	defer e.Close()
+
+	_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "sampled-op")
+
+	if s.ended == true {
+		t.Errorf("ended = true, want false for sampled span")
+	}
+	if s.Attributes == nil {
+		t.Errorf("Attributes = nil, want non-nil map for sampled span")
+	}
+
+	s.SetAttr("key", "value")
+	s.End()
+}
