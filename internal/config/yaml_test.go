@@ -616,6 +616,23 @@ func TestLoadYAMLProviderTailWeightEnvInvalid(t *testing.T) {
 	}
 }
 
+func TestLoadYAMLFusionAgreementThresholdOutOfRange(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(path, []byte("fusion_agreement_threshold: 0.85\n"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv("NEXUS_FUSION_AGREEMENT_THRESHOLD", "1.5")
+	if _, err := LoadYAML(path); err == nil {
+		t.Error("LoadYAML: expected error for NEXUS_FUSION_AGREEMENT_THRESHOLD=1.5")
+	}
+
+	t.Setenv("NEXUS_FUSION_AGREEMENT_THRESHOLD", "-0.1")
+	if _, err := LoadYAML(path); err == nil {
+		t.Error("LoadYAML: expected error for NEXUS_FUSION_AGREEMENT_THRESHOLD=-0.1")
+	}
+}
+
 func TestLoadYAMLHealthSettings(t *testing.T) {
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "config.yaml")
