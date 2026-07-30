@@ -26,6 +26,8 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/tracing"
+	"github.com/anchapin/nexus-proxy/internal/tracingtest"
 	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
 
@@ -2357,5 +2359,77 @@ func TestChatFrontierCostUsesFrontierCostPer1K(t *testing.T) {
 		t.Errorf("Cost ratio = %v, want ~5.0 (FrontierCostPer1K=0.010 / JudgeCostPer1KUSD=0.002); got ratio %.2f which indicates %s",
 			ratio, ratio,
 			map[bool]string{true: "CORRECT use of FrontierCostPer1K", false: "INCORRECT use of JudgeCostPer1KUSD"}[ratio > 4.5])
+	}
+}
+
+func TestChatRootSpanAttributes(t *testing.T) {
+	deps, _ := baseDeps(t)
+	deps.Client = &http.Client{Transport: upstream.NewRecordingTransport()}
+
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+	defer exp.Close()
+
+	spanCtx, rootSpan := tracing.StartSpan(tracing.Context{}, "nexus.chat_completions")
+	ctx := tracing.WithRootSpan(tracing.WithSpanContext(context.Background(), spanCtx), rootSpan)
+
+	body := `{"messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req = req.WithContext(ctx)
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	rootSpan.End()
+
+	if err := exp.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	s := coll.FindSpan(t, "nexus.chat_completions")
+	if s == nil {
+		t.Fatal("missing nexus.chat_completions span")
+	}
+
+	if got := tracingtest.AttrBool(s, "streaming"); !got {
+		t.Error("streaming = false, want true (default streaming request)")
+	}
+
+	if got := tracingtest.AttrInt(s, "input_tokens"); got <= 0 {
+		t.Errorf("input_tokens = %d, want > 0", got)
+	}
+
+	if got := tracingtest.AttrInt(s, "output_tokens"); got <= 0 {
+		t.Errorf("output_tokens = %d, want > 0", got)
+	}
+}
+
+func TestChatRootSpanErrorAttribute(t *testing.T) {
+	deps, _ := baseDeps(t)
+	deps.Client = &http.Client{Transport: errTransport{}}
+
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+	defer exp.Close()
+
+	spanCtx, rootSpan := tracing.StartSpan(tracing.Context{}, "nexus.chat_completions")
+	ctx := tracing.WithRootSpan(tracing.WithSpanContext(context.Background(), spanCtx), rootSpan)
+
+	body := `{"messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req = req.WithContext(ctx)
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	rootSpan.End()
+
+	if err := exp.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	s := coll.FindSpan(t, "nexus.chat_completions")
+	if s == nil {
+		t.Fatal("missing nexus.chat_completions span")
+	}
+
+	if got := tracingtest.AttrString(s, "error"); got == "" {
+		t.Error("error = empty, want non-empty for upstream failure")
 	}
 }

@@ -1980,6 +1980,22 @@ func Chat(d Deps) http.Handler {
 			d.Recorder.Record(rec)
 		}
 
+		// Stamp remaining observability attributes on the root span so
+		// OTLP backends can filter traces by streaming mode, correlate
+		// errors, and analyze token counts without joining telemetry store.
+		if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
+			rootSpan.SetAttr("streaming", streaming)
+			if upErr != nil {
+				rootSpan.SetAttr("error", upErr.Error())
+			}
+			if rec.InputTokens > 0 {
+				rootSpan.SetAttr("input_tokens", int64(rec.InputTokens))
+			}
+			if rec.OutputTokens > 0 {
+				rootSpan.SetAttr("output_tokens", int64(rec.OutputTokens))
+			}
+		}
+
 		// LatencyObserver (issue #165): fired after the upstream response
 		// completes so callers can record end-to-end latency histograms.
 		// ttftMs is already computed above; convert to float64 seconds.
