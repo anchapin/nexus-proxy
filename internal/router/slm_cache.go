@@ -52,12 +52,13 @@ type Embedder interface {
 // Zero value is ready to use with default TTL (DefaultSLMCacheTTL).
 // Construct with NewSLMCache to override TTL.
 type SLMCache struct {
-	ttl            time.Duration
-	maxEntries     int
-	maxStale       int // proactive eviction threshold (0 = disabled, issue #835)
-	maxScanEntries int // max entries scanned in getSemantic; 0 = unlimited (issue #933)
-	embedder       Embedder
-	semThreshold   float64 // cosine similarity floor for semantic match (0.0..1.0)
+	ttl                   time.Duration
+	maxEntries            int
+	maxStale              int // proactive eviction threshold in getSemantic (0 = disabled, issue #835)
+	staleCleanupThreshold int // Get-triggered eviction threshold (0 = disabled, issue #1037)
+	maxScanEntries        int // max entries scanned in getSemantic; 0 = unlimited (issue #933)
+	embedder              Embedder
+	semThreshold          float64 // cosine similarity floor for semantic match (0.0..1.0)
 
 	mu      sync.RWMutex
 	entries map[string]cachedDecision
@@ -294,6 +295,12 @@ func (c *SLMCache) Get(ctx context.Context, prompt string) (Route, bool, CacheHi
 		return route, true, CacheHitExact
 	}
 	c.mu.RUnlock()
+
+	if c.staleCleanupThreshold > 0 {
+		if stale := c.StaleEntries(); stale > c.staleCleanupThreshold {
+			go c.EvictExpired()
+		}
+	}
 
 	if c.embedder == nil {
 		return "", false, ""
@@ -552,6 +559,22 @@ func (c *SLMCache) SetMaxScanEntries(maxScanEntries int) {
 	}
 	c.mu.Lock()
 	c.maxScanEntries = maxScanEntries
+	c.mu.Unlock()
+}
+
+// SetStaleCleanupThreshold sets the threshold of expired-but-not-yet-evicted
+// entries that triggers background eviction on Get (issue #1037). When
+// staleCleanupThreshold > 0 and StaleEntries() > staleCleanupThreshold,
+// Get spawns a background goroutine to remove stale entries. This prevents
+// stale entries from accumulating indefinitely in read-heavy workloads where
+// Set is not called frequently enough to trigger eviction on write.
+// SetStaleCleanupThreshold is safe to call concurrently with Get/Set.
+func (c *SLMCache) SetStaleCleanupThreshold(threshold int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.staleCleanupThreshold = threshold
 	c.mu.Unlock()
 }
 

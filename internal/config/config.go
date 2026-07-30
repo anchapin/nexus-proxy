@@ -138,16 +138,17 @@ type Config struct {
 	RAGBatchSize int
 
 	// Routing
-	TokenGuardrail            int           // estimated tokens above this force frontier (6000)
-	SLMTimeout                time.Duration // Qwen3-Coder routing timeout (8s)
-	SLMCacheMaxEntries        int           // max entries in SLM routing decision cache (512)
-	SLMCacheSemanticThreshold float64       // cosine similarity floor for semantic cache hits (0.0..1.0, issue #245)
-	SLMCacheMaxStale          int           // max stale entries before proactive eviction (0 = disabled, issue #835)
-	SLMCacheSemanticScanLimit int           // max entries scanned in getSemantic; 0 = unlimited (issue #933)
-	SLMConfidenceThreshold    float64       // hard escalation threshold: local/fusion decisions below this force frontier (default 0.3, issue #301)
-	FusionTimeout             time.Duration // per-panel-member fetch timeout (120s)
-	CascadeTimeout            time.Duration // per-attempt timeout for cascade fallback (30s)
-	ArbiterTimeout            time.Duration // per-call timeout for the fusion arbiter stream (60s)
+	TokenGuardrail                int           // estimated tokens above this force frontier (6000)
+	SLMTimeout                    time.Duration // Qwen3-Coder routing timeout (8s)
+	SLMCacheMaxEntries            int           // max entries in SLM routing decision cache (512)
+	SLMCacheSemanticThreshold     float64       // cosine similarity floor for semantic cache hits (0.0..1.0, issue #245)
+	SLMCacheMaxStale              int           // max stale entries before proactive eviction (0 = disabled, issue #835)
+	SLMCacheStaleCleanupThreshold int           // Get-triggered eviction threshold; 0 = disabled (issue #1037)
+	SLMCacheSemanticScanLimit     int           // max entries scanned in getSemantic; 0 = unlimited (issue #933)
+	SLMConfidenceThreshold        float64       // hard escalation threshold: local/fusion decisions below this force frontier (default 0.3, issue #301)
+	FusionTimeout                 time.Duration // per-panel-member fetch timeout (120s)
+	CascadeTimeout                time.Duration // per-attempt timeout for cascade fallback (30s)
+	ArbiterTimeout                time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
 	// DSL fast-pass patterns (issue #305). DSLFormattingPatterns
 	// matches simple formatting keywords (css, format, docstring, ...).
@@ -1138,8 +1139,8 @@ func Load() (Config, error) {
 
 	// Max stale entries before proactive eviction triggers in getSemantic
 	// (issue #835). 0 disables proactive eviction (stale entries accumulate
-	// until the next Set call); a positive value causes getSemantic to spawn
-	// a background eviction goroutine when stale > maxStale.
+	// silently until the next Set call); a positive value causes getSemantic
+	// to spawn a background eviction goroutine when stale > maxStale.
 	slmCacheMaxStale, err := getEnvInt("NEXUS_SLMCACHE_MAX_STALE", 0)
 	if err != nil {
 		return cfg, err
@@ -1148,6 +1149,20 @@ func Load() (Config, error) {
 		slmCacheMaxStale = 0
 	}
 	cfg.SLMCacheMaxStale = slmCacheMaxStale
+
+	// Stale cleanup threshold for Get-triggered eviction (issue #1037).
+	// When staleCleanupThreshold > 0 and StaleEntries() > threshold,
+	// Get spawns a background goroutine to evict stale entries. This prevents
+	// stale entries from accumulating in read-heavy workloads where Set is not
+	// called frequently enough to trigger eviction on write. Default 0 (disabled).
+	slmCacheStaleCleanupThreshold, err := getEnvInt("NEXUS_SLMCACHE_STALE_CLEANUP_THRESHOLD", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if slmCacheStaleCleanupThreshold < 0 {
+		slmCacheStaleCleanupThreshold = 0
+	}
+	cfg.SLMCacheStaleCleanupThreshold = slmCacheStaleCleanupThreshold
 
 	// Semantic scan limit for SLM cache (issue #933). When maxScanEntries > 0,
 	// getSemantic stops scanning after examining maxScanEntries entries. 0 (the

@@ -1284,6 +1284,121 @@ func TestSLMCache_SetMaxStale(t *testing.T) {
 	c.SetMaxStale(100) // must not panic
 }
 
+func TestSLMCache_SetStaleCleanupThreshold_NilSafe(t *testing.T) {
+	// SetStaleCleanupThreshold must not panic on a nil *SLMCache.
+	var c *SLMCache
+	c.SetStaleCleanupThreshold(10) // must not panic
+}
+
+// --- Stale cleanup threshold on Get (issue #1037) ---
+
+func TestSLMCache_StaleCleanup_GetTriggeredEviction(t *testing.T) {
+	// With staleCleanupThreshold=1, Get must trigger EvictExpired when
+	// stale entries exceed the threshold (issue #1037).
+	c := NewSLMCache(50*time.Millisecond, 0) // no embedder
+	ctx := context.Background()
+
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteLocal)
+
+	time.Sleep(120 * time.Millisecond)
+
+	// Both entries are now stale.
+	if stale := c.Stale(); stale != 2 {
+		t.Fatalf("Stale = %d before Get, want 2", stale)
+	}
+
+	// Set threshold=1, then call Get (miss, but triggers eviction check).
+	c.SetStaleCleanupThreshold(1)
+	c.Get(ctx, "different") // triggers eviction because stale(2) > threshold(1)
+
+	// Wait for background eviction goroutine to run.
+	time.Sleep(50 * time.Millisecond)
+
+	// Stale should be 0 after background eviction.
+	if stale := c.Stale(); stale != 0 {
+		t.Errorf("Stale after Get-triggered eviction = %d, want 0", stale)
+	}
+}
+
+func TestSLMCache_StaleCleanup_Disabled(t *testing.T) {
+	// With staleCleanupThreshold=0 (default), no Get-triggered eviction occurs.
+	c := NewSLMCache(50*time.Millisecond, 0) // no embedder
+	ctx := context.Background()
+
+	c.Set(ctx, "a", RouteLocal)
+	time.Sleep(120 * time.Millisecond)
+
+	// staleCleanupThreshold=0 by default (disabled).
+	c.Get(ctx, "different")
+
+	// Wait for any background goroutine (shouldn't exist).
+	time.Sleep(50 * time.Millisecond)
+
+	// With threshold=0, eviction should NOT be triggered by Get.
+	if stale := c.Stale(); stale != 1 {
+		t.Errorf("Stale with threshold=0 = %d, want 1 (no eviction)", stale)
+	}
+}
+
+func TestSLMCache_StaleCleanup_ExactlyAtThreshold(t *testing.T) {
+	// Get-triggered eviction fires when stale > threshold, not >=.
+	// With threshold=2 and stale=2, no eviction should fire.
+	c := NewSLMCache(50*time.Millisecond, 0) // no embedder
+	ctx := context.Background()
+
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteLocal)
+	time.Sleep(120 * time.Millisecond)
+
+	c.SetStaleCleanupThreshold(2)
+	c.Get(ctx, "different") // stale(2) > threshold(2) is false
+	time.Sleep(50 * time.Millisecond)
+
+	if stale := c.Stale(); stale != 2 {
+		t.Errorf("Stale at exactly threshold = %d, want 2 (no eviction)", stale)
+	}
+}
+
+func TestSLMCache_StaleCleanup_ThresholdOne(t *testing.T) {
+	// With threshold=1 and stale=1, no eviction (stale > threshold is false).
+	c := NewSLMCache(50*time.Millisecond, 0) // no embedder
+	ctx := context.Background()
+
+	c.Set(ctx, "a", RouteLocal)
+	time.Sleep(120 * time.Millisecond)
+
+	c.SetStaleCleanupThreshold(1)
+	c.Get(ctx, "different")
+	time.Sleep(50 * time.Millisecond)
+
+	if stale := c.Stale(); stale != 1 {
+		t.Errorf("Stale with threshold=1 and stale=1 = %d, want 1 (no eviction)", stale)
+	}
+}
+
+func TestSLMCache_StaleCleanup_GetHitPath(t *testing.T) {
+	// Even when Get hits an exact match, it should still check stale
+	// and trigger eviction if threshold is exceeded.
+	c := NewSLMCache(50*time.Millisecond, 0) // no embedder
+	ctx := context.Background()
+
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteLocal)
+	time.Sleep(120 * time.Millisecond)
+
+	// Both entries stale. Now set threshold=1.
+	c.SetStaleCleanupThreshold(1)
+
+	// Get a DIFFERENT key (miss) - eviction should trigger.
+	c.Get(ctx, "different")
+	time.Sleep(50 * time.Millisecond)
+
+	if stale := c.Stale(); stale != 0 {
+		t.Errorf("Stale after Get miss with threshold=1 = %d, want 0", stale)
+	}
+}
+
 // --- Semantic scan limit (issue #933) ---
 
 func TestSLMCache_SetMaxScanEntries_NilSafe(t *testing.T) {
