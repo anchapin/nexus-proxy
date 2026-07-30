@@ -37,8 +37,9 @@ const permissionsPolicyValue = "accelerometer=(), autoplay=(), camera=(), " +
 //   - Permissions-Policy — disables privacy-sensitive browser features
 //     the proxy never uses (issue #605).
 //   - Content-Security-Policy: default-src 'none'; frame-ancestors 'none';
-//     script-src 'none'; object-src 'none' — locks down script and object
-//     sources to prevent XSS via upstream injection (issue #965).
+//     script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'
+//     — locks down script and object sources to prevent XSS via upstream
+//     injection (issue #965, #1060).
 //
 // When tlsActive is true, Strict-Transport-Security is added with a
 // one-year max-age so clients pin HTTPS and refuse plaintext fallbacks.
@@ -73,7 +74,7 @@ func SecurityHeaders(tlsActive bool) func(http.Handler) http.Handler {
 			h.Set("Cross-Origin-Embedder-Policy", "require-corp")
 			h.Set("Cross-Origin-Resource-Policy", "same-origin")
 			h.Set("Permissions-Policy", permissionsPolicyValue)
-			h.Set("Content-Security-Policy", `default-src 'none'; frame-ancestors 'none'; script-src 'none'; object-src 'none'`)
+			h.Set("Content-Security-Policy", `default-src 'none'; frame-ancestors 'none'; script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'`)
 			if tlsActive {
 				h.Set("Strict-Transport-Security", "max-age=31536000")
 			}
