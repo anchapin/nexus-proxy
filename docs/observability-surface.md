@@ -399,6 +399,28 @@ The `/status` endpoint also surfaces a `local_cooldown` sub-object:
 | `active` | bool | Whether the cooldown window is currently in effect |
 | `expires_at` | time | Wall-clock time when the active window ends (zero if inactive or disabled) |
 
+## Per-route latency percentiles (issue #774, #1051)
+
+Three gauge families expose request-latency percentiles per route,
+computed from a sliding-window ring buffer of recent samples (capacity
+1000). The ring buffer gives exact percentile values from actual
+observations — operators can set precise SLO alerts (e.g. `p95 < 2s`)
+without client-side estimation.
+
+Values are expressed in **seconds** (Prometheus convention for latency).
+
+| Metric | Type | Labels | Source |
+|--------|------|--------|--------|
+| `nexus_upstream_request_latency_p50_seconds` | gauge | `route` | `latencyPercentileBuffer.Perc()` (issue #774) |
+| `nexus_upstream_request_latency_p95_seconds` | gauge | `route` | `latencyPercentileBuffer.Perc()` (issue #774) |
+| `nexus_upstream_request_latency_p99_seconds` | gauge | `route` | `latencyPercentileBuffer.Perc()` (issue #1051) |
+
+`route` label values: `local`, `frontier`, `fusion`.
+
+p99 is critical for SLA monitoring: p95 misses the tail outliers that
+cause user-visible issues. With p99, operators can alert on the latency
+that only 1% of requests exceed.
+
 ## Observer wiring
 
 The chat handler never imports `internal/observability` directly
