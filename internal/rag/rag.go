@@ -214,27 +214,19 @@ func (c *EmbedCache) Embed(ctx context.Context, text string) ([]float64, error) 
 			case result = <-slot.ch:
 				timer.Stop()
 			case <-timer.C:
-				// Timeout: acquire lock and atomically delete the loading slot
-				// before closing done. If another goroutine already deleted
-				// the slot, skip the close to avoid double-close panic (race
-				// with ctx cancel on the same select; Go picks one randomly).
+				// Timeout: delete the loading slot so future waiters don't reuse it,
+				// then fall through to call inner directly. We do NOT close done —
+				// the inner goroutine may still be running and its result will be
+				// broadcast to any other waiters on slot.ch (issue #1043).
 				c.mu.Lock()
-				_, stillLoading := c.loading[key]
 				delete(c.loading, key)
 				c.mu.Unlock()
-				if stillLoading {
-					close(slot.done)
-				}
 				return c.inner.Embed(ctx, text)
 			case <-ctx.Done():
 				timer.Stop()
 				c.mu.Lock()
-				_, stillLoading := c.loading[key]
 				delete(c.loading, key)
 				c.mu.Unlock()
-				if stillLoading {
-					close(slot.done)
-				}
 				return nil, ctx.Err()
 			}
 		} else {
@@ -242,12 +234,8 @@ func (c *EmbedCache) Embed(ctx context.Context, text string) ([]float64, error) 
 			case result = <-slot.ch:
 			case <-ctx.Done():
 				c.mu.Lock()
-				_, stillLoading := c.loading[key]
 				delete(c.loading, key)
 				c.mu.Unlock()
-				if stillLoading {
-					close(slot.done)
-				}
 				return nil, ctx.Err()
 			}
 		}

@@ -795,6 +795,78 @@ func TestEmbedCacheRecordBreakerSuccessWithoutBreaker(t *testing.T) {
 	cache.RecordBreakerSuccess()
 }
 
+// slowEmbedder is a test embedder that delays for a fixed duration.
+type slowEmbedder struct {
+	delay time.Duration
+	vec   []float64
+	calls atomic.Int64
+}
+
+func (s *slowEmbedder) Embed(ctx context.Context, text string) ([]float64, error) {
+	s.calls.Add(1)
+	select {
+	case <-time.After(s.delay):
+		return s.vec, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *slowEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float64, error) {
+	vec, err := s.Embed(ctx, texts[0])
+	if err != nil {
+		return nil, err
+	}
+	result := make([][]float64, len(texts))
+	for i := range texts {
+		result[i] = vec
+	}
+	return result, nil
+}
+
+func (s *slowEmbedder) IsHealthy(context.Context) bool              { return true }
+func (s *slowEmbedder) IsBreakerOpen() bool                       { return false }
+func (s *slowEmbedder) RecordBreakerSuccess()                      {}
+func (s *slowEmbedder) SetTripCallback(string, func(kind string)) {}
+
+// TestEmbedCacheWaiterTimeoutInnerStillRunning (issue #1043) verifies that
+// when the inner Embed call completes before any waiter times out, the result
+// is broadcast to all waiting goroutines and no extra upstream requests are
+// made. This is the "no extra upstream requests" acceptance criterion.
+func TestEmbedCacheWaiterTimeoutInnerStillRunning(t *testing.T) {
+	const innerDelay = 10 * time.Millisecond
+	const waitTimeout = 30 * time.Millisecond
+
+	inner := &slowEmbedder{vec: []float64{1, 2, 3}, delay: innerDelay}
+	cache := NewEmbedCache(inner, 100, 5*time.Minute, waitTimeout)
+
+	var wg sync.WaitGroup
+	var callersWithResult int32
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := cache.Embed(ctx, "same-key")
+			if err == nil {
+				atomic.AddInt32(&callersWithResult, 1)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if callersWithResult != 3 {
+		t.Errorf("all 3 waiters should receive the shared result; got %d", callersWithResult)
+	}
+	if inner.calls.Load() != 1 {
+		t.Errorf("inner calls = %d, want 1 (all 3 waiters should share one call)", inner.calls.Load())
+	}
+}
+
 func TestStoreWithCachingEmbedder(t *testing.T) {
 	// Verify that Store.EmbedHitCount() delegates to the wrapped *EmbedCache.
 	inner := &stubEmbedder{vecs: map[string][]float64{
