@@ -88,8 +88,8 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ReadTimeout != DefaultServerReadTimeout {
 		t.Errorf("ReadTimeout = %v, want %v", cfg.ReadTimeout, DefaultServerReadTimeout)
 	}
-	if cfg.WriteTimeout != 0 {
-		t.Errorf("WriteTimeout = %v, want 0 (disabled, streaming-safe)", cfg.WriteTimeout)
+	if cfg.WriteTimeout != DefaultServerWriteTimeout {
+		t.Errorf("WriteTimeout = %v, want %v", cfg.WriteTimeout, DefaultServerWriteTimeout)
 	}
 	if cfg.IdleTimeout != DefaultServerIdleTimeout {
 		t.Errorf("IdleTimeout = %v, want %v", cfg.IdleTimeout, DefaultServerIdleTimeout)
@@ -681,7 +681,7 @@ func TestLoadServerTimeoutOverrides(t *testing.T) {
 
 func TestLoadServerTimeoutZeroAllowed(t *testing.T) {
 	// Zero is valid for all four — it disables the corresponding
-	// guard (and WriteTimeout=0 is the streaming-safe default).
+	// guard (WriteTimeout=0 is the streaming-unlimited opt-in, not the default).
 	t.Setenv("NEXUS_SERVER_READ_TIMEOUT", "0")
 	t.Setenv("NEXUS_SERVER_WRITE_TIMEOUT", "0")
 	t.Setenv("NEXUS_SERVER_IDLE_TIMEOUT", "0")

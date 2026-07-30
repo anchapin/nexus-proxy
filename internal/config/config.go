@@ -32,11 +32,14 @@ type Config struct {
 	// outbound NEXUS_HTTP_* transport knobs — these apply to the
 	// http.Server listener, not to upstream client calls.
 	//
-	// WriteTimeout defaults to 0 (disabled) so SSE streaming
-	// responses are never killed mid-stream; set it only when the
-	// proxy is behind a buffering reverse proxy. ReadTimeout covers
-	// the full request read (headers + body) and should be generous
-	// enough for large chat-completion payloads.
+	// WriteTimeout bounds the time a slow client can hold a connection
+	// before the server closes it, preventing slow-client attacks on SSE
+	// streaming responses (issue #1069). It defaults to 300 seconds (5 min),
+	// long enough for legitimate streaming clients while capping abuse; set
+	// to 0 only when the proxy is behind a buffering reverse proxy that
+	// handles slow reads at the network edge. ReadTimeout covers the full
+	// request read (headers + body) and should be generous enough for
+	// large chat-completion payloads.
 	ReadTimeout    time.Duration // full request read deadline; 0 disables
 	WriteTimeout   time.Duration // full response write deadline; 0 disables (streaming-safe)
 	IdleTimeout    time.Duration // keep-alive idle wait; 0 disables
@@ -1289,7 +1292,7 @@ func Load() (Config, error) {
 	}
 	cfg.ReadTimeout = readTimeout
 
-	writeTimeout, err := getEnvDuration("NEXUS_SERVER_WRITE_TIMEOUT", 0)
+	writeTimeout, err := getEnvDuration("NEXUS_SERVER_WRITE_TIMEOUT", DefaultServerWriteTimeout)
 	if err != nil {
 		return cfg, err
 	}
@@ -1754,6 +1757,12 @@ func (c Config) FrontierProviders() []FrontierProvider {
 // disconnecting slow-header/slow-body abuse well before the connection
 // ties up a goroutine for minutes.
 const DefaultServerReadTimeout = 30 * time.Second
+
+// DefaultServerWriteTimeout is the default full response write deadline
+// (issue #1069). 300s (5 min) prevents slow-client connection exhaustion
+// while accommodating legitimate long-running SSE streams. Set to 0 to
+// disable (streaming-unlimited opt-in).
+const DefaultServerWriteTimeout = 300 * time.Second
 
 // DefaultServerIdleTimeout is the default keep-alive idle wait (issue #77).
 // 120s matches Go's http.DefaultServer zero-value behaviour and keeps a
