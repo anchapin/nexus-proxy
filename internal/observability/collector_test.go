@@ -274,25 +274,28 @@ func TestNilCollectorRenderSafe(t *testing.T) {
 // --- Middleware instrumentation (issue #70) --------------------------------
 
 // TestIncAuthCounters verifies each of the three per-decision auth
-// counters increments independently and that AuthAuthenticatedClients
-// mirrors the accepted counter for the gauge surface.
+// counters increments independently per client IP and that
+// AuthAuthenticatedClients mirrors the sum across all IPs (issue #70/#1061).
 func TestIncAuthCounters(t *testing.T) {
 	c := NewCollector()
 
-	c.IncAuthAccepted()
-	c.IncAuthAccepted()
-	c.IncAuthRejectedInvalid()
-	c.IncAuthRejectedMissing()
-	c.IncAuthRejectedMissing()
+	c.IncAuthAccepted("192.168.1.1")
+	c.IncAuthAccepted("192.168.1.2")
+	c.IncAuthRejectedInvalid("192.168.1.1")
+	c.IncAuthRejectedMissing("192.168.1.3")
+	c.IncAuthRejectedMissing("192.168.1.3")
 
-	if got := c.authAccepted.Load(); got != 2 {
-		t.Errorf("authAccepted = %d, want 2", got)
+	if got := c.authAccepted["192.168.1.1"].Load(); got != 1 {
+		t.Errorf("authAccepted[192.168.1.1] = %d, want 1", got)
 	}
-	if got := c.authRejectedInvalid.Load(); got != 1 {
-		t.Errorf("authRejectedInvalid = %d, want 1", got)
+	if got := c.authAccepted["192.168.1.2"].Load(); got != 1 {
+		t.Errorf("authAccepted[192.168.1.2] = %d, want 1", got)
 	}
-	if got := c.authRejectedMissing.Load(); got != 2 {
-		t.Errorf("authRejectedMissing = %d, want 2", got)
+	if got := c.authRejectedInvalid["192.168.1.1"].Load(); got != 1 {
+		t.Errorf("authRejectedInvalid[192.168.1.1] = %d, want 1", got)
+	}
+	if got := c.authRejectedMissing["192.168.1.3"].Load(); got != 2 {
+		t.Errorf("authRejectedMissing[192.168.1.3] = %d, want 2", got)
 	}
 	if got := c.AuthAuthenticatedClients(); got != 2 {
 		t.Errorf("AuthAuthenticatedClients = %d, want 2", got)
@@ -414,6 +417,7 @@ func TestCollectorCountersConcurrent(t *testing.T) {
 	c := NewCollector()
 	const goroutines = 16
 	const iters = 200
+	const testIP = "192.168.1.100" // single IP for concurrency testing
 
 	var wg sync.WaitGroup
 	for g := 0; g < goroutines; g++ {
@@ -421,9 +425,9 @@ func TestCollectorCountersConcurrent(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for i := 0; i < iters; i++ {
-				c.IncAuthAccepted()
-				c.IncAuthRejectedInvalid()
-				c.IncAuthRejectedMissing()
+				c.IncAuthAccepted(testIP)
+				c.IncAuthRejectedInvalid(testIP)
+				c.IncAuthRejectedMissing(testIP)
 				if id%2 == 0 {
 					c.IncRateLimit("global", true)
 				} else {
@@ -439,14 +443,14 @@ func TestCollectorCountersConcurrent(t *testing.T) {
 	wg.Wait()
 
 	const wantAuth = goroutines * iters
-	if got := c.authAccepted.Load(); got != wantAuth {
-		t.Errorf("authAccepted = %d, want %d", got, wantAuth)
+	if got := c.authAccepted[testIP].Load(); got != wantAuth {
+		t.Errorf("authAccepted[testIP] = %d, want %d", got, wantAuth)
 	}
-	if got := c.authRejectedInvalid.Load(); got != wantAuth {
-		t.Errorf("authRejectedInvalid = %d, want %d", got, wantAuth)
+	if got := c.authRejectedInvalid[testIP].Load(); got != wantAuth {
+		t.Errorf("authRejectedInvalid[testIP] = %d, want %d", got, wantAuth)
 	}
-	if got := c.authRejectedMissing.Load(); got != wantAuth {
-		t.Errorf("authRejectedMissing = %d, want %d", got, wantAuth)
+	if got := c.authRejectedMissing[testIP].Load(); got != wantAuth {
+		t.Errorf("authRejectedMissing[testIP] = %d, want %d", got, wantAuth)
 	}
 	if got := c.rateLimitAllowedGlobal.Load(); got != uint64(goroutines/2*iters) {
 		t.Errorf("rateLimitAllowedGlobal = %d, want %d", got, goroutines/2*iters)

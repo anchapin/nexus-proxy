@@ -334,20 +334,44 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 
 	// --- Middleware instrumentation (issue #70) --------------------------
 
-	// Auth counters are emitted with one sample line per outcome label
-	// (accepted / rejected_invalid / rejected_missing). The fourth
-	// outcome "exempt" is intentionally omitted: an exempt request is
-	// not an authentication decision and would dilute the per-decision
-	// counts. The AuthAuthenticatedClients gauge mirrors the
-	// accepted counter so operators can chart a clean "successful
-	// authentications" timeline.
-	writeCounterLabeled(w, "nexus_auth_requests_total",
-		"Authentication decisions by outcome (issue #70).",
-		"outcome", []labelSample{
-			{value: "accepted", n: c.authAccepted.Load()},
-			{value: "rejected_invalid", n: c.authRejectedInvalid.Load()},
-			{value: "rejected_missing", n: c.authRejectedMissing.Load()},
-		})
+	// Auth counters are emitted with two label dimensions: outcome
+	// (accepted / rejected_invalid / rejected_missing) and client_ip.
+	// The fourth outcome "exempt" is intentionally omitted: an exempt
+	// request is not an authentication decision and would dilute the
+	// per-decision counts. Adding client_ip enables operators to identify
+	// which IPs are generating auth failures (issue #1061).
+	// Collect all unique client IPs across all three outcome maps.
+	authIPs := make(map[string]struct{})
+	for ip := range c.authAccepted {
+		authIPs[ip] = struct{}{}
+	}
+	for ip := range c.authRejectedInvalid {
+		authIPs[ip] = struct{}{}
+	}
+	for ip := range c.authRejectedMissing {
+		authIPs[ip] = struct{}{}
+	}
+	// Build sorted slice for deterministic output.
+	authIPSlice := make([]string, 0, len(authIPs))
+	for ip := range authIPs {
+		authIPSlice = append(authIPSlice, ip)
+	}
+	sort.Strings(authIPSlice)
+	authSamples := make([]labelSample2, 0, len(authIPs)*3)
+	for _, ip := range authIPSlice {
+		if v, ok := c.authAccepted[ip]; ok {
+			authSamples = append(authSamples, labelSample2{value1: "accepted", value2: ip, n: v.Load()})
+		}
+		if v, ok := c.authRejectedInvalid[ip]; ok {
+			authSamples = append(authSamples, labelSample2{value1: "rejected_invalid", value2: ip, n: v.Load()})
+		}
+		if v, ok := c.authRejectedMissing[ip]; ok {
+			authSamples = append(authSamples, labelSample2{value1: "rejected_missing", value2: ip, n: v.Load()})
+		}
+	}
+	writeCounterLabeled2(w, "nexus_auth_requests_total",
+		"Authentication decisions by outcome and client IP (issue #70/#1061).",
+		"outcome", "client_ip", authSamples)
 
 	// Rate-limit counters are emitted as two labelled families so the
 	// {scope, allowed} matrix is one scrape away. scope values are
@@ -561,6 +585,27 @@ func writeCounterLabeled(w io.Writer, name, help, label string, samples []labelS
 	writeMeta(w, name, help, "counter")
 	for _, s := range samples {
 		fmt.Fprintf(w, "%s{%s=%q} %d\n", name, label, s.value, s.n)
+	}
+}
+
+// labelSample2 pairs two label values with their counter reading for a
+// two-dimensional labelled counter family (e.g. outcome + client_ip on
+// nexus_auth_requests_total for issue #1061).
+type labelSample2 struct {
+	value1 string
+	value2 string
+	n      uint64
+}
+
+// writeCounterLabeled2 emits a counter family with two label dimensions.
+// Each (label1, label2) tuple becomes its own sample line. Samples are
+// emitted in sorted order by label1, then label2 for deterministic output.
+//
+//nolint:errcheck
+func writeCounterLabeled2(w io.Writer, name, help, label1, label2 string, samples []labelSample2) {
+	writeMeta(w, name, help, "counter")
+	for _, s := range samples {
+		fmt.Fprintf(w, "%s{%s=%q,%s=%q} %d\n", name, label1, s.value1, label2, s.value2, s.n)
 	}
 }
 
