@@ -8,6 +8,65 @@ import (
 	"time"
 )
 
+// tripCallbackEmbedder is an embedder that records the callback passed to
+// SetTripCallback and exposes a Trip method to invoke it.
+type tripCallbackEmbedder struct {
+	mu       sync.Mutex
+	cb       func(kind string)
+	calls    map[string]int
+	batchCalls int
+}
+
+func newTripCallbackEmbedder() *tripCallbackEmbedder {
+	return &tripCallbackEmbedder{calls: make(map[string]int)}
+}
+
+func (e *tripCallbackEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
+	e.mu.Lock()
+	e.calls[text]++
+	e.mu.Unlock()
+	return []float64{float64(len(text)), 0, 0}, nil
+}
+
+func (e *tripCallbackEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float64, error) {
+	e.mu.Lock()
+	e.batchCalls++
+	for _, text := range texts {
+		e.calls[text]++
+	}
+	e.mu.Unlock()
+	result := make([][]float64, len(texts))
+	for i, text := range texts {
+		result[i] = []float64{float64(len(text)), 0, 0}
+	}
+	return result, nil
+}
+
+func (e *tripCallbackEmbedder) IsHealthy(context.Context) bool { return true }
+func (e *tripCallbackEmbedder) IsBreakerOpen() bool          { return false }
+func (e *tripCallbackEmbedder) RecordBreakerSuccess()        {}
+
+func (e *tripCallbackEmbedder) SetTripCallback(_ string, cb func(kind string)) {
+	e.mu.Lock()
+	e.cb = cb
+	e.mu.Unlock()
+}
+
+func (e *tripCallbackEmbedder) Trip() {
+	e.mu.Lock()
+	cb := e.cb
+	e.mu.Unlock()
+	if cb != nil {
+		cb("rag")
+	}
+}
+
+func (e *tripCallbackEmbedder) callCount(text string) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls[text]
+}
+
 // countingEmbedder tracks how many times Embed is actually called,
 // so tests can assert that the cache skips the inner embedder on a
 // cache hit.
@@ -470,5 +529,28 @@ func TestCachedEmbedderCacheStatsWithEmbedCache(t *testing.T) {
 	// EmbedCache.Embed — the second call never reached EmbedCache.
 	if count := cached.EmbedHitCount(); count != 0 {
 		t.Errorf("EmbedHitCount = %d, want 0 (EmbedCache not called on second request)", count)
+	}
+}
+
+// TestCachedEmbedderSetTripCallback verifies that SetTripCallback is
+// forwarded to the inner embedder, enabling circuit-breaker trip
+// observability hooks to fire (issue #1041).
+func TestCachedEmbedderSetTripCallback(t *testing.T) {
+	inner := newTripCallbackEmbedder()
+	cached := NewCachedEmbedder(inner, 64)
+
+	var tripped bool
+	cached.SetTripCallback("rag", func(kind string) {
+		tripped = true
+	})
+
+	if tripped {
+		t.Error("callback fired before Trip() was called on inner")
+	}
+
+	inner.Trip()
+
+	if !tripped {
+		t.Error("callback was not fired after inner.Trip() — SetTripCallback was not forwarded")
 	}
 }
