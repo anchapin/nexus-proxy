@@ -1604,6 +1604,216 @@ func TestSLMCache_EmbedBreaker_SustainedFailureSkipsEmbed(t *testing.T) {
 	}
 }
 
+// --- getSemantic embed circuit breaker tests (issue #1036) ---
+
+func TestSLMCache_EmbedBreaker_GetSemantic_TripAndSkipEmbed(t *testing.T) {
+	// Three rapid embed failures in getSemantic must trip the circuit breaker;
+	// subsequent getSemantic calls must skip the embedder until the cooldown expires.
+	// Use SetEmbedding to store entries without triggering the failing embedder.
+	errEmbed := &failOnceEmbedder{failCount: 100} // always fails
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+	ctx := context.Background()
+
+	// Store entries via SetEmbedding to avoid Set's embedder calls.
+	c.SetEmbedding("cached-a", RouteLocal, []float64{1, 0, 0, 0})
+	c.SetEmbedding("cached-b", RouteFrontier, []float64{0, 1, 0, 0})
+
+	var embedCalls int
+	c.SetEmbedErrorObserver(func() { embedCalls++ })
+
+	// Trigger getSemantic for a non-cached prompt — first two failures.
+	_, _, _ = c.Get(ctx, "query-a") // getSemantic fails (no exact match, then embed fails)
+	_, _, _ = c.Get(ctx, "query-b")
+	if embedCalls != 2 {
+		t.Errorf("after 2 getSemantic failures: embedCalls=%d, want 2", embedCalls)
+	}
+
+	// Third getSemantic failure trips the breaker.
+	_, _, _ = c.Get(ctx, "query-c")
+	if embedCalls != 3 {
+		t.Errorf("after 3rd getSemantic failure: embedCalls=%d, want 3", embedCalls)
+	}
+
+	// Now the breaker is active; next getSemantic must skip embedding.
+	embedCallsBefore := embedCalls
+	_, ok, kind := c.Get(ctx, "query-d") // no exact match, but embed should be skipped
+	if ok || kind != "" {
+		t.Errorf("getSemantic during cooldown: got (ok=%v, kind=%v), want miss", ok, kind)
+	}
+	if embedCalls != embedCallsBefore {
+		t.Errorf("getSemantic during cooldown: embedCalls=%d, want %d (should skip embed)", embedCalls, embedCallsBefore)
+	}
+
+	// Exact matches still work without embedding.
+	got, ok, kind := c.Get(ctx, "cached-a")
+	if !ok || got != RouteLocal || kind != CacheHitExact {
+		t.Errorf("exact match during cooldown: got (%v, %v, %v), want (RouteLocal, true, CacheHitExact)", got, ok, kind)
+	}
+}
+
+func TestSLMCache_EmbedBreaker_GetSemantic_CooldownExpires(t *testing.T) {
+	// After the cooldown window expires, getSemantic must call the embedder again.
+	errEmbed := &failOnceEmbedder{failCount: 100} // always fails
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+	ctx := context.Background()
+
+	c.SetEmbedding("cached", RouteLocal, []float64{1, 0, 0, 0})
+
+	// Trip the breaker via getSemantic.
+	_, _, _ = c.Get(ctx, "query-a")
+	_, _, _ = c.Get(ctx, "query-b")
+	_, _, _ = c.Get(ctx, "query-c") // trips breaker
+
+	// Advance time past the cooldown window by manipulating embedCooldownUntil.
+	c.mu.Lock()
+	c.embedCooldownUntil = time.Now().Add(-1 * time.Second) // expired 1s ago
+	c.mu.Unlock()
+
+	// Next getSemantic should attempt embedding (and fail again).
+	embedErrorsBefore := c.Stats().EmbedErrors
+	_, _, _ = c.Get(ctx, "query-d")
+	if c.Stats().EmbedErrors <= embedErrorsBefore {
+		t.Errorf("getSemantic after cooldown: embed error count should increase, was %d before", embedErrorsBefore)
+	}
+}
+
+func TestSLMCache_EmbedBreaker_GetSemantic_ThreeFailuresOutsideWindow(t *testing.T) {
+	// Three failures spread over more than 30s must NOT trip the breaker.
+	errEmbed := &failOnceEmbedder{failCount: 100} // always fails
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+	ctx := context.Background()
+
+	// Manually set three failure timestamps spaced 40s apart.
+	c.mu.Lock()
+	now := time.Now()
+	c.embedBreaker[0] = now.Add(-120 * time.Second) // 120s ago
+	c.embedBreaker[1] = now.Add(-80 * time.Second)  // 80s ago
+	c.embedBreaker[2] = now.Add(-40 * time.Second)  // 40s ago
+	c.embedBreakerPos = 3
+	c.mu.Unlock()
+
+	// The span is 80s (> 30s) — breaker must not trip.
+	embedErrorsBefore := c.Stats().EmbedErrors
+	_, _, _ = c.Get(ctx, "query")
+	if c.Stats().EmbedErrors <= embedErrorsBefore {
+		t.Errorf("getSemantic with failures outside window: embed error count should increase, was %d before", embedErrorsBefore)
+	}
+}
+
+func TestSLMCache_EmbedBreaker_GetSemantic_SustainedFailureSkipsEmbed(t *testing.T) {
+	// While the breaker is active, repeated getSemantic calls must not call the embedder.
+	errEmbed := &failOnceEmbedder{failCount: 1000} // always fails
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+	ctx := context.Background()
+
+	c.SetEmbedding("cached", RouteLocal, []float64{1, 0, 0, 0})
+
+	// Trip the breaker via getSemantic.
+	_, _, _ = c.Get(ctx, "query-a")
+	_, _, _ = c.Get(ctx, "query-b")
+	_, _, _ = c.Get(ctx, "query-c") // trips breaker
+
+	// Subsequent getSemantic calls must skip embedding.
+	for i := 0; i < 5; i++ {
+		embedErrorsBefore := c.Stats().EmbedErrors
+		_, ok, kind := c.Get(ctx, fmt.Sprintf("query-%d", i))
+		if ok || kind != "" {
+			t.Errorf("getSemantic #%d during cooldown: got (ok=%v, kind=%v), want miss", i, ok, kind)
+		}
+		if c.Stats().EmbedErrors != embedErrorsBefore {
+			t.Errorf("getSemantic #%d during cooldown: embedErrors increased unexpectedly", i)
+		}
+	}
+
+	// Exact matches still work.
+	got, ok, kind := c.Get(ctx, "cached")
+	if !ok || got != RouteLocal || kind != CacheHitExact {
+		t.Errorf("exact match during cooldown: got (%v, %v, %v), want (RouteLocal, true, CacheHitExact)", got, ok, kind)
+	}
+}
+
+func TestSLMCache_EmbedBreaker_GetSemantic_RecordsInSameBuffer(t *testing.T) {
+	// getSemantic and Set share the same embedBreaker buffer.
+	// Failures from both must be counted together to trip the breaker.
+	errEmbed := &failOnceEmbedder{failCount: 100} // always fails
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+	ctx := context.Background()
+
+	c.SetEmbedding("cached", RouteLocal, []float64{1, 0, 0, 0})
+
+	var embedCalls int
+	c.SetEmbedErrorObserver(func() { embedCalls++ })
+
+	// Two failures from Set.
+	c.Set(ctx, "set-a", RouteLocal)
+	c.Set(ctx, "set-b", RouteLocal)
+	if embedCalls != 2 {
+		t.Errorf("after 2 Set failures: embedCalls=%d, want 2", embedCalls)
+	}
+
+	// One failure from getSemantic — third total, should trip breaker.
+	_, _, _ = c.Get(ctx, "query") // getSemantic fails
+	if embedCalls != 3 {
+		t.Errorf("after 3rd total failure (2 Set + 1 getSemantic): embedCalls=%d, want 3", embedCalls)
+	}
+
+	// Now breaker is active — next getSemantic should skip.
+	embedCallsBefore := embedCalls
+	_, ok, kind := c.Get(ctx, "query-2")
+	if ok || kind != "" {
+		t.Errorf("getSemantic during cooldown: got (ok=%v, kind=%v), want miss", ok, kind)
+	}
+	if embedCalls != embedCallsBefore {
+		t.Errorf("getSemantic during cooldown: embedCalls=%d, want %d (should skip)", embedCalls, embedCallsBefore)
+	}
+}
+
+func TestSLMCache_EmbedBreaker_GetSemantic_ReclosesOnSuccess(t *testing.T) {
+	// After cooldown expires, a successful embed call must reset the breaker
+	// so the next 3 failures trip again.
+	errEmbed := &failOnceEmbedder{failCount: 3} // fails first 3, then succeeds
+	c := NewSLMCacheWithEmbedder(time.Hour, 0, errEmbed, 0.5)
+	ctx := context.Background()
+
+	c.SetEmbedding("cached", RouteLocal, []float64{1, 0, 0, 0})
+
+	// Trip the breaker with 3 failures from getSemantic.
+	_, _, _ = c.Get(ctx, "query-a")
+	_, _, _ = c.Get(ctx, "query-b")
+	_, _, _ = c.Get(ctx, "query-c")
+
+	// Breaker is now active; verify.
+	_, ok1, _ := c.Get(ctx, "query-d")
+	if ok1 {
+		t.Errorf("getSemantic during cooldown: should be miss")
+	}
+
+	// Advance time past the cooldown window.
+	c.mu.Lock()
+	c.embedCooldownUntil = time.Now().Add(-1 * time.Second)
+	c.mu.Unlock()
+
+	// Next getSemantic call succeeds (failCount=3, so 4th call succeeds).
+	_, _, _ = c.Get(ctx, "query-e")
+
+	// Advance time again for next failure sequence.
+	c.mu.Lock()
+	c.embedCooldownUntil = time.Now().Add(-1 * time.Second)
+	c.mu.Unlock()
+
+	// Next 3 failures should trip the breaker again (fresh start after success).
+	_, _, _ = c.Get(ctx, "query-f")
+	_, _, _ = c.Get(ctx, "query-g")
+	_, _, _ = c.Get(ctx, "query-h") // 3rd failure after success — should trip
+	if !c.embedCooldownUntil.IsZero() && time.Now().Before(c.embedCooldownUntil) {
+		// breaker should be active
+		_, okAfterTrip, _ := c.Get(ctx, "query-i")
+		if okAfterTrip {
+			t.Errorf("breaker should be active after 3 new failures")
+		}
+	}
+}
+
 // --- Dimension mismatch detection (issue #968) ---
 
 // changingDimEmbedder returns embeddings whose dimension changes after a
