@@ -786,6 +786,26 @@ func TestLoadShutdownTimeoutInvalidValue(t *testing.T) {
 	}
 }
 
+// --- Tracing timeout (issue #1058) ---
+
+func TestLoadTracingTimeoutNegativeRejected(t *testing.T) {
+	t.Setenv("NEXUS_TRACING_TIMEOUT", "-5s")
+	if _, err := Load(); err == nil {
+		t.Errorf("expected error for NEXUS_TRACING_TIMEOUT=-5s")
+	}
+}
+
+func TestLoadTracingTimeoutHonoursOverride(t *testing.T) {
+	t.Setenv("NEXUS_TRACING_TIMEOUT", "15s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TracingTimeout != 15*time.Second {
+		t.Errorf("TracingTimeout = %v, want 15s", cfg.TracingTimeout)
+	}
+}
+
 // --- Trusted proxies (issue #75) ---
 
 func TestTrustedProxies_DefaultDisabled(t *testing.T) {

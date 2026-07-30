@@ -1636,10 +1636,12 @@ func Load() (Config, error) {
 	// (NewExporter returns nil, RegisterExporter is never called).
 	cfg.TracingEndpoint = getEnvAllowEmpty("NEXUS_TRACING_ENDPOINT", "")
 
-	tracingTimeout := time.Duration(0)
-	tracingTimeout, _ = getEnvDuration("NEXUS_TRACING_TIMEOUT", 10*time.Second)
+	tracingTimeout, err := getEnvDuration("NEXUS_TRACING_TIMEOUT", 10*time.Second)
+	if err != nil {
+		return cfg, err
+	}
 	if tracingTimeout < 0 {
-		tracingTimeout = 10 * time.Second
+		return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT must not be negative, got %s", tracingTimeout)
 	}
 	cfg.TracingTimeout = tracingTimeout
 
