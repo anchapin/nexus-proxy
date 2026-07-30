@@ -94,6 +94,26 @@ in via `JudgeObserver` / `QualityObserver` function-typed fields on
 `handlers.Deps` wired in `cmd/nexus/main.go`. This keeps the hot path
 testable without spinning up worker pools.
 
+**RAG embedder circuit breaker** (`NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD`, default 3):
+trips after N consecutive Ollama `/api/embeddings` failures; recloses on first
+success. Separate from the Ollama health breaker that governs chat routing.
+
+**SLM decision cache semantic dedup** (`NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT`):
+when > 0, `getSemantic` stops scanning after examining this many entries,
+bounding O(n) cosine similarity to a cap. Default 0 = unlimited.
+
+**Models discovery endpoint** (`GET /v1/models`): served when
+`NEXUS_MODELS_ENDPOINT=true` (default). Lists configured local/router/frontier
+models plus cached Ollama `/api/tags` results (TTL: `NEXUS_MODELS_CACHE_TTL`,
+default 5m). Set `NEXUS_MODELS_ENDPOINT=false` to disable entirely.
+
+**Distributed tracing config**: `NEXUS_TRACING_ENDPOINT` enables OTLP/JSON export.
+Tune with `NEXUS_TRACING_TIMEOUT` (default 10s), `NEXUS_TRACING_MAX_RETRIES` (3),
+`NEXUS_TRACING_RETRY_BASE_DELAY` (100ms), `NEXUS_TRACING_RETRY_MAX_DELAY` (2s),
+`NEXUS_TRACING_QUEUE_SIZE` (256), `NEXUS_TRACING_BATCH_SIZE` (64), and
+`NEXUS_TRACING_SAMPLE_RATE` (1.0 = record all). Dropped spans appear as
+`nexus_tracing_dropped_total`; flush failures as `nexus_tracing_flush_failures_total`.
+
 ## Routing pipeline
 
 `internal/router`: Guardrail → DSL → SLM.Decide. Every failure defaults
@@ -169,7 +189,7 @@ Set `NEXUS_HEALTH_POLL_INTERVAL=0` to disable the poller.
 `internal/ratelimit.ClientIPResolver` is the single source of truth.
 `X-Forwarded-For` / `X-Real-IP` are honoured **only** when the direct
 TCP peer is in `NEXUS_TRUSTED_PROXIES` CIDR allowlist. Empty =
-trust nobody (safe default). Invalid CIDR **fails boot** (not silent).
+trust nobody (safe default). **Invalid CIDR fails boot** (not silent).
 
 ## TOON compression (issue #123)
 
@@ -237,6 +257,11 @@ middleware belongs in `internal/handlers`.
 After `NEXUS_AUTH_RATE_LIMIT_BURST` auth failures from the same client IP
 within the `NEXUS_AUTH_RATE_LIMIT_WINDOW` sliding window, the proxy returns
 429 with `Retry-After`. Disabled when `NEXUS_AUTH_RATE_LIMIT_RPM <= 0`.
+
+**Rate limiting** (`NEXUS_RATE_LIMIT_RPM` / `NEXUS_RATE_LIMIT_BURST`) is
+hot-reloadable and buckets by client IP by default. Set
+`NEXUS_RATE_LIMIT_BY_API_KEY=true` to bucket by `SHA256(IP + ":" + APIKey)`
+instead — prevents shared-IP abuse across different API keys (issue #776).
 
 ## Prompt injection hardening (issue #76)
 
