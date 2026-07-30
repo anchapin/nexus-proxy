@@ -664,6 +664,9 @@ func LoadYAML(path string) (Config, error) {
 		if err != nil {
 			return cfg, fmt.Errorf("config: NEXUS_FUSION_AGREEMENT_THRESHOLD: %w", err)
 		}
+		if f < 0 || f > 1 {
+			return cfg, fmt.Errorf("config: NEXUS_FUSION_AGREEMENT_THRESHOLD must be in [0,1], got %v", f)
+		}
 		cfg.FusionAgreementThreshold = f
 	}
 	if v := os.Getenv("NEXUS_ARBITER_CACHE_TTL"); v != "" {
