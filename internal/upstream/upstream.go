@@ -1305,13 +1305,22 @@ func streamPanelResultAsSSE(w http.ResponseWriter, r PanelResult) error {
 // sets SSE headers and commits WriteHeader itself (issue #532) so it
 // is safe to call from any code path that has not yet written headers.
 func streamCachedArbiterSynthesis(w http.ResponseWriter, synthesis any) error {
+	content, ok := synthesis.(string)
+	if !ok {
+		return fmt.Errorf("fusion: cached synthesis is not a string: %T", synthesis)
+	}
+	if strings.Contains(content, "\ndata:") {
+		slog.Warn("fusion: cached synthesis contains SSE framing, rejecting",
+			slog.String("content_preview", content[:min(len(content), 100)]))
+		return fmt.Errorf("fusion: cached synthesis contains SSE framing")
+	}
 	chunk := map[string]interface{}{
 		"object":  "chat.completion.chunk",
 		"created": time.Now().Unix(),
 		"model":   "arbiter",
 		"nexus":   map[string]string{"source": "arbiter-cached"},
 		"choices": []map[string]interface{}{
-			{"index": 0, "delta": map[string]interface{}{"content": synthesis}, "finish_reason": "stop"},
+			{"index": 0, "delta": map[string]interface{}{"content": content}, "finish_reason": "stop"},
 		},
 	}
 	b, err := json.Marshal(chunk)
