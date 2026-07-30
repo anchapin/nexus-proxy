@@ -1660,8 +1660,8 @@ func (b *confidenceBridge) forget(requestID string) {
 
 // Record resolves the category for the scored request and feeds the
 // outcome into the confidence store, then delegates to the inner storage.
-// Parse-failure scores (Err set, or Score outside 1..5) are persisted by
-// the inner storage but excluded from the confidence aggregate.
+// Parse-failure scores (Err set, Score outside 1..5, or Score==0 with no Err)
+// are persisted by the inner storage but excluded from the confidence aggregate.
 //
 // NOTE(issue #1017): A previous version of this function had an "else if"
 // branch that called RecordOutcome with a hardcoded RouteLocal before the
@@ -1673,12 +1673,14 @@ func (b *confidenceBridge) Record(s judge.JudgeScore) error {
 	cat, ok := b.cats[s.RequestID]
 	delete(b.cats, s.RequestID)
 	b.mu.Unlock()
-	if ok && s.Err == nil && s.Score >= 1 {
-		if s.Score > 5 {
+	if ok && s.Err == nil {
+		if s.Score < 1 || s.Score > 5 {
 			slog.Warn("confidence: judge score out of range, dropped",
 				slog.String("request_id", s.RequestID),
 				slog.Int("score", s.Score),
 			)
+		} else if s.Score == 0 {
+			slog.Debug("confidence: score=0 with no error, treating as parse failure")
 		} else {
 			route := s.Route
 			if route == "" {
