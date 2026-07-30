@@ -314,10 +314,36 @@ func (c *SLMCache) Get(ctx context.Context, prompt string) (Route, bool, CacheHi
 // "", false, "". Caller must not hold a lock (it releases the lock
 // around the embedder call to avoid blocking Set during HTTP).
 func (c *SLMCache) getSemantic(ctx context.Context, prompt string) (Route, bool, CacheHitKind) {
+	now := time.Now()
+
+	// Circuit breaker (issue #982/#1036): skip embedding during cooldown.
+	if now.Before(c.embedCooldownUntil) {
+		return "", false, ""
+	}
+
 	emb, err := c.embedder.Embed(ctx, prompt)
 	if err != nil {
 		atomic.AddUint64(&c.embedErrors, 1)
 		onEmbedErr := c.onEmbedError
+
+		// Record this failure in the circular buffer.
+		writeIdx := c.embedBreakerPos % embedFailureCooldownThreshold
+		c.embedBreaker[writeIdx] = now
+		c.embedBreakerPos++
+
+		// Check whether 3 recent failures all fall within the cooldown window.
+		if c.embedBreakerPos >= embedFailureCooldownThreshold {
+			n := embedFailureCooldownThreshold
+			oldestIdx := (writeIdx - 1 + n) % n
+			newestIdx := writeIdx
+			span := c.embedBreaker[newestIdx].Sub(c.embedBreaker[oldestIdx])
+			if span <= embedFailureCooldownWindow {
+				// 3 failures within the window — trip the breaker.
+				c.embedCooldownUntil = now.Add(embedFailureCooldownWindow)
+				c.embedBreakerPos = 0
+			}
+		}
+
 		// The lock is not held here (we are still in the read path before
 		// acquiring it), but we fire the callback synchronously after the
 		// embed call so it behaves consistently with Set.
@@ -329,10 +355,10 @@ func (c *SLMCache) getSemantic(ctx context.Context, prompt string) (Route, bool,
 
 	c.mu.RLock()
 	var stale int
+	staleNow := time.Now()
 	if c.maxStale > 0 {
-		now := time.Now()
 		for _, entry := range c.entries {
-			if now.Sub(entry.stamp) > c.ttl {
+			if staleNow.Sub(entry.stamp) > c.ttl {
 				stale++
 			}
 		}
@@ -353,11 +379,11 @@ func (c *SLMCache) getSemantic(ctx context.Context, prompt string) (Route, bool,
 	var best Route
 	var bestScore float64 = -1
 
-	now := time.Now()
+	scanNow := time.Now()
 	scanned := 0
 	for _, entry := range c.entries {
 		scanned++
-		if now.Sub(entry.stamp) > c.ttl {
+		if scanNow.Sub(entry.stamp) > c.ttl {
 			continue
 		}
 		if entry.emb == nil {
