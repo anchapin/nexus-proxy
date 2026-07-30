@@ -257,6 +257,45 @@ func TestHNSWIndexSerializeDefaultConfig(t *testing.T) {
 	}
 }
 
+// TestHNSWIndexDims verifies that Dims returns the correct dimension and 0
+// for an empty index (issue #1040).
+func TestHNSWIndexDims(t *testing.T) {
+	cfg := DefaultHNSWConfig()
+
+	empty := NewHNSWIndex(cfg)
+	if dims := empty.Dims(); dims != 0 {
+		t.Errorf("empty index Dims() = %d, want 0", dims)
+	}
+
+	const n, dim = 10, 64
+	idx := buildTestIndex(t, cfg, n, dim)
+	if dims := idx.Dims(); dims != dim {
+		t.Errorf("Dims() = %d, want %d", dims, dim)
+	}
+}
+
+// TestHNSWIndexDeserializeDimensionMismatch verifies that Dims() reports a
+// mismatch when an index is restored with a different embedder dimension
+// (issue #1040).
+func TestHNSWIndexDeserializeDimensionMismatch(t *testing.T) {
+	cfg := DefaultHNSWConfig()
+	const n, dim = 5, 32
+	idx := buildTestIndex(t, cfg, n, dim)
+
+	data, err := idx.Serialize()
+	if err != nil {
+		t.Fatalf("Serialize: %v", err)
+	}
+
+	restored, err := DeserializeHNSWIndex(data, HNSWConfig{})
+	if err != nil {
+		t.Fatalf("DeserializeHNSWIndex: %v", err)
+	}
+	if dims := restored.Dims(); dims != dim {
+		t.Errorf("restored Dims() = %d, want %d", dims, dim)
+	}
+}
+
 // TestHNSWIndexSerializeIdempotent verifies that serializing the same index
 // twice produces identical output (deterministic format).
 func TestHNSWIndexSerializeIdempotent(t *testing.T) {
