@@ -349,9 +349,6 @@ func (c *SLMCache) getSemantic(ctx context.Context, prompt string) (Route, bool,
 	now := time.Now()
 	scanned := 0
 	for _, entry := range c.entries {
-		if c.maxScanEntries > 0 && scanned >= c.maxScanEntries {
-			break
-		}
 		scanned++
 		if now.Sub(entry.stamp) > c.ttl {
 			continue
@@ -370,6 +367,12 @@ func (c *SLMCache) getSemantic(ctx context.Context, prompt string) (Route, bool,
 		if score > bestScore {
 			bestScore = score
 			best = entry.Route
+		}
+		// Early exit when bestScore reaches 1.0 (perfect cosine similarity =
+		// identical embedding vectors). No further entry can improve on this;
+		// scanning the remainder of the cache is unnecessary.
+		if bestScore >= 1.0 {
+			break
 		}
 	}
 
@@ -541,11 +544,15 @@ func (c *SLMCache) SetMaxStale(maxStale int) {
 	c.mu.Unlock()
 }
 
-// SetMaxScanEntries sets the maximum number of entries scanned during
-// semantic deduplication in getSemantic (issue #933). When maxScanEntries > 0,
-// getSemantic stops scanning after examining maxScanEntries entries. A value
-// of 0 (the default) means unlimited — all entries are scanned.
-// SetMaxScanEntries is safe to call concurrently with Get/Set.
+// SetMaxScanEntries is a no-op (issue #1038). The maxScanEntries limit
+// was removed because it caused non-deterministic cache hits: Go map
+// iteration order is randomized, so with maxScanEntries > 0 different
+// entries were scanned on each call, producing inconsistent semantic
+// matches. Semantic deduplication now scans all entries and exits early
+// only when bestScore reaches 1.0 (perfect match).
+//
+// SetMaxScanEntries is retained for backward compatibility but has no
+// effect. It is safe to call concurrently with Get/Set.
 func (c *SLMCache) SetMaxScanEntries(maxScanEntries int) {
 	if c == nil {
 		return
