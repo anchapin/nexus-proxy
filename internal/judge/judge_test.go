@@ -48,7 +48,7 @@ func newTestEvaluator(t *testing.T, cfg Config, fn rtFunc) (*Evaluator, *MemoryS
 	if cfg.QueueDepth == 0 {
 		cfg.QueueDepth = 8
 	}
-	store := NewMemoryStorage()
+	store := NewMemoryStorage(time.Hour)
 	e := NewEvaluator(cfg, &http.Client{Transport: fn}, store)
 	return e, store
 }
@@ -484,7 +484,7 @@ func waitFor(t *testing.T, cond func() bool, d time.Duration) {
 func TestSampleRateDisabled(t *testing.T) {
 	// Build the evaluator directly so newTestEvaluator's "zero rate
 	// means 1.0" override does not interfere with this test's intent.
-	store := NewMemoryStorage()
+	store := NewMemoryStorage(time.Hour)
 	e := NewEvaluator(Config{SampleRate: 0, URL: "http://x", Model: "m"}, &http.Client{Transport: rtFunc(func(_ *http.Request) (*http.Response, error) {
 		t.Error("HTTP should not be called when sample rate is 0")
 		return nil, nil
@@ -590,7 +590,7 @@ func TestRecordEntryPoint(t *testing.T) {
 // test for issue #662 — the write path was previously exercised only
 // through the worker goroutine, not in standalone unit tests.
 func TestMemoryStorageRecordAndRetrieve(t *testing.T) {
-	store := NewMemoryStorage()
+	store := NewMemoryStorage(time.Hour)
 
 	// (a) Record a single value and retrieve it.
 	want := JudgeScore{RequestID: "req-single", Score: 5, Cost: 0.001}
@@ -643,7 +643,7 @@ func TestMemoryStorageRecordAndRetrieve(t *testing.T) {
 // Record calls — the worker pool can call Record from N goroutines
 // simultaneously, so the storage's locking must hold.
 func TestMemoryStorageConcurrency(t *testing.T) {
-	store := NewMemoryStorage()
+	store := NewMemoryStorage(time.Hour)
 	const writers = 8
 	const perWriter = 50
 	var wg sync.WaitGroup
@@ -659,6 +659,67 @@ func TestMemoryStorageConcurrency(t *testing.T) {
 	wg.Wait()
 	if got := len(store.Scores()); got != writers*perWriter {
 		t.Errorf("got %d scores, want %d", got, writers*perWriter)
+	}
+}
+
+// TestMemoryStorageNoPruningWithZeroWindow verifies that a zero window
+// disables pruning entirely — the slice grows without bound (regression
+// guard for issue #1063: zero window must preserve pre-fix behaviour).
+func TestMemoryStorageNoPruningWithZeroWindow(t *testing.T) {
+	store := NewMemoryStorage(0) // zero = no pruning
+	for i := 0; i < cleanEveryN+100; i++ {
+		_ = store.Record(JudgeScore{RequestID: t.Name(), Score: 3})
+	}
+	if got := len(store.Scores()); got != cleanEveryN+100 {
+		t.Errorf("zero-window store: got %d scores, want %d (pruning should be disabled)", got, cleanEveryN+100)
+	}
+}
+
+// TestMemoryStoragePrunesOldEntries verifies that after cleanEveryN inserts,
+// entries older than 2*window are removed and Scores() returns only recent
+// entries (issue #1063).
+func TestMemoryStoragePrunesOldEntries(t *testing.T) {
+	window := 10 * time.Millisecond
+	store := NewMemoryStorage(window)
+
+	oldScore := JudgeScore{RequestID: "old", Score: 1, Timestamp: time.Now().UTC().Add(-3 * window)}
+	newScore := JudgeScore{RequestID: "new", Score: 5, Timestamp: time.Now().UTC()}
+
+	for i := 0; i < cleanEveryN; i++ {
+		_ = store.Record(oldScore)
+	}
+	_ = store.Record(newScore)
+
+	got := store.Scores()
+	if len(got) != 1 {
+		t.Errorf("got %d scores after cleanup, want 1 (old entries should be pruned)", len(got))
+	}
+	if len(got) > 0 && got[0].RequestID != "new" {
+		t.Errorf("got RequestID=%q, want new", got[0].RequestID)
+	}
+}
+
+// TestMemoryStorageScoresSince verifies ScoresSince returns only entries at
+// or after the given timestamp (issue #1063).
+func TestMemoryStorageScoresSince(t *testing.T) {
+	store := NewMemoryStorage(time.Hour)
+	ts := time.Now().UTC()
+
+	for i := 0; i < 5; i++ {
+		_ = store.Record(JudgeScore{RequestID: "pre", Score: 3, Timestamp: ts.Add(-time.Hour)})
+	}
+	for i := 0; i < 3; i++ {
+		_ = store.Record(JudgeScore{RequestID: "post", Score: 4, Timestamp: ts.Add(time.Hour)})
+	}
+
+	since := store.ScoresSince(ts)
+	if len(since) != 3 {
+		t.Errorf("ScoresSince: got %d, want 3", len(since))
+	}
+	for _, s := range since {
+		if s.RequestID != "post" {
+			t.Errorf("unexpected RequestID %q in ScoresSince result", s.RequestID)
+		}
 	}
 }
 
