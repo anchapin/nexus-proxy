@@ -1191,8 +1191,8 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		JudgeDBPath:       yc.stringDefault(yc.JudgeDBPath, DefaultJudgeDBPath()),
 
 		RoutingConfidenceDB:         yc.stringDefault(yc.RoutingConfidenceDB, DefaultRoutingConfidenceDBPath()),
-		RoutingConfidenceFloor:      yc.floatDefault(yc.RoutingConfidenceFloor, 0.4),
-		RoutingConfidenceCeiling:    yc.floatDefault(yc.RoutingConfidenceCeiling, 0.85),
+		RoutingConfidenceFloor:      clampFloat(yc.floatDefault(yc.RoutingConfidenceFloor, 0.4), 0, 1),
+		RoutingConfidenceCeiling:    clampFloat(yc.floatDefault(yc.RoutingConfidenceCeiling, 0.85), 0, 1),
 		RoutingConfidenceMinSamples: yc.intDefault(yc.RoutingConfidenceMinSamples, 5),
 		RoutingConfidenceWindow:     yc.durationDefault(yc.RoutingConfidenceWindow, 168*time.Hour),
 
@@ -1429,6 +1429,12 @@ func (yc YAMLConfig) validate() error {
 	}
 	if yc.TracingSampleRate < 0 || yc.TracingSampleRate > 1 {
 		return fmt.Errorf("config: tracing_sample_rate must be in range [0,1], got %f", yc.TracingSampleRate)
+	}
+	if yc.RoutingConfidenceFloor < 0 || yc.RoutingConfidenceFloor > 1 {
+		return fmt.Errorf("config: routing_confidence_floor must be in range [0,1], got %f", yc.RoutingConfidenceFloor)
+	}
+	if yc.RoutingConfidenceCeiling < 0 || yc.RoutingConfidenceCeiling > 1 {
+		return fmt.Errorf("config: routing_confidence_ceiling must be in range [0,1], got %f", yc.RoutingConfidenceCeiling)
 	}
 
 	return nil
