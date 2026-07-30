@@ -29,9 +29,9 @@ import (
 // AuthObserver is the interface for receiving auth lifecycle callbacks.
 // The observability.Collector implements this interface (issue #295).
 type AuthObserver interface {
-	IncAuthAccepted()
-	IncAuthRejectedInvalid()
-	IncAuthRejectedMissing()
+	IncAuthAccepted(clientIP string)
+	IncAuthRejectedInvalid(clientIP string)
+	IncAuthRejectedMissing(clientIP string)
 }
 
 // clientSlot tracks an in-progress auth attempt for one client IP.
@@ -70,6 +70,8 @@ func NewMiddleware(key string, exempt func(*http.Request) bool, authLimiter *rat
 	var resolver *ratelimit.ClientIPResolver
 	if authLimiter != nil {
 		resolver = authLimiter.Resolver()
+	} else {
+		resolver = ratelimit.NewClientIPResolver(nil)
 	}
 	if resolver == nil {
 		resolver = ratelimit.NewClientIPResolver(nil)
@@ -138,7 +140,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			defer span.End()
 		}
 
-		ip := m.resolver.Resolve(r)
+		clientIP := m.resolver.Resolve(r)
 		exempt := m.exempt != nil && m.exempt(r)
 		token := BearerToken(r)
 		tokenPresent := token != ""
@@ -149,7 +151,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		}
 
 		if m.authLimiter != nil && m.authLimiter.Enabled() {
-			if m.authLimiter.IsBlocked(ip) {
+			if m.authLimiter.IsBlocked(clientIP) {
 				if span != nil {
 					span.SetAttr("auth.outcome", "reject")
 				}
@@ -165,20 +167,20 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 					},
 				})
 				slog.Warn("auth rate limit exceeded",
-					slog.String("client_ip", ip),
+					slog.String("client_ip", clientIP),
 				)
 				return
 			}
 		}
 
-		m.acquireSlot(ip)
+		m.acquireSlot(clientIP)
 
 		if exempt {
 			if span != nil {
 				span.SetAttr("auth.outcome", "accept")
 			}
 			next.ServeHTTP(w, r)
-			m.renewSlot(ip)
+			m.renewSlot(clientIP)
 			return
 		}
 		if token == "" {
@@ -190,12 +192,12 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = fmt.Fprint(w, `{"error":"missing or malformed Authorization header"}`)
 			if m.observer != nil {
-				m.observer.IncAuthRejectedMissing()
+				m.observer.IncAuthRejectedMissing(clientIP)
 			}
 			if m.authLimiter != nil && m.authLimiter.Enabled() {
-				m.authLimiter.RecordFailure(ip, "missing")
+				m.authLimiter.RecordFailure(clientIP, "missing")
 			}
-			m.renewSlot(ip)
+			m.renewSlot(clientIP)
 			return
 		}
 		// Use crypto/subtle.ConstantTimeCompare to prevent timing attacks
@@ -209,12 +211,12 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = fmt.Fprint(w, `{"error":"invalid API key"}`)
 			if m.observer != nil {
-				m.observer.IncAuthRejectedInvalid()
+				m.observer.IncAuthRejectedInvalid(clientIP)
 			}
 			if m.authLimiter != nil && m.authLimiter.Enabled() {
-				m.authLimiter.RecordFailure(ip, "invalid")
+				m.authLimiter.RecordFailure(clientIP, "invalid")
 			}
-			m.renewSlot(ip)
+			m.renewSlot(clientIP)
 			return
 		}
 		if span != nil {
@@ -222,9 +224,9 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 		if m.observer != nil {
-			m.observer.IncAuthAccepted()
+			m.observer.IncAuthAccepted(clientIP)
 		}
-		m.renewSlot(ip)
+		m.renewSlot(clientIP)
 	})
 }
 

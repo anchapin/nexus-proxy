@@ -452,18 +452,19 @@ func TestRenderPrometheusCostFloat(t *testing.T) {
 	}
 }
 
-// TestRenderPrometheusAuthCounters (issue #70) renders the auth
+// TestRenderPrometheusAuthCounters (issue #70/#1061) renders the auth
 // counters and gauge after a known sequence of Inc* calls and
-// confirms the per-outcome labels and cumulative gauge are correct.
+// confirms the per-outcome and per-client_ip labels and cumulative
+// gauge are correct.
 func TestRenderPrometheusAuthCounters(t *testing.T) {
 	c := NewCollector()
 
-	c.IncAuthAccepted()
-	c.IncAuthAccepted()
-	c.IncAuthAccepted()
-	c.IncAuthRejectedInvalid()
-	c.IncAuthRejectedMissing()
-	c.IncAuthRejectedMissing()
+	c.IncAuthAccepted("192.168.1.1")
+	c.IncAuthAccepted("192.168.1.1")
+	c.IncAuthAccepted("192.168.1.2")
+	c.IncAuthRejectedInvalid("192.168.1.1")
+	c.IncAuthRejectedMissing("192.168.1.3")
+	c.IncAuthRejectedMissing("192.168.1.3")
 
 	var sb strings.Builder
 	RenderPrometheus(&sb, c)
@@ -471,9 +472,10 @@ func TestRenderPrometheusAuthCounters(t *testing.T) {
 
 	wantLines := []string{
 		"# TYPE nexus_auth_requests_total counter",
-		`nexus_auth_requests_total{outcome="accepted"} 3`,
-		`nexus_auth_requests_total{outcome="rejected_invalid"} 1`,
-		`nexus_auth_requests_total{outcome="rejected_missing"} 2`,
+		`nexus_auth_requests_total{outcome="accepted",client_ip="192.168.1.1"} 2`,
+		`nexus_auth_requests_total{outcome="accepted",client_ip="192.168.1.2"} 1`,
+		`nexus_auth_requests_total{outcome="rejected_invalid",client_ip="192.168.1.1"} 1`,
+		`nexus_auth_requests_total{outcome="rejected_missing",client_ip="192.168.1.3"} 2`,
 		"# TYPE nexus_auth_authenticated_clients gauge",
 		"nexus_auth_authenticated_clients 3",
 	}

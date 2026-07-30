@@ -253,16 +253,23 @@ func TestConstantTimeComparisonRegression(t *testing.T) {
 	}
 }
 
-// mockObserver implements AuthObserver for testing (issue #295).
+// mockObserver implements AuthObserver for testing (issue #295/#1061).
 type mockObserver struct {
 	accepted        int
 	rejectedInvalid int
 	rejectedMissing int
+	lastClientIP    string
 }
 
-func (m *mockObserver) IncAuthAccepted()        { m.accepted++ }
-func (m *mockObserver) IncAuthRejectedInvalid() { m.rejectedInvalid++ }
-func (m *mockObserver) IncAuthRejectedMissing() { m.rejectedMissing++ }
+func (m *mockObserver) IncAuthAccepted(clientIP string) { m.accepted++; m.lastClientIP = clientIP }
+func (m *mockObserver) IncAuthRejectedInvalid(clientIP string) {
+	m.rejectedInvalid++
+	m.lastClientIP = clientIP
+}
+func (m *mockObserver) IncAuthRejectedMissing(clientIP string) {
+	m.rejectedMissing++
+	m.lastClientIP = clientIP
+}
 
 // TestAuthObserverMissingToken verifies that IncAuthRejectedMissing is called
 // when a request arrives without a token (issue #295).

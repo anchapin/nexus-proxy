@@ -183,13 +183,17 @@ type Collector struct {
 
 	// --- Middleware instrumentation (issue #70) ---------------------------
 	//
-	// Auth counters are labelled by outcome via three separate atomics
-	// rather than a label-keyed map. The label set is fixed at three
-	// values, so three atomics is the simplest lock-free layout and
-	// keeps the hot path to a single add per request.
-	authAccepted        atomic.Uint64
-	authRejectedInvalid atomic.Uint64
-	authRejectedMissing atomic.Uint64
+	// Auth counters are labelled by (outcome, client_ip) via maps of
+	// atomics. The outcome label has three fixed values (accepted,
+	// rejected_invalid, rejected_missing); client_ip is dynamic.
+	// Maps are keyed by clientIP to enable per-IP metric tracking so
+	// operators can distinguish attack sources (issue #1061).
+	// The mutex guards map mutations (adding new IP keys); atomic
+	// operations on existing keys are lock-free.
+	authMu              sync.Mutex
+	authAccepted        map[string]*atomic.Uint64
+	authRejectedInvalid map[string]*atomic.Uint64
+	authRejectedMissing map[string]*atomic.Uint64
 
 	// Auth limiter reaper evictions counter (issue #839). Incremented
 	// each time the reaper goroutine evicts an idle IP from the
@@ -310,18 +314,21 @@ const (
 // RenderPrometheus scrapes from any goroutine.
 func NewCollector() *Collector {
 	c := &Collector{
-		latencyLocal:     NewHistogram(DefaultBuckets),
-		latencyFrontier:  NewHistogram(DefaultBuckets),
-		latencyFusion:    NewHistogram(DefaultBuckets),
-		ttftLocal:        NewHistogram(DefaultBuckets),
-		ttftFrontier:     NewHistogram(DefaultBuckets),
-		ttftFusion:       NewHistogram(DefaultBuckets),
-		stageRAG:         NewHistogram(DefaultBuckets),
-		stagePromptEng:   NewHistogram(DefaultBuckets),
-		stageTOON:        NewHistogram(DefaultBuckets),
-		stageSLM:         NewHistogram(DefaultBuckets),
-		stageUpstream:    NewHistogram(DefaultBuckets),
-		embedderFailures: make(map[string]*atomic.Uint64),
+		latencyLocal:        NewHistogram(DefaultBuckets),
+		latencyFrontier:     NewHistogram(DefaultBuckets),
+		latencyFusion:       NewHistogram(DefaultBuckets),
+		ttftLocal:           NewHistogram(DefaultBuckets),
+		ttftFrontier:        NewHistogram(DefaultBuckets),
+		ttftFusion:          NewHistogram(DefaultBuckets),
+		stageRAG:            NewHistogram(DefaultBuckets),
+		stagePromptEng:      NewHistogram(DefaultBuckets),
+		stageTOON:           NewHistogram(DefaultBuckets),
+		stageSLM:            NewHistogram(DefaultBuckets),
+		stageUpstream:       NewHistogram(DefaultBuckets),
+		embedderFailures:    make(map[string]*atomic.Uint64),
+		authAccepted:        make(map[string]*atomic.Uint64),
+		authRejectedInvalid: make(map[string]*atomic.Uint64),
+		authRejectedMissing: make(map[string]*atomic.Uint64),
 		authBlockedTotal: map[string]*atomic.Uint64{
 			"missing": {},
 			"invalid": {},
@@ -542,16 +549,40 @@ func (c *Collector) LatencyPercentileGauges() []GaugeSample {
 // decision logic (when a request is "accepted" vs "rejected_invalid"
 // etc.); the collector only stores the resulting counts.
 
-// IncAuthAccepted records one accepted authentication request.
-func (c *Collector) IncAuthAccepted() { c.authAccepted.Add(1) }
+// IncAuthAccepted records one accepted authentication request from the
+// given client IP (issue #1061).
+func (c *Collector) IncAuthAccepted(clientIP string) {
+	c.authMu.Lock()
+	if _, ok := c.authAccepted[clientIP]; !ok {
+		c.authAccepted[clientIP] = &atomic.Uint64{}
+	}
+	c.authMu.Unlock()
+	c.authAccepted[clientIP].Add(1)
+}
 
 // IncAuthRejectedInvalid records a request that presented a
-// credential but it did not match any configured key.
-func (c *Collector) IncAuthRejectedInvalid() { c.authRejectedInvalid.Add(1) }
+// credential but it did not match any configured key, from the given
+// client IP (issue #1061).
+func (c *Collector) IncAuthRejectedInvalid(clientIP string) {
+	c.authMu.Lock()
+	if _, ok := c.authRejectedInvalid[clientIP]; !ok {
+		c.authRejectedInvalid[clientIP] = &atomic.Uint64{}
+	}
+	c.authMu.Unlock()
+	c.authRejectedInvalid[clientIP].Add(1)
+}
 
 // IncAuthRejectedMissing records a request that presented no
-// credential at all (no Authorization / X-API-Key header).
-func (c *Collector) IncAuthRejectedMissing() { c.authRejectedMissing.Add(1) }
+// credential at all (no Authorization / X-API-Key header), from the
+// given client IP (issue #1061).
+func (c *Collector) IncAuthRejectedMissing(clientIP string) {
+	c.authMu.Lock()
+	if _, ok := c.authRejectedMissing[clientIP]; !ok {
+		c.authRejectedMissing[clientIP] = &atomic.Uint64{}
+	}
+	c.authMu.Unlock()
+	c.authRejectedMissing[clientIP].Add(1)
+}
 
 // IncAuthReaperEvictions records one reaper eviction of an idle IP
 // from the auth limiter's failures map (issue #839).
@@ -564,15 +595,22 @@ func (c *Collector) IncAuthReaperEvictions() { c.authReaperEvictions.Add(1) }
 func (c *Collector) IncAuthBlocked(reason string) { c.authBlockedTotal[reason].Add(1) }
 
 // AuthAuthenticatedClients returns the cumulative count of accepted
-// authentications. The /metrics renderer exposes it under the gauge
-// name nexus_auth_authenticated_clients so operators can chart a
-// running total of successful auth events without scraping logs.
+// authentications across all client IPs. The /metrics renderer exposes
+// it under the gauge name nexus_auth_authenticated_clients so operators
+// can chart a running total of successful auth events without scraping
+// logs.
 //
 // (The name carries "clients" rather than "events" because the issue
 // spec calls for a gauge by that name; semantically this is a
 // monotonic counter rendered as a gauge family so a single PromQL
 // query shows the long-running trend.)
-func (c *Collector) AuthAuthenticatedClients() uint64 { return c.authAccepted.Load() }
+func (c *Collector) AuthAuthenticatedClients() uint64 {
+	var total uint64
+	for _, v := range c.authAccepted {
+		total += v.Load()
+	}
+	return total
+}
 
 // IncRateLimit bumps the appropriate rate-limit counter for scope
 // (one of "global", "per_client"). The middleware packages own the
