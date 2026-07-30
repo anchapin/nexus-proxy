@@ -308,3 +308,39 @@ func TestConfidenceCleanupDeletesOldRows(t *testing.T) {
 			cleanEveryN+10, got)
 	}
 }
+
+// TestConfidenceTimeBasedCleanup verifies that cleanup runs when window has
+// elapsed since last cleanup, regardless of insert count (issue #1065).
+func TestConfidenceTimeBasedCleanup(t *testing.T) {
+	window := 100 * time.Millisecond
+	cs, err := OpenConfidenceStore(ConfidenceConfig{
+		Path:       ":memory:",
+		MinSamples: 1,
+		Window:     window,
+	})
+	if err != nil {
+		t.Fatalf("OpenConfidenceStore: %v", err)
+	}
+	defer cs.Close()
+
+	// Insert stale rows older than 2*window.
+	old := time.Now().UTC().Add(-3 * window)
+	for i := 0; i < 5; i++ {
+		cs.recordAt("test-time-cleanup", RouteLocal, 3, old)
+	}
+	if got := cs.RowsTotal(); got != 5 {
+		t.Fatalf("setup: expected 5 stale rows, got %d", got)
+	}
+
+	// Advance lastCleanup to the past so the next insert triggers time-based cleanup.
+	cs.lastCleanup = time.Now().Add(-2 * window)
+
+	// Insert a fresh row — this should trigger time-based cleanup and delete the stale rows.
+	cs.RecordOutcome("test-time-cleanup", RouteLocal, 3)
+
+	// Only the fresh row should remain.
+	got := cs.RowsTotal()
+	if got != 1 {
+		t.Errorf("RowsTotal after time-based cleanup = %d, want 1 (stale rows deleted)", got)
+	}
+}

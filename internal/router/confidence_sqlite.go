@@ -73,6 +73,7 @@ type SQLiteConfidenceStore struct {
 	minSamples   int
 	window       time.Duration
 	insertCount  int64
+	lastCleanup  time.Time // wall-clock of last cleanup; enables time-based trigger
 
 	closeOnce sync.Once
 	closeErr  error
@@ -152,6 +153,7 @@ func OpenConfidenceStore(cfg ConfidenceConfig) (*SQLiteConfidenceStore, error) {
 		successScore: cfg.SuccessScore,
 		minSamples:   cfg.MinSamples,
 		window:       cfg.Window,
+		lastCleanup:  time.Now(),
 	}, nil
 }
 
@@ -209,6 +211,12 @@ func (s *SQLiteConfidenceStore) recordAt(category string, route Route, judgeScor
 	count := atomic.AddInt64(&s.insertCount, 1)
 	if count%cleanEveryN == 0 {
 		s.cleanupLocked(ctx)
+	}
+	// Time-based cleanup: if window has elapsed since last cleanup, delete
+	// old rows regardless of insert count, preventing unbounded table growth.
+	if time.Since(s.lastCleanup) > s.window {
+		s.cleanupLocked(ctx)
+		s.lastCleanup = time.Now()
 	}
 
 	return nil
