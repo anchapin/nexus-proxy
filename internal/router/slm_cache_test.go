@@ -1284,13 +1284,13 @@ func TestSLMCache_SetMaxStale(t *testing.T) {
 	c.SetMaxStale(100) // must not panic
 }
 
+// --- Stale cleanup threshold on Get (issue #1037) ---
+
 func TestSLMCache_SetStaleCleanupThreshold_NilSafe(t *testing.T) {
 	// SetStaleCleanupThreshold must not panic on a nil *SLMCache.
 	var c *SLMCache
 	c.SetStaleCleanupThreshold(10) // must not panic
 }
-
-// --- Stale cleanup threshold on Get (issue #1037) ---
 
 func TestSLMCache_StaleCleanup_GetTriggeredEviction(t *testing.T) {
 	// With staleCleanupThreshold=1, Get must trigger EvictExpired when
@@ -1396,6 +1396,41 @@ func TestSLMCache_StaleCleanup_GetHitPath(t *testing.T) {
 
 	if stale := c.Stale(); stale != 0 {
 		t.Errorf("Stale after Get miss with threshold=1 = %d, want 0", stale)
+	}
+}
+
+// TestSLMCache_StaleCounter_Atomic verifies the atomic staleCount is
+// correctly maintained (issue #1034). staleCount is incremented on Set
+// and decremented on EvictExpired. The counter is used by getSemantic
+// to decide whether to spawn proactive eviction without an O(n) scan.
+func TestSLMCache_StaleCounter_Atomic(t *testing.T) {
+	c := NewSLMCache(50*time.Millisecond, 0)
+	ctx := context.Background()
+
+	c.Set(ctx, "a", RouteLocal)
+	c.Set(ctx, "b", RouteLocal)
+	c.Set(ctx, "c", RouteLocal)
+
+	c.SetMaxStale(1)
+
+	time.Sleep(120 * time.Millisecond)
+
+	if stale := c.Stale(); stale != 3 {
+		t.Fatalf("Stale = %d before eviction, want 3", stale)
+	}
+
+	if stale := c.staleCount.Load(); stale != 3 {
+		t.Fatalf("staleCount = %d before eviction, want 3", stale)
+	}
+
+	c.EvictExpired()
+
+	if stale := c.Stale(); stale != 0 {
+		t.Errorf("Stale after eviction = %d, want 0", stale)
+	}
+
+	if stale := c.staleCount.Load(); stale != 0 {
+		t.Errorf("staleCount after eviction = %d, want 0", stale)
 	}
 }
 
