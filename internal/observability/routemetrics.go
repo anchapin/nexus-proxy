@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -88,6 +89,19 @@ type counterKey struct {
 	confBucket string
 	taskType   string
 }
+
+// handlerPanicEntry holds a panic counter keyed by normalized route label
+// (issue #1053). The normalizedLabel is the bounded Prometheus label value;
+// template is the original mux route pattern for debugging.
+type handlerPanicEntry struct {
+	template string // original mux route pattern
+	counter  *uint64
+}
+
+// wildcardSegmentRE matches mux wildcard segments like {id} or {name}.
+// Used by normalizeRouteLabel to collapse unbounded wildcard routes into
+// a bounded label value (issue #1053).
+var wildcardSegmentRE = regexp.MustCompile(`\{[^}]+\}`)
 
 // RouteCounters is a concurrency-safe collection of route-decision
 // counters. The zero value is NOT safe to use directly because Go
@@ -183,10 +197,11 @@ type RouteCounters struct {
 	// volume spikes without enabling full debug tracing.
 	promptInjectionHits map[string]*uint64
 
-	// Handler-path panic counter (issue #480). Bumped when the
+	// Handler-path panic counter (issue #480, #1053). Bumped when the
 	// Recover middleware catches a panic in the request hot path.
-	// Labelled by mux route template to bound cardinality.
-	handlerPanics map[string]*uint64
+	// Labelled by normalized route to bound cardinality; the original
+	// template is preserved in path_template for debugging.
+	handlerPanics map[string]*handlerPanicEntry
 
 	// localCooldownTriggers counts how many times the local-route
 	// cooldown was armed (issue #530). Protected by sync.Mutex like
@@ -238,7 +253,7 @@ func NewRouteCounters() *RouteCounters {
 		arbiterCache:             make(map[string]*uint64),
 		arbiterCacheEvictions:    make(map[string]*uint64),
 		slmEscalations:           make(map[string]*uint64),
-		handlerPanics:            make(map[string]*uint64),
+		handlerPanics:            make(map[string]*handlerPanicEntry),
 		ragCacheHits:             &cHits,
 		ragCacheMisses:           &cMisses,
 		promptInjectionHits:      make(map[string]*uint64),
@@ -673,29 +688,43 @@ func (rc *RouteCounters) promptInjectionSlot(mode string) *uint64 {
 	return p
 }
 
-// ObserveHandlerPanic records one handler-path panic recovery (issue #480).
-// path is the mux route template (not the raw URL) to keep label cardinality
-// bounded. Safe for concurrent use; nil receivers are a no-op so the Recover
+// ObserveHandlerPanic records one handler-path panic recovery (issue #480,
+// #1053). path is the mux route template (not the raw URL). Wildcard
+// segments like {id} are normalized to "xxx" to bound label cardinality.
+// The original template is preserved under path_template for debugging.
+// Safe for concurrent use; nil receivers are a no-op so the Recover
 // middleware can invoke it unconditionally.
 func (rc *RouteCounters) ObserveHandlerPanic(path string) {
 	if rc == nil || path == "" {
 		return
 	}
-	atomic.AddUint64(rc.handlerPanicSlot(path), 1)
+	normalized := normalizeRouteLabel(path)
+	atomic.AddUint64(rc.handlerPanicSlot(normalized, path), 1)
 }
 
-// handlerPanicSlot returns the *uint64 for the given route template, creating
-// it if absent. Same lock-then-atomic pattern as reasonSlot.
-func (rc *RouteCounters) handlerPanicSlot(path string) *uint64 {
+// handlerPanicSlot returns the *uint64 for the given normalized route label,
+// creating it if absent. The original template is stored for the
+// path_template attribute. Same lock-then-atomic pattern as reasonSlot.
+func (rc *RouteCounters) handlerPanicSlot(normalized, template string) *uint64 {
 	rc.mu.Lock()
-	p, ok := rc.handlerPanics[path]
+	entry, ok := rc.handlerPanics[normalized]
 	if !ok {
 		v := uint64(0)
-		p = &v
-		rc.handlerPanics[path] = p
+		entry = &handlerPanicEntry{
+			template: template,
+			counter:  &v,
+		}
+		rc.handlerPanics[normalized] = entry
 	}
 	rc.mu.Unlock()
-	return p
+	return entry.counter
+}
+
+// normalizeRouteLabel replaces mux wildcard segments (e.g., {id}) with a
+// constant "xxx" to bound the Prometheus label cardinality (issue #1053).
+// Fixed paths are returned unchanged.
+func normalizeRouteLabel(path string) string {
+	return wildcardSegmentRE.ReplaceAllString(path, "xxx")
 }
 
 // reasonSlot returns the *uint64 for reason, creating it if absent.
@@ -1017,9 +1046,7 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += n
 	}
-	if n, err := writeStringKeySeries(w, "nexus_handler_panics_total",
-		"Handler-path panic recoveries by mux route template (issue #480).",
-		"path", rc.handlerPanics); err != nil {
+	if n, err := writeHandlerPanicsSeries(w, rc.handlerPanics); err != nil {
 		return total, err
 	} else {
 		total += n
@@ -1375,6 +1402,39 @@ func writeLabelledSeries(w io.Writer, name, help, label string, m map[string]*ui
 	for _, k := range keys {
 		v := atomic.LoadUint64(m[k])
 		n, err := fmt.Fprintf(w, "%s{%s=%q} %d\n", name, label, sanitizeLabel(k), v)
+		if err != nil {
+			return total + int64(n), err
+		}
+		total += int64(n)
+	}
+	return total, nil
+}
+
+// writeHandlerPanicsSeries emits the nexus_handler_panics_total counter
+// family (issue #480, #1053). Each entry has two labels: "path" (the
+// normalized bounded label, with wildcards replaced by "xxx") and
+// "path_template" (the original mux route pattern for debugging).
+// Output is sorted by normalized path for deterministic scrape diffs.
+func writeHandlerPanicsSeries(w io.Writer, m map[string]*handlerPanicEntry) (int64, error) {
+	var total int64
+	n, err := fmt.Fprintf(w, "# HELP nexus_handler_panics_total Handler-path panic recoveries by mux route template (issues #480, #1053).\n# TYPE nexus_handler_panics_total counter\n")
+	if err != nil {
+		return total + int64(n), err
+	}
+	total += int64(n)
+	if len(m) == 0 {
+		return total, nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		entry := m[k]
+		v := atomic.LoadUint64(entry.counter)
+		n, err := fmt.Fprintf(w, "nexus_handler_panics_total{path=%q,path_template=%q} %d\n",
+			sanitizeLabel(k), sanitizeLabel(entry.template), v)
 		if err != nil {
 			return total + int64(n), err
 		}
