@@ -767,6 +767,16 @@ func main() {
 				{Name: "nexus_quality_concurrency", Value: float64(cc)},
 			}
 		}),
+		// Quality dropped ring capacity gauge (issue #1066).
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var rc int
+			if verifier != nil {
+				rc = verifier.DroppedRingCapacity()
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_quality_dropped_ring_capacity", Value: float64(rc)},
+			}
+		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
 			var v uint64
 			if ms, ok := metricsStore.(*metrics.SQLiteStore); ok {

@@ -335,7 +335,7 @@ type Config struct {
 	QualityQueueDepth      int           // buffered channel size (default 64)
 	QualityTimeout         time.Duration // per-check timeout (default 60s)
 	QualityStderrCap       int           // stderr bytes retained per verdict (default 2 KiB)
-	QualityDroppedRingSize int           // ring buffer capacity for dropped events (default 16)
+	QualityDroppedRingSize int           // ring buffer capacity for dropped events (default 256)
 
 	// Middleware prompts
 	MetaPrompt   string // appended to system prompt by prompt_engine
@@ -1435,7 +1435,7 @@ func Load() (Config, error) {
 		slog.Warn("NEXUS_QUALITY_DROPED_RING_SIZE is deprecated; use NEXUS_QUALITY_DROPPED_RING_SIZE",
 			slog.String("component", "config"))
 	}
-	droppedRingSize, err := getEnvInt("NEXUS_QUALITY_DROPPED_RING_SIZE", 16)
+	droppedRingSize, err := getEnvInt("NEXUS_QUALITY_DROPPED_RING_SIZE", 256)
 	if err != nil {
 		return cfg, err
 	}

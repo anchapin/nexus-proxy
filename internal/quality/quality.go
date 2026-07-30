@@ -125,7 +125,7 @@ type Config struct {
 	Timeout         time.Duration // per-check timeout (default 60s)
 	StderrCap       int           // stderr bytes retained per verdict (default 2 KiB)
 	Observer        Observer      // required at runtime; nil is replaced with a no-op
-	DroppedRingSize int           // ring buffer capacity for dropped events (default 16)
+	DroppedRingSize int           // ring buffer capacity for dropped events (default 256)
 	// Now is overridable for tests. Real callers leave it nil and the
 	// verifier uses time.Now.
 	Now func() time.Time
@@ -151,7 +151,7 @@ func (c *Config) applyDefaults() {
 		c.Now = time.Now
 	}
 	if c.DroppedRingSize <= 0 {
-		c.DroppedRingSize = 16
+		c.DroppedRingSize = 256
 	}
 }
 
@@ -173,6 +173,9 @@ type Verifier interface {
 	Dropped() uint64
 	// DroppedEvents returns the most recently dropped events.
 	DroppedEvents() []Event
+	// DroppedRingCapacity returns the maximum number of dropped events
+	// retained in the ring buffer for inspection.
+	DroppedRingCapacity() int
 	// Close drains the queue and stops the worker pool.
 	Close() error
 }
@@ -314,6 +317,15 @@ func (v *ShellVerifier) DroppedEvents() []Event {
 		return nil
 	}
 	return v.droppedRing.Events()
+}
+
+// DroppedRingCapacity returns the maximum number of dropped events
+// retained in the ring buffer for inspection.
+func (v *ShellVerifier) DroppedRingCapacity() int {
+	if v == nil {
+		return 0
+	}
+	return v.droppedRing.size
 }
 
 // Submit enqueues e for asynchronous verification. It is the non-
