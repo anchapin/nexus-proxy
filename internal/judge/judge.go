@@ -567,23 +567,56 @@ type noopStorage struct{}
 func (noopStorage) Record(JudgeScore) error { return nil }
 func (noopStorage) Close() error            { return nil }
 
+// cleanEveryN is the interval (in inserts) between stale-entry cleanup
+// passes. Every cleanEveryN inserts, entries older than 2*window are deleted
+// to keep memory bounded regardless of the sliding window size.
+const cleanEveryN = 1000
+
 // MemoryStorage is a thread-safe in-memory Storage for development
 // and tests. Production code uses a SQLite-backed implementation
 // (issue #16); the interface is identical so swapping is trivial.
 type MemoryStorage struct {
-	mu     sync.Mutex
-	scores []JudgeScore
+	mu          sync.Mutex
+	window      time.Duration
+	insertCount int64
+	scores      []JudgeScore
 }
 
-// NewMemoryStorage returns an empty in-memory store.
-func NewMemoryStorage() *MemoryStorage { return &MemoryStorage{} }
+// NewMemoryStorage returns an empty in-memory store. window is the TTL;
+// entries older than 2*window are pruned every cleanEveryN inserts. A zero
+// window disables pruning (matching the pre-issue-#1063 behaviour).
+func NewMemoryStorage(window time.Duration) *MemoryStorage {
+	return &MemoryStorage{window: window}
+}
 
 // Record appends s to the in-memory log.
 func (m *MemoryStorage) Record(s JudgeScore) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if s.Timestamp.IsZero() {
+		s.Timestamp = time.Now().UTC()
+	}
 	m.scores = append(m.scores, s)
+	if m.window > 0 {
+		m.insertCount++
+		if m.insertCount%cleanEveryN == 0 {
+			m.cleanupLocked()
+		}
+	}
 	return nil
+}
+
+// cleanupLocked deletes entries older than 2*window. Caller must hold m.mu.
+func (m *MemoryStorage) cleanupLocked() {
+	cutoff := time.Now().UTC().Add(-2 * m.window)
+	j := 0
+	for _, s := range m.scores {
+		if !s.Timestamp.Before(cutoff) {
+			m.scores[j] = s
+			j++
+		}
+	}
+	m.scores = m.scores[:j]
 }
 
 // Scores returns a copy of the recorded scores in insertion order.
@@ -592,6 +625,20 @@ func (m *MemoryStorage) Scores() []JudgeScore {
 	defer m.mu.Unlock()
 	out := make([]JudgeScore, len(m.scores))
 	copy(out, m.scores)
+	return out
+}
+
+// ScoresSince returns all scores with Timestamp >= t. Exists for testing
+// and monitoring purposes; it is not part of the Storage interface.
+func (m *MemoryStorage) ScoresSince(t time.Time) []JudgeScore {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]JudgeScore, 0, len(m.scores))
+	for _, s := range m.scores {
+		if !s.Timestamp.Before(t) {
+			out = append(out, s)
+		}
+	}
 	return out
 }
 
