@@ -161,6 +161,9 @@ func (c *Config) applyDefaults() {
 	if c.MaxIdleConnsPerHost <= 0 {
 		c.MaxIdleConnsPerHost = DefaultMaxIdleConnsPerHost
 	}
+	if c.MaxConnsPerHost <= 0 {
+		c.MaxConnsPerHost = DefaultMaxConnsPerHost
+	}
 	if c.IdleConnTimeout <= 0 {
 		c.IdleConnTimeout = DefaultIdleConnTimeout
 	}
@@ -175,7 +178,7 @@ func (c *Config) applyDefaults() {
 func loadConfigFromEnv() Config {
 	return Config{
 		MaxIdleConnsPerHost:   parseEnvInt("NEXUS_HTTP_MAX_IDLE_CONNS_PER_HOST", DefaultMaxIdleConnsPerHost),
-		MaxConnsPerHost:       parseEnvInt("NEXUS_HTTP_MAX_CONNS_PER_HOST", 0),
+		MaxConnsPerHost:       parseEnvInt("NEXUS_HTTP_MAX_CONNS_PER_HOST", DefaultMaxConnsPerHost),
 		IdleConnTimeout:       parseEnvDuration("NEXUS_HTTP_IDLE_CONN_TIMEOUT", DefaultIdleConnTimeout),
 		DialContextTimeout:    parseEnvDuration("NEXUS_HTTP_DIAL_CONTEXT_TIMEOUT", DefaultDialContextTimeout),
 		ResponseHeaderTimeout: parseEnvDuration("NEXUS_HTTP_RESPONSE_HEADER_TIMEOUT", DefaultResponseHeaderTimeout),
@@ -206,6 +209,7 @@ func parseEnvDuration(key string, def time.Duration) time.Duration {
 // Default values for Config knobs.
 const (
 	DefaultMaxIdleConnsPerHost   = 100
+	DefaultMaxConnsPerHost       = 200 // 2× MaxIdleConnsPerHost; bounds concurrent connections per host
 	DefaultIdleConnTimeout       = 90 * time.Second
 	DefaultDialContextTimeout    = 30 * time.Second
 	DefaultResponseHeaderTimeout = 30 * time.Second
