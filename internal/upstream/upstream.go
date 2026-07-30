@@ -40,6 +40,17 @@ func IncPanelPanics() { panelPanicsTotal.Add(1) }
 // PanelPanicsTotal returns the cumulative panel panic count.
 func PanelPanicsTotal() uint64 { return panelPanicsTotal.Load() }
 
+// fusionClientAbortTotal counts client aborts during fusion streaming
+// (issue #1046). Exposed via FusionClientAbortTotal for the /metrics endpoint.
+var fusionClientAbortTotal atomic.Uint64
+
+// IncFusionClientAbort increments the fusion client abort counter. Called
+// when IsClientAbort(err) is true during speculative or arbiter synthesis streaming.
+func IncFusionClientAbort() { fusionClientAbortTotal.Add(1) }
+
+// FusionClientAbortTotal returns the cumulative fusion client abort count.
+func FusionClientAbortTotal() uint64 { return fusionClientAbortTotal.Load() }
+
 // IsClientAbort reports whether err is a client-side connection error
 // (EPIPE, ECONNRESET, broken pipe) that indicates the client disconnected
 // mid-response. These are logged at info level rather than error level.
@@ -1043,6 +1054,7 @@ func PanelStreaming(
 			// nobody to receive its output. Log at info level so
 			// operators can distinguish "client dropped" from "slow
 			// arbiter" in the access log (issue #167).
+			IncFusionClientAbort()
 			slog.Info("fusion speculative write: client aborted",
 				slog.String("source", outcome.Source),
 			)
@@ -1178,6 +1190,10 @@ func PanelStreaming(
 			)
 			outcome.ArbiterCacheHit = true
 			if err := streamCachedArbiterSynthesis(w, cached); err != nil {
+				if errors.Is(err, ErrClientAbort) {
+					IncFusionClientAbort()
+					return outcome, nil
+				}
 				return outcome, err
 			}
 			return outcome, nil
@@ -1196,6 +1212,10 @@ func PanelStreaming(
 	// behavior where the arbiter's SSE is passed through directly. Caching
 	// synthesis content is only useful for the non-streaming Panel path.
 	if err := StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody); err != nil {
+		if IsClientAbort(err) {
+			IncFusionClientAbort()
+			return outcome, nil
+		}
 		return outcome, fmt.Errorf("fusion: arbiter stream: %w", err)
 	}
 	// Cancel the slow member's goroutine — its result was already consumed

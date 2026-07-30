@@ -2034,6 +2034,54 @@ func TestPanelStreamingClientAbortSkipsArbiter(t *testing.T) {
 	_ = outcome // outcome.Similarity is 0 since we never reached agreement check
 }
 
+// TestFusionClientAbortTotalIncrementsSpeculative verifies that
+// FusionClientAbortTotal is incremented when the client aborts during
+// speculative SSE streaming (issue #1046).
+func TestFusionClientAbortTotalIncrementsSpeculative(t *testing.T) {
+	initial := FusionClientAbortTotal()
+	localURL := "http://local.local/v1/chat/completions"
+	frontierURL := "http://frontier.local"
+	arbiterURL := "http://arbiter.local/v1/chat/completions"
+	ft := newFakeTransport()
+	ft.on(localURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local answer"}}]}`)
+	})
+	ft.on(frontierURL, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier answer"}}]}`)
+	})
+	var arbiterCalled int
+	ft.on(arbiterURL, func(w http.ResponseWriter, _ *http.Request) {
+		arbiterCalled++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "data: {\"synth\":\"arbiter-out\"}\n\n")
+	})
+	client := &http.Client{Transport: ft}
+	rw := newBrokenPipeRW()
+	_, err := PanelStreaming(
+		context.Background(), rw, client,
+		"http://local.local", "local-m",
+		frontierURL, "", "frontier-m",
+		arbiterURL, "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		5*time.Second, 5*time.Second,
+		false, 0.85, "test-request",
+		nil, 0*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("PanelStreaming: got error %v, want nil (client abort)", err)
+	}
+	if arbiterCalled != 0 {
+		t.Errorf("arbiter called %d times, want 0", arbiterCalled)
+	}
+	if got := FusionClientAbortTotal(); got != initial+1 {
+		t.Errorf("FusionClientAbortTotal = %d, want %d (incremented after speculative client abort)", got, initial+1)
+	}
+}
+
 // TestIsClientAbort verifies the IsClientAbort helper correctly identifies
 // EPIPE, ECONNRESET, and ErrClientAbort.
 func TestIsClientAbort(t *testing.T) {

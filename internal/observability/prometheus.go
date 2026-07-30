@@ -395,6 +395,11 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	writeCounter(w, "nexus_panel_panics_total",
 		"Total recovered panics in panel goroutines (issue #309).", upstream.PanelPanicsTotal())
 
+	// Fusion client abort counter (issue #1046). Tracks client disconnects
+	// during fusion speculative streaming and arbiter synthesis streaming.
+	writeCounter(w, "nexus_fusion_client_abort_total",
+		"Total client aborts during fusion speculative streaming and arbiter synthesis streaming (issue #1046).", upstream.FusionClientAbortTotal())
+
 	// Auth gauge: cumulative accepted authentications. The metric name
 	// carries "_clients" per the issue spec; semantically this is a
 	// monotonic counter that operators usually want charted as a
