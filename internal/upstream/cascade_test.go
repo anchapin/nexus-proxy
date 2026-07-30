@@ -79,6 +79,7 @@ func (f *fakeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	f.mu.Unlock()
 	rec := httptest.NewRecorder()
+	rec.Header().Set("Content-Type", "application/json")
 	h(rec, req)
 	return rec.Result(), nil
 }
