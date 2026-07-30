@@ -555,6 +555,9 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 						slog.String("filename", fi.name),
 						slog.Any("err", err),
 					)
+					p.mu.Lock()
+					p.index = nil
+					p.mu.Unlock()
 					continue
 				}
 				slog.Info("rag indexed", slog.String("filename", fi.name))
