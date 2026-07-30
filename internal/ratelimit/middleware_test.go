@@ -687,7 +687,7 @@ func TestMiddleware_Enabled_NilSafe(t *testing.T) {
 }
 
 // TestMiddleware_APIKeyAwareKeyFunc_Hashed verifies that APIKeyAwareKeyFunc
-// returns a SHA256 hash truncated to 8 hex chars and that different API keys
+// returns a SHA256 hash truncated to 16 hex chars and that different API keys
 // behind the same IP produce different bucket keys (issue #776).
 func TestMiddleware_APIKeyAwareKeyFunc_Hashed(t *testing.T) {
 	ip := "10.0.0.1"
@@ -704,8 +704,8 @@ func TestMiddleware_APIKeyAwareKeyFunc_Hashed(t *testing.T) {
 	if key1 == "" || key2 == "" {
 		t.Fatal("APIKeyAwareKeyFunc returned empty string")
 	}
-	if len(key1) != 8 || len(key2) != 8 {
-		t.Errorf("expected 8-char hex key, got key1=%q (%d chars), key2=%q (%d chars)", key1, len(key1), key2, len(key2))
+	if len(key1) != 16 || len(key2) != 16 {
+		t.Errorf("expected 16-char hex key, got key1=%q (%d chars), key2=%q (%d chars)", key1, len(key1), key2, len(key2))
 	}
 	if key1 == key2 {
 		t.Errorf("different API keys should produce different bucket keys: key1=%q, key2=%q", key1, key2)

@@ -147,17 +147,17 @@ func (m *Middleware) SetAllowHook(fn func(bucketID string, utilizationPct float6
 	m.onAllow = fn
 }
 
-// hashedBucketKey returns a SHA256 hash of input truncated to 8 hex characters,
+// hashedBucketKey returns a SHA256 hash of input truncated to 16 hex characters,
 // suitable for use as a high-cardinality-safe bucket identifier in
 // telemetry labels.
 func hashedBucketKey(v string) string {
 	h := sha256.Sum256([]byte(v))
-	return hex.EncodeToString(h[:4])
+	return hex.EncodeToString(h[:8])
 }
 
 // APIKeyAwareKeyFunc returns a key-fn that composes the resolved client
 // IP with the Bearer API key from the Authorization header, producing
-// SHA256(IP + ":" + APIKey) truncated to 8 hex chars. When no Authorization
+// SHA256(IP + ":" + APIKey) truncated to 16 hex chars. When no Authorization
 // header is present the key falls back to IP-only so unauthenticated
 // requests are still bucketed by IP (the auth middleware runs before the
 // rate limiter so this is only hit in health-check / metrics paths).
@@ -181,7 +181,7 @@ func APIKeyAwareKeyFunc(ip string, r *http.Request) string {
 		key = auth
 	}
 	h := sha256.Sum256([]byte(ip + ":" + key))
-	return hex.EncodeToString(h[:4])
+	return hex.EncodeToString(h[:8])
 }
 
 // Wrap returns an http.Handler that applies the rate limit before
