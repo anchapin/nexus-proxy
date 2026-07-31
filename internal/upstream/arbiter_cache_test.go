@@ -450,6 +450,46 @@ func TestArbiterCacheEvictionObserver_NilSafe(t *testing.T) {
 	}
 }
 
+func TestArbiterCacheTouchDoesNotAppendOrphanedLRUEntry(t *testing.T) {
+	cache := NewArbiterCache(time.Hour, 3)
+	ttl := time.Hour
+
+	cache.Set("a", "b", "v1", ttl)
+	cache.Set("c", "d", "v2", ttl)
+
+	cache.mu.Lock()
+	lruLenBefore := len(cache.lru)
+	key := cacheKey("a", "b")
+	delete(cache.items, key)
+	cache.touch(key)
+	lruLenAfter := len(cache.lru)
+	cache.mu.Unlock()
+
+	if lruLenAfter != lruLenBefore {
+		t.Errorf("lru len after touch on orphaned key = %d, want %d (unchanged)",
+			lruLenAfter, lruLenBefore)
+	}
+}
+
+func TestArbiterCacheTouchSkipsKeyNotInItems(t *testing.T) {
+	cache := NewArbiterCache(time.Hour, 3)
+	ttl := time.Hour
+
+	cache.Set("a", "b", "v1", ttl)
+
+	cache.mu.Lock()
+	lruLenBefore := len(cache.lru)
+	key := cacheKey("nonexistent", "pair")
+	cache.touch(key)
+	lruLenAfter := len(cache.lru)
+	cache.mu.Unlock()
+
+	if lruLenAfter != lruLenBefore {
+		t.Errorf("lru len after touch on nonexistent key = %d, want %d (no change)",
+			lruLenAfter, lruLenBefore)
+	}
+}
+
 func TestArbiterCacheDeleteRemovesFromLRU(t *testing.T) {
 	cache := NewArbiterCache(time.Hour, 3)
 	ttl := time.Hour

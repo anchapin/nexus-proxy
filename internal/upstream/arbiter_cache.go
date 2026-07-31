@@ -117,6 +117,9 @@ func canonicalize(h1, h2 *[32]byte) [64]byte {
 // touch moves the given key to the end of the LRU list (most recently used).
 // Caller must hold c.mu.
 func (c *ArbiterCache) touch(key [32]byte) {
+	if _, exists := c.items[key]; !exists {
+		return
+	}
 	for i, k := range c.lru {
 		if k == key {
 			c.lru = append(c.lru[:i], c.lru[i+1:]...)
