@@ -345,7 +345,11 @@ hot-reloadable var will fail the test.
 ## Branch conventions
 
 - **`develop`** is the default branch — base for all feature/fix branches
-- **`main`** — only as PR target from `develop` for releases
+- **`main`** — **release-only branch**. Changes land on `main` **only** via a
+  PR merged from `develop` after all CI checks pass and at least one approving
+  review. Direct pushes to `main` are blocked by branch protection (enforce_admins,
+  require_code_owner_reviews, required_status_checks). Never commit directly to
+  `main` — treat it as a read-only release artifact.
 - Naming: `fix/issue-<number>` or `feat/<short-description>`
 - **Conventional Commits:** `feat:`, `fix:`, `docs:`, etc. Reference the
   issue in the subject (e.g. `feat: resolve #123 — …`)
@@ -389,7 +393,7 @@ Key knobs not covered elsewhere (verify defaults in `.env.example`):
 - **`NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT`** (default 5s): max waiter time for concurrent in-flight Embeds; 0 = wait indefinitely (issue #800).
 - **`NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD`** (default 3): consecutive embed failures before RAG circuit trips.
 - **`NEXUS_ARBITER_CACHE_MAX_ENTRIES`** (default 512): LRU cap for arbiter synthesis cache.
-- **`NEXUS_READINESS_MODE`** (`degraded`|`strict`): `/readyz` returns 503 in `strict` mode when Ollama is down.
+- **`NEXUS_READINESS_MODE`** (`degraded`|`strict`): `/readyz` returns 503 in `strict` mode when Ollama is degraded or down.
 
 ## `nexus check` exit codes
 
