@@ -42,6 +42,8 @@ type Exporter struct {
 
 	sampler Sampler
 
+	batchCap int
+
 	queue chan *Span
 
 	wg     sync.WaitGroup
@@ -50,6 +52,19 @@ type Exporter struct {
 	// full. Useful for /metrics gauges and tests that assert
 	// non-blocking behaviour under back-pressure.
 	dropped atomic.Uint64
+	// flushFailures is the count of batches that failed to POST to
+	// the collector (4xx/5xx, timeout, connection error). Each
+	// failure drops up to e.batchCap spans, so this is a per-batch
+	// counter — distinct from dropped, which counts per-span
+	// buffer-full sheds at Submit-time. Surfaced as
+	// nexus_tracing_flush_failures_total so operators can alert on
+	// silent trace loss that dropped does not capture (issue #484).
+	flushFailures atomic.Uint64
+
+	// Retry parameters for OTLP POST retries with exponential backoff.
+	maxRetries     int
+	retryBaseDelay time.Duration
+	maxRetryDelay  time.Duration
 }
 
 // ExporterConfig is the input to NewExporter.
@@ -78,16 +93,47 @@ type ExporterConfig struct {
 	// to AlwaysSample. The probability sampler hashes the trace
 	// id so the decision is deterministic across processes.
 	Sampler Sampler
+
+	// MaxRetries is the maximum number of retry attempts after
+	// the initial POST fails with a 5xx status. A value <= 0
+	// falls back to defaultMaxRetries.
+	MaxRetries int
+
+	// RetryBaseDelay is the initial back-off delay between
+	// retries. The actual delay follows exponential growth:
+	// base * 2^(attempt-1). A value <= 0 falls back to
+	// defaultRetryBaseDelay.
+	RetryBaseDelay time.Duration
+
+	// MaxRetryDelay caps the exponential back-off ceiling so
+	// retries do not exceed a reasonable interval even with
+	// many failures. A value <= 0 falls back to
+	// defaultMaxRetryDelay.
+	MaxRetryDelay time.Duration
+
+	// BatchSize bounds the in-memory batch size — once reached
+	// the consumer flushes before draining more spans. Keeps the
+	// worst-case body size predictable. A value <= 0 falls back
+	// to defaultBatchCap. Operators with high-throughput/low-
+	// latency collectors may want larger batches to reduce HTTP
+	// overhead; operators with high-latency collectors may prefer
+	// smaller batches to reduce per-batch loss exposure.
+	BatchSize int
 }
 
 const (
 	defaultExporterQueue   = 256
 	defaultExporterTimeout = 10 * time.Second
-	// batchCap bounds the in-memory batch size — once reached
-	// the consumer flushes before draining more spans. Keeps the
-	// worst-case body size predictable (256 spans × ~500 B ≈
-	// 128 KB, well within OTLP collector defaults).
-	batchCap = 64
+	// defaultBatchCap is the fallback batch size when BatchSize
+	// is not configured or is <= 0.
+	defaultBatchCap = 64
+)
+
+// Default retry constants for OTLP POST retries with exponential backoff.
+const (
+	defaultMaxRetries     = 3 // retry attempts after the initial attempt
+	defaultRetryBaseDelay = 100 * time.Millisecond
+	defaultMaxRetryDelay  = 2 * time.Second
 )
 
 // NewExporter starts the background POST loop and returns a ready
@@ -119,12 +165,32 @@ func NewExporter(cfg ExporterConfig) *Exporter {
 	if sampler == nil {
 		sampler = AlwaysSample{}
 	}
+	maxRetries := cfg.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = defaultMaxRetries
+	}
+	retryBaseDelay := cfg.RetryBaseDelay
+	if retryBaseDelay <= 0 {
+		retryBaseDelay = defaultRetryBaseDelay
+	}
+	maxRetryDelay := cfg.MaxRetryDelay
+	if maxRetryDelay <= 0 {
+		maxRetryDelay = defaultMaxRetryDelay
+	}
+	batchCap := cfg.BatchSize
+	if batchCap <= 0 {
+		batchCap = defaultBatchCap
+	}
 	e := &Exporter{
-		endpoint: cfg.Endpoint,
-		client:   client,
-		timeout:  cfg.Timeout,
-		sampler:  sampler,
-		queue:    make(chan *Span, cfg.QueueSize),
+		endpoint:       cfg.Endpoint,
+		client:         client,
+		timeout:        cfg.Timeout,
+		sampler:        sampler,
+		batchCap:       batchCap,
+		queue:          make(chan *Span, cfg.QueueSize),
+		maxRetries:     maxRetries,
+		retryBaseDelay: retryBaseDelay,
+		maxRetryDelay:  maxRetryDelay,
 	}
 	e.wg.Add(1)
 	go e.run()
@@ -149,6 +215,20 @@ func (e *Exporter) Dropped() uint64 {
 	return e.dropped.Load()
 }
 
+// FlushFailures returns the cumulative count of batches that failed
+// to POST to the collector (HTTP 4xx/5xx, timeout, or transport
+// error). Each failure silently drops up to e.batchCap spans, so this
+// counter is the operator-visible signal for trace loss that Dropped
+// does not capture — Dropped only counts per-span buffer-full sheds
+// at Submit-time. Surfaced as nexus_tracing_flush_failures_total
+// (issue #484).
+func (e *Exporter) FlushFailures() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.flushFailures.Load()
+}
+
 // QueueDepth returns the current number of spans waiting in the export
 // queue. Useful for /metrics gauges to observe back-pressure.
 func (e *Exporter) QueueDepth() int {
@@ -156,6 +236,15 @@ func (e *Exporter) QueueDepth() int {
 		return 0
 	}
 	return len(e.queue)
+}
+
+// BatchCap returns the configured batch size cap. Useful for /metrics
+// gauges so operators can see what batch size is configured.
+func (e *Exporter) BatchCap() int {
+	if e == nil {
+		return 0
+	}
+	return e.batchCap
 }
 
 // Submit enqueues s for asynchronous POST. The call never blocks:
@@ -193,6 +282,15 @@ func (e *Exporter) StartSpan(parent Context, name string) (Context, *Span) {
 		ctx.TraceID = NewTraceID()
 	}
 	sid := NewSpanID()
+	if e == nil || e.endpoint == "" || !e.sampler.ShouldSample(ctx.TraceID) {
+		return ctx.WithSpanID(sid), &Span{
+			TraceID:      ctx.TraceID,
+			SpanID:       sid,
+			ParentSpanID: parent.SpanID,
+			Name:         name,
+			ended:        true,
+		}
+	}
 	s := &Span{
 		TraceID:      ctx.TraceID,
 		SpanID:       sid,
@@ -201,9 +299,7 @@ func (e *Exporter) StartSpan(parent Context, name string) (Context, *Span) {
 		StartTime:    time.Now(),
 		Attributes:   make(map[string]any, 4),
 		Status:       StatusUnset,
-	}
-	if e != nil && e.endpoint != "" && e.sampler.ShouldSample(ctx.TraceID) {
-		s.exporter = e
+		exporter:     e,
 	}
 	return ctx.WithSpanID(sid), s
 }
@@ -228,19 +324,20 @@ func (e *Exporter) Close() error {
 }
 
 // run is the background consumer. It batches queued spans and
-// flushes when the batch reaches batchCap OR when the channel
+// flushes when the batch reaches e.batchCap OR when the channel
 // closes (final drain on shutdown). Batches that fail to POST log a
 // warning but are otherwise dropped — the spec mandates
 // non-blocking semantics on the request path, so the export loop
 // must never queue unbounded retries.
 func (e *Exporter) run() {
 	defer e.wg.Done()
-	batch := make([]*Span, 0, batchCap)
+	batch := make([]*Span, 0, e.batchCap)
 	flush := func() {
 		if len(batch) == 0 {
 			return
 		}
 		if err := e.flush(batch); err != nil {
+			e.flushFailures.Add(1)
 			slog.Warn("tracing flush failed",
 				slog.String("endpoint", e.endpoint),
 				slog.Int("count", len(batch)),
@@ -251,7 +348,7 @@ func (e *Exporter) run() {
 	}
 	for s := range e.queue {
 		batch = append(batch, s)
-		if len(batch) >= batchCap {
+		if len(batch) >= e.batchCap {
 			flush()
 		}
 	}
@@ -272,20 +369,52 @@ func (e *Exporter) flush(batch []*Span) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), e.timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("tracing: build request: %w", err)
+
+	var lastErr error
+	for attempt := 0; attempt <= e.maxRetries; attempt++ {
+		if attempt > 0 {
+			delay := e.retryBaseDelay * time.Duration(1<<(attempt-1))
+			if delay > e.maxRetryDelay {
+				delay = e.maxRetryDelay
+			}
+			select {
+			case <-ctx.Done():
+				return lastErr // return most recent error, not ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("tracing: build request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := e.client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("tracing: do: %w", err)
+			// Do not retry on network errors — they indicate a persistent
+			// problem (unreachable host, TLS handshake failure, etc.) and
+			// the next attempt will likely fail the same way.
+			break
+		}
+		if resp != nil {
+			defer resp.Body.Close()
+		}
+		if resp.StatusCode >= 400 {
+			lastErr = fmt.Errorf("tracing: collector status %d", resp.StatusCode)
+			// 4xx: non-retryable client errors — fail immediately
+			if resp.StatusCode < 500 {
+				return lastErr
+			}
+			// 5xx: retryable collector errors
+			if attempt < e.maxRetries {
+				continue
+			}
+			break // retries exhausted
+		}
+		return nil // success
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := e.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("tracing: do: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("tracing: collector status %d", resp.StatusCode)
-	}
-	return nil
+	return lastErr
 }
 
 // --- OTLP/JSON envelope ----------------------------------------------------
@@ -300,11 +429,16 @@ func (e *Exporter) flush(batch []*Span) error {
 // the JSON shape stays strictly typed — collectors reject
 // untyped values.
 
+type otlpArrayValue struct {
+	Values []otlpAttrValue `json:"values"`
+}
+
 type otlpAttrValue struct {
-	StringValue *string  `json:"stringValue,omitempty"`
-	BoolValue   *bool    `json:"boolValue,omitempty"`
-	IntValue    *int64   `json:"intValue,omitempty"`
-	DoubleValue *float64 `json:"doubleValue,omitempty"`
+	StringValue *string         `json:"stringValue,omitempty"`
+	BoolValue   *bool           `json:"boolValue,omitempty"`
+	IntValue    *int64          `json:"intValue,omitempty"`
+	DoubleValue *float64        `json:"doubleValue,omitempty"`
+	ArrayValue  *otlpArrayValue `json:"arrayValue,omitempty"`
 }
 
 type otlpAttr struct {
@@ -317,16 +451,23 @@ type otlpStatus struct {
 	Description string `json:"description,omitempty"`
 }
 
+type otlpEvent struct {
+	Name                  string     `json:"name"`
+	TimestampUnixNanoNano string     `json:"timestampUnixNano"`
+	Attributes            []otlpAttr `json:"attributes,omitempty"`
+}
+
 type otlpSpan struct {
-	TraceID           string     `json:"traceId"`
-	SpanID            string     `json:"spanId"`
-	ParentSpanID      string     `json:"parentSpanId,omitempty"`
-	Name              string     `json:"name"`
-	Kind              string     `json:"kind"`
-	StartTimeUnixNano string     `json:"startTimeUnixNano"`
-	EndTimeUnixNano   string     `json:"endTimeUnixNano"`
-	Attributes        []otlpAttr `json:"attributes,omitempty"`
-	Status            otlpStatus `json:"status"`
+	TraceID           string      `json:"traceId"`
+	SpanID            string      `json:"spanId"`
+	ParentSpanID      string      `json:"parentSpanId,omitempty"`
+	Name              string      `json:"name"`
+	Kind              string      `json:"kind"`
+	StartTimeUnixNano string      `json:"startTimeUnixNano"`
+	EndTimeUnixNano   string      `json:"endTimeUnixNano"`
+	Attributes        []otlpAttr  `json:"attributes,omitempty"`
+	Events            []otlpEvent `json:"events,omitempty"`
+	Status            otlpStatus  `json:"status"`
 }
 
 type otlpScope struct {
@@ -408,6 +549,25 @@ func toOTLPSpan(s *Span) otlpSpan {
 			})
 		}
 	}
+	if len(s.Events) > 0 {
+		out.Events = make([]otlpEvent, 0, len(s.Events))
+		for _, e := range s.Events {
+			ev := otlpEvent{
+				Name:                  e.Name,
+				TimestampUnixNanoNano: fmt.Sprintf("%d", e.Timestamp.UnixNano()),
+			}
+			if len(e.Attributes) > 0 {
+				ev.Attributes = make([]otlpAttr, 0, len(e.Attributes))
+				for k, v := range e.Attributes {
+					ev.Attributes = append(ev.Attributes, otlpAttr{
+						Key:   k,
+						Value: encodeAttr(v),
+					})
+				}
+			}
+			out.Events = append(out.Events, ev)
+		}
+	}
 	return out
 }
 
@@ -461,6 +621,42 @@ func encodeAttr(v any) otlpAttrValue {
 		out.DoubleValue = &f
 	case float64:
 		out.DoubleValue = &x
+	case []any:
+		arr := make([]otlpAttrValue, len(x))
+		for i, elem := range x {
+			arr[i] = encodeAttr(elem)
+		}
+		out.ArrayValue = &otlpArrayValue{Values: arr}
+	case []string:
+		arr := make([]otlpAttrValue, len(x))
+		for i, elem := range x {
+			arr[i] = encodeAttr(elem)
+		}
+		out.ArrayValue = &otlpArrayValue{Values: arr}
+	case []bool:
+		arr := make([]otlpAttrValue, len(x))
+		for i, elem := range x {
+			arr[i] = encodeAttr(elem)
+		}
+		out.ArrayValue = &otlpArrayValue{Values: arr}
+	case []int:
+		arr := make([]otlpAttrValue, len(x))
+		for i, elem := range x {
+			arr[i] = encodeAttr(elem)
+		}
+		out.ArrayValue = &otlpArrayValue{Values: arr}
+	case []int64:
+		arr := make([]otlpAttrValue, len(x))
+		for i, elem := range x {
+			arr[i] = encodeAttr(elem)
+		}
+		out.ArrayValue = &otlpArrayValue{Values: arr}
+	case []float64:
+		arr := make([]otlpAttrValue, len(x))
+		for i, elem := range x {
+			arr[i] = encodeAttr(elem)
+		}
+		out.ArrayValue = &otlpArrayValue{Values: arr}
 	default:
 		// Fallback: stringify via fmt so an unknown type still
 		// renders something the collector can index. Operators

@@ -22,12 +22,20 @@
 // slot frees or the effective count grows. Context cancellation is
 // honoured via context.AfterFunc so a request whose context is done
 // never blocks indefinitely.
+//
+// Multi-GPU support (issue #775): NewVRAMLimiter creates one semaphore
+// per GPU and distributes requests in round-robin order. When a GPU's
+// semaphore is exhausted (its in-flight >= effective slots based on that
+// GPU's free VRAM), the limiter falls through to the next GPU in the
+// ring. The fallback traversal is bounded at O(gpuCount).
 package concurrencylimit
 
 import (
 	"context"
 	"log/slog"
+	"math"
 	"sync"
+	"sync/atomic"
 )
 
 // DefaultBytesPerSlot is the conservative VRAM reservation assumed per
@@ -164,42 +172,70 @@ func (l *Limiter) Acquire(ctx context.Context) (func(), error) {
 		return func() {}, nil
 	}
 	// Wake blocked acquirers when ctx is cancelled so they do not
-	// wait forever. context.AfterFunc runs f in a new goroutine if
-	// the context is already done; Broadcast is safe to call without
-	// holding the lock (sync.Cond allows it).
-	stop := context.AfterFunc(ctx, func() { l.cond.Broadcast() })
+	// wait forever (issue #439). The callback grabs l.mu so the
+	// Broadcast is strictly ordered with respect to Cond.Wait's
+	// register-and-park step: either the Broadcast acquires l.mu
+	// before Wait releases it (lost — but in that case Wait has not
+	// yet registered, so Wait will re-check ctx.Err() on the next
+	// loop iteration once it does register), or the Broadcast is
+	// sequenced behind Wait's release and observes the waiter
+	// already on the list. The naive "Broadcast without l.mu"
+	// pattern can lose the wakeup because the Broadcast can run
+	// before Cond.Wait installs the listener.
+	stop := context.AfterFunc(ctx, func() {
+		l.mu.Lock()
+		l.cond.Broadcast()
+		l.mu.Unlock()
+	})
 
+	var err error
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	for {
-		if err := ctx.Err(); err != nil {
-			// stop is documented as not waiting for a running f, so
-			// this cannot deadlock against our held mutex.
-			stop()
-			return nil, err
+		if err = ctx.Err(); err != nil {
+			break
 		}
 		if l.inFlight < l.effectiveLocked() {
 			l.inFlight++
-			// Deregister the AfterFunc; a late Broadcast would be a
-			// harmless no-op but cleaning up avoids leaking it.
-			stop()
-			return l.release, nil
+			break
 		}
 		l.cond.Wait()
 	}
+	l.mu.Unlock()
+
+	// Deregister the AfterFunc outside the mutex. If a cancellation
+	// callback is currently running its Broadcast under l.mu, Stop
+	// may block briefly waiting for it to complete; that is safe
+	// because we have already released l.mu and so cannot be the
+	// reason the callback is stuck. Calling stop inside the locked
+	// section would risk a self-deadlock against the callback's
+	// own l.mu.Lock().
+	stop()
+
+	if err != nil {
+		return nil, err
+	}
+	return l.release, nil
 }
 
-// release decrements the in-flight counter and wakes one blocked
-// acquirer. It is the function returned by a successful Acquire.
+// release decrements the in-flight counter and wakes blocked
+// acquirers. It is the function returned by a successful Acquire.
 func (l *Limiter) release() {
 	l.mu.Lock()
+	prevEff := l.effectiveLocked()
 	if l.inFlight > 0 {
 		l.inFlight--
 	}
-	// Broadcast rather than Signal so that, when the effective count
-	// has grown (probe reported more VRAM), multiple waiters can
-	// proceed at once. Signal would only wake one.
-	l.cond.Broadcast()
+	// Broadcast only when the effective count has grown (probe
+	// reported more VRAM) so that multiple waiters can proceed at
+	// once. In the normal single-slot-release case the effective
+	// count is unchanged; Signal is sufficient and avoids waking
+	// every waiter when only one slot is available.
+	newEff := l.effectiveLocked()
+	if newEff > prevEff {
+		l.cond.Broadcast()
+	} else {
+		l.cond.Signal()
+	}
 	l.mu.Unlock()
 }
 
@@ -212,4 +248,231 @@ func (l *Limiter) InFlight() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.inFlight
+}
+
+// gpuSlot tracks in-flight slots and effective limit for one GPU.
+type gpuSlot struct {
+	mu       sync.Mutex
+	cond     *sync.Cond
+	inFlight int
+	lastEff  int
+	haveLast bool
+}
+
+// gpuLimiter distributes Acquire calls across multiple per-GPU
+// semaphores using round-robin GPU selection (issue #775). Each GPU
+// has its own in-flight counter and condition variable so that a
+// request blocked on GPU 0 does not prevent GPU 1 from accepting work.
+type gpuLimiter struct {
+	ceiling      int
+	bytesPerSlot int64
+	// FreeVRAM returns the free VRAM in bytes for GPU i. A nil entry
+	// or non-positive value means "probe unavailable for this GPU" and
+	// the limiter falls back to the per-GPU ceiling share.
+	freeVRAM []func() int64
+	gpuCount int
+
+	slots []gpuSlot
+	rr    atomic.Uint64 // round-robin counter
+
+	// ceilingPerGPU is ceiling/gpuCount rounded up; used as the
+	// default effective slots when probe returns nil/0.
+	ceilingPerGPU int
+
+	// onWait is called just before a goroutine enters cond.Wait().
+	// It is nil in production; tests set it to observe synchronization.
+	// Stored in atomic.Value (storing func()) for race-free access.
+	onWait atomic.Value // stores func()
+}
+
+// NewVRAMLimiter constructs a multi-GPU limiter (issue #775). It
+// distributes Acquire calls across gpuCount GPUs in round-robin order
+// using an atomic counter. When a GPU's semaphore is exhausted, the
+// call falls through to the next GPU in the ring (bounded O(gpuCount)).
+//
+// The total concurrent slots across all GPUs is capped at ceiling.
+// Each GPU gets at most ceilingPerGPU = ceil(ceiling/gpuCount) slots
+// based on its own free-VRAM reading.
+//
+// A non-positive ceiling, bytesPerSlot, or gpuCount < 1 produces a
+// disabled limiter (Acquire is a no-op). A gpuCount of 1 still creates
+// a valid limiter (no round-robin needed).
+//
+// freeVRAM is an array of per-GPU closures. A nil closure or
+// non-positive return means "probe unavailable for this GPU" and
+// that GPU falls back to its share of the ceiling.
+func NewVRAMLimiter(ceiling int, bytesPerSlot int64, freeVRAM []func() int64, gpuCount int) *gpuLimiter {
+	if ceiling <= 0 || gpuCount < 1 {
+		return &gpuLimiter{}
+	}
+	if bytesPerSlot <= 0 {
+		bytesPerSlot = DefaultBytesPerSlot
+	}
+	slots := make([]gpuSlot, gpuCount)
+	for i := 0; i < gpuCount; i++ {
+		slots[i].cond = sync.NewCond(&slots[i].mu)
+	}
+	ceilingPerGPU := int(math.Ceil(float64(ceiling) / float64(gpuCount)))
+	return &gpuLimiter{
+		ceiling:       ceiling,
+		bytesPerSlot:  bytesPerSlot,
+		freeVRAM:      freeVRAM,
+		gpuCount:      gpuCount,
+		slots:         slots,
+		ceilingPerGPU: ceilingPerGPU,
+	}
+}
+
+// EffectivePerGPU returns the effective slot count for GPU i.
+func (g *gpuLimiter) EffectivePerGPU(i int) int {
+	if g == nil || i < 0 || i >= g.gpuCount {
+		return 0
+	}
+	g.slots[i].mu.Lock()
+	defer g.slots[i].mu.Unlock()
+	return g.effectivePerGPULocked(i)
+}
+
+func (g *gpuLimiter) effectivePerGPULocked(i int) int {
+	if g.ceiling <= 0 {
+		return 0
+	}
+	perGPU := g.ceilingPerGPU
+	if i < len(g.freeVRAM) && g.freeVRAM[i] != nil {
+		free := g.freeVRAM[i]()
+		if free > 0 && g.bytesPerSlot > 0 {
+			slots := int(free / g.bytesPerSlot)
+			if slots < 1 {
+				slots = 1
+			}
+			if slots > g.ceilingPerGPU {
+				slots = g.ceilingPerGPU
+			}
+			perGPU = slots
+		}
+	}
+	if !g.slots[i].haveLast || g.slots[i].lastEff != perGPU {
+		g.slots[i].lastEff = perGPU
+		g.slots[i].haveLast = true
+		slog.Info("local concurrency effective slots (per GPU)",
+			slog.Int("gpu", i),
+			slog.Int("slots", perGPU),
+			slog.Int("ceiling_per_gpu", g.ceilingPerGPU),
+		)
+	}
+	return perGPU
+}
+
+// AcquireGPU blocks until a slot is available on one of the GPUs or ctx
+// is cancelled. On success it returns the GPU index that was assigned and
+// a release function to call when done. On ctx cancellation it returns
+// ctx.Err() and -1.
+//
+// GPU selection is round-robin via an atomic counter. When the selected
+// GPU has no available slot, the limiter falls through to the next GPU
+// in the ring (at most gpuCount attempts, O(gpuCount) bounded).
+//
+// A disabled limiter (ceiling <= 0) returns a no-op release immediately.
+func (g *gpuLimiter) AcquireGPU(ctx context.Context) (func(), error) {
+	if g == nil || g.ceiling <= 0 {
+		return func() {}, nil
+	}
+	if g.gpuCount == 1 {
+		return g.acquireSingle(ctx, 0)
+	}
+	start := int(g.rr.Add(1) - 1)
+	for attempt := 0; attempt < g.gpuCount; attempt++ {
+		gpu := (start + attempt) % g.gpuCount
+		rel, ok := g.tryAcquire(ctx, gpu)
+		if ok {
+			return rel, nil
+		}
+	}
+	return g.acquireSingle(ctx, start%g.gpuCount)
+}
+
+func (g *gpuLimiter) tryAcquire(ctx context.Context, gpu int) (func(), bool) {
+	stop := context.AfterFunc(ctx, func() {
+		g.slots[gpu].mu.Lock()
+		g.slots[gpu].cond.Broadcast()
+		g.slots[gpu].mu.Unlock()
+	})
+
+	g.slots[gpu].mu.Lock()
+	for {
+		if err := ctx.Err(); err != nil {
+			g.slots[gpu].mu.Unlock()
+			stop()
+			return nil, false
+		}
+		eff := g.effectivePerGPULocked(gpu)
+		if g.slots[gpu].inFlight < eff {
+			g.slots[gpu].inFlight++
+			g.slots[gpu].mu.Unlock()
+			stop()
+			return func() { g.releaseGPU(gpu) }, true
+		}
+		if cb, ok := g.onWait.Load().(func()); ok && cb != nil {
+			cb()
+		}
+		g.slots[gpu].cond.Wait()
+	}
+}
+
+func (g *gpuLimiter) acquireSingle(ctx context.Context, gpu int) (func(), error) {
+	stop := context.AfterFunc(ctx, func() {
+		g.slots[gpu].mu.Lock()
+		g.slots[gpu].cond.Broadcast()
+		g.slots[gpu].mu.Unlock()
+	})
+
+	g.slots[gpu].mu.Lock()
+	for {
+		if err := ctx.Err(); err != nil {
+			g.slots[gpu].mu.Unlock()
+			stop()
+			return nil, err
+		}
+		eff := g.effectivePerGPULocked(gpu)
+		if g.slots[gpu].inFlight < eff {
+			g.slots[gpu].inFlight++
+			g.slots[gpu].mu.Unlock()
+			stop()
+			return func() { g.releaseGPU(gpu) }, nil
+		}
+		if cb, ok := g.onWait.Load().(func()); ok && cb != nil {
+			cb()
+		}
+		g.slots[gpu].cond.Wait()
+	}
+}
+
+func (g *gpuLimiter) releaseGPU(gpu int) {
+	g.slots[gpu].mu.Lock()
+	prevEff := g.effectivePerGPULocked(gpu)
+	if g.slots[gpu].inFlight > 0 {
+		g.slots[gpu].inFlight--
+	}
+	newEff := g.effectivePerGPULocked(gpu)
+	if newEff > prevEff {
+		g.slots[gpu].cond.Broadcast()
+	} else {
+		g.slots[gpu].cond.Signal()
+	}
+	g.slots[gpu].mu.Unlock()
+}
+
+// InFlightByGPU returns the in-flight count per GPU. The returned slice
+// has length gpuCount; a nil slice means the limiter is disabled.
+func (g *gpuLimiter) InFlightByGPU() []int {
+	if g == nil || g.ceiling <= 0 || len(g.slots) == 0 {
+		return nil
+	}
+	out := make([]int, len(g.slots))
+	for i := 0; i < len(g.slots); i++ {
+		g.slots[i].mu.Lock()
+		out[i] = g.slots[i].inFlight
+		g.slots[i].mu.Unlock()
+	}
+	return out
 }

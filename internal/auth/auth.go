@@ -14,17 +14,33 @@ package auth
 
 import (
 	"crypto/subtle"
+	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/ratelimit"
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
 // AuthObserver is the interface for receiving auth lifecycle callbacks.
 // The observability.Collector implements this interface (issue #295).
 type AuthObserver interface {
-	IncAuthRejectedInvalid()
-	IncAuthRejectedMissing()
+	IncAuthAccepted(clientIP string)
+	IncAuthRejectedInvalid(clientIP string)
+	IncAuthRejectedMissing(clientIP string)
+}
+
+// clientSlot tracks an in-progress auth attempt for one client IP.
+// The channel is closed when the auth attempt completes, allowing
+// a new slot to be acquired. This prevents a slow attacker from
+// holding a slot indefinitely and blocking other IPs (issue #1062).
+type clientSlot struct {
+	ch       chan struct{} // closed when auth attempt completes
+	lastSeen time.Time
 }
 
 // Middleware gates HTTP requests behind a bearer token. When key is
@@ -36,6 +52,10 @@ type Middleware struct {
 	exempt      func(*http.Request) bool
 	authLimiter *ratelimit.AuthLimiter
 	observer    AuthObserver
+	resolver    *ratelimit.ClientIPResolver
+
+	mu    sync.Mutex
+	slots map[string]*clientSlot // keyed by client IP
 }
 
 // NewMiddleware returns a middleware that rejects requests without a
@@ -47,11 +67,63 @@ type Middleware struct {
 // When observer is non-nil, auth rejection counters are incremented on
 // 401 responses (issue #295).
 func NewMiddleware(key string, exempt func(*http.Request) bool, authLimiter *ratelimit.AuthLimiter, observer AuthObserver) *Middleware {
-	return &Middleware{key: key, exempt: exempt, authLimiter: authLimiter, observer: observer}
+	var resolver *ratelimit.ClientIPResolver
+	if authLimiter != nil {
+		resolver = authLimiter.Resolver()
+	} else {
+		resolver = ratelimit.NewClientIPResolver(nil)
+	}
+	if resolver == nil {
+		resolver = ratelimit.NewClientIPResolver(nil)
+	}
+	return &Middleware{
+		key:         key,
+		exempt:      exempt,
+		authLimiter: authLimiter,
+		observer:    observer,
+		resolver:    resolver,
+		slots:       make(map[string]*clientSlot),
+	}
 }
 
 // Enabled reports whether the middleware actually enforces auth.
 func (m *Middleware) Enabled() bool { return m.key != "" }
+
+// acquireSlot acquires an auth slot for the given IP. If the IP already has
+// a slot with an open channel (previous auth attempt still in progress),
+// the old channel is closed and a new slot is created. This prevents a slow
+// attacker from holding a slot indefinitely and blocking other IPs (issue #1062).
+func (m *Middleware) acquireSlot(ip string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if slot, ok := m.slots[ip]; ok {
+		select {
+		case <-slot.ch:
+			delete(m.slots, ip)
+		default:
+			close(slot.ch)
+			m.slots[ip] = &clientSlot{ch: make(chan struct{}), lastSeen: time.Now()}
+		}
+	} else {
+		m.slots[ip] = &clientSlot{ch: make(chan struct{}), lastSeen: time.Now()}
+	}
+}
+
+// renewSlot closes the current auth slot for the given IP and creates a new one.
+// Called when auth completes (success or failure) so subsequent requests
+// from the same IP can proceed.
+func (m *Middleware) renewSlot(ip string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if slot, ok := m.slots[ip]; ok {
+		select {
+		case <-slot.ch:
+		default:
+			close(slot.ch)
+		}
+		m.slots[ip] = &clientSlot{ch: make(chan struct{}), lastSeen: time.Now()}
+	}
+}
 
 // Wrap returns an http.Handler that enforces the bearer-token gate.
 // When auth is disabled (empty key) the handler is returned as-is.
@@ -60,30 +132,101 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if m.exempt != nil && m.exempt(r) {
+		var span *tracing.Span
+		if tracing.Enabled() {
+			r2, s := tracing.StartSpanFromContext(r.Context(), "auth.check")
+			span = s
+			r = r.WithContext(r2)
+			defer span.End()
+		}
+
+		clientIP := m.resolver.Resolve(r)
+		exempt := m.exempt != nil && m.exempt(r)
+		token := BearerToken(r)
+		tokenPresent := token != ""
+
+		if span != nil {
+			span.SetAttr("auth.exempt", exempt)
+			span.SetAttr("auth.token_present", tokenPresent)
+		}
+
+		if m.authLimiter != nil && m.authLimiter.Enabled() {
+			if m.authLimiter.IsBlocked(clientIP) {
+				if span != nil {
+					span.SetAttr("auth.outcome", "reject")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Retry-After", "60")
+				w.Header().Set("X-Nexus-RateLimit-Key-Type", "auth-brute-force")
+				w.WriteHeader(http.StatusTooManyRequests)
+				enc := json.NewEncoder(w)
+				_ = enc.Encode(map[string]any{
+					"error": map[string]any{
+						"type":    "auth_rate_limit_exceeded",
+						"message": "too many authentication failures for this client",
+					},
+				})
+				slog.Warn("auth rate limit exceeded",
+					slog.String("client_ip", clientIP),
+				)
+				return
+			}
+		}
+
+		m.acquireSlot(clientIP)
+
+		if exempt {
+			if span != nil {
+				span.SetAttr("auth.outcome", "accept")
+			}
 			next.ServeHTTP(w, r)
+			m.renewSlot(clientIP)
 			return
 		}
-		token := BearerToken(r)
 		if token == "" {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="nexus-proxy"`)
-			http.Error(w, `{"error":"missing or malformed Authorization header"}`, http.StatusUnauthorized)
-			if m.observer != nil {
-				m.observer.IncAuthRejectedMissing()
+			if span != nil {
+				span.SetAttr("auth.outcome", "reject")
 			}
+			w.Header().Set("WWW-Authenticate", `Bearer realm="nexus-proxy"`)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = fmt.Fprint(w, `{"error":"missing or malformed Authorization header"}`)
+			if m.observer != nil {
+				m.observer.IncAuthRejectedMissing(clientIP)
+			}
+			if m.authLimiter != nil && m.authLimiter.Enabled() {
+				m.authLimiter.RecordFailure(clientIP, "missing")
+			}
+			m.renewSlot(clientIP)
 			return
 		}
 		// Use crypto/subtle.ConstantTimeCompare to prevent timing attacks
 		// (issue #228). The == 0 return value means the strings differ.
 		if subtle.ConstantTimeCompare([]byte(token), []byte(m.key)) == 0 {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="nexus-proxy", error="invalid_token"`)
-			http.Error(w, `{"error":"invalid API key"}`, http.StatusUnauthorized)
-			if m.observer != nil {
-				m.observer.IncAuthRejectedInvalid()
+			if span != nil {
+				span.SetAttr("auth.outcome", "invalid")
 			}
+			w.Header().Set("WWW-Authenticate", `Bearer realm="nexus-proxy", error="invalid_token"`)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = fmt.Fprint(w, `{"error":"invalid API key"}`)
+			if m.observer != nil {
+				m.observer.IncAuthRejectedInvalid(clientIP)
+			}
+			if m.authLimiter != nil && m.authLimiter.Enabled() {
+				m.authLimiter.RecordFailure(clientIP, "invalid")
+			}
+			m.renewSlot(clientIP)
 			return
 		}
+		if span != nil {
+			span.SetAttr("auth.outcome", "accept")
+		}
 		next.ServeHTTP(w, r)
+		if m.observer != nil {
+			m.observer.IncAuthAccepted(clientIP)
+		}
+		m.renewSlot(clientIP)
 	})
 }
 

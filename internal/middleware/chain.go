@@ -61,9 +61,10 @@ func NewMiddleware(name string, fn func([]interface{}) ([]interface{}, error)) M
 }
 
 // ragMiddleware implements ContextMiddleware for RAG retrieval.
+// The retrieval threshold lives on the rag.RAGStore (the single source of
+// truth); the middleware never applies one itself.
 type ragMiddleware struct {
-	rag       rag.RAGStore
-	threshold float64
+	rag rag.RAGStore
 }
 
 func (r ragMiddleware) Name() string { return "rag" }
@@ -74,7 +75,7 @@ func (r ragMiddleware) Transform(m []interface{}) ([]interface{}, error) {
 
 func (r ragMiddleware) TransformContext(ctx context.Context, msgs []interface{}) ([]interface{}, error) {
 	prompt := ExtractLatestUserPrompt(msgs)
-	ex, _, err := r.rag.Retrieve(ctx, prompt)
+	ex, _, _, err := r.rag.Retrieve(ctx, prompt)
 	if err != nil || ex == nil {
 		return msgs, nil
 	}
@@ -82,8 +83,9 @@ func (r ragMiddleware) TransformContext(ctx context.Context, msgs []interface{})
 }
 
 // NewRAGMiddleware creates a RAG middleware that uses the provided store.
-func NewRAGMiddleware(store rag.RAGStore, threshold float64) ContextMiddleware {
-	return &ragMiddleware{store, threshold}
+// The store is the sole owner of the retrieval threshold.
+func NewRAGMiddleware(store rag.RAGStore) ContextMiddleware {
+	return &ragMiddleware{store}
 }
 
 // Named middleware registry. Built-in transforms are registered at
@@ -160,7 +162,7 @@ func DefaultChain() []Middleware {
 // Init registers the four built-in transforms under their canonical
 // names. Called automatically via package initialization; exported for
 // tests that need to re-init with different Config values.
-func Init(metaPrompt string, toonNotice string, isolated bool) {
+func Init(metaPrompt string, toonNotice string, toonUnfenced bool, isolated bool) {
 	registry = make(map[string]Middleware)
 	registeredContext = make(map[string]bool)
 
@@ -191,7 +193,7 @@ func Init(metaPrompt string, toonNotice string, isolated bool) {
 	Register(MiddlewareFunc{
 		name: "compressJSONBlocks",
 		fn: func(msgs []interface{}) ([]interface{}, error) {
-			CompressJSONBlocks(msgs)
+			CompressJSONBlocks(msgs, toonUnfenced)
 			return msgs, nil
 		},
 	})
@@ -211,5 +213,5 @@ func Init(metaPrompt string, toonNotice string, isolated bool) {
 func init() {
 	// Sensible defaults for init; main.go re-initializes with real
 	// config values before building the chain.
-	Init("", "", false)
+	Init("", "", true, false)
 }

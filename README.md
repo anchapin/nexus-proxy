@@ -53,7 +53,7 @@ complexity.
 
 ### Prerequisites
 
-- Go 1.21+
+- Go 1.25+ (1.26 recommended, matching CI)
 - [Ollama](https://ollama.com) running locally on `:11434`
 - The following models pulled:
   ```bash
@@ -90,7 +90,64 @@ cp .env.example .env
 # Edit .env and set NEXUS_FRONTIER_API_KEY
 ```
 
+### Verify (before serving traffic)
+
+Before the first start, run the boot-time diagnostic suite so missing
+models, invalid keys, unreachable Ollama, RAG directory issues, and
+writable-path problems surface as a clear pass/fail report instead of
+the first proxied request timing out:
+
+```bash
+./bin/nexus check
+# or, equivalently:
+./bin/nexus doctor
+```
+
+Sample output:
+
+```text
+Nexus Proxy — Configuration Check
+===================================
+[PASS] ollama_reachable — reachable at http://localhost:11434
+[PASS] ollama_router_model — model "qwen3-coder:4b" available
+[PASS] ollama_local_model — model "qwen3-coder:8b" available
+[PASS] ollama_embedding_model — model "nomic-embed-text" functional (768-dim vector)
+[PASS] frontier_api_key — key accepted (endpoint: https://api.openai.com/v1)
+[WARN] zai_api_key — no NEXUS_ZAI_API_KEY set — cascade fallback to z.ai disabled
+[PASS] vram_probe — budget: 4096 tokens (source: ollama)
+[PASS] rag_directory — 12 file(s) in "./few_shot_examples"
+[PASS] telemetry_path_writable — writable (./nexus-telemetry.jsonl)
+[PASS] metrics_db_writable — writable (~/.cache/nexus-proxy/metrics.db)
+[PASS] judge_readiness — ready (model=glm-4.5, sample_rate=0.10)
+[PASS] rag_circuit_breaker — threshold=3 consecutive failures
+[WARN] quality_verifier — NEXUS_QUALITY_CONCURRENCY=0 — quality verifier dormant
+[WARN] budget_guard — NEXUS_BUDGET_DAILY_LIMIT=0 — budget guard disabled
+[SKIP] rate_limit_proxy_config — rate limiting disabled (NEXUS_RATE_LIMIT_RPM <= 0)
+[PASS] provider_registry — JSON valid
+[PASS] middleware_chain — chain valid (promptEngineering,rag,compressJSONBlocks,appendSystemNote)
+[SKIP] models_endpoint — models endpoint disabled (NEXUS_MODELS_ENDPOINT=false)
+
+All checks passed, 3 warning(s).
+```
+
+**Exit codes:**
+
+| Code | Meaning |
+| ---- | ------- |
+| `0`  | Every check passed (warnings and skips are fine — see [issue #32](https://github.com/anchapin/nexus-proxy/issues/32)). |
+| `1`  | At least one check failed. Read the `[FAIL]` lines and the `Detail` column for the remediation hint (often a missing `ollama pull <model>` or an unset API key). |
+
+The `--json` flag (`./bin/nexus check --json`) emits a stable JSON array
+of `{name, status, detail}` objects suitable for `jq` filtering and CI
+gates:
+
+```bash
+./bin/nexus check --json | jq '.[] | select(.status == "fail") | .detail'
+```
+
 ### Build and run
+
+Once `nexus check` is green:
 
 ```bash
 make build && ./bin/nexus
@@ -134,7 +191,14 @@ client behind the proxy shares one bucket).
 
 ### Point your agent at the proxy
 
-In OpenCode's `~/.config/opencode/config.toml`:
+Nexus Proxy exposes an OpenAI-compatible `/v1` endpoint. Every supported
+agent points at the same base URL — `http://localhost:8000/v1` — and
+supplies any non-empty API key (the proxy authenticates inbound traffic
+via `NEXUS_PROXY_API_KEY`, not the provider key the agent sends).
+
+#### OpenCode
+
+In `~/.config/opencode/config.toml`:
 
 ```toml
 [provider.openai]
@@ -142,7 +206,37 @@ baseURL = "http://localhost:8000/v1"
 apiKey = "any-non-empty-string"
 ```
 
-Replace `baseURL` with whatever your agent uses for the OpenAI provider.
+#### Aider
+
+Aider reads the endpoint from environment variables (or `--openai-api-base`):
+
+```bash
+export OPENAI_API_BASE=http://localhost:8000/v1
+export OPENAI_API_KEY=any-non-empty-string
+aider --model gpt-4o
+```
+
+To persist it, drop the same keys into `~/.aider.conf.yml`:
+
+```yaml
+openai-api-base: http://localhost:8000/v1
+openai-api-key: any-non-empty-string
+```
+
+The `--model` value is passed straight through to the proxy; Nexus routes
+it based on the routing pipeline, so any frontier model name works.
+
+#### OpenHands
+
+OpenHands honours `LLM_BASE_URL` / `LLM_API_KEY`:
+
+```bash
+export LLM_BASE_URL=http://localhost:8000/v1
+export LLM_API_KEY=any-non-empty-string
+```
+
+For other OpenAI-compatible agents, set their respective base-URL / API-key
+option to the same `http://localhost:8000/v1` value and any non-empty key.
 
 ### Add few-shot examples
 
@@ -153,7 +247,9 @@ above `NEXUS_RAG_THRESHOLD` (default 0.55).
 ## Docker
 
 A multi-stage `Dockerfile` ships at the repo root: stage 1 builds a static
-binary in `golang:1.21-alpine` and stage 2 copies it into
+binary in `golang:${GO_VERSION}-alpine` (Dockerfile `ARG GO_VERSION`, default
+`1.26` matching CI — override with `--build-arg GO_VERSION=1.26`) and stage 2
+copies it into
 [`gcr.io/distroless/static-debian12:nonroot`](https://github.com/GoogleContainerTools/distroless).
 The final image runs as UID 65532 with no shell and no package manager,
 uses env-only configuration, and listens on `:8000`. Final image size is
@@ -182,6 +278,12 @@ docker build -t nexus-proxy:dev .
 docker run --rm -p 8000:8000 \
   -e NEXUS_FRONTIER_API_KEY=sk-... \
   nexus-proxy:dev
+```
+
+Smoke-test the built image to confirm the binary reports the expected version:
+
+```bash
+docker run --rm nexus-proxy:dev --version
 ```
 
 ### Compose (proxy + Ollama)
@@ -267,13 +369,41 @@ Every semver tag (`v1.0.0`, `v1.2.3`, …) triggers the
 [release workflow](.github/workflows/release.yml), which publishes:
 
 - **Cross-compiled binaries** — `linux/amd64`, `linux/arm64`,
-  `darwin/arm64`
-- **SHA256 checksums** — `checksums-sha256.txt`
+  `darwin/arm64`, `windows/amd64`
+- **Per-binary SBOM** — SPDX JSON generated by `syft` for each binary
+  (`*-linux-amd64.spdx.json`, `*-linux-arm64.spdx.json`,
+  `*-darwin-arm64.spdx.json`), so binary-only operators have a component
+  inventory without pulling the container image
+- **SHA256 checksums** — `checksums-sha256.txt` (covers binaries + SBOMs)
+- **SLSA provenance attestation** — `.intoto.jsonl` for each binary
 - **GHCR multi-arch image** — `ghcr.io/anchapin/nexus-proxy:<tag>`
   (amd64 + arm64), also tagged `latest`
-- **SBOM** — SPDX JSON attached to the release
+- **Source-level SBOM** — SPDX JSON attached to the release
 - **Cosign signature** — keyless (OIDC) signature on the image,
   recorded in the Rekor transparency log
+
+### Install
+
+The fastest way to get `nexus` on your `PATH` is `go install`. Nexus is
+pure Go (CGO-free), so a working Go toolchain is the only prerequisite —
+no `goreleaser.yml` or Homebrew tap is required:
+
+```bash
+go install github.com/anchapin/nexus-proxy/cmd/nexus@latest
+```
+
+This drops the binary into `$(go env GOPATH)/bin` (usually `~/go/bin`).
+Ensure that directory is on your `PATH`, then verify it runs:
+
+```bash
+nexus --version
+```
+
+> **Pin a version.** Replace `@latest` with a semver tag
+> (e.g. `@v1.2.3`) to install a reproducible build. `@latest` always
+> resolves to the most recent tagged release on the default branch.
+
+> **No Go toolchain?** Use the prebuilt binary or container image below.
 
 ### Install a prebuilt binary
 
@@ -282,10 +412,43 @@ Every semver tag (`v1.0.0`, `v1.2.3`, …) triggers the
 # then verify its checksum:
 sha256sum -c checksums-sha256.txt
 
-# Make it executable and run:
-chmod +x nexus-*-linux-amd64
-./nexus-*-linux-amd64 --version
+# Make it executable and run (replace PLATFORM as needed):
+PLATFORM="linux-amd64"   # or linux-arm64, darwin-arm64
+chmod +x "nexus-*-${PLATFORM}"
+./nexus-*-${PLATFORM} --version
 ```
+
+> **Windows:** the binary ships as `nexus-<tag>-windows-amd64.exe` and
+> needs no `chmod`. From PowerShell or cmd, run
+> `.\nexus-<tag>-windows-amd64.exe --version` to verify it starts.
+
+### Verify binary provenance
+
+Each release includes an SLSA Level 3 provenance attestation (`.intoto.jsonl`) that
+cryptographically verifies the binary was built from the exact source commit by GitHub
+Actions. Install the [slsa-verifier](https://github.com/slsa-framework/slsa-verifier):
+
+```bash
+go install github.com/slsa-framework/slsa-verifier/cli/slsa-verifier@latest
+```
+
+Then verify a binary against its provenance attestation:
+
+```bash
+# Replace <tag> with the release version (e.g. v1.0.0)
+TAG="<tag>"
+PLATFORM="linux-amd64"   # or linux-arm64, darwin-arm64
+BINARY="nexus-${TAG}-${PLATFORM}"
+ATTESTATION="${BINARY}.intoto.jsonl"
+
+slsa-verifier verify-artifact "${BINARY}" \
+  --provenance-path "${ATTESTATION}" \
+  --source-repo "https://github.com/anchapin/nexus-proxy" \
+  --tag "${TAG}"
+```
+
+A successful verification confirms the binary's supply-chain integrity. If verification
+fails, the binary may have been tampered with.
 
 ### Pull the container image
 
@@ -318,6 +481,26 @@ nexus v1.0.0
 `--version` (or `-v`) prints the build version and exits. The version is
 injected at compile time via `-ldflags`; a local `make build` reports
 `nexus dev` unless you override it with `make build VERSION=v1.2.3`.
+
+### CLI reference
+
+The `nexus` binary ships with the subcommands below. The default
+invocation (no args) starts the proxy on `:8000`.
+
+| Command | Purpose |
+| ------- | ------- |
+| `nexus` | Start the proxy (binds `:8000` by default; override with `NEXUS_ADDR`). |
+| `nexus check` | Run the boot-time diagnostic suite and exit. Use `--json` for machine-readable output. See [Verify](#verify-before-serving-traffic) above. |
+| `nexus doctor` | Alias for `nexus check`. |
+| `nexus config validate <file>` | Parse and validate a YAML config file, then print the resolved keys. Exits `0` on success, `1` on parse / indentation errors. |
+| `nexus dashboard` | Print the daily savings summary from the SQLite metrics store. Flags: `--json`, `--since YYYY-MM-DD`, `--days N`, `--db PATH`, `--cost-per-1k RATE`. |
+| `nexus --version` / `-v` | Print the build version (`nexus dev` for local builds). |
+| `nexus --help` / `-h` | Print the usage banner. |
+
+An unknown verb exits with code `2`. The full subcommand dispatch lives
+in `cmd/nexus/main.go:67-99`; the diagnostic suite is implemented in
+`internal/diag/diag.go`. Run any subcommand with `--help` for
+subcommand-specific flags.
 
 ## Architecture
 
@@ -412,6 +595,7 @@ defaults. The most useful ones:
 | `NEXUS_TRUSTED_PROXIES`   | *(empty = trust nobody)*      | CIDR allowlist for X-Forwarded-For (issue #75) |
 | `NEXUS_RATE_LIMIT_RPM`    | `0` (disabled)                | Per-client requests/min ceiling (issue #75) |
 | `NEXUS_RATE_LIMIT_BURST`  | `0` (= RPM)                  | Token-bucket burst capacity (issue #75) |
+| `NEXUS_RATE_LIMIT_BY_API_KEY` | `false`                     | Bucket by IP+APIKey instead of IP alone (issue #776) |
 | `NEXUS_AUTH_RATE_LIMIT_RPM` | `5`                           | Auth brute-force: failures/min before block (issue #296) |
 | `NEXUS_AUTH_RATE_LIMIT_BURST` | `3`                         | Auth brute-force: failures before 429 (issue #296) |
 | `NEXUS_AUTH_RATE_LIMIT_WINDOW` | `5m`                         | Auth brute-force: sliding window for tracking (issue #296) |

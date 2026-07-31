@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -49,8 +50,20 @@ func TestLoadYAMLDefaults(t *testing.T) {
 	if !cfg.ProbeEnabled {
 		t.Error("ProbeEnabled = false, want true")
 	}
+	if cfg.ProbeThermalThreshold != 90 {
+		t.Errorf("ProbeThermalThreshold = %d, want 90", cfg.ProbeThermalThreshold)
+	}
 	if cfg.LocalCooldown != 10*time.Second {
 		t.Errorf("LocalCooldown = %v, want 10s", cfg.LocalCooldown)
+	}
+	if cfg.AuthRateLimitRPM != 5 {
+		t.Errorf("AuthRateLimitRPM = %d, want 5", cfg.AuthRateLimitRPM)
+	}
+	if cfg.AuthRateLimitBurst != 3 {
+		t.Errorf("AuthRateLimitBurst = %d, want 3", cfg.AuthRateLimitBurst)
+	}
+	if cfg.AuthRateLimitWindow != 5*time.Minute {
+		t.Errorf("AuthRateLimitWindow = %v, want 5m", cfg.AuthRateLimitWindow)
 	}
 }
 
@@ -77,6 +90,7 @@ rag_threshold: 0.75
 probe_interval: "90s"
 probe_timeout: "3s"
 probe_bytes_per_token: 131072
+probe_thermal_threshold: 75
 local_max_concurrent: 4
 local_vram_bytes_per_slot: 1073741824
 local_cooldown: "20s"
@@ -87,6 +101,9 @@ models_cache_ttl: "10m"
 rate_limit_rpm: 120
 rate_limit_burst: 30
 trusted_proxies: "10.0.0.0/8"
+auth_rate_limit_rpm: 20
+auth_rate_limit_burst: 10
+auth_rate_limit_window: "3m"
 `
 	if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
@@ -150,6 +167,9 @@ trusted_proxies: "10.0.0.0/8"
 	if cfg.ProbeBytesPerToken != 131072 {
 		t.Errorf("ProbeBytesPerToken = %d", cfg.ProbeBytesPerToken)
 	}
+	if cfg.ProbeThermalThreshold != 75 {
+		t.Errorf("ProbeThermalThreshold = %d, want 75", cfg.ProbeThermalThreshold)
+	}
 	if cfg.LocalMaxConcurrent != 4 {
 		t.Errorf("LocalMaxConcurrent = %d", cfg.LocalMaxConcurrent)
 	}
@@ -176,6 +196,15 @@ trusted_proxies: "10.0.0.0/8"
 	}
 	if cfg.RateLimitBurst != 30 {
 		t.Errorf("RateLimitBurst = %d", cfg.RateLimitBurst)
+	}
+	if cfg.AuthRateLimitRPM != 20 {
+		t.Errorf("AuthRateLimitRPM = %d, want 20", cfg.AuthRateLimitRPM)
+	}
+	if cfg.AuthRateLimitBurst != 10 {
+		t.Errorf("AuthRateLimitBurst = %d, want 10", cfg.AuthRateLimitBurst)
+	}
+	if cfg.AuthRateLimitWindow != 3*time.Minute {
+		t.Errorf("AuthRateLimitWindow = %v, want 3m", cfg.AuthRateLimitWindow)
 	}
 	if len(cfg.TrustedProxies) != 1 {
 		t.Errorf("TrustedProxies len = %d, want 1", len(cfg.TrustedProxies))
@@ -264,6 +293,70 @@ shutdown_timeout: "-5s"
 	}
 }
 
+// issue #986: fractional fields must be validated in 0..1 range
+func TestLoadYAMLFractionalFieldRangeValidation(t *testing.T) {
+	fractionalFields := []struct {
+		yamlKey string
+		yamlVal string
+		wantErr string
+	}{
+		{"budget_alert_threshold", "5.0", "budget_alert_threshold must be in range [0,1]"},
+		{"budget_alert_threshold", "-0.5", "budget_alert_threshold must be in range [0,1]"},
+		{"fusion_agreement_threshold", "2.0", "fusion_agreement_threshold must be in range [0,1]"},
+		{"fusion_agreement_threshold", "-0.1", "fusion_agreement_threshold must be in range [0,1]"},
+		{"provider_tail_weight", "1.5", "provider_tail_weight must be in range [0,1]"},
+		{"provider_tail_weight", "-0.1", "provider_tail_weight must be in range [0,1]"},
+		{"tracing_sample_rate", "3.0", "tracing_sample_rate must be in range [0,1]"},
+		{"tracing_sample_rate", "-0.1", "tracing_sample_rate must be in range [0,1]"},
+	}
+
+	for _, tc := range fractionalFields {
+		t.Run(tc.yamlKey+"_"+tc.yamlVal, func(t *testing.T) {
+			tmp := t.TempDir()
+			path := filepath.Join(tmp, "config.yaml")
+			yamlContent := tc.yamlKey + ": " + tc.yamlVal + "\n"
+			if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			_, err := LoadYAML(path)
+			if err == nil {
+				t.Errorf("LoadYAML: expected error for %s=%s, got nil", tc.yamlKey, tc.yamlVal)
+			}
+			if err != nil && !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("LoadYAML error = %q, want containing %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadYAMLFractionalFieldBoundaryValues(t *testing.T) {
+	// Boundary values 0.0 and 1.0 should be accepted
+	validValues := []string{"0.0", "0", "1.0", "1", "0.5", "0.85"}
+	fractionalFields := []string{
+		"budget_alert_threshold",
+		"fusion_agreement_threshold",
+		"provider_tail_weight",
+		"tracing_sample_rate",
+	}
+
+	for _, field := range fractionalFields {
+		for _, val := range validValues {
+			t.Run(field+"_"+val, func(t *testing.T) {
+				tmp := t.TempDir()
+				path := filepath.Join(tmp, "config.yaml")
+				yamlContent := field + ": " + val + "\n"
+				if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+				_, err := LoadYAML(path)
+				if err != nil {
+					t.Errorf("LoadYAML: unexpected error for %s=%s: %v", field, val, err)
+				}
+			})
+		}
+	}
+}
+
 func TestLoadYAMLTrustedProxiesYAML(t *testing.T) {
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "config.yaml")
@@ -280,6 +373,12 @@ trusted_proxies: "10.0.0.0/8, 172.16.0.0/12"
 	}
 	if len(cfg.TrustedProxies) != 2 {
 		t.Errorf("TrustedProxies len = %d, want 2", len(cfg.TrustedProxies))
+	}
+	// TrustedProxiesRaw is consumed by the rate_limit_proxy_config
+	// diagnostic check (issue #603) — assert it is populated so the
+	// field stays wired through the YAML loader.
+	if cfg.TrustedProxiesRaw == "" {
+		t.Error("TrustedProxiesRaw should be populated from YAML trusted_proxies")
 	}
 }
 
@@ -452,6 +551,7 @@ func TestLoadYAMLSelectorSettings(t *testing.T) {
 selector_window: "2h"
 selector_min_samples: 10
 selector_refresh_interval: "120s"
+provider_tail_weight: 0.5
 frontier_cost_per_1k: 0.01
 zai_cost_per_1k: 0.005
 `
@@ -472,11 +572,64 @@ zai_cost_per_1k: 0.005
 	if cfg.SelectorRefreshInterval != 120*time.Second {
 		t.Errorf("SelectorRefreshInterval = %v", cfg.SelectorRefreshInterval)
 	}
+	if cfg.ProviderTailWeight != 0.5 {
+		t.Errorf("ProviderTailWeight = %v, want 0.5", cfg.ProviderTailWeight)
+	}
 	if cfg.FrontierCostPer1K != 0.01 {
 		t.Errorf("FrontierCostPer1K = %v", cfg.FrontierCostPer1K)
 	}
 	if cfg.ZAICostPer1K != 0.005 {
 		t.Errorf("ZAICostPer1K = %v", cfg.ZAICostPer1K)
+	}
+}
+
+func TestLoadYAMLProviderTailWeightEnvOverride(t *testing.T) {
+	// Issue #450: the env var must override the YAML default and
+	// reject out-of-range values. Set a YAML file with the default
+	// 0, then push NEXUS_PROVIDER_TAIL_WEIGHT through the loader's
+	// env-override branch and assert it wins. A separate sub-test
+	// pins the strict range check on the env-var path.
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(path, []byte("provider_tail_weight: 0.0\n"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv("NEXUS_PROVIDER_TAIL_WEIGHT", "0.3")
+	cfg, err := LoadYAML(path)
+	if err != nil {
+		t.Fatalf("LoadYAML: %v", err)
+	}
+	if cfg.ProviderTailWeight != 0.3 {
+		t.Errorf("ProviderTailWeight = %v, want 0.3 (env override)", cfg.ProviderTailWeight)
+	}
+}
+
+func TestLoadYAMLProviderTailWeightEnvInvalid(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(path, []byte("provider_tail_weight: 0.0\n"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv("NEXUS_PROVIDER_TAIL_WEIGHT", "1.5")
+	if _, err := LoadYAML(path); err == nil {
+		t.Error("LoadYAML: expected error for NEXUS_PROVIDER_TAIL_WEIGHT=1.5")
+	}
+}
+
+func TestLoadYAMLFusionAgreementThresholdOutOfRange(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(path, []byte("fusion_agreement_threshold: 0.85\n"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv("NEXUS_FUSION_AGREEMENT_THRESHOLD", "1.5")
+	if _, err := LoadYAML(path); err == nil {
+		t.Error("LoadYAML: expected error for NEXUS_FUSION_AGREEMENT_THRESHOLD=1.5")
+	}
+
+	t.Setenv("NEXUS_FUSION_AGREEMENT_THRESHOLD", "-0.1")
+	if _, err := LoadYAML(path); err == nil {
+		t.Error("LoadYAML: expected error for NEXUS_FUSION_AGREEMENT_THRESHOLD=-0.1")
 	}
 }
 
@@ -573,6 +726,25 @@ max_body_bytes: 2097152
 	}
 }
 
+// TestLoadYAMLTLSEnabled (issue #444) verifies the YAML mirror of
+// NEXUS_TLS_ENABLED. Operators running behind a TLS-terminating reverse
+// proxy can set the flag via config.yaml instead of an env var.
+func TestLoadYAMLTLSEnabled(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(path, []byte("tls_enabled: true\n"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := LoadYAML(path)
+	if err != nil {
+		t.Fatalf("LoadYAML: %v", err)
+	}
+	if !cfg.TLSEnabled {
+		t.Error("TLSEnabled = false, want true when tls_enabled: true in YAML")
+	}
+}
+
 func TestLoadYAMLCLoudEndpoint(t *testing.T) {
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "config.yaml")
@@ -631,6 +803,37 @@ routing_confidence_window: "336h"
 	}
 }
 
+func TestLoadYAMLRoutingConfidenceOutOfRange(t *testing.T) {
+	routingConfidenceFields := []struct {
+		yamlKey string
+		yamlVal string
+		wantErr string
+	}{
+		{"routing_confidence_floor", "1.5", "routing_confidence_floor must be in range [0,1]"},
+		{"routing_confidence_floor", "-0.2", "routing_confidence_floor must be in range [0,1]"},
+		{"routing_confidence_ceiling", "1.5", "routing_confidence_ceiling must be in range [0,1]"},
+		{"routing_confidence_ceiling", "-0.2", "routing_confidence_ceiling must be in range [0,1]"},
+	}
+
+	for _, tc := range routingConfidenceFields {
+		t.Run(tc.yamlKey+"_"+tc.yamlVal, func(t *testing.T) {
+			tmp := t.TempDir()
+			path := filepath.Join(tmp, "config.yaml")
+			yamlContent := tc.yamlKey + ": " + tc.yamlVal + "\n"
+			if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			_, err := LoadYAML(path)
+			if err == nil {
+				t.Errorf("LoadYAML: expected error for %s=%s, got nil", tc.yamlKey, tc.yamlVal)
+			}
+			if err != nil && !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("LoadYAML error = %q, want containing %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestLoadYAMLSLMCacheSettings(t *testing.T) {
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "config.yaml")
@@ -655,5 +858,256 @@ slm_cache_similarity_threshold: 0.5
 	}
 	if cfg.SLMCacheSemanticThreshold != 0.5 {
 		t.Errorf("SLMCacheSemanticThreshold = %v", cfg.SLMCacheSemanticThreshold)
+	}
+}
+
+func TestLoadYAMLTOONUnfencedSettings(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	yamlContent := `
+toon_unfenced: false
+`
+	if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := LoadYAML(path)
+	if err != nil {
+		t.Fatalf("LoadYAML: %v", err)
+	}
+	if cfg.TOONUnfenced {
+		t.Error("TOONUnfenced = true, want false from YAML")
+	}
+}
+
+func TestLoadYAMLTOONUnfencedEnvOverridesYAML(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	yamlContent := `
+toon_unfenced: false
+`
+	if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	t.Setenv("NEXUS_TOON_UNFENCED", "true")
+
+	cfg, err := LoadYAML(path)
+	if err != nil {
+		t.Fatalf("LoadYAML: %v", err)
+	}
+	if !cfg.TOONUnfenced {
+		t.Error("TOONUnfenced = false, want true (env overrides YAML)")
+	}
+}
+
+func TestLoadYAMLTOONUnfencedInvalidValue(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	yamlContent := `
+toon_unfenced: maybe
+`
+	if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := LoadYAML(path)
+	if err == nil {
+		t.Fatal("LoadYAML: expected error for toon_unfenced: maybe, got nil")
+	}
+	if got := err.Error(); got != `config: toon_unfenced value "maybe" is not recognised; want true or false` {
+		t.Errorf("error = %q, want %q", got, `config: toon_unfenced value "maybe" is not recognised; want true or false`)
+	}
+}
+
+func TestParseYAMLBool(t *testing.T) {
+	tests := []struct {
+		input   string
+		wantVal bool
+		wantErr bool
+	}{
+		{"true", true, false},
+		{"false", false, false},
+		{"1", true, false},
+		{"0", false, false},
+		{"yes", true, false},
+		{"no", false, false},
+		{"on", true, false},
+		{"off", false, false},
+		{"True", true, false},
+		{"FALSE", false, false},
+		{"  yes  ", true, false},
+		{"maybe", false, true},
+		{"certainly", false, true},
+		{"", false, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := parseYAMLBool(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("parseYAMLBool(%q) = _, nil; want error", tt.input)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("parseYAMLBool(%q) = _, %v; want no error", tt.input, err)
+				}
+				if got != tt.wantVal {
+					t.Errorf("parseYAMLBool(%q) = %v; want %v", tt.input, got, tt.wantVal)
+				}
+			}
+		})
+	}
+}
+
+func TestLoadYAMLCascadeMaxResponseBytesEnvOverridesYAML(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	yamlContent := `
+cascade_max_response_bytes: 12345
+`
+	if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	t.Setenv("NEXUS_CASCADE_MAX_RESPONSE_BYTES", "67890")
+
+	cfg, err := LoadYAML(path)
+	if err != nil {
+		t.Fatalf("LoadYAML: %v", err)
+	}
+	if cfg.CascadeMaxResponseBytes != 67890 {
+		t.Errorf("CascadeMaxResponseBytes = %d, want 67890 (env overrides YAML 12345)", cfg.CascadeMaxResponseBytes)
+	}
+}
+
+func TestLoadYAMLMaxResponseBytesEnvOverridesYAML(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	yamlContent := `
+max_response_bytes: 10000000
+`
+	if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	t.Setenv("NEXUS_MAX_RESPONSE_BYTES", "20000000")
+
+	cfg, err := LoadYAML(path)
+	if err != nil {
+		t.Fatalf("LoadYAML: %v", err)
+	}
+	if cfg.MaxResponseBytes != 20000000 {
+		t.Errorf("MaxResponseBytes = %d, want 20000000 (env overrides YAML 10000000)", cfg.MaxResponseBytes)
+	}
+}
+
+func TestLoadYAMLAuthRateLimitEnvOverridesYAML(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.yaml")
+	yamlContent := `
+auth_rate_limit_rpm: 10
+auth_rate_limit_burst: 5
+auth_rate_limit_window: 3m
+`
+	if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	t.Setenv("NEXUS_AUTH_RATE_LIMIT_RPM", "20")
+	t.Setenv("NEXUS_AUTH_RATE_LIMIT_BURST", "15")
+	t.Setenv("NEXUS_AUTH_RATE_LIMIT_WINDOW", "7m")
+
+	cfg, err := LoadYAML(path)
+	if err != nil {
+		t.Fatalf("LoadYAML: %v", err)
+	}
+	if cfg.AuthRateLimitRPM != 20 {
+		t.Errorf("AuthRateLimitRPM = %d, want 20 (env overrides YAML 10)", cfg.AuthRateLimitRPM)
+	}
+	if cfg.AuthRateLimitBurst != 15 {
+		t.Errorf("AuthRateLimitBurst = %d, want 15 (env overrides YAML 5)", cfg.AuthRateLimitBurst)
+	}
+	if cfg.AuthRateLimitWindow != 7*time.Minute {
+		t.Errorf("AuthRateLimitWindow = %v, want 7m (env overrides YAML 3m)", cfg.AuthRateLimitWindow)
+	}
+}
+
+func TestClampFloatBoundaryConditions(t *testing.T) {
+	tests := []struct {
+		name string
+		v    float64
+		min  float64
+		max  float64
+		want float64
+	}{
+		{"in_range", 0.5, 0.0, 1.0, 0.5},
+		{"below_min", -0.5, 0.0, 1.0, 0.0},
+		{"above_max", 1.5, 0.0, 1.0, 1.0},
+		{"exact_min", 0.0, 0.0, 1.0, 0.0},
+		{"exact_max", 1.0, 0.0, 1.0, 1.0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := clampFloat(tc.v, tc.min, tc.max)
+			if got != tc.want {
+				t.Errorf("clampFloat(%v, %v, %v) = %v, want %v", tc.v, tc.min, tc.max, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseBoolEnvStr(t *testing.T) {
+	// Tests verify that recognized boolean strings return the correct value,
+	// and that unrecognized strings (typos) return the default.
+	tests := []struct {
+		name   string
+		val    string
+		def    bool
+		want   bool
+		isTypo bool // if true, this is a typo that should fall through to default
+	}{
+		// Recognized true values
+		{"true_lower", "true", false, true, false},
+		{"TRUE_UPPER", "TRUE", false, true, false},
+		{"True_Mixed", "True", false, true, false},
+		{"one", "1", false, true, false},
+		{"yes_lower", "yes", false, true, false},
+		{"YES_UPPER", "YES", false, true, false},
+		{"on_lower", "on", false, true, false},
+		{"ON_UPPER", "ON", false, true, false},
+		// Recognized false values
+		{"false_lower", "false", true, false, false},
+		{"FALSE_UPPER", "FALSE", true, false, false},
+		{"False_Mixed", "False", true, false, false},
+		{"zero", "0", true, false, false},
+		{"no_lower", "no", true, false, false},
+		{"NO_UPPER", "NO", true, false, false},
+		{"off_lower", "off", true, false, false},
+		{"OFF_UPPER", "OFF", true, false, false},
+		// Whitespace trimming
+		{"spaces_around", "  true  ", false, true, false},
+		{"tab_prefix", "\ton", false, true, false},
+		// Default-return branch (typos / unrecognized values — should return default)
+		{"typo_ture", "ture", false, false, true},
+		{"typo_faalse", "faalse", true, true, true},
+		{"typo_yess", "yess", false, false, true},
+		{"typo_onn", "onn", true, true, true},
+		{"random_string", "random", false, false, true},
+		{"empty_string", "", false, false, true},
+		{"non_boolean_number", "123", false, false, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseBoolEnvStr(tc.val, tc.def)
+			want := tc.def
+			if !tc.isTypo {
+				want = tc.want
+			}
+			if got != want {
+				t.Errorf("parseBoolEnvStr(%q, %v) = %v, want %v", tc.val, tc.def, got, want)
+			}
+		})
 	}
 }

@@ -27,6 +27,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
 
@@ -42,6 +43,7 @@ type LocalCompletion struct {
 	Instruction string
 	Output      string
 	LocalModel  string
+	Route       string // routing path that produced this output: "local", "fusion", or "frontier"
 }
 
 // JudgeObserver is the hook the chat handler invokes when a
@@ -86,12 +88,21 @@ func (f LatencyObserverFunc) ObserveLatency(e LatencyEvent) { f(e) }
 // PipelineStageEvent carries per-stage timing breakdown for a single
 // request (issue #300). Each field is integer milliseconds spent in
 // that pipeline stage; 0 when the stage was skipped or not applicable.
+//
+// SLMConfidence and SLMTaskType carry the routing decision metadata
+// (issue #425). Confidence is 0.0..1.0 from the judge-guided
+// adaptive routing store; TaskType is the Categorize() bucket.
+// Both are 0/"" when the SLM was not consulted (guardrail/DSL path).
 type PipelineStageEvent struct {
 	RAGRetrievalMs      int64
 	PromptEngineeringMs int64
 	TOONCompressionMs   int64
 	SLMRoutingMs        int64
 	UpstreamFirstByteMs int64 // TTFT minus all proxy overhead stages
+
+	// SLM confidence for histogram recording (issue #425).
+	SLMConfidence float64
+	SLMTaskType   string
 }
 
 // PipelineStageObserver is called after each request completes with
@@ -178,6 +189,12 @@ type RouteDecisionEvent struct {
 	// Valid values are "exact" (exact string match) and "semantic"
 	// (cosine similarity match, issue #245). Empty when CacheHit is false.
 	CacheHitKind string
+
+	// DSLMiss is true when the DSL fast-pass had no opinion (miss)
+	// and the request fell through to the SLM (issue #875). This lets
+	// observers distinguish a direct SLM decision from a DSL-miss → SLM
+	// fallback.
+	DSLMiss bool
 }
 
 // RouteDecisionObserver is the hook invoked once per proxied request
@@ -225,6 +242,9 @@ const (
 	// RejectionBudget marks a 429 Too Many Requests response emitted
 	// when the rolling 24h frontier budget is exhausted (issue #220).
 	RejectionBudget = "budget"
+	// RejectionAuthRateLimit marks a 429 Too Many Requests response
+	// emitted by the auth brute-force limiter (issue #296).
+	RejectionAuthRateLimit = "auth_rate_limit"
 )
 
 // RejectionEvent carries the minimal context a rejection observer
@@ -260,6 +280,13 @@ func (f RejectionObserverFunc) ObserveRejection(e RejectionEvent) { f(e) }
 type FusionOutcomeEvent struct {
 	RequestID      string
 	ArbiterSkipped bool
+	// SkipReason describes why the arbiter was skipped (issue #882):
+	// "agreement" when the two panel members agreed, "tool_calls" when
+	// the speculative winner carried tool calls, "one_member" when only
+	// one panel member returned content, "cache_hit" when the arbiter
+	// synthesis was served from cache. Empty when ArbiterSkipped is
+	// false (arbiter was invoked).
+	SkipReason string
 }
 
 // FusionOutcomeObserver is the hook invoked once per fusion request
@@ -279,16 +306,34 @@ type FusionOutcomeObserverFunc func(FusionOutcomeEvent)
 func (f FusionOutcomeObserverFunc) ObserveFusionOutcome(e FusionOutcomeEvent) { f(e) }
 
 // RAGEvent carries the outcome of a single RAG retrieval attempt
-// (issue #186). Hit is true when Retrieve returned a non-nil example;
-// Filename is the matched snippet (meaningful only when Hit is true).
-// MissReason is the miss cause when Hit is false: "empty_store" when
-// the store has no indexed examples, "threshold" when the best match
-// fell below the similarity floor, or "embed_error" when the embedding
-// call failed.
+// (issue #186, extended in #447). Hit is true when Retrieve returned a
+// non-nil example; Filename is the matched snippet (meaningful only
+// when Hit is true). MissReason is the miss cause when Hit is false:
+// "empty_store" when the store has no indexed examples, "threshold"
+// when the best match fell below the similarity floor, or
+// "embed_error" when the embedding call failed.
+//
+// Score and IndexPath record the search telemetry (issue #447):
+// IndexPath is the algorithm Retrieve actually used
+// ("hnsw" or "brute_force"), and Score is the cosine similarity of the
+// best candidate (always populated when IndexPath is non-empty, even
+// for threshold misses). For the fast-exit cases
+// (empty_store / empty_prompt / embed_error) both fields are zero so
+// the observability layer can partition the similarity histogram by
+// path without polluting it with sentinel values.
+//
+// EffectiveThreshold records the similarity threshold that was applied
+// for this retrieval (issue #671). When per-directory overrides are
+// configured via NEXUS_RAG_THRESHOLD_<DIR>, this may differ from the
+// global NEXUS_RAG_THRESHOLD. Operators use this label to tune
+// per-domain thresholds by observing which thresholds produce hits.
 type RAGEvent struct {
-	Hit        bool
-	Filename   string
-	MissReason string
+	Hit                bool
+	Filename           string
+	MissReason         string
+	Score              float64
+	IndexPath          string  // "" | "hnsw" | "brute_force" (see rag.IndexPath)
+	EffectiveThreshold float64 // threshold that was applied (global or per-directory override)
 }
 
 // RAGObserver is the hook invoked once per RAG retrieval attempt,
@@ -307,10 +352,10 @@ func (f RAGObserverFunc) ObserveRAG(e RAGEvent) { f(e) }
 // CascadeFallbackEvent carries the reason for a cascade fallback (issue #205).
 // The handler dispatches one when a retryable step failure causes the cascade
 // to fall back to the next step. The reason is one of "timeout",
-// "transport_error", or "malformed_toolcall".
+// "transport_error", "malformed_toolcall", or "malformed_response".
 type CascadeFallbackEvent struct {
 	RequestID string
-	Reason    string // "timeout", "transport_error", or "malformed_toolcall"
+	Reason    string // "timeout", "transport_error", "malformed_toolcall", or "malformed_response"
 }
 
 // CascadeFallbackObserver is the hook invoked when the cascade falls back
@@ -335,6 +380,12 @@ func (f CascadeFallbackObserverFunc) ObserveCascadeFallback(e CascadeFallbackEve
 type CircuitBreakerObserver interface {
 	RecordCircuitFailure(circuit string)
 	RecordCircuitRecovery(circuit string)
+	// IncEmbedderFailure records a circuit trip for an embedder (issue #423).
+	IncEmbedderFailure(kind string)
+	// IncRAGCircuitTrip records a RAG circuit breaker trip for an embedder kind (issue #886).
+	IncRAGCircuitTrip(kind string)
+	// IncRAGCircuitRecover records a RAG circuit breaker recovery for an embedder kind (issue #886).
+	IncRAGCircuitRecover(kind string)
 }
 
 // CircuitBreakerObserverFunc adapts a plain function to the
@@ -346,6 +397,16 @@ func (f CircuitBreakerObserverFunc) RecordCircuitFailure(circuit string) { f(cir
 
 // RecordCircuitRecovery implements CircuitBreakerObserver.
 func (f CircuitBreakerObserverFunc) RecordCircuitRecovery(circuit string) { f(circuit) }
+
+// IncEmbedderFailure implements CircuitBreakerObserver (issue #423).
+// The embedded function is called with the embedder kind (e.g. "openai").
+func (f CircuitBreakerObserverFunc) IncEmbedderFailure(kind string) {}
+
+// IncRAGCircuitTrip implements CircuitBreakerObserver (issue #886).
+func (f CircuitBreakerObserverFunc) IncRAGCircuitTrip(kind string) {}
+
+// IncRAGCircuitRecover implements CircuitBreakerObserver (issue #886).
+func (f CircuitBreakerObserverFunc) IncRAGCircuitRecover(kind string) {}
 
 // MetricsEvent carries the per-request data needed by the savings
 // dashboard (issue #4). Fields track the full round-trip metrics:
@@ -524,6 +585,11 @@ type Deps struct {
 	// judge; main.go bridges JudgeScore -> RecordOutcome.
 	Confidence router.ConfidenceStore
 
+	// ConfidenceErrorHook is invoked when LocalConfidence returns an error
+	// in the planner (issue #927). The hook logs at Warn level and increments
+	// the nexus_confidence_errors_total counter. Nil is a safe no-op.
+	ConfidenceErrorHook func(category string, err error)
+
 	// SLMCache is the optional time-bounded prompt→route cache
 	// (issue #206). When non-nil the planner checks the cache before
 	// calling the SLM; a cache hit returns the cached route without
@@ -684,8 +750,8 @@ type Deps struct {
 	// later step due to a retryable error (issue #205). The handler
 	// dispatches exactly one event per request when FallbackReason is
 	// non-empty (i.e., the cascade fell back at least once). The
-	// reason is one of "timeout", "transport_error", or
-	// "malformed_toolcall". Implementations must be safe for concurrent
+	// reason is one of "timeout", "transport_error",
+	// "malformed_toolcall", or "malformed_response". Implementations must be safe for concurrent
 	// use and must not block. Nil means "no observer"; the hot path is
 	// unaffected. The handler does not import the observability package —
 	// main.go wires a closure that forwards to
@@ -707,6 +773,15 @@ type Deps struct {
 	// if detected. Safe for concurrent use; nil is "no observer" so the
 	// hot path is unaffected.
 	PanelPanicObserver func()
+
+	// InjectionHitObserver is invoked once per request that produced at
+	// least one suspicious prompt-injection pattern hit (issue #482).
+	// mode is "warn" or "strict" depending on the configured injection
+	// mode. The handler does not import the observability package —
+	// main.go wires a closure that forwards to
+	// RouteCounters.ObservePromptInjectionHit. Safe for concurrent use;
+	// nil is "no observer" so boot and tests without metrics still pass.
+	InjectionHitObserver func(mode string)
 
 	// ArbiterCache is the optional in-memory cache for fusion arbiter
 	// synthesis responses (issue #232). When non-nil and
@@ -856,7 +931,8 @@ func Chat(d Deps) http.Handler {
 
 		if r.Method != http.MethodPost {
 			recordRejection(RejectionMethod)
-			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			writeJSONError(w, http.StatusMethodNotAllowed, ErrTypeMethodNotAllowed,
+				"Only POST is supported on /v1/chat/completions")
 			return
 		}
 
@@ -873,7 +949,7 @@ func Chat(d Deps) http.Handler {
 			var maxErr *http.MaxBytesError
 			if errors.As(err, &maxErr) {
 				recordRejection(RejectionBodyTooLarge)
-				writeJSONError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
+				writeJSONError(w, http.StatusRequestEntityTooLarge, ErrTypeRequestTooLarge, fmt.Sprintf(
 					"Request body exceeds NEXUS_MAX_BODY_BYTES (%d bytes)", maxBytes))
 				slog.Warn("rejected oversized request",
 					slog.String("remote", r.RemoteAddr),
@@ -883,19 +959,22 @@ func Chat(d Deps) http.Handler {
 				return
 			}
 			recordRejection(RejectionBadRequest)
-			http.Error(w, "Failed to read request", http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, ErrTypeInvalidRequest,
+				"Failed to read request body")
 			return
 		}
 		var body map[string]interface{}
 		if err := json.Unmarshal(bodyBytes, &body); err != nil {
 			recordRejection(RejectionBadRequest)
-			http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, ErrTypeInvalidRequest,
+				"Invalid JSON payload")
 			return
 		}
 		rawMessages, ok := body["messages"].([]interface{})
 		if !ok {
 			recordRejection(RejectionBadRequest)
-			http.Error(w, "Invalid or missing messages array", http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, ErrTypeInvalidRequest,
+				"Invalid or missing messages array")
 			return
 		}
 
@@ -913,20 +992,33 @@ func Chat(d Deps) http.Handler {
 			trace.Request.Stream = s
 		}
 
-		// Prompt-injection hardening (issue #76). In warn and strict
-		// modes the proxy scans the user-supplied system messages for
-		// suspicious override patterns BEFORE applying its own policy.
-		// Strict mode rejects the request with a 400 OpenAI-style
-		// error; warn mode logs and continues. Off mode (default)
-		// skips detection entirely for zero overhead.
+		// Prompt-injection hardening (issue #76, #481). In warn and
+		// strict modes the proxy scans the configured message roles
+		// (InjectionScanRoles; default ["system"]) for suspicious
+		// override patterns BEFORE applying its own policy. Strict
+		// mode rejects the request with a 400 OpenAI-style error; warn
+		// mode logs and continues. Off mode (default) skips detection
+		// entirely for zero overhead.
 		if d.Config.PromptInjectionIsolated() {
-			hits := middleware.DetectSuspiciousSystem(rawMessages)
+			hits := middleware.DetectSuspiciousRoles(rawMessages, d.Config.InjectionScanRoles)
 			if len(hits) > 0 {
+				// Increment the prompt-injection counter once per
+				// suspicious request (issue #482). The mode label is
+				// "warn" or "strict" so operators can alert on volume
+				// by enforcement policy. Called before the mode-specific
+				// handling so the counter fires for both paths.
+				if d.InjectionHitObserver != nil {
+					mode := "warn"
+					if d.Config.PromptInjectionMode == middleware.InjectionModeStrict {
+						mode = "strict"
+					}
+					d.InjectionHitObserver(mode)
+				}
 				if d.Config.PromptInjectionMode == middleware.InjectionModeStrict {
 					recordRejection(RejectionBadRequest)
-					writeJSONError(w, http.StatusBadRequest,
-						"Request rejected: suspicious prompt-injection pattern detected in system message")
-					slog.Warn("strict mode rejected suspicious system message",
+					writeJSONError(w, http.StatusBadRequest, ErrTypeInvalidRequest,
+						"Request rejected: suspicious prompt-injection pattern detected in message")
+					slog.Warn("strict mode rejected suspicious message",
 						slog.Int("patterns", len(hits)),
 						slog.String("request_id", reqID),
 					)
@@ -956,6 +1048,7 @@ func Chat(d Deps) http.Handler {
 		var ragInjected bool
 		var ragFilename string
 		var ragScore float64
+		var ragIndexPath rag.IndexPath
 
 		// Snapshot the embedding cache hit count before Retrieve so we can
 		// determine whether the prompt embedding was served from cache (issue #303).
@@ -964,7 +1057,7 @@ func Chat(d Deps) http.Handler {
 			cacheHitCountBefore = statsProvider.EmbedHitCount()
 		}
 
-		ragEx, ragScore, ragErr := d.RAG.Retrieve(r.Context(), latestPrompt)
+		ragEx, ragScore, ragIndexPath, ragErr := d.RAG.Retrieve(r.Context(), latestPrompt)
 		switch {
 		case ragErr != nil:
 			slog.Info("rag miss",
@@ -979,27 +1072,69 @@ func Chat(d Deps) http.Handler {
 			if d.CircuitBreakerObserver != nil {
 				if s, ok := d.RAG.(interface{ IsBreakerOpen() bool }); ok && s.IsBreakerOpen() {
 					d.CircuitBreakerObserver.RecordCircuitFailure("rag")
+					// Also record the embedder-specific failure counter (issue #423, #886).
+					if kind := rag.CircuitKind(ragErr); kind != "" {
+						d.CircuitBreakerObserver.IncEmbedderFailure(kind)
+						d.CircuitBreakerObserver.IncRAGCircuitTrip(kind)
+					}
 				}
 			}
 		case ragEx != nil:
-			messages = middleware.InjectRAG(messages, rag.FormatInjection(ragEx))
-			slog.Info("rag hit",
-				slog.String("filename", ragEx.Filename),
-				slog.Float64("score", ragScore),
-				slog.String("request_id", reqID),
+			// Size guard (issue #594): a retrieved few-shot example can
+			// be large enough to overflow the model's context window.
+			// InjectRAGWithLimit skips the context block when appending it
+			// would push the latest user message past NEXUS_MAX_BODY_BYTES.
+			contextBlock := rag.FormatInjection(ragEx)
+			messages, ragInjected = middleware.InjectRAGWithLimit(
+				messages, contextBlock, d.Config.EffectiveMaxBodyBytes(),
 			)
-			ragInjected = true
-			ragFilename = ragEx.Filename
-			if d.RAGObserver != nil {
-				d.RAGObserver.ObserveRAG(RAGEvent{Hit: true, Filename: ragEx.Filename})
+			if ragInjected {
+				slog.Info("rag hit",
+					slog.String("filename", ragEx.Filename),
+					slog.Float64("score", ragScore),
+					slog.String("index_path", string(ragIndexPath)),
+					slog.String("request_id", reqID),
+				)
+				ragFilename = ragEx.Filename
+				if d.RAGObserver != nil {
+					d.RAGObserver.ObserveRAG(RAGEvent{
+						Hit:                true,
+						Filename:           ragEx.Filename,
+						Score:              ragScore,
+						IndexPath:          string(ragIndexPath),
+						EffectiveThreshold: d.RAG.ThresholdFor(ragEx.Dir),
+					})
+				}
+			} else {
+				slog.Warn("rag injection skipped: context block exceeds size guard",
+					slog.String("filename", ragEx.Filename),
+					slog.Int("context_block_bytes", len(contextBlock)),
+					slog.Int("max_body_bytes", d.Config.EffectiveMaxBodyBytes()),
+					slog.String("request_id", reqID),
+				)
+				if rec, ok := d.RAG.(rag.InjectionSkipRecorder); ok {
+					rec.IncInjectionSkippedSizeLimit()
+				}
+				if d.RAGObserver != nil {
+					d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "size_limit"})
+				}
 			}
+			// Retrieval itself succeeded regardless of whether the
+			// context block was injected, so reset the RAG embedder's
+			// circuit-breaker state (issue #304).
 			if d.CircuitBreakerObserver != nil {
 				d.CircuitBreakerObserver.RecordCircuitRecovery("rag")
 			}
-			// Reset the RAG embedder's circuit breaker failure counter on
-			// a successful retrieval (issue #304).
 			if s, ok := d.RAG.(interface{ RecordBreakerSuccess() }); ok {
 				s.RecordBreakerSuccess()
+			}
+			// Track per-embedder recovery for observability (issue #886).
+			if d.CircuitBreakerObserver != nil {
+				if rec, ok := d.RAG.(interface{ LastSuccessfulKind() string }); ok {
+					if kind := rec.LastSuccessfulKind(); kind != "" {
+						d.CircuitBreakerObserver.IncRAGCircuitRecover(kind)
+					}
+				}
 			}
 		case d.RAG.Size() == 0:
 			slog.Info("rag miss",
@@ -1013,10 +1148,20 @@ func Chat(d Deps) http.Handler {
 			slog.Info("rag miss",
 				slog.String("reason", "threshold"),
 				slog.Float64("score", ragScore),
+				slog.String("index_path", string(ragIndexPath)),
 				slog.String("request_id", reqID),
 			)
 			if d.RAGObserver != nil {
-				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "threshold"})
+				// For threshold misses, we don't have access to the best candidate's
+				// directory, so we use the global threshold as an approximation.
+				// This still provides useful visibility into threshold behavior.
+				d.RAGObserver.ObserveRAG(RAGEvent{
+					Hit:                false,
+					MissReason:         "threshold",
+					Score:              ragScore,
+					IndexPath:          string(ragIndexPath),
+					EffectiveThreshold: d.RAG.Threshold(),
+				})
 			}
 		}
 		// Determine embedding cache hit by diffing the hit counter before/after
@@ -1027,6 +1172,9 @@ func Chat(d Deps) http.Handler {
 		}
 		ragRetrievalMs = time.Since(started).Milliseconds() - promptEngineeringMs
 		trace.Transforms.RAGInjected = ragInjected
+		if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
+			rootSpan.SetAttr("rag_hits", ragInjected)
+		}
 		trace.Transforms.RAGFilename = ragFilename
 		trace.Transforms.RAGCacheHit = cacheHit
 		trace.Transforms.RAGScore = ragScore
@@ -1040,7 +1188,7 @@ func Chat(d Deps) http.Handler {
 		// (see internal/telemetry.EstimateTokens).
 		preCompressionChars := totalMessageChars(messages)
 		trace.Transforms.TOONBytesBefore = preCompressionChars
-		toonCompressionMethod := middleware.CompressJSONBlocks(messages)
+		toonCompressionMethod := middleware.CompressJSONBlocks(messages, d.Config.TOONUnfenced)
 		if toonCompressionMethod != "" {
 			if d.Config.PromptInjectionIsolated() {
 				messages = middleware.AppendSystemNoteIsolated(messages, d.Config.TOONNotice)
@@ -1092,13 +1240,18 @@ func Chat(d Deps) http.Handler {
 		}
 
 		planner := &router.Planner{
-			SLM:                 d.SLM,
-			Confidence:          d.Confidence,
-			FusionPatterns:      d.Config.DSLFusionPatterns,
-			FormattingRegex:     d.Config.DSLFormattingPatterns,
-			LocalPatternsRegex:  d.LocalPatternsRegex,
-			SLMCache:            d.SLMCache,
-			ConfidenceThreshold: d.Config.SLMConfidenceThreshold,
+			SLM:                  d.SLM,
+			Confidence:           d.Confidence,
+			FusionPatterns:       d.Config.DSLFusionPatterns,
+			FormattingRegex:      d.Config.DSLFormattingPatterns,
+			LocalPatternsRegex:   d.LocalPatternsRegex,
+			UnicodePatternsRegex: d.Config.DSLUnicodePatterns,
+			SLMCache:             d.SLMCache,
+			ConfidenceThreshold:  d.Config.SLMConfidenceThreshold,
+			ConfidenceErrorHook:  d.ConfidenceErrorHook,
+		}
+		if d.Config.SLMConfidenceThreshold > 0 && d.Confidence == nil {
+			slog.Warn("planner: ConfidenceThreshold set but no ConfidenceStore — threshold disabled")
 		}
 		decision := planner.Plan(router.PlanRequest{
 			Prompt:          latestPrompt,
@@ -1129,6 +1282,12 @@ func Chat(d Deps) http.Handler {
 			TaskType:     decision.TaskType,
 			CacheHit:     decision.CacheHit,
 			CacheHitKind: string(decision.CacheHitKind),
+			// DSLMiss is true when the DSL fast-pass had no opinion and the
+			// request fell through to SLM (issue #875). Guardrail and DSL
+			// are the only sources that mean "DSL was evaluated"; everything
+			// else (SLM, SLM-error, escalation, SLM-escalation) means DSL
+			// was bypassed and the request went to SLM.
+			DSLMiss: decision.Source != router.SourceGuardrail && decision.Source != router.SourceDSL,
 		}
 		w.Header().Set("X-Nexus-Route", SanitizeHeaderValue(routeEvent.Route))
 		w.Header().Set("X-Nexus-Route-Source", SanitizeHeaderValue(routeEvent.Source))
@@ -1136,6 +1295,16 @@ func Chat(d Deps) http.Handler {
 		w.Header().Set("X-Nexus-Route-Confidence", SanitizeHeaderValue(formatConfidence(routeEvent.Confidence)))
 		if d.RouteDecisionObserver != nil {
 			d.RouteDecisionObserver.Observe(routeEvent)
+		}
+
+		// Stamp observability attributes on the root span so OTLP backends
+		// can filter traces by route (issue #825) and correlate with slog
+		// logs that already carry request_id (issue #985).
+		if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
+			rootSpan.SetAttr("route", string(route))
+			rootSpan.SetAttr("request_id", reqID)
+			rootSpan.SetAttr("route_reason", decision.Source.TraceReason())
+			rootSpan.SetAttr("token_count", int64(trace.Request.EstimatedTokens))
 		}
 
 		// Emit the slog lines the pre-extraction handler produced, so
@@ -1183,8 +1352,9 @@ func Chat(d Deps) http.Handler {
 
 		// Populate the debug trace from the Decision. The trace reason
 		// uses the planner's source-to-reason mapping so the labels
-		// ("guardrail", "dsl", "slm") are backward-compatible with the
-		// pre-extraction handler.
+		// ("guardrail", "dsl", "slm", "slm-error", "slm-no-client",
+		// "slm-low-confidence") remain stable and distinguish the SLM
+		// outcome that produced the route.
 		trace.Routing.Route = string(decision.Route)
 		trace.Routing.Reason = decision.Source.TraceReason()
 		trace.Routing.BudgetSource = decision.BudgetSource
@@ -1207,11 +1377,17 @@ func Chat(d Deps) http.Handler {
 		// the debug log reflects what the handler actually used.
 		trace.Request.Stream = streaming
 
+		// Capture root span for TTFT and stream_complete events (issue #1052).
+		// Nil-safe: AddEvent is a no-op when span is nil.
+		rootSpanForEvents, _ := tracing.RootSpanFromContext(r.Context())
+
 		// Wrap the response writer so we can capture TTFT and byte counts
 		// without affecting upstream.Stream's flusher contract.
 		var firstWriteAt atomic.Int64 // unix nano; 0 means "no write yet"
 		obs := telemetry.NewObservingWriter(w, func(t time.Time) {
-			firstWriteAt.CompareAndSwap(0, t.UnixNano())
+			if firstWriteAt.CompareAndSwap(0, t.UnixNano()) {
+				rootSpanForEvents.AddEvent("first_token")
+			}
 		})
 
 		// Graceful degradation (issue #8) + local-route cooldown
@@ -1318,7 +1494,8 @@ func Chat(d Deps) http.Handler {
 					slog.Float64("cost_estimate", frontierCost),
 				)
 				recordRejection(RejectionBudget)
-				http.Error(w, "Budget exhausted", http.StatusTooManyRequests)
+				writeJSONError(w, http.StatusTooManyRequests, ErrTypeBudgetExceeded,
+					"Frontier budget exhausted for the rolling 24h window")
 				break
 			}
 			if streaming && d.Config.FusionProgressiveDelivery {
@@ -1327,7 +1504,7 @@ func Chat(d Deps) http.Handler {
 					r.Context(),
 					obs, d.Client,
 					d.Config.OllamaURL, d.Config.LocalModel,
-					d.Config.FrontierURL, d.Config.FrontierModel,
+					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
 					body, latestPrompt, d.Config.FusionTimeout,
 					d.Config.ArbiterTimeout,
@@ -1353,24 +1530,35 @@ func Chat(d Deps) http.Handler {
 					d.FusionOutcomeObserver.ObserveFusionOutcome(FusionOutcomeEvent{
 						RequestID:      reqID,
 						ArbiterSkipped: outcome.ArbiterSkipped,
+						SkipReason:     outcome.SkipReason,
 					})
 				}
 			} else {
+				var outcome upstream.PanelOutcome
 				var cacheHit bool
-				cacheHit, upErr = upstream.Panel(
+				outcome, cacheHit, upErr = upstream.Panel(
 					r.Context(),
 					obs, d.Client,
 					d.Config.OllamaURL, d.Config.LocalModel,
-					d.Config.FrontierURL, d.Config.FrontierModel,
+					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
 					body, latestPrompt, d.Config.FusionTimeout,
 					d.Config.ArbiterTimeout,
 					skipLocal,
+					reqID,
 					d.ArbiterCache,
 					d.Config.ArbiterCacheTTL,
+					false, // isFusion: false when called directly (legacy path, issue #984)
 				)
 				if d.ArbiterCacheObserver != nil {
 					d.ArbiterCacheObserver(cacheHit)
+				}
+				if d.FusionOutcomeObserver != nil {
+					d.FusionOutcomeObserver.ObserveFusionOutcome(FusionOutcomeEvent{
+						RequestID:      reqID,
+						ArbiterSkipped: outcome.ArbiterSkipped,
+						SkipReason:     outcome.SkipReason,
+					})
 				}
 			}
 			if upErr != nil {
@@ -1384,12 +1572,17 @@ func Chat(d Deps) http.Handler {
 				if d.PanelPanicObserver != nil && strings.Contains(upErr.Error(), "panic:") {
 					d.PanelPanicObserver()
 				}
-				http.Error(w, "Upstream error", http.StatusBadGateway)
+				writeJSONError(w, http.StatusBadGateway, ErrTypeUpstreamError,
+					"Fusion panel failed; both local and frontier members errored")
 			} else if d.SpendGuard != nil && frontierCost > 0 {
 				// Budget guard: record after successful fusion frontier leg (issue #220).
 				d.SpendGuard.Record(r.Context(), frontierCost, "frontier")
 			}
 			model = d.Config.FrontierModel
+			if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
+				rootSpan.SetAttr("ai.model", model)
+				rootSpan.SetAttr("upstream_target", trace.Upstream.TargetHost)
+			}
 
 		case router.RouteLocal:
 			// VRAM-aware concurrency ceiling (issue #81). Bound the
@@ -1415,7 +1608,8 @@ func Chat(d Deps) http.Handler {
 					trace.Upstream.Streaming = streaming
 					trace.Upstream.Model = model
 					trace.Upstream.TargetHost = HostOfURL(d.Config.OllamaURL)
-					http.Error(w, "Local route busy", http.StatusServiceUnavailable)
+					writeJSONError(w, http.StatusServiceUnavailable, ErrTypeLocalCapacityError,
+						"Local route is at capacity; retry or fall back to frontier")
 					break
 				}
 				defer release()
@@ -1459,20 +1653,21 @@ func Chat(d Deps) http.Handler {
 						APIKey: p.APIKey(),
 					})
 				}
-				cas = &upstream.Cascade{Steps: steps, Timeout: d.Config.CascadeTimeout}
+				cas = &upstream.Cascade{Steps: steps, Timeout: d.Config.CascadeTimeout, MaxResponseBytes: d.Config.EffectiveCascadeMaxResponseBytes()}
 			} else {
 				// Legacy path: build cascade from config (frontier + z.ai).
 				cas = upstream.BuildLocalCascade(upstream.CascadeConfig{
-					LocalURL:      d.Config.OllamaURL,
-					LocalModel:    d.Config.LocalModel,
-					FrontierURL:   d.Config.FrontierURL,
-					FrontierModel: d.Config.FrontierModel,
-					FrontierKey:   d.Config.FrontierKey,
-					ZAIURL:        d.Config.ZAIURL,
-					ZAIModel:      d.Config.ZAIModel,
-					ZAIKey:        d.Config.ZAIKey,
-					Timeout:       d.Config.CascadeTimeout,
-					SkipLocal:     skipLocal,
+					LocalURL:         d.Config.OllamaURL,
+					LocalModel:       d.Config.LocalModel,
+					FrontierURL:      d.Config.FrontierURL,
+					FrontierModel:    d.Config.FrontierModel,
+					FrontierKey:      d.Config.FrontierKey,
+					ZAIURL:           d.Config.ZAIURL,
+					ZAIModel:         d.Config.ZAIModel,
+					ZAIKey:           d.Config.ZAIKey,
+					Timeout:          d.Config.CascadeTimeout,
+					MaxResponseBytes: d.Config.EffectiveCascadeMaxResponseBytes(),
+					SkipLocal:        skipLocal,
 				})
 			}
 
@@ -1496,7 +1691,7 @@ func Chat(d Deps) http.Handler {
 				// #8) is honoured — when the health poller reports
 				// Ollama unreachable the cascade skips the local step
 				// entirely and starts at frontier.
-				res, err := cas.Run(r.Context(), rw, d.Client, body)
+				res, err := cas.Run(r.Context(), rw, d.Client, body, reqID)
 				logCascadeTelemetry(res, err, reqID)
 				// Issue #205: record cascade fallback metric when a retryable
 				// step failure caused the cascade to fall back to the next
@@ -1530,8 +1725,10 @@ func Chat(d Deps) http.Handler {
 						slog.Any("err", err),
 						slog.String("request_id", reqID),
 					)
+					model = d.Config.LocalModel
 					upErr = err
-					http.Error(w, "Upstream error", http.StatusBadGateway)
+					writeJSONError(w, http.StatusBadGateway, ErrTypeUpstreamError,
+						"Cascade failed; all local and frontier steps errored")
 					// fall through: telemetry Record still fires
 					// below so the failed request shows up in the
 					// dashboard.
@@ -1545,6 +1742,7 @@ func Chat(d Deps) http.Handler {
 								Instruction: latestPrompt,
 								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
+								Route:       string(route),
 							})
 						}
 						if d.QualityObserver != nil {
@@ -1597,7 +1795,8 @@ func Chat(d Deps) http.Handler {
 						slog.String("request_id", reqID),
 					)
 					upErr = err
-					http.Error(w, "Upstream error", http.StatusBadGateway)
+					writeJSONError(w, http.StatusBadGateway, ErrTypeUpstreamError,
+						"Buffered fetch of upstream failed")
 					// Issue #80: a non-streaming local fetch failure is
 					// also a local failure — arm the cooldown so the next
 					// request skips local and goes to the fallback.
@@ -1619,6 +1818,7 @@ func Chat(d Deps) http.Handler {
 								Instruction: latestPrompt,
 								Output:      capw.Buffer(),
 								LocalModel:  d.Config.LocalModel,
+								Route:       string(route),
 							})
 						}
 						if d.QualityObserver != nil {
@@ -1638,6 +1838,10 @@ func Chat(d Deps) http.Handler {
 				trace.Upstream.CascadeServedBy = ""
 				trace.Upstream.CascadeSuccess = upErr == nil
 			}
+			if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
+				rootSpan.SetAttr("ai.model", model)
+				rootSpan.SetAttr("upstream_target", trace.Upstream.TargetHost)
+			}
 
 		default:
 			model = d.Config.FrontierModel
@@ -1648,7 +1852,8 @@ func Chat(d Deps) http.Handler {
 					slog.Float64("cost_estimate", frontierCost),
 				)
 				recordRejection(RejectionBudget)
-				http.Error(w, "Budget exhausted", http.StatusTooManyRequests)
+				writeJSONError(w, http.StatusTooManyRequests, ErrTypeBudgetExceeded,
+					"Frontier budget exhausted for the rolling 24h window")
 				break
 			}
 			// Honor the harness's stream flag (issue #10). Stream
@@ -1682,7 +1887,8 @@ func Chat(d Deps) http.Handler {
 						slog.Any("err", upErr),
 						slog.String("request_id", reqID),
 					)
-					http.Error(w, "Upstream error", http.StatusBadGateway)
+					writeJSONError(w, http.StatusBadGateway, ErrTypeUpstreamError,
+						"Frontier upstream call failed")
 				}
 			} else if d.SpendGuard != nil && frontierCost > 0 {
 				// Budget guard: record after successful frontier call (issue #220).
@@ -1695,6 +1901,10 @@ func Chat(d Deps) http.Handler {
 			trace.Upstream.Streaming = streaming
 			trace.Upstream.Model = model
 			trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
+			if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
+				rootSpan.SetAttr("ai.model", model)
+				rootSpan.SetAttr("upstream_target", trace.Upstream.TargetHost)
+			}
 		}
 
 		// Per-request recording. The metrics observer (issue #4)
@@ -1776,6 +1986,22 @@ func Chat(d Deps) http.Handler {
 			d.Recorder.Record(rec)
 		}
 
+		// Stamp remaining observability attributes on the root span so
+		// OTLP backends can filter traces by streaming mode, correlate
+		// errors, and analyze token counts without joining telemetry store.
+		if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
+			rootSpan.SetAttr("streaming", streaming)
+			if upErr != nil {
+				rootSpan.SetAttr("error", upErr.Error())
+			}
+			if rec.InputTokens > 0 {
+				rootSpan.SetAttr("input_tokens", int64(rec.InputTokens))
+			}
+			if rec.OutputTokens > 0 {
+				rootSpan.SetAttr("output_tokens", int64(rec.OutputTokens))
+			}
+		}
+
 		// LatencyObserver (issue #165): fired after the upstream response
 		// completes so callers can record end-to-end latency histograms.
 		// ttftMs is already computed above; convert to float64 seconds.
@@ -1807,6 +2033,8 @@ func Chat(d Deps) http.Handler {
 				TOONCompressionMs:   toonCompressionMs,
 				SLMRoutingMs:        slmRoutingMs,
 				UpstreamFirstByteMs: ttftMs,
+				SLMConfidence:       decision.Confidence,
+				SLMTaskType:         decision.TaskType,
 			})
 		}
 
@@ -1838,6 +2066,12 @@ func Chat(d Deps) http.Handler {
 			}
 			trace.Emit(slog.Default())
 		}
+
+		// stream_complete event marks the end of streaming (issue #1052).
+		// Nil-safe: AddEvent is a no-op when span is nil.
+		if streaming {
+			rootSpanForEvents.AddEvent("stream_complete")
+		}
 	})
 }
 
@@ -1856,18 +2090,49 @@ func logCascadeTelemetry(res upstream.CascadeResult, err error, requestID string
 	)
 }
 
-// writeJSONError writes a structured JSON error response. Used for the
-// 413 body-cap overflow (issue #11) so clients get a parseable error
-// rather than a plain-text body. The shape matches the OpenAI error
-// envelope (`{"error":{"message":...,"type":...}}`) so existing
-// OpenAI-compatible clients surface the message without changes.
-func writeJSONError(w http.ResponseWriter, status int, message string) {
+// Stable error type identifiers used in the OpenAI-style error envelope
+// (issue #453). These strings are part of the public contract: they
+// let an OpenAI-compatible SDK dispatch on `error.type` without
+// parsing the localized message. The taxonomy mirrors OpenAI's own
+// vocabulary where applicable (invalid_request_error, rate_limit_
+// exceeded, server_error) and adds a few nexus-specific categories for
+// non-OpenAI failure modes (method_not_allowed, request_too_large,
+// upstream_error, local_capacity_exceeded).
+const (
+	ErrTypeInvalidRequest     = "invalid_request_error"
+	ErrTypeMethodNotAllowed   = "method_not_allowed"
+	ErrTypeRequestTooLarge    = "request_too_large"
+	ErrTypeRateLimitExceeded  = "rate_limit_exceeded"
+	ErrTypeBudgetExceeded     = "budget_exceeded"
+	ErrTypeUpstreamError      = "upstream_error"
+	ErrTypeServerError        = "server_error"
+	ErrTypeLocalCapacityError = "local_capacity_exceeded"
+)
+
+// writeJSONError writes a structured JSON error response. The shape
+// matches the OpenAI error envelope
+// (`{"error":{"message":...,"type":...,"code":...}}`) so existing
+// OpenAI-compatible SDKs surface the message without having to parse
+// `text/plain` bodies. errorType is a stable identifier (see the
+// ErrType* constants above); clients can dispatch on it without
+// parsing the message. The code field echoes the HTTP status as a
+// short ASCII token so SDKs that expect a numeric status string
+// (rather than parsing the header) keep working.
+//
+// Every chat-handler rejection and upstream-failure path uses this
+// helper (issue #453); the handler's error envelope is now uniformly
+// OpenAI-style.
+func writeJSONError(w http.ResponseWriter, status int, errorType, message string) {
+	if errorType == "" {
+		errorType = ErrTypeServerError
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"error": map[string]string{
 			"message": message,
-			"type":    http.StatusText(status),
+			"type":    errorType,
+			"code":    http.StatusText(status),
 		},
 	})
 }

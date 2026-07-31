@@ -2,11 +2,15 @@ package rag
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 // recordingEmbedder is a stub that records every Embed call. Tests
@@ -26,9 +30,21 @@ func (r *recordingEmbedder) Embed(_ context.Context, text string) ([]float64, er
 	return hashVector(text), nil
 }
 
-func (r *recordingEmbedder) IsHealthy(context.Context) bool { return true }
-func (r *recordingEmbedder) IsBreakerOpen() bool            { return false }
-func (r *recordingEmbedder) RecordBreakerSuccess()          {}
+func (r *recordingEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, texts...)
+	result := make([][]float64, len(texts))
+	for i, text := range texts {
+		result[i] = hashVector(text)
+	}
+	return result, nil
+}
+
+func (r *recordingEmbedder) IsHealthy(context.Context) bool            { return true }
+func (r *recordingEmbedder) IsBreakerOpen() bool                       { return false }
+func (r *recordingEmbedder) RecordBreakerSuccess()                     {}
+func (r *recordingEmbedder) SetTripCallback(string, func(kind string)) {}
 
 func (r *recordingEmbedder) Called() []string {
 	r.mu.Lock()
@@ -333,10 +349,238 @@ func TestWatcherScanOnceRemovesDeleted(t *testing.T) {
 func TestWatcherNewWatcherDefaultsInterval(t *testing.T) {
 	dir := t.TempDir()
 	ps, _ := newWatcherStore(t)
-	w := NewWatcher(ps, dir, 0) // 0 -> default
+	w := NewWatcher(ps, dir, 0) // 0 -> default (fsnotify disabled, 60s fallback)
 	if w.interval <= 0 {
 		t.Errorf("interval = %v, want positive default", w.interval)
 	}
+	if w.interval != 60*time.Second {
+		t.Errorf("interval = %v, want 60s fallback for NEXUS_RAG_POLL_INTERVAL=0", w.interval)
+	}
 	w.Start(context.Background())
 	w.Stop()
+}
+
+func TestWatcherFsnotifyDetection(t *testing.T) {
+	// This test verifies that when fsnotify is available (interval > 0),
+	// the watcher uses immediate event detection rather than waiting
+	// for a full poll interval.
+	dir := t.TempDir()
+	ps, emb := newWatcherStore(t)
+
+	w := NewWatcher(ps, dir, 10*time.Millisecond) // short interval, fsnotify active
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.Start(ctx)
+	defer w.Stop()
+
+	// Wait for initial scan.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ps.Size() == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Write a new file.
+	if err := os.WriteFile(filepath.Join(dir, "fast.go"), []byte("fast"), 0o644); err != nil {
+		t.Fatalf("write fast.go: %v", err)
+	}
+
+	// With fsnotify, detection should be nearly immediate (sub-second),
+	// not bounded by the poll interval.
+	deadline = time.Now().Add(500 * time.Millisecond)
+	detected := false
+	for time.Now().Before(deadline) {
+		if ps.Size() == 1 {
+			detected = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !detected {
+		t.Errorf("watcher did not detect new file within 500ms (fsnotify may be unavailable)")
+	}
+	if len(emb.Called()) < 1 {
+		t.Errorf("embedder was not called for new file")
+	}
+}
+
+func fakeWatcherFn(events chan fsnotify.Event, errors chan error) func() (*fsnotify.Watcher, error) {
+	return func() (*fsnotify.Watcher, error) {
+		fw, err := fsnotify.NewWatcher()
+		if err != nil {
+			return nil, err
+		}
+		// Replace the unexported channels with our controllable ones.
+		// *fsnotify.Watcher has unexported fields: events<-chan Event,
+		// errors<-chan error, and a non-blocking send goroutine.
+		v := reflect.ValueOf(fw).Elem()
+		v.FieldByName("Events").Set(reflect.ValueOf(events))
+		v.FieldByName("Errors").Set(reflect.ValueOf(errors))
+		return fw, nil
+	}
+}
+
+func TestWatcherDegradesToPollingOnEventsChannelClose(t *testing.T) {
+	dir := t.TempDir()
+	ps, emb := newWatcherStore(t)
+
+	events := make(chan fsnotify.Event, 1)
+	errors := make(chan error, 1)
+
+	w := NewWatcher(ps, dir, 50*time.Millisecond)
+	w.newWatcherFn = fakeWatcherFn(events, errors)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.Start(ctx)
+	defer w.Stop()
+
+	// Wait for initial scan to seed the store.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ps.Size() >= 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Close the Events channel to trigger degradation.
+	// This is what happens on macOS FSEvents buffer overflow.
+	close(events)
+
+	// Write a new file — should be picked up via polling fallback.
+	newFile := filepath.Join(dir, "after-degrade.go")
+	if err := os.WriteFile(newFile, []byte("polled-content"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// The watcher must pick up the file via the ticker path within
+	// two poll intervals (100ms), proving degradation worked.
+	deadline = time.Now().Add(150 * time.Millisecond)
+	found := false
+	for time.Now().Before(deadline) {
+		snaps := ps.Snapshot()
+		for _, s := range snaps {
+			if s.Filename == "after-degrade.go" && s.Content == "polled-content" {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !found {
+		t.Errorf("watcher did not detect file via polling after Events channel closed (content=%v)", ps.Snapshot())
+	}
+	if len(emb.Called()) == 0 {
+		t.Errorf("embedder was not called at all")
+	}
+}
+
+func TestWatcherDegradesToPollingOnErrorsChannelClose(t *testing.T) {
+	dir := t.TempDir()
+	ps, _ := newWatcherStore(t)
+
+	events := make(chan fsnotify.Event, 1)
+	errors := make(chan error, 1)
+
+	w := NewWatcher(ps, dir, 50*time.Millisecond)
+	w.newWatcherFn = fakeWatcherFn(events, errors)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.Start(ctx)
+	defer w.Stop()
+
+	// Close the Errors channel to trigger degradation.
+	close(errors)
+
+	// Write a new file — must still be picked up via polling.
+	newFile := filepath.Join(dir, "err-degrade.go")
+	if err := os.WriteFile(newFile, []byte("err-degrade-content"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	deadline := time.Now().Add(150 * time.Millisecond)
+	found := false
+	for time.Now().Before(deadline) {
+		snaps := ps.Snapshot()
+		for _, s := range snaps {
+			if s.Filename == "err-degrade.go" && s.Content == "err-degrade-content" {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !found {
+		t.Errorf("watcher did not detect file via polling after Errors channel closed (content=%v)", ps.Snapshot())
+	}
+}
+
+func TestWatcherStopReturnsAfterDegradation(t *testing.T) {
+	dir := t.TempDir()
+	ps, _ := newWatcherStore(t)
+
+	events := make(chan fsnotify.Event, 1)
+	errors := make(chan error, 1)
+
+	w := NewWatcher(ps, dir, 50*time.Millisecond)
+	w.newWatcherFn = fakeWatcherFn(events, errors)
+	ctx, cancel := context.WithCancel(context.Background())
+	w.Start(ctx)
+
+	// Give the goroutine time to open fsnotify and register the watch.
+	time.Sleep(50 * time.Millisecond)
+
+	// Trigger degradation then call Stop — it must not deadlock.
+	close(events)
+	done := make(chan struct{})
+	go func() {
+		w.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Stop returned — no deadlock.
+	case <-time.After(2 * time.Second):
+		t.Errorf("Stop() deadlocked after Events channel close")
+	}
+	cancel()
+}
+
+func TestWatcherCloseWhenFsnotifyUnavailable(t *testing.T) {
+	// When fsnotify is unavailable from the start (NewWatcher fails),
+	// fw is nil and the polling-only path is taken. Stop() must not
+	// panic and must return promptly.
+	dir := t.TempDir()
+	ps, _ := newWatcherStore(t)
+
+	// Inject a factory that always fails.
+	w := NewWatcher(ps, dir, 50*time.Millisecond)
+	w.newWatcherFn = func() (*fsnotify.Watcher, error) {
+		return nil, errors.New("fsnotify unavailable")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	w.Start(ctx)
+
+	done := make(chan struct{})
+	go func() {
+		w.Stop() // must not panic
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Clean stop.
+	case <-time.After(2 * time.Second):
+		t.Errorf("Stop() deadlocked when fsnotify unavailable from start")
+	}
+	cancel()
 }

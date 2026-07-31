@@ -12,11 +12,15 @@
 package observability
 
 import (
+	"fmt"
 	"math"
 	"net/http"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/health"
 )
 
 // DefaultBuckets are the histogram bucket upper bounds (in
@@ -26,6 +30,60 @@ import (
 // where local Ollama responses land in the 100 ms–2.5 s band and
 // frontier streams occasionally exceed 10 s.
 var DefaultBuckets = []float64{5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000}
+
+// ConfidenceBuckets are the histogram bucket upper bounds for SLM
+// confidence scores (issue #425). They span 0.1 through 1.0 in 0.1
+// increments; the implicit +Inf bucket catches any value > 1.0.
+var ConfidenceBuckets = []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0}
+
+// RAGSimilarityBuckets are the histogram bucket upper bounds for RAG
+// cosine-similarity scores (issue #447). Cosine similarity on the
+// [-1, 1] range is, in practice for code retrieval, 0..1 with the
+// default floor at 0.55 — same shape as ConfidenceBuckets so the two
+// distributions are visually comparable in Grafana. The implicit
+// +Inf bucket catches any value > 1.0 (which should never happen for
+// cosine but defends against a buggy embedder emitting >1).
+var RAGSimilarityBuckets = []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0}
+
+// RateLimitUtilizationBuckets are the histogram bucket upper bounds for
+// per-client rate-limit bucket utilization fractions (issue #746).
+// Quartiles [0.25, 0.50, 0.75, 1.0] let operators see how close each
+// bucket is to its burst limit at the moment of acquisition.
+var RateLimitUtilizationBuckets = []float64{0.25, 0.50, 0.75, 1.0}
+
+// ragSimilarityLabels are the fixed low-cardinality (path, outcome)
+// label pairs used for the RAG similarity histogram (issue #447).
+// Both axes are bounded at construction:
+//
+//   - path: "hnsw" or "brute_force" (see rag.IndexPath)
+//   - outcome: "hit" or "miss"
+//
+// Total cardinality is 4 series. We pre-allocate one histogram per pair
+// so ObserveRAGSimilarity is a lock-free single increment — the
+// histogram map lookup is read-locked but the histogram's Observe
+// method itself never contends.
+var ragSimilarityLabels = []struct {
+	path    string
+	outcome string
+}{
+	{path: "hnsw", outcome: "hit"},
+	{path: "hnsw", outcome: "miss"},
+	{path: "brute_force", outcome: "hit"},
+	{path: "brute_force", outcome: "miss"},
+}
+
+// slmConfidenceCategories are the fixed low-cardinality task-category
+// labels used for the SLM confidence histogram (issue #425). They
+// mirror the Category* constants in internal/router/confidence.go.
+var slmConfidenceCategories = []string{
+	"css",
+	"refactoring",
+	"debugging",
+	"architecture",
+	"boilerplate",
+	"documentation",
+	"other",
+}
 
 // ObservabilityEvent is the per-request payload the chat handler
 // dispatches to the Collector via the ObservabilityObserver hook. Every
@@ -67,6 +125,13 @@ type ObservabilityEvent struct {
 	TOONCompressionMs   int64 // JSON array compression
 	SLMRoutingMs        int64 // SLM routing decision (including DSL fast-pass)
 	UpstreamFirstByteMs int64 // upstream call to first byte (TTFT minus proxy overhead)
+
+	// SLM confidence recording (issue #425). Confidence is 0.0..1.0
+	// from the judge-guided adaptive routing store; TaskType is the
+	// Categorize() bucket. Both are zero when the SLM was not
+	// consulted (guardrail/DSL stages) or on cache hits.
+	SLMConfidence float64
+	SLMTaskType   string
 }
 
 // Collector is the in-process metrics surface. It is safe for
@@ -118,17 +183,27 @@ type Collector struct {
 
 	// --- Middleware instrumentation (issue #70) ---------------------------
 	//
-	// Auth counters are labelled by outcome via three separate atomics
-	// rather than a label-keyed map. The label set is fixed at three
-	// values, so three atomics is the simplest lock-free layout and
-	// keeps the hot path to a single add per request.
-	authAccepted        atomic.Uint64
-	authRejectedInvalid atomic.Uint64
-	authRejectedMissing atomic.Uint64
+	// Auth counters are labelled by (outcome, client_ip) via maps of
+	// atomics. The outcome label has three fixed values (accepted,
+	// rejected_invalid, rejected_missing); client_ip is dynamic.
+	// Maps are keyed by clientIP to enable per-IP metric tracking so
+	// operators can distinguish attack sources (issue #1061).
+	// The mutex guards map mutations (adding new IP keys); atomic
+	// operations on existing keys are lock-free.
+	authMu              sync.Mutex
+	authAccepted        map[string]*atomic.Uint64
+	authRejectedInvalid map[string]*atomic.Uint64
+	authRejectedMissing map[string]*atomic.Uint64
 
-	// Auth rate limit counter (issue #296). Bumped when the auth
-	// brute-force limiter rejects a client with 429.
-	authRateLimitRejected atomic.Uint64
+	// Auth limiter reaper evictions counter (issue #839). Incremented
+	// each time the reaper goroutine evicts an idle IP from the
+	// failures map.
+	authReaperEvictions atomic.Uint64
+
+	// Auth limiter blocked counter (issue #831/#937). Incremented each time
+	// an IP is blocked (burst threshold crossed) by the auth limiter.
+	// Keyed by reason: "missing" or "invalid".
+	authBlockedTotal map[string]*atomic.Uint64
 
 	// Rate-limit counters are emitted per bucket (global / per_client)
 	// so operators can tell at a glance whether the global bucket or a
@@ -160,6 +235,64 @@ type Collector struct {
 	// Protected by cbMu; read via atomic for hot path.
 	cbMu    sync.RWMutex
 	cbState map[string]*circuitBreakerState
+
+	// --- SLM confidence histogram (issue #425) --------------------
+	//
+	// Per-task-category confidence histograms. Maps category name to
+	// histogram. Pre-allocated in NewCollector so ObserveSLMConfidence
+	// only needs a read lock to find the histogram; the histogram's
+	// Observe method itself is lock-free.
+	slmConfidenceMu         sync.RWMutex
+	slmConfidenceHistograms map[string]*Histogram
+
+	// --- RAG similarity histogram (issue #447) -------------------
+	//
+	// Per-(path, outcome) cosine-similarity histograms. The (path,
+	// outcome) label set is fixed at 4 pairs (see ragSimilarityLabels)
+	// so we pre-allocate the histograms in NewCollector and never
+	// mutate the map after boot. ObserveRAGSimilarity only needs a
+	// read lock to find the histogram; Histogram.Observe is lock-free.
+	ragSimilarityMu         sync.RWMutex
+	ragSimilarityHistograms map[string]*Histogram // keyed by "path|outcome"
+
+	// --- Rate-limit bucket utilization histogram (issue #746) --------
+	//
+	// Per-bucket-ID utilization histograms. Each histogram records the
+	// fractional token utilization (tokens/burst) at the moment of
+	// acquisition. Histograms are created lazily per bucket so the
+	// hot path is a single read-lock + map lookup; Histogram.Observe
+	// itself is lock-free.
+	rateLimitUtilizationMu         sync.RWMutex
+	rateLimitUtilizationHistograms map[string]*Histogram // keyed by bucketID (hashed IP)
+
+	// --- Embedder circuit breaker instrumentation (issue #423) -----
+	//
+	// Tracks failures for each embedder circuit breaker (ollama, rag).
+	// Protected by cbMu for map access; individual counters are atomic.
+	embedderMu       sync.RWMutex
+	embedderFailures map[string]*atomic.Uint64 // keyed by "ollama", "openai", "cohere"
+
+	// --- RAG embedder circuit breaker state metrics (issue #886) -----
+	//
+	// Tracks trip/recover events per embedder kind. State and failure count
+	// are read live from health.breakers at scrape time.
+	ragCircuitMu       sync.RWMutex
+	ragCircuitTrips    map[string]*atomic.Uint64 // keyed by "ollama", "openai", "cohere"
+	ragCircuitRecovers map[string]*atomic.Uint64
+
+	// --- Per-route latency percentile ring buffers (issue #774) --------
+	//
+	// Per-(route) sliding window ring buffers that store recent latency
+	// samples and maintain running p50/p95/p99 estimates. Keyed by route
+	// string ("local", "frontier", "fusion").
+	latencyPercentilesMu sync.RWMutex
+	latencyPercentiles   map[string]*latencyPercentileBuffer
+
+	// --- ConfidenceStore error counter (issue #927) -----------------
+	//
+	// Tracks LocalConfidence errors so operators can detect DB/locking
+	// issues in the SQLite-backed confidence store.
+	confidenceErrorsTotal atomic.Uint64
 }
 
 // circuitBreakerState holds the atomic state for one named circuit.
@@ -180,19 +313,52 @@ const (
 // The returned collector is ready to receive Submit calls and
 // RenderPrometheus scrapes from any goroutine.
 func NewCollector() *Collector {
-	return &Collector{
-		latencyLocal:    NewHistogram(DefaultBuckets),
-		latencyFrontier: NewHistogram(DefaultBuckets),
-		latencyFusion:   NewHistogram(DefaultBuckets),
-		ttftLocal:       NewHistogram(DefaultBuckets),
-		ttftFrontier:    NewHistogram(DefaultBuckets),
-		ttftFusion:      NewHistogram(DefaultBuckets),
-		stageRAG:        NewHistogram(DefaultBuckets),
-		stagePromptEng:  NewHistogram(DefaultBuckets),
-		stageTOON:       NewHistogram(DefaultBuckets),
-		stageSLM:        NewHistogram(DefaultBuckets),
-		stageUpstream:   NewHistogram(DefaultBuckets),
+	c := &Collector{
+		latencyLocal:        NewHistogram(DefaultBuckets),
+		latencyFrontier:     NewHistogram(DefaultBuckets),
+		latencyFusion:       NewHistogram(DefaultBuckets),
+		ttftLocal:           NewHistogram(DefaultBuckets),
+		ttftFrontier:        NewHistogram(DefaultBuckets),
+		ttftFusion:          NewHistogram(DefaultBuckets),
+		stageRAG:            NewHistogram(DefaultBuckets),
+		stagePromptEng:      NewHistogram(DefaultBuckets),
+		stageTOON:           NewHistogram(DefaultBuckets),
+		stageSLM:            NewHistogram(DefaultBuckets),
+		stageUpstream:       NewHistogram(DefaultBuckets),
+		embedderFailures:    make(map[string]*atomic.Uint64),
+		authAccepted:        make(map[string]*atomic.Uint64),
+		authRejectedInvalid: make(map[string]*atomic.Uint64),
+		authRejectedMissing: make(map[string]*atomic.Uint64),
+		authBlockedTotal: map[string]*atomic.Uint64{
+			"missing": {},
+			"invalid": {},
+		},
 	}
+	// Pre-allocate SLM confidence histograms for each known category
+	// (issue #425). Pre-allocation means ObserveSLMConfidence only
+	// needs a read lock to find the histogram; Histogram.Observe
+	// itself is lock-free.
+	c.slmConfidenceHistograms = make(map[string]*Histogram, len(slmConfidenceCategories))
+	for _, cat := range slmConfidenceCategories {
+		c.slmConfidenceHistograms[cat] = NewHistogram(ConfidenceBuckets)
+	}
+	// Pre-allocate RAG similarity histograms for the default (path, outcome)
+	// pairs (issue #447). Additional histograms for per-threshold observations
+	// are created lazily by ObserveRAGSimilarity (issue #671).
+	c.ragSimilarityHistograms = make(map[string]*Histogram, len(ragSimilarityLabels))
+	for _, l := range ragSimilarityLabels {
+		key := ragSimilarityKey(l.path, l.outcome, 0) // 0 = default/global threshold
+		c.ragSimilarityHistograms[key] = NewHistogram(RAGSimilarityBuckets)
+	}
+	return c
+}
+
+// ragSimilarityKey builds the lookup key for the (path, outcome, threshold) tuple.
+// Stable across processes so scrape diffs are reproducible.
+// The threshold is rounded to 2 decimal places to avoid floating-point
+// key explosion while still providing per-threshold visibility (issue #671).
+func ragSimilarityKey(path, outcome string, threshold float64) string {
+	return fmt.Sprintf("%s|%s|%.2f", path, outcome, threshold)
 }
 
 // Submit records one ObservabilityEvent. Called exactly once per
@@ -270,6 +436,14 @@ func (c *Collector) Submit(e ObservabilityEvent) {
 	if e.UpstreamFirstByteMs > 0 {
 		c.stageUpstream.Observe(float64(e.UpstreamFirstByteMs))
 	}
+	// SLM confidence histogram (issue #425). Recorded when both
+	// Confidence > 0 and TaskType is a known category. A zero
+	// confidence means the SLM was not consulted (guardrail/DSL
+	// path); an empty TaskType means cache hit or no confidence
+	// store was wired.
+	if e.SLMConfidence > 0 && e.SLMTaskType != "" {
+		c.ObserveSLMConfidence(e.SLMTaskType, e.SLMConfidence)
+	}
 }
 
 // RequestsLocal returns the cumulative local-route request count.
@@ -313,6 +487,61 @@ func (c *Collector) TTFTFrontier() *Histogram { return c.ttftFrontier }
 // TTFTFusion returns the fusion-route time-to-first-token histogram.
 func (c *Collector) TTFTFusion() *Histogram { return c.ttftFusion }
 
+// ObserveLatency records a latency observation for percentile computation
+// (issue #774). route is the routing decision ("local", "frontier", "fusion").
+// latencyMs is the total request latency in milliseconds. Safe for concurrent use.
+func (c *Collector) ObserveLatency(route string, latencyMs int64) {
+	if c == nil || latencyMs <= 0 {
+		return
+	}
+	c.latencyPercentilesMu.RLock()
+	buf, ok := c.latencyPercentiles[route]
+	c.latencyPercentilesMu.RUnlock()
+	if ok && buf != nil {
+		buf.Observe(float64(latencyMs))
+		return
+	}
+	// Lazily create buffer
+	c.latencyPercentilesMu.Lock()
+	if c.latencyPercentiles == nil {
+		c.latencyPercentiles = make(map[string]*latencyPercentileBuffer)
+	}
+	buf, ok = c.latencyPercentiles[route]
+	if !ok || buf == nil {
+		buf = newLatencyPercentileBuffer(defaultLatencyBufferCapacity)
+		c.latencyPercentiles[route] = buf
+	}
+	c.latencyPercentilesMu.Unlock()
+	buf.Observe(float64(latencyMs))
+}
+
+// LatencyPercentileGauges returns the current p50/p95/p99 latency readings
+// per route as GaugeSamples for the Prometheus renderer. Values are 0 when
+// no samples have been recorded for a route.
+func (c *Collector) LatencyPercentileGauges() []GaugeSample {
+	if c == nil {
+		return nil
+	}
+	c.latencyPercentilesMu.RLock()
+	defer c.latencyPercentilesMu.RUnlock()
+	var out []GaugeSample
+	// Fixed route order for deterministic output
+	for _, route := range []string{"local", "frontier", "fusion"} {
+		buf := c.latencyPercentiles[route]
+		if buf == nil {
+			continue
+		}
+		p50, p95, p99 := buf.Perc()
+		labels := map[string]string{"route": route}
+		out = append(out,
+			GaugeSample{Name: "nexus_upstream_request_latency_p50_seconds", Labels: labels, Value: p50 / 1000}, // ms → s
+			GaugeSample{Name: "nexus_upstream_request_latency_p95_seconds", Labels: labels, Value: p95 / 1000},
+			GaugeSample{Name: "nexus_upstream_request_latency_p99_seconds", Labels: labels, Value: p99 / 1000},
+		)
+	}
+	return out
+}
+
 // --- Middleware instrumentation helpers (issue #70) ----------------------
 //
 // Each helper bumps exactly one atomic counter so the middleware hot
@@ -320,31 +549,68 @@ func (c *Collector) TTFTFusion() *Histogram { return c.ttftFusion }
 // decision logic (when a request is "accepted" vs "rejected_invalid"
 // etc.); the collector only stores the resulting counts.
 
-// IncAuthAccepted records one accepted authentication request.
-func (c *Collector) IncAuthAccepted() { c.authAccepted.Add(1) }
+// IncAuthAccepted records one accepted authentication request from the
+// given client IP (issue #1061).
+func (c *Collector) IncAuthAccepted(clientIP string) {
+	c.authMu.Lock()
+	if _, ok := c.authAccepted[clientIP]; !ok {
+		c.authAccepted[clientIP] = &atomic.Uint64{}
+	}
+	c.authMu.Unlock()
+	c.authAccepted[clientIP].Add(1)
+}
 
 // IncAuthRejectedInvalid records a request that presented a
-// credential but it did not match any configured key.
-func (c *Collector) IncAuthRejectedInvalid() { c.authRejectedInvalid.Add(1) }
+// credential but it did not match any configured key, from the given
+// client IP (issue #1061).
+func (c *Collector) IncAuthRejectedInvalid(clientIP string) {
+	c.authMu.Lock()
+	if _, ok := c.authRejectedInvalid[clientIP]; !ok {
+		c.authRejectedInvalid[clientIP] = &atomic.Uint64{}
+	}
+	c.authMu.Unlock()
+	c.authRejectedInvalid[clientIP].Add(1)
+}
 
 // IncAuthRejectedMissing records a request that presented no
-// credential at all (no Authorization / X-API-Key header).
-func (c *Collector) IncAuthRejectedMissing() { c.authRejectedMissing.Add(1) }
+// credential at all (no Authorization / X-API-Key header), from the
+// given client IP (issue #1061).
+func (c *Collector) IncAuthRejectedMissing(clientIP string) {
+	c.authMu.Lock()
+	if _, ok := c.authRejectedMissing[clientIP]; !ok {
+		c.authRejectedMissing[clientIP] = &atomic.Uint64{}
+	}
+	c.authMu.Unlock()
+	c.authRejectedMissing[clientIP].Add(1)
+}
 
-// IncAuthRateLimitRejected bumps the auth-rate-limit counter when
-// the auth brute-force limiter rejects a client (issue #296).
-func (c *Collector) IncAuthRateLimitRejected() { c.authRateLimitRejected.Add(1) }
+// IncAuthReaperEvictions records one reaper eviction of an idle IP
+// from the auth limiter's failures map (issue #839).
+func (c *Collector) IncAuthReaperEvictions() { c.authReaperEvictions.Add(1) }
+
+// IncAuthBlocked records one auth limiter block event — an IP that
+// crossed the burst threshold and is now blocked (issue #831/#937).
+// reason is "missing" or "invalid", indicating which auth failure type
+// accumulated to the burst threshold.
+func (c *Collector) IncAuthBlocked(reason string) { c.authBlockedTotal[reason].Add(1) }
 
 // AuthAuthenticatedClients returns the cumulative count of accepted
-// authentications. The /metrics renderer exposes it under the gauge
-// name nexus_auth_authenticated_clients so operators can chart a
-// running total of successful auth events without scraping logs.
+// authentications across all client IPs. The /metrics renderer exposes
+// it under the gauge name nexus_auth_authenticated_clients so operators
+// can chart a running total of successful auth events without scraping
+// logs.
 //
 // (The name carries "clients" rather than "events" because the issue
 // spec calls for a gauge by that name; semantically this is a
 // monotonic counter rendered as a gauge family so a single PromQL
 // query shows the long-running trend.)
-func (c *Collector) AuthAuthenticatedClients() uint64 { return c.authAccepted.Load() }
+func (c *Collector) AuthAuthenticatedClients() uint64 {
+	var total uint64
+	for _, v := range c.authAccepted {
+		total += v.Load()
+	}
+	return total
+}
 
 // IncRateLimit bumps the appropriate rate-limit counter for scope
 // (one of "global", "per_client"). The middleware packages own the
@@ -465,6 +731,41 @@ func (c *Collector) CircuitBreakerGauges() []GaugeSample {
 	return out
 }
 
+// RAGCircuitGauges returns live state and failure count readings for all
+// registered RAG embedder circuit breakers (issue #886). State values:
+// 0=closed, 1=half_open, 2=open. Reads directly from health.breakers
+// via health.GetBreakerStates so gauges are always current at scrape time.
+func (c *Collector) RAGCircuitGauges() []GaugeSample {
+	var out []GaugeSample
+	states := health.GetBreakerStates()
+	for kind, st := range states {
+		labels := map[string]string{"service": kind}
+		out = append(out,
+			GaugeSample{Name: "nexus_rag_circuit_state", Labels: labels, Value: float64(st.State)},
+			GaugeSample{Name: "nexus_rag_circuit_failure_count", Labels: labels, Value: float64(st.FailureCount)},
+		)
+	}
+	return out
+}
+
+// Gauges implements GaugeProvider so *Collector can be passed
+// directly to RenderPrometheus via the RouteCounters.Handler() chain
+// (issue #443). It returns the circuit-breaker state, failures,
+// last-failure samples, RAG circuit breaker state/failure count (issue #886),
+// and latency percentile gauges (issue #774).
+// Safe for a nil receiver — returns nil so the collector can be
+// omitted without panicking during boot or in tests.
+func (c *Collector) Gauges() []GaugeSample {
+	if c == nil {
+		return nil
+	}
+	var out []GaugeSample
+	out = append(out, c.CircuitBreakerGauges()...)
+	out = append(out, c.RAGCircuitGauges()...)
+	out = append(out, c.LatencyPercentileGauges()...)
+	return out
+}
+
 // getOrCreateCircuit returns the state for a named circuit, creating
 // it if first seen. Caller must hold cbMu.
 func (c *Collector) getOrCreateCircuit(name string) *circuitBreakerState {
@@ -477,11 +778,115 @@ func (c *Collector) getOrCreateCircuit(name string) *circuitBreakerState {
 	return c.cbState[name]
 }
 
+// IncEmbedderFailure increments the failure counter for the given embedder kind
+// (one of "ollama", "openai", "cohere"). Called when an embedder circuit breaker
+// trips (issue #423).
+func (c *Collector) IncEmbedderFailure(kind string) {
+	if kind == "" {
+		return
+	}
+	c.embedderMu.Lock()
+	defer c.embedderMu.Unlock()
+	if c.embedderFailures == nil {
+		c.embedderFailures = make(map[string]*atomic.Uint64)
+	}
+	if c.embedderFailures[kind] == nil {
+		c.embedderFailures[kind] = new(atomic.Uint64)
+	}
+	c.embedderFailures[kind].Add(1)
+}
+
+// EmbedderFailures returns the current failure counts keyed by embedder kind.
+// Used by the Prometheus renderer.
+func (c *Collector) EmbedderFailures() map[string]uint64 {
+	c.embedderMu.RLock()
+	defer c.embedderMu.RUnlock()
+	out := make(map[string]uint64, len(c.embedderFailures))
+	for k, v := range c.embedderFailures {
+		out[k] = v.Load()
+	}
+	return out
+}
+
+// IncRAGCircuitTrip increments the trip counter for the given embedder kind
+// (one of "ollama", "openai", "cohere"). Called when a RAG embedder circuit
+// breaker trips (issue #886).
+func (c *Collector) IncRAGCircuitTrip(kind string) {
+	if kind == "" {
+		return
+	}
+	c.ragCircuitMu.Lock()
+	defer c.ragCircuitMu.Unlock()
+	if c.ragCircuitTrips == nil {
+		c.ragCircuitTrips = make(map[string]*atomic.Uint64)
+	}
+	if c.ragCircuitTrips[kind] == nil {
+		c.ragCircuitTrips[kind] = new(atomic.Uint64)
+	}
+	c.ragCircuitTrips[kind].Add(1)
+}
+
+// IncRAGCircuitRecover increments the recovery counter for the given embedder kind
+// (one of "ollama", "openai", "cohere"). Called when a RAG embedder circuit
+// breaker recovers (issue #886).
+func (c *Collector) IncRAGCircuitRecover(kind string) {
+	if kind == "" {
+		return
+	}
+	c.ragCircuitMu.Lock()
+	defer c.ragCircuitMu.Unlock()
+	if c.ragCircuitRecovers == nil {
+		c.ragCircuitRecovers = make(map[string]*atomic.Uint64)
+	}
+	if c.ragCircuitRecovers[kind] == nil {
+		c.ragCircuitRecovers[kind] = new(atomic.Uint64)
+	}
+	c.ragCircuitRecovers[kind].Add(1)
+}
+
+// RAGCircuitTrips returns the current trip counts keyed by embedder kind.
+// Used by the Prometheus renderer (issue #886).
+func (c *Collector) RAGCircuitTrips() map[string]uint64 {
+	c.ragCircuitMu.RLock()
+	defer c.ragCircuitMu.RUnlock()
+	out := make(map[string]uint64, len(c.ragCircuitTrips))
+	for k, v := range c.ragCircuitTrips {
+		out[k] = v.Load()
+	}
+	return out
+}
+
+// RAGCircuitRecovers returns the current recovery counts keyed by embedder kind.
+// Used by the Prometheus renderer (issue #886).
+func (c *Collector) RAGCircuitRecovers() map[string]uint64 {
+	c.ragCircuitMu.RLock()
+	defer c.ragCircuitMu.RUnlock()
+	out := make(map[string]uint64, len(c.ragCircuitRecovers))
+	for k, v := range c.ragCircuitRecovers {
+		out[k] = v.Load()
+	}
+	return out
+}
+
+// --- ConfidenceStore error counter (issue #927) --------------------
+
+// IncConfidenceError increments the confidence store error counter.
+// Called when LocalConfidence returns an error so operators can detect
+// DB locking or other SQLite errors in the confidence store path.
+func (c *Collector) IncConfidenceError() { c.confidenceErrorsTotal.Add(1) }
+
+// ConfidenceErrors returns the cumulative confidence store error count.
+// Used by the Prometheus renderer (issue #927).
+func (c *Collector) ConfidenceErrors() uint64 { return c.confidenceErrorsTotal.Load() }
+
 // --- Pipeline stage latency breakdown (issue #300) -------------------
 //
 // ObservePipelineStage records per-stage timing breakdown from the chat
 // handler (issue #300). Each field is milliseconds spent in that stage;
 // 0 when the stage was skipped. Safe for concurrent use.
+//
+// Also records the SLM confidence histogram (issue #425) when
+// SLMConfidence > 0 and SLMTaskType is non-empty.
 func (c *Collector) ObservePipelineStage(e PipelineStageEvent) {
 	if e.RAGRetrievalMs > 0 {
 		c.stageRAG.Observe(float64(e.RAGRetrievalMs))
@@ -498,6 +903,10 @@ func (c *Collector) ObservePipelineStage(e PipelineStageEvent) {
 	if e.UpstreamFirstByteMs > 0 {
 		c.stageUpstream.Observe(float64(e.UpstreamFirstByteMs))
 	}
+	// SLM confidence histogram (issue #425).
+	if e.SLMConfidence > 0 && e.SLMTaskType != "" {
+		c.ObserveSLMConfidence(e.SLMTaskType, e.SLMConfidence)
+	}
 }
 
 // PipelineStageEvent mirrors handlers.PipelineStageEvent so the
@@ -508,6 +917,10 @@ type PipelineStageEvent struct {
 	TOONCompressionMs   int64
 	SLMRoutingMs        int64
 	UpstreamFirstByteMs int64
+
+	// SLM confidence for histogram recording (issue #425).
+	SLMConfidence float64
+	SLMTaskType   string
 }
 
 // Handler returns an http.Handler that renders stage latency histograms
@@ -520,7 +933,239 @@ func (c *Collector) Handler() http.Handler {
 	})
 }
 
+// --- SLM confidence histogram (issue #425) ------------------------------
+//
+// ObserveSLMConfidence records a confidence observation for the given task
+// category. It is called from Submit (which is invoked in the handler's
+// request goroutine after the planner returns a Decision with a
+// confidence value). The histogram itself is pre-allocated per category
+// in NewCollector so this method only needs a read lock to find it;
+// Histogram.Observe is lock-free.
+func (c *Collector) ObserveSLMConfidence(category string, confidence float64) {
+	c.slmConfidenceMu.RLock()
+	h, ok := c.slmConfidenceHistograms[category]
+	c.slmConfidenceMu.RUnlock()
+	if ok && h != nil {
+		h.Observe(confidence)
+	}
+}
+
+// SLMConfidenceHistograms returns the per-category SLM confidence
+// histograms for rendering. Returns nil if the collector is not yet
+// initialized.
+func (c *Collector) SLMConfidenceHistograms() map[string]*Histogram {
+	c.slmConfidenceMu.RLock()
+	defer c.slmConfidenceMu.RUnlock()
+	return c.slmConfidenceHistograms
+}
+
+// --- RAG similarity histogram (issue #447) ------------------------------
+//
+// ObserveRAGSimilarity records one similarity observation for the
+// given (path, outcome, threshold) tuple (issue #447, #671).
+// Called from the RAG observer closure in main.go when
+// handlers.RAGEvent carries a non-empty IndexPath.
+//
+// The outcome is "hit" when the retrieval returned a snippet above the
+// configured threshold and "miss" otherwise; both observations land in
+// the same bucket layout so the bucket counts can be directly compared.
+// Score values outside [0, 1] are clamped to the [0, 1] range so a
+// buggy embedder cannot push an observation into the +Inf bucket
+// spuriously — the cosine contract is that similarity is bounded by 1.
+//
+// path values outside the fixed set ("hnsw", "brute_force") are
+// silently dropped rather than bucketed under a third label, to
+// preserve the bounded-cardinality contract documented for
+// nexus_rag_similarity_histogram.
+//
+// effectiveThreshold is the similarity floor that was applied for this
+// retrieval (issue #671). When per-directory overrides are configured,
+// this may differ from the global NEXUS_RAG_THRESHOLD. Operators use
+// the threshold label to tune per-domain thresholds.
+func (c *Collector) ObserveRAGSimilarity(path, outcome string, score, effectiveThreshold float64) {
+	if score < 0 {
+		score = 0
+	} else if score > 1 {
+		score = 1
+	}
+	key := ragSimilarityKey(path, outcome, effectiveThreshold)
+	c.ragSimilarityMu.RLock()
+	h, ok := c.ragSimilarityHistograms[key]
+	c.ragSimilarityMu.RUnlock()
+	if !ok || h == nil {
+		// Lazily create histogram for this (path, outcome, threshold) combination
+		// (issue #671). This allows per-directory threshold tuning visibility
+		// without pre-allocating histograms for every possible threshold.
+		c.ragSimilarityMu.Lock()
+		// Double-check after acquiring write lock
+		if h, ok = c.ragSimilarityHistograms[key]; !ok || h == nil {
+			h = NewHistogram(RAGSimilarityBuckets)
+			c.ragSimilarityHistograms[key] = h
+		}
+		c.ragSimilarityMu.Unlock()
+	}
+	h.Observe(score)
+}
+
+// RAGSimilarityHistograms returns the per-(path, outcome, threshold) RAG
+// similarity histograms for rendering. The map is keyed by
+// "path|outcome|threshold" (e.g. "hnsw|hit|0.55"); callers iterate the keys to
+// emit nexus_rag_similarity_histogram_bucket lines (issue #671).
+//
+// Returns nil when the collector is not yet initialised (e.g. when a
+// nil receiver is passed to RenderPrometheus). Safe to call from
+// multiple goroutines — returns a snapshot reference to the internal
+// map, which is never mutated after NewCollector returns.
+func (c *Collector) RAGSimilarityHistograms() map[string]*Histogram {
+	c.ragSimilarityMu.RLock()
+	defer c.ragSimilarityMu.RUnlock()
+	return c.ragSimilarityHistograms
+}
+
+// --- Rate-limit bucket utilization histogram (issue #746) ---------------
+//
+// ObserveRateLimitUtilization records one utilization observation for the
+// given bucket ID. The utilization value is clamped to [0, 1] so a
+// buggy caller cannot push an observation past the +Inf bucket
+// spuriously. Histograms are created lazily per bucket ID.
+func (c *Collector) ObserveRateLimitUtilization(bucketID string, utilizationPct float64) {
+	if bucketID == "" || c == nil {
+		return
+	}
+	if utilizationPct < 0 {
+		utilizationPct = 0
+	} else if utilizationPct > 1 {
+		utilizationPct = 1
+	}
+	c.rateLimitUtilizationMu.RLock()
+	h, ok := c.rateLimitUtilizationHistograms[bucketID]
+	c.rateLimitUtilizationMu.RUnlock()
+	if !ok || h == nil {
+		c.rateLimitUtilizationMu.Lock()
+		if h, ok = c.rateLimitUtilizationHistograms[bucketID]; !ok || h == nil {
+			h = NewHistogram(RateLimitUtilizationBuckets)
+			if c.rateLimitUtilizationHistograms == nil {
+				c.rateLimitUtilizationHistograms = make(map[string]*Histogram)
+			}
+			c.rateLimitUtilizationHistograms[bucketID] = h
+		}
+		c.rateLimitUtilizationMu.Unlock()
+	}
+	h.Observe(utilizationPct)
+}
+
+// RateLimitUtilizationHistograms returns the per-bucket-ID utilization
+// histograms for rendering. The map is keyed by bucket ID (hashed IP).
+//
+// Returns nil when the collector is not yet initialized. Safe to call
+// from multiple goroutines.
+func (c *Collector) RateLimitUtilizationHistograms() map[string]*Histogram {
+	if c == nil {
+		return nil
+	}
+	c.rateLimitUtilizationMu.RLock()
+	defer c.rateLimitUtilizationMu.RUnlock()
+	return c.rateLimitUtilizationHistograms
+}
+
 // Histogram}
+
+// --- Per-route latency percentile ring buffers (issue #774) -----------
+//
+// latencyPercentileBuffer stores a sliding window of latency samples and
+// maintains running p50/p95/p99 percentile estimates. Updated on each
+// request completion so percentiles are always current at scrape time.
+// The ring buffer has fixed capacity; oldest samples are evicted.
+//
+// Using a ring buffer (not histogram interpolation) gives exact
+// percentile values from actual samples — operators can set precise
+// SLO alerts (e.g. "p95 < 2s") without client-side queries.
+//
+// Capacity of 1000 samples gives ~3–15 min of history depending on
+// request rate, sufficient for stable p95/p99 estimates.
+type latencyPercentileBuffer struct {
+	mu       sync.Mutex
+	samples  []float64 // latency in milliseconds, oldest first
+	capacity int
+	p50Bits  atomic.Uint64 // IEEE-754 bits of p50 value
+	p95Bits  atomic.Uint64
+	p99Bits  atomic.Uint64
+}
+
+const defaultLatencyBufferCapacity = 1000
+
+func newLatencyPercentileBuffer(capacity int) *latencyPercentileBuffer {
+	if capacity <= 0 {
+		capacity = defaultLatencyBufferCapacity
+	}
+	return &latencyPercentileBuffer{
+		samples:  make([]float64, 0, capacity),
+		capacity: capacity,
+	}
+}
+
+func (b *latencyPercentileBuffer) Observe(latencyMs float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(b.samples) < b.capacity {
+		b.samples = append(b.samples, latencyMs)
+	} else {
+		// Ring buffer: overwrite oldest, keep newest
+		copy(b.samples, b.samples[1:])
+		b.samples[b.capacity-1] = latencyMs
+	}
+
+	b.recomputePercentilesLocked()
+}
+
+func (b *latencyPercentileBuffer) recomputePercentilesLocked() {
+	n := len(b.samples)
+	if n == 0 {
+		return
+	}
+	// Sort ascending for percentile computation
+	sorted := make([]float64, n)
+	copy(sorted, b.samples)
+	sort.Float64s(sorted)
+
+	b.p50Bits.Store(math.Float64bits(percentile(sorted, 0.50)))
+	b.p95Bits.Store(math.Float64bits(percentile(sorted, 0.95)))
+	b.p99Bits.Store(math.Float64bits(percentile(sorted, 0.99)))
+}
+
+func percentile(sorted []float64, p float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if len(sorted) == 1 {
+		return sorted[0]
+	}
+	// Linear interpolation between nearest ranks
+	idx := p * float64(len(sorted)-1)
+	lower := int(idx)
+	upper := lower + 1
+	if upper >= len(sorted) {
+		return sorted[len(sorted)-1]
+	}
+	frac := idx - float64(lower)
+	return sorted[lower]*(1-frac) + sorted[upper]*frac
+}
+
+// Perc returns the current p50/p95/p99 readings. Values are 0 when
+// no samples have been recorded yet.
+func (b *latencyPercentileBuffer) Perc() (p50, p95, p99 float64) {
+	return math.Float64frombits(b.p50Bits.Load()),
+		math.Float64frombits(b.p95Bits.Load()),
+		math.Float64frombits(b.p99Bits.Load())
+}
+
+// Count returns the number of samples currently in the buffer.
+func (b *latencyPercentileBuffer) Count() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.samples)
+}
 
 // Histogram is a fixed-bucket cumulative histogram. Buckets are
 // pre-allocated at construction; Observe performs a single linear scan

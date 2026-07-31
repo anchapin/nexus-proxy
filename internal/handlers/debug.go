@@ -114,7 +114,7 @@ func (t TransformTrace) Log(logger *slog.Logger, reqID string) {
 // these answer "why did nexus pick the model it did?".
 type RouteTrace struct {
 	Route           string // "local" | "frontier" | "fusion"
-	Reason          string // "guardrail" | "dsl" | "slm"
+	Reason          string // "guardrail" | "dsl" | "slm" | "slm-error" | "slm-no-client" | "slm-low-confidence"
 	BudgetSource    string // "static-fallback" | "ollama-ps" | ...
 	BudgetTokens    int
 	EstimatedTokens int

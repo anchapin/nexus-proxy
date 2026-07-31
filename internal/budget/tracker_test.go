@@ -178,3 +178,75 @@ func TestBudgetAccessor(t *testing.T) {
 		t.Errorf("Budget = %v, want 42.5", got)
 	}
 }
+
+// TestBudgetNilReceiver verifies Budget() returns 0 on a nil receiver
+// (disabled tracker).
+func TestBudgetNilReceiver(t *testing.T) {
+	var st *SpendTracker
+	if got := st.Budget(); got != 0 {
+		t.Errorf("Budget on nil = %v, want 0", got)
+	}
+}
+
+// TestRetryAfterNilReceiver verifies RetryAfter() returns 0 on a nil
+// receiver (disabled tracker).
+func TestRetryAfterNilReceiver(t *testing.T) {
+	var st *SpendTracker
+	if got := st.RetryAfter(); got != 0 {
+		t.Errorf("RetryAfter on nil = %v, want 0", got)
+	}
+}
+
+// TestBucketPruning verifies that entries older than the rolling window
+// are pruned and the total is correctly maintained.
+func TestBucketPruning(t *testing.T) {
+	st := NewSpendTracker(100.0)
+	st.window = 50 * time.Millisecond
+
+	st.Record(1.0)
+	if got := st.CurrentSpend(); got != 1.0 {
+		t.Fatalf("after Record: CurrentSpend = %v, want 1.0", got)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+
+	_ = st.CurrentSpend()
+
+	if got := st.CurrentSpend(); got != 0.0 {
+		t.Errorf("after prune: CurrentSpend = %v, want 0.0", got)
+	}
+}
+
+// TestManySmallRequests tests that many small requests don't cause
+// O(n) performance degradation (issue #1070).
+func TestManySmallRequests(t *testing.T) {
+	st := NewSpendTracker(10000.0)
+
+	for i := 0; i < 10000; i++ {
+		st.Record(0.001)
+	}
+
+	got := st.CurrentSpend()
+	if got < 9.99 || got > 10.01 {
+		t.Errorf("CurrentSpend = %v, want ~10.0", got)
+	}
+
+	if st.WouldExceed(1.0) {
+		t.Error("WouldExceed(1.0) = true, want false (10 + 1 < 10000)")
+	}
+}
+
+// TestBucketOverflow tests that the tracker handles many entries
+// in the same bucket correctly.
+func TestBucketOverflow(t *testing.T) {
+	st := NewSpendTracker(100.0)
+
+	for i := 0; i < 1000; i++ {
+		st.Record(0.01)
+	}
+
+	got := st.CurrentSpend()
+	if got < 9.99 || got > 10.01 {
+		t.Errorf("CurrentSpend = %v, want ~10.0", got)
+	}
+}

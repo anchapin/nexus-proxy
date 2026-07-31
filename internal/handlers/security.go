@@ -7,13 +7,39 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
+// permissionsPolicyValue locks down browser features that an LLM proxy
+// API endpoint never needs (issue #605). Every feature directive is set
+// to an empty allow-list "()" so no origin — including same-origin —
+// can activate the camera, microphone, geolocation, payment, or the
+// other privacy-sensitive surfaces listed below. This is
+// defense-in-depth: if a client context is compromised it cannot
+// silently turn these features on.
+const permissionsPolicyValue = "accelerometer=(), autoplay=(), camera=(), " +
+	"clipboard-read=(), clipboard-write=(), geolocation=(), gyroscope=(), " +
+	"magnetometer=(), microphone=(), payment=(), publickey-credentials-get=(), " +
+	"usb=(), interest-cohort=()"
+
 // SecurityHeaders returns middleware that stamps standard security
-// response headers on every response (issue #39):
+// response headers on every response (issue #39, #965):
 //
 //   - X-Content-Type-Options: nosniff — blocks MIME sniffing.
 //   - X-Frame-Options: DENY — blocks clickjacking via framing.
 //   - Referrer-Policy: no-referrer — strips the Referer header on
 //     outbound navigations so the proxy's URL is not leaked.
+//   - Cross-Origin-Opener-Policy: same-origin — isolates the browsing
+//     context group so cross-origin documents cannot manipulate the
+//     proxy's window (issue #605).
+//   - Cross-Origin-Embedder-Policy: require-corp — opts the context
+//     into cross-origin isolation, gating subresource loads on CORP
+//     (issue #605).
+//   - Cross-Origin-Resource-Policy: same-origin — blocks cross-origin
+//     no-cors requests from reading the response (issue #605).
+//   - Permissions-Policy — disables privacy-sensitive browser features
+//     the proxy never uses (issue #605).
+//   - Content-Security-Policy: default-src 'none'; frame-ancestors 'none';
+//     script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'
+//     — locks down script and object sources to prevent XSS via upstream
+//     injection (issue #965, #1060).
 //
 // When tlsActive is true, Strict-Transport-Security is added with a
 // one-year max-age so clients pin HTTPS and refuse plaintext fallbacks.
@@ -44,6 +70,11 @@ func SecurityHeaders(tlsActive bool) func(http.Handler) http.Handler {
 			h.Set("X-Content-Type-Options", "nosniff")
 			h.Set("X-Frame-Options", "DENY")
 			h.Set("Referrer-Policy", "no-referrer")
+			h.Set("Cross-Origin-Opener-Policy", "same-origin")
+			h.Set("Cross-Origin-Embedder-Policy", "require-corp")
+			h.Set("Cross-Origin-Resource-Policy", "same-origin")
+			h.Set("Permissions-Policy", permissionsPolicyValue)
+			h.Set("Content-Security-Policy", `default-src 'none'; frame-ancestors 'none'; script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'`)
 			if tlsActive {
 				h.Set("Strict-Transport-Security", "max-age=31536000")
 			}

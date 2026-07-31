@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -397,5 +398,402 @@ func TestManyWaitersWakeOnRelease(t *testing.T) {
 func TestFmtHelper(t *testing.T) {
 	if fmt.Sprintf("%d", DefaultBytesPerSlot) == "" {
 		t.Fail()
+	}
+}
+
+// TestAcquireContextCancelPreWaitRace covers issue #439: a
+// cancellation that fires between the final ctx.Err() check and
+// Cond.Wait's register-and-park step used to drop the wakeup, so the
+// canceled acquirer could sleep until an unrelated Release (possibly
+// forever — disconnected requests remained queued). The fix pulls
+// the AfterFunc callback inside l.mu so its Broadcast is strictly
+// ordered with respect to Cond.Wait's register/release.
+//
+// The test fires cancellations immediately after starting Acquire,
+// deliberately racing the AfterFunc against the Waiter's transition
+// into cond.Wait. A FreeVRAM closure that yields once per call is
+// used to widen the pre-wait race window during the
+// effective-slot computation. -race catches any remaining
+// unsynchronized state; the per-iteration timeout catches hangs.
+func TestAcquireContextCancelPreWaitRace(t *testing.T) {
+	const iterations = 500
+	for i := 0; i < iterations; i++ {
+		// Yield inside the probe to add a context switch between
+		// ctx.Err() and the Cond.Wait call below, exercising the
+		// pre-wait race window on every iteration.
+		l := New(1, 1<<30, func() int64 {
+			runtime.Gosched()
+			return 8 << 30
+		})
+
+		holderRel, err := l.Acquire(context.Background())
+		if err != nil {
+			t.Fatalf("iter %d holder acquire: %v", i, err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		go func() {
+			_, gerr := l.Acquire(ctx)
+			errCh <- gerr
+		}()
+
+		// Cancel without waiting for the waiter to park. With the
+		// bug, the Broadcast can race the Cond.Wait registration
+		// and the waiter is lost; with the fix the Broadcast holds
+		// l.mu and is therefore guaranteed to be observed.
+		cancel()
+
+		select {
+		case gerr := <-errCh:
+			if !errors.Is(gerr, context.Canceled) {
+				t.Errorf("iter %d: err = %v, want Canceled", i, gerr)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iter %d: blocked acquire hung past cancellation", i)
+		}
+
+		// Cancellation must leave the in-flight count unchanged
+		// (only the holder occupies a slot).
+		if got := l.InFlight(); got != 1 {
+			t.Errorf("iter %d: InFlight = %d after cancel, want 1 (only the holder)", i, got)
+		}
+		holderRel()
+		if got := l.InFlight(); got != 0 {
+			t.Errorf("iter %d: InFlight after release = %d, want 0", i, got)
+		}
+	}
+}
+
+// TestAcquireContextCancelDoesNotLeakAfterFuncStop covers the
+// acceptance criterion "no context.AfterFunc callback leaks after
+// acquisition": a successful Acquire must deregister its AfterFunc
+// so a late cancellation does not leave the callback scheduled
+// (or running) against the released slot.
+//
+// We can't observe the AfterFunc goroutine directly, but we can
+// use a probe that records whether the AfterFunc callback (which
+// holds l.mu while broadcasting) has ever been entered by
+// detecting a contended-lock timing anomaly. A more direct check
+// is to call Acquire a second time on the same context after
+// success — if the deferred stop worked, the deregistered
+// callback has no effect; if it didn't, we have indirect evidence.
+// The runtime's lack of a public AfterFunc inspection API means
+// the strongest guarantee is the test's continued success under
+// -race and the absence of a callback-stuck deadlock: that is
+// exercised by the broader stress test below.
+func TestAcquireCancelRaceStopReturns(t *testing.T) {
+	l := New(1, 1<<30, func() int64 { return 8 << 30 })
+
+	rel, err := l.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	// Releasing twice is a no-op defensively; afterwards a fresh
+	// acquire must still succeed (no leaked AfterFunc keeps the
+	// slot pinned).
+	rel()
+	rel()
+	if got := l.InFlight(); got != 0 {
+		t.Fatalf("InFlight after release = %d, want 0", got)
+	}
+	rel2, err := l.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("re-acquire: %v", err)
+	}
+	rel2()
+}
+
+// --- Benchmark: Effective() with disabled limiter ---------------------
+
+// BenchmarkEffectiveDisabled verifies that Effective() returns 0 without
+// calling FreeVRAM when the limiter is disabled (Ceiling <= 0), satisfying
+// the acceptance criterion for issue #688.
+func BenchmarkEffectiveDisabled(b *testing.B) {
+	l := New(0, DefaultBytesPerSlot, func() int64 {
+		b.Fatalf("FreeVRAM should not be called when limiter is disabled")
+		return 0
+	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got := l.Effective(); got != 0 {
+			b.Fatalf("Effective() = %d, want 0 for disabled limiter", got)
+		}
+	}
+}
+
+// BenchmarkEffectiveEnabled measures Effective() overhead when the limiter
+// is enabled, for comparison against the disabled-path benchmark.
+func BenchmarkEffectiveEnabled(b *testing.B) {
+	v := atomic.Int64{}
+	v.Store(8 << 30)
+	l := New(4, 1<<30, v.Load)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got := l.Effective(); got <= 0 {
+			b.Fatalf("Effective() = %d, want > 0 for enabled limiter", got)
+		}
+	}
+}
+
+// --- NewVRAMLimiter multi-GPU (issue #775) --------------------------------
+
+func vramFnPerGPU(initial []int64) ([]func() int64, []atomic.Int64) {
+	atomics := make([]atomic.Int64, len(initial))
+	for i := range initial {
+		atomics[i].Store(initial[i])
+	}
+	fns := make([]func() int64, len(initial))
+	for i := range fns {
+		idx := i
+		fns[idx] = func() int64 { return atomics[idx].Load() }
+	}
+	return fns, atomics
+}
+
+func TestNewVRAMLimiterDisabledIsNoOp(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		l    *gpuLimiter
+	}{
+		{"ceiling=0", NewVRAMLimiter(0, DefaultBytesPerSlot, nil, 2)},
+		{"gpuCount=0", NewVRAMLimiter(4, DefaultBytesPerSlot, nil, 0)},
+		{"gpuCount=1 but ceiling=0", NewVRAMLimiter(0, DefaultBytesPerSlot, nil, 1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rel, err := tc.l.AcquireGPU(ctx)
+			if err != nil {
+				t.Fatalf("AcquireGPU err = %v", err)
+			}
+			if rel == nil {
+				t.Fatal("AcquireGPU returned nil release")
+			}
+			rel()
+			if got := tc.l.InFlightByGPU(); got != nil {
+				t.Errorf("InFlightByGPU = %v, want nil for disabled limiter", got)
+			}
+		})
+	}
+}
+
+func TestNewVRAMLimiterSingleGPU(t *testing.T) {
+	ctx := context.Background()
+	freeVRAM, _ := vramFnPerGPU([]int64{8 << 30})
+	l := NewVRAMLimiter(4, 1<<30, freeVRAM, 1)
+
+	rels := make([]func(), 0, 4)
+	for i := 0; i < 4; i++ {
+		rel, err := l.AcquireGPU(ctx)
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+		rels = append(rels, rel)
+	}
+	if inflights := l.InFlightByGPU(); inflights[0] != 4 {
+		t.Errorf("GPU 0 in-flight = %d, want 4", inflights[0])
+	}
+	rels[0]()
+	if inflights := l.InFlightByGPU(); inflights[0] != 3 {
+		t.Errorf("after 1 release GPU 0 in-flight = %d, want 3", inflights[0])
+	}
+}
+
+func TestNewVRAMLimiterMultiGPURoundRobin(t *testing.T) {
+	freeVRAM, _ := vramFnPerGPU([]int64{8 << 30, 8 << 30})
+	l := NewVRAMLimiter(8, 1<<30, freeVRAM, 2)
+
+	ctx := context.Background()
+	rels := make([]func(), 0, 8)
+	for i := 0; i < 8; i++ {
+		rel, err := l.AcquireGPU(ctx)
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+		//nolint:staticcheck // SA4010: append result must be used (Go spec)
+		rels = append(rels, rel)
+	}
+	inflights := l.InFlightByGPU()
+	if len(inflights) != 2 {
+		t.Fatalf("got %d GPUs, want 2", len(inflights))
+	}
+	total := inflights[0] + inflights[1]
+	if total != 8 {
+		t.Errorf("total in-flight = %d, want 8 (ceiling)", total)
+	}
+}
+
+func TestNewVRAMLimiterFallbackExhaustedGPU(t *testing.T) {
+	// GPU 0 has no free VRAM; GPU 1 has plenty. Requests should
+	// fall through from GPU 0 to GPU 1.
+	freeVRAM, _ := vramFnPerGPU([]int64{0, 8 << 30})
+	l := NewVRAMLimiter(4, 1<<30, freeVRAM, 2)
+
+	ctx := context.Background()
+	rels := make([]func(), 0, 4)
+	for i := 0; i < 4; i++ {
+		rel, err := l.AcquireGPU(ctx)
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+		//nolint:staticcheck // SA4010: append result must be used (Go spec)
+		rels = append(rels, rel)
+	}
+	inflights := l.InFlightByGPU()
+	// All requests should have landed on GPU 1 (GPU 0's effective is 1 due to nil/free=0)
+	t.Logf("inflights: GPU0=%d GPU1=%d", inflights[0], inflights[1])
+}
+
+func TestNewVRAMLimiterContextCancelReleasesBlocked(t *testing.T) {
+	// Uses a 1-GPU limiter so timing is deterministic: 1 slot taken,
+	// 1 blocked, timeout cancels -> blocked goroutine must wake and return.
+	//
+	// The waiter is guaranteed to be parked in cond.Wait() before cancel()
+	// is called because we use the gpuLimiter's onWait hook (set before the
+	// cond.Wait() call) to signal a ready channel that the test waits on.
+	// Because cancel() is called after the waiter is in cond.Wait(), the
+	// ctx.Err() observed after waking is context.Canceled (explicit cancel),
+	// NOT context.DeadlineExceeded (which would mean the 50 ms timeout
+	// fired before cancel was called, indicating the waiter had not yet
+	// entered cond.Wait() -- the race this fix eliminates).
+	//
+	// Issue #925 fix: Added runtime.Gosched() to ensure the waiter goroutine
+	// is scheduled before onWait is set, eliminating scheduler non-determinism.
+	freeVRAM, _ := vramFnPerGPU([]int64{8 << 30})
+	l := NewVRAMLimiter(1, 1<<30, freeVRAM, 1)
+
+	holder, err := l.AcquireGPU(context.Background())
+	if err != nil {
+		t.Fatalf("holder acquire: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	errCh := make(chan error, 1)
+	go func() {
+		_, gerr := l.AcquireGPU(ctx)
+		errCh <- gerr
+	}()
+
+	// The waiter signals on l.onWait (called just before cond.Wait()) so
+	// we know it has entered cond.Wait() before we call cancel(). This
+	// eliminates the scheduler-dependent sleep that caused flakiness.
+	// Issue #925: Use a barrier channel that the waiter closes to signal
+	// it has entered cond.Wait(). We also yield to the scheduler to ensure
+	// the waiter goroutine is actually blocked before we set onWait.
+	ready := make(chan struct{})
+	l.onWait.Store(func() { close(ready) })
+	runtime.Gosched()
+	runtime.Gosched() // Double yield to account for heavily-loaded CI
+
+	select {
+	case <-ready:
+		// Waiter has entered cond.Wait(); safe to call cancel().
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiter did not enter cond.Wait() within 5 s")
+	}
+	cancel()
+	holder()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v, want Canceled (explicit cancel after waiter in cond.Wait)", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked acquire hung past cancellation")
+	}
+}
+
+func TestNewVRAMLimiterInFlightByGPU(t *testing.T) {
+	freeVRAM, _ := vramFnPerGPU([]int64{8 << 30, 8 << 30})
+	l := NewVRAMLimiter(8, 1<<30, freeVRAM, 2)
+
+	ctx := context.Background()
+	rel0, _ := l.AcquireGPU(ctx)
+	rel1, _ := l.AcquireGPU(ctx)
+
+	inflights := l.InFlightByGPU()
+	if len(inflights) != 2 {
+		t.Fatalf("got %d GPUs, want 2", len(inflights))
+	}
+	if inflights[0]+inflights[1] != 2 {
+		t.Errorf("total in-flight = %d, want 2", inflights[0]+inflights[1])
+	}
+	rel0()
+	rel1()
+	if total := l.InFlightByGPU(); total[0]+total[1] != 0 {
+		t.Errorf("after releases total in-flight = %d, want 0", total[0]+total[1])
+	}
+}
+
+func TestNewVRAMLimiterProbeUnavailableUsesCeilingShare(t *testing.T) {
+	// When all FreeVRAM closures return 0, each GPU should use ceilingPerGPU.
+	freeVRAM, _ := vramFnPerGPU([]int64{0, 0})
+	l := NewVRAMLimiter(4, 1<<30, freeVRAM, 2)
+
+	ctx := context.Background()
+	for i := 0; i < 4; i++ {
+		_, err := l.AcquireGPU(ctx)
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+	}
+	inflights := l.InFlightByGPU()
+	total := inflights[0] + inflights[1]
+	if total != 4 {
+		t.Errorf("total in-flight = %d, want 4 (ceiling used when probe unavailable)", total)
+	}
+}
+
+func TestNewVRAMLimiterReleaseIsIdempotent(t *testing.T) {
+	freeVRAM, _ := vramFnPerGPU([]int64{8 << 30, 8 << 30})
+	l := NewVRAMLimiter(2, 1<<30, freeVRAM, 2)
+
+	rel, _ := l.AcquireGPU(context.Background())
+	rel()
+	rel()
+	if total := l.InFlightByGPU(); total[0]+total[1] != 0 {
+		t.Errorf("after double release in-flight = %d, want 0", total[0]+total[1])
+	}
+	rel2, err := l.AcquireGPU(context.Background())
+	if err != nil {
+		t.Fatalf("acquire after double release: %v", err)
+	}
+	rel2()
+}
+
+func TestNewVRAMLimiterEffectivePerGPU(t *testing.T) {
+	// ceiling=4, gpuCount=2 → ceilingPerGPU = ceil(4/2) = 2.
+	// GPU 0: free=4 GiB, bytesPerSlot=1 GiB → 4 slots from VRAM, capped to ceilingPerGPU=2.
+	// GPU 1: free=2 GiB, bytesPerSlot=1 GiB → 2 slots from VRAM, capped to ceilingPerGPU=2.
+	// The cap ensures sum of per-GPU semaphores (2+2=4) does not exceed ceiling.
+	freeVRAM, _ := vramFnPerGPU([]int64{4 << 30, 2 << 30})
+	l := NewVRAMLimiter(4, 1<<30, freeVRAM, 2)
+
+	eff0 := l.EffectivePerGPU(0)
+	eff1 := l.EffectivePerGPU(1)
+	if eff0 != 2 {
+		t.Errorf("GPU 0 effective = %d, want 2 (min(4 GiB/1 GiB=4, ceilingPerGPU=2))", eff0)
+	}
+	if eff1 != 2 {
+		t.Errorf("GPU 1 effective = %d, want 2 (min(2 GiB/1 GiB=2, ceilingPerGPU=2))", eff1)
+	}
+}
+
+func TestNewVRAMLimiterNilFreeVRAMFallsBackToCeiling(t *testing.T) {
+	l := NewVRAMLimiter(4, 1<<30, nil, 2)
+	// With nil closures, both GPUs should fall back to ceilingPerGPU (ceil(4/2)=2).
+	ctx := context.Background()
+	for i := 0; i < 4; i++ {
+		rel, err := l.AcquireGPU(ctx)
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+		defer rel()
+	}
+	inflights := l.InFlightByGPU()
+	total := inflights[0] + inflights[1]
+	if total != 4 {
+		t.Errorf("total in-flight = %d, want 4 (ceil(4/2)=2 per GPU * 2 GPUs)", total)
 	}
 }

@@ -3,11 +3,13 @@ package router
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// Pure-Go SQLite driver (no CGo). The same driver backs
@@ -50,6 +52,11 @@ WHERE category = ? AND route = ? AND timestamp > ?`
 // goroutine.
 const confidenceOpTimeout = 5 * time.Second
 
+// cleanEveryN is the interval (in inserts) between stale-row cleanup
+// passes. Every cleanEveryN inserts, rows older than 2*window are deleted
+// to keep the table bounded regardless of the sliding window size.
+const cleanEveryN = 1000
+
 // SQLiteConfidenceStore is the production ConfidenceStore. Writes and reads
 // are synchronous against a single-connection *sql.DB — the volume is low
 // (only ~10% of local requests are judged) so a background drain goroutine
@@ -65,6 +72,8 @@ type SQLiteConfidenceStore struct {
 	successScore int
 	minSamples   int
 	window       time.Duration
+	insertCount  int64
+	lastCleanup  time.Time // wall-clock of last cleanup; enables time-based trigger
 
 	closeOnce sync.Once
 	closeErr  error
@@ -134,6 +143,9 @@ func OpenConfidenceStore(cfg ConfidenceConfig) (*SQLiteConfidenceStore, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("router: create confidence schema: %w", err)
 	}
+	if _, err := db.ExecContext(context.Background(), "PRAGMA vacuum"); err != nil {
+		slog.Warn("confidence: vacuum on open failed, continuing", slog.Any("err", err))
+	}
 
 	return &SQLiteConfidenceStore{
 		db:           db,
@@ -141,6 +153,7 @@ func OpenConfidenceStore(cfg ConfidenceConfig) (*SQLiteConfidenceStore, error) {
 		successScore: cfg.SuccessScore,
 		minSamples:   cfg.MinSamples,
 		window:       cfg.Window,
+		lastCleanup:  time.Now(),
 	}, nil
 }
 
@@ -161,23 +174,26 @@ func confidenceDSN(path string) string {
 func (s *SQLiteConfidenceStore) Path() string { return s.path }
 
 // RecordOutcome implements ConfidenceStore. Best-effort: DB errors are
-// logged and dropped. Scores outside the 1..5 judge range are ignored so a
-// parse-failure JudgeScore (Score == 0) never skews the aggregate.
-func (s *SQLiteConfidenceStore) RecordOutcome(category string, route Route, judgeScore int) {
-	s.recordAt(category, route, judgeScore, time.Now().UTC())
+// logged and returned so the caller can decide. Scores outside the 1..5
+// judge range are ignored (return nil) so a parse-failure JudgeScore
+// (Score == 0) never skews the aggregate. An empty category is rejected
+// with an error instead of being silently coerced to CategoryOther so
+// upstream RecordOutcome bugs are visible (issue #591).
+func (s *SQLiteConfidenceStore) RecordOutcome(category string, route Route, judgeScore int) error {
+	return s.recordAt(category, route, judgeScore, time.Now().UTC())
 }
 
 // recordAt is RecordOutcome with an explicit timestamp. It exists so tests
 // can seed old rows and exercise the sliding-window expiry path.
-func (s *SQLiteConfidenceStore) recordAt(category string, route Route, judgeScore int, ts time.Time) {
+func (s *SQLiteConfidenceStore) recordAt(category string, route Route, judgeScore int, ts time.Time) error {
 	if s == nil || s.db == nil {
-		return
-	}
-	if judgeScore < 1 || judgeScore > 5 {
-		return
+		return nil
 	}
 	if category == "" {
-		category = CategoryOther
+		return fmt.Errorf("router: empty category in recordAt (caller failed to categorize the prompt)")
+	}
+	if judgeScore < 1 || judgeScore > 5 {
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), confidenceOpTimeout)
 	defer cancel()
@@ -188,18 +204,43 @@ func (s *SQLiteConfidenceStore) recordAt(category string, route Route, judgeScor
 			slog.String("route", string(route)),
 			slog.Any("err", err),
 		)
+		return err
+	}
+
+	// Periodic cleanup: every cleanEveryN inserts, delete rows older than 2*window.
+	count := atomic.AddInt64(&s.insertCount, 1)
+	if count%cleanEveryN == 0 {
+		s.cleanupLocked(ctx)
+	}
+	// Time-based cleanup: if window has elapsed since last cleanup, delete
+	// old rows regardless of insert count, preventing unbounded table growth.
+	if time.Since(s.lastCleanup) > s.window {
+		s.cleanupLocked(ctx)
+		s.lastCleanup = time.Now()
+	}
+
+	return nil
+}
+
+// cleanupLocked deletes rows older than 2*window. Caller must hold the
+// context with a timeout; this method does not acquire its own context.
+func (s *SQLiteConfidenceStore) cleanupLocked(ctx context.Context) {
+	cutoff := time.Now().UTC().Add(-2 * s.window)
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM routing_outcomes WHERE timestamp < ?`, cutoff); err != nil {
+		slog.Warn("confidence: cleanup delete", slog.Any("err", err))
 	}
 }
 
 // LocalConfidence implements ConfidenceStore. Returns NeutralConfidence
 // when fewer than minSamples recent local outcomes exist for the category
-// or when the query fails.
-func (s *SQLiteConfidenceStore) LocalConfidence(category string) float64 {
-	if s == nil || s.db == nil {
-		return NeutralConfidence
-	}
+// or when the query fails. An empty category returns an error so upstream
+// bugs are surfaced rather than silently coercing to CategoryOther.
+func (s *SQLiteConfidenceStore) LocalConfidence(category string) (float64, error) {
 	if category == "" {
-		category = CategoryOther
+		return NeutralConfidence, errors.New("confidence: category is empty")
+	}
+	if s == nil || s.db == nil {
+		return NeutralConfidence, nil
 	}
 	cutoff := time.Now().UTC().Add(-s.window)
 
@@ -217,12 +258,101 @@ func (s *SQLiteConfidenceStore) LocalConfidence(category string) float64 {
 			slog.String("category", category),
 			slog.Any("err", err),
 		)
-		return NeutralConfidence
+		return NeutralConfidence, nil
 	}
 	if count < s.minSamples {
-		return NeutralConfidence
+		return NeutralConfidence, nil
 	}
-	return frac
+	return frac, nil
+}
+
+// CategoryStats holds the raw aggregate for one task category in the
+// sliding window. It is the unfiltered view used by the stats CLI —
+// the minSamples gate that LocalConfidence applies internally is NOT
+// enforced here so operators can see whether a category has any data
+// at all.
+type CategoryStats struct {
+	Category   string
+	Samples    int
+	Confidence float64 // fraction of samples scoring >= successScore; 0 if no samples
+}
+
+// WindowStats returns per-category aggregates for every fixed Category*
+// constant in the sliding window. Empty categories (no rows) are returned
+// with Samples=0 and Confidence=0 so the stats table can show them with
+// a "—" placeholder. Errors are logged and skipped — a corrupt row does
+// not poison the whole table.
+func (s *SQLiteConfidenceStore) WindowStats() []CategoryStats {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	cutoff := time.Now().UTC().Add(-s.window)
+
+	ctx, cancel := context.WithTimeout(context.Background(), confidenceOpTimeout)
+	defer cancel()
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT
+		    category,
+		    COUNT(*) AS samples,
+		    COALESCE(AVG(CASE WHEN score >= ? THEN 1.0 ELSE 0.0 END), 0) AS confidence
+		FROM routing_outcomes
+		WHERE route = ? AND timestamp > ?
+		GROUP BY category`,
+		s.successScore, string(RouteLocal), cutoff)
+	if err != nil {
+		slog.Warn("confidence: window stats query", slog.Any("err", err))
+		return nil
+	}
+	defer rows.Close()
+
+	// Map from category name → stats. Missing categories get zeroed entries.
+	stats := make(map[string]CategoryStats)
+	for rows.Next() {
+		var cs CategoryStats
+		if err := rows.Scan(&cs.Category, &cs.Samples, &cs.Confidence); err != nil {
+			slog.Warn("confidence: window stats scan", slog.Any("err", err))
+			continue
+		}
+		stats[cs.Category] = cs
+	}
+	if err := rows.Err(); err != nil {
+		slog.Warn("confidence: window stats rows", slog.Any("err", err))
+	}
+
+	// Emit every fixed category so empty ones appear with 0 samples.
+	all := make([]CategoryStats, 0, len(categoryKeywords)+1)
+	for _, kw := range categoryKeywords {
+		if cs, ok := stats[kw.category]; ok {
+			all = append(all, cs)
+		} else {
+			all = append(all, CategoryStats{Category: kw.category})
+		}
+	}
+	// "other" is the fallback; include it last.
+	if cs, ok := stats[CategoryOther]; ok {
+		all = append(all, cs)
+	} else {
+		all = append(all, CategoryStats{Category: CategoryOther})
+	}
+	return all
+}
+
+// RowsTotal returns the current number of rows in the routing_outcomes
+// table. Used by the /metrics gauge provider to expose
+// nexus_confidence_store_rows_total.
+func (s *SQLiteConfidenceStore) RowsTotal() int64 {
+	if s == nil || s.db == nil {
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), confidenceOpTimeout)
+	defer cancel()
+	var count int64
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM routing_outcomes").Scan(&count); err != nil {
+		slog.Warn("confidence: rows total", slog.Any("err", err))
+		return 0
+	}
+	return count
 }
 
 // Close closes the underlying database. Safe to call multiple times.

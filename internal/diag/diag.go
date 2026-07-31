@@ -508,6 +508,9 @@ func checkZAIKeyFn(cfg config.Config) Check {
 // pass; zero budget (no signal) is warn — the handler falls back to
 // the static NEXUS_TOKEN_GUARDRAIL in that case, which still serves
 // traffic but loses the dynamic-aware behaviour the PRD promises.
+//
+// When NVIDIA GPUs are detected (issue #775), per-GPU VRAM status is
+// included in the detail line: "GPU 0: 8.2 GiB free, GPU 1: 8.2 GiB free".
 func checkVRAMProbeFn(ctx context.Context, cfg config.Config, opts Options) Check {
 	p := probe.NewOllamaProbe(opts.OllamaURL, opts.HTTPClient)
 	p.BytesPerToken = cfg.ProbeBytesPerToken
@@ -531,10 +534,20 @@ func checkVRAMProbeFn(ctx context.Context, cfg config.Config, opts Options) Chec
 			Detail: fmt.Sprintf("budget disabled (source=%s) — falling back to NEXUS_TOKEN_GUARDRAIL=%d", b.Source, cfg.TokenGuardrail),
 		}
 	}
+	detail := fmt.Sprintf("budget: %d tokens (source: %s)", b.Tokens, b.Source)
+	if gpus, gerr := probe.ReadPerGPUVRAM(); gerr == nil && len(gpus) > 0 {
+		var parts []string
+		for _, g := range gpus {
+			parts = append(parts, fmt.Sprintf("GPU %d: %.1f GiB free", g.Index, float64(g.MemoryFree)/(1024*1024*1024)))
+		}
+		if len(parts) > 0 {
+			detail += "; " + strings.Join(parts, ", ")
+		}
+	}
 	return Check{
 		Name:   checkVRAMProbe,
 		Status: StatusPass,
-		Detail: fmt.Sprintf("budget: %d tokens (source: %s)", b.Tokens, b.Source),
+		Detail: detail,
 	}
 }
 
@@ -690,7 +703,7 @@ func checkQualityVerifierFn(cfg config.Config) Check {
 	return Check{
 		Name:   checkQualityVerifier,
 		Status: StatusPass,
-		Detail: fmt.Sprintf("concurrency=%d workers", cfg.QualityConcurrency),
+		Detail: fmt.Sprintf("concurrency=%d workers, queue=%d, ring=%d", cfg.QualityConcurrency, cfg.QualityQueueDepth, cfg.QualityDroppedRingSize),
 	}
 }
 
@@ -735,16 +748,29 @@ func checkRateLimitProxyConfigFn(cfg config.Config) Check {
 		}
 	}
 	if !cfg.TrustedProxiesConfigured() {
+		detail := "NEXUS_RATE_LIMIT_RPM > 0 but no NEXUS_TRUSTED_PROXIES configured — spoofing vulnerability: a client behind a NAT gateway shares rate-limit bucket with other clients"
+		// Raw was set but parsed to zero CIDRs — almost certainly a
+		// malformed CIDR list that the YAML loader swallowed (the env
+		// path fails boot on parse error). Surface the offending value
+		// via TrustedProxiesRaw so the operator can see what `nexus
+		// check` actually evaluated.
+		if cfg.TrustedProxiesRaw != "" {
+			detail = fmt.Sprintf("%s (raw value %q parsed to 0 CIDRs)", detail, cfg.TrustedProxiesRaw)
+		}
 		return Check{
 			Name:   checkRateLimitProxyConfig,
 			Status: StatusFail,
-			Detail: "NEXUS_RATE_LIMIT_RPM > 0 but no NEXUS_TRUSTED_PROXIES configured — spoofing vulnerability: a client behind a NAT gateway shares rate-limit bucket with other clients",
+			Detail: detail,
 		}
+	}
+	detail := fmt.Sprintf("rate limit=%d RPM, %d trusted proxy CIDR(s)", cfg.RateLimitRPM, len(cfg.TrustedProxies))
+	if cfg.TrustedProxiesRaw != "" {
+		detail = fmt.Sprintf("%s: %s", detail, cfg.TrustedProxiesRaw)
 	}
 	return Check{
 		Name:   checkRateLimitProxyConfig,
 		Status: StatusPass,
-		Detail: fmt.Sprintf("rate limit=%d RPM, %d trusted proxy CIDR(s)", cfg.RateLimitRPM, len(cfg.TrustedProxies)),
+		Detail: detail,
 	}
 }
 
@@ -784,7 +810,7 @@ func checkMiddlewareChainFn(cfg config.Config) Check {
 	// Re-init the middleware registry with the defaults so BuildChain
 	// has the canonical set available. This mirrors what main.go does
 	// before building the chain.
-	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.PromptInjectionIsolated())
+	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.TOONUnfenced, cfg.PromptInjectionIsolated())
 	if _, err := middleware.BuildChain(cfg.MiddlewareChain); err != nil {
 		return Check{
 			Name:   checkMiddlewareChain,

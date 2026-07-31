@@ -1,10 +1,16 @@
 package rag
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +27,14 @@ func newTestPersistentStore(t *testing.T) *PersistentStore {
 	}
 	t.Cleanup(func() { _ = ps.Close() })
 	return ps
+}
+
+// logOutput redirects slog's default logger into w and returns the
+// previous logger so callers can restore it via slog.SetDefault.
+func logOutput(w io.Writer) *slog.Logger {
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	return prev
 }
 
 func TestOpenPersistentStoreRejectsEmptyPath(t *testing.T) {
@@ -91,6 +105,9 @@ func TestPersistentStoreUpsertAndLoad(t *testing.T) {
 	if got := disk2.Size(); got != 2 {
 		t.Errorf("Size after Load = %d, want 2", got)
 	}
+	if disk2.Stats().LastIndexAt.IsZero() {
+		t.Error("LastIndexAt after Load is zero, want persisted index time")
+	}
 
 	// Reopen with a counting embedder keyed by the prompt text. If
 	// the disk cache is bypassed (i.e. someone re-embedded every
@@ -109,7 +126,7 @@ func TestPersistentStoreUpsertAndLoad(t *testing.T) {
 	if _, err := failingStore.Load(ctx); err != nil {
 		t.Fatalf("Load with counter: %v", err)
 	}
-	ex, _, err := failingStore.Retrieve(ctx, "alpha content")
+	ex, _, _, err := failingStore.Retrieve(ctx, "alpha content")
 	if err != nil {
 		t.Fatalf("Retrieve: %v", err)
 	}
@@ -157,7 +174,7 @@ func TestPersistentStoreUpsertReplacesExisting(t *testing.T) {
 	if got := ps.Size(); got != 1 {
 		t.Errorf("Size after duplicate Upsert = %d, want 1 (replaced)", got)
 	}
-	ex, _, err := ps.Retrieve(ctx, "v2")
+	ex, _, _, err := ps.Retrieve(ctx, "v2")
 	if err != nil {
 		t.Fatalf("Retrieve: %v", err)
 	}
@@ -204,6 +221,42 @@ func TestPersistentStoreUpsertValidatesFilename(t *testing.T) {
 		Embedding: []float64{1, 0},
 	}); err == nil {
 		t.Fatal("expected error for empty filename")
+	}
+}
+
+// TestPersistentStoreUpsertNilEmbedding verifies that Upsert returns an
+// error when given a nil or empty embedding, preventing silent data loss
+// (issue #941).
+func TestPersistentStoreUpsertNilEmbedding(t *testing.T) {
+	ps := newTestPersistentStore(t)
+
+	// Test nil embedding
+	if err := ps.Upsert(context.Background(), FewShotExample{
+		Filename:  "nil.go",
+		Content:   "content",
+		Embedding: nil,
+	}); err == nil {
+		t.Fatal("expected error for nil embedding")
+	}
+
+	// Test empty embedding
+	if err := ps.Upsert(context.Background(), FewShotExample{
+		Filename:  "empty.go",
+		Content:   "content",
+		Embedding: []float64{},
+	}); err == nil {
+		t.Fatal("expected error for empty embedding")
+	}
+
+	// Verify error message includes filename for operator diagnostics
+	if err := ps.Upsert(context.Background(), FewShotExample{
+		Filename:  "diagnostic.go",
+		Content:   "content",
+		Embedding: nil,
+	}); err == nil {
+		t.Fatal("expected error for nil embedding")
+	} else if !strings.Contains(err.Error(), "diagnostic.go") {
+		t.Errorf("error %q does not contain filename", err)
 	}
 }
 
@@ -341,7 +394,7 @@ func TestPersistentStoreRetrieveUsesInMemoryState(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
-	ex, _, err := ps.Retrieve(ctx, "match")
+	ex, _, _, err := ps.Retrieve(ctx, "match")
 	if err != nil {
 		t.Fatalf("Retrieve: %v", err)
 	}
@@ -420,9 +473,18 @@ func (c *countingErrEmbedder) Embed(_ context.Context, _ string) ([]float64, err
 	return nil, err
 }
 
-func (c *countingErrEmbedder) IsHealthy(context.Context) bool { return true }
-func (c *countingErrEmbedder) IsBreakerOpen() bool            { return false }
-func (c *countingErrEmbedder) RecordBreakerSuccess()          {}
+func (c *countingErrEmbedder) EmbedBatch(_ context.Context, _ []string) ([][]float64, error) {
+	c.mu.Lock()
+	c.calls++
+	err := c.err
+	c.mu.Unlock()
+	return nil, err
+}
+
+func (c *countingErrEmbedder) IsHealthy(context.Context) bool            { return true }
+func (c *countingErrEmbedder) IsBreakerOpen() bool                       { return false }
+func (c *countingErrEmbedder) RecordBreakerSuccess()                     {}
+func (c *countingErrEmbedder) SetTripCallback(string, func(kind string)) {}
 
 // Calls returns the number of Embed invocations observed by this
 // embedder. Safe for concurrent use.
@@ -455,15 +517,36 @@ func (v *vectorEmbedder) Embed(_ context.Context, text string) ([]float64, error
 	return []float64{0, 0, 0}, nil
 }
 
-func (v *vectorEmbedder) IsHealthy(context.Context) bool { return true }
-func (v *vectorEmbedder) IsBreakerOpen() bool            { return false }
-func (v *vectorEmbedder) RecordBreakerSuccess()          {}
+func (v *vectorEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float64, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.err != nil {
+		return nil, v.err
+	}
+	result := make([][]float64, len(texts))
+	for i, text := range texts {
+		if x, ok := v.vecs[text]; ok {
+			out := make([]float64, len(x))
+			copy(out, x)
+			result[i] = out
+		} else {
+			result[i] = []float64{0, 0, 0}
+		}
+	}
+	return result, nil
+}
+
+func (v *vectorEmbedder) IsHealthy(context.Context) bool            { return true }
+func (v *vectorEmbedder) IsBreakerOpen() bool                       { return false }
+func (v *vectorEmbedder) RecordBreakerSuccess()                     {}
+func (v *vectorEmbedder) SetTripCallback(string, func(kind string)) {}
 
 // indexedCallCounter counts every Embed call so tests can
 // distinguish the disk-cache fast path (1 call — only the
 // prompt) from a regression where the cache was bypassed
 // (N+1 calls — prompt plus every indexed row).
 type indexedCallCounter struct {
+	model string
 	mu    sync.Mutex
 	vecs  map[string][]float64
 	calls int
@@ -481,12 +564,864 @@ func (c *indexedCallCounter) Embed(_ context.Context, text string) ([]float64, e
 	return []float64{0, 0, 0}, nil
 }
 
-func (c *indexedCallCounter) IsHealthy(context.Context) bool { return true }
-func (c *indexedCallCounter) IsBreakerOpen() bool            { return false }
-func (c *indexedCallCounter) RecordBreakerSuccess()          {}
+func (c *indexedCallCounter) EmbedBatch(_ context.Context, texts []string) ([][]float64, error) {
+	c.mu.Lock()
+	c.calls += len(texts)
+	c.mu.Unlock()
+	result := make([][]float64, len(texts))
+	for i, text := range texts {
+		if v, ok := c.vecs[text]; ok {
+			out := make([]float64, len(v))
+			copy(out, v)
+			result[i] = out
+		} else {
+			result[i] = []float64{0, 0, 0}
+		}
+	}
+	return result, nil
+}
+
+func (c *indexedCallCounter) IsHealthy(context.Context) bool            { return true }
+func (c *indexedCallCounter) IsBreakerOpen() bool                       { return false }
+func (c *indexedCallCounter) Model() string                             { return c.model }
+func (c *indexedCallCounter) RecordBreakerSuccess()                     {}
+func (c *indexedCallCounter) SetTripCallback(string, func(kind string)) {}
 
 func (c *indexedCallCounter) totalCalls() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.calls
+}
+
+type dimEmbedder struct {
+	model string
+	dims  int
+	vecs  map[string][]float64
+}
+
+func (d *dimEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
+	if v, ok := d.vecs[text]; ok {
+		out := make([]float64, len(v))
+		copy(out, v)
+		return out, nil
+	}
+	return make([]float64, d.dims), nil
+}
+
+func (d *dimEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float64, error) {
+	result := make([][]float64, len(texts))
+	for i, text := range texts {
+		if v, ok := d.vecs[text]; ok {
+			out := make([]float64, len(v))
+			copy(out, v)
+			result[i] = out
+		} else {
+			result[i] = make([]float64, d.dims)
+		}
+	}
+	return result, nil
+}
+
+func (d *dimEmbedder) IsHealthy(context.Context) bool            { return true }
+func (d *dimEmbedder) IsBreakerOpen() bool                       { return false }
+func (d *dimEmbedder) RecordBreakerSuccess()                     {}
+func (d *dimEmbedder) SetTripCallback(string, func(kind string)) {}
+func (d *dimEmbedder) Model() string                             { return d.model }
+
+// TestRunRAGMigrations_SchemaVersionIntegrity checks that if schema_version
+// is higher than currentSchemaVersion (e.g., mid-migration crash left an
+// intermediate value), the store refuses to open with a descriptive error
+// instead of trying to re-run the failed migration (issue #672).
+func TestRunRAGMigrations_SchemaVersionIntegrity(t *testing.T) {
+	t.Parallel()
+	dbPath := filepath.Join(t.TempDir(), "rag_future_version.db")
+
+	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=rwc", dbPath))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	// Create v1 schema without running migrations
+	_, err = db.Exec(`
+		CREATE TABLE rag_examples (
+			filename TEXT PRIMARY KEY,
+			content TEXT NOT NULL,
+			embedding BLOB NOT NULL,
+			indexed_at DATETIME NOT NULL
+		)`)
+	if err != nil {
+		t.Fatalf("create v1 schema: %v", err)
+	}
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)`)
+	if err != nil {
+		t.Fatalf("create schema_version: %v", err)
+	}
+	// Set version to currentSchemaVersion + 1 to simulate a mid-migration crash
+	// that left schema_version at a version we don't know how to migrate from.
+	_, err = db.Exec(`INSERT INTO schema_version (version) VALUES (?)`, currentSchemaVersion+1)
+	if err != nil {
+		t.Fatalf("insert future version: %v", err)
+	}
+	db.Close()
+
+	_, err = OpenPersistentStore(dbPath, &stubEmbedder{}, 0.55)
+	if err == nil {
+		t.Fatal("expected error when schema_version > currentSchemaVersion")
+	}
+	if !strings.Contains(err.Error(), "schema_version is at") {
+		t.Errorf("error = %q, want descriptive 'schema_version is at' message", err)
+	}
+	if !strings.Contains(err.Error(), "database may be corrupted") {
+		t.Errorf("error = %q, want 'database may be corrupted' hint", err)
+	}
+	if !strings.Contains(err.Error(), "backup and re-index") {
+		t.Errorf("error = %q, want 'backup and re-index' recovery hint", err)
+	}
+}
+
+// TestRunRAGMigrations_CORRUPTHandling verifies that SQLITE_CORRUPT
+// during migration returns a descriptive error rather than a generic one
+// (issue #672).
+func TestRunRAGMigrations_CORRUPTHandling(t *testing.T) {
+	t.Parallel()
+	dbPath := filepath.Join(t.TempDir(), "rag_corrupt.db")
+
+	// Create a valid v1 database with an intermediate schema_version (1)
+	// so the next migration will try to ADD COLUMN dims, then corrupt the
+	// file so that SQLITE_CORRUPT fires on the next write.
+	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=rwc", dbPath))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE rag_examples (
+			filename TEXT PRIMARY KEY,
+			content TEXT NOT NULL,
+			embedding BLOB NOT NULL,
+			indexed_at DATETIME NOT NULL
+		)`)
+	if err != nil {
+		t.Fatalf("create v1 schema: %v", err)
+	}
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)`)
+	if err != nil {
+		t.Fatalf("create schema_version: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO schema_version (version) VALUES (1)`)
+	if err != nil {
+		t.Fatalf("insert version 1: %v", err)
+	}
+	db.Close()
+
+	// Corrupt the file header at offset 50: this is still within the
+	// 100-byte SQLite header but corrupting a non-magic-byte offset
+	// may allow the open to succeed while causing SQLITE_CORRUPT on
+	// subsequent operations.
+	f, err := os.OpenFile(dbPath, os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open for corruption: %v", err)
+	}
+	_, err = f.WriteAt([]byte("garbage"), 50)
+	f.Close()
+	if err != nil {
+		t.Fatalf("write corrupt bytes: %v", err)
+	}
+
+	_, err = OpenPersistentStore(dbPath, &stubEmbedder{}, 0.55)
+	if err == nil {
+		t.Fatal("expected error when opening a corrupted database")
+	}
+	// The error may come from the initial schema create or from runRAGMigrations.
+	// Either way it should be descriptive about corruption.
+	if !strings.Contains(err.Error(), "database may be corrupted") {
+		t.Errorf("error = %q, want 'database may be corrupted' message", err)
+	}
+	if !strings.Contains(err.Error(), "backup and re-index") {
+		t.Errorf("error = %q, want 'backup and re-index' recovery hint", err)
+	}
+}
+
+func TestPersistentStore_AlterTableMigration(t *testing.T) {
+	t.Parallel()
+	dbPath := filepath.Join(t.TempDir(), "rag_migration.db")
+
+	{
+		db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=rwc", dbPath))
+		if err != nil {
+			t.Fatalf("open v1 db: %v", err)
+		}
+		_, err = db.Exec(`
+			CREATE TABLE rag_examples (
+				filename TEXT PRIMARY KEY,
+				content TEXT NOT NULL,
+				embedding BLOB NOT NULL,
+				indexed_at DATETIME NOT NULL
+			)`)
+		if err != nil {
+			t.Fatalf("create v1 schema: %v", err)
+		}
+		_, err = db.Exec(`
+			INSERT INTO rag_examples (filename, content, embedding, indexed_at)
+			VALUES (?, ?, ?, ?)`,
+			"legacy.go", "legacy content", []byte("not-a-real gob"), time.Now().UTC())
+		if err != nil {
+			t.Fatalf("insert legacy row: %v", err)
+		}
+		db.Close()
+	}
+
+	ps, err := OpenPersistentStore(dbPath, &stubEmbedder{}, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore with migration: %v", err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+
+	row := ps.db.QueryRow("SELECT embedder_model, dims FROM rag_examples WHERE filename = ?", "legacy.go")
+	var model string
+	var dims int
+	if err := row.Scan(&model, &dims); err != nil {
+		t.Fatalf("SELECT new columns: %v", err)
+	}
+	if model == "" && dims == 0 {
+		t.Log("migration added columns with defaults (expected for legacy row)")
+	}
+}
+
+func TestLoad_DetectsDimensionMismatchAndReindexes(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "code.go"), []byte("print('hello')"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "rag_dim_mismatch.db")
+
+	embA := &dimEmbedder{model: "model-a", dims: 4, vecs: map[string][]float64{
+		"print('hello')": make([]float64, 4),
+	}}
+	psA, err := OpenPersistentStore(dbPath, embA, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore A: %v", err)
+	}
+	if _, err := psA.LoadOrIndex(context.Background(), dir); err != nil {
+		t.Fatalf("LoadOrIndex A: %v", err)
+	}
+	psA.Close()
+
+	counter := &indexedCallCounter{
+		model: "model-b",
+		vecs: map[string][]float64{
+			"print('hello')": make([]float64, 4),
+		},
+	}
+	psB, err := OpenPersistentStore(dbPath, counter, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore B: %v", err)
+	}
+	t.Cleanup(func() { _ = psB.Close() })
+
+	n, err := psB.LoadOrIndex(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("LoadOrIndex B: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("LoadOrIndex returned %d, want 1 (re-indexed)", n)
+	}
+	if counter.totalCalls() == 0 {
+		t.Errorf("embedder calls = 0, want >0 (should have re-indexed)")
+	}
+}
+
+func TestCosineSimilarity_HandlesMismatchedDims(t *testing.T) {
+	t.Parallel()
+	a := []float64{1, 0, 0, 0}
+	b := []float64{1, 0}
+	got := CosineSimilarity(a, b)
+	if got != 1.0 {
+		t.Errorf("CosineSimilarity([1,0,0,0], [1,0]) = %v, want 1.0 (shorter vector governs)", got)
+	}
+
+	got2 := CosineSimilarity(b, a)
+	if got2 != 1.0 {
+		t.Errorf("CosineSimilarity([1,0], [1,0,0,0]) = %v, want 1.0", got2)
+	}
+}
+
+// modelErrEmbedder reports a known model name (so extractEmbedderModel
+// returns it and the boot-time probe is attempted) but always fails
+// Embed, simulating an unreachable embedder at boot (issue #593).
+type modelErrEmbedder struct {
+	model string
+	err   error
+}
+
+func (m *modelErrEmbedder) Embed(context.Context, string) ([]float64, error) {
+	return nil, m.err
+}
+
+func (m *modelErrEmbedder) EmbedBatch(context.Context, []string) ([][]float64, error) {
+	return nil, m.err
+}
+
+func (m *modelErrEmbedder) IsHealthy(context.Context) bool            { return false }
+func (m *modelErrEmbedder) IsBreakerOpen() bool                       { return false }
+func (m *modelErrEmbedder) RecordBreakerSuccess()                     {}
+func (m *modelErrEmbedder) SetTripCallback(string, func(kind string)) {}
+func (m *modelErrEmbedder) Model() string                             { return m.model }
+
+// TestOpenPersistentStore_ProbeFailureLogged verifies that when the
+// embedder is unreachable at boot, the probeEmbedderDims error is
+// surfaced as a WARN (issue #593) instead of being silently
+// discarded, and EmbedderDims() reports the probe as unavailable.
+//
+// Issue #925 fix: Removed t.Parallel() because this test modifies the
+// global slog.Default(), which can race with other parallel tests
+// that also set the global default, causing log capture to fail.
+func TestOpenPersistentStore_ProbeFailureLogged(t *testing.T) {
+	// Capture slog output so we can assert the WARN was emitted.
+	var buf bytes.Buffer
+	prev := logOutput(&buf)
+	defer slog.SetDefault(prev)
+
+	ps, err := OpenPersistentStore(":memory:",
+		&modelErrEmbedder{model: "unreachable-model", err: errors.New("connection refused")},
+		0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+
+	// Issue #593 acceptance: embedderDims=0, probe marked unusable.
+	if dims, ok := ps.EmbedderDims(); ok || dims != 0 {
+		t.Errorf("EmbedderDims() = (%d, %v), want (0, false) after probe failure", dims, ok)
+	}
+
+	logged := buf.String()
+	for _, want := range []string{"probe failed", "unreachable-model", "connection refused"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("log missing %q; got:\n%s", want, logged)
+		}
+	}
+}
+
+// TestLoad_ProbeFailedStillDetectsModelMismatch verifies the
+// issue #593 recovery path: when the probe failed at boot (so
+// embedderDims=0 and the per-row dimension check cannot fire), Load
+// still clears the cache via the model-name mismatch check when
+// stored rows were stamped with a different model. This prevents
+// stale embeddings from being served while the embedder is down.
+func TestLoad_ProbeFailedStillDetectsModelMismatch(t *testing.T) {
+	t.Parallel()
+	dbPath := filepath.Join(t.TempDir(), "rag_probe.db")
+
+	// Phase 1: index with model-a so rows are stamped on disk.
+	seedEmb := &dimEmbedder{model: "model-a", dims: 4, vecs: map[string][]float64{
+		"snippet": make([]float64, 4),
+	}}
+	psA, err := OpenPersistentStore(dbPath, seedEmb, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore A: %v", err)
+	}
+	ctx := context.Background()
+	if err := psA.Upsert(ctx, FewShotExample{
+		Filename:  "code.go",
+		Content:   "snippet",
+		Embedding: make([]float64, 4),
+	}); err != nil {
+		t.Fatalf("seed Upsert: %v", err)
+	}
+	if err := psA.Close(); err != nil {
+		t.Fatalf("close A: %v", err)
+	}
+
+	// Phase 2: reopen with a different model whose probe FAILS
+	// (embedder unreachable). embedderDims will be 0, so only the
+	// model-name check can catch the drift.
+	failing := &modelErrEmbedder{model: "model-b", err: errors.New("unreachable")}
+	psB, err := OpenPersistentStore(dbPath, failing, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore B: %v", err)
+	}
+	t.Cleanup(func() { _ = psB.Close() })
+
+	// EmbedderDims must report unavailable (probe failed).
+	if _, ok := psB.EmbedderDims(); ok {
+		t.Fatal("EmbedderDims() ok=true, want false (probe failed)")
+	}
+
+	n, err := psB.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// The model-name mismatch should have cleared the store so
+	// stale vectors are not served.
+	if n != 0 {
+		t.Errorf("Load returned %d rows, want 0 (model mismatch cleared cache)", n)
+	}
+	if psB.Size() != 0 {
+		t.Errorf("Size after mismatch Load = %d, want 0", psB.Size())
+	}
+}
+
+// TestExtractEmbedderModel_UnwrapsEmbedCache ensures the boot-time
+// probe and model stamping work in the cache-enabled production path
+// (issue #593), where the embedder is wrapped in an EmbedCache.
+func TestExtractEmbedderModel_UnwrapsEmbedCache(t *testing.T) {
+	t.Parallel()
+
+	inner := &OllamaEmbedder{BaseURL: "http://localhost:11434", Model: "nomic-embed-text"}
+	wrapped := NewEmbedCache(inner, 8, time.Minute, 5*time.Second)
+
+	if got := extractEmbedderModel(wrapped); got != "nomic-embed-text" {
+		t.Errorf("extractEmbedderModel(EmbedCache) = %q, want %q", got, "nomic-embed-text")
+	}
+	if got := embedderURL(wrapped); got != "http://localhost:11434" {
+		t.Errorf("embedderURL(EmbedCache) = %q, want %q", got, "http://localhost:11434")
+	}
+
+	// Unwrapping a bare embedder is a no-op.
+	if got := extractEmbedderModel(inner); got != "nomic-embed-text" {
+		t.Errorf("extractEmbedderModel(bare) = %q, want %q", got, "nomic-embed-text")
+	}
+	// Unknown/stub types degrade gracefully.
+	if got := extractEmbedderModel(&stubEmbedder{}); got != "unknown" {
+		t.Errorf("extractEmbedderModel(stub) = %q, want %q", got, "unknown")
+	}
+	if got := embedderURL(&stubEmbedder{}); got != "" {
+		t.Errorf("embedderURL(stub) = %q, want empty", got)
+	}
+}
+
+// TestEmbedderDims_HealthyProbe reports the probed dimension when the
+// embedder is reachable at boot.
+func TestEmbedderDims_HealthyProbe(t *testing.T) {
+	t.Parallel()
+	ps, err := OpenPersistentStore(":memory:", &dimEmbedder{model: "ok-model", dims: 768}, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+	if dims, ok := ps.EmbedderDims(); !ok || dims != 768 {
+		t.Errorf("EmbedderDims() = (%d, %v), want (768, true)", dims, ok)
+	}
+}
+
+// TestPersistentStore_Path_OnDisk verifies Path() returns the path
+// passed to OpenPersistentStore for an on-disk store.
+func TestPersistentStore_Path_OnDisk(t *testing.T) {
+	t.Parallel()
+	dbPath := filepath.Join(t.TempDir(), "rag_path_test.db")
+	ps, err := OpenPersistentStore(dbPath, &stubEmbedder{}, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+	if got := ps.Path(); got != dbPath {
+		t.Errorf("Path() = %q, want %q", got, dbPath)
+	}
+}
+
+// TestPersistentStore_Path_InMemory verifies Path() returns empty
+// string for a ":memory:" store.
+func TestPersistentStore_Path_InMemory(t *testing.T) {
+	t.Parallel()
+	ps, err := OpenPersistentStore(":memory:", &stubEmbedder{}, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+	if got := ps.Path(); got != "" {
+		t.Errorf("Path() = %q, want empty string for :memory:", got)
+	}
+}
+
+// batchCounterEmbedder tracks Embed vs EmbedBatch call counts separately
+// so tests can assert which method was invoked.
+type batchCounterEmbedder struct {
+	mu         sync.Mutex
+	embedCalls int
+	batchCalls int
+}
+
+func (b *batchCounterEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
+	b.mu.Lock()
+	b.embedCalls++
+	b.mu.Unlock()
+	return []float64{0, 0, 0}, nil
+}
+
+func (b *batchCounterEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float64, error) {
+	b.mu.Lock()
+	b.batchCalls++
+	b.mu.Unlock()
+	result := make([][]float64, len(texts))
+	for i := range texts {
+		result[i] = []float64{0, 0, 0}
+	}
+	return result, nil
+}
+
+func (b *batchCounterEmbedder) IsHealthy(context.Context) bool            { return true }
+func (b *batchCounterEmbedder) IsBreakerOpen() bool                       { return false }
+func (b *batchCounterEmbedder) RecordBreakerSuccess()                     {}
+func (b *batchCounterEmbedder) SetTripCallback(string, func(kind string)) {}
+
+func (b *batchCounterEmbedder) EmbedCalls() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.embedCalls
+}
+
+func (b *batchCounterEmbedder) BatchCalls() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.batchCalls
+}
+
+// TestPersistentStoreIndexDir_UsesBatchEmbedding verifies that when
+// batchSize > 0, IndexDir calls EmbedBatch (not Embed) and that the
+// number of EmbedBatch calls matches the expected partition count.
+// This is the regression test for issue #832.
+func TestPersistentStoreIndexDir_UsesBatchEmbedding(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	const fileCount = 10
+	for i := 0; i < fileCount; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("file%d.go", i)), []byte(fmt.Sprintf("content %d", i)), 0o644); err != nil {
+			t.Fatalf("write file%d: %v", i, err)
+		}
+	}
+
+	t.Run("batchSize=4_callsEmbedBatch", func(t *testing.T) {
+		emb := &batchCounterEmbedder{}
+		ps, err := OpenPersistentStore(":memory:", emb, 0.55, WithBatchSize(4))
+		if err != nil {
+			t.Fatalf("OpenPersistentStore: %v", err)
+		}
+		t.Cleanup(func() { _ = ps.Close() })
+
+		if err := ps.IndexDir(context.Background(), dir); err != nil {
+			t.Fatalf("IndexDir: %v", err)
+		}
+
+		if emb.EmbedCalls() != 0 {
+			t.Errorf("Embed calls = %d, want 0 (should use EmbedBatch when batchSize > 0)", emb.EmbedCalls())
+		}
+		wantBatchCalls := (fileCount + 4 - 1) / 4
+		if emb.BatchCalls() != wantBatchCalls {
+			t.Errorf("EmbedBatch calls = %d, want %d", emb.BatchCalls(), wantBatchCalls)
+		}
+	})
+
+	t.Run("batchSize=0_callsEmbed", func(t *testing.T) {
+		emb := &batchCounterEmbedder{}
+		ps, err := OpenPersistentStore(":memory:", emb, 0.55)
+		if err != nil {
+			t.Fatalf("OpenPersistentStore: %v", err)
+		}
+		t.Cleanup(func() { _ = ps.Close() })
+
+		if err := ps.IndexDir(context.Background(), dir); err != nil {
+			t.Fatalf("IndexDir: %v", err)
+		}
+
+		if emb.BatchCalls() != 0 {
+			t.Errorf("EmbedBatch calls = %d, want 0 (should use Embed when batchSize == 0)", emb.BatchCalls())
+		}
+		if emb.EmbedCalls() != fileCount {
+			t.Errorf("Embed calls = %d, want %d", emb.EmbedCalls(), fileCount)
+		}
+	})
+}
+
+// TestPersistentStoreIndexDir_BatchUpsertFailureLogsWarning verifies that when
+// EmbedBatch succeeds but Upsert fails, a warning is logged and no panic occurs.
+// This is the regression test for issue #889.
+func TestPersistentStoreIndexDir_BatchUpsertFailureLogsWarning(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	// Write two files so batch size of 2 triggers a single EmbedBatch call.
+	for i := 0; i < 2; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("file%d.go", i)), []byte(fmt.Sprintf("content %d", i)), 0o644); err != nil {
+			t.Fatalf("write file%d: %v", i, err)
+		}
+	}
+
+	emb := &batchCounterEmbedder{}
+	ps, err := OpenPersistentStore(":memory:", emb, 0.55, WithBatchSize(2))
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+
+	// First IndexDir: succeeds and populates the store.
+	if err := ps.IndexDir(context.Background(), dir); err != nil {
+		t.Fatalf("first IndexDir: %v", err)
+	}
+
+	// Close the DB so subsequent Upsert calls fail.
+	if err := ps.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Capture log output.
+	var buf bytes.Buffer
+	prev := logOutput(&buf)
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	// Second IndexDir: EmbedBatch succeeds (embedder doesn't need DB),
+	// but Upsert fails because DB is closed.
+	// The code must not panic and should log a warning.
+	if err := ps.IndexDir(context.Background(), dir); err != nil {
+		t.Fatalf("second IndexDir: %v", err)
+	}
+
+	// Verify a warning containing "upsert" was logged.
+	logOutput := buf.String()
+	if !strings.Contains(logOutput, "upsert") {
+		t.Errorf("expected warning log containing 'upsert', got: %s", logOutput)
+	}
+}
+
+// TestPersistentStoreHNSWSerializeRoundTrip verifies that after Upserting
+// enough examples to build an HNSW index, the serialized blob is persisted
+// and Load restores the index via DeserializeHNSWIndex instead of rebuilding
+// from scratch (issue #939).
+func TestPersistentStoreHNSWSerializeRoundTrip(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	// Create enough examples to exceed indexThreshold (50) so the HNSW index is built.
+	const n = indexThreshold + 10
+	onDisk := filepath.Join(t.TempDir(), "rag_hnsw_serialize.db")
+
+	// Use a counting embedder to verify no embeddings happen on Load.
+	// The embedder returns a fixed vector that matches file0's embedding.
+	counter := &indexedCallCounter{
+		vecs: map[string][]float64{
+			"file0 content": {1, 0, 0, 0, 0, 0, 0, 0}, // matches file0's embedding
+		},
+	}
+
+	ps, err := OpenPersistentStore(onDisk, counter, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+
+	// Insert n examples with deterministic embeddings.
+	for i := 0; i < n; i++ {
+		vec := make([]float64, 8)
+		vec[i%8] = 1.0 // deterministic, non-zero in one dimension
+		if err := ps.Upsert(ctx, FewShotExample{
+			Filename:  fmt.Sprintf("file%d.go", i),
+			Content:   fmt.Sprintf("content %d", i),
+			Embedding: vec,
+		}); err != nil {
+			t.Fatalf("Upsert file%d: %v", i, err)
+		}
+	}
+	if ps.Size() != n {
+		t.Fatalf("Size = %d, want %d", ps.Size(), n)
+	}
+	if err := ps.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Reopen with the same counting embedder.
+	counter2 := &indexedCallCounter{
+		vecs: map[string][]float64{
+			"file0 content": {1, 0, 0, 0, 0, 0, 0, 0},
+		},
+	}
+	ps2, err := OpenPersistentStore(onDisk, counter2, 0.55)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = ps2.Close() })
+
+	// Load should NOT call the embedder since we have a serialized blob.
+	nLoaded, err := ps2.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if nLoaded != n {
+		t.Fatalf("Load returned %d, want %d", nLoaded, n)
+	}
+	if counter2.calls > 0 {
+		t.Errorf("Load called embedder %d times, want 0 (serialized blob should be used)", counter2.calls)
+	}
+
+	// Verify the index was actually restored by doing a Retrieve.
+	// Retrieve always calls the embedder to embed the prompt (that's normal),
+	// but with a restored HNSW index, it should use the index to find neighbors
+	// rather than doing a brute-force scan.
+	ex, _, path, err := ps2.Retrieve(ctx, "file0 content")
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if ex == nil {
+		t.Fatal("Retrieve returned nil, want a match")
+	}
+	// With a restored HNSW index, Retrieve should report HNSW path.
+	if path != IndexPathHNSW {
+		t.Errorf("Retrieve path = %q, want %q (index should be restored)", path, IndexPathHNSW)
+	}
+}
+
+// TestPersistentStoreIndexDir_BatchUpsertFailureInvalidatesHNSW (issue #1042)
+// verifies that when EmbedBatch succeeds but an individual Upsert fails within
+// a batch, the HNSW index is invalidated so subsequent Retrieve calls fall back
+// to brute-force instead of returning stale HNSW IDs.
+func TestPersistentStoreIndexDir_BatchUpsertFailureInvalidatesHNSW(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	// Use batch size > 0 to exercise the batch code path.
+	ps, err := OpenPersistentStore(":memory:", &stubEmbedder{}, 0.55, WithBatchSize(4))
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+
+	// Add enough examples via individual Upserts to exceed indexThreshold (50)
+	// so the HNSW index is built. Use a non-zero vector so cosine similarity
+	// is well-defined.
+	const n = indexThreshold + 5
+	vec := []float64{1, 0, 0, 0, 0, 0, 0, 0}
+	for i := 0; i < n; i++ {
+		if err := ps.Upsert(ctx, FewShotExample{
+			Filename:  fmt.Sprintf("file%d.go", i),
+			Content:   fmt.Sprintf("content %d", i),
+			Embedding: vec,
+		}); err != nil {
+			t.Fatalf("Upsert file%d: %v", i, err)
+		}
+	}
+
+	// Trigger lazy HNSW index build via Retrieve (Upsert invalidates after
+	// each call, so Retrieve is the first call that rebuilds it).
+	_, _, _, err = ps.Retrieve(ctx, "content 0")
+	if err != nil {
+		t.Fatalf("Retrieve to build index: %v", err)
+	}
+
+	// Verify HNSW index is active before the failure.
+	if mode := ps.IndexMode(); mode != IndexModeHNSW {
+		t.Fatalf("before failure: IndexMode = %q, want %q", mode, IndexModeHNSW)
+	}
+
+	// Close the DB so subsequent Upsert calls fail (but EmbedBatch still succeeds
+	// because the embedder doesn't need the DB).
+	if err := ps.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// IndexDir: EmbedBatch succeeds (embedder doesn't need DB), but Upsert fails
+	// because DB is closed. The code must invalidate the HNSW index to prevent
+	// stale IDs from being returned by subsequent Retrieve calls.
+	dir := t.TempDir()
+	for i := 0; i < 3; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("new%d.go", i)), []byte(fmt.Sprintf("new content %d", i)), 0o644); err != nil {
+			t.Fatalf("write new%d: %v", i, err)
+		}
+	}
+	if err := ps.IndexDir(ctx, dir); err != nil {
+		t.Fatalf("IndexDir after close: %v", err)
+	}
+
+	// After the Upsert failure, the HNSW index must be invalidated so
+	// Retrieve falls back to brute-force instead of returning stale HNSW IDs.
+	if mode := ps.IndexMode(); mode != IndexModeBruteForce {
+		t.Errorf("after upsert failure: IndexMode = %q, want %q (HNSW should be invalidated)", mode, IndexModeBruteForce)
+	}
+}
+
+// TestPersistentStoreHNSWFallbackRebuild verifies that Load falls back to
+// rebuildIndex when no serialized hnsw_index blob is present (backward
+// compatibility with pre-issue-#939 databases).
+func TestPersistentStoreHNSWFallbackRebuild(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	onDisk := filepath.Join(t.TempDir(), "rag_hnsw_fallback.db")
+
+	// Manually create a v2 schema (no hnsw_index column) to simulate
+	// a database created before issue #939.
+	{
+		db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=rwc", onDisk))
+		if err != nil {
+			t.Fatalf("open db: %v", err)
+		}
+		_, err = db.Exec(`
+			CREATE TABLE rag_examples (
+				filename TEXT PRIMARY KEY,
+				content TEXT NOT NULL,
+				embedding BLOB NOT NULL,
+				indexed_at DATETIME NOT NULL,
+				embedder_model TEXT NOT NULL DEFAULT '',
+				dims INTEGER NOT NULL DEFAULT 0
+			)`)
+		if err != nil {
+			t.Fatalf("create v2 schema: %v", err)
+		}
+		_, err = db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)`)
+		if err != nil {
+			t.Fatalf("create schema_version: %v", err)
+		}
+		_, err = db.Exec(`INSERT INTO schema_version (version) VALUES (2)`)
+		if err != nil {
+			t.Fatalf("insert version 2: %v", err)
+		}
+
+		// Insert enough rows to exceed indexThreshold.
+		for i := 0; i < indexThreshold+5; i++ {
+			vec := make([]float64, 8)
+			vec[i%8] = 1.0
+			embBlob, err := encodeEmbedding(vec)
+			if err != nil {
+				t.Fatalf("encode embedding: %v", err)
+			}
+			_, err = db.Exec(`
+				INSERT INTO rag_examples (filename, content, embedding, indexed_at, embedder_model, dims)
+				VALUES (?, ?, ?, ?, '', 8)`,
+				fmt.Sprintf("file%d.go", i), fmt.Sprintf("content %d", i), embBlob, time.Now().UTC())
+			if err != nil {
+				t.Fatalf("insert row %d: %v", i, err)
+			}
+		}
+		db.Close()
+	}
+
+	// Open the v2 database - it should run migration and fall back to rebuild.
+	// Use a dimEmbedder that returns a vector matching file0.
+	emb := &dimEmbedder{
+		model: "test",
+		dims:  8,
+		vecs: map[string][]float64{
+			"file0 content": {1, 0, 0, 0, 0, 0, 0, 0}, // matches file0's embedding
+		},
+	}
+	ps, err := OpenPersistentStore(onDisk, emb, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+
+	nLoaded, err := ps.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if nLoaded != indexThreshold+5 {
+		t.Fatalf("Load returned %d, want %d", nLoaded, indexThreshold+5)
+	}
+
+	// Verify the index was rebuilt by checking Retrieve works.
+	ex, _, path, err := ps.Retrieve(ctx, "file0 content")
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if ex == nil {
+		t.Fatal("Retrieve returned nil, want a result")
+	}
+	// Fallback path should still produce HNSW path after rebuild.
+	if path != IndexPathHNSW {
+		t.Errorf("Retrieve path = %q, want %q (fallback rebuild should use HNSW)", path, IndexPathHNSW)
+	}
 }

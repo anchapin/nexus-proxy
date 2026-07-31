@@ -2,15 +2,12 @@ package router
 
 import (
 	"bytes"
-	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/ioutils"
@@ -23,6 +20,12 @@ const defaultMaxResponseBytes = 64 << 20 // 64 MiB
 // SLMClient talks to a local Ollama /api/chat endpoint and asks the small
 // model to produce a routing decision. The HTTP layer is abstracted so
 // tests can substitute a deterministic stub.
+//
+// SLMClient no longer maintains its own decision cache (issue #489). The
+// planner-level SLMCache (slm_cache.go) is the sole caching layer and
+// honours NEXUS_SLM_CACHE_TTL=0 as a true kill-switch. Previously the
+// internal cache silently fell back to a 5-minute TTL when the configured
+// value was non-positive, defeating the documented disable contract.
 type SLMClient struct {
 	BaseURL string        // e.g. "http://localhost:11434"
 	Model   string        // e.g. "qwen3-coder:4b"
@@ -38,28 +41,6 @@ type SLMClient struct {
 	// back to DefaultConfidenceFloor / DefaultConfidenceCeiling.
 	ConfidenceFloor   float64
 	ConfidenceCeiling float64
-
-	// SLM routing decision cache (issue #162). Caches identical prompts
-	// keyed by FNV-1a hash of (prompt, systemPrompt) so that repeated
-	// prompts (e.g. looping coding agents, repeated RAG queries) avoid
-	// a full 8s Ollama round-trip. cacheTTL controls entry expiry;
-	// cacheMaxEntries caps memory use with LRU eviction.
-	CacheTTL        time.Duration // default 5m
-	CacheMaxEntries int           // default 512
-
-	cacheMu   sync.RWMutex
-	cacheList *list.List               // LRU list: front=MRU, back=LRU
-	cacheMap  map[string]*list.Element // key -> list element for O(1) lookup
-	hits      int64
-	misses    int64
-}
-
-// cacheEntry pairs a route decision with its expiry time.
-// Key is stored so we can delete from cacheMap when this entry is evicted.
-type cacheEntry struct {
-	Key       string
-	Route     Route
-	ExpiresAt time.Time
 }
 
 // NewSLMClient constructs a client. Pass nil for Client to use
@@ -69,29 +50,11 @@ func NewSLMClient(baseURL, model string, timeout time.Duration, client *http.Cli
 		client = http.DefaultClient
 	}
 	return &SLMClient{
-		BaseURL:         baseURL,
-		Model:           model,
-		Timeout:         timeout,
-		Client:          client,
-		CacheTTL:        5 * time.Minute,
-		CacheMaxEntries: 512,
-		cacheList:       list.New(),
-		cacheMap:        make(map[string]*list.Element),
+		BaseURL: baseURL,
+		Model:   model,
+		Timeout: timeout,
+		Client:  client,
 	}
-}
-
-// WithCache sets the cache TTL and max-entries cap and returns the
-// same client for chaining. Call on the return value of NewSLMClient:
-//   - WithCache(0, 0)  disables caching
-//   - WithCache(10, 5*time.Minute) enables a 10-entry TTL cache
-func (c *SLMClient) WithCache(maxEntries int, ttl time.Duration) *SLMClient {
-	c.CacheMaxEntries = maxEntries
-	c.CacheTTL = ttl
-	if maxEntries > 0 {
-		c.cacheList = list.New()
-		c.cacheMap = make(map[string]*list.Element)
-	}
-	return c
 }
 
 // slmSystemPrompt is the static instruction we send to the routing SLM.
@@ -161,81 +124,10 @@ func (c *SLMClient) systemPromptFor(confidence float64) string {
 	}
 }
 
-// cacheKey returns the FNV-1a hash key for a (prompt, systemPrompt) pair.
-// The same logical prompt always produces the same key regardless of
-// SLMClient pointer equality, so callers can use this for pre-check.
-func cacheKey(prompt, systemPrompt string) string {
-	h := fnv.New64a()
-	h.Write([]byte(prompt))
-	h.Write([]byte(systemPrompt))
-	return fmt.Sprintf("%x", h.Sum64())
-}
-
-// CacheStats returns the current cache hit and miss counts.
-func (c *SLMClient) CacheStats() (hits, misses int64) {
-	c.cacheMu.RLock()
-	defer c.cacheMu.RUnlock()
-	return c.hits, c.misses
-}
-
-// evictStale removes expired entries and enforces the max-entries cap via
-// true LRU eviction: expired entries are always removed first; if the cache
-// is still over capacity after expired entry removal, the least-recently-used
-// entry (the back of the LRU list) is evicted. This ensures deterministic
-// eviction order regardless of Go map iteration order (issue #275).
-func (c *SLMClient) evictStale() {
-	now := time.Now()
-	max := c.CacheMaxEntries
-	if max <= 0 {
-		max = 512
-	}
-
-	// Phase 1: remove all expired entries by iterating the LRU list.
-	// Iterate from back to front so we can safely remove while iterating.
-	for e := c.cacheList.Back(); e != nil; e = e.Prev() {
-		entry := e.Value.(*cacheEntry)
-		if now.After(entry.ExpiresAt) {
-			delete(c.cacheMap, entry.Key)
-			c.cacheList.Remove(e)
-		}
-	}
-
-	// Phase 2: if still over capacity, evict LRU entries from the back.
-	if c.cacheList.Len() >= max {
-		evict := c.cacheList.Len() - max + 1
-		for i := 0; i < evict; i++ {
-			lruElem := c.cacheList.Back()
-			if lruElem == nil {
-				break
-			}
-			entry := lruElem.Value.(*cacheEntry)
-			delete(c.cacheMap, entry.Key)
-			c.cacheList.Remove(lruElem)
-		}
-	}
-}
-
 // decide performs the HTTP round-trip with the supplied system prompt.
+// The planner-level SLMCache (slm_cache.go) is the sole caching layer;
+// SLMClient itself is cache-free (issue #489).
 func (c *SLMClient) decide(ctx context.Context, prompt, systemPrompt string) (Route, error) {
-	var key string
-	caching := c.CacheMaxEntries > 0
-	if caching {
-		key = cacheKey(prompt, systemPrompt)
-		// Fast path: check cache before HTTP call (issue #162).
-		c.cacheMu.RLock()
-		elem, ok := c.cacheMap[key]
-		hit := ok && time.Now().Before(elem.Value.(*cacheEntry).ExpiresAt)
-		if hit {
-			c.hits++
-			// Move to front (MRU position) since this entry was just accessed.
-			c.cacheList.MoveToFront(elem)
-		}
-		c.cacheMu.RUnlock()
-		if hit {
-			return elem.Value.(*cacheEntry).Route, nil
-		}
-	}
-
 	payload, _ := json.Marshal(map[string]interface{}{
 		"model": c.Model,
 		"messages": []map[string]string{
@@ -295,26 +187,6 @@ func (c *SLMClient) decide(ctx context.Context, prompt, systemPrompt string) (Ro
 	route := Route(strings.ToLower(decision.Route))
 	if route != RouteLocal && route != RouteFusion {
 		route = RouteFrontier
-	}
-
-	// Populate cache on successful HTTP response (issue #162).
-	if caching {
-		c.cacheMu.Lock()
-		c.evictStale()
-		ttl := c.CacheTTL
-		if ttl <= 0 {
-			ttl = 5 * time.Minute
-		}
-		entry := &cacheEntry{
-			Key:       key,
-			Route:     route,
-			ExpiresAt: time.Now().Add(ttl),
-		}
-		// Add to front of list (MRU position) and map.
-		elem := c.cacheList.PushFront(entry)
-		c.cacheMap[key] = elem
-		c.misses++
-		c.cacheMu.Unlock()
 	}
 
 	return route, nil

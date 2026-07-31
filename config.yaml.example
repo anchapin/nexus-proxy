@@ -22,6 +22,10 @@ server_idle_timeout: "120s"
 server_max_header_bytes: 1048576  # 1 MiB
 shutdown_timeout: "30s"
 max_body_bytes: 1048576       # request body cap
+# Effective inbound TLS posture (issue #444). Drives the security-headers
+# HSTS gate. Set true when the proxy terminates TLS directly OR sits behind
+# a TLS-terminating reverse proxy.
+tls_enabled: false
 
 # --- Structured logging ---------------------------------------------------
 log_level: "info"             # debug | info | warn | error

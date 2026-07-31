@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/health"
 )
@@ -235,9 +236,11 @@ func TestStatusShape(t *testing.T) {
 		Probe:         probe,
 		Judge:         judge,
 		Quality:       quality,
+		LocalCooldown: nil, // disabled in this test
 		Config:        cfg,
 		ReadinessMode: ReadinessModeStrict,
 		StartTime:     start,
+		Version:       "v1.2.3-test",
 	})
 
 	rec := httptest.NewRecorder()
@@ -266,16 +269,23 @@ func TestStatusShape(t *testing.T) {
 			t.Errorf("top-level key %q is nil (want %s)", key, wantType)
 		}
 	}
+	check("version", "string")
 	check("ollama", "object")
 	check("frontier", "object")
 	check("vram_probe", "object")
 	check("judge", "object")
 	check("quality", "object")
+	check("local_cooldown", "object")
 	check("uptime_seconds", "number")
 	check("readiness_mode", "string")
 
 	if body["readiness_mode"] != ReadinessModeStrict {
 		t.Errorf("readiness_mode = %v, want %q", body["readiness_mode"], ReadinessModeStrict)
+	}
+
+	// Version field (issue #529).
+	if body["version"] != "v1.2.3-test" {
+		t.Errorf("version = %v, want %q", body["version"], "v1.2.3-test")
 	}
 
 	// Uptime is reported in seconds; the handler rounds toward zero
@@ -351,6 +361,20 @@ func TestStatusShape(t *testing.T) {
 	if v, _ := qualityJSON["dropped"].(float64); v != 7 {
 		t.Errorf("quality.dropped = %v, want 7", v)
 	}
+
+	cooldownJSON, _ := body["local_cooldown"].(map[string]interface{})
+	if cooldownJSON == nil {
+		t.Fatal("local_cooldown is not an object")
+	}
+	if cooldownJSON["enabled"] != false {
+		t.Errorf("local_cooldown.enabled = %v, want false (nil cooldown)", cooldownJSON["enabled"])
+	}
+	if cooldownJSON["active"] != false {
+		t.Errorf("local_cooldown.active = %v, want false", cooldownJSON["active"])
+	}
+	if cooldownJSON["expires_at"] != "0001-01-01T00:00:00Z" {
+		t.Errorf("local_cooldown.expires_at = %v, want zero time 0001-01-01T00:00:00Z", cooldownJSON["expires_at"])
+	}
 }
 
 // TestStatusZeroAdapters verifies the /status handler works when
@@ -364,6 +388,7 @@ func TestStatusZeroAdapters(t *testing.T) {
 		Probe:         ProbeStatsFunc{},
 		Judge:         JudgeStatsFunc{},
 		Quality:       QualityStatsFunc{},
+		LocalCooldown: nil,
 		Config:        config.Config{},
 		ReadinessMode: "", // exercises NormalizeReadinessMode fallback
 	})
@@ -384,6 +409,70 @@ func TestStatusZeroAdapters(t *testing.T) {
 	}
 	if body["frontier"].(map[string]interface{})["configured"] != false {
 		t.Errorf("zero adapters frontier.configured should be false, got %v", body["frontier"])
+	}
+}
+
+// TestStatusLocalCooldownActive (issue #530) verifies the /status
+// handler correctly surfaces an active cooldown with enabled=true,
+// active=true, and a non-zero expires_at.
+func TestStatusLocalCooldownActive(t *testing.T) {
+	probe := ProbeStatsFunc{
+		TokensFn:   func() int { return 12345 },
+		SourceFn:   func() string { return "static" },
+		FreeVRAMFn: func() int64 { return 0 },
+		ContextFn:  func() int { return 0 },
+	}
+	judge := JudgeStatsFunc{
+		EnabledFn:     func() bool { return false },
+		QueueDepthFn:  func() int { return 0 },
+		ConcurrencyFn: func() int { return 0 },
+	}
+	quality := QualityStatsFunc{
+		EnabledFn:     func() bool { return false },
+		QueueDepthFn:  func() int { return 0 },
+		ConcurrencyFn: func() int { return 0 },
+	}
+
+	clk := circuit.NewWithClock(30*time.Second, func() time.Time {
+		return time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	})
+	clk.RecordFailure()
+
+	h := StatusHandler(HealthStatusDeps{
+		Health:        nil,
+		Probe:         probe,
+		Judge:         judge,
+		Quality:       quality,
+		LocalCooldown: clk,
+		Config:        config.Config{},
+		ReadinessMode: ReadinessModeDegraded,
+		StartTime:     time.Now(),
+	})
+
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/status code = %d, want 200", rec.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+
+	cooldownJSON, _ := body["local_cooldown"].(map[string]interface{})
+	if cooldownJSON == nil {
+		t.Fatal("local_cooldown is not an object")
+	}
+	if cooldownJSON["enabled"] != true {
+		t.Errorf("local_cooldown.enabled = %v, want true", cooldownJSON["enabled"])
+	}
+	if cooldownJSON["active"] != true {
+		t.Errorf("local_cooldown.active = %v, want true", cooldownJSON["active"])
+	}
+	expiresAt, ok := cooldownJSON["expires_at"].(string)
+	if !ok || expiresAt == "" {
+		t.Errorf("local_cooldown.expires_at = %v, want non-empty ISO8601 string", cooldownJSON["expires_at"])
 	}
 }
 

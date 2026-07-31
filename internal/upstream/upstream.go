@@ -18,14 +18,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/anchapin/nexus-proxy/internal/ioutils"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
-
-// defaultMaxResponseBytes is the default cap on upstream response bodies.
-// It is used by ReadAllLimited to prevent memory exhaustion (issue #365).
-// The chat handler's Config.MaxResponseBytes takes precedence when set.
-const defaultMaxResponseBytes = 64 << 20 // 64 MiB
 
 // ErrClientAbort is returned by streamPanelResultAsSSE when the client
 // disconnects mid-stream (EPIPE, ECONNRESET). Callers must treat it as
@@ -43,6 +39,17 @@ func IncPanelPanics() { panelPanicsTotal.Add(1) }
 
 // PanelPanicsTotal returns the cumulative panel panic count.
 func PanelPanicsTotal() uint64 { return panelPanicsTotal.Load() }
+
+// fusionClientAbortTotal counts client aborts during fusion streaming
+// (issue #1046). Exposed via FusionClientAbortTotal for the /metrics endpoint.
+var fusionClientAbortTotal atomic.Uint64
+
+// IncFusionClientAbort increments the fusion client abort counter. Called
+// when IsClientAbort(err) is true during speculative or arbiter synthesis streaming.
+func IncFusionClientAbort() { fusionClientAbortTotal.Add(1) }
+
+// FusionClientAbortTotal returns the cumulative fusion client abort count.
+func FusionClientAbortTotal() uint64 { return fusionClientAbortTotal.Load() }
 
 // IsClientAbort reports whether err is a client-side connection error
 // (EPIPE, ECONNRESET, broken pipe) that indicates the client disconnected
@@ -97,6 +104,33 @@ func copyAllowedHeaders(dst, src http.Header) {
 	}
 }
 
+// DefaultMaxUpstreamResponseBytes is the default cap on buffered upstream
+// responses. It is used as the initial value of maxResponseBytes before
+// ConfigureMaxResponseBytes is called. The value (10 MiB) accommodates
+// multi-turn conversations with long contexts while preventing a malicious
+// or misbehaving upstream from exhausting proxy memory (issue #386).
+var DefaultMaxUpstreamResponseBytes int64 = 10 << 20 // 10 MiB
+
+// maxResponseBytes is the currently-configured cap on buffered upstream
+// responses. It is consulted by BufferedFetchWithContext and FetchPanel
+// instead of the bare DefaultMaxUpstreamResponseBytes constant.
+var maxResponseBytes int64 = DefaultMaxUpstreamResponseBytes
+
+// ConfigureMaxResponseBytes sets the cap on buffered upstream response
+// bodies. Called once at startup from cmd/nexus/main.go so the configured
+// NEXUS_MAX_RESPONSE_BYTES value (or its default) is authoritative for
+// the upstream package. Issue #533.
+func ConfigureMaxResponseBytes(n int64) {
+	maxResponseBytes = n
+}
+
+// ResetMaxResponseBytesForTest resets maxResponseBytes to the default
+// so tests do not bleed state into each other. Called at the end of each
+// test that calls ConfigureMaxResponseBytes.
+func ResetMaxResponseBytesForTest() {
+	maxResponseBytes = DefaultMaxUpstreamResponseBytes
+}
+
 // Client is the minimal interface used by the stream and fusion helpers. The
 // default http.Client satisfies it; tests can pass a stub.
 type Client interface {
@@ -140,6 +174,21 @@ func Stream(w http.ResponseWriter, client Client, targetURL, apiKey string, payl
 // record the truncation via its observability hook.
 var ErrUpstreamTruncated = errors.New("upstream: stream truncated")
 
+// ErrUpstreamContentTypeMismatch is returned by BufferedFetchWithContext
+// (issue #930) and by StreamWithContext (issue #934) when the upstream
+// responds with 200 OK but declares a Content-Type that is neither
+// application/json nor text/event-stream. This prevents HTML or other
+// non-compliant bodies from being forwarded as SSE frames or being
+// unmarshalled as JSON.
+var ErrUpstreamContentTypeMismatch = errors.New("upstream: content-type mismatch")
+
+// ErrResponseTruncated is returned by FetchPanel when the upstream
+// response body equals MaxResponseBytes (issue #1047). It indicates
+// the response was truncated at the limit but no I/O error occurred.
+// This distinguishes exact-limit responses (not an error) from actual
+// truncation errors (upstream had more data).
+var ErrResponseTruncated = errors.New("fusion: response truncated at max response bytes")
+
 // sseDoneMarker is the OpenAI SSE stream terminator, recognised as a
 // standalone frame so a [DONE] embedded inside a JSON content chunk
 // never falsely marks the stream complete.
@@ -176,6 +225,21 @@ func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client
 	}
 	defer resp.Body.Close()
 
+	// Issue #934: validate Content-Type before any data is written to the
+	// client. A 200 response with text/html would otherwise have its body
+	// forwarded line-by-line as SSE data, corrupting the response stream.
+	if resp.StatusCode == http.StatusOK {
+		ct := resp.Header.Get("Content-Type")
+		if ct != "text/event-stream" && ct != "application/json" {
+			slog.Warn("upstream Content-Type mismatch",
+				"status", resp.StatusCode,
+				"content_type", ct,
+				"target", targetURL,
+			)
+			return ErrUpstreamContentTypeMismatch
+		}
+	}
+
 	// Forward only allowlisted upstream headers so the proxy does not
 	// leak upstream identity (Server), session state (Set-Cookie), or
 	// routing metadata (Via) to the client (issue #39).
@@ -192,6 +256,26 @@ func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
+			// Issue #980: validate SSE data lines as JSON before forwarding.
+			// isSSEDoneLine already passes through the [DONE] sentinel
+			// unchanged. For non-DONE data: lines we extract the JSON
+			// payload and validate it; malformed content is not forwarded —
+			// we terminate the stream cleanly instead.
+			if !isSSEDoneLine(line) && isSSEDataLine(line) {
+				if !validSSELineJSON(line) {
+					slog.Warn("upstream sent malformed SSE data, terminating stream",
+						"target", targetURL,
+						"line", string(line),
+					)
+					if !seenDone {
+						if _, werr := io.WriteString(w, "data: [DONE]\n\n"); werr != nil {
+							return werr
+						}
+						flusher.Flush()
+					}
+					return nil
+				}
+			}
 			if _, werr := w.Write(line); werr != nil {
 				return werr
 			}
@@ -241,6 +325,31 @@ func StreamWithContext(ctx context.Context, w http.ResponseWriter, client Client
 // payload after `data: `, not the bare token.
 func isSSEDoneLine(line []byte) bool {
 	return strings.TrimSpace(string(line)) == sseDoneMarker
+}
+
+// isSSEDataLine reports whether line is an SSE data field (data: <content>).
+// Lines that are the done marker, blank lines, comment lines, or other SSE
+// fields (event:, id:, retry:) are not data lines and are forwarded as-is.
+func isSSEDataLine(line []byte) bool {
+	trimmed := strings.TrimSpace(string(line))
+	// The [DONE] sentinel starts with "data: " but is not a JSON data field.
+	if trimmed == sseDoneMarker {
+		return false
+	}
+	return strings.HasPrefix(trimmed, "data: ") && len(trimmed) > 6
+}
+
+// validSSELineJSON reports whether the JSON payload in an SSE data: line is
+// valid JSON. The "data: " prefix is stripped before validation so json.Valid
+// sees only the raw payload. Non-JSON content (plain text, error messages,
+// partial fragments) returns false.
+func validSSELineJSON(line []byte) bool {
+	trimmed := strings.TrimSpace(string(line))
+	if !strings.HasPrefix(trimmed, "data: ") {
+		return true // not a data line — forward unchanged
+	}
+	payload := trimmed[6:] // strip "data: "
+	return json.Valid([]byte(payload))
 }
 
 // emitTruncationTerminator writes the SSE signal the downstream
@@ -325,7 +434,35 @@ func BufferedFetchWithContext(ctx context.Context, w http.ResponseWriter, client
 		return fmt.Errorf("upstream: do: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, _ := ioutils.ReadAllLimited(resp.Body, defaultMaxResponseBytes)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	// err may be nil even when the limit was hit: io.LimitReader returns
+	// io.EOF (not an error) when the limit is reached but all requested
+	// bytes were returned. To detect this truncation we also check whether
+	// the body length equals the limit — if so, the upstream may have
+	// had more data we did not receive.
+	if err != nil || int64(len(respBody)) >= maxResponseBytes {
+		// Preserve the upstream status code before returning a truncation
+		// error so the harness receives the actual upstream response code
+		// (e.g. 429 with {"error":"rate limited"}) instead of a blank 500.
+		// Issue #967.
+		w.WriteHeader(resp.StatusCode)
+		return fmt.Errorf("upstream: read response: %w", err)
+	}
+
+	// Reject 200 responses with wrong Content-Type before JSON unmarshal.
+	// A misbehaving upstream returning e.g. text/html would otherwise be
+	// forwarded as application/json and confuse the harness. Issue #930.
+	if resp.StatusCode == http.StatusOK {
+		ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
+		if ct != "application/json" && ct != "text/event-stream" {
+			slog.Warn("upstream content-type mismatch",
+				"status", resp.StatusCode,
+				"content_type", ct,
+				"target", targetURL,
+			)
+			return ErrUpstreamContentTypeMismatch
+		}
+	}
 
 	// Validate the upstream body is a single JSON object. A misbehaving
 	// upstream returning HTML or plain text would otherwise propagate
@@ -381,9 +518,26 @@ func FetchPanel(ctx context.Context, client Client, targetURL, apiKey, modelName
 		return AssistantMessage{}, fmt.Errorf("fusion: do: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, _ := ioutils.ReadAllLimited(resp.Body, defaultMaxResponseBytes)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	truncated := int64(len(respBody)) >= maxResponseBytes
+	if err != nil || truncated {
+		if err == nil && truncated {
+			err = ErrResponseTruncated
+		}
+		return AssistantMessage{}, fmt.Errorf("fusion: read response: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
-		return AssistantMessage{}, fmt.Errorf("fusion: %s status %d: %s", modelName, resp.StatusCode, respBody)
+		return AssistantMessage{}, fmt.Errorf("fusion: %s status %d: %s", modelName, resp.StatusCode, truncateForLog(respBody, 200))
+	}
+
+	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if ct != "application/json" && ct != "text/event-stream" {
+		slog.Warn("upstream content-type mismatch",
+			"status", resp.StatusCode,
+			"content_type", ct,
+			"target", targetURL,
+		)
+		return AssistantMessage{}, ErrUpstreamContentTypeMismatch
 	}
 
 	var raw struct {
@@ -422,6 +576,13 @@ type PanelResult struct {
 	Content   string
 	ToolCalls []ToolCall
 	Err       error
+}
+
+func (p PanelResult) ErrStr() string {
+	if p.Err == nil {
+		return ""
+	}
+	return p.Err.Error()
 }
 
 // Panel runs local and frontier fetches concurrently and waits for both.
@@ -477,20 +638,26 @@ type PanelResult struct {
 // HTTP handler). When the client disconnects, ctx is cancelled and the
 // in-flight upstream calls are cancelled within 1 second rather than
 // waiting for their individual timeouts (issue #297).
+//
+// When isFusion is true, Panel sets X-Nexus-Fusion-Progressive: true on
+// the response so downstream telemetry can distinguish a fusion fallback
+// from a regular non-fusion request (issue #984).
 func Panel(
 	ctx context.Context,
 	w http.ResponseWriter,
 	client Client,
-	localBaseURL, localModel, frontierURL, frontierModel string,
+	localBaseURL, localModel, frontierURL, frontierKey, frontierModel string,
 	arbiterURL, arbiterKey, arbiterModel string,
 	body map[string]interface{},
 	latestPrompt string,
 	perFetchTimeout time.Duration,
 	arbiterTimeout time.Duration,
 	skipLocal bool,
+	requestID string,
 	arbiterCache *ArbiterCache,
 	arbiterCacheTTL time.Duration,
-) (cacheHit bool, _ error) {
+	isFusion bool,
+) (outcome PanelOutcome, cacheHit bool, _ error) {
 	results := make(chan PanelResult, 2)
 	if skipLocal {
 		// Synthetic local failure so the arbiter prompt shape stays
@@ -503,11 +670,15 @@ func Panel(
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
+					slog.Warn("fusion panel local goroutine panicked",
+						slog.String("request_id", requestID),
+						slog.Any("panic", r),
+					)
 					IncPanelPanics()
 					results <- PanelResult{Source: "local", Err: fmt.Errorf("panic: %v", r)}
 				}
 			}()
-			ctx, cancel := context.WithTimeout(ctx, withDefault(perFetchTimeout))
+			ctx, cancel := context.WithTimeout(ctx, perFetchTimeout)
 			defer cancel()
 			msg, err := FetchPanel(ctx, client,
 				localBaseURL+"/v1/chat/completions", "", localModel, body)
@@ -517,18 +688,30 @@ func Panel(
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
+				slog.Warn("fusion panel frontier goroutine panicked",
+					slog.String("request_id", requestID),
+					slog.Any("panic", r),
+				)
 				IncPanelPanics()
 				results <- PanelResult{Source: "frontier", Err: fmt.Errorf("panic: %v", r)}
 			}
 		}()
-		ctx, cancel := context.WithTimeout(ctx, withDefault(perFetchTimeout))
+		ctx, cancel := context.WithTimeout(ctx, perFetchTimeout)
 		defer cancel()
 		msg, err := FetchPanel(ctx, client,
-			frontierURL, "", frontierModel, body)
+			frontierURL, frontierKey, frontierModel, body)
 		results <- PanelResult{Source: "frontier", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
 	}()
 	r1 := <-results
 	r2 := <-results
+
+	slog.Info("fusion panel: members ready",
+		slog.String("request_id", requestID),
+		slog.String("r1_source", r1.Source),
+		slog.String("r2_source", r2.Source),
+		slog.String("r1_err", r1.ErrStr()),
+		slog.String("r2_err", r2.ErrStr()),
+	)
 
 	synth := SynthesisPrompt(latestPrompt, r1, r2)
 	synthBody := map[string]interface{}{
@@ -543,7 +726,7 @@ func Panel(
 	// above already enforce perFetchTimeout via FetchPanel's context,
 	// so we leave them alone and only the arbiter stream picks up the
 	// new arbiterTimeout knob.
-	arbiterCtx, cancelArbiter := context.WithTimeout(ctx, withDefaultArbiterTimeout(arbiterTimeout))
+	arbiterCtx, cancelArbiter := context.WithTimeout(ctx, arbiterTimeout)
 	defer cancelArbiter()
 	// Honor the harness's stream flag (issue #10). Panel members
 	// already force stream=false on the wire (FetchPanel needs the
@@ -563,16 +746,30 @@ func Panel(
 	if arbiterCache != nil && arbiterCacheTTL > 0 {
 		if cached, ok := arbiterCache.Get(r1.Content, r2.Content); ok {
 			slog.Info("fusion arbiter cache hit",
+				slog.String("request_id", requestID),
 				slog.String("r1_source", r1.Source),
 				slog.String("r2_source", r2.Source),
 			)
 			cacheHit = true
-			if stream {
-				return true, streamCachedArbiterSynthesis(w, cached)
+			outcome.ArbiterCacheHit = true
+			outcome.ArbiterSkipped = true
+			outcome.Similarity = SimilarityRatio(r1.Content, r2.Content)
+			outcome.SkipReason = "cache_hit"
+			if isFusion {
+				w.Header().Set("X-Nexus-Fusion-Progressive", "true")
 			}
-			return true, writeCachedArbiterJSON(w, cached, arbiterModel)
+			if stream {
+				return outcome, true, streamCachedArbiterSynthesis(w, cached)
+			}
+			return outcome, true, writeCachedArbiterJSON(w, cached, arbiterModel)
 		}
 	}
+
+	slog.Info("fusion arbiter invoked",
+		slog.String("request_id", requestID),
+		slog.String("r1_source", r1.Source),
+		slog.String("r2_source", r2.Source),
+	)
 
 	// When stream=true, use the original StreamWithContext to pass SSE through
 	// directly (no caching possible, but preserves passthrough behavior).
@@ -582,14 +779,17 @@ func Panel(
 	var fetchErr error
 	if stream {
 		// stream=true: SSE passthrough, no caching
+		if isFusion {
+			w.Header().Set("X-Nexus-Fusion-Progressive", "true")
+		}
 		fetchErr = StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody)
 		if fetchErr != nil {
-			return false, fmt.Errorf("fusion: arbiter stream: %w", fetchErr)
+			return outcome, false, fmt.Errorf("fusion: arbiter stream: %w", fetchErr)
 		}
 		if err := writeSSEDone(w); err != nil {
-			return false, err
+			return outcome, false, err
 		}
-		return false, nil
+		return outcome, false, nil
 	}
 	// stream=false: buffered fetch, can cache
 	{
@@ -614,7 +814,21 @@ func Panel(
 		}
 	}
 	if fetchErr != nil {
-		return false, fmt.Errorf("fusion: arbiter fetch: %w", fetchErr)
+		return outcome, false, fmt.Errorf("fusion: arbiter fetch: %w", fetchErr)
+	}
+	if synthesis == "" {
+		slog.Debug("fusion arbiter returned empty synthesis",
+			slog.String("request_id", requestID),
+			slog.String("r1_source", r1.Source),
+			slog.String("r2_source", r2.Source),
+			slog.Int("synthesis_len", 0),
+		)
+		slog.Warn("fusion arbiter returned empty synthesis",
+			slog.String("request_id", requestID),
+			slog.String("r1_source", r1.Source),
+			slog.String("r2_source", r2.Source),
+		)
+		return outcome, false, fmt.Errorf("fusion: arbiter returned empty synthesis")
 	}
 
 	// Cache the synthesis for future identical panel members (issue #232).
@@ -622,19 +836,10 @@ func Panel(
 		arbiterCache.Set(r1.Content, r2.Content, synthesis, arbiterCacheTTL)
 	}
 
-	return false, writeCachedArbiterJSON(w, synthesis, arbiterModel)
-}
-
-// arbiterDefaultTimeout is the per-call arbiter timeout used when
-// Panel's arbiterTimeout argument is <= 0. Mirrors the issue default
-// ("configurable, default 60s").
-const arbiterDefaultTimeout = 60 * time.Second
-
-func withDefaultArbiterTimeout(d time.Duration) time.Duration {
-	if d <= 0 {
-		return arbiterDefaultTimeout
+	if isFusion {
+		w.Header().Set("X-Nexus-Fusion-Progressive", "true")
 	}
-	return d
+	return outcome, false, writeCachedArbiterJSON(w, synthesis, arbiterModel)
 }
 
 // SynthesisPrompt formats the arbiter prompt. Exported so the handler and
@@ -656,13 +861,6 @@ func formatCandidate(r PanelResult) string {
 		return fmt.Sprintf("[%s failed: %v]", r.Source, r.Err)
 	}
 	return r.Content
-}
-
-func withDefault(d time.Duration) time.Duration {
-	if d <= 0 {
-		return 120 * time.Second
-	}
-	return d
 }
 
 // PanelOutcome describes the runtime path PanelStreaming took. The chat
@@ -689,6 +887,13 @@ type PanelOutcome struct {
 	// When false and the arbiter was invoked, the synthesis was
 	// fetched from the arbiter and cached for future requests.
 	ArbiterCacheHit bool
+	// SkipReason describes why the arbiter was skipped (issue #384):
+	// "agreement" when Similarity >= agreementThreshold,
+	// "tool_calls" when the speculative winner carried tool calls,
+	// "one_member" when only one panel member returned content,
+	// or "cache_hit" when the synthesis was served from the arbiter cache.
+	// Empty when ArbiterSkipped is false.
+	SkipReason string
 }
 
 // PanelStreaming runs the fusion panel with progressive delivery
@@ -734,7 +939,7 @@ func PanelStreaming(
 	ctx context.Context,
 	w http.ResponseWriter,
 	client Client,
-	localBaseURL, localModel, frontierURL, frontierModel string,
+	localBaseURL, localModel, frontierURL, frontierKey, frontierModel string,
 	arbiterURL, arbiterKey, arbiterModel string,
 	body map[string]interface{},
 	latestPrompt string,
@@ -754,15 +959,18 @@ func PanelStreaming(
 	// hands PanelStreaming a stream=false body gets the existing
 	// JSON-object response shape (issue #10).
 	if s, ok := body["stream"].(bool); ok && !s {
-		cacheHit, err := Panel(ctx, w, client,
-			localBaseURL, localModel, frontierURL, frontierModel,
+		panelOutcome, cacheHit, err := Panel(ctx, w, client,
+			localBaseURL, localModel, frontierURL, frontierKey, frontierModel,
 			arbiterURL, arbiterKey, arbiterModel,
 			body, latestPrompt, perFetchTimeout, arbiterTimeout,
-			skipLocal, arbiterCache, arbiterCacheTTL)
+			skipLocal, requestID, arbiterCache, arbiterCacheTTL,
+			true) // isFusion: set X-Nexus-Fusion-Progressive header (issue #984)
 		if err != nil {
 			return outcome, err
 		}
 		outcome.ArbiterCacheHit = cacheHit
+		outcome.ArbiterSkipped = panelOutcome.ArbiterSkipped
+		outcome.SkipReason = panelOutcome.SkipReason
 		return outcome, nil
 	}
 
@@ -775,60 +983,53 @@ func PanelStreaming(
 		agreementThreshold = 1
 	}
 
-	// SSE response headers must be set before the first Write. We
-	// commit them now so the speculative chunk goes out with the
-	// correct Content-Type regardless of which member wins.
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Nexus-Fusion-Progressive", "true")
-	w.WriteHeader(http.StatusOK)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-
 	results := make(chan PanelResult, 2)
 	var cancelLocal, cancelFrontier context.CancelFunc
+
+	g, gCtx := errgroup.WithContext(ctx)
+
 	if skipLocal {
-		// Issue #8: synthetic local failure so the arbiter-style
-		// code paths below degrade cleanly. The handler sets
-		// X-Nexus-Degraded=true; we don't duplicate the header here.
 		results <- PanelResult{
 			Source: "local",
 			Err:    errors.New("ollama unavailable (degraded)"),
 		}
 	} else {
-		go func() {
+		g.Go(func() error {
 			defer func() {
 				if r := recover(); r != nil {
 					IncPanelPanics()
 					results <- PanelResult{Source: "local", Err: fmt.Errorf("panic: %v", r)}
 				}
 			}()
-			ctxLocal, cancel := context.WithTimeout(ctx, withDefault(perFetchTimeout))
+			ctxLocal, cancel := context.WithTimeout(gCtx, perFetchTimeout)
 			cancelLocal = cancel
 			defer cancel()
 			msg, err := FetchPanel(ctxLocal, client,
 				localBaseURL+"/v1/chat/completions", "", localModel, body)
 			results <- PanelResult{Source: "local", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
-		}()
+			return nil
+		})
 	}
-	go func() {
+	g.Go(func() error {
 		defer func() {
 			if r := recover(); r != nil {
 				IncPanelPanics()
 				results <- PanelResult{Source: "frontier", Err: fmt.Errorf("panic: %v", r)}
 			}
 		}()
-		ctxFrontier, cancel := context.WithTimeout(ctx, withDefault(perFetchTimeout))
+		ctxFrontier, cancel := context.WithTimeout(gCtx, perFetchTimeout)
 		cancelFrontier = cancel
 		defer cancel()
 		msg, err := FetchPanel(ctxFrontier, client,
-			frontierURL, "", frontierModel, body)
+			frontierURL, frontierKey, frontierModel, body)
 		results <- PanelResult{Source: "frontier", Content: msg.Content, ToolCalls: msg.ToolCalls, Err: err}
-	}()
+		return nil
+	})
+
 	first := <-results
 	second := <-results
 
+	_ = g.Wait()
 	// Both members errored — there's nothing speculative to deliver.
 	// Surface the upstream errors so the handler renders a 502 with
 	// context. The legacy Panel path tolerates one failed member by
@@ -856,6 +1057,17 @@ func PanelStreaming(
 	}
 	outcome.Source = winner.Source
 
+	// Issue #437: commit SSE headers only after confirming at least
+	// one panel member succeeded. If both failed the handler above
+	// returns an error and the chat handler can emit a real 502.
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Nexus-Fusion-Progressive", "true")
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
 	if err := streamPanelResultAsSSE(w, winner); err != nil {
 		if errors.Is(err, ErrClientAbort) {
 			// Client disconnected mid-stream. The speculative chunk
@@ -863,6 +1075,7 @@ func PanelStreaming(
 			// nobody to receive its output. Log at info level so
 			// operators can distinguish "client dropped" from "slow
 			// arbiter" in the access log (issue #167).
+			IncFusionClientAbort()
 			slog.Info("fusion speculative write: client aborted",
 				slog.String("source", outcome.Source),
 			)
@@ -881,6 +1094,7 @@ func PanelStreaming(
 	// change may add tool-call-aware arbitration.
 	if len(winner.ToolCalls) > 0 {
 		outcome.ArbiterSkipped = true
+		outcome.SkipReason = "tool_calls"
 		slog.Info("fusion tool-call winner, arbiter skipped",
 			slog.String("request_id", requestID),
 			slog.String("source", outcome.Source),
@@ -911,6 +1125,7 @@ func PanelStreaming(
 	// The slow member's result was already consumed in the main flow.
 	if first.Err != nil || second.Err != nil {
 		outcome.ArbiterSkipped = true
+		outcome.SkipReason = "one_member"
 		// Cancel the slow member's goroutine to stop in-flight work.
 		if winnerFromSecond {
 			// winner is second; first (local) is slow
@@ -933,6 +1148,7 @@ func PanelStreaming(
 	outcome.Similarity = SimilarityRatio(first.Content, second.Content)
 	if outcome.Similarity >= agreementThreshold {
 		outcome.ArbiterSkipped = true
+		outcome.SkipReason = "agreement"
 		slog.Info("fusion agreement, arbiter skipped",
 			slog.String("request_id", requestID),
 			slog.String("source", outcome.Source),
@@ -989,24 +1205,38 @@ func PanelStreaming(
 	if arbiterCache != nil && arbiterCacheTTL > 0 {
 		if cached, ok := arbiterCache.Get(first.Content, second.Content); ok {
 			slog.Info("fusion arbiter cache hit (streaming)",
+				slog.String("request_id", requestID),
 				slog.String("first_source", first.Source),
 				slog.String("second_source", second.Source),
 			)
 			outcome.ArbiterCacheHit = true
 			if err := streamCachedArbiterSynthesis(w, cached); err != nil {
+				if errors.Is(err, ErrClientAbort) {
+					IncFusionClientAbort()
+					return outcome, nil
+				}
 				return outcome, err
 			}
 			return outcome, nil
 		}
 	}
 
-	arbiterCtx, cancelArbiter := context.WithTimeout(context.Background(), withDefaultArbiterTimeout(arbiterTimeout))
+	// Issue #488: derive arbiterCtx from the request ctx (not
+	// context.Background()) so a client disconnect mid-stream cancels
+	// the in-flight arbiter synthesis instead of stranding it on its
+	// own timeout. The panel fetches already derive from gCtx (which
+	// descends from ctx); this was an isolated inconsistency.
+	arbiterCtx, cancelArbiter := context.WithTimeout(ctx, arbiterTimeout)
 	defer cancelArbiter()
 
 	// Use StreamWithContext for SSE passthrough. This preserves the original
 	// behavior where the arbiter's SSE is passed through directly. Caching
 	// synthesis content is only useful for the non-streaming Panel path.
 	if err := StreamWithContext(arbiterCtx, w, client, arbiterURL, arbiterKey, synthBody); err != nil {
+		if IsClientAbort(err) {
+			IncFusionClientAbort()
+			return outcome, nil
+		}
 		return outcome, fmt.Errorf("fusion: arbiter stream: %w", err)
 	}
 	// Cancel the slow member's goroutine — its result was already consumed
@@ -1112,27 +1342,51 @@ func streamPanelResultAsSSE(w http.ResponseWriter, r PanelResult) error {
 // streamCachedArbiterSynthesis streams a cached arbiter synthesis text as
 // SSE chunks (issue #232). This mimics the output of StreamWithContext
 // for the arbiter, but serves from cache instead. The synthesis is
-// streamed as a single delta chunk followed by [DONE]. Headers must
-// already be committed (WriteHeader called) when this runs.
-func streamCachedArbiterSynthesis(w http.ResponseWriter, synthesis string) error {
+// streamed as a single delta chunk followed by [DONE]. This function
+// sets SSE headers and commits WriteHeader itself (issue #532) so it
+// is safe to call from any code path that has not yet written headers.
+func streamCachedArbiterSynthesis(w http.ResponseWriter, synthesis any) error {
+	content, ok := synthesis.(string)
+	if !ok {
+		return fmt.Errorf("fusion: cached synthesis is not a string: %T", synthesis)
+	}
+	if strings.Contains(content, "\ndata:") {
+		slog.Warn("fusion: cached synthesis contains SSE framing, rejecting",
+			slog.String("content_preview", content[:min(len(content), 100)]))
+		return fmt.Errorf("fusion: cached synthesis contains SSE framing")
+	}
 	chunk := map[string]interface{}{
-		"object": "chat.completion.chunk",
-		"nexus":  map[string]string{"source": "arbiter-cached"},
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   "arbiter",
+		"nexus":   map[string]string{"source": "arbiter-cached"},
 		"choices": []map[string]interface{}{
-			{"index": 0, "delta": map[string]interface{}{"content": synthesis}, "finish_reason": "stop"},
+			{"index": 0, "delta": map[string]interface{}{"content": content}, "finish_reason": "stop"},
 		},
 	}
 	b, err := json.Marshal(chunk)
 	if err != nil {
 		return fmt.Errorf("fusion: marshal cached arbiter chunk: %w", err)
 	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write([]byte("data: ")); err != nil {
+		if IsClientAbort(err) {
+			return ErrClientAbort
+		}
 		return err
 	}
 	if _, err := w.Write(b); err != nil {
+		if IsClientAbort(err) {
+			return ErrClientAbort
+		}
 		return err
 	}
 	if _, err := w.Write([]byte("\n\n")); err != nil {
+		if IsClientAbort(err) {
+			return ErrClientAbort
+		}
 		return err
 	}
 	if f, ok := w.(http.Flusher); ok {
@@ -1179,6 +1433,9 @@ func writeCachedArbiterJSON(w http.ResponseWriter, synthesis, modelName string) 
 // stream completed).
 func writeSSEDone(w http.ResponseWriter) error {
 	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+		if IsClientAbort(err) {
+			return ErrClientAbort
+		}
 		return err
 	}
 	if f, ok := w.(http.Flusher); ok {

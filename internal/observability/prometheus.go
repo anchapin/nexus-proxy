@@ -100,17 +100,57 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total quality events dropped because the verifier queue was full.",
 		typ:  "counter",
 	},
+	"nexus_quality_dropped_ring_capacity": {
+		help: "Maximum number of dropped events retained in the ring buffer for inspection (issue #1066).",
+		typ:  "gauge",
+	},
+	"nexus_judge_dropped_total": {
+		help: "Total judge samples dropped because the judge queue was full (issue #892).",
+		typ:  "counter",
+	},
+	"nexus_confidence_store_rows_total": {
+		help: "Current number of rows in the routing_outcomes confidence store table (issue #834).",
+		typ:  "gauge",
+	},
 	"nexus_metrics_dropped_total": {
 		help: "Total metrics records dropped because the SQLite write buffer was full.",
 		typ:  "counter",
+	},
+	"nexus_metrics_prune_last_rows": {
+		help: "Rows removed by the most recent metrics retention prune pass (issue #483).",
+		typ:  "gauge",
+	},
+	"nexus_metrics_prune_last_timestamp_seconds": {
+		help: "Unix timestamp of the most recent metrics retention prune pass (issue #483).",
+		typ:  "gauge",
 	},
 	"nexus_telemetry_dropped_total": {
 		help: "Total telemetry records dropped because the JSONL write buffer was full.",
 		typ:  "counter",
 	},
+	"nexus_telemetry_write_errors_total": {
+		help: "Total write/flush error events in the JSONL recorder background loop (issue #795). Each increment corresponds to one failed disk write or flush that dropped buffered records.",
+		typ:  "counter",
+	},
+	"nexus_telemetry_rotations_total": {
+		help: "Total telemetry file rotations triggered by the NEXUS_TELEMETRY_MAX_BYTES size cap.",
+		typ:  "counter",
+	},
 	"nexus_tracing_dropped_total": {
 		help: "Total trace spans dropped because the exporter buffer was full.",
 		typ:  "counter",
+	},
+	"nexus_tracing_flush_failures_total": {
+		help: "Total trace batches that failed to POST to the collector (HTTP 4xx/5xx, timeout, or transport error). Each failure drops up to 64 spans — distinct from nexus_tracing_dropped_total, which counts per-span buffer-full sheds at submit time (issue #484).",
+		typ:  "counter",
+	},
+	"nexus_tracing_queue_depth": {
+		help: "Current number of trace spans waiting in the exporter buffer (issue #596). Gives operators early warning of exporter saturation before nexus_tracing_dropped_total begins incrementing.",
+		typ:  "gauge",
+	},
+	"nexus_tracing_batch_size": {
+		help: "Configured OTLP tracing batch size (issue #826). Shows the cap set via NEXUS_TRACING_BATCH_SIZE, not the current fill level.",
+		typ:  "gauge",
 	},
 	// Issue #70: live middleware gauges. These come from backing
 	// sources (rate-limit bucket count, budget running total) at
@@ -119,6 +159,11 @@ var gaugeMeta = map[string]metricMeta{
 	"nexus_rate_limit_buckets": {
 		help: "Current number of per-client rate-limit buckets held in memory.",
 		typ:  "gauge",
+	},
+	// Issue #746: per-client rate-limit bucket utilization histogram.
+	"nexus_rate_limit_bucket_utilization": {
+		help: "Fractional token utilization (tokens/burst) at moment of acquisition per client bucket, bucketed by quartile (issue #746).",
+		typ:  "histogram",
 	},
 	"nexus_budget_spend_usd": {
 		help: "Rolling 24-hour spend in USD from the daily frontier budget tracker.",
@@ -138,6 +183,102 @@ var gaugeMeta = map[string]metricMeta{
 	"nexus_circuit_breaker_last_failure_seconds": {
 		help: "Unix timestamp of the last failure recorded for this circuit breaker (issue #304).",
 		typ:  "gauge",
+	},
+	// Local-route concurrency limiter gauges (issue #487). The VRAM-aware
+	// limiter shrinks its effective slot count dynamically from the latest
+	// probe snapshot; these gauges let operators see the ceiling, how many
+	// slots are in use, and whether requests are saturating the local path.
+	"nexus_local_concurrency_effective_slots": {
+		help: "Current effective slot count for the VRAM-aware local-route concurrency limiter (issue #487).",
+		typ:  "gauge",
+	},
+	"nexus_local_concurrency_in_flight": {
+		help: "Number of held slots in the local-route concurrency limiter (issue #487).",
+		typ:  "gauge",
+	},
+	// Embedder circuit breaker failures (issue #423).
+	"nexus_embedder_failures_total": {
+		help: "Total number of circuit breaker trip events for embedder kinds (issue #423).",
+		typ:  "counter",
+	},
+	// RAG embedder circuit breaker state metrics (issue #886).
+	"nexus_rag_circuit_state": {
+		help: "RAG embedder circuit breaker state: 0=closed, 1=half_open, 2=open (issue #886).",
+		typ:  "gauge",
+	},
+	"nexus_rag_circuit_trip_total": {
+		help: "Total number of RAG embedder circuit breaker trip events (issue #886).",
+		typ:  "counter",
+	},
+	"nexus_rag_circuit_recover_total": {
+		help: "Total number of RAG embedder circuit breaker recovery events (issue #886).",
+		typ:  "counter",
+	},
+	"nexus_rag_circuit_failure_count": {
+		help: "Current consecutive failure count for RAG embedder circuit breakers (issue #886).",
+		typ:  "gauge",
+	},
+	// SLM decision cache gauges (issue #531).
+	"nexus_slm_cache_entries": {
+		help: "Current number of entries in the SLM decision cache (issue #531).",
+		typ:  "gauge",
+	},
+	"nexus_slm_cache_max_entries": {
+		help: "Configured maximum entry capacity of the SLM decision cache (issue #531).",
+		typ:  "gauge",
+	},
+	"nexus_slm_cache_stale_entries": {
+		help: "Number of entries in the SLM decision cache that have passed their TTL but have not yet been evicted (issue #835).",
+		typ:  "gauge",
+	},
+	// Local-route cooldown gauge (issue #530).
+	"nexus_local_cooldown_active": {
+		help: "1 when the local-route cooldown is active (a cascade failure was recorded and the window has not expired); 0 otherwise (issue #530). Absent from /metrics when the cooldown is disabled (NEXUS_LOCAL_COOLDOWN<=0).",
+		typ:  "gauge",
+	},
+	// Build info gauge (issue #529). Static metadata — value is always 1.
+	"nexus_build_info": {
+		help: "Build metadata for the running nexus-proxy binary (issue #529). Always 1.",
+		typ:  "gauge",
+	},
+	// Per-route latency percentile gauges (issue #774). Computed from a
+	// sliding window ring buffer per route (local/frontier/fusion).
+	// Values are in seconds (ms → s conversion at render time).
+	"nexus_upstream_request_latency_p50_seconds": {
+		help: "p50 request latency in seconds per route (local/frontier/fusion), from sliding window ring buffer (issue #774).",
+		typ:  "gauge",
+	},
+	"nexus_upstream_request_latency_p95_seconds": {
+		help: "p95 request latency in seconds per route (local/frontier/fusion), from sliding window ring buffer (issue #774).",
+		typ:  "gauge",
+	},
+	"nexus_upstream_request_latency_p99_seconds": {
+		help: "p99 request latency in seconds per route (local/frontier/fusion), from sliding window ring buffer (issue #774).",
+		typ:  "gauge",
+	},
+	// Auth limiter gauges (issue #744). Track brute-force protection state.
+	"nexus_auth_limiter_tracked_ips": {
+		help: "Current number of IPs being tracked by the auth brute-force limiter (issue #744).",
+		typ:  "gauge",
+	},
+	"nexus_auth_limiter_blocked_ips": {
+		help: "Current number of IPs blocked by the auth brute-force limiter (issue #744).",
+		typ:  "gauge",
+	},
+	// Auth limiter reaper evictions counter (issue #839).
+	"nexus_auth_limiter_reaper_evictions_total": {
+		help: "Total idle IPs evicted from the auth limiter's failures map by the reaper (issue #839).",
+		typ:  "counter",
+	},
+	// Auth limiter blocked counter (issue #831/#937).
+	"nexus_auth_limiter_blocked_total": {
+		help: "Total IPs blocked by the auth brute-force limiter (burst threshold crossed), by reason (issue #831/#937).",
+		typ:  "counter",
+	},
+	// Confidence store error counter (issue #927).
+	"nexus_confidence_errors_total": {
+		help: "Total LocalConfidence errors in the planner where the SQLite confidence store returned an error (DB locked, query failed, etc.).",
+		typ:  "counter",
 	},
 }
 
@@ -197,25 +338,44 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 
 	// --- Middleware instrumentation (issue #70) --------------------------
 
-	// Auth counters are emitted with one sample line per outcome label
-	// (accepted / rejected_invalid / rejected_missing). The fourth
-	// outcome "exempt" is intentionally omitted: an exempt request is
-	// not an authentication decision and would dilute the per-decision
-	// counts. The AuthAuthenticatedClients gauge mirrors the
-	// accepted counter so operators can chart a clean "successful
-	// authentications" timeline.
-	writeCounterLabeled(w, "nexus_auth_requests_total",
-		"Authentication decisions by outcome (issue #70).",
-		"outcome", []labelSample{
-			{value: "accepted", n: c.authAccepted.Load()},
-			{value: "rejected_invalid", n: c.authRejectedInvalid.Load()},
-			{value: "rejected_missing", n: c.authRejectedMissing.Load()},
-		})
-
-	// Auth rate limit counter (issue #296).
-	writeCounter(w, "nexus_requests_rejected_total",
-		"Total requests rejected by auth brute-force protection (issue #296).",
-		c.authRateLimitRejected.Load())
+	// Auth counters are emitted with two label dimensions: outcome
+	// (accepted / rejected_invalid / rejected_missing) and client_ip.
+	// The fourth outcome "exempt" is intentionally omitted: an exempt
+	// request is not an authentication decision and would dilute the
+	// per-decision counts. Adding client_ip enables operators to identify
+	// which IPs are generating auth failures (issue #1061).
+	// Collect all unique client IPs across all three outcome maps.
+	authIPs := make(map[string]struct{})
+	for ip := range c.authAccepted {
+		authIPs[ip] = struct{}{}
+	}
+	for ip := range c.authRejectedInvalid {
+		authIPs[ip] = struct{}{}
+	}
+	for ip := range c.authRejectedMissing {
+		authIPs[ip] = struct{}{}
+	}
+	// Build sorted slice for deterministic output.
+	authIPSlice := make([]string, 0, len(authIPs))
+	for ip := range authIPs {
+		authIPSlice = append(authIPSlice, ip)
+	}
+	sort.Strings(authIPSlice)
+	authSamples := make([]labelSample2, 0, len(authIPs)*3)
+	for _, ip := range authIPSlice {
+		if v, ok := c.authAccepted[ip]; ok {
+			authSamples = append(authSamples, labelSample2{value1: "accepted", value2: ip, n: v.Load()})
+		}
+		if v, ok := c.authRejectedInvalid[ip]; ok {
+			authSamples = append(authSamples, labelSample2{value1: "rejected_invalid", value2: ip, n: v.Load()})
+		}
+		if v, ok := c.authRejectedMissing[ip]; ok {
+			authSamples = append(authSamples, labelSample2{value1: "rejected_missing", value2: ip, n: v.Load()})
+		}
+	}
+	writeCounterLabeled2(w, "nexus_auth_requests_total",
+		"Authentication decisions by outcome and client IP (issue #70/#1061).",
+		"outcome", "client_ip", authSamples)
 
 	// Rate-limit counters are emitted as two labelled families so the
 	// {scope, allowed} matrix is one scrape away. scope values are
@@ -263,6 +423,11 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	writeCounter(w, "nexus_panel_panics_total",
 		"Total recovered panics in panel goroutines (issue #309).", upstream.PanelPanicsTotal())
 
+	// Fusion client abort counter (issue #1046). Tracks client disconnects
+	// during fusion speculative streaming and arbiter synthesis streaming.
+	writeCounter(w, "nexus_fusion_client_abort_total",
+		"Total client aborts during fusion speculative streaming and arbiter synthesis streaming (issue #1046).", upstream.FusionClientAbortTotal())
+
 	// Auth gauge: cumulative accepted authentications. The metric name
 	// carries "_clients" per the issue spec; semantically this is a
 	// monotonic counter that operators usually want charted as a
@@ -272,6 +437,56 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 		"Cumulative accepted authentications (issue #70).", "gauge")
 	//nolint:errcheck // cannot check error after headers committed
 	fmt.Fprintf(w, "nexus_auth_authenticated_clients %d\n", c.AuthAuthenticatedClients())
+
+	// Embedder circuit breaker failures (issue #423).
+	failures := c.EmbedderFailures()
+	if len(failures) > 0 {
+		samples := make([]labelSample, 0, len(failures))
+		for kind, count := range failures {
+			samples = append(samples, labelSample{value: kind, n: count})
+		}
+		writeCounterLabeled(w, "nexus_embedder_failures_total",
+			"Total circuit breaker trip events for embedder kinds (issue #423).",
+			"kind", samples)
+	}
+
+	// RAG circuit breaker trip/recover counters (issue #886).
+	if trips := c.RAGCircuitTrips(); len(trips) > 0 {
+		samples := make([]labelSample, 0, len(trips))
+		for kind, count := range trips {
+			samples = append(samples, labelSample{value: kind, n: count})
+		}
+		writeCounterLabeled(w, "nexus_rag_circuit_trip_total",
+			"Total RAG embedder circuit breaker trip events (issue #886).",
+			"service", samples)
+	}
+	if recovers := c.RAGCircuitRecovers(); len(recovers) > 0 {
+		samples := make([]labelSample, 0, len(recovers))
+		for kind, count := range recovers {
+			samples = append(samples, labelSample{value: kind, n: count})
+		}
+		writeCounterLabeled(w, "nexus_rag_circuit_recover_total",
+			"Total RAG embedder circuit breaker recovery events (issue #886).",
+			"service", samples)
+	}
+
+	// Auth limiter reaper evictions counter (issue #839).
+	writeCounter(w, "nexus_auth_limiter_reaper_evictions_total",
+		"Total idle IPs evicted from the auth limiter's failures map by the reaper (issue #839).",
+		c.authReaperEvictions.Load())
+
+	// Auth limiter blocked counter (issue #831/#937).
+	writeCounterLabeled(w, "nexus_auth_limiter_blocked_total",
+		"Total IPs blocked by the auth brute-force limiter (burst threshold crossed), by reason (issue #831/#937).",
+		"reason", []labelSample{
+			{value: "missing", n: c.authBlockedTotal["missing"].Load()},
+			{value: "invalid", n: c.authBlockedTotal["invalid"].Load()},
+		})
+
+	// Confidence store error counter (issue #927).
+	writeCounter(w, "nexus_confidence_errors_total",
+		"Total LocalConfidence errors in the planner where the SQLite confidence store returned an error (DB locked, query failed, etc.).",
+		c.ConfidenceErrors())
 
 	// --- Histograms -----------------------------------------------------
 
@@ -291,6 +506,24 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 		})
 	// Per-stage pipeline latency histograms (issue #300).
 	writeStageHistogram(w, c)
+
+	// SLM confidence histogram (issue #425). Written only when the
+	// histograms map is non-nil and contains at least one observation.
+	if hists := c.SLMConfidenceHistograms(); len(hists) > 0 {
+		writeSLMConfidenceHistogram(w, hists)
+	}
+
+	// RAG similarity histogram (issue #447). Written only when at
+	// least one (path, outcome) histogram has observations.
+	if hists := c.RAGSimilarityHistograms(); len(hists) > 0 {
+		writeRAGSimilarityHistogram(w, hists)
+	}
+
+	// Rate-limit bucket utilization histogram (issue #746). Written only
+	// when at least one bucket has been observed.
+	if hists := c.RateLimitUtilizationHistograms(); len(hists) > 0 {
+		writeRateLimitUtilizationHistogram(w, hists)
+	}
 
 	// --- Gauges (live readings from providers) --------------------------
 
@@ -356,6 +589,27 @@ func writeCounterLabeled(w io.Writer, name, help, label string, samples []labelS
 	writeMeta(w, name, help, "counter")
 	for _, s := range samples {
 		fmt.Fprintf(w, "%s{%s=%q} %d\n", name, label, s.value, s.n)
+	}
+}
+
+// labelSample2 pairs two label values with their counter reading for a
+// two-dimensional labelled counter family (e.g. outcome + client_ip on
+// nexus_auth_requests_total for issue #1061).
+type labelSample2 struct {
+	value1 string
+	value2 string
+	n      uint64
+}
+
+// writeCounterLabeled2 emits a counter family with two label dimensions.
+// Each (label1, label2) tuple becomes its own sample line. Samples are
+// emitted in sorted order by label1, then label2 for deterministic output.
+//
+//nolint:errcheck
+func writeCounterLabeled2(w io.Writer, name, help, label1, label2 string, samples []labelSample2) {
+	writeMeta(w, name, help, "counter")
+	for _, s := range samples {
+		fmt.Fprintf(w, "%s{%s=%q,%s=%q} %d\n", name, label1, s.value1, label2, s.value2, s.n)
 	}
 }
 
@@ -436,6 +690,185 @@ func writeStageHistogram(w io.Writer, c *Collector) {
 			s.name, formatFloat(sum))
 		fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_count{stage=%q} %d\n",
 			s.name, count)
+	}
+}
+
+// writeSLMConfidenceHistogram emits the nexus_slm_confidence_histogram
+// histogram family labelled by task_category (issue #425). Categories
+// are emitted in sorted order for deterministic output.
+func writeSLMConfidenceHistogram(w io.Writer, histograms map[string]*Histogram) {
+	writeMeta(w, "nexus_slm_confidence_histogram",
+		"SLM routing confidence score distribution by task category (issue #425).",
+		"histogram")
+	// Sort categories for deterministic output.
+	categories := sortedKeys(histograms)
+	for _, cat := range categories {
+		h := histograms[cat]
+		if h == nil {
+			continue
+		}
+		cum, upperBounds, sum, count := h.Snapshot()
+		// Skip completely empty histograms.
+		if count == 0 {
+			continue
+		}
+		for i, ub := range upperBounds {
+			fmt.Fprintf(w, "nexus_slm_confidence_histogram_bucket{task_category=%q,le=%q} %d\n",
+				cat, formatFloat(ub), cum[i])
+		}
+		fmt.Fprintf(w, "nexus_slm_confidence_histogram_bucket{task_category=%q,le=%q} %d\n",
+			cat, "+Inf", cum[len(upperBounds)])
+		fmt.Fprintf(w, "nexus_slm_confidence_histogram_sum{task_category=%q} %s\n",
+			cat, formatFloat(sum))
+		fmt.Fprintf(w, "nexus_slm_confidence_histogram_count{task_category=%q} %d\n",
+			cat, count)
+	}
+}
+
+// writeRAGSimilarityHistogram emits the nexus_rag_similarity_histogram
+// histogram family labelled by path, outcome, and threshold (issue #447, #671).
+//
+// Labels:
+//   - path       ∈ {"hnsw", "brute_force"} — the retrieval algorithm
+//     Retrieve actually used; see rag.IndexPath.
+//   - outcome    ∈ {"hit", "miss"}         — "hit" when a snippet cleared
+//     the configured threshold, "miss" when it did not.
+//   - threshold  ∈ (0.0, 1.0]              — the effective similarity floor
+//     applied for this retrieval (global or per-directory override).
+//
+// Cardinality: dynamic — one series per (path × outcome × threshold) tuple.
+// Each series has RAGSimilarityBuckets (10) + +Inf bucket lines, plus _sum
+// and _count. The map key is "path|outcome|threshold"; we split it back
+// into three labels at render time so the Prometheus exposition matches
+// the documented label schema.
+//
+// Series are emitted in sorted key order so scrape-to-scrape diffs are
+// stable and friendly to human inspection. Empty histograms (count == 0)
+// are skipped so the scrape output stays clean until the first observation
+// lands — and when ALL histograms are empty the HELP/TYPE header is omitted
+// too, so a freshly-booted scraper never sees a misleading zero-count
+// family.
+func writeRAGSimilarityHistogram(w io.Writer, histograms map[string]*Histogram) {
+	type snapshot struct {
+		path, outcome string
+		threshold     float64
+		cum           []uint64
+		upperBounds   []float64
+		sum           float64
+		count         uint64
+	}
+	var snaps []snapshot
+	for key, h := range histograms {
+		if h == nil {
+			continue
+		}
+		cum, upperBounds, sum, count := h.Snapshot()
+		if count == 0 {
+			continue
+		}
+		// Parse key: "path|outcome|threshold"
+		parts := strings.Split(key, "|")
+		if len(parts) != 3 {
+			continue
+		}
+		path := parts[0]
+		outcome := parts[1]
+		var threshold float64
+		if _, err := fmt.Sscanf(parts[2], "%f", &threshold); err != nil {
+			continue
+		}
+		snaps = append(snaps, snapshot{
+			path:        path,
+			outcome:     outcome,
+			threshold:   threshold,
+			cum:         cum,
+			upperBounds: upperBounds,
+			sum:         sum,
+			count:       count,
+		})
+	}
+	if len(snaps) == 0 {
+		return
+	}
+	// Sort for stable output order
+	sort.Slice(snaps, func(i, j int) bool {
+		if snaps[i].path != snaps[j].path {
+			return snaps[i].path < snaps[j].path
+		}
+		if snaps[i].outcome != snaps[j].outcome {
+			return snaps[i].outcome < snaps[j].outcome
+		}
+		return snaps[i].threshold < snaps[j].threshold
+	})
+	writeMeta(w, "nexus_rag_similarity_histogram",
+		"RAG retrieval cosine-similarity score distribution, labelled by index path, outcome, and effective threshold (issue #447, #671).",
+		"histogram")
+	for _, s := range snaps {
+		thr := fmt.Sprintf("%.2f", s.threshold)
+		for i, ub := range s.upperBounds {
+			fmt.Fprintf(w, "nexus_rag_similarity_histogram_bucket{path=%q,outcome=%q,threshold=%q,le=%q} %d\n",
+				s.path, s.outcome, thr, formatFloat(ub), s.cum[i])
+		}
+		fmt.Fprintf(w, "nexus_rag_similarity_histogram_bucket{path=%q,outcome=%q,threshold=%q,le=%q} %d\n",
+			s.path, s.outcome, thr, "+Inf", s.cum[len(s.upperBounds)])
+		fmt.Fprintf(w, "nexus_rag_similarity_histogram_sum{path=%q,outcome=%q,threshold=%q} %s\n",
+			s.path, s.outcome, thr, formatFloat(s.sum))
+		fmt.Fprintf(w, "nexus_rag_similarity_histogram_count{path=%q,outcome=%q,threshold=%q} %d\n",
+			s.path, s.outcome, thr, s.count)
+	}
+}
+
+// writeRateLimitUtilizationHistogram emits the
+// nexus_rate_limit_bucket_utilization histogram family labelled by
+// bucket_id (hashed IP) and utilization quartile (issue #746).
+// Series are emitted in sorted bucket-ID order for deterministic output.
+// Empty histograms (count == 0) are skipped so a freshly-booted scraper
+// never sees a misleading zero-count family.
+func writeRateLimitUtilizationHistogram(w io.Writer, histograms map[string]*Histogram) {
+	type snapshot struct {
+		bucketID    string
+		cum         []uint64
+		upperBounds []float64
+		sum         float64
+		count       uint64
+	}
+	var snaps []snapshot
+	for bucketID, h := range histograms {
+		if h == nil {
+			continue
+		}
+		cum, upperBounds, sum, count := h.Snapshot()
+		if count == 0 {
+			continue
+		}
+		snaps = append(snaps, snapshot{
+			bucketID:    bucketID,
+			cum:         cum,
+			upperBounds: upperBounds,
+			sum:         sum,
+			count:       count,
+		})
+	}
+	if len(snaps) == 0 {
+		return
+	}
+	sort.Slice(snaps, func(i, j int) bool {
+		return snaps[i].bucketID < snaps[j].bucketID
+	})
+	writeMeta(w, "nexus_rate_limit_bucket_utilization",
+		"Fractional token utilization (tokens/burst) at moment of acquisition per client bucket, bucketed by quartile (issue #746).",
+		"histogram")
+	for _, s := range snaps {
+		for i, ub := range s.upperBounds {
+			fmt.Fprintf(w, "nexus_rate_limit_bucket_utilization_bucket{bucket_id=%q,le=%q} %d\n",
+				s.bucketID, formatFloat(ub), s.cum[i])
+		}
+		fmt.Fprintf(w, "nexus_rate_limit_bucket_utilization_bucket{bucket_id=%q,le=%q} %d\n",
+			s.bucketID, "+Inf", s.cum[len(s.upperBounds)])
+		fmt.Fprintf(w, "nexus_rate_limit_bucket_utilization_sum{bucket_id=%q} %s\n",
+			s.bucketID, formatFloat(s.sum))
+		fmt.Fprintf(w, "nexus_rate_limit_bucket_utilization_count{bucket_id=%q} %d\n",
+			s.bucketID, s.count)
 	}
 }
 

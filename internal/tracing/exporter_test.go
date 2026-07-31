@@ -3,6 +3,7 @@ package tracing
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -219,7 +220,7 @@ func TestExporterOTLPBodyShape(t *testing.T) {
 	root.SetAttr("ttft_ms", int64(120))
 	root.End()
 
-	// Allow batch flush (batchCap=64 so we must Close to drain).
+	// Allow batch flush (defaultBatchCap=64 so we must Close to drain).
 	if err := e.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -297,6 +298,53 @@ func TestExporterOTLPBodyShape(t *testing.T) {
 	}
 }
 
+func TestExporterSpanEventsInOTLP(t *testing.T) {
+	var raw []byte
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		raw, _ = io.ReadAll(r.Body)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{Endpoint: srv.URL})
+	defer e.Close()
+
+	_, s := e.StartSpan(Context{}, "nexus.chat_completions")
+	s.AddEvent("first_token")
+	s.AddEvent("stream_complete")
+	s.End()
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(raw) == 0 {
+		t.Fatal("collector received no body")
+	}
+	var payload otlpPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal: %v\nbody=%s", err, raw)
+	}
+	sp := payload.ResourceSpans[0].ScopeSpans[0].Spans[0]
+	if len(sp.Events) != 2 {
+		t.Fatalf("span events = %d, want 2", len(sp.Events))
+	}
+	if sp.Events[0].Name != "first_token" {
+		t.Errorf("event[0].name = %q, want first_token", sp.Events[0].Name)
+	}
+	if sp.Events[1].Name != "stream_complete" {
+		t.Errorf("event[1].name = %q, want stream_complete", sp.Events[1].Name)
+	}
+	if sp.Events[0].TimestampUnixNanoNano == "" {
+		t.Error("event[0].timestamp not set")
+	}
+}
+
 func TestExporterErrorPropagatesFromCollector(t *testing.T) {
 	// A 500 from the collector must NOT block the request path;
 	// it is logged and dropped inside the export goroutine.
@@ -312,6 +360,64 @@ func TestExporterErrorPropagatesFromCollector(t *testing.T) {
 	// Close waits for the background goroutine; a 500 just logs.
 	if err := e.Close(); err != nil {
 		t.Errorf("Close: %v", err)
+	}
+}
+
+func TestExporterFlushFailuresIncrementOn503(t *testing.T) {
+	// Issue #484: a collector returning 503 must surface as a
+	// flush-failure counter increment, not vanish silently. The
+	// counter increments once per failed batch (not per span).
+	var batches atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		batches.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{Endpoint: srv.URL})
+	if e == nil {
+		t.Fatal("NewExporter returned nil")
+	}
+
+	// Submit enough spans to force at least one full batch flush
+	// (defaultBatchCap=64) plus trailing spans drained on Close.
+	for i := 0; i < defaultBatchCap+5; i++ {
+		_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "op")
+		s.End()
+	}
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if got := e.FlushFailures(); got == 0 {
+		t.Errorf("FlushFailures() = 0, want > 0 (batches=%d)", batches.Load())
+	}
+	// Flush failures must not be counted as buffer-full drops —
+	// the two counters measure distinct loss modes.
+	if e.Dropped() != 0 {
+		t.Errorf("Dropped() = %d, want 0 (flush failure must not inflate buffer-full counter)", e.Dropped())
+	}
+}
+
+func TestExporterFlushFailuresUnchangedOnSuccess(t *testing.T) {
+	// A healthy collector must never increment flush failures.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{Endpoint: srv.URL})
+	defer e.Close()
+	for i := 0; i < 10; i++ {
+		_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "op")
+		s.End()
+	}
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := e.FlushFailures(); got != 0 {
+		t.Errorf("FlushFailures() = %d, want 0 on healthy collector", got)
 	}
 }
 
@@ -366,6 +472,9 @@ func TestExporterNoopExports(t *testing.T) {
 	if e.Dropped() != 0 {
 		t.Errorf("nil exporter Dropped() = %d", e.Dropped())
 	}
+	if e.FlushFailures() != 0 {
+		t.Errorf("nil exporter FlushFailures() = %d", e.FlushFailures())
+	}
 }
 
 func TestEncodeAttrTypes(t *testing.T) {
@@ -396,9 +505,101 @@ func TestEncodeAttrTypes(t *testing.T) {
 				t.Errorf("got %+v", v)
 			}
 		}},
+		{"uint64_within_int63", uint64(1<<63 - 1), func(t *testing.T, v otlpAttrValue) {
+			if v.IntValue == nil || *v.IntValue != 1<<63-1 {
+				t.Errorf("got %+v, want IntValue=%d", v, int64(1<<63-1))
+			}
+		}},
+		{"uint64_overflow", uint64(1 << 63), func(t *testing.T, v otlpAttrValue) {
+			// Values > 1<<63-1 cannot fit in int64; must degrade
+			// to DoubleValue so the OTLP body stays valid.
+			if v.DoubleValue == nil || *v.DoubleValue != float64(1<<63) {
+				t.Errorf("got %+v, want DoubleValue=%f", v, float64(1<<63))
+			}
+		}},
+		{"float32", float32(1.5), func(t *testing.T, v otlpAttrValue) {
+			if v.DoubleValue == nil || *v.DoubleValue != float64(float32(1.5)) {
+				t.Errorf("got %+v, want DoubleValue", v)
+			}
+		}},
 		{"unknown", struct{ X int }{X: 1}, func(t *testing.T, v otlpAttrValue) {
 			if v.StringValue == nil || !strings.Contains(*v.StringValue, "{") {
 				t.Errorf("expected struct fallback to string, got %+v", v)
+			}
+		}},
+		{"unknown_empty_struct", struct{}{}, func(t *testing.T, v otlpAttrValue) {
+			// Default branch must fmt.Sprintf the value into a
+			// StringValue so the collector can still index it.
+			want := fmt.Sprintf("%v", struct{}{})
+			if v.StringValue == nil || *v.StringValue != want {
+				t.Errorf("got %+v, want StringValue=%q", v, want)
+			}
+		}},
+		{"array_any_mixed", []any{"a", 1, true}, func(t *testing.T, v otlpAttrValue) {
+			if v.ArrayValue == nil || len(v.ArrayValue.Values) != 3 {
+				t.Errorf("expected arrayValue with 3 elements, got %+v", v)
+				return
+			}
+			if v.ArrayValue.Values[0].StringValue == nil || *v.ArrayValue.Values[0].StringValue != "a" {
+				t.Errorf("expected stringValue 'a' at [0], got %+v", v.ArrayValue.Values[0])
+			}
+			if v.ArrayValue.Values[1].IntValue == nil || *v.ArrayValue.Values[1].IntValue != 1 {
+				t.Errorf("expected intValue 1 at [1], got %+v", v.ArrayValue.Values[1])
+			}
+			if v.ArrayValue.Values[2].BoolValue == nil || !*v.ArrayValue.Values[2].BoolValue {
+				t.Errorf("expected boolValue true at [2], got %+v", v.ArrayValue.Values[2])
+			}
+		}},
+		{"array_string", []string{"foo", "bar"}, func(t *testing.T, v otlpAttrValue) {
+			if v.ArrayValue == nil || len(v.ArrayValue.Values) != 2 {
+				t.Errorf("expected arrayValue with 2 elements, got %+v", v)
+				return
+			}
+			if v.ArrayValue.Values[0].StringValue == nil || *v.ArrayValue.Values[0].StringValue != "foo" {
+				t.Errorf("expected stringValue 'foo' at [0], got %+v", v.ArrayValue.Values[0])
+			}
+			if v.ArrayValue.Values[1].StringValue == nil || *v.ArrayValue.Values[1].StringValue != "bar" {
+				t.Errorf("expected stringValue 'bar' at [1], got %+v", v.ArrayValue.Values[1])
+			}
+		}},
+		{"array_int", []int{1, 2, 3}, func(t *testing.T, v otlpAttrValue) {
+			if v.ArrayValue == nil || len(v.ArrayValue.Values) != 3 {
+				t.Errorf("expected arrayValue with 3 elements, got %+v", v)
+				return
+			}
+			for i, want := range []int64{1, 2, 3} {
+				if v.ArrayValue.Values[i].IntValue == nil || *v.ArrayValue.Values[i].IntValue != want {
+					t.Errorf("expected intValue %d at [%d], got %+v", want, i, v.ArrayValue.Values[i])
+				}
+			}
+		}},
+		{"array_float64", []float64{1.1, 2.2}, func(t *testing.T, v otlpAttrValue) {
+			if v.ArrayValue == nil || len(v.ArrayValue.Values) != 2 {
+				t.Errorf("expected arrayValue with 2 elements, got %+v", v)
+				return
+			}
+			if v.ArrayValue.Values[0].DoubleValue == nil || *v.ArrayValue.Values[0].DoubleValue != 1.1 {
+				t.Errorf("expected doubleValue 1.1 at [0], got %+v", v.ArrayValue.Values[0])
+			}
+			if v.ArrayValue.Values[1].DoubleValue == nil || *v.ArrayValue.Values[1].DoubleValue != 2.2 {
+				t.Errorf("expected doubleValue 2.2 at [1], got %+v", v.ArrayValue.Values[1])
+			}
+		}},
+		{"array_bool", []bool{true, false}, func(t *testing.T, v otlpAttrValue) {
+			if v.ArrayValue == nil || len(v.ArrayValue.Values) != 2 {
+				t.Errorf("expected arrayValue with 2 elements, got %+v", v)
+				return
+			}
+			if v.ArrayValue.Values[0].BoolValue == nil || !*v.ArrayValue.Values[0].BoolValue {
+				t.Errorf("expected boolValue true at [0], got %+v", v.ArrayValue.Values[0])
+			}
+			if v.ArrayValue.Values[1].BoolValue == nil || *v.ArrayValue.Values[1].BoolValue {
+				t.Errorf("expected boolValue false at [1], got %+v", v.ArrayValue.Values[1])
+			}
+		}},
+		{"array_empty", []any{}, func(t *testing.T, v otlpAttrValue) {
+			if v.ArrayValue == nil || len(v.ArrayValue.Values) != 0 {
+				t.Errorf("expected empty arrayValue, got %+v", v)
 			}
 		}},
 	}
@@ -500,6 +701,136 @@ func TestExporterQueueDepth(t *testing.T) {
 	}
 }
 
+func TestExporterNilRespNetworkError(t *testing.T) {
+	// Issue #565: network-level errors (DNS failure, connection refused)
+	// cause e.client.Do(req) to return (nil, err). The deferred
+	// resp.Body.Close() must not panic when resp is nil.
+	e := NewExporter(ExporterConfig{Endpoint: "http://127.0.0.1:1"})
+	e.client.Transport = &errorTransport{err: context.DeadlineExceeded}
+	defer e.Close()
+
+	_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "op")
+	s.End()
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if e.FlushFailures() == 0 {
+		t.Error("FlushFailures() = 0, want > 0 after network error")
+	}
+}
+
+func TestExporterRetryParamsConfigurable(t *testing.T) {
+	// Issue #803: retry parameters must be configurable via ExporterConfig.
+	// Verify the constructor applies custom values and falls back to
+	// defaults when <= 0.
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	// Custom: 1 retry with 10ms base, 50ms max.
+	e := NewExporter(ExporterConfig{
+		Endpoint:       srv.URL,
+		MaxRetries:     1,
+		RetryBaseDelay: 10 * time.Millisecond,
+		MaxRetryDelay:  50 * time.Millisecond,
+	})
+	if e == nil {
+		t.Fatal("NewExporter returned nil")
+	}
+	defer e.Close()
+
+	_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "op")
+	s.End()
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Initial attempt + 1 retry = 2 total attempts.
+	if got := attempts.Load(); got != 2 {
+		t.Errorf("attempts = %d, want 2 (initial + 1 retry)", got)
+	}
+	if e.FlushFailures() == 0 {
+		t.Error("FlushFailures() = 0, want > 0 after retries exhausted")
+	}
+}
+
+func TestExporterRetryParamsDefaults(t *testing.T) {
+	// When MaxRetries/RetryBaseDelay/MaxRetryDelay are 0 (or negative),
+	// the constructor must fall back to the defaults.
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{
+		Endpoint:       srv.URL,
+		MaxRetries:     0, // should fall back to defaultMaxRetries (3)
+		RetryBaseDelay: 0,
+		MaxRetryDelay:  0,
+	})
+	if e == nil {
+		t.Fatal("NewExporter returned nil")
+	}
+	defer e.Close()
+
+	_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "op")
+	s.End()
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Initial attempt + 3 retries = 4 total attempts.
+	if got := attempts.Load(); got != 4 {
+		t.Errorf("attempts = %d, want 4 (initial + 3 retries)", got)
+	}
+}
+
+func TestExporterRetryParamsNegative(t *testing.T) {
+	// Negative values must also fall back to defaults.
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{
+		Endpoint:       srv.URL,
+		MaxRetries:     -5,
+		RetryBaseDelay: -100 * time.Millisecond,
+		MaxRetryDelay:  -1 * time.Second,
+	})
+	if e == nil {
+		t.Fatal("NewExporter returned nil")
+	}
+	defer e.Close()
+
+	_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "op")
+	s.End()
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Initial attempt + 3 retries = 4 total attempts.
+	if got := attempts.Load(); got != 4 {
+		t.Errorf("attempts = %d, want 4 (negative values should fall back to defaults)", got)
+	}
+}
+
+type errorTransport struct {
+	err error
+}
+
+func (t *errorTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, t.err
+}
+
 func TestExporterNilQueueDepthAndDropped(t *testing.T) {
 	var e *Exporter
 	if e.QueueDepth() != 0 {
@@ -508,4 +839,187 @@ func TestExporterNilQueueDepthAndDropped(t *testing.T) {
 	if e.Dropped() != 0 {
 		t.Errorf("nil exporter Dropped() = %d, want 0", e.Dropped())
 	}
+	if e.FlushFailures() != 0 {
+		t.Errorf("nil exporter FlushFailures() = %d, want 0", e.FlushFailures())
+	}
+	if e.BatchCap() != 0 {
+		t.Errorf("nil exporter BatchCap() = %d, want 0", e.BatchCap())
+	}
+}
+
+func TestExporterBatchCap(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// Default batch size when not configured.
+	e := NewExporter(ExporterConfig{Endpoint: srv.URL})
+	if e.BatchCap() != defaultBatchCap {
+		t.Errorf("default BatchCap() = %d, want %d", e.BatchCap(), defaultBatchCap)
+	}
+	e.Close()
+
+	// Custom batch size.
+	e = NewExporter(ExporterConfig{Endpoint: srv.URL, BatchSize: 128})
+	if e.BatchCap() != 128 {
+		t.Errorf("BatchCap() = %d, want 128", e.BatchCap())
+	}
+	e.Close()
+
+	// Batch size <= 0 falls back to default.
+	e = NewExporter(ExporterConfig{Endpoint: srv.URL, BatchSize: 0})
+	if e.BatchCap() != defaultBatchCap {
+		t.Errorf("BatchCap() = %d, want %d (zero falls back to default)", e.BatchCap(), defaultBatchCap)
+	}
+	e.Close()
+
+	e = NewExporter(ExporterConfig{Endpoint: srv.URL, BatchSize: -5})
+	if e.BatchCap() != defaultBatchCap {
+		t.Errorf("BatchCap() = %d, want %d (negative falls back to default)", e.BatchCap(), defaultBatchCap)
+	}
+	e.Close()
+}
+
+func TestExporterCustomBatchSizeFlush(t *testing.T) {
+	// Test that a custom batch size is respected: flush fires at
+	// the configured cap, not the default.
+	var batches atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		batches.Add(1)
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	const customBatchSize = 8
+	e := NewExporter(ExporterConfig{
+		Endpoint:  srv.URL,
+		BatchSize: customBatchSize,
+	})
+	if e == nil {
+		t.Fatal("NewExporter returned nil")
+	}
+	defer e.Close()
+
+	// Submit exactly customBatchSize spans — should trigger one flush.
+	for i := 0; i < customBatchSize; i++ {
+		_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "op")
+		s.End()
+	}
+
+	// Give the background goroutine time to flush.
+	time.Sleep(100 * time.Millisecond)
+
+	if batches.Load() != 1 {
+		t.Errorf("batches = %d after %d spans (custom batch size %d), want 1 flush",
+			batches.Load(), customBatchSize, customBatchSize)
+	}
+}
+
+func TestExporterStartSpanNoopOnNonSampled(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{
+		Endpoint: srv.URL,
+		Sampler:  NeverSample{},
+	})
+	if e == nil {
+		t.Fatal("NewExporter returned nil")
+	}
+	defer e.Close()
+
+	traceID := NewTraceID()
+	ctx, s := e.StartSpan(Context{TraceID: traceID}, "non-sampled-op")
+
+	if ctx.TraceID != traceID {
+		t.Errorf("TraceID = %q, want %q", ctx.TraceID, traceID)
+	}
+	if s.TraceID != traceID {
+		t.Errorf("span TraceID = %q, want %q", s.TraceID, traceID)
+	}
+	if s.ParentSpanID != "" {
+		t.Errorf("ParentSpanID = %q, want empty", s.ParentSpanID)
+	}
+	if s.ended != true {
+		t.Errorf("ended = false, want true for non-sampled span")
+	}
+	if s.Attributes != nil {
+		t.Errorf("Attributes = %v, want nil for non-sampled span (no map allocation)", s.Attributes)
+	}
+
+	s.End()
+
+	if hits.Load() != 0 {
+		t.Errorf("hits = %d, want 0 (non-sampled span End must not submit)", hits.Load())
+	}
+	if e.Dropped() != 0 {
+		t.Errorf("Dropped = %d, want 0", e.Dropped())
+	}
+}
+
+func TestExporterStartSpanNoopOnProbabilityZero(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{
+		Endpoint: srv.URL,
+		Sampler:  NewProbabilitySampler(0),
+	})
+	if e == nil {
+		t.Fatal("NewExporter returned nil")
+	}
+	defer e.Close()
+
+	for i := 0; i < 32; i++ {
+		_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "zero-rate-op")
+		if s.ended != true {
+			t.Errorf("span %d: ended = false, want true for zero-rate-sampled span", i)
+		}
+		if s.Attributes != nil {
+			t.Errorf("span %d: Attributes = %v, want nil (no map allocation)", i, s.Attributes)
+		}
+		s.End()
+	}
+
+	if hits.Load() != 0 {
+		t.Errorf("hits = %d, want 0 (zero-rate spans must not export)", hits.Load())
+	}
+}
+
+func TestExporterStartSpanSampledAllocatesMap(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{
+		Endpoint: srv.URL,
+		Sampler:  AlwaysSample{},
+	})
+	if e == nil {
+		t.Fatal("NewExporter returned nil")
+	}
+	defer e.Close()
+
+	_, s := e.StartSpan(Context{TraceID: NewTraceID()}, "sampled-op")
+
+	if s.ended == true {
+		t.Errorf("ended = true, want false for sampled span")
+	}
+	if s.Attributes == nil {
+		t.Errorf("Attributes = nil, want non-nil map for sampled span")
+	}
+
+	s.SetAttr("key", "value")
+	s.End()
 }

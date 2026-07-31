@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// Pure-Go SQLite driver. Imports register the driver under the
@@ -164,6 +165,17 @@ type SQLiteStore struct {
 	ch      chan Request
 	dropped atomicDropped
 
+	// Retention prune goroutine (issue #483). pruneStop is non-nil
+	// only when retentionDays > 0; Close closes it to unblock the
+	// goroutine before wg.Wait.
+	pruneStop chan struct{}
+
+	// pruneLastRows / pruneLastTimestamp are updated atomically by
+	// pruneOnce so the /metrics gauge provider can read them without
+	// locking. Zero until the first successful prune tick.
+	pruneLastRows      atomic.Int64
+	pruneLastTimestamp atomic.Int64
+
 	wg     sync.WaitGroup
 	closed bool
 	close  closeOnce
@@ -171,8 +183,10 @@ type SQLiteStore struct {
 }
 
 // newSQLiteStore opens the database, creates the schema (idempotent),
-// and starts the background drain goroutine.
-func newSQLiteStore(path string, lg Logger) (*SQLiteStore, error) {
+// and starts the background drain goroutine. When retentionDays > 0 a
+// second goroutine periodically DELETEs rows older than the retention
+// window (issue #483).
+func newSQLiteStore(path string, retentionDays int, lg Logger) (*SQLiteStore, error) {
 	dsn := buildDSN(path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -204,6 +218,13 @@ func newSQLiteStore(path string, lg Logger) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("metrics: migrate route-source: %w", err)
 	}
 
+	// Issue #595: ensure auto_vacuum=INCREMENTAL so that
+	// incremental_vacuum in pruneOnce actually reclaims pages.
+	// The DSN pragma handles fresh databases; this is the safety
+	// net for databases upgraded from a pre-fix build. Errors are
+	// logged as warnings and do not prevent the store from opening.
+	migrateAutoVacuum(context.Background(), db, lg)
+
 	s := &SQLiteStore{
 		db:     db,
 		logger: lg,
@@ -212,6 +233,15 @@ func newSQLiteStore(path string, lg Logger) (*SQLiteStore, error) {
 	}
 	s.wg.Add(1)
 	go s.drain()
+
+	// Retention prune goroutine (issue #483). Only started when the
+	// operator set a non-zero retention window; the default (0) is
+	// byte-for-byte identical to the pre-#483 path.
+	if retentionDays > 0 {
+		s.pruneStop = make(chan struct{})
+		s.wg.Add(1)
+		go s.prune(retentionDays)
+	}
 	return s, nil
 }
 
@@ -241,6 +271,46 @@ func migrateSchema(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// autoVacuumIncremental is the integer value SQLite stores in the
+// database header for auto_vacuum=INCREMENTAL (0=NONE, 1=FULL, 2=INCREMENTAL).
+const autoVacuumIncremental = 2
+
+// migrateAutoVacuum ensures the database is in auto_vacuum=INCREMENTAL
+// mode so that incremental_vacuum in pruneOnce actually reclaims freed
+// pages (issue #595).
+//
+// The DSN _pragma=auto_vacuum(INCREMENTAL) handles fresh databases by
+// setting the mode before any tables exist. This function is the safety
+// net for databases created by a pre-fix build (auto_vacuum=NONE): it
+// checks the current mode and, if not already INCREMENTAL, sets the
+// pragma and runs VACUUM to rebuild the file with the new mode. On
+// SQLite, setting auto_vacuum on an existing database with tables is
+// silently ignored unless followed by VACUUM.
+//
+// Errors are logged as warnings and do NOT prevent the store from
+// opening — a failed migration simply means incremental_vacuum remains
+// a no-op until the operator runs a manual VACUUM.
+func migrateAutoVacuum(ctx context.Context, db *sql.DB, lg Logger) {
+	var mode int
+	if err := db.QueryRowContext(ctx, "PRAGMA auto_vacuum").Scan(&mode); err != nil {
+		lg("WARN: metrics: check auto_vacuum mode: %v", err)
+		return
+	}
+	if mode == autoVacuumIncremental {
+		return
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA auto_vacuum=INCREMENTAL"); err != nil {
+		lg("WARN: metrics: set auto_vacuum=INCREMENTAL: %v", err)
+		return
+	}
+	if _, err := db.ExecContext(ctx, "VACUUM"); err != nil {
+		lg("WARN: metrics: VACUUM for auto_vacuum migration: %v"+
+			" (incremental_vacuum will remain a no-op until manual VACUUM)", err)
+		return
+	}
+	lg("metrics: migrated auto_vacuum to INCREMENTAL (was mode=%d)", mode)
+}
+
 // buildDSN maps a plain path or ":memory:" into the URI form modernc
 // expects. The _pragma pair flips the connection to WAL and sets a
 // short busy timeout — both are recommended for hot-path append-only
@@ -260,8 +330,13 @@ func buildDSN(path string) string {
 	//                                    best-effort metrics log.
 	// _pragma=foreign_keys(ON)         — future-proof for relational
 	//                                    extensions.
+	// _pragma=auto_vacuum(INCREMENTAL) — set before any tables exist
+	//                                    on a fresh database so
+	//                                    incremental_vacuum in
+	//                                    pruneOnce actually reclaims
+	//                                    pages (issue #595).
 	return fmt.Sprintf(
-		"file:%s?mode=rwc&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)",
+		"file:%s?mode=rwc&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=auto_vacuum(INCREMENTAL)",
 		path,
 	)
 }
@@ -349,6 +424,101 @@ func (s *SQLiteStore) writeOne(req Request) {
 	)
 	if err != nil {
 		s.logger("ERROR: insert request_id=%s: %v", req.RequestID, err)
+	}
+}
+
+// --- Retention pruning (issue #483) ---------------------------------------
+//
+// The requests table is the highest-volume table in the metrics DB
+// (~52M rows/year at 100 req/min). Without a retention window the
+// table grows without bound. When the operator sets
+// NEXUS_METRICS_RETENTION_DAYS > 0, newSQLiteStore starts a background
+// goroutine that wakes every pruneInterval and DELETEs rows whose
+// timestamp is older than the retention window.
+//
+// The cutoff is computed in Go and passed as a time.Time parameter so
+// the comparison uses the same storage format modernc.org/sqlite uses
+// for the stored timestamps — no reliance on SQLite datetime() string
+// format compatibility.
+
+// pruneInterval is how often the background prune goroutine wakes.
+// ~1 hour per the issue spec; short enough to meet the "~1 hour"
+// acceptance criterion without burning CPU on a cold table.
+const pruneInterval = time.Hour
+
+// pruneTimeout bounds a single prune pass so a stalled disk cannot
+// pin the goroutine indefinitely. The DELETE is indexed by
+// idx_requests_timestamp so it is cheap even on millions of rows.
+const pruneTimeout = 30 * time.Second
+
+// pruneVacuumThreshold is the minimum DELETE row count that triggers an
+// incremental_vacuum pass for best-effort space reclamation. Below this
+// the overhead outweighs the benefit. Requires auto_vacuum=INCREMENTAL,
+// which is set at database creation time via the DSN pragma (issue #595).
+const pruneVacuumThreshold = 1000
+
+// pruneSQL deletes every row whose timestamp is strictly older than
+// the cutoff (a Go time.Time bound by the caller). The index
+// idx_requests_timestamp makes the range scan cheap.
+const pruneSQL = `DELETE FROM requests WHERE timestamp < ?`
+
+// PruneLastRows returns the number of rows removed by the most recent
+// prune pass. Zero until the first prune runs. Safe for concurrent use.
+func (s *SQLiteStore) PruneLastRows() int64 { return s.pruneLastRows.Load() }
+
+// PruneLastTimestamp returns the Unix timestamp (seconds) of the most
+// recent successful prune pass. Zero until the first prune runs.
+// Safe for concurrent use.
+func (s *SQLiteStore) PruneLastTimestamp() int64 { return s.pruneLastTimestamp.Load() }
+
+// prune is the background retention goroutine. It runs an immediate
+// prune at startup (so retention is enforced right after boot, not up
+// to an hour later), then wakes every pruneInterval. It exits when
+// pruneStop is closed (during Close).
+func (s *SQLiteStore) prune(retentionDays int) {
+	defer s.wg.Done()
+	s.pruneOnce(retentionDays)
+	ticker := time.NewTicker(pruneInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.pruneStop:
+			return
+		case <-ticker.C:
+			s.pruneOnce(retentionDays)
+		}
+	}
+}
+
+// pruneOnce executes one DELETE pass and records the outcome in the
+// atomic gauges. Exported via the struct (lowercase) so tests can call
+// it directly without waiting for the hourly ticker.
+func (s *SQLiteStore) pruneOnce(retentionDays int) {
+	if retentionDays <= 0 {
+		return // retention disabled — no-op guard
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), pruneTimeout)
+	defer cancel()
+
+	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
+	res, err := s.db.ExecContext(ctx, pruneSQL, cutoff)
+	if err != nil {
+		s.logger("WARN: retention prune failed: %v", err)
+		return
+	}
+	n, _ := res.RowsAffected()
+	s.pruneLastRows.Store(n)
+	s.pruneLastTimestamp.Store(time.Now().Unix())
+
+	// Best-effort space reclamation. Effective on databases created
+	// with auto_vacuum=INCREMENTAL (the default since issue #595).
+	if n >= pruneVacuumThreshold {
+		if _, err := s.db.ExecContext(ctx, "PRAGMA incremental_vacuum(100)"); err != nil {
+			s.logger("WARN: incremental_vacuum after prune: %v", err)
+		}
+	}
+	if n > 0 {
+		s.logger("retention prune: removed %d rows older than %d days", n, retentionDays)
 	}
 }
 
@@ -574,6 +744,9 @@ func (s *SQLiteStore) Close() error {
 	if !s.closed {
 		s.closed = true
 		close(s.ch)
+		if s.pruneStop != nil {
+			close(s.pruneStop)
+		}
 		s.wg.Wait()
 	}
 	return s.close.Close(func() error {
@@ -583,6 +756,11 @@ func (s *SQLiteStore) Close() error {
 		return nil
 	})
 }
+
+// Sync is a no-op for SQLiteStore because the database engine handles
+// durability internally via its write-ahead log (WAL). This method
+// satisfies the telemetry.Recorder interface.
+func (s *SQLiteStore) Sync() {}
 
 // Writable checks whether the database is currently reachable by attempting
 // a Ping. Returns false when the database is closed or inaccessible.

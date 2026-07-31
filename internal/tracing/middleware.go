@@ -37,7 +37,7 @@ func RequestMiddleware(next http.Handler) http.Handler {
 		rootCtx, rootSpan := StartSpan(parent, "nexus.chat_completions")
 		defer rootSpan.End()
 
-		ctx := WithSpanContext(r.Context(), rootCtx)
+		ctx := WithRootSpan(WithSpanContext(r.Context(), rootCtx), rootSpan)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

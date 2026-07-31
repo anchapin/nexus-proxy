@@ -4,7 +4,8 @@ import "strings"
 
 // SimilarityRatio returns the Jaccard similarity of the token sets of a
 // and b. Tokens are produced by strings.Fields (whitespace splitting),
-// so word boundaries (spaces, tabs, newlines) define token identity.
+// then normalized (lowercased, punctuation trimmed, JSON escapes unwrapped)
+// before set insertion.
 //
 //   - 1.0 when both inputs are empty (vacuously identical)
 //   - 0.0 when exactly one is empty
@@ -50,13 +51,28 @@ func SimilarityRatio(a, b string) float64 {
 }
 
 // tokenSet splits s on whitespace (per strings.Fields) and returns the
-// deduplicated token set. Caller is responsible for any further
-// normalization; the streaming fusion arbiter skip decision does not
-// need case folding or stemming.
+// deduplicated token set after normalization (lowercase, punctuation
+// trim, JSON-escape unwrapping).
 func tokenSet(s string) map[string]struct{} {
 	out := make(map[string]struct{}, 16)
 	for _, tok := range strings.Fields(s) {
-		out[tok] = struct{}{}
+		norm := normalizeToken(tok)
+		if norm != "" {
+			out[norm] = struct{}{}
+		}
 	}
 	return out
+}
+
+// normalizeToken applies surface-form normalization: lowercase, trim
+// ASCII punctuation and surrounding whitespace, and unwrap JSON escape
+// sequences.
+func normalizeToken(tok string) string {
+	tok = strings.ToLower(tok)
+	tok = strings.TrimSpace(tok)
+	tok = strings.Trim(tok, ".,;:!?()[]{}\"'")
+	tok = strings.ReplaceAll(tok, `\"`, `"`)
+	tok = strings.ReplaceAll(tok, `\n`, " ")
+	tok = strings.ReplaceAll(tok, `\\`, `\`)
+	return tok
 }

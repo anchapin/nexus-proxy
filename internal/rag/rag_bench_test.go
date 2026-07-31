@@ -36,9 +36,14 @@ func (e constEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
 	return e.vec, nil
 }
 
-func (e constEmbedder) IsHealthy(context.Context) bool { return true }
-func (e constEmbedder) IsBreakerOpen() bool            { return false }
-func (e constEmbedder) RecordBreakerSuccess()          {}
+func (e constEmbedder) EmbedBatch(_ context.Context, _ []string) ([][]float64, error) {
+	return [][]float64{e.vec}, nil
+}
+
+func (e constEmbedder) IsHealthy(context.Context) bool            { return true }
+func (e constEmbedder) IsBreakerOpen() bool                       { return false }
+func (e constEmbedder) RecordBreakerSuccess()                     {}
+func (e constEmbedder) SetTripCallback(string, func(kind string)) {}
 
 // BenchmarkCosineSimilarity measures the raw dot-product + norm
 // computation at the default 768-dimension embedding width. This is
@@ -80,7 +85,7 @@ func BenchmarkRetrieve(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, _, err := store.Retrieve(context.Background(), "test prompt"); err != nil {
+				if _, _, _, err := store.Retrieve(context.Background(), "test prompt"); err != nil {
 					b.Fatal(err)
 				}
 			}

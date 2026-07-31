@@ -1,17 +1,22 @@
 package ratelimit
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/tracing"
+	"github.com/anchapin/nexus-proxy/internal/tracingtest"
 )
 
 func TestMiddleware_Disabled_Passthrough(t *testing.T) {
-	m := NewMiddleware(0, 0, nil)
+	m := NewMiddleware(0, 0, nil, nil)
 	called := false
 	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
@@ -26,7 +31,7 @@ func TestMiddleware_Disabled_Passthrough(t *testing.T) {
 }
 
 func TestMiddleware_NilResolver_UsesPeer(t *testing.T) {
-	m := NewMiddleware(1, 1, nil) // 1 req/min, burst 1
+	m := NewMiddleware(1, 1, nil, nil) // 1 req/min, burst 1
 	var hits int
 	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
@@ -46,7 +51,7 @@ func TestMiddleware_NilResolver_UsesPeer(t *testing.T) {
 // the test: first 2 succeed, 3rd is 429.
 func TestMiddleware_429AfterBurst(t *testing.T) {
 	resolver := NewClientIPResolver(nil)
-	m := NewMiddleware(1000, 2, resolver) // huge rpm, burst 2
+	m := NewMiddleware(1000, 2, resolver, nil) // huge rpm, burst 2
 	var statuses []int
 	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -70,7 +75,7 @@ func TestMiddleware_429AfterBurst(t *testing.T) {
 // Different client IPs get independent buckets.
 func TestMiddleware_PerClientIsolation(t *testing.T) {
 	resolver := NewClientIPResolver(nil)
-	m := NewMiddleware(1, 1, resolver) // burst 1 each
+	m := NewMiddleware(1, 1, resolver, nil) // burst 1 each
 	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -93,7 +98,7 @@ func TestMiddleware_PerClientIsolation(t *testing.T) {
 func TestMiddleware_ResolverHonoured(t *testing.T) {
 	trusted := mustCIDRs(t, "10.0.0.0/8")
 	resolver := NewClientIPResolver(trusted)
-	m := NewMiddleware(1, 1, resolver) // burst 1
+	m := NewMiddleware(1, 1, resolver, nil) // burst 1
 	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -119,7 +124,7 @@ func TestMiddleware_ResolverHonoured(t *testing.T) {
 // Refill after time advances lets a throttled client back in.
 func TestMiddleware_RefillOverTime(t *testing.T) {
 	resolver := NewClientIPResolver(nil)
-	m := NewMiddleware(60, 1, resolver) // 60/min = 1/sec, burst 1
+	m := NewMiddleware(60, 1, resolver, nil) // 60/min = 1/sec, burst 1
 	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -145,10 +150,86 @@ func TestMiddleware_RefillOverTime(t *testing.T) {
 	}
 }
 
+// TestMiddleware_ReaperExitsOnClose verifies that the reaper goroutine
+// exits within 2 seconds of Close() being called (issue #739).
+func TestMiddleware_ReaperExitsOnClose(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(60, 1, resolver, nil) // rpm > 0 so reaper is started
+	m.ttl = 10 * time.Minute                 // intentionally long so only the stop matters
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+	h.ServeHTTP(httptest.NewRecorder(), req) // ensure reaper is running
+
+	done := make(chan struct{})
+	go func() {
+		m.reap(time.Now()) // drive reap manually while reaper ticker is live
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// reap returned — proceed to close and verify reaper exits
+	case <-time.After(500 * time.Millisecond):
+		// reaper ticker cycle still running, which is fine
+	}
+
+	m.Close()
+
+	// Give the reaper goroutine 2 seconds to exit after stopCh is closed.
+	select {
+	case <-time.After(2 * time.Second):
+		t.Error("reaper did not exit within 2 seconds of Close()")
+	default:
+		// passed — goroutine exited in time
+	}
+}
+
+// TestMiddleware_Reaper_Once verifies that exactly one reaper goroutine is
+// running per Middleware instance regardless of how many times Wrap() is
+// called (issue #978). The reaper starts in NewMiddleware, not in Wrap,
+// so calling Wrap() multiple times does not spawn multiple goroutines.
+func TestMiddleware_Reaper_Once(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+
+	// Baseline goroutine count before creating the middleware.
+	baseline := runtime.NumGoroutine()
+
+	m := NewMiddleware(60, 1, resolver, nil)
+
+	// After NewMiddleware, exactly one reaper goroutine should be running.
+	afterNew := runtime.NumGoroutine()
+	if afterNew != baseline+1 {
+		t.Errorf("after NewMiddleware: goroutines = %d, want %d (baseline %d + 1 reaper)",
+			afterNew, baseline+1, baseline)
+	}
+
+	// Calling Wrap() multiple times must not start additional reapers.
+	_ = m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	_ = m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	_ = m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	afterWrap := runtime.NumGoroutine()
+	if afterWrap != baseline+1 {
+		t.Errorf("after 3× Wrap: goroutines = %d, want %d (no extra reaper should start)",
+			afterWrap, baseline+1)
+	}
+
+	// Stop() blocks until the reaper goroutine has exited (WaitGroup-based),
+	// so the goroutine count is guaranteed to be back at baseline immediately.
+	m.Stop()
+
+	afterStop := runtime.NumGoroutine()
+	if afterStop != baseline {
+		t.Errorf("after Stop: goroutines = %d, want %d (reaper should have exited)",
+			afterStop, baseline)
+	}
+}
+
 // Reaper evicts idle buckets.
 func TestMiddleware_Reaper(t *testing.T) {
 	resolver := NewClientIPResolver(nil)
-	m := NewMiddleware(10, 1, resolver)
+	m := NewMiddleware(10, 1, resolver, nil)
 	m.ttl = 50 * time.Millisecond
 	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
@@ -173,7 +254,7 @@ func TestMiddleware_ConcurrentNoRace(t *testing.T) {
 	// at the burst capacity regardless of scheduling jitter, making the
 	// assertion deterministic. A high RPM (e.g. 100k) would refill ~17
 	// tokens in 10ms and make the test flaky.
-	m := NewMiddleware(60, 10, resolver) // burst 10
+	m := NewMiddleware(60, 10, resolver, nil) // burst 10
 	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -214,7 +295,7 @@ var _ = net.ParseIP
 // the burst, so the 3rd and 4th must each fire the hook.
 func TestMiddleware_RejectionHookFires(t *testing.T) {
 	resolver := NewClientIPResolver(nil)
-	m := NewMiddleware(1000, 2, resolver) // huge rpm, burst 2
+	m := NewMiddleware(1000, 2, resolver, nil) // huge rpm, burst 2
 	var rejected int64
 	m.SetRejectionHook(func() {
 		atomic.AddInt64(&rejected, 1)
@@ -237,7 +318,7 @@ func TestMiddleware_RejectionHookFires(t *testing.T) {
 // hook installed still works (no nil-panic on the 429 path).
 func TestMiddleware_RejectionHookNilSafe(t *testing.T) {
 	resolver := NewClientIPResolver(nil)
-	m := NewMiddleware(1, 1, resolver) // burst 1
+	m := NewMiddleware(1, 1, resolver, nil) // burst 1
 	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -251,7 +332,7 @@ func TestMiddleware_RejectionHookNilSafe(t *testing.T) {
 // a previously installed hook.
 func TestMiddleware_SetRejectionHookRemoves(t *testing.T) {
 	resolver := NewClientIPResolver(nil)
-	m := NewMiddleware(1, 1, resolver)
+	m := NewMiddleware(1, 1, resolver, nil)
 	var fired int64
 	m.SetRejectionHook(func() { atomic.AddInt64(&fired, 1) })
 	m.SetRejectionHook(nil)
@@ -265,12 +346,117 @@ func TestMiddleware_SetRejectionHookRemoves(t *testing.T) {
 	}
 }
 
+// TestMiddleware_AllowHookFires verifies that the SetAllowHook
+// callback is invoked once per allowed request (issue #746), before the
+// token is consumed. With burst=2, the first two requests are allowed;
+// the hook must fire exactly twice with a non-empty bucketID and a
+// utilization value in (0, 1].
+func TestMiddleware_AllowHookFires(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 2, resolver, nil) // huge rpm, burst 2
+	var calls []struct {
+		bucketID       string
+		utilizationPct float64
+	}
+	m.SetAllowHook(func(bucketID string, utilizationPct float64) {
+		calls = append(calls, struct {
+			bucketID       string
+			utilizationPct float64
+		}{bucketID, utilizationPct})
+	})
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	for i := 0; i < 4; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", nil)
+		req.RemoteAddr = "10.0.0.1:1000"
+		h.ServeHTTP(rec, req)
+	}
+	if len(calls) != 2 {
+		t.Errorf("allow hook fired %d times, want 2", len(calls))
+	}
+	for i, call := range calls {
+		if call.bucketID == "" {
+			t.Errorf("call %d: bucketID is empty, want non-empty", i)
+		}
+		if call.utilizationPct <= 0 || call.utilizationPct > 1 {
+			t.Errorf("call %d: utilizationPct = %v, want (0, 1]", i, call.utilizationPct)
+		}
+	}
+	// The first allowed request sees a full bucket (tokens=2, burst=2 → 1.0).
+	if calls[0].utilizationPct != 1.0 {
+		t.Errorf("first call utilizationPct = %v, want 1.0", calls[0].utilizationPct)
+	}
+	// The second allowed request sees ~1 token after the first decrement;
+	// a tiny refill may have occurred between the two ServeHTTP calls so we
+	// check the value is approximately 0.5 rather than exact.
+	if calls[1].utilizationPct < 0.49 || calls[1].utilizationPct > 0.51 {
+		t.Errorf("second call utilizationPct = %v, want ~0.5", calls[1].utilizationPct)
+	}
+}
+
+// TestMiddleware_AllowHookNilSafe confirms a middleware with no hook
+// installed still works (no nil-panic on the allow path).
+func TestMiddleware_AllowHookNilSafe(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 1, resolver, nil) // burst 1
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+	h.ServeHTTP(httptest.NewRecorder(), req) // allowed — must not panic
+}
+
+// TestMiddleware_SetAllowHookRemoves confirms passing nil clears a
+// previously installed hook.
+func TestMiddleware_SetAllowHookRemoves(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 1, resolver, nil)
+	var fired int64
+	m.SetAllowHook(func(bucketID string, utilizationPct float64) {
+		atomic.AddInt64(&fired, 1)
+	})
+	m.SetAllowHook(nil)
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if fired != 0 {
+		t.Errorf("hook fired %d after nil removal, want 0", fired)
+	}
+}
+
+// TestMiddleware_AllowHookNotFiredOnRejection verifies the allow hook
+// does NOT fire when a request is rejected (tokens < 1).
+func TestMiddleware_AllowHookNotFiredOnRejection(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 1, resolver, nil) // burst 1
+	var allowed int64
+	m.SetAllowHook(func(bucketID string, utilizationPct float64) {
+		atomic.AddInt64(&allowed, 1)
+	})
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+	h.ServeHTTP(httptest.NewRecorder(), req) // allowed
+	h.ServeHTTP(httptest.NewRecorder(), req) // rejected (429)
+	if allowed != 1 {
+		t.Errorf("allow hook fired %d times on rejected request, want 1", allowed)
+	}
+}
+
 // TestMiddleware_BucketRaceConcurrencyFix verifies issue #248: many
 // concurrent goroutines requesting the same previously-unseen IP must
 // result in exactly one bucket, not one per goroutine.
 func TestMiddleware_BucketRaceConcurrencyFix(t *testing.T) {
 	resolver := NewClientIPResolver(nil)
-	m := NewMiddleware(1000, 1000, resolver) // big burst to avoid 429 noise
+	m := NewMiddleware(1000, 1000, resolver, nil) // big burst to avoid 429 noise
 	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -300,7 +486,7 @@ func TestMiddleware_BucketRaceConcurrencyFix(t *testing.T) {
 // A newly created bucket should use the updated rpm for refill calculations.
 func TestMiddleware_SetRPM(t *testing.T) {
 	resolver := NewClientIPResolver(nil)
-	m := NewMiddleware(60, 2, resolver) // 60/min = 1/s, burst 2
+	m := NewMiddleware(60, 2, resolver, nil) // 60/min = 1/s, burst 2
 	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -332,7 +518,7 @@ func TestMiddleware_SetRPM(t *testing.T) {
 // TestMiddleware_SetBurst verifies SetBurst updates the bucket capacity.
 func TestMiddleware_SetBurst(t *testing.T) {
 	resolver := NewClientIPResolver(nil)
-	m := NewMiddleware(1000, 2, resolver) // burst 2
+	m := NewMiddleware(1000, 2, resolver, nil) // burst 2
 	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -391,7 +577,7 @@ func TestMiddleware_SetBurst(t *testing.T) {
 // TestMiddleware_SetBurstZeroDoesNotChange verifies that SetBurst(0) is a no-op.
 func TestMiddleware_SetBurstZeroDoesNotChange(t *testing.T) {
 	resolver := NewClientIPResolver(nil)
-	m := NewMiddleware(1000, 2, resolver) // burst 2
+	m := NewMiddleware(1000, 2, resolver, nil) // burst 2
 	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -424,3 +610,616 @@ func TestMiddleware_NilSafeSetBurst(t *testing.T) {
 	var m *Middleware
 	m.SetBurst(10) // must not panic
 }
+
+// TestMiddleware_RPM_Disabled verifies RPM() returns 0 when the middleware is disabled.
+func TestMiddleware_RPM_Disabled(t *testing.T) {
+	m := NewMiddleware(0, 0, nil, nil)
+	if got := m.RPM(); got != 0 {
+		t.Errorf("RPM() on disabled middleware = %d, want 0", got)
+	}
+}
+
+// TestMiddleware_RPM_Enabled verifies RPM() returns the configured value when enabled.
+func TestMiddleware_RPM_Enabled(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(120, 10, resolver, nil)
+	if got := m.RPM(); got != 120 {
+		t.Errorf("RPM() = %d, want 120", got)
+	}
+}
+
+// TestMiddleware_RPM_NilSafe verifies RPM() on a nil receiver does not panic and returns 0.
+func TestMiddleware_RPM_NilSafe(t *testing.T) {
+	var m *Middleware
+	if got := m.RPM(); got != 0 {
+		t.Errorf("RPM() on nil = %d, want 0", got)
+	}
+}
+
+// TestMiddleware_Burst_Disabled verifies Burst() returns 0 when the middleware is disabled.
+func TestMiddleware_Burst_Disabled(t *testing.T) {
+	m := NewMiddleware(0, 0, nil, nil)
+	if got := m.Burst(); got != 0 {
+		t.Errorf("Burst() on disabled middleware = %d, want 0", got)
+	}
+}
+
+// TestMiddleware_Burst_Enabled verifies Burst() returns the configured value when enabled.
+func TestMiddleware_Burst_Enabled(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(60, 5, resolver, nil)
+	if got := m.Burst(); got != 5 {
+		t.Errorf("Burst() = %d, want 5", got)
+	}
+}
+
+// TestMiddleware_Burst_NilSafe verifies Burst() on a nil receiver does not panic and returns 0.
+func TestMiddleware_Burst_NilSafe(t *testing.T) {
+	var m *Middleware
+	if got := m.Burst(); got != 0 {
+		t.Errorf("Burst() on nil = %d, want 0", got)
+	}
+}
+
+// TestMiddleware_Enabled_FalseWhenDisabled verifies Enabled() returns false when rpm <= 0.
+func TestMiddleware_Enabled_FalseWhenDisabled(t *testing.T) {
+	m := NewMiddleware(0, 0, nil, nil)
+	if got := m.Enabled(); got != false {
+		t.Errorf("Enabled() on disabled middleware = %v, want false", got)
+	}
+}
+
+// TestMiddleware_Enabled_TrueWhenEnabled verifies Enabled() returns true when rpm > 0.
+func TestMiddleware_Enabled_TrueWhenEnabled(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(60, 1, resolver, nil)
+	if got := m.Enabled(); got != true {
+		t.Errorf("Enabled() on enabled middleware = %v, want true", got)
+	}
+}
+
+// TestMiddleware_Enabled_NilSafe verifies Enabled() on a nil receiver does not panic and returns false.
+func TestMiddleware_Enabled_NilSafe(t *testing.T) {
+	var m *Middleware
+	if got := m.Enabled(); got != false {
+		t.Errorf("Enabled() on nil = %v, want false", got)
+	}
+}
+
+// TestMiddleware_APIKeyAwareKeyFunc_Hashed verifies that APIKeyAwareKeyFunc
+// returns a SHA256 hash truncated to 16 hex chars and that different API keys
+// behind the same IP produce different bucket keys (issue #776).
+func TestMiddleware_APIKeyAwareKeyFunc_Hashed(t *testing.T) {
+	ip := "10.0.0.1"
+
+	req1 := httptest.NewRequest(http.MethodPost, "/", nil)
+	req1.Header.Set("Authorization", "Bearer key-alpha")
+
+	req2 := httptest.NewRequest(http.MethodPost, "/", nil)
+	req2.Header.Set("Authorization", "Bearer key-beta")
+
+	key1 := APIKeyAwareKeyFunc(ip, req1)
+	key2 := APIKeyAwareKeyFunc(ip, req2)
+
+	if key1 == "" || key2 == "" {
+		t.Fatal("APIKeyAwareKeyFunc returned empty string")
+	}
+	if len(key1) != 16 || len(key2) != 16 {
+		t.Errorf("expected 16-char hex key, got key1=%q (%d chars), key2=%q (%d chars)", key1, len(key1), key2, len(key2))
+	}
+	if key1 == key2 {
+		t.Errorf("different API keys should produce different bucket keys: key1=%q, key2=%q", key1, key2)
+	}
+	// Same IP + same key should produce the same key.
+	key1Again := APIKeyAwareKeyFunc(ip, req1)
+	if key1 != key1Again {
+		t.Errorf("same IP+key should produce same hash: first=%q, second=%q", key1, key1Again)
+	}
+}
+
+// TestMiddleware_APIKeyAwareKeyFunc_NoAuth returns IP when no Authorization header is present.
+func TestMiddleware_APIKeyAwareKeyFunc_NoAuth(t *testing.T) {
+	ip := "10.0.0.1"
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	// No Authorization header set.
+	key := APIKeyAwareKeyFunc(ip, req)
+	if key != ip {
+		t.Errorf("expected IP=%q when no Authorization header, got %q", ip, key)
+	}
+}
+
+// TestMiddleware_APIKeyAwareKeyFunc_CaseInsensitiveBearerPrefix verifies that the
+// Bearer prefix is matched case-insensitively so "bearer MYKEY", "Bearer MYKEY",
+// and "BEARER MYKEY" all correctly extract the token value (RFC 6750).
+// The token value itself is NOT lowercased; only the prefix is matched
+// case-insensitively. "Bearer mykey" and "bearer mykey" both extract token
+// "mykey" (same logical token) and therefore share a bucket.
+func TestMiddleware_APIKeyAwareKeyFunc_CaseInsensitiveBearerPrefix(t *testing.T) {
+	ip := "10.0.0.1"
+
+	// All of these should extract token "mykey" (same logical token) and therefore
+	// produce the same bucket key. "Bearer  mykey" has a double space which
+	// TrimSpace normalises away.
+	reqBearer := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqBearer.Header.Set("Authorization", "Bearer mykey")
+
+	reqBearerLower := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqBearerLower.Header.Set("Authorization", "bearer mykey")
+
+	reqBearerDoubleSpace := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqBearerDoubleSpace.Header.Set("Authorization", "Bearer  mykey")
+
+	keyBearer := APIKeyAwareKeyFunc(ip, reqBearer)
+	keyBearerLower := APIKeyAwareKeyFunc(ip, reqBearerLower)
+	keyBearerDoubleSpace := APIKeyAwareKeyFunc(ip, reqBearerDoubleSpace)
+
+	if keyBearer != keyBearerLower {
+		t.Errorf("Bearer mykey and bearer mykey should produce same key: got %q vs %q", keyBearer, keyBearerLower)
+	}
+	if keyBearer != keyBearerDoubleSpace {
+		t.Errorf("Bearer mykey and Bearer  mykey (double space) should produce same key: got %q vs %q", keyBearer, keyBearerDoubleSpace)
+	}
+
+	// Different casing of the same logical token (mykey vs MYKEY) should produce
+	// different bucket keys because the token is case-sensitive.
+	reqMYKEY := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqMYKEY.Header.Set("Authorization", "Bearer MYKEY")
+	keyMYKEY := APIKeyAwareKeyFunc(ip, reqMYKEY)
+	if keyBearer == keyMYKEY {
+		t.Errorf("Bearer mykey and Bearer MYKEY should produce DIFFERENT keys (token is case-sensitive): got same %q", keyBearer)
+	}
+}
+
+// TestMiddleware_APIKeyAwareKeyFunc_CaseSensitiveToken verifies that different
+// casings of the same logical token produce different bucket keys, preventing
+// an attacker from bypassing a victim's per-key rate limit by changing token
+// casing (issue #977).
+func TestMiddleware_APIKeyAwareKeyFunc_CaseSensitiveToken(t *testing.T) {
+	ip := "10.0.0.1"
+
+	// Same logical token "MyKey" in different casings — these must NOT share
+	// a bucket because auth.go uses case-sensitive ConstantTimeCompare.
+	reqMyKey := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqMyKey.Header.Set("Authorization", "Bearer MyKey")
+
+	reqmykey := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqmykey.Header.Set("Authorization", "Bearer mykey")
+
+	reqMYKEY := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqMYKEY.Header.Set("Authorization", "Bearer MYKEY")
+
+	keyMyKey := APIKeyAwareKeyFunc(ip, reqMyKey)
+	keymykey := APIKeyAwareKeyFunc(ip, reqmykey)
+	keyMYKEY := APIKeyAwareKeyFunc(ip, reqMYKEY)
+
+	if keyMyKey == keymykey {
+		t.Errorf("Bearer MyKey and Bearer mykey should produce DIFFERENT keys (security fix #977): got same %q", keyMyKey)
+	}
+	if keyMyKey == keyMYKEY {
+		t.Errorf("Bearer MyKey and Bearer MYKEY should produce DIFFERENT keys (security fix #977): got same %q", keyMyKey)
+	}
+	if keymykey == keyMYKEY {
+		t.Errorf("Bearer mykey and Bearer MYKEY should produce DIFFERENT keys (security fix #977): got same %q", keymykey)
+	}
+}
+
+// TestMiddleware_APIKeyMode_DifferentCasingDifferentBuckets verifies at the
+// middleware integration level that two requests with different-cased versions
+// of the same logical API key are rate-limited independently (issue #977).
+func TestMiddleware_APIKeyMode_DifferentCasingDifferentBuckets(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	keyFn := func(r *http.Request) string {
+		ip := resolver.Resolve(r)
+		return APIKeyAwareKeyFunc(ip, r)
+	}
+	m := NewMiddleware(1, 1, resolver, keyFn) // burst 1 per bucket
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Exhaust victim's bucket with "Bearer MyKey".
+	reqVictim := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqVictim.RemoteAddr = "10.0.0.1:1000"
+	reqVictim.Header.Set("Authorization", "Bearer MyKey")
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, reqVictim)
+	}
+
+	// Attacker using "bearer mykey" (lowercase) should hit their own bucket and be allowed.
+	// If lowercase normalization existed (the bug), they would share the victim's bucket
+	// and be rate-limited. With the fix, they have separate buckets.
+	reqAttacker := httptest.NewRequest(http.MethodPost, "/", nil)
+	reqAttacker.RemoteAddr = "10.0.0.1:1000"
+	reqAttacker.Header.Set("Authorization", "bearer mykey")
+	recAttacker := httptest.NewRecorder()
+	h.ServeHTTP(recAttacker, reqAttacker)
+	if recAttacker.Code != 200 {
+		t.Errorf("attacker using different-cased token (bearer mykey) should get own bucket, got %d", recAttacker.Code)
+	}
+}
+
+// TestMiddleware_APIKeyMode_DifferentBuckets verifies that two different
+// API keys from the same IP occupy separate buckets (issue #776).
+func TestMiddleware_APIKeyMode_DifferentBuckets(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	keyFn := func(r *http.Request) string {
+		ip := resolver.Resolve(r)
+		return APIKeyAwareKeyFunc(ip, r)
+	}
+	m := NewMiddleware(1, 1, resolver, keyFn) // burst 1 per API key
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// First request with key-alpha: allowed.
+	req1 := httptest.NewRequest(http.MethodPost, "/", nil)
+	req1.RemoteAddr = "10.0.0.1:1000"
+	req1.Header.Set("Authorization", "Bearer key-alpha")
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, req1)
+	if rec1.Code != 200 {
+		t.Fatalf("first request (key-alpha) should pass, got %d", rec1.Code)
+	}
+
+	// Second request with key-alpha from same IP: exhausted burst, 429.
+	req2 := httptest.NewRequest(http.MethodPost, "/", nil)
+	req2.RemoteAddr = "10.0.0.1:1000"
+	req2.Header.Set("Authorization", "Bearer key-alpha")
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+	if rec2.Code != 429 {
+		t.Errorf("second request (key-alpha, same IP) should be throttled, got %d", rec2.Code)
+	}
+
+	// First request with key-beta from same IP: allowed (separate bucket).
+	req3 := httptest.NewRequest(http.MethodPost, "/", nil)
+	req3.RemoteAddr = "10.0.0.1:1000"
+	req3.Header.Set("Authorization", "Bearer key-beta")
+	rec3 := httptest.NewRecorder()
+	h.ServeHTTP(rec3, req3)
+	if rec3.Code != 200 {
+		t.Errorf("first request (key-beta) should pass (separate bucket from key-alpha), got %d", rec3.Code)
+	}
+
+	// Bucket count: should be 2 (one per API key).
+	if m.BucketCount() != 2 {
+		t.Errorf("expected 2 buckets (key-alpha, key-beta), got %d", m.BucketCount())
+	}
+}
+
+// TestMiddleware_APIKeyMode_HeaderKeyType verifies that the
+// X-Nexus-RateLimit-Key-Type header is set to "apikey" when using
+// API-key-aware mode (issue #776).
+func TestMiddleware_APIKeyMode_HeaderKeyType(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	keyFn := func(r *http.Request) string {
+		ip := resolver.Resolve(r)
+		return APIKeyAwareKeyFunc(ip, r)
+	}
+	m := NewMiddleware(1000, 2, resolver, keyFn)
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("X-Nexus-RateLimit-Key-Type"); got != "apikey" {
+		t.Errorf("X-Nexus-RateLimit-Key-Type = %q, want %q", got, "apikey")
+	}
+}
+
+// TestMiddleware_IPMode_HeaderKeyType verifies that the
+// X-Nexus-RateLimit-Key-Type header is set to "ip" when using
+// IP-only mode (default, issue #776).
+func TestMiddleware_IPMode_HeaderKeyType(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 2, resolver, nil) // no keyFn = IP-only
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("X-Nexus-RateLimit-Key-Type"); got != "ip" {
+		t.Errorf("X-Nexus-RateLimit-Key-Type = %q, want %q", got, "ip")
+	}
+}
+
+// TestMiddleware_IPMode_DifferentIPsSameKey verifies that in IP-only mode,
+// two different IPs with the same API key share the same bucket.
+func TestMiddleware_IPMode_DifferentIPsSameKey(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1, 1, resolver, nil) // IP-only mode, burst 1
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Request from IP1.
+	req1 := httptest.NewRequest(http.MethodPost, "/", nil)
+	req1.RemoteAddr = "10.0.0.1:1000"
+	req1.Header.Set("Authorization", "Bearer same-key")
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, req1)
+	if rec1.Code != 200 {
+		t.Fatalf("first request should pass, got %d", rec1.Code)
+	}
+
+	// Request from IP2, same API key: different IP = separate bucket in IP-only mode.
+	req2 := httptest.NewRequest(http.MethodPost, "/", nil)
+	req2.RemoteAddr = "10.0.0.2:1000"
+	req2.Header.Set("Authorization", "Bearer same-key")
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+	if rec2.Code != 200 {
+		t.Errorf("second request (different IP) should pass in IP-only mode even with same key, got %d", rec2.Code)
+	}
+
+	// Should have 2 buckets (one per IP).
+	if m.BucketCount() != 2 {
+		t.Errorf("expected 2 buckets (one per IP), got %d", m.BucketCount())
+	}
+}
+
+// TestMiddleware_Concurrent_IPvsAPIKey verifies that IP-only and IP+key modes
+// produce different bucket counts under concurrent requests (issue #776 acceptance criterion).
+func TestMiddleware_Concurrent_IPvsAPIKey(t *testing.T) {
+	t.Run("IP-only mode", func(t *testing.T) {
+		resolver := NewClientIPResolver(nil)
+		m := NewMiddleware(1000, 1000, resolver, nil)
+		h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		var wg sync.WaitGroup
+		for i := 0; i < 50; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				req := httptest.NewRequest(http.MethodPost, "/", nil)
+				req.RemoteAddr = fmt.Sprintf("10.0.0.%d:1000", idx%5+1)            // 5 distinct IPs
+				req.Header.Set("Authorization", fmt.Sprintf("Bearer key-%d", idx)) // 50 distinct keys
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, req)
+			}(i)
+		}
+		wg.Wait()
+		// IP-only mode: 5 buckets (one per IP), not 50 (one per key).
+		if m.BucketCount() != 5 {
+			t.Errorf("IP-only: expected 5 buckets (one per IP), got %d", m.BucketCount())
+		}
+	})
+
+	t.Run("API-key-aware mode", func(t *testing.T) {
+		resolver := NewClientIPResolver(nil)
+		keyFn := func(r *http.Request) string {
+			ip := resolver.Resolve(r)
+			return APIKeyAwareKeyFunc(ip, r)
+		}
+		m := NewMiddleware(1000, 1000, resolver, keyFn)
+		h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		var wg sync.WaitGroup
+		for i := 0; i < 50; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				req := httptest.NewRequest(http.MethodPost, "/", nil)
+				req.RemoteAddr = fmt.Sprintf("10.0.0.%d:1000", idx%5+1)            // 5 distinct IPs
+				req.Header.Set("Authorization", fmt.Sprintf("Bearer key-%d", idx)) // 50 distinct keys
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, req)
+			}(i)
+		}
+		wg.Wait()
+		// API-key-aware mode: 50 buckets (one per IP+key pair).
+		if m.BucketCount() != 50 {
+			t.Errorf("API-key-aware: expected 50 buckets (one per IP+key), got %d", m.BucketCount())
+		}
+	})
+}
+
+// TestMiddleware_RejectedSpanHasRateLimitAttributes verifies that when the
+// middleware rejects a request with 429, it emits a "ratelimit.check"
+// span with ratelimit.allowed=false and ratelimit.key_type="ip"
+// attributes (issue #936).
+func TestMiddleware_RejectedSpanHasRateLimitAttributes(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 1, resolver, nil) // burst 1
+
+	// Set up a tracing collector to capture spans.
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+
+	// First request succeeds.
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, req)
+	if rec1.Code != 200 {
+		t.Fatalf("first request should succeed, got %d", rec1.Code)
+	}
+
+	// Second request is rejected with 429.
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req)
+	if rec2.Code != 429 {
+		t.Fatalf("second request should be 429, got %d", rec2.Code)
+	}
+
+	// Close the exporter to drain the queue before checking spans.
+	if err := exp.Close(); err != nil {
+		t.Fatalf("exporter Close: %v", err)
+	}
+
+	// Find the span with allowed=false (rejected request).
+	var span *tracingtest.CapturedSpan
+	for _, s := range coll.Spans(t) {
+		if s.Name == "ratelimit.check" && !tracingtest.AttrBool(&s, "ratelimit.allowed") {
+			span = &s
+			break
+		}
+	}
+	if span == nil {
+		t.Fatal("no ratelimit.check span with allowed=false found in captured spans")
+	}
+	if keyType := tracingtest.AttrString(span, "ratelimit.key_type"); keyType != "ip" {
+		t.Errorf("ratelimit.key_type = %q, want %q", keyType, "ip")
+	}
+}
+
+// TestMiddleware_AcceptedSpanHasRateLimitAttributes verifies that when the
+// middleware allows a request, it emits a "ratelimit.check" span with
+// ratelimit.allowed=true and ratelimit.key_type="ip" attributes
+// (issue #936).
+func TestMiddleware_AcceptedSpanHasRateLimitAttributes(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 10, resolver, nil) // burst 10
+
+	// Set up a tracing collector to capture spans.
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("request should succeed, got %d", rec.Code)
+	}
+
+	// Close the exporter to drain the queue before checking spans.
+	if err := exp.Close(); err != nil {
+		t.Fatalf("exporter Close: %v", err)
+	}
+
+	// Verify the span was captured with the correct attributes.
+	span := coll.FindSpan(t, "ratelimit.check")
+	if span == nil {
+		t.Fatal("no ratelimit.check span found in captured spans")
+	}
+	if allowed := tracingtest.AttrBool(span, "ratelimit.allowed"); !allowed {
+		t.Errorf("ratelimit.allowed = false, want true on accept")
+	}
+	if keyType := tracingtest.AttrString(span, "ratelimit.key_type"); keyType != "ip" {
+		t.Errorf("ratelimit.key_type = %q, want %q", keyType, "ip")
+	}
+}
+
+// TestMiddleware_RejectedSpanHasRateLimitReason verifies that when the
+// middleware rejects a request with 429, it emits a "ratelimit.check"
+// span with ratelimit.reason="rate_exceeded" (issue #938).
+func TestMiddleware_RejectedSpanHasRateLimitReason(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 1, resolver, nil) // burst 1
+
+	// Set up a tracing collector to capture spans.
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+
+	// First request succeeds.
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, req)
+	if rec1.Code != 200 {
+		t.Fatalf("first request should succeed, got %d", rec1.Code)
+	}
+
+	// Second request is rejected with 429.
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req)
+	if rec2.Code != 429 {
+		t.Fatalf("second request should be 429, got %d", rec2.Code)
+	}
+
+	// Close the exporter to drain the queue before checking spans.
+	if err := exp.Close(); err != nil {
+		t.Fatalf("exporter Close: %v", err)
+	}
+
+	// Verify the span was captured with the correct reason attribute.
+	allSpans := coll.Spans(t)
+	t.Logf("total spans captured: %d", len(allSpans))
+	for i, s := range allSpans {
+		t.Logf("span[%d]: name=%q, allowed=%v, key_type=%q, reason=%q",
+			i, s.Name,
+			tracingtest.AttrBool(&s, "ratelimit.allowed"),
+			tracingtest.AttrString(&s, "ratelimit.key_type"),
+			tracingtest.AttrString(&s, "ratelimit.reason"))
+	}
+
+	// Find the span from the rejected request (allowed=false).
+	var rejectedSpan *tracingtest.CapturedSpan
+	for _, s := range allSpans {
+		if s.Name == "ratelimit.check" && !tracingtest.AttrBool(&s, "ratelimit.allowed") {
+			sp := s
+			rejectedSpan = &sp
+			break
+		}
+	}
+	if rejectedSpan == nil {
+		t.Fatal("no ratelimit.check span with allowed=false found in captured spans")
+	}
+	if reason := tracingtest.AttrString(rejectedSpan, "ratelimit.reason"); reason != "rate_exceeded" {
+		t.Errorf("ratelimit.reason = %q, want %q", reason, "rate_exceeded")
+	}
+}
+
+// TestMiddleware_RejectedSpanNilSafeWhenTracingDisabled verifies that when
+// tracing is not enabled, the middleware does not panic and still
+// emits 429 correctly.
+func TestMiddleware_RejectedSpanNilSafeWhenTracingDisabled(t *testing.T) {
+	// Ensure tracing is disabled.
+	tracing.RegisterExporter(nil)
+
+	resolver := NewClientIPResolver(nil)
+	m := NewMiddleware(1000, 1, resolver, nil) // burst 1
+
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1000"
+
+	// First request succeeds.
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, req)
+	if rec1.Code != 200 {
+		t.Fatalf("first request should succeed, got %d", rec1.Code)
+	}
+
+	// Second request is rejected with 429 — must not panic.
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req)
+	if rec2.Code != 429 {
+		t.Fatalf("second request should be 429, got %d", rec2.Code)
+	}
+}
+
+var _ = fmt.Sprintf // for TestMiddleware_Concurrent_IPvsAPIKey

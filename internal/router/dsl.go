@@ -5,7 +5,11 @@
 package router
 
 import (
+	"fmt"
+	"log"
 	"regexp"
+	"strings"
+	"unicode"
 
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
 )
@@ -20,17 +24,52 @@ const (
 // Default DSL patterns. These match the hardcoded behaviour prior to issue #305.
 // Exported so the chat handler can fall back to them when the config fields
 // are nil (e.g. in tests that construct config.Config directly).
+//
+// The patterns are compiled via mustCompileDefaultPattern (issue #588) so that
+// an invalid default surfaces as a structured boot error (log.Fatalf) rather
+// than a runtime panic from regexp.MustCompile.
 var (
 	DefaultFormattingPatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`),
+		mustCompileDefaultPattern("formatting", `(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`),
 	}
 	DefaultFusionPatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\b(architectural design|system architecture)\b`),
+		mustCompileDefaultPattern("fusion", `(?i)\b(architectural design|system architecture)\b`),
 	}
 	DefaultLocalPatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis)\b`),
+		mustCompileDefaultPattern("local", `(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis)\b`),
+	}
+	// DefaultUnicodePatterns matches non-ASCII text categories (issue #422).
+	// Operators can override via NEXUS_DSL_UNICODE_PATTERNS.
+	DefaultUnicodePatterns = []*regexp.Regexp{
+		mustCompileDefaultPattern("unicode", `(?i)\p{Han}`),    // Chinese characters
+		mustCompileDefaultPattern("unicode", `(?i)\p{Arabic}`), // Arabic characters
 	}
 )
+
+// compileDefaultPattern compiles a single default DSL regex expression and
+// returns a descriptive error identifying the pattern group (formatting,
+// fusion, local, or unicode) if the syntax is invalid. It never panics.
+// This is the testable core of mustCompileDefaultPattern (issue #588).
+func compileDefaultPattern(name, expr string) (*regexp.Regexp, error) {
+	re, err := regexp.Compile(expr)
+	if err != nil {
+		return nil, fmt.Errorf("dsl: invalid default %s pattern %q: %w", name, expr, err)
+	}
+	return re, nil
+}
+
+// mustCompileDefaultPattern compiles a default DSL regex expression and is
+// intended for package-level var initialization. On invalid syntax it logs a
+// descriptive message (identifying the pattern group and the parse error) and
+// calls log.Fatalf, so the proxy exits with a clear boot error instead of a
+// panic (issue #588).
+func mustCompileDefaultPattern(name, expr string) *regexp.Regexp {
+	re, err := compileDefaultPattern(name, expr)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	return re
+}
 
 // Guardrail returns RouteFrontier when the prompt is too large for the
 // configured VRAM budget. The threshold is the maximum *estimated* token
@@ -53,76 +92,89 @@ type Route string
 // DSL runs the heuristic fast-pass. Returns one of RouteLocal, RouteFusion,
 // or "" if no rule matched (caller should fall back to the SLM).
 //
-// fusionPatterns matches architecture keywords that warrant fusion (both
-// local and frontier). formattingPatterns matches simple formatting keywords
-// (css, format, docstring, lint, typo, boilerplate). localPatterns matches
-// common coding task keywords (refactor, security scan, generate tests,
-// explain this code, performance analysis, etc.). Each pattern slice may be
-// nil or empty in which case that branch is skipped.
-func DSL(prompt string, fusionPatterns, formattingPatterns, localPatterns []*regexp.Regexp) (Route, bool) {
-	lower := toLowerASCII(prompt)
+// The second return value is the reason: "fusion", "formatting", "local",
+// or "unicode" when a rule matched, or "" when no rule matched.
+//
+// fusionPatterns, formattingPatterns, and localPatterns are matched against
+// the lowercase prompt (via toUnicodeLower) so that keywords like "REFACTOR"
+// and "refactor" are treated identically. unicodePatterns is matched against
+// the raw prompt because Unicode property escapes (\p{Han}, \p{Arabic}, etc.)
+// are inherently case-invariant — lowercasing a Chinese or Arabic character
+// is a no-op, and using the raw prompt avoids an unnecessary allocation.
+func DSL(prompt string, fusionPatterns, formattingPatterns, localPatterns, unicodePatterns []*regexp.Regexp) (Route, string, bool) {
+	lower := toUnicodeLower(prompt)
 
 	if len(fusionPatterns) > 0 {
 		for _, re := range fusionPatterns {
 			if re.MatchString(lower) {
-				return RouteFusion, true
+				return RouteFusion, "fusion", true
 			}
 		}
 	}
 	if len(formattingPatterns) > 0 {
 		for _, re := range formattingPatterns {
 			if re.MatchString(lower) {
-				return RouteLocal, true
+				return RouteLocal, "formatting", true
 			}
 		}
 	}
 	if len(localPatterns) > 0 {
 		for _, re := range localPatterns {
 			if re.MatchString(lower) {
-				return RouteLocal, true
+				return RouteLocal, "local", true
 			}
 		}
 	}
-	return "", false
+	// Unicode patterns match non-ASCII text directly (issue #422).
+	// These patterns are NOT lowercased because they target script
+	// categories (e.g. \p{Han}) rather than ASCII keywords.
+	if len(unicodePatterns) > 0 {
+		for _, re := range unicodePatterns {
+			if re.MatchString(prompt) {
+				return RouteLocal, "unicode", true
+			}
+		}
+	}
+	return "", "", false
 }
 
-// toLowerASCII lowercases ASCII letters only. The DSL rules are
-// ASCII-keyword matches; full Unicode lowercasing is unnecessary and
-// would force an allocation proportional to prompt length.
-func toLowerASCII(s string) string {
-	if !hasUpperASCII(s) {
+// toUnicodeLower converts s to lowercase using Unicode case-folding rules
+// (issue #422). Unlike the prior toLowerASCII, this handles all scripts
+// (Chinese, Arabic, Greek, etc.). The allocation is proportional to the
+// number of uppercase runes in s; prompts without uppercase return s
+// unchanged (zero allocation).
+func toUnicodeLower(s string) string {
+	if !hasUpperUnicode(s) {
 		return s
 	}
-	b := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		b[i] = c
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		b.WriteRune(unicode.ToLower(r))
 	}
-	return string(b)
+	return b.String()
 }
 
-func hasUpperASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] >= 'A' && s[i] <= 'Z' {
+// hasUpperUnicode returns true if s contains any uppercase Unicode rune.
+// Used to skip the toUnicodeLower allocation for already-lowercase strings.
+func hasUpperUnicode(s string) bool {
+	for _, r := range s {
+		if r != unicode.ToLower(r) {
 			return true
 		}
 	}
 	return false
 }
 
-func stringsContains(s, substr string) bool {
-	return len(substr) == 0 || (len(s) >= len(substr) && indexOf(s, substr) >= 0)
-}
-
-func indexOf(s, substr string) int {
-	n, m := len(s), len(substr)
-	for i := 0; i+m <= n; i++ {
-		if s[i:i+m] == substr {
-			return i
-		}
+// containsWord returns true if kw appears in s as a whole word/phrase,
+// using \b word-boundary matching so that e.g. "test" does not match
+// inside "contest". The keyword kw is already lowercased by the caller.
+func containsWord(s, kw string) bool {
+	if kw == "" {
+		return false
 	}
-	return -1
+	// regexp.QuoteMeta escapes all regex metacharacters, then we wrap with \b.
+	pattern := `(?i)\b` + regexp.QuoteMeta(kw) + `\b`
+	matched, _ := regexp.MatchString(pattern, s)
+	return matched
 }

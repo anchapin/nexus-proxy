@@ -26,12 +26,15 @@ package judge
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,6 +59,12 @@ type Sample struct {
 	Output      string // full streamed local-model response
 	LocalModel  string // which local model produced Output
 
+	// Route is which routing path produced Output: "local", "fusion", or
+	// "frontier". It is fed into JudgeScore so callers (notably the
+	// confidenceBridge in cmd/nexus) can record outcome quality against
+	// the correct route instead of always defaulting to RouteLocal.
+	Route string
+
 	// TraceParent and TraceState carry the W3C trace context from the
 	// inbound request so the async worker can create a child span (issue #233).
 	TraceParent string
@@ -75,6 +84,11 @@ type JudgeScore struct {
 	OutputTok   int
 	Err         error
 	Timestamp   time.Time
+
+	// Route records which routing path produced the response that was
+	// scored. This lets the confidenceBridge record the outcome against
+	// the correct route instead of always defaulting to RouteLocal (issue #970).
+	Route string
 }
 
 // Storage persists JudgeScore records. A future PR will supply a
@@ -149,6 +163,28 @@ type Evaluator struct {
 	onDrop func(uint64)
 }
 
+// newSeededRand returns a *rand.Rand seeded from a cryptographic
+// entropy source. Seeding exclusively from time.Now().UnixNano()
+// collapses to identical streams when multiple evaluators are
+// constructed within the same nanosecond, biasing the sample rate
+// (issue #589). crypto/rand supplies 64 bits of entropy; if it fails
+// (extremely rare — e.g. /dev/urandom unavailable) the fallback mixes
+// the nanosecond clock with the PID so a same-nanosecond pair of
+// evaluators on the same host still diverge.
+//
+// The seed is drawn once at construction; Sample() remains a single
+// mutex-guarded Float64() draw, so this change is latency-neutral.
+func newSeededRand() *rand.Rand {
+	var seed int64
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err == nil {
+		seed = int64(binary.LittleEndian.Uint64(b[:]))
+	} else {
+		seed = time.Now().UnixNano() ^ (int64(os.Getpid()) << 32)
+	}
+	return rand.New(rand.NewSource(seed))
+}
+
 // NewEvaluator wires the evaluator and starts its worker pool. The
 // workers live until Close is called.
 //
@@ -168,7 +204,7 @@ func NewEvaluator(cfg Config, client HTTPClient, storage Storage) *Evaluator {
 		client:  client,
 		storage: storage,
 		queue:   make(chan Sample, cfg.QueueDepth),
-		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
+		rng:     newSeededRand(),
 		closed:  make(chan struct{}),
 	}
 	if cfg.SampleRate <= 0 {
@@ -309,7 +345,7 @@ func (e *Evaluator) evaluate(s Sample) JudgeScore {
 }
 
 func (e *Evaluator) evaluateCtx(ctx context.Context, s Sample) JudgeScore {
-	score := JudgeScore{RequestID: s.RequestID, Timestamp: time.Now().UTC()}
+	score := JudgeScore{RequestID: s.RequestID, Timestamp: time.Now().UTC(), Route: s.Route}
 
 	prompt := PromptFor(s)
 	// Use a struct so the JSON field order is deterministic — Go's
@@ -531,23 +567,56 @@ type noopStorage struct{}
 func (noopStorage) Record(JudgeScore) error { return nil }
 func (noopStorage) Close() error            { return nil }
 
+// cleanEveryN is the interval (in inserts) between stale-entry cleanup
+// passes. Every cleanEveryN inserts, entries older than 2*window are deleted
+// to keep memory bounded regardless of the sliding window size.
+const cleanEveryN = 1000
+
 // MemoryStorage is a thread-safe in-memory Storage for development
 // and tests. Production code uses a SQLite-backed implementation
 // (issue #16); the interface is identical so swapping is trivial.
 type MemoryStorage struct {
-	mu     sync.Mutex
-	scores []JudgeScore
+	mu          sync.Mutex
+	window      time.Duration
+	insertCount int64
+	scores      []JudgeScore
 }
 
-// NewMemoryStorage returns an empty in-memory store.
-func NewMemoryStorage() *MemoryStorage { return &MemoryStorage{} }
+// NewMemoryStorage returns an empty in-memory store. window is the TTL;
+// entries older than 2*window are pruned every cleanEveryN inserts. A zero
+// window disables pruning (matching the pre-issue-#1063 behaviour).
+func NewMemoryStorage(window time.Duration) *MemoryStorage {
+	return &MemoryStorage{window: window}
+}
 
 // Record appends s to the in-memory log.
 func (m *MemoryStorage) Record(s JudgeScore) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if s.Timestamp.IsZero() {
+		s.Timestamp = time.Now().UTC()
+	}
 	m.scores = append(m.scores, s)
+	if m.window > 0 {
+		m.insertCount++
+		if m.insertCount%cleanEveryN == 0 {
+			m.cleanupLocked()
+		}
+	}
 	return nil
+}
+
+// cleanupLocked deletes entries older than 2*window. Caller must hold m.mu.
+func (m *MemoryStorage) cleanupLocked() {
+	cutoff := time.Now().UTC().Add(-2 * m.window)
+	j := 0
+	for _, s := range m.scores {
+		if !s.Timestamp.Before(cutoff) {
+			m.scores[j] = s
+			j++
+		}
+	}
+	m.scores = m.scores[:j]
 }
 
 // Scores returns a copy of the recorded scores in insertion order.
@@ -556,6 +625,20 @@ func (m *MemoryStorage) Scores() []JudgeScore {
 	defer m.mu.Unlock()
 	out := make([]JudgeScore, len(m.scores))
 	copy(out, m.scores)
+	return out
+}
+
+// ScoresSince returns all scores with Timestamp >= t. Exists for testing
+// and monitoring purposes; it is not part of the Storage interface.
+func (m *MemoryStorage) ScoresSince(t time.Time) []JudgeScore {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]JudgeScore, 0, len(m.scores))
+	for _, s := range m.scores {
+		if !s.Timestamp.Before(t) {
+			out = append(out, s)
+		}
+	}
 	return out
 }
 

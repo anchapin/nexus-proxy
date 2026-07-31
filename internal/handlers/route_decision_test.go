@@ -64,11 +64,9 @@ func TestChatSetsRouteDecisionHeadersForDSLMatch(t *testing.T) {
 	if got := rw.Header().Get("X-Nexus-Route-Source"); got != "dsl" {
 		t.Errorf("X-Nexus-Route-Source = %q, want \"dsl\"", got)
 	}
-	// DSL path leaves Reason empty; the header carries the sanitised
-	// empty value rather than being omitted, so consumers can rely on
-	// the header always being set.
-	if got := rw.Header().Get("X-Nexus-Route-Reason"); got != "" {
-		t.Errorf("X-Nexus-Route-Reason = %q, want \"\"", got)
+	// DSL path sets Reason to the DSL category (issue #875).
+	if got := rw.Header().Get("X-Nexus-Route-Reason"); got != "formatting" {
+		t.Errorf("X-Nexus-Route-Reason = %q, want \"formatting\"", got)
 	}
 	// DSL bypasses the SLM, so the planner emits the neutral
 	// confidence floor (0.50) which surfaces on the header.
@@ -98,9 +96,13 @@ func TestChatSetsRouteDecisionHeadersForGuardrail(t *testing.T) {
 	deps, rt := baseDeps(t)
 	deps.RouteDecisionObserver = &routeDecisionRecorder{}
 
-	// 48500 char prompt ≈ 6062 tokens > 6000 guardrail. Reduced from
-	// 49000 to speed tiktoken encoding in race mode on shared CI runners.
-	largeUser := strings.Repeat("a", 48500)
+	// Lower the guardrail threshold so a small prompt trips it. This
+	// avoids the expensive tiktoken BPE encoding of a multi-thousand-char
+	// prompt (which pushed the package over the 10m CI timeout under the
+	// race detector on slower runners). The test validates route-decision
+	// headers, not tokenizer performance.
+	deps.Config.TokenGuardrail = 10
+	largeUser := strings.Repeat("a", 100) // len/4 = 25 > 10 guardrail
 	body := `{"messages":[{"role":"user","content":"` + largeUser + `"}]}`
 	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "frontier stream")
@@ -236,8 +238,8 @@ func TestChatMetricsEventCarriesRouteDecisionFields(t *testing.T) {
 	if e.RouteSource != "dsl" {
 		t.Errorf("RouteSource = %q, want \"dsl\"", e.RouteSource)
 	}
-	if e.RouteReason != "" {
-		t.Errorf("RouteReason = %q, want \"\"", e.RouteReason)
+	if e.RouteReason != "formatting" {
+		t.Errorf("RouteReason = %q, want \"formatting\"", e.RouteReason)
 	}
 	if e.SLMConfidence != 0.5 {
 		t.Errorf("SLMConfidence = %v, want 0.5", e.SLMConfidence)
@@ -259,6 +261,7 @@ func (r *recordingRecorder) Record(rec telemetry.Record) {
 	r.mu.Unlock()
 }
 func (r *recordingRecorder) Close() error { return nil }
+func (r *recordingRecorder) Sync()        {}
 func (r *recordingRecorder) snapshot() []telemetry.Record {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -393,7 +396,11 @@ func TestSanitizeHeaderValueAdversarial(t *testing.T) {
 		{"crlf", "a\r\nb", "ab"},
 		{"only_newline", "\n", ""},
 		{"low_control", "a\x01b\x02c", "a b c"},
-		{"pathological_long", strings.Repeat("x", MaxHeaderValue*4), strings.Repeat("x", MaxHeaderValue)},
+		// Exactly at the boundary: returned unchanged, no marker (issue #494).
+		{"at_boundary", strings.Repeat("x", MaxHeaderValue), strings.Repeat("x", MaxHeaderValue)},
+		// Pathological length: prefix plus "...(+N)" truncation marker (issue #494).
+		// MaxHeaderValue*4 = 512 runes; dropped = 512 - 128 = 384.
+		{"pathological_long", strings.Repeat("x", MaxHeaderValue*4), strings.Repeat("x", MaxHeaderValue) + "...(+384)"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

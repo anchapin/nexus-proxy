@@ -16,10 +16,17 @@ package router
 
 import (
 	"context"
+	"log/slog"
 	"regexp"
 
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
 )
+
+func init() {
+	if Categorize("") == "" {
+		panic("Categorize must never return an empty string")
+	}
+}
 
 // DecisionSource names which stage of the planner produced the route.
 // It is the structured equivalent of the handler's trace "reason"
@@ -58,17 +65,25 @@ const (
 	SourceSLMEscalation DecisionSource = "slm-escalation"
 )
 
-// TraceReason maps a DecisionSource to the short string the handler
-// stamps on the debug RouteTrace.Reason field. The handler's pre-issue-
-// 82 ladder used "guardrail", "dsl", and "slm" as reason labels; the
-// SLM-error and escalation paths also map to "slm" so the trace remains
-// backward-compatible with any log-scraping tooling.
+// TraceReason returns the stable machine-readable trace label for a decision source:
+// "guardrail", "dsl", "slm" for a clean SLM decision, "slm-error" for an
+// SLM failure, "slm-no-client" when no SLM client is configured, and
+// "slm-low-confidence" for a confidence-triggered escalation. Unknown
+// sources retain the legacy "slm" fallback.
 func (s DecisionSource) TraceReason() string {
 	switch s {
 	case SourceGuardrail:
 		return "guardrail"
 	case SourceDSL:
 		return "dsl"
+	case SourceSLM:
+		return "slm"
+	case SourceSLMError:
+		return "slm-error"
+	case SourceEscalation:
+		return "slm-no-client"
+	case SourceSLMEscalation:
+		return "slm-low-confidence"
 	default:
 		return "slm"
 	}
@@ -180,6 +195,11 @@ type Planner struct {
 	// local-patterns branch of the DSL.
 	LocalPatternsRegex []*regexp.Regexp
 
+	// UnicodePatternsRegex is the DSL fast-pass regex(es) for non-ASCII
+	// text categories (issue #422). E.g. \p{Han} matches Chinese characters.
+	// An empty/nil slice uses the hardcoded defaults (Chinese \p{Han}).
+	UnicodePatternsRegex []*regexp.Regexp
+
 	// SLMCache is the optional time-bounded prompt→route cache
 	// (issue #206). When non-nil the planner checks the cache before
 	// calling the SLM; a hit returns the cached route without calling
@@ -196,6 +216,11 @@ type Planner struct {
 	// planner uses >, not >=, so a threshold of 0.3 fires when
 	// confidence is 0.29.
 	ConfidenceThreshold float64
+
+	// ConfidenceErrorHook is invoked when LocalConfidence returns an error
+	// (issue #927). The hook logs at Warn level and increments the
+	// nexus_confidence_errors_total counter. Nil is a safe no-op.
+	ConfidenceErrorHook func(category string, err error)
 }
 
 // PlanRequest carries the per-request inputs the planner needs. The
@@ -253,6 +278,20 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	}
 
 	// Stage 2: DSL fast-pass. Use default patterns when config fields are nil.
+	//
+	// DSL PATTERN PRECEDENCE (issue #876): when a prompt matches multiple
+	// pattern groups, the FIRST match wins. The fixed check order is:
+	//
+	//   1. fusionPatterns     → RouteFusion  (architectural design, system architecture)
+	//   2. formattingPatterns → RouteLocal   (css, format, docstring, lint, ...)
+	//   3. localPatterns     → RouteLocal   (refactor, security scan, generate tests, ...)
+	//   4. unicodePatterns   → RouteLocal   (\p{Han}, \p{Arabic} script detection)
+	//
+	// Operators should be aware that precedence is meaningful: a prompt
+	// containing both "refactor" (local) and "system architecture" (fusion)
+	// will be routed to fusion because fusionPatterns are checked first.
+	// If you need different precedence, the patterns themselves must be
+	// narrowed to avoid overlap.
 	fusionPatterns := p.FusionPatterns
 	if len(fusionPatterns) == 0 {
 		fusionPatterns = DefaultFusionPatterns
@@ -265,10 +304,15 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	if len(localPatterns) == 0 {
 		localPatterns = DefaultLocalPatterns
 	}
-	if r, hit := DSL(req.Prompt, fusionPatterns, formattingPatterns, localPatterns); hit {
+	unicodePatterns := p.UnicodePatternsRegex
+	if len(unicodePatterns) == 0 {
+		unicodePatterns = DefaultUnicodePatterns
+	}
+	if r, reason, hit := DSL(req.Prompt, fusionPatterns, formattingPatterns, localPatterns, unicodePatterns); hit {
 		return Decision{
 			Route:           r,
 			Source:          SourceDSL,
+			Reason:          reason, // DSL fast-pass reason: fusion, formatting, local, unicode
 			Confidence:      NeutralConfidence,
 			EstimatedTokens: estimatedTokens,
 			BudgetSource:    req.GuardrailSource,
@@ -291,21 +335,33 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 		dec        Route
 		err        error
 		confidence float64 = NeutralConfidence
-		category   string
 	)
+
+	// Categorize once for observability. Every decision reaching the SLM
+	// stage (including cache hits) carries a non-empty TaskType so that
+	// Prometheus and JSONL telemetry lose their per-category dimension
+	// even when no ConfidenceStore is wired (issue #441).
+	category := Categorize(req.Prompt)
 
 	// Check cache first if enabled.
 	if p.SLMCache != nil {
 		if cached, hit, hitKind := p.SLMCache.Get(req.Context, req.Prompt); hit {
-			// We still categorize for observability even on cache hit,
-			// but we use the cached route directly.
 			if p.Confidence != nil {
-				category = Categorize(req.Prompt)
-				confidence = p.Confidence.LocalConfidence(category)
+				if conf, err := p.Confidence.LocalConfidence(category); err != nil {
+					slog.Warn("planner: confidence lookup",
+						slog.String("category", category),
+						slog.Any("err", err),
+					)
+					if p.ConfidenceErrorHook != nil {
+						p.ConfidenceErrorHook(category, err)
+					}
+				} else {
+					confidence = conf
+				}
 			}
 			// Hard override: same check as the miss path — a cached
 			// local/fusion decision with low confidence still escalates.
-			if p.ConfidenceThreshold > 0 && (cached == RouteLocal || cached == RouteFusion) && confidence < p.ConfidenceThreshold {
+			if p.ConfidenceThreshold > 0 && p.Confidence != nil && (cached == RouteLocal || cached == RouteFusion) && confidence < p.ConfidenceThreshold {
 				return Decision{
 					Route:           RouteFrontier,
 					Source:          SourceSLMEscalation,
@@ -334,8 +390,17 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	}
 
 	if p.Confidence != nil {
-		category = Categorize(req.Prompt)
-		confidence = p.Confidence.LocalConfidence(category)
+		if conf, err := p.Confidence.LocalConfidence(category); err != nil {
+			slog.Warn("planner: confidence lookup",
+				slog.String("category", category),
+				slog.Any("err", err),
+			)
+			if p.ConfidenceErrorHook != nil {
+				p.ConfidenceErrorHook(category, err)
+			}
+		} else {
+			confidence = conf
+		}
 		dec, err = p.SLM.DecideWithConfidence(req.Context, req.Prompt, confidence)
 	} else {
 		dec, err = p.SLM.Decide(req.Context, req.Prompt)
@@ -355,12 +420,11 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 		}
 	}
 
-	// Hard override: if the SLM returned local/fusion but confidence
+	// Hard override: if the SLM returned local/fusion but confidence (issue #928: only when ConfidenceStore is wired)
 	// is below the threshold, escalate to frontier (issue #301).
 	// The check uses > so threshold 0.3 fires on 0.29. A zero or
 	// negative threshold disables the override.
-	if p.ConfidenceThreshold > 0 && (dec == RouteLocal || dec == RouteFusion) && confidence < p.ConfidenceThreshold {
-		category = Categorize(req.Prompt)
+	if p.ConfidenceThreshold > 0 && p.Confidence != nil && (dec == RouteLocal || dec == RouteFusion) && confidence < p.ConfidenceThreshold {
 		return Decision{
 			Route:           RouteFrontier,
 			Source:          SourceSLMEscalation,

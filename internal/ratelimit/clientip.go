@@ -19,11 +19,16 @@
 //
 //	X-Forwarded-For: client, proxy1, proxy2
 //
-// where the rightmost entry is the closest proxy (the direct peer). The
-// resolver walks the chain right-to-left, skipping every IP that is in
-// the trusted CIDR list, and returns the first untrusted IP — the real
-// client. This is the canonical behaviour used by nginx
-// (real_ip_recursive) and Go's httputil.ReverseProxy.
+// where the leftmost entry is the original client and the rightmost is
+// the closest proxy (the direct peer). The resolver walks the chain
+// left-to-right from the original client, skipping every IP that is in
+// the trusted CIDR list, and returns the first untrusted IP. When all
+// hops are trusted the original client is returned; when the chain
+// contains an untrusted proxy the first such untrusted hop is returned.
+// This is the correct behaviour for split-trust chains (issue #979):
+// the prior right-to-left walk allowed an attacker-controlled proxy to
+// masquerade as the first untrusted hop by placing their IP before the
+// trusted proxy in the chain.
 //
 // # Zero dependencies
 //
@@ -119,6 +124,17 @@ func (r *ClientIPResolver) Trusted() bool {
 	return r != nil && len(r.trusted) > 0
 }
 
+// SetTrustedProxies atomically replaces the trusted-proxy CIDR allowlist.
+// Issue #896: this allows the SIGHUP handler to update the resolver without
+// constructing a new ClientIPResolver, so in-flight requests see a consistent
+// view of the old list until the swap is visible to the next Resolve call.
+func (r *ClientIPResolver) SetTrustedProxies(trusted []*net.IPNet) {
+	if r == nil {
+		return
+	}
+	r.trusted = trusted
+}
+
 // Resolve returns the effective client IP for the request.
 //
 // Decision tree (in order):
@@ -130,8 +146,9 @@ func (r *ClientIPResolver) Trusted() bool {
 //  3. If the peer IP is not in any trusted CIDR, return the peer IP.
 //     Forwarded headers from an untrusted peer are ignored (spoofing
 //     defence).
-//  4. The peer IS trusted. Walk X-Forwarded-For right-to-left, skipping
-//     trusted IPs; return the first untrusted, valid IP.
+//  4. The peer IS trusted. Walk X-Forwarded-For left-to-right, skipping
+//     trusted IPs; return the first untrusted, valid IP (the original
+//     client when all hops are trusted).
 //  5. If XFF is absent, empty, or every hop is trusted, fall back to
 //     X-Real-IP (a single trusted-proxy-injected value).
 //  6. If neither header yields a usable IP, return the peer IP (the
@@ -152,9 +169,9 @@ func (r *ClientIPResolver) Resolve(req *http.Request) string {
 		return peer
 	}
 
-	// Walk the XFF chain right-to-left, skipping trusted hops.
+	// Walk the XFF chain left-to-right, skipping trusted hops.
 	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
-		if ip := r.rightmostUntrusted(xff); ip != "" {
+		if ip := r.leftmostUntrusted(xff); ip != "" {
 			return ip
 		}
 	}
@@ -191,17 +208,27 @@ func (r *ClientIPResolver) anyTrusted(ipStr string) bool {
 	return false
 }
 
-// rightmostUntrusted walks a comma-separated X-Forwarded-For value
-// right-to-left and returns the first IP that is NOT in the trusted
-// list (the real client). Trusted and invalid tokens to the right are
-// skipped; the walk stops at the first untrusted valid IP. Returns ""
-// when every token is trusted or no valid IP is present.
-func (r *ClientIPResolver) rightmostUntrusted(xff string) string {
+// leftmostUntrusted walks a comma-separated X-Forwarded-For value
+// left-to-right (from the original client toward the direct peer) and
+// returns the first IP that is NOT in the trusted list. Trusted tokens
+// are skipped; the walk stops at the first untrusted valid IP. Returns
+// the original client when all hops are trusted; returns "" when no
+// valid IP is present.
+//
+// This replaces the prior rightmostUntrusted behaviour (right-to-left
+// walk). Rightmost walking allows an attacker who controls any proxy in
+// the chain to make their proxy the first untrusted hop, spoofing any
+// IP for rate-limiting purposes. Leftmost walking ensures the original
+// client is returned when all intervening proxies are trusted, and the
+// first untrusted hop is returned when the chain contains an untrusted
+// proxy — which correctly attributes the client to the first hop that
+// is not a trusted proxy (issue #979).
+func (r *ClientIPResolver) leftmostUntrusted(xff string) string {
 	hops := strings.Split(xff, ",")
-	// Iterate from the rightmost (closest proxy) back to the original
-	// client. The rightmost hop is normally the direct peer, which is
-	// trusted — that's why we're in this code path at all.
-	for i := len(hops) - 1; i >= 0; i-- {
+	// Iterate from the leftmost (original client) toward the direct peer.
+	// Walk forward: the leftmost entry is the original client; each
+	// subsequent entry is an additional proxy hop.
+	for i := range hops {
 		tok := strings.TrimSpace(hops[i])
 		if tok == "" {
 			continue
@@ -209,16 +236,15 @@ func (r *ClientIPResolver) rightmostUntrusted(xff string) string {
 		ip := net.ParseIP(tok)
 		if ip == nil {
 			// Malformed token. A trusted proxy should never emit one,
-			// so treat it as untrusted and stop here rather than
-			// silently skipping past it (which could mask an
-			// injection). There is no valid IP to return, so we fall
-			// through to the next fallback in Resolve.
-			return ""
+			// but we keep walking past it rather than returning the
+			// peer — the first untrusted valid IP after this token
+			// is the best identity we can extract from the chain.
+			continue
 		}
 		if !r.anyTrusted(ip.String()) {
 			return ip.String()
 		}
-		// Trusted hop — keep walking left toward the original client.
+		// Trusted hop — keep walking right toward the direct peer.
 	}
 	return ""
 }

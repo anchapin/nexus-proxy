@@ -1,0 +1,188 @@
+// Package health exposes the embedder circuit breaker state and the shared
+// Breaker struct used by all three embedder implementations (ollama, openai,
+// cohere). Having the breaker in a shared package avoids the duplication of
+// the isOpen/recordFailure/recordSuccess logic across each embedder while
+// keeping the health poller separate from the rag package.
+//
+// The breaker implements the same three-state machine as the Ollama health
+// poller breaker: closed → half-open → open, with a configurable consecutive-
+// failure threshold and cooldown window. A zero Threshold disables the breaker
+// entirely.
+package health
+
+import (
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// BreakerConfig configures a per-embedder circuit breaker.
+// A zero Threshold disables the breaker.
+type BreakerConfig struct {
+	Threshold int           // consecutive failures that trip the breaker; 0 = disabled
+	Cooldown  time.Duration // how long the breaker stays open after tripping
+}
+
+// Breaker is a three-state circuit breaker: closed, half-open, and open.
+// It is safe for concurrent use via atomic operations.
+//
+// A zero Breaker (Threshold==0) is disabled: all calls to IsOpen return
+// false and recordFailure/recordSuccess are no-ops.
+type Breaker struct {
+	// Threshold is the number of consecutive failures required to trip
+	// the breaker. Zero disables the breaker.
+	Threshold int
+
+	// Cooldown is how long the breaker stays open before transitioning
+	// to half-open.
+	Cooldown time.Duration
+
+	// tripKind is the embedder kind (e.g. "ollama", "openai", "cohere")
+	// set by SetTripCallback and passed to TripCallback when the breaker trips.
+	tripKind string
+
+	// TripCallback is called synchronously when the breaker trips (issue #971).
+	// It receives the tripKind as argument. A nil callback is a no-op.
+	TripCallback func(kind string)
+
+	// Internal state (atomic):
+	//   state: 0=closed, 1=half_open, 2=open
+	//   failureCount: consecutive failures since last success
+	//   cooldownUntil: nanoseconds since Unix epoch; 0 = not in cooldown
+	state         atomic.Int32
+	failureCount  atomic.Int32
+	cooldownUntil atomic.Int64
+}
+
+const (
+	breakerStateClosed   int32 = 0
+	breakerStateHalfOpen int32 = 1
+	breakerStateOpen     int32 = 2
+)
+
+// IsOpen reports whether the circuit is currently in the open (cooldown)
+// state. When the cooldown deadline has passed, IsOpen atomically transitions
+// to half-open and admits exactly one probe request.
+func (b *Breaker) IsOpen() bool {
+	if b.Threshold == 0 {
+		return false
+	}
+	for {
+		state := b.state.Load()
+		switch state {
+		case breakerStateClosed:
+			return false
+		case breakerStateHalfOpen:
+			return true
+		case breakerStateOpen:
+			deadline := b.cooldownUntil.Load()
+			if deadline == 0 || time.Now().UnixNano() < deadline {
+				return true
+			}
+			if !b.state.CompareAndSwap(breakerStateOpen, breakerStateHalfOpen) {
+				continue
+			}
+			b.failureCount.Store(0)
+			b.cooldownUntil.Store(0)
+			return false
+		default:
+			slog.Error("breaker: invalid state, treating as open", slog.Int("state", int(state)))
+			return true
+		}
+	}
+}
+
+// RecordFailure increments the consecutive-failure counter and trips the
+// breaker when the threshold is reached. The cooldown window starts from
+// the current time, or immediately when a half-open probe fails.
+func (b *Breaker) RecordFailure() {
+	if b.Threshold == 0 {
+		return
+	}
+	count := b.failureCount.Add(1)
+	if b.state.Load() == breakerStateHalfOpen || count >= int32(b.Threshold) {
+		// Capture previous state to detect actual trip transitions.
+		prevState := b.state.Load()
+		// Trip: set the cooldown deadline. We add one nanosecond so that
+		// the comparison in IsOpen is strict (deadline > now, not >=).
+		b.cooldownUntil.Store(time.Now().Add(b.Cooldown).UnixNano() + 1)
+		b.state.Store(breakerStateOpen)
+		slog.Warn("embedder circuit breaker tripped",
+			slog.Int("failures", int(count)),
+			slog.Int("threshold", b.Threshold),
+			slog.Duration("cooldown", b.Cooldown),
+		)
+		// Emit the trip counter synchronously only on actual transitions
+		// to open state, not on re-trips from half-open (issue #971).
+		if prevState != breakerStateOpen && b.TripCallback != nil {
+			b.TripCallback(b.tripKind)
+		}
+	}
+}
+
+// RecordSuccess resets the consecutive-failure counter and transitions
+// the breaker to closed. No-op when the breaker is already closed.
+func (b *Breaker) RecordSuccess() {
+	if b.Threshold == 0 {
+		return
+	}
+	b.failureCount.Store(0)
+	b.cooldownUntil.Store(0)
+	b.state.Store(breakerStateClosed)
+}
+
+// State returns the current breaker state: 0=closed, 1=half_open, 2=open.
+func (b *Breaker) State() int32 {
+	return b.state.Load()
+}
+
+// FailureCount returns the current consecutive-failure count.
+func (b *Breaker) FailureCount() int32 {
+	return b.failureCount.Load()
+}
+
+// SetTripCallback sets the callback and kind for when the breaker trips (issue #971).
+func (b *Breaker) SetTripCallback(kind string, cb func(kind string)) {
+	b.tripKind = kind
+	b.TripCallback = cb
+}
+
+// breakers is the internal registry of per-kind embedder circuit breakers.
+// Wired from rag.go at construction time. This map is intentionally not
+// exported — external consumers should use the observability package's
+// Prometheus gauges which are updated via IncEmbedderFailure calls.
+var (
+	breakers = make(map[string]*Breaker)
+	mu       sync.RWMutex
+)
+
+// RegisterBreaker registers a circuit breaker for the given embedder kind.
+// This is called from rag.go when each embedder is constructed so that
+// the collector can track embedder failures via IncEmbedderFailure.
+func RegisterBreaker(kind string, brk *Breaker) {
+	mu.Lock()
+	defer mu.Unlock()
+	breakers[kind] = brk
+}
+
+// BreakerState holds the current state of a circuit breaker for observability purposes.
+type BreakerState struct {
+	State        int32 // 0=closed, 1=half_open, 2=open
+	FailureCount int32
+}
+
+// GetBreakerStates returns a snapshot of all registered breaker states.
+// Used by the observability package to expose RAG circuit breaker metrics (issue #886).
+func GetBreakerStates() map[string]BreakerState {
+	mu.RLock()
+	defer mu.RUnlock()
+	result := make(map[string]BreakerState, len(breakers))
+	for kind, brk := range breakers {
+		result[kind] = BreakerState{
+			State:        brk.State(),
+			FailureCount: brk.FailureCount(),
+		}
+	}
+	return result
+}

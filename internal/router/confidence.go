@@ -1,5 +1,7 @@
 package router
 
+import "regexp"
+
 // confidence.go closes the feedback loop between the async LLM-as-a-judge
 // evaluator (internal/judge, issue #15) and the routing decision (issue #47).
 //
@@ -53,6 +55,9 @@ const (
 	CategoryCSS           = "css"
 	CategoryRefactoring   = "refactoring"
 	CategoryDebugging     = "debugging"
+	CategoryTesting       = "testing"
+	CategorySecurity      = "security"
+	CategoryData          = "data"
 	CategoryArchitecture  = "architecture"
 	CategoryBoilerplate   = "boilerplate"
 	CategoryDocumentation = "documentation"
@@ -70,22 +75,28 @@ type ConfidenceStore interface {
 	// RecordOutcome persists one judged outcome. route is the route that
 	// produced the scored output (only RouteLocal outcomes influence
 	// LocalConfidence). judgeScore is the 1..5 judge rating; scores
-	// outside that range are ignored.
-	RecordOutcome(category string, route Route, judgeScore int)
+	// outside that range are ignored. An empty category returns an error
+	// so upstream callers that fail to categorize a prompt are surfaced
+	// rather than silently polluting the "other" bucket (issue #591).
+	RecordOutcome(category string, route Route, judgeScore int) error
 
 	// LocalConfidence returns the fraction of recent local outcomes for
 	// category that scored acceptably (0.0..1.0). It returns
 	// NeutralConfidence (0.5) when there is insufficient data so the
-	// caller's routing is unchanged.
-	LocalConfidence(category string) float64
+	// caller's routing is unchanged. An empty category returns an error
+	// so upstream callers that fail to categorize a prompt are surfaced
+	// rather than silently coercing to CategoryOther (issue #802).
+	LocalConfidence(category string) (float64, error)
 }
 
-// categoryKeywords maps each category to the substrings that select it.
-// Order matters: earlier entries win when a prompt matches several
-// categories, so the list runs from most-specific/most-complex
-// (architecture, debugging) to least (documentation) before falling
-// through to "other". Keywords are matched against the ASCII-lowercased
-// prompt using the same cheap contains helpers as dsl.go.
+// categoryKeywords maps each category to the word-boundary-matched
+// keywords that select it. Order matters: earlier entries win when a
+// prompt matches several categories, so the list runs from most-
+// specific/most-complex (architecture, debugging) to least
+// (documentation) before falling through to "other". Keywords are
+// matched against the Unicode-lowercased prompt using word-boundary
+// matching (containsWord) so that e.g. "test" does not match inside
+// "contest", ensuring consistent routing with the DSL \b...\b patterns.
 var categoryKeywords = []struct {
 	category string
 	keywords []string
@@ -99,13 +110,27 @@ var categoryKeywords = []struct {
 		"panic", "segfault", "crash", "error message", "why does", "not working",
 		"fails", "failing", "broken",
 	}},
-	{CategoryRefactoring, []string{
-		"refactor", "restructure", "extract method", "rename", "clean up",
-		"cleanup", "simplify", "deduplicate", "move method", "reorganize",
-	}},
 	{CategoryCSS, []string{
 		"css", "tailwind", "flexbox", "stylesheet", "styling", "responsive",
 		"media query", "padding", "margin", "layout", "scss", "sass",
+	}},
+	{CategoryTesting, []string{
+		"test", "unit test", "integration test", "unit-test", "integration-test",
+		"generate tests", "test case", "mock", "fixture", "coverage", "benchmark",
+		"assert", "pytest", "jest",
+	}},
+	{CategorySecurity, []string{
+		"security scan", "vulnerability", "injection", "xss", "csrf", "sanitize",
+		"auth check", "owasp", "cve", "exploit", "pen test", "sast", "hardening",
+	}},
+	{CategoryData, []string{
+		"sql query", "database", "migration", "schema", "query optimization",
+		"parse json", "data model", "etl", "analytics", "pipeline",
+	}},
+	{CategoryRefactoring, []string{
+		"refactor", "re-factor", "re-factoring", "restructure", "extract method",
+		"rename", "clean up", "cleanup", "simplify", "deduplicate", "move method",
+		"reorganize",
 	}},
 	{CategoryBoilerplate, []string{
 		"boilerplate", "scaffold", "template", "getter", "setter", "crud",
@@ -117,18 +142,37 @@ var categoryKeywords = []struct {
 	}},
 }
 
+// categoryPatterns is the pre-compiled equivalent of categoryKeywords.
+// Each keyword gets its own compiled (?i)\b<kw>\b regex at package init.
+// Categorize iterates these directly to avoid per-call regexp compilation
+// (issue #877).
+var categoryPatterns []struct {
+	category string
+	re       *regexp.Regexp
+}
+
+func init() {
+	for _, group := range categoryKeywords {
+		for _, kw := range group.keywords {
+			pattern := `(?i)\b` + regexp.QuoteMeta(kw) + `\b`
+			categoryPatterns = append(categoryPatterns, struct {
+				category string
+				re       *regexp.Regexp
+			}{group.category, regexp.MustCompile(pattern)})
+		}
+	}
+}
+
 // Categorize buckets prompt into one of the fixed Category* constants using
 // a lightweight keyword classifier. It never calls out to an embedding
 // model — it is a pure, cheap function on the prompt text so it is safe to
 // call on the request hot path. Unmatched prompts fall through to
 // CategoryOther.
 func Categorize(prompt string) string {
-	lower := toLowerASCII(prompt)
-	for _, group := range categoryKeywords {
-		for _, kw := range group.keywords {
-			if stringsContains(lower, kw) {
-				return group.category
-			}
+	lower := toUnicodeLower(prompt)
+	for _, cp := range categoryPatterns {
+		if cp.re.MatchString(lower) {
+			return cp.category
 		}
 	}
 	return CategoryOther

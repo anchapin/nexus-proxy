@@ -288,258 +288,60 @@ func TestSLMDecideTolerantShapes(t *testing.T) {
 	}
 }
 
-// TestSLMCacheHitMiss verifies that repeated prompts hit the cache on
-// the second call and only one HTTP round-trip occurs.
-func TestSLMCacheHitMiss(t *testing.T) {
+// TestNewSLMClientNilDefaultsToDefaultClient exercises the nil-client
+// defaulting branch of NewSLMClient (slm.go:49-51). Every other test passes a
+// custom *http.Client, so the `if client == nil { client = http.DefaultClient }`
+// body was never hit — leaving NewSLMClient at 66.7% coverage (issue #604).
+// This test closes that branch and guards against a refactor that silently
+// breaks the nil-defaulting contract.
+func TestNewSLMClientNilDefaultsToDefaultClient(t *testing.T) {
+	c := NewSLMClient("http://x", "m", time.Second, nil)
+	if c.Client != http.DefaultClient {
+		t.Errorf("NewSLMClient(nil).Client = %p, want http.DefaultClient (%p)",
+			c.Client, http.DefaultClient)
+	}
+}
+
+// TestNewSLMClientPreservesCustomClient confirms the non-nil arm of
+// NewSLMClient passes the supplied client through unchanged (pointer
+// identity). The Decide-based tests verify it indirectly via a Do call, but
+// never assert the exact client object is retained. Together with the
+// nil-defaulting test this brings NewSLMClient to 100% branch coverage and
+// directly pins both arms of the client-assignment logic.
+func TestNewSLMClientPreservesCustomClient(t *testing.T) {
+	custom := &http.Client{}
+	c := NewSLMClient("http://x", "m", time.Second, custom)
+	if c.Client != custom {
+		t.Errorf("NewSLMClient(custom).Client = %p, want %p", c.Client, custom)
+	}
+}
+
+// TestSLMDecideAlwaysPerformsHTTP verifies the issue #489 fix: the SLMClient
+// no longer maintains an internal decision cache, so every Decide call for
+// the same prompt performs a fresh HTTP round-trip. This makes the
+// planner-level SLMCache the sole caching layer and lets
+// NEXUS_SLM_CACHE_TTL=0 act as a true kill-switch — previously the internal
+// cache silently fell back to a 5-minute TTL, leaving prompt-dependent
+// routing stickiness even with the documented disable set.
+func TestSLMDecideAlwaysPerformsHTTP(t *testing.T) {
 	callCount := 0
 	client := newClient(func(_ *http.Request) (*http.Response, error) {
 		callCount++
 		return okBody(`{"message":{"content":"{\"route\":\"local\"}"}}`)
 	})
-	c := NewSLMClient("http://x", "m", time.Second, client).WithCache(10, 5*time.Minute)
+	c := NewSLMClient("http://x", "m", time.Second, client)
 
-	// First call: cache miss, should hit Ollama
-	r1, err := c.Decide(context.Background(), "identical prompt")
-	if err != nil {
-		t.Fatalf("first Decide: %v", err)
-	}
-	if r1 != RouteLocal {
-		t.Errorf("first route = %q, want local", r1)
-	}
-	if callCount != 1 {
-		t.Errorf("first callCount = %d, want 1", callCount)
-	}
-
-	// Second call: cache hit, should NOT hit Ollama
-	r2, err := c.Decide(context.Background(), "identical prompt")
-	if err != nil {
-		t.Fatalf("second Decide: %v", err)
-	}
-	if r2 != RouteLocal {
-		t.Errorf("second route = %q, want local", r2)
-	}
-	if callCount != 1 {
-		t.Errorf("second callCount = %d, want 1 (cache hit)", callCount)
-	}
-
-	// Different prompt: cache miss, should hit Ollama again
-	r3, err := c.Decide(context.Background(), "different prompt")
-	if err != nil {
-		t.Fatalf("third Decide: %v", err)
-	}
-	if r3 != RouteLocal {
-		t.Errorf("third route = %q, want local", r3)
-	}
-	if callCount != 2 {
-		t.Errorf("third callCount = %d, want 2 (cache miss for new prompt)", callCount)
-	}
-}
-
-// TestSLMCacheTTLExpiry verifies that entries expire after TTL and
-// trigger a fresh Ollama call.
-func TestSLMCacheTTLExpiry(t *testing.T) {
-	callCount := 0
-	client := newClient(func(_ *http.Request) (*http.Response, error) {
-		callCount++
-		return okBody(`{"message":{"content":"{\"route\":\"local\"}"}}`)
-	})
-	// TTL = 10ms to make test fast
-	c := NewSLMClient("http://x", "m", time.Second, client).WithCache(10, 10*time.Millisecond)
-
-	// First call
-	if _, err := c.Decide(context.Background(), "prompt"); err != nil {
-		t.Fatalf("first: %v", err)
-	}
-	if callCount != 1 {
-		t.Errorf("after first callCount = %d, want 1", callCount)
-	}
-
-	// Second call within TTL: cache hit
-	if _, err := c.Decide(context.Background(), "prompt"); err != nil {
-		t.Fatalf("second: %v", err)
-	}
-	if callCount != 1 {
-		t.Errorf("within TTL callCount = %d, want 1", callCount)
-	}
-
-	// Wait for TTL to expire
-	time.Sleep(20 * time.Millisecond)
-
-	// Third call after TTL: cache miss, fresh Ollama call
-	if _, err := c.Decide(context.Background(), "prompt"); err != nil {
-		t.Fatalf("third: %v", err)
-	}
-	if callCount != 2 {
-		t.Errorf("after TTL callCount = %d, want 2", callCount)
-	}
-}
-
-// TestSLMCacheSizeEviction verifies eviction when cache exceeds max size.
-// The implementation evicts entries by map iteration order (a FIFO approximation),
-// NOT LRU — access does not change insertion order. Map iteration order is
-// deliberately randomised by the Go runtime, making this test non-deterministic.
-// Skipped until the implementation is upgraded to a true LRU (e.g. list.Map).
-func TestSLMCacheSizeEviction(t *testing.T) {
-	t.Skip("flaky: implementation uses randomised map iteration order, not LRU")
-
-	callCount := 0
-	client := newClient(func(_ *http.Request) (*http.Response, error) {
-		callCount++
-		return okBody(`{"message":{"content":"{\"route\":\"local\"}"}}`)
-	})
-	// Size = 2
-	c := NewSLMClient("http://x", "m", time.Second, client).WithCache(2, 5*time.Minute)
-
-	// Fill cache with two entries
-	if _, err := c.Decide(context.Background(), "prompt A"); err != nil {
-		t.Fatalf("A: %v", err)
-	}
-	if _, err := c.Decide(context.Background(), "prompt B"); err != nil {
-		t.Fatalf("B: %v", err)
-	}
-	if callCount != 2 {
-		t.Errorf("after A+B callCount = %d, want 2", callCount)
-	}
-
-	// Access A again — FIFO order is unchanged by access, so cache still [A, B].
-	if _, err := c.Decide(context.Background(), "prompt A"); err != nil {
-		t.Fatalf("A again: %v", err)
-	}
-	if callCount != 2 {
-		t.Errorf("A again callCount = %d, want 2 (cache hit)", callCount)
-	}
-
-	// Add C, evicts A (oldest/FIFO). Cache = [B, C].
-	if _, err := c.Decide(context.Background(), "prompt C"); err != nil {
-		t.Fatalf("C: %v", err)
-	}
-	if callCount != 3 {
-		t.Errorf("after C callCount = %d, want 3 (A evicted)", callCount)
-	}
-
-	// B is still in cache — hit.
-	if _, err := c.Decide(context.Background(), "prompt B"); err != nil {
-		t.Fatalf("B again: %v", err)
-	}
-	if callCount != 3 {
-		t.Errorf("B again callCount = %d, want 3 (B still cached)", callCount)
-	}
-
-	// Cache = [B, C], B is MRU. Add A — evicts C (oldest). Cache = [B, A].
-	if _, err := c.Decide(context.Background(), "prompt A"); err != nil {
-		t.Fatalf("A: %v", err)
-	}
-	if callCount != 4 {
-		t.Errorf("A callCount = %d, want 4 (C evicted, A added)", callCount)
-	}
-
-	// A is in cache — hit.
-	if _, err := c.Decide(context.Background(), "prompt A"); err != nil {
-		t.Fatalf("A again: %v", err)
-	}
-	if callCount != 4 {
-		t.Errorf("A again callCount = %d, want 4 (A still cached)", callCount)
-	}
-
-	// Cache = [B, A], A is MRU. Add B — evicts A (oldest). Cache = [B, C].
-	// C was previously evicted; this is a miss.
-	if _, err := c.Decide(context.Background(), "prompt C"); err != nil {
-		t.Fatalf("C: %v", err)
-	}
-	if callCount != 5 {
-		t.Errorf("C callCount = %d, want 5 (C was evicted, re-added)", callCount)
-	}
-}
-
-// TestSLMCacheTransportErrorNotCached verifies that transport errors
-// (network failure, non-200, parse failure) are NOT cached, so a
-// transient Ollama failure is retried on the next request.
-func TestSLMCacheTransportErrorNotCached(t *testing.T) {
-	callCount := 0
-	// First call fails, second succeeds
-	client := newClient(func(_ *http.Request) (*http.Response, error) {
-		callCount++
-		if callCount == 1 {
-			return nil, errNet("dial tcp: connection refused")
+	// Two identical prompts must each hit Ollama — no internal cache.
+	for i := 0; i < 2; i++ {
+		r, err := c.Decide(context.Background(), "identical prompt")
+		if err != nil {
+			t.Fatalf("Decide #%d: %v", i+1, err)
 		}
-		return okBody(`{"message":{"content":"{\"route\":\"local\"}"}}`)
-	})
-	c := NewSLMClient("http://x", "m", time.Second, client).WithCache(10, 5*time.Minute)
-
-	// First call: transport error returns ErrFallback; route is frontier.
-	r1, err := c.Decide(context.Background(), "flaky prompt")
-	if err == nil {
-		t.Fatalf("first Decide: expected transport error, got nil")
-	}
-	if r1 != RouteFrontier {
-		t.Errorf("first route = %q, want frontier (error fallback)", r1)
-	}
-
-	// Second call: should retry (not use cached error) and succeed
-	r2, err := c.Decide(context.Background(), "flaky prompt")
-	if err != nil {
-		t.Fatalf("second Decide: %v", err)
-	}
-	if r2 != RouteLocal {
-		t.Errorf("second route = %q, want local (retry succeeded)", r2)
+		if r != RouteLocal {
+			t.Errorf("Decide #%d route = %q, want local", i+1, r)
+		}
 	}
 	if callCount != 2 {
-		t.Errorf("callCount = %d, want 2 (error not cached, retry happened)", callCount)
-	}
-}
-
-// TestSLMCacheDisabledWhenSizeZero verifies that cache size 0 disables
-// caching entirely (every call hits Ollama).
-func TestSLMCacheDisabledWhenSizeZero(t *testing.T) {
-	callCount := 0
-	client := newClient(func(_ *http.Request) (*http.Response, error) {
-		callCount++
-		return okBody(`{"message":{"content":"{\"route\":\"local\"}"}}`)
-	})
-	c := NewSLMClient("http://x", "m", time.Second, client).WithCache(0, 5*time.Minute)
-
-	if _, err := c.Decide(context.Background(), "prompt"); err != nil {
-		t.Fatalf("first: %v", err)
-	}
-	if _, err := c.Decide(context.Background(), "prompt"); err != nil {
-		t.Fatalf("second: %v", err)
-	}
-	if callCount != 2 {
-		t.Errorf("callCount = %d, want 2 (cache disabled)", callCount)
-	}
-}
-
-// TestSLMCacheConfidenceKeyed verifies that different confidence values
-// produce different cache entries (the system prompt changes with confidence).
-func TestSLMCacheConfidenceKeyed(t *testing.T) {
-	callCount := 0
-	client := newClient(func(_ *http.Request) (*http.Response, error) {
-		callCount++
-		return okBody(`{"message":{"content":"{\"route\":\"local\"}"}}`)
-	})
-	c := NewSLMClient("http://x", "m", time.Second, client).WithCache(10, 5*time.Minute)
-
-	// Decide (uses NeutralConfidence = 0.5)
-	if _, err := c.Decide(context.Background(), "prompt"); err != nil {
-		t.Fatalf("Decide: %v", err)
-	}
-	if callCount != 1 {
-		t.Errorf("after Decide callCount = %d, want 1", callCount)
-	}
-
-	// DecideWithConfidence with same confidence = cache hit
-	if _, err := c.DecideWithConfidence(context.Background(), "prompt", 0.5); err != nil {
-		t.Fatalf("DecideWithConfidence(0.5): %v", err)
-	}
-	if callCount != 1 {
-		t.Errorf("after DecideWithConfidence(0.5) callCount = %d, want 1 (cache hit)", callCount)
-	}
-
-	// DecideWithConfidence with different confidence = cache miss (different system prompt)
-	if _, err := c.DecideWithConfidence(context.Background(), "prompt", 0.9); err != nil {
-		t.Fatalf("DecideWithConfidence(0.9): %v", err)
-	}
-	if callCount != 2 {
-		t.Errorf("after DecideWithConfidence(0.9) callCount = %d, want 2 (different confidence = miss)", callCount)
+		t.Errorf("callCount = %d, want 2 (no internal cache; planner cache is sole layer)", callCount)
 	}
 }

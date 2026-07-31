@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -26,6 +27,7 @@ type YAMLConfig struct {
 	MaxHeaderBytes  int    `yaml:"server_max_header_bytes"`
 	ShutdownTimeout string `yaml:"shutdown_timeout"`
 	MaxBodyBytes    int    `yaml:"max_body_bytes"`
+	TLSEnabled      bool   `yaml:"tls_enabled"`
 
 	// Logging
 	LogLevel  string `yaml:"log_level"`
@@ -69,34 +71,44 @@ type YAMLConfig struct {
 	BudgetAlertWebhookURL string  `yaml:"budget_alert_webhook_url"`
 
 	// Selector
-	SelectorWindow          string `yaml:"selector_window"`
-	SelectorMinSamples      int    `yaml:"selector_min_samples"`
-	SelectorRefreshInterval string `yaml:"selector_refresh_interval"`
+	SelectorWindow          string  `yaml:"selector_window"`
+	SelectorMinSamples      int     `yaml:"selector_min_samples"`
+	SelectorRefreshInterval string  `yaml:"selector_refresh_interval"`
+	ProviderTailWeight      float64 `yaml:"provider_tail_weight"`
 
 	// RAG
-	ExamplesDir       string  `yaml:"examples_dir"`
-	RAGThreshold      float64 `yaml:"rag_threshold"`
-	EmbedderType      string  `yaml:"embedder_type"`
-	EmbedderBaseURL   string  `yaml:"embedder_base_url"`
-	CohereAPIKey      string  `yaml:"cohere_api_key"`
-	RAGDBPath         string  `yaml:"rag_db_path"`
-	RAGPollInterval   string  `yaml:"rag_poll_interval"`
-	RAGEmbedCacheSize int     `yaml:"rag_embed_cache_size"`
-	RAGEmbedCacheTTL  string  `yaml:"rag_embed_cache_ttl"`
+	ExamplesDir              string  `yaml:"examples_dir"`
+	RAGThreshold             float64 `yaml:"rag_threshold"`
+	EmbedderType             string  `yaml:"embedder_type"`
+	EmbedderBaseURL          string  `yaml:"embedder_base_url"`
+	CohereAPIKey             string  `yaml:"cohere_api_key"`
+	RAGDBPath                string  `yaml:"rag_db_path"`
+	RAGPollInterval          string  `yaml:"rag_poll_interval"`
+	RAGEmbedCacheSize        int     `yaml:"rag_embed_cache_size"`
+	RAGEmbedCacheTTL         string  `yaml:"rag_embed_cache_ttl"`
+	RAGEmbedCacheWaitTimeout string  `yaml:"rag_embed_cache_wait_timeout"`
+	RAGBatchSize             int     `yaml:"rag_batch_size"`
 
 	// Routing
-	TokenGuardrail            int     `yaml:"token_guardrail"`
-	SLMTimeout                string  `yaml:"slm_timeout"`
-	SLMCacheMaxEntries        int     `yaml:"slm_cache_max_entries"`
-	SLMCacheTTL               string  `yaml:"slm_cache_ttl"`
-	SLMCacheSemanticThreshold float64 `yaml:"slm_cache_similarity_threshold"`
-	FusionTimeout             string  `yaml:"fusion_timeout"`
-	CascadeTimeout            string  `yaml:"cascade_timeout"`
-	ArbiterTimeout            string  `yaml:"arbiter_timeout"`
+	TokenGuardrail                int     `yaml:"token_guardrail"`
+	SLMTimeout                    string  `yaml:"slm_timeout"`
+	SLMCacheMaxEntries            int     `yaml:"slm_cache_max_entries"`
+	SLMCacheTTL                   string  `yaml:"slm_cache_ttl"`
+	SLMCacheSemanticThreshold     float64 `yaml:"slm_cache_similarity_threshold"`
+	SLMCacheMaxStale              int     `yaml:"slm_cache_max_stale"`               // issue #835
+	SLMCacheStaleCleanupThreshold int     `yaml:"slm_cache_stale_cleanup_threshold"` // issue #1037
+	SLMCacheSemanticScanLimit     int     `yaml:"slm_cache_semantic_scan_limit"`     // issue #933
+	FusionTimeout                 string  `yaml:"fusion_timeout"`
+	CascadeTimeout                string  `yaml:"cascade_timeout"`
+	ArbiterTimeout                string  `yaml:"arbiter_timeout"`
+	CascadeMaxResponseBytes       int     `yaml:"cascade_max_response_bytes"`
+	MaxResponseBytes              int     `yaml:"max_response_bytes"`
 
 	// Fusion
 	FusionProgressiveDelivery bool    `yaml:"fusion_progressive_delivery"`
 	FusionAgreementThreshold  float64 `yaml:"fusion_agreement_threshold"`
+	ArbiterCacheTTL           string  `yaml:"arbiter_cache_ttl"`
+	ArbiterCacheMaxEntries    int     `yaml:"arbiter_cache_max_entries"`
 
 	// Health
 	HealthPollInterval     string `yaml:"health_poll_interval"`
@@ -104,9 +116,10 @@ type YAMLConfig struct {
 	HealthProbeTimeout     string `yaml:"health_probe_timeout"`
 
 	// Probe
-	ProbeInterval      string `yaml:"probe_interval"`
-	ProbeTimeout       string `yaml:"probe_timeout"`
-	ProbeBytesPerToken int    `yaml:"probe_bytes_per_token"`
+	ProbeInterval         string `yaml:"probe_interval"`
+	ProbeTimeout          string `yaml:"probe_timeout"`
+	ProbeBytesPerToken    int    `yaml:"probe_bytes_per_token"`
+	ProbeThermalThreshold int    `yaml:"probe_thermal_threshold"`
 
 	// Local concurrency
 	LocalMaxConcurrent    int    `yaml:"local_max_concurrent"`
@@ -132,30 +145,58 @@ type YAMLConfig struct {
 	RoutingConfidenceWindow     string  `yaml:"routing_confidence_window"`
 
 	// Quality
-	QualityConcurrency int    `yaml:"quality_concurrency"`
-	QualityQueueDepth  int    `yaml:"quality_queue"`
-	QualityTimeout     string `yaml:"quality_timeout"`
-	QualityStderrCap   int    `yaml:"quality_stderr_cap"`
+	QualityConcurrency     int    `yaml:"quality_concurrency"`
+	QualityQueueDepth      int    `yaml:"quality_queue"`
+	QualityTimeout         string `yaml:"quality_timeout"`
+	QualityStderrCap       int    `yaml:"quality_stderr_cap"`
+	QualityDroppedRingSize int    `yaml:"quality_dropped_ring_size"`
 
 	// Middleware
-	MetaPrompt string `yaml:"meta_prompt"`
-	TOONNotice string `yaml:"toon_notice"`
+	MetaPrompt   string `yaml:"meta_prompt"`
+	TOONNotice   string `yaml:"toon_notice"`
+	TOONUnfenced bool   `yaml:"toon_unfenced"`
 
 	// Prompt injection
 	PromptInjectionMode string `yaml:"prompt_injection_mode"`
+	InjectionScanRoles  string `yaml:"injection_scan_roles"`
 
 	// Telemetry
-	TelemetryPath string `yaml:"telemetry_path"`
-	MetricsDBPath string `yaml:"metrics_db_path"`
+	TelemetryPath          string `yaml:"telemetry_path"`
+	TelemetryMaxBytes      int    `yaml:"telemetry_max_bytes"`
+	TelemetryMaxFiles      int    `yaml:"telemetry_max_files"`
+	TelemetryBufferSize    int    `yaml:"telemetry_buffer_size"`
+	TelemetryFlushInterval string `yaml:"telemetry_flush_interval"`
+	MetricsDBPath          string `yaml:"metrics_db_path"`
+	// MetricsRetentionDays (issue #483) sets a TTL on the requests
+	// table. 0 = disabled (grow without bound). Not hot-reloadable.
+	MetricsRetentionDays int `yaml:"metrics_retention_days"`
+
+	// OTLP retry/back-off parameters (issue #803).
+	TracerMaxRetries     int    `yaml:"tracer_max_retries"`
+	TracerRetryBaseDelay string `yaml:"tracer_retry_base_delay"`
+	TracerRetryMaxDelay  string `yaml:"tracer_retry_max_delay"`
 
 	// Models
 	ModelsEndpointEnabled bool   `yaml:"models_endpoint_enabled"`
 	ModelsCacheTTL        string `yaml:"models_cache_ttl"`
 
 	// Trusted proxies
-	TrustedProxies string `yaml:"trusted_proxies"`
-	RateLimitRPM   int    `yaml:"rate_limit_rpm"`
-	RateLimitBurst int    `yaml:"rate_limit_burst"`
+	TrustedProxies    string `yaml:"trusted_proxies"`
+	RateLimitRPM      int    `yaml:"rate_limit_rpm"`
+	RateLimitBurst    int    `yaml:"rate_limit_burst"`
+	RateLimitByAPIKey bool   `yaml:"rate_limit_by_api_key"`
+
+	// Auth brute-force protection (issue #840)
+	AuthRateLimitRPM    int    `yaml:"auth_rate_limit_rpm"`
+	AuthRateLimitBurst  int    `yaml:"auth_rate_limit_burst"`
+	AuthRateLimitWindow string `yaml:"auth_rate_limit_window"`
+
+	// Tracing
+	TracingEndpoint   string  `yaml:"tracing_endpoint"`
+	TracingTimeout    string  `yaml:"tracing_timeout"`
+	TracingQueueSize  int     `yaml:"tracing_queue_size"`
+	TracingBatchSize  int     `yaml:"tracing_batch_size"`
+	TracingSampleRate float64 `yaml:"tracing_sample_rate"`
 }
 
 // LoadYAML reads configuration from a YAML file at path, then overlays
@@ -172,6 +213,14 @@ func LoadYAML(path string) (Config, error) {
 		return Config{}, fmt.Errorf("config: cannot read config.yaml %q: %w", path, err)
 	}
 
+	// Pre-pass: inspect raw YAML values for boolean fields that must be
+	// valid bools. This catches "toon_unfenced: maybe" before yaml.Unmarshal
+	// silently leaves the field at its zero value (false), which would then
+	// be incorrectly interpreted as the default.
+	if err := validateRawBoolFields(data); err != nil {
+		return Config{}, err
+	}
+
 	var yc YAMLConfig
 	if err := yaml.Unmarshal(data, &yc); err != nil {
 		return Config{}, fmt.Errorf("config: cannot unmarshal config.yaml %q: %w", path, err)
@@ -184,7 +233,10 @@ func LoadYAML(path string) (Config, error) {
 	}
 
 	// Seed from YAML values (these are the "soft defaults").
-	cfg := yc.toConfig()
+	cfg, err := yc.toConfig()
+	if err != nil {
+		return Config{}, err
+	}
 
 	// Now apply env overrides on top of the YAML seed.
 	// The logic mirrors Load() but reads from os.Getenv directly
@@ -241,6 +293,13 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.MaxBodyBytes = n
 	}
+	if v := os.Getenv("NEXUS_MAX_RESPONSE_BYTES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_MAX_RESPONSE_BYTES: %w", err)
+		}
+		cfg.MaxResponseBytes = n
+	}
 	if v := os.Getenv("NEXUS_SHUTDOWN_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -254,10 +313,30 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.ShutdownTimeout = d
 	}
+	if v := os.Getenv("NEXUS_TRACING_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT: %w", err)
+		}
+		if d < 0 {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT must not be negative, got %s", d)
+		}
+		if d == 0 {
+			d = DefaultTracingTimeout
+		}
+		cfg.TracingTimeout = d
+	}
+	if v := os.Getenv("NEXUS_TLS_ENABLED"); v != "" {
+		cfg.TLSEnabled = parseBoolEnvStr(v, false)
+	}
 
 	// Logging
 	if v := os.Getenv("NEXUS_LOG_LEVEL"); v != "" {
-		cfg.LogLevel = parseLogLevel(v)
+		logLevel, logLevelErr := parseLogLevel(v)
+		if logLevelErr != nil {
+			return cfg, logLevelErr
+		}
+		cfg.LogLevel = logLevel
 	}
 	if v := os.Getenv("NEXUS_LOG_FORMAT"); v != "" {
 		cfg.LogFormat = parseLogFormat(v)
@@ -413,6 +492,16 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.SelectorRefreshInterval = d
 	}
+	if v := os.Getenv("NEXUS_PROVIDER_TAIL_WEIGHT"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_PROVIDER_TAIL_WEIGHT: %w", err)
+		}
+		if f < 0 || f > 1 {
+			return cfg, fmt.Errorf("config: NEXUS_PROVIDER_TAIL_WEIGHT must be in [0,1], got %v", f)
+		}
+		cfg.ProviderTailWeight = f
+	}
 
 	// RAG
 	if v := os.Getenv("NEXUS_EXAMPLES_DIR"); v != "" {
@@ -461,6 +550,23 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.RAGEmbedCacheTTL = d
 	}
+	if v := os.Getenv("NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT: %w", err)
+		}
+		cfg.RAGEmbedCacheWaitTimeout = d
+	}
+	if v := os.Getenv("NEXUS_RAG_BATCH_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_RAG_BATCH_SIZE: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.RAGBatchSize = n
+	}
 
 	// Routing
 	if v := os.Getenv("NEXUS_TOKEN_GUARDRAIL"); v != "" {
@@ -501,6 +607,36 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.SLMCacheSemanticThreshold = clampFloat(f, 0, 1)
 	}
+	if v := os.Getenv("NEXUS_SLMCACHE_MAX_STALE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_SLMCACHE_MAX_STALE: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.SLMCacheMaxStale = n
+	}
+	if v := os.Getenv("NEXUS_SLMCACHE_STALE_CLEANUP_THRESHOLD"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_SLMCACHE_STALE_CLEANUP_THRESHOLD: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.SLMCacheStaleCleanupThreshold = n
+	}
+	if v := os.Getenv("NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.SLMCacheSemanticScanLimit = n
+	}
 	if v := os.Getenv("NEXUS_FUSION_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -522,6 +658,13 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.ArbiterTimeout = d
 	}
+	if v := os.Getenv("NEXUS_CASCADE_MAX_RESPONSE_BYTES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_CASCADE_MAX_RESPONSE_BYTES: %w", err)
+		}
+		cfg.CascadeMaxResponseBytes = n
+	}
 
 	// Fusion
 	if v := os.Getenv("NEXUS_FUSION_PROGRESSIVE"); v != "" {
@@ -532,7 +675,27 @@ func LoadYAML(path string) (Config, error) {
 		if err != nil {
 			return cfg, fmt.Errorf("config: NEXUS_FUSION_AGREEMENT_THRESHOLD: %w", err)
 		}
+		if f < 0 || f > 1 {
+			return cfg, fmt.Errorf("config: NEXUS_FUSION_AGREEMENT_THRESHOLD must be in [0,1], got %v", f)
+		}
 		cfg.FusionAgreementThreshold = f
+	}
+	if v := os.Getenv("NEXUS_ARBITER_CACHE_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_ARBITER_CACHE_TTL: %w", err)
+		}
+		cfg.ArbiterCacheTTL = d
+	}
+	if v := os.Getenv("NEXUS_ARBITER_CACHE_MAX_ENTRIES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_ARBITER_CACHE_MAX_ENTRIES: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.ArbiterCacheMaxEntries = n
 	}
 
 	// Health
@@ -583,6 +746,16 @@ func LoadYAML(path string) (Config, error) {
 			n = 0
 		}
 		cfg.ProbeBytesPerToken = n
+	}
+	if v := os.Getenv("NEXUS_PROBE_THERMAL_THRESHOLD"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_PROBE_THERMAL_THRESHOLD: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.ProbeThermalThreshold = n
 	}
 
 	// Local concurrency
@@ -730,6 +903,18 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.QualityStderrCap = n
 	}
+	// Backward-compat alias (issue #924)
+	if v := os.Getenv("NEXUS_QUALITY_DROPED_RING_SIZE"); v != "" {
+		slog.Warn("NEXUS_QUALITY_DROPED_RING_SIZE is deprecated; use NEXUS_QUALITY_DROPPED_RING_SIZE",
+			slog.String("component", "config"))
+	}
+	if v := os.Getenv("NEXUS_QUALITY_DROPPED_RING_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_QUALITY_DROPPED_RING_SIZE: %w", err)
+		}
+		cfg.QualityDroppedRingSize = n
+	}
 
 	// Middleware prompts
 	if v := os.Getenv("NEXUS_META_PROMPT"); v != "" {
@@ -738,18 +923,72 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_TOON_NOTICE"); v != "" {
 		cfg.TOONNotice = v
 	}
+	if v := os.Getenv("NEXUS_TOON_UNFENCED"); v != "" {
+		cfg.TOONUnfenced = parseBoolEnvStr(v, true)
+	}
 
 	// Prompt injection
 	if v := os.Getenv("NEXUS_PROMPT_INJECTION_MODE"); v != "" {
 		cfg.PromptInjectionMode = middleware.ParseInjectionMode(v)
+	}
+	if v := os.Getenv("NEXUS_INJECTION_SCAN_ROLES"); v != "" {
+		roles, unrecognized := parseInjectionScanRoles(v)
+		cfg.InjectionScanRoles = roles
+		if len(unrecognized) > 0 && len(roles) == 1 && roles[0] == "system" {
+			slog.Warn("unrecognised injection scan role(s): falling back to [system]",
+				slog.String("ignored", strings.Join(unrecognized, ",")),
+			)
+		}
 	}
 
 	// Telemetry
 	if v := os.Getenv("NEXUS_TELEMETRY_PATH"); v != "" {
 		cfg.TelemetryPath = v
 	}
+	if v := os.Getenv("NEXUS_TELEMETRY_MAX_BYTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.TelemetryMaxBytes = n
+		}
+	}
+	if v := os.Getenv("NEXUS_TELEMETRY_MAX_FILES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.TelemetryMaxFiles = n
+		}
+	}
+	if v := os.Getenv("NEXUS_TELEMETRY_BUFFER_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.TelemetryBufferSize = n
+		}
+	}
+	if v := os.Getenv("NEXUS_TELEMETRY_FLUSH_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.TelemetryFlushInterval = d
+		}
+	}
 	if v := os.Getenv("NEXUS_METRICS_DB"); v != "" {
 		cfg.MetricsDBPath = v
+	}
+	if v := os.Getenv("NEXUS_METRICS_RETENTION_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.MetricsRetentionDays = n
+		}
+	}
+
+	// OTLP retry/back-off parameters (issue #803).
+	if v := os.Getenv("NEXUS_TRACING_MAX_RETRIES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.TracerMaxRetries = n
+		}
+	}
+	if v := os.Getenv("NEXUS_TRACING_RETRY_BASE_DELAY"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.TracerRetryBaseDelay = d
+		}
+	}
+	if v := os.Getenv("NEXUS_TRACING_RETRY_MAX_DELAY"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.TracerRetryMaxDelay = d
+		}
 	}
 
 	// Models
@@ -795,49 +1034,166 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.RateLimitBurst = n
 	}
+	if v := os.Getenv("NEXUS_RATE_LIMIT_BY_API_KEY"); v != "" {
+		cfg.RateLimitByAPIKey = strings.ToLower(v) == "true" || v == "1"
+	}
 
+	// Auth brute-force protection (issue #840)
+	if v := os.Getenv("NEXUS_AUTH_RATE_LIMIT_RPM"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_AUTH_RATE_LIMIT_RPM: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.AuthRateLimitRPM = n
+	}
+	if v := os.Getenv("NEXUS_AUTH_RATE_LIMIT_BURST"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_AUTH_RATE_LIMIT_BURST: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.AuthRateLimitBurst = n
+	}
+	if v := os.Getenv("NEXUS_AUTH_RATE_LIMIT_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_AUTH_RATE_LIMIT_WINDOW: %w", err)
+		}
+		if d < 0 {
+			d = 0
+		}
+		cfg.AuthRateLimitWindow = d
+	}
+
+	// Tracing
+	if v := os.Getenv("NEXUS_TRACING_ENDPOINT"); v != "" {
+		cfg.TracingEndpoint = v
+	}
+	if v := os.Getenv("NEXUS_TRACING_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT: %w", err)
+		}
+		if d < 0 {
+			d = 10 * time.Second
+		}
+		cfg.TracingTimeout = d
+	}
+	if v := os.Getenv("NEXUS_TRACING_QUEUE_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_QUEUE_SIZE: %w", err)
+		}
+		if n < 0 {
+			n = 256
+		}
+		cfg.TracingQueueSize = n
+	}
+	if v := os.Getenv("NEXUS_TRACING_BATCH_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_BATCH_SIZE: %w", err)
+		}
+		if n < 1 {
+			n = 64
+		}
+		cfg.TracingBatchSize = n
+	}
+	if v := os.Getenv("NEXUS_TRACING_SAMPLE_RATE"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_SAMPLE_RATE: %w", err)
+		}
+		if f < 0 {
+			f = 0
+		}
+		if f > 1 {
+			f = 1
+		}
+		cfg.TracingSampleRate = f
+	}
+
+	ValidateShutdownTimeout(cfg)
 	return cfg, nil
 }
 
 // toConfig converts a YAMLConfig into a Config by applying the same
 // defaults that Load() uses for fields not set in the YAML.
-func (yc YAMLConfig) toConfig() Config {
+func (yc YAMLConfig) toConfig() (Config, error) {
+	// Validate log level early so we can return error if invalid.
+	logLevel, logLevelErr := parseLogLevel(yc.LogLevel)
+	if logLevelErr != nil {
+		return Config{}, logLevelErr
+	}
+
+	// InjectionScanRoles for yaml path: compute before composite literal so we can warn
+	yamlRolesRaw := yc.InjectionScanRoles
+	if yamlRolesRaw == "" {
+		yamlRolesRaw = "system"
+	}
+	yamlRoles, yamlUnrecognized := parseInjectionScanRoles(yamlRolesRaw)
+
 	cfg := Config{
-		Addr:           yc.stringDefault(yc.Addr, ":8000"),
-		OllamaURL:      strings.TrimRight(yc.stringDefault(yc.OllamaURL, "http://localhost:11434"), "/"),
-		RouterModel:    yc.stringDefault(yc.RouterModel, "qwen3-coder:4b"),
-		LocalModel:     yc.stringDefault(yc.LocalModel, "qwen3-coder:8b"),
-		EmbeddingModel: yc.stringDefault(yc.EmbeddingModel, "nomic-embed-text"),
-		FrontierURL:    yc.stringDefault(yc.FrontierURL, "https://api.openai.com/v1/chat/completions"),
-		FrontierModel:  yc.stringDefault(yc.FrontierModel, "gpt-4o"),
-		FrontierKey:    yc.FrontierKey,
-		ZAIURL:         yc.stringDefault(yc.ZAIURL, "https://api.z.ai/v1/chat/completions"),
-		ZAIModel:       yc.stringDefault(yc.ZAIModel, "glm-4.6"),
-		ZAIKey:         yc.ZAIKey,
-		ProxyAPIKey:    yc.ProxyAPIKey,
-		StatusPublic:   yc.StatusPublic,
-		ExamplesDir:    yc.stringDefault(yc.ExamplesDir, "./few_shot_examples"),
-		MetaPrompt:     yc.stringDefault(yc.MetaPrompt, defaultMetaPrompt),
-		TOONNotice:     yc.stringDefault(yc.TOONNotice, defaultTOONNotice),
-		TelemetryPath:  yc.stringDefault(yc.TelemetryPath, "./nexus-telemetry.jsonl"),
-		MetricsDBPath:  yc.stringDefault(yc.MetricsDBPath, DefaultMetricsDBPath()),
+		Addr:                   yc.stringDefault(yc.Addr, ":8000"),
+		OllamaURL:              strings.TrimRight(yc.stringDefault(yc.OllamaURL, "http://localhost:11434"), "/"),
+		RouterModel:            yc.stringDefault(yc.RouterModel, "qwen3-coder:4b"),
+		LocalModel:             yc.stringDefault(yc.LocalModel, "qwen3-coder:8b"),
+		EmbeddingModel:         yc.stringDefault(yc.EmbeddingModel, "nomic-embed-text"),
+		FrontierURL:            yc.stringDefault(yc.FrontierURL, "https://api.openai.com/v1/chat/completions"),
+		FrontierModel:          yc.stringDefault(yc.FrontierModel, "gpt-4o"),
+		FrontierKey:            yc.FrontierKey,
+		ZAIURL:                 yc.stringDefault(yc.ZAIURL, "https://api.z.ai/v1/chat/completions"),
+		ZAIModel:               yc.stringDefault(yc.ZAIModel, "glm-4.6"),
+		ZAIKey:                 yc.ZAIKey,
+		ProxyAPIKey:            yc.ProxyAPIKey,
+		StatusPublic:           yc.StatusPublic,
+		ExamplesDir:            yc.stringDefault(yc.ExamplesDir, "./few_shot_examples"),
+		MetaPrompt:             yc.stringDefault(yc.MetaPrompt, defaultMetaPrompt),
+		TOONNotice:             yc.stringDefault(yc.TOONNotice, defaultTOONNotice),
+		TOONUnfenced:           yc.boolFieldDefault(yc.TOONUnfenced, true),
+		TelemetryPath:          yc.stringDefault(yc.TelemetryPath, "./nexus-telemetry.jsonl"),
+		TelemetryMaxBytes:      yc.intDefault(yc.TelemetryMaxBytes, 0),
+		TelemetryMaxFiles:      yc.intDefault(yc.TelemetryMaxFiles, 5),
+		TelemetryBufferSize:    yc.intDefault(yc.TelemetryBufferSize, 64<<10),
+		TelemetryFlushInterval: yc.durationDefault(yc.TelemetryFlushInterval, 5*time.Second),
+		MetricsDBPath:          yc.stringDefault(yc.MetricsDBPath, DefaultMetricsDBPath()),
+		MetricsRetentionDays:   yc.intDefault(yc.MetricsRetentionDays, 0),
+
+		// OTLP retry/back-off parameters (issue #803).
+		TracerMaxRetries:     yc.intDefault(yc.TracerMaxRetries, 0),
+		TracerRetryBaseDelay: yc.durationDefault(yc.TracerRetryBaseDelay, 0),
+		TracerRetryMaxDelay:  yc.durationDefault(yc.TracerRetryMaxDelay, 0),
 
 		// Non-string fields with defaults
-		RAGThreshold:              yc.floatDefault(yc.RAGThreshold, 0.55),
-		RAGDBPath:                 yc.stringDefault(yc.RAGDBPath, DefaultRAGDBPath()),
-		RAGEmbedCacheSize:         yc.intDefault(yc.RAGEmbedCacheSize, 256),
-		RAGEmbedCacheTTL:          yc.durationDefault(yc.RAGEmbedCacheTTL, 24*time.Hour),
-		TokenGuardrail:            yc.intDefault(yc.TokenGuardrail, 6000),
-		SLMTimeout:                yc.durationDefault(yc.SLMTimeout, 8*time.Second),
-		SLMCacheMaxEntries:        yc.intDefault(yc.SLMCacheMaxEntries, 512),
-		SLMCacheTTL:               yc.durationDefault(yc.SLMCacheTTL, 30*time.Second),
-		SLMCacheSemanticThreshold: clampFloat(yc.floatDefault(yc.SLMCacheSemanticThreshold, 0.0), 0, 1),
-		FusionTimeout:             yc.durationDefault(yc.FusionTimeout, 120*time.Second),
-		CascadeTimeout:            yc.durationDefault(yc.CascadeTimeout, 30*time.Second),
-		ArbiterTimeout:            yc.durationDefault(yc.ArbiterTimeout, 60*time.Second),
+		RAGThreshold:                  yc.floatDefault(yc.RAGThreshold, 0.55),
+		RAGDBPath:                     yc.stringDefault(yc.RAGDBPath, DefaultRAGDBPath()),
+		RAGEmbedCacheSize:             yc.intDefault(yc.RAGEmbedCacheSize, 256),
+		RAGEmbedCacheTTL:              yc.durationDefault(yc.RAGEmbedCacheTTL, 24*time.Hour),
+		RAGEmbedCacheWaitTimeout:      yc.durationDefault(yc.RAGEmbedCacheWaitTimeout, 5*time.Second),
+		RAGBatchSize:                  yc.intDefault(yc.RAGBatchSize, 32),
+		TokenGuardrail:                yc.intDefault(yc.TokenGuardrail, 6000),
+		SLMTimeout:                    yc.durationDefault(yc.SLMTimeout, 8*time.Second),
+		SLMCacheMaxEntries:            yc.intDefault(yc.SLMCacheMaxEntries, 512),
+		SLMCacheTTL:                   yc.durationDefault(yc.SLMCacheTTL, 30*time.Second),
+		SLMCacheSemanticThreshold:     clampFloat(yc.floatDefault(yc.SLMCacheSemanticThreshold, 0.0), 0, 1),
+		SLMCacheMaxStale:              yc.intDefault(yc.SLMCacheMaxStale, 0),              // issue #835
+		SLMCacheStaleCleanupThreshold: yc.intDefault(yc.SLMCacheStaleCleanupThreshold, 0), // issue #1037
+		SLMCacheSemanticScanLimit:     yc.intDefault(yc.SLMCacheSemanticScanLimit, 0),     // issue #933
+		FusionTimeout:                 yc.durationDefault(yc.FusionTimeout, 120*time.Second),
+		CascadeTimeout:                yc.durationDefault(yc.CascadeTimeout, 30*time.Second),
+		ArbiterTimeout:                yc.durationDefault(yc.ArbiterTimeout, 60*time.Second),
+		CascadeMaxResponseBytes:       yc.intDefault(yc.CascadeMaxResponseBytes, DefaultMaxResponseBytes),
+		MaxResponseBytes:              yc.intDefault(yc.MaxResponseBytes, DefaultMaxResponseBytes),
 
 		FusionProgressiveDelivery: yc.boolFieldDefault(yc.FusionProgressiveDelivery, true),
 		FusionAgreementThreshold:  yc.floatDefault(yc.FusionAgreementThreshold, 0.85),
+		ArbiterCacheTTL:           yc.durationDefault(yc.ArbiterCacheTTL, 5*time.Minute),
+		ArbiterCacheMaxEntries:    yc.intDefault(yc.ArbiterCacheMaxEntries, 512),
 
 		JudgeURL:          yc.stringDefault(yc.JudgeURL, "https://api.z.ai/v1/chat/completions"),
 		JudgeModel:        yc.stringDefault(yc.JudgeModel, ""), // Falls back to FrontierModel later
@@ -850,8 +1206,8 @@ func (yc YAMLConfig) toConfig() Config {
 		JudgeDBPath:       yc.stringDefault(yc.JudgeDBPath, DefaultJudgeDBPath()),
 
 		RoutingConfidenceDB:         yc.stringDefault(yc.RoutingConfidenceDB, DefaultRoutingConfidenceDBPath()),
-		RoutingConfidenceFloor:      yc.floatDefault(yc.RoutingConfidenceFloor, 0.4),
-		RoutingConfidenceCeiling:    yc.floatDefault(yc.RoutingConfidenceCeiling, 0.85),
+		RoutingConfidenceFloor:      clampFloat(yc.floatDefault(yc.RoutingConfidenceFloor, 0.4), 0, 1),
+		RoutingConfidenceCeiling:    clampFloat(yc.floatDefault(yc.RoutingConfidenceCeiling, 0.85), 0, 1),
 		RoutingConfidenceMinSamples: yc.intDefault(yc.RoutingConfidenceMinSamples, 5),
 		RoutingConfidenceWindow:     yc.durationDefault(yc.RoutingConfidenceWindow, 168*time.Hour),
 
@@ -859,9 +1215,10 @@ func (yc YAMLConfig) toConfig() Config {
 		HealthBreakerThreshold: yc.intDefault(yc.HealthBreakerThreshold, 3),
 		HealthProbeTimeout:     yc.durationDefault(yc.HealthProbeTimeout, 5*time.Second),
 
-		ProbePollInterval:  yc.durationDefault(yc.ProbeInterval, 60*time.Second),
-		ProbeTimeout:       yc.durationDefault(yc.ProbeTimeout, 5*time.Second),
-		ProbeBytesPerToken: yc.intDefault(yc.ProbeBytesPerToken, 256*1024),
+		ProbePollInterval:     yc.durationDefault(yc.ProbeInterval, 60*time.Second),
+		ProbeTimeout:          yc.durationDefault(yc.ProbeTimeout, 5*time.Second),
+		ProbeBytesPerToken:    yc.intDefault(yc.ProbeBytesPerToken, 256*1024),
+		ProbeThermalThreshold: yc.intDefault(yc.ProbeThermalThreshold, 90),
 
 		LocalMaxConcurrent:    yc.intDefault(yc.LocalMaxConcurrent, 0),
 		LocalVRAMBytesPerSlot: yc.int64Default(yc.LocalVRAMBytesPerSlot, DefaultLocalVRAMBytesPerSlot),
@@ -873,6 +1230,7 @@ func (yc YAMLConfig) toConfig() Config {
 		IdleTimeout:     yc.durationDefault(yc.IdleTimeout, DefaultServerIdleTimeout),
 		MaxHeaderBytes:  yc.intDefault(yc.MaxHeaderBytes, DefaultServerMaxHeaderBytes),
 		ShutdownTimeout: yc.durationDefault(yc.ShutdownTimeout, DefaultShutdownTimeout),
+		TLSEnabled:      yc.TLSEnabled,
 
 		BudgetDailyLimit:      yc.floatDefault(yc.BudgetDailyLimit, 0),
 		BudgetAlertEnabled:    yc.BudgetAlertEnabled,
@@ -882,6 +1240,7 @@ func (yc YAMLConfig) toConfig() Config {
 		SelectorWindow:          yc.durationDefault(yc.SelectorWindow, time.Hour),
 		SelectorMinSamples:      yc.intDefault(yc.SelectorMinSamples, 5),
 		SelectorRefreshInterval: yc.durationDefault(yc.SelectorRefreshInterval, 60*time.Second),
+		ProviderTailWeight:      clampFloat(yc.floatDefault(yc.ProviderTailWeight, 0.0), 0, 1),
 		FrontierCostPer1K:       yc.floatDefault(yc.FrontierCostPer1K, 0.005),
 		ZAICostPer1K:            yc.floatDefault(yc.ZAICostPer1K, 0.002),
 
@@ -889,15 +1248,17 @@ func (yc YAMLConfig) toConfig() Config {
 		CostBaselineModel:     yc.stringDefault(yc.CostBaselineModel, ""),   // Falls back to FrontierModel later
 		CostBaselineRatePer1K: yc.floatDefault(yc.CostBaselineRatePer1K, 0), // Falls back to FrontierCostPer1K later
 
-		QualityConcurrency: yc.intDefault(yc.QualityConcurrency, 2),
-		QualityQueueDepth:  yc.intDefault(yc.QualityQueueDepth, 64),
-		QualityTimeout:     yc.durationDefault(yc.QualityTimeout, 60*time.Second),
-		QualityStderrCap:   yc.intDefault(yc.QualityStderrCap, 2*1024),
-		QualityEnabled:     yc.intDefault(yc.QualityConcurrency, 2) > 0,
+		QualityConcurrency:     yc.intDefault(yc.QualityConcurrency, 2),
+		QualityQueueDepth:      yc.intDefault(yc.QualityQueueDepth, 64),
+		QualityTimeout:         yc.durationDefault(yc.QualityTimeout, 60*time.Second),
+		QualityStderrCap:       yc.intDefault(yc.QualityStderrCap, 2*1024),
+		QualityDroppedRingSize: yc.intDefault(yc.QualityDroppedRingSize, 256),
+		QualityEnabled:         yc.intDefault(yc.QualityConcurrency, 2) > 0,
 
 		PromptInjectionMode: middleware.ParseInjectionMode(yc.PromptInjectionMode),
+		InjectionScanRoles:  yamlRoles,
 
-		LogLevel:  parseLogLevel(yc.LogLevel),
+		LogLevel:  logLevel,
 		LogFormat: parseLogFormat(yc.LogFormat),
 
 		Debug:          yc.Debug, // defaults to false in toConfig if not set
@@ -908,8 +1269,27 @@ func (yc YAMLConfig) toConfig() Config {
 
 		RAGPollInterval: yc.durationDefault(yc.RAGPollInterval, 30*time.Second),
 
-		RateLimitRPM:   yc.intDefault(yc.RateLimitRPM, 0),
-		RateLimitBurst: yc.intDefault(yc.RateLimitBurst, 0),
+		RateLimitRPM:      yc.intDefault(yc.RateLimitRPM, 0),
+		RateLimitBurst:    yc.intDefault(yc.RateLimitBurst, 0),
+		RateLimitByAPIKey: yc.RateLimitByAPIKey,
+
+		AuthRateLimitRPM:    yc.intDefault(yc.AuthRateLimitRPM, 5),
+		AuthRateLimitBurst:  yc.intDefault(yc.AuthRateLimitBurst, 3),
+		AuthRateLimitWindow: yc.durationDefault(yc.AuthRateLimitWindow, 5*time.Minute),
+
+		TracingEndpoint:   yc.stringDefault(yc.TracingEndpoint, ""),
+		TracingTimeout:    yc.durationDefault(yc.TracingTimeout, 10*time.Second),
+		TracingQueueSize:  yc.intDefault(yc.TracingQueueSize, 256),
+		TracingBatchSize:  yc.intDefault(yc.TracingBatchSize, 64),
+		TracingSampleRate: yc.floatDefault(yc.TracingSampleRate, 1.0),
+	}
+
+	// Warn if yaml had unrecognized injection scan roles (issue #845)
+	// Only warn when unrecognized tokens exist AND the fallback is ["system"] (issue #879).
+	if len(yamlUnrecognized) > 0 && len(yamlRoles) == 1 && yamlRoles[0] == "system" {
+		slog.Warn("unrecognised injection scan role(s) in config.yaml: falling back to [system]",
+			slog.String("ignored", strings.Join(yamlUnrecognized, ",")),
+		)
 	}
 
 	// Embedder type
@@ -957,7 +1337,7 @@ func (yc YAMLConfig) toConfig() Config {
 		cfg.TrustedProxiesRaw = yc.TrustedProxies
 	}
 
-	return cfg
+	return cfg, nil
 }
 
 // boolFieldDefault applies a default when the YAML field was the zero value.
@@ -1051,7 +1431,73 @@ func (yc YAMLConfig) validate() error {
 			return fmt.Errorf("config: shutdown_timeout must not be negative, got %s", d)
 		}
 	}
+
+	// Fractional fields (0..1 range)
+	if yc.BudgetAlertThreshold < 0 || yc.BudgetAlertThreshold > 1 {
+		return fmt.Errorf("config: budget_alert_threshold must be in range [0,1], got %f", yc.BudgetAlertThreshold)
+	}
+	if yc.FusionAgreementThreshold < 0 || yc.FusionAgreementThreshold > 1 {
+		return fmt.Errorf("config: fusion_agreement_threshold must be in range [0,1], got %f", yc.FusionAgreementThreshold)
+	}
+	if yc.ProviderTailWeight < 0 || yc.ProviderTailWeight > 1 {
+		return fmt.Errorf("config: provider_tail_weight must be in range [0,1], got %f", yc.ProviderTailWeight)
+	}
+	if yc.TracingSampleRate < 0 || yc.TracingSampleRate > 1 {
+		return fmt.Errorf("config: tracing_sample_rate must be in range [0,1], got %f", yc.TracingSampleRate)
+	}
+	if yc.RoutingConfidenceFloor < 0 || yc.RoutingConfidenceFloor > 1 {
+		return fmt.Errorf("config: routing_confidence_floor must be in range [0,1], got %f", yc.RoutingConfidenceFloor)
+	}
+	if yc.RoutingConfidenceCeiling < 0 || yc.RoutingConfidenceCeiling > 1 {
+		return fmt.Errorf("config: routing_confidence_ceiling must be in range [0,1], got %f", yc.RoutingConfidenceCeiling)
+	}
+
 	return nil
+}
+
+// validateRawBoolFields checks that boolean fields in the raw YAML data
+// contain valid bool values. It uses a map unmarshal to inspect raw values
+// before the real struct unmarshal, so invalid values like "maybe" for a
+// bool field are caught and reported rather than silently becoming the zero
+// value (which would then be misinterpreted as the default).
+func validateRawBoolFields(data []byte) error {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil // yaml parse error will be caught by the real unmarshal
+	}
+
+	// TOONUnfenced: reject non-bool values
+	if v, ok := raw["toon_unfenced"]; ok {
+		switch v := v.(type) {
+		case bool:
+			// valid
+		case string:
+			// Try to parse as bool; reject if unrecognized
+			if _, err := parseYAMLBool(v); err != nil {
+				return fmt.Errorf("config: toon_unfenced %s", err.Error())
+			}
+		default:
+			// Also catch int/float etc that yaml.Unmarshal accepted
+			return fmt.Errorf("config: toon_unfenced value %v is not a boolean", v)
+		}
+	}
+
+	return nil
+}
+
+// parseYAMLBool parses a boolean value from a YAML field string and returns
+// an error for unrecognized strings (unlike parseBoolEnvStr which silently
+// falls back to the default). Used for YAML fields where invalid values
+// should fail-fast rather than silently passing.
+func parseYAMLBool(v string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1", "yes", "on":
+		return true, nil
+	case "false", "0", "no", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("value %q is not recognised; want true or false", v)
+	}
 }
 
 // parseBoolEnvStr is like parseBoolEnv but takes the raw string directly.

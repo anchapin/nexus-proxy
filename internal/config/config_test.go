@@ -1,7 +1,11 @@
 package config
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
@@ -37,6 +41,9 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.ProbeBytesPerToken != 256*1024 {
 		t.Errorf("ProbeBytesPerToken = %d, want 262144", cfg.ProbeBytesPerToken)
+	}
+	if cfg.ProbeThermalThreshold != 90 {
+		t.Errorf("ProbeThermalThreshold = %d, want 90", cfg.ProbeThermalThreshold)
 	}
 	if !cfg.ProbeEnabled {
 		t.Error("ProbeEnabled = false, want true with default interval")
@@ -81,8 +88,8 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ReadTimeout != DefaultServerReadTimeout {
 		t.Errorf("ReadTimeout = %v, want %v", cfg.ReadTimeout, DefaultServerReadTimeout)
 	}
-	if cfg.WriteTimeout != 0 {
-		t.Errorf("WriteTimeout = %v, want 0 (disabled, streaming-safe)", cfg.WriteTimeout)
+	if cfg.WriteTimeout != DefaultServerWriteTimeout {
+		t.Errorf("WriteTimeout = %v, want %v", cfg.WriteTimeout, DefaultServerWriteTimeout)
 	}
 	if cfg.IdleTimeout != DefaultServerIdleTimeout {
 		t.Errorf("IdleTimeout = %v, want %v", cfg.IdleTimeout, DefaultServerIdleTimeout)
@@ -94,6 +101,11 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ShutdownTimeout != DefaultShutdownTimeout {
 		t.Errorf("ShutdownTimeout = %v, want %v", cfg.ShutdownTimeout, DefaultShutdownTimeout)
 	}
+	// Effective inbound TLS posture (issue #444). Default false so a stock
+	// plaintext deployment never advertises HSTS.
+	if cfg.TLSEnabled {
+		t.Error("TLSEnabled = true, want false (default)")
+	}
 	// TOON unfenced-array detection (issue #123) defaults to on so a
 	// stock deployment compresses bare arrays; operators can opt out
 	// with NEXUS_TOON_UNFENCED=false.
@@ -103,6 +115,11 @@ func TestLoadDefaults(t *testing.T) {
 	// DSL fast-pass patterns (issue #305).
 	if len(cfg.DSLFormattingPatterns) == 0 {
 		t.Error("DSLFormattingPatterns is empty, want default patterns")
+	}
+	// Provider tail weight (issue #450) defaults to 0 so a stock
+	// deployment preserves the legacy P50-only scoring byte-for-byte.
+	if cfg.ProviderTailWeight != 0 {
+		t.Errorf("ProviderTailWeight = %v, want 0 (default)", cfg.ProviderTailWeight)
 	}
 	if len(cfg.DSLFusionPatterns) == 0 {
 		t.Error("DSLFusionPatterns is empty, want default patterns")
@@ -125,6 +142,8 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("NEXUS_PROBE_INTERVAL", "120s")
 	t.Setenv("NEXUS_PROBE_TIMEOUT", "2s")
 	t.Setenv("NEXUS_PROBE_BYTES_PER_TOKEN", "131072")
+	t.Setenv("NEXUS_PROBE_THERMAL_THRESHOLD", "75")
+	t.Setenv("NEXUS_PROVIDER_TAIL_WEIGHT", "0.25")
 
 	cfg, err := Load()
 	if err != nil {
@@ -166,6 +185,12 @@ func TestLoadOverrides(t *testing.T) {
 	if cfg.ProbeBytesPerToken != 131072 {
 		t.Errorf("ProbeBytesPerToken = %d, want 131072", cfg.ProbeBytesPerToken)
 	}
+	if cfg.ProbeThermalThreshold != 75 {
+		t.Errorf("ProbeThermalThreshold = %d, want 75", cfg.ProbeThermalThreshold)
+	}
+	if cfg.ProviderTailWeight != 0.25 {
+		t.Errorf("ProviderTailWeight = %v, want 0.25", cfg.ProviderTailWeight)
+	}
 }
 
 func TestLoadTOONUnfencedFlag(t *testing.T) {
@@ -197,6 +222,56 @@ func TestLoadTOONUnfencedFlag(t *testing.T) {
 		}
 		if !cfg.TOONUnfenced {
 			t.Error("TOONUnfenced = false, want true when NEXUS_TOON_UNFENCED=true")
+		}
+	})
+}
+
+// TestLoadTLSEnabledFlag (issue #444) verifies NEXUS_TLS_ENABLED gates the
+// HSTS emission policy. The default is false so a stock plaintext
+// deployment never advertises HSTS; operators behind a TLS-terminating
+// reverse proxy (or running with inbound HTTPS) flip the flag.
+func TestLoadTLSEnabledFlag(t *testing.T) {
+	t.Run("default_off", func(t *testing.T) {
+		t.Setenv("NEXUS_TLS_ENABLED", "")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.TLSEnabled {
+			t.Error("TLSEnabled = true, want false when NEXUS_TLS_ENABLED unset")
+		}
+	})
+	t.Run("explicit_false", func(t *testing.T) {
+		t.Setenv("NEXUS_TLS_ENABLED", "false")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.TLSEnabled {
+			t.Error("TLSEnabled = true, want false when NEXUS_TLS_ENABLED=false")
+		}
+	})
+	t.Run("explicit_true", func(t *testing.T) {
+		t.Setenv("NEXUS_TLS_ENABLED", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.TLSEnabled {
+			t.Error("TLSEnabled = false, want true when NEXUS_TLS_ENABLED=true")
+		}
+	})
+	t.Run("alternate_truthy", func(t *testing.T) {
+		// "1" / "yes" should also turn the flag on so operators with
+		// muscle memory for boolean env vars (e.g. NEXUS_DEBUG=1) get
+		// the same behaviour.
+		t.Setenv("NEXUS_TLS_ENABLED", "1")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.TLSEnabled {
+			t.Error("TLSEnabled = false, want true when NEXUS_TLS_ENABLED=1")
 		}
 	})
 }
@@ -286,6 +361,36 @@ func TestLoadTelemetryPathHonoursOverride(t *testing.T) {
 	}
 }
 
+func TestLoadTelemetryBufferSizeAndFlushIntervalHonoured(t *testing.T) {
+	t.Setenv("NEXUS_TELEMETRY_BUFFER_SIZE", "131072")
+	t.Setenv("NEXUS_TELEMETRY_FLUSH_INTERVAL", "10s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TelemetryBufferSize != 131072 {
+		t.Errorf("TelemetryBufferSize = %d, want 131072", cfg.TelemetryBufferSize)
+	}
+	if cfg.TelemetryFlushInterval != 10*time.Second {
+		t.Errorf("TelemetryFlushInterval = %v, want 10s", cfg.TelemetryFlushInterval)
+	}
+}
+
+func TestLoadTelemetryBufferSizeAndFlushIntervalDefaultOnZero(t *testing.T) {
+	t.Setenv("NEXUS_TELEMETRY_BUFFER_SIZE", "0")
+	t.Setenv("NEXUS_TELEMETRY_FLUSH_INTERVAL", "0")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TelemetryBufferSize != 64<<10 {
+		t.Errorf("TelemetryBufferSize = %d, want 64<<10 (65536)", cfg.TelemetryBufferSize)
+	}
+	if cfg.TelemetryFlushInterval != 5*time.Second {
+		t.Errorf("TelemetryFlushInterval = %v, want 5s", cfg.TelemetryFlushInterval)
+	}
+}
+
 func TestLoadProbeDisabledByZeroInterval(t *testing.T) {
 	t.Setenv("NEXUS_PROBE_INTERVAL", "0")
 	cfg, err := Load()
@@ -306,6 +411,7 @@ func TestLoadProbeInvalidValues(t *testing.T) {
 		{"bad interval", "NEXUS_PROBE_INTERVAL", "forever"},
 		{"bad timeout", "NEXUS_PROBE_TIMEOUT", "ten seconds"},
 		{"bad bytes per token", "NEXUS_PROBE_BYTES_PER_TOKEN", "lots"},
+		{"bad thermal threshold", "NEXUS_PROBE_THERMAL_THRESHOLD", "hot"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -336,6 +442,51 @@ func TestLoadInvalidValues(t *testing.T) {
 			t.Setenv(tc.key, tc.val)
 			if _, err := Load(); err == nil {
 				t.Errorf("expected error for %s=%s", tc.key, tc.val)
+			}
+		})
+	}
+}
+
+func TestLoadProviderTailWeightBounds(t *testing.T) {
+	// Issue #450: NEXUS_PROVIDER_TAIL_WEIGHT must accept only
+	// values in [0,1]. Anything outside fails config validation
+	// rather than being silently clamped, so a typo surfaces
+	// immediately instead of flipping the ranking in subtle ways.
+	cases := []struct {
+		name    string
+		key     string
+		val     string
+		wantErr bool
+	}{
+		{"unparseable fails", "NEXUS_PROVIDER_TAIL_WEIGHT", "halfway", true},
+		{"negative fails", "NEXUS_PROVIDER_TAIL_WEIGHT", "-0.1", true},
+		{"above one fails", "NEXUS_PROVIDER_TAIL_WEIGHT", "1.5", true},
+		{"zero accepted", "NEXUS_PROVIDER_TAIL_WEIGHT", "0", false},
+		{"one accepted", "NEXUS_PROVIDER_TAIL_WEIGHT", "1", false},
+		{"mid range accepted", "NEXUS_PROVIDER_TAIL_WEIGHT", "0.42", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.key, tc.val)
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error for %s=%s", tc.key, tc.val)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			want := 0.0
+			switch tc.val {
+			case "1":
+				want = 1.0
+			case "0.42":
+				want = 0.42
+			}
+			if cfg.ProviderTailWeight != want {
+				t.Errorf("ProviderTailWeight = %v, want %v", cfg.ProviderTailWeight, want)
 			}
 		})
 	}
@@ -530,7 +681,7 @@ func TestLoadServerTimeoutOverrides(t *testing.T) {
 
 func TestLoadServerTimeoutZeroAllowed(t *testing.T) {
 	// Zero is valid for all four — it disables the corresponding
-	// guard (and WriteTimeout=0 is the streaming-safe default).
+	// guard (WriteTimeout=0 is the streaming-unlimited opt-in, not the default).
 	t.Setenv("NEXUS_SERVER_READ_TIMEOUT", "0")
 	t.Setenv("NEXUS_SERVER_WRITE_TIMEOUT", "0")
 	t.Setenv("NEXUS_SERVER_IDLE_TIMEOUT", "0")
@@ -632,6 +783,26 @@ func TestLoadShutdownTimeoutInvalidValue(t *testing.T) {
 	t.Setenv("NEXUS_SHUTDOWN_TIMEOUT", "soon")
 	if _, err := Load(); err == nil {
 		t.Errorf("expected error for NEXUS_SHUTDOWN_TIMEOUT=soon")
+	}
+}
+
+// --- Tracing timeout (issue #1058) ---
+
+func TestLoadTracingTimeoutNegativeRejected(t *testing.T) {
+	t.Setenv("NEXUS_TRACING_TIMEOUT", "-5s")
+	if _, err := Load(); err == nil {
+		t.Errorf("expected error for NEXUS_TRACING_TIMEOUT=-5s")
+	}
+}
+
+func TestLoadTracingTimeoutHonoursOverride(t *testing.T) {
+	t.Setenv("NEXUS_TRACING_TIMEOUT", "15s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TracingTimeout != 15*time.Second {
+		t.Errorf("TracingTimeout = %v, want 15s", cfg.TracingTimeout)
 	}
 }
 
@@ -794,6 +965,67 @@ func TestReloadHotReloadable_LogLevel(t *testing.T) {
 	}
 }
 
+// TestParseLogLevel_ValidValues verifies that parseLogLevel returns the
+// correct slog.Level for valid log level strings.
+func TestParseLogLevel_ValidValues(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    slog.Level
+		wantErr bool
+	}{
+		{"debug", slog.LevelDebug, false},
+		{"DEBUG", slog.LevelDebug, false},
+		{"Debug", slog.LevelDebug, false},
+		{"warn", slog.LevelWarn, false},
+		{"WARNING", slog.LevelWarn, false},
+		{"warning", slog.LevelWarn, false},
+		{"error", slog.LevelError, false},
+		{"ERROR", slog.LevelError, false},
+		{"err", slog.LevelError, false},
+		{"info", slog.LevelInfo, false},
+		{"INFO", slog.LevelInfo, false},
+		{"", slog.LevelInfo, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := parseLogLevel(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseLogLevel(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("parseLogLevel(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestParseLogLevel_InvalidValues verifies that parseLogLevel returns
+// slog.LevelInfo with an error for invalid log level strings.
+func TestParseLogLevel_InvalidValues(t *testing.T) {
+	invalidValues := []string{
+		"INVALID_GIBBERISH",
+		"trace",
+		"critical",
+		"warnning", // typo of "warning"
+		"infoo",    // typo of "info"
+		"debu",     // typo of "debug"
+	}
+
+	for _, input := range invalidValues {
+		t.Run(input, func(t *testing.T) {
+			got, err := parseLogLevel(input)
+			if err == nil {
+				t.Errorf("parseLogLevel(%q) error = nil, want non-nil error", input)
+			}
+			if got != slog.LevelInfo {
+				t.Errorf("parseLogLevel(%q) = %v, want slog.LevelInfo (fallback)", input, got)
+			}
+		})
+	}
+}
+
 // TestReloadHotReloadable_LogFormat verifies that log format is correctly
 // reloaded from NEXUS_LOG_FORMAT.
 func TestReloadHotReloadable_LogFormat(t *testing.T) {
@@ -900,6 +1132,273 @@ func TestReloadHotReloadable_PreservesNonReloadable(t *testing.T) {
 	// so we verify the returned cfg preserves non-reloadable fields.
 }
 
+// TestReloadHotReloadable_TrustedProxiesInvalid verifies that an invalid
+// NEXUS_TRUSTED_PROXIES value after boot adds NEXUS_TRUSTED_PROXIES to
+// NeedsRestart so the operator is told a restart is required (issue #1055).
+func TestReloadHotReloadable_TrustedProxiesInvalid(t *testing.T) {
+	prev := Config{
+		TrustedProxiesRaw: "10.0.0.0/8",
+	}
+	// Set an invalid CIDR that will fail parsing.
+	t.Setenv("NEXUS_TRUSTED_PROXIES", "not-a-valid-cidr")
+	stop := captureSlog(t)
+	_, result := ReloadHotReloadable(prev)
+	lines, _ := stop()
+
+	// Verify NEXUS_TRUSTED_PROXIES is in NeedsRestart.
+	if len(result.NeedsRestart) != 1 {
+		t.Errorf("expected 1 restart-required setting, got %d: %v", len(result.NeedsRestart), result.NeedsRestart)
+	}
+	if result.NeedsRestart[0] != "NEXUS_TRUSTED_PROXIES" {
+		t.Errorf("NeedsRestart[0] = %q, want NEXUS_TRUSTED_PROXIES", result.NeedsRestart[0])
+	}
+
+	// Verify a warning was logged.
+	var found bool
+	for _, line := range lines {
+		msg, _ := line["msg"].(string)
+		if strings.Contains(msg, "invalid NEXUS_TRUSTED_PROXIES") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected warning about invalid NEXUS_TRUSTED_PROXIES to be logged")
+	}
+}
+
+// captureSlog swaps slog.Default for a JSON handler bound to a buffer
+// that captures every line. Returns the captured buffer contents as a
+// JSON-decoded slice (one map per line) plus the raw string.
+func captureSlog(t *testing.T) func() ([]map[string]any, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return func() ([]map[string]any, string) {
+		raw := buf.String()
+		lines := strings.Split(strings.TrimSpace(raw), "\n")
+		out := make([]map[string]any, 0, len(lines))
+		for _, line := range lines {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			var rec map[string]any
+			if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				t.Fatalf("invalid slog line %q: %v", line, err)
+			}
+			out = append(out, rec)
+		}
+		return out, raw
+	}
+}
+
+// TestReloadHotReloadable_ShutdownTimeoutWarning verifies that a SIGHUP
+// reload that sets ShutdownTimeout below ReadTimeout emits a warning
+// (issue #990).
+func TestReloadHotReloadable_ShutdownTimeoutWarning(t *testing.T) {
+	// prev simulates the boot config: ReadTimeout=60s, ShutdownTimeout=45s
+	prev := Config{
+		ReadTimeout:     60 * time.Second,
+		ShutdownTimeout: 45 * time.Second,
+	}
+	// SIGHUP reduces ShutdownTimeout to 10s, below ReadTimeout=60s
+	t.Setenv("NEXUS_SHUTDOWN_TIMEOUT", "10s")
+
+	stop := captureSlog(t)
+	_, _ = ReloadHotReloadable(prev)
+	lines, _ := stop()
+
+	// Find the shutdown-timeout warning.
+	var found bool
+	for _, line := range lines {
+		msg, _ := line["msg"].(string)
+		if strings.Contains(msg, "shutdown drain shorter than read timeout") {
+			found = true
+			// Verify the durations are reflected correctly in the log.
+			gotShutdown, _ := line["shutdown_timeout"].(float64)
+			wantShutdown := 10 * float64(time.Second)
+			if gotShutdown != wantShutdown {
+				t.Errorf("shutdown_timeout = %v, want %v", gotShutdown, wantShutdown)
+			}
+			gotRead, _ := line["read_timeout"].(float64)
+			wantRead := 60 * float64(time.Second)
+			if gotRead != wantRead {
+				t.Errorf("read_timeout = %v, want %v", gotRead, wantRead)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("expected shutdown-timeout warning to be logged during ReloadHotReloadable")
+	}
+}
+
+// TestReloadHotReloadable_ShutdownTimeoutOK verifies no warning is logged
+// when ShutdownTimeout >= ReadTimeout after reload.
+func TestReloadHotReloadable_ShutdownTimeoutOK(t *testing.T) {
+	prev := Config{
+		ReadTimeout:     30 * time.Second,
+		ShutdownTimeout: 45 * time.Second,
+	}
+	// SIGHUP keeps ShutdownTimeout=45s, which is still >= ReadTimeout=30s
+	t.Setenv("NEXUS_SHUTDOWN_TIMEOUT", "45s")
+
+	stop := captureSlog(t)
+	_, _ = ReloadHotReloadable(prev)
+	lines, _ := stop()
+
+	for _, line := range lines {
+		msg, _ := line["msg"].(string)
+		if strings.Contains(msg, "shutdown drain shorter than read timeout") {
+			t.Error("unexpected shutdown-timeout warning: ShutdownTimeout (45s) >= ReadTimeout (30s)")
+		}
+	}
+}
+
+// TestReloadHotReloadable_OutOfRangeValues verifies that out-of-range float
+// values for hot-reloadable fields are clamped and produce warnings (issue #1054).
+func TestReloadHotReloadable_OutOfRangeValues(t *testing.T) {
+	tests := []struct {
+		name              string
+		envKey            string
+		envValue          string
+		prevValue         float64
+		wantClamped       float64
+		wantWarningPrefix string
+	}{
+		{
+			name:              "BudgetAlertThreshold above 1",
+			envKey:            "NEXUS_BUDGET_ALERT_THRESHOLD",
+			envValue:          "1.5",
+			prevValue:         0.8,
+			wantClamped:       1.0,
+			wantWarningPrefix: "NEXUS_BUDGET_ALERT_THRESHOLD value 1.5 is outside valid range [0,1]",
+		},
+		{
+			name:              "BudgetAlertThreshold below 0",
+			envKey:            "NEXUS_BUDGET_ALERT_THRESHOLD",
+			envValue:          "-0.3",
+			prevValue:         0.8,
+			wantClamped:       0.0,
+			wantWarningPrefix: "NEXUS_BUDGET_ALERT_THRESHOLD value -0.3 is outside valid range [0,1]",
+		},
+		{
+			name:              "FusionAgreementThreshold above 1",
+			envKey:            "NEXUS_FUSION_AGREEMENT_THRESHOLD",
+			envValue:          "2.0",
+			prevValue:         0.85,
+			wantClamped:       1.0,
+			wantWarningPrefix: "NEXUS_FUSION_AGREEMENT_THRESHOLD value 2 is outside valid range [0,1]",
+		},
+		{
+			name:              "FusionAgreementThreshold below 0",
+			envKey:            "NEXUS_FUSION_AGREEMENT_THRESHOLD",
+			envValue:          "-0.1",
+			prevValue:         0.85,
+			wantClamped:       0.0,
+			wantWarningPrefix: "NEXUS_FUSION_AGREEMENT_THRESHOLD value -0.1 is outside valid range [0,1]",
+		},
+		{
+			name:              "TracingSampleRate above 1",
+			envKey:            "NEXUS_TRACING_SAMPLE_RATE",
+			envValue:          "1.5",
+			prevValue:         1.0,
+			wantClamped:       1.0,
+			wantWarningPrefix: "NEXUS_TRACING_SAMPLE_RATE value 1.5 is outside valid range [0,1]",
+		},
+		{
+			name:              "TracingSampleRate below 0",
+			envKey:            "NEXUS_TRACING_SAMPLE_RATE",
+			envValue:          "-0.5",
+			prevValue:         1.0,
+			wantClamped:       0.0,
+			wantWarningPrefix: "NEXUS_TRACING_SAMPLE_RATE value -0.5 is outside valid range [0,1]",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.envKey, tc.envValue)
+			prev := Config{
+				BudgetAlertThreshold:     tc.prevValue,
+				FusionAgreementThreshold: tc.prevValue,
+				TracingSampleRate:        tc.prevValue,
+			}
+
+			stop := captureSlog(t)
+			next, result := ReloadHotReloadable(prev)
+			lines, _ := stop()
+
+			// Check the clamped value.
+			switch tc.envKey {
+			case "NEXUS_BUDGET_ALERT_THRESHOLD":
+				if next.BudgetAlertThreshold != tc.wantClamped {
+					t.Errorf("BudgetAlertThreshold = %g, want %g", next.BudgetAlertThreshold, tc.wantClamped)
+				}
+			case "NEXUS_FUSION_AGREEMENT_THRESHOLD":
+				if next.FusionAgreementThreshold != tc.wantClamped {
+					t.Errorf("FusionAgreementThreshold = %g, want %g", next.FusionAgreementThreshold, tc.wantClamped)
+				}
+			case "NEXUS_TRACING_SAMPLE_RATE":
+				if next.TracingSampleRate != tc.wantClamped {
+					t.Errorf("TracingSampleRate = %g, want %g", next.TracingSampleRate, tc.wantClamped)
+				}
+			}
+
+			// Check warning was produced.
+			if len(result.Warnings) == 0 {
+				t.Errorf("expected a warning for out-of-range value, got none")
+				return
+			}
+			found := false
+			for _, w := range result.Warnings {
+				if strings.HasPrefix(w, tc.wantWarningPrefix) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("warning %q not found in result.Warnings: %v", tc.wantWarningPrefix, result.Warnings)
+			}
+
+			// Also verify the warning was logged via slog.
+			var slogFound bool
+			for _, line := range lines {
+				msg, _ := line["msg"].(string)
+				if strings.HasPrefix(msg, tc.wantWarningPrefix) {
+					slogFound = true
+					break
+				}
+			}
+			if !slogFound {
+				t.Errorf("warning not found in slog output: %v", lines)
+			}
+		})
+	}
+}
+
+// TestReloadHotReloadable_FloatInRange verifies that in-range float values
+// are accepted without warnings.
+func TestReloadHotReloadable_FloatInRange(t *testing.T) {
+	t.Setenv("NEXUS_BUDGET_ALERT_THRESHOLD", "0.5")
+	t.Setenv("NEXUS_FUSION_AGREEMENT_THRESHOLD", "0.9")
+	t.Setenv("NEXUS_TRACING_SAMPLE_RATE", "0.75")
+
+	prev := Config{
+		BudgetAlertThreshold:     0.8,
+		FusionAgreementThreshold: 0.85,
+		TracingSampleRate:        1.0,
+	}
+
+	_, result := ReloadHotReloadable(prev)
+
+	if len(result.Warnings) != 0 {
+		t.Errorf("expected no warnings for in-range values, got %v", result.Warnings)
+	}
+}
+
 func TestReadinessModeValidation(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -962,5 +1461,385 @@ func TestReadinessModeValidation(t *testing.T) {
 				t.Errorf("cfg.ReadinessMode = %q, want %q", cfg.ReadinessMode, tc.wantMode)
 			}
 		})
+	}
+}
+
+// TestEffectiveMaxBodyBytes covers the EffectiveMaxBodyBytes DoS-protection
+// cap constructor: positive overrides are honoured, while zero/negative
+// values fall back to DefaultMaxBodyBytes so a zero-value Config still gets
+// a sane cap (issue #539).
+func TestEffectiveMaxBodyBytes(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{"zero value falls back to default", 0, DefaultMaxBodyBytes},
+		{"negative falls back to default", -1, DefaultMaxBodyBytes},
+		{"large negative falls back to default", -1 << 30, DefaultMaxBodyBytes},
+		{"positive override honoured", 2 << 20, 2 << 20},
+		{"one byte minimum honoured", 1, 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{MaxBodyBytes: tc.in}
+			if got := cfg.EffectiveMaxBodyBytes(); got != tc.want {
+				t.Errorf("EffectiveMaxBodyBytes() with MaxBodyBytes=%d = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEffectiveMaxResponseBytes covers the upstream response-body cap
+// constructor (issue #539). Same branch matrix as EffectiveMaxBodyBytes,
+// anchored against DefaultMaxResponseBytes.
+func TestEffectiveMaxResponseBytes(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{"zero value falls back to default", 0, DefaultMaxResponseBytes},
+		{"negative falls back to default", -1, DefaultMaxResponseBytes},
+		{"large negative falls back to default", -1 << 30, DefaultMaxResponseBytes},
+		{"positive override honoured", 128 << 20, 128 << 20},
+		{"one byte minimum honoured", 1, 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{MaxResponseBytes: tc.in}
+			if got := cfg.EffectiveMaxResponseBytes(); got != tc.want {
+				t.Errorf("EffectiveMaxResponseBytes() with MaxResponseBytes=%d = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEffectiveDebugBodyBytes covers the debug-trace body preview cap
+// constructor (issue #539). Anchored against DefaultDebugBodyBytes so the
+// defining package owns the contract; the parity assertion in
+// internal/handlers/debug_test.go stays as defence-in-depth.
+func TestEffectiveDebugBodyBytes(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{"zero value falls back to default", 0, DefaultDebugBodyBytes},
+		{"negative falls back to default", -1, DefaultDebugBodyBytes},
+		{"large negative falls back to default", -1 << 30, DefaultDebugBodyBytes},
+		{"positive override honoured", 2048, 2048},
+		{"one byte minimum honoured", 1, 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{DebugBodyBytes: tc.in}
+			if got := cfg.EffectiveDebugBodyBytes(); got != tc.want {
+				t.Errorf("EffectiveDebugBodyBytes() with DebugBodyBytes=%d = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFrontierProviders covers the security-sensitive provider list
+// constructor (issue #539). Providers with an empty API key are omitted so a
+// half-configured deployment cannot proxy to an unauthenticated endpoint, and
+// the declaration order is frontier-then-zai.
+func TestFrontierProviders(t *testing.T) {
+	const (
+		frontierKey   = "fk-123"
+		frontierURL   = "https://api.openai.com/v1/chat/completions"
+		frontierModel = "gpt-4o"
+		frontierCost  = 0.01
+
+		zaiKey   = "zk-456"
+		zaiURL   = "https://api.z.ai/v1/chat/completions"
+		zaiModel = "glm-4.6"
+		zaiCost  = 0.002
+	)
+
+	tests := []struct {
+		name      string
+		cfg       Config
+		wantNames []string // declaration order
+		wantKey   []string // parallel slice of API keys
+	}{
+		{
+			name:      "both keys set returns two providers in frontier-then-zai order",
+			cfg:       Config{FrontierURL: frontierURL, FrontierModel: frontierModel, FrontierKey: frontierKey, FrontierCostPer1K: frontierCost, ZAIURL: zaiURL, ZAIModel: zaiModel, ZAIKey: zaiKey, ZAICostPer1K: zaiCost},
+			wantNames: []string{"frontier", "zai"},
+			wantKey:   []string{frontierKey, zaiKey},
+		},
+		{
+			name:      "only frontier key set returns one frontier provider",
+			cfg:       Config{FrontierURL: frontierURL, FrontierModel: frontierModel, FrontierKey: frontierKey, FrontierCostPer1K: frontierCost, ZAIURL: zaiURL, ZAIModel: zaiModel, ZAIKey: ""},
+			wantNames: []string{"frontier"},
+			wantKey:   []string{frontierKey},
+		},
+		{
+			name:      "only zai key set returns one zai provider",
+			cfg:       Config{FrontierURL: frontierURL, FrontierModel: frontierModel, FrontierKey: "", ZAIURL: zaiURL, ZAIModel: zaiModel, ZAIKey: zaiKey, ZAICostPer1K: zaiCost},
+			wantNames: []string{"zai"},
+			wantKey:   []string{zaiKey},
+		},
+		{
+			name:      "neither key set returns empty slice (no unauthenticated providers)",
+			cfg:       Config{FrontierURL: frontierURL, FrontierModel: frontierModel, FrontierKey: "", ZAIURL: zaiURL, ZAIModel: zaiModel, ZAIKey: ""},
+			wantNames: nil,
+			wantKey:   nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.cfg.FrontierProviders()
+			if len(got) != len(tc.wantNames) {
+				t.Fatalf("FrontierProviders() returned %d providers, want %d (%v)", len(got), len(tc.wantNames), tc.wantNames)
+			}
+			for i, p := range got {
+				if p.Name != tc.wantNames[i] {
+					t.Errorf("provider[%d].Name = %q, want %q", i, p.Name, tc.wantNames[i])
+				}
+				if p.APIKey != tc.wantKey[i] {
+					t.Errorf("provider[%d].APIKey = %q, want %q", i, p.APIKey, tc.wantKey[i])
+				}
+				if p.APIKey == "" {
+					t.Errorf("provider[%d] (%s) has empty APIKey — security regression: unauthenticated provider must be omitted", i, p.Name)
+				}
+			}
+
+			// Assert the field wiring for the populated cases so a
+			// silent field-swap (URL/Model/Cost) is caught.
+			if len(got) > 0 && tc.cfg.FrontierKey != "" {
+				f := got[0]
+				if f.URL != tc.cfg.FrontierURL {
+					t.Errorf("frontier provider URL = %q, want %q", f.URL, tc.cfg.FrontierURL)
+				}
+				if f.Model != tc.cfg.FrontierModel {
+					t.Errorf("frontier provider Model = %q, want %q", f.Model, tc.cfg.FrontierModel)
+				}
+				if f.CostPer1KUSD != tc.cfg.FrontierCostPer1K {
+					t.Errorf("frontier provider CostPer1KUSD = %v, want %v", f.CostPer1KUSD, tc.cfg.FrontierCostPer1K)
+				}
+			}
+			if len(got) == 2 {
+				z := got[1]
+				if z.URL != tc.cfg.ZAIURL {
+					t.Errorf("zai provider URL = %q, want %q", z.URL, tc.cfg.ZAIURL)
+				}
+				if z.Model != tc.cfg.ZAIModel {
+					t.Errorf("zai provider Model = %q, want %q", z.Model, tc.cfg.ZAIModel)
+				}
+				if z.CostPer1KUSD != tc.cfg.ZAICostPer1K {
+					t.Errorf("zai provider CostPer1KUSD = %v, want %v", z.CostPer1KUSD, tc.cfg.ZAICostPer1K)
+				}
+			}
+		})
+	}
+
+	// Explicit zero-value Config guard: a fresh deployment with no keys
+	// configured must not surface any provider.
+	t.Run("zero value Config returns empty provider list", func(t *testing.T) {
+		got := Config{}.FrontierProviders()
+		if len(got) != 0 {
+			t.Fatalf("zero-value Config FrontierProviders() = %v, want empty", got)
+		}
+	})
+}
+
+// TestNewLogger_TextFormat verifies that LogFormatText produces a *slog.TextHandler.
+func TestNewLogger_TextFormat(t *testing.T) {
+	cfg := Config{LogFormat: LogFormatText, LogLevel: slog.LevelInfo}
+	logger := cfg.NewLogger()
+	if logger == nil {
+		t.Fatal("NewLogger returned nil")
+	}
+	h := logger.Handler()
+	textHandler, ok := h.(*slog.TextHandler)
+	if !ok {
+		t.Fatalf("handler type = %T, want *slog.TextHandler", h)
+	}
+	if textHandler == nil {
+		t.Error("textHandler is nil")
+	}
+}
+
+// TestNewLogger_JSONFormat verifies that LogFormatJSON produces a *slog.JSONHandler.
+func TestNewLogger_JSONFormat(t *testing.T) {
+	cfg := Config{LogFormat: LogFormatJSON, LogLevel: slog.LevelInfo}
+	logger := cfg.NewLogger()
+	if logger == nil {
+		t.Fatal("NewLogger returned nil")
+	}
+	h := logger.Handler()
+	jsonHandler, ok := h.(*slog.JSONHandler)
+	if !ok {
+		t.Fatalf("handler type = %T, want *slog.JSONHandler", h)
+	}
+	if jsonHandler == nil {
+		t.Error("jsonHandler is nil")
+	}
+}
+
+// TestNewLogger_UnknownFormatFallsBackToJSON verifies that an unknown LogFormat
+// value falls back to JSON handler.
+func TestNewLogger_UnknownFormatFallsBackToJSON(t *testing.T) {
+	// Invalid format value (iota starts at 0 = LogFormatJSON, so 99 is invalid).
+	cfg := Config{LogFormat: LogFormat(99), LogLevel: slog.LevelInfo}
+	logger := cfg.NewLogger()
+	if logger == nil {
+		t.Fatal("NewLogger returned nil")
+	}
+	h := logger.Handler()
+	if _, ok := h.(*slog.JSONHandler); !ok {
+		t.Fatalf("handler type = %T, want *slog.JSONHandler (fallback)", h)
+	}
+}
+
+// TestNewLogger_LevelDebug verifies that LogLevel=Debug is respected.
+// A Debug logger logs everything (all levels >= Debug).
+func TestNewLogger_LevelDebug(t *testing.T) {
+	cfg := Config{LogFormat: LogFormatText, LogLevel: slog.LevelDebug}
+	logger := cfg.NewLogger()
+	if logger == nil {
+		t.Fatal("NewLogger returned nil")
+	}
+	ctx := context.Background()
+	if !logger.Enabled(ctx, slog.LevelDebug) {
+		t.Error("Enabled(LevelDebug) = false, want true")
+	}
+	// A Debug logger (level -4) also logs Info, Warn, Error (all >= -4).
+	if !logger.Enabled(ctx, slog.LevelInfo) {
+		t.Error("Enabled(LevelInfo) = false, want true for Debug logger")
+	}
+	if !logger.Enabled(ctx, slog.LevelWarn) {
+		t.Error("Enabled(LevelWarn) = false, want true for Debug logger")
+	}
+}
+
+// TestNewLogger_LevelWarn verifies that LogLevel=Warn is respected.
+// A Warn logger logs Warn and Error but not Debug or Info.
+func TestNewLogger_LevelWarn(t *testing.T) {
+	cfg := Config{LogFormat: LogFormatJSON, LogLevel: slog.LevelWarn}
+	logger := cfg.NewLogger()
+	if logger == nil {
+		t.Fatal("NewLogger returned nil")
+	}
+	ctx := context.Background()
+	if !logger.Enabled(ctx, slog.LevelWarn) {
+		t.Error("Enabled(LevelWarn) = false, want true")
+	}
+	if !logger.Enabled(ctx, slog.LevelError) {
+		t.Error("Enabled(LevelError) = false, want true for Warn logger")
+	}
+	// Debug (-4) and Info (0) are less severe than Warn (4), so not enabled.
+	if logger.Enabled(ctx, slog.LevelDebug) {
+		t.Error("Enabled(LevelDebug) = true, want false for Warn logger")
+	}
+	if logger.Enabled(ctx, slog.LevelInfo) {
+		t.Error("Enabled(LevelInfo) = true, want false for Warn logger")
+	}
+}
+
+// TestNewLogger_LevelError verifies that LogLevel=Error is respected.
+// An Error logger logs only Error messages.
+func TestNewLogger_LevelError(t *testing.T) {
+	cfg := Config{LogFormat: LogFormatText, LogLevel: slog.LevelError}
+	logger := cfg.NewLogger()
+	if logger == nil {
+		t.Fatal("NewLogger returned nil")
+	}
+	ctx := context.Background()
+	if !logger.Enabled(ctx, slog.LevelError) {
+		t.Error("Enabled(LevelError) = false, want true")
+	}
+	// Warn (4) is less severe than Error (8), so not enabled.
+	if logger.Enabled(ctx, slog.LevelWarn) {
+		t.Error("Enabled(LevelWarn) = true, want false for Error logger")
+	}
+}
+
+// TestParseInjectionScanRoles verifies that parseInjectionScanRoles returns
+// the correct roles and unrecognized tokens (issue #845).
+func TestParseInjectionScanRoles(t *testing.T) {
+	tests := []struct {
+		raw         string
+		wantRoles   []string
+		wantUnrecog []string
+	}{
+		{"system", []string{"system"}, nil},
+		{"user", []string{"user"}, nil},
+		{"system,user", []string{"system", "user"}, nil},
+		{"user,system", []string{"user", "system"}, nil},
+		{"SYSTEM", []string{"system"}, nil},
+		{"USER", []string{"user"}, nil},
+		{"System,User", []string{"system", "user"}, nil},
+		{"system,admin", []string{"system"}, []string{"admin"}},
+		{"system,admin,user", []string{"system", "user"}, []string{"admin"}},
+		{"admin", []string{"system"}, []string{"admin"}},
+		{"admin,user", []string{"user"}, []string{"admin"}},
+		{"", []string{"system"}, nil},
+		{"  system  ", []string{"system"}, nil},
+		{"  system, user  ", []string{"system", "user"}, nil},
+		{"system, ", []string{"system"}, nil},
+		{"system,system", []string{"system"}, nil},
+		{"system,system,user", []string{"system", "user"}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.raw, func(t *testing.T) {
+			roles, unrecognized := parseInjectionScanRoles(tt.raw)
+			if !slicesEqual(roles, tt.wantRoles) {
+				t.Errorf("parseInjectionScanRoles(%q) roles = %v, want %v", tt.raw, roles, tt.wantRoles)
+			}
+			if !slicesEqual(unrecognized, tt.wantUnrecog) {
+				t.Errorf("parseInjectionScanRoles(%q) unrecognized = %v, want %v", tt.raw, unrecognized, tt.wantUnrecog)
+			}
+		})
+	}
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestNewLogger_TextFormatLevelCombination verifies both format and level together.
+func TestNewLogger_TextFormatLevelCombination(t *testing.T) {
+	cfg := Config{LogFormat: LogFormatText, LogLevel: slog.LevelWarn}
+	logger := cfg.NewLogger()
+	if logger == nil {
+		t.Fatal("NewLogger returned nil")
+	}
+	h := logger.Handler()
+	if _, ok := h.(*slog.TextHandler); !ok {
+		t.Fatalf("handler type = %T, want *slog.TextHandler", h)
+	}
+	ctx := context.Background()
+	if !logger.Enabled(ctx, slog.LevelWarn) {
+		t.Error("Enabled(LevelWarn) = false, want true")
+	}
+}
+
+// TestNewLogger_JSONFormatLevelCombination verifies both format and level together.
+func TestNewLogger_JSONFormatLevelCombination(t *testing.T) {
+	cfg := Config{LogFormat: LogFormatJSON, LogLevel: slog.LevelDebug}
+	logger := cfg.NewLogger()
+	if logger == nil {
+		t.Fatal("NewLogger returned nil")
+	}
+	h := logger.Handler()
+	if _, ok := h.(*slog.JSONHandler); !ok {
+		t.Fatalf("handler type = %T, want *slog.JSONHandler", h)
+	}
+	ctx := context.Background()
+	if !logger.Enabled(ctx, slog.LevelDebug) {
+		t.Error("Enabled(LevelDebug) = false, want true")
 	}
 }

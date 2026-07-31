@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -37,6 +38,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/ratelimit"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 	"github.com/anchapin/nexus-proxy/internal/transport"
 	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
@@ -51,15 +53,25 @@ const (
 // local `make build` without any special setup.
 var version = "dev"
 
+// commit is the git commit SHA. Overridden at compile time via
+// -ldflags "-X main.commit=$(git rev-parse HEAD)". Default "unknown".
+var commit = "unknown"
+
 // circuitBreakerAdapter bridges the chat handler's CircuitBreakerObserver
-// calls into the observability Collector (issue #304).
+// calls into the observability Collector (issue #304, #886).
 type circuitBreakerAdapter struct {
-	recordFailure  func(string)
-	recordRecovery func(string)
+	recordFailure      func(string)
+	recordRecovery     func(string)
+	incEmbedderFailure func(string)
+	incRAGCircuitTrip  func(string)
+	incRAGCircuitRecov func(string)
 }
 
 func (a circuitBreakerAdapter) RecordCircuitFailure(circuit string)  { a.recordFailure(circuit) }
 func (a circuitBreakerAdapter) RecordCircuitRecovery(circuit string) { a.recordRecovery(circuit) }
+func (a circuitBreakerAdapter) IncEmbedderFailure(kind string)       { a.incEmbedderFailure(kind) }
+func (a circuitBreakerAdapter) IncRAGCircuitTrip(kind string)        { a.incRAGCircuitTrip(kind) }
+func (a circuitBreakerAdapter) IncRAGCircuitRecover(kind string)     { a.incRAGCircuitRecov(kind) }
 
 func main() {
 	startTime := time.Now()
@@ -76,12 +88,21 @@ func main() {
 			os.Exit(runCheck(os.Args[2:], os.Stdout, os.Stderr))
 		case "dashboard":
 			os.Exit(runDashboard(os.Args[2:], os.Stdout, os.Stderr))
+		case "config":
+			os.Exit(runConfig(os.Args[2:], os.Stdout, os.Stderr))
+		case "judge":
+			os.Exit(runJudgeStats(os.Args[2:], os.Stdout, os.Stderr))
+		case "routing-preview":
+			os.Exit(runRoutingPreview(os.Args[2:], os.Stdout, os.Stderr))
 		case "-h", "--help", "help":
-			fmt.Fprintln(os.Stderr, "Usage: nexus [check|doctor|dashboard]")
+			fmt.Fprintln(os.Stderr, "Usage: nexus [check|doctor|config|dashboard|judge|routing-preview]")
 			fmt.Fprintln(os.Stderr, "")
 			fmt.Fprintln(os.Stderr, "Run with no arguments to start the proxy.")
 			fmt.Fprintln(os.Stderr, "Run `nexus check` to validate boot-time configuration.")
 			fmt.Fprintln(os.Stderr, "Run `nexus dashboard` to view the daily savings summary.")
+			fmt.Fprintln(os.Stderr, "Run `nexus config validate <file>` to validate a config file.")
+			fmt.Fprintln(os.Stderr, "Run `nexus judge stats` to view adaptive routing confidence.")
+			fmt.Fprintln(os.Stderr, "Run `nexus routing-preview \"prompt\"` to preview routing decisions.")
 			fmt.Fprintln(os.Stderr, "Run `nexus --version` to print the build version.")
 			os.Exit(0)
 		case "-v", "--version", "version":
@@ -89,7 +110,7 @@ func main() {
 			os.Exit(0)
 		default:
 			fmt.Fprintf(os.Stderr, "nexus: unknown subcommand %q\n\n", os.Args[1])
-			fmt.Fprintln(os.Stderr, "Usage: nexus [check|doctor|dashboard]")
+			fmt.Fprintln(os.Stderr, "Usage: nexus [check|doctor|config|dashboard|judge|routing-preview]")
 			os.Exit(2)
 		}
 	}
@@ -104,6 +125,40 @@ func main() {
 	}
 	logger := cfg.NewLogger()
 	slog.SetDefault(logger)
+
+	// OTLP/JSON tracing exporter (issue #787). When TracingEndpoint is
+	// empty the exporter is nil and RegisterExporter is skipped — all
+	// GlobalExporter() calls are safe no-ops and the gauge providers
+	// below will return 0 for queue-depth / dropped counters.
+	var exporterCloser func() error
+	if cfg.TracingEndpoint != "" {
+		exporter := tracing.NewExporter(tracing.ExporterConfig{
+			Endpoint:  cfg.TracingEndpoint,
+			Timeout:   cfg.TracingTimeout,
+			QueueSize: cfg.TracingQueueSize,
+			BatchSize: cfg.TracingBatchSize,
+			Sampler:   tracing.NewProbabilitySampler(cfg.TracingSampleRate),
+		})
+		tracing.RegisterExporter(exporter)
+		exporterCloser = exporter.Close
+		slog.Info("tracing exporter wired",
+			slog.String("endpoint", cfg.TracingEndpoint),
+			slog.Duration("timeout", cfg.TracingTimeout),
+			slog.Int("queue_size", cfg.TracingQueueSize),
+			slog.Int("batch_size", cfg.TracingBatchSize),
+			slog.Float64("sample_rate", cfg.TracingSampleRate),
+		)
+	}
+
+	// Safety net: in normal operation the signal handler closes the
+	// exporter explicitly. The deferred call fires on any early return
+	// (e.g. a future introduced before the signal handler is reachable)
+	// and is a no-op when exporterCloser is nil or already called.
+	defer func() {
+		if exporterCloser != nil {
+			_ = exporterCloser() // nil func is impossible here, but defers are fire-and-forget
+		}
+	}()
 
 	// Shared pooled HTTP client for all outbound upstream calls (issue #184).
 	// Connection pooling reduces TCP handshake overhead across Ollama,
@@ -129,10 +184,11 @@ func main() {
 	// the cache (falls back to the raw embedder).
 	var ragEmbedder rag.Embedder = emb
 	if cfg.RAGEmbedCacheSize > 0 && cfg.RAGEmbedCacheTTL > 0 {
-		ragEmbedder = rag.NewEmbedCache(emb, cfg.RAGEmbedCacheSize, cfg.RAGEmbedCacheTTL)
+		ragEmbedder = rag.NewEmbedCache(emb, cfg.RAGEmbedCacheSize, cfg.RAGEmbedCacheTTL, cfg.RAGEmbedCacheWaitTimeout)
 		slog.Info("rag embedding cache enabled",
 			slog.Int("max_entries", cfg.RAGEmbedCacheSize),
 			slog.Duration("ttl", cfg.RAGEmbedCacheTTL),
+			slog.Duration("wait_timeout", cfg.RAGEmbedCacheWaitTimeout),
 		)
 	}
 
@@ -144,7 +200,7 @@ func main() {
 	// in-memory-only Store with the original IndexDir semantics —
 	// the proxy is byte-for-byte identical to the pre-issue-46
 	// behaviour.
-	store, persistentStore, ragWatcher := buildRAGStore(cfg, ragEmbedder, bootCtx)
+	store, persistentStore, ragWatcher, ragEmbed := buildRAGStore(cfg, ragEmbedder, bootCtx)
 
 	slm := router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, cfg.SLMTimeout, httpClient)
 	// Judge-guided adaptive routing (issue #47): the confidence
@@ -153,10 +209,9 @@ func main() {
 	// router defaults, so this is safe even when the feature is off.
 	slm.ConfidenceFloor = cfg.RoutingConfidenceFloor
 	slm.ConfidenceCeiling = cfg.RoutingConfidenceCeiling
-	// SLM routing decision cache (issue #162). Zero values fall back
-	// to the NewSLMClient defaults (5m TTL, 512 max entries).
-	slm.CacheTTL = cfg.SLMCacheTTL
-	slm.CacheMaxEntries = cfg.SLMCacheMaxEntries
+	// SLMClient no longer has its own internal decision cache (issue #489).
+	// The planner-level SLMCache wired below is the sole caching layer and
+	// honours NEXUS_SLM_CACHE_TTL=0 as a true kill-switch.
 
 	// Ollama health poller (issue #8). When NEXUS_HEALTH_POLL_INTERVAL
 	// is zero the handler treats Ollama as always healthy (useful for
@@ -197,6 +252,23 @@ func main() {
 	// back to the static value when it produces no budget.
 	probeImpl := probe.NewOllamaProbe(cfg.OllamaURL, httpClient)
 	probeImpl.BytesPerToken = cfg.ProbeBytesPerToken
+	// Thermal throttle threshold (issue #597): when the GPU junction
+	// temperature exceeds this value the probe collapses the budget so
+	// the router falls back to the static guardrail instead of routing
+	// heavy prompts to a thermally-clamped GPU. A zero config value
+	// disables the check inside the probe.
+	probeImpl.ThermalThreshold = cfg.ProbeThermalThreshold
+	// Restrict the VRAM probe's context signal to the configured chat
+	// model so a resident embedding model (e.g. nomic-embed-text, 8192
+	// context) cannot shrink the chat-route guardrail below the chat
+	// model's real window (issue #490). When LocalModel is empty the
+	// probe keeps the legacy smallest-across-all behaviour.
+	probeImpl.ChatModel = cfg.LocalModel
+	if cfg.LocalModel != "" {
+		slog.Info("vram probe scoped to chat model",
+			slog.String("chat_model", cfg.LocalModel),
+		)
+	}
 	probeMgr := probe.NewManager(probeImpl, cfg.ProbePollInterval, cfg.ProbeTimeout)
 	go probeMgr.Run(context.Background())
 	defer func() {
@@ -224,12 +296,14 @@ func main() {
 	// missing probe never opens the floodgates. The closure reads
 	// probeMgr directly so the limiter never imports internal/probe.
 	var localLimiter handlers.LocalLimiter
+	var localConcLimiter *concurrencylimit.Limiter
 	if cfg.LocalMaxConcurrent > 0 {
-		localLimiter = concurrencylimit.New(
+		localConcLimiter = concurrencylimit.New(
 			cfg.LocalMaxConcurrent,
 			cfg.LocalVRAMBytesPerSlot,
 			func() int64 { return probeMgr.Get().FreeVRAMBytes },
 		)
+		localLimiter = localConcLimiter
 		slog.Info("local-route concurrency limiter enabled",
 			slog.Int("ceiling", cfg.LocalMaxConcurrent),
 			slog.Int64("bytes_per_slot", cfg.LocalVRAMBytesPerSlot),
@@ -282,11 +356,19 @@ func main() {
 
 	var rateLimiter *ratelimit.Middleware
 	if cfg.RateLimitEnabled() {
-		rateLimiter = ratelimit.NewMiddleware(cfg.RateLimitRPM, cfg.RateLimitBurst, ipResolver)
+		var keyFn func(*http.Request) string
+		if cfg.RateLimitByAPIKey {
+			keyFn = func(r *http.Request) string {
+				ip := ipResolver.Resolve(r)
+				return ratelimit.APIKeyAwareKeyFunc(ip, r)
+			}
+		}
+		rateLimiter = ratelimit.NewMiddleware(cfg.RateLimitRPM, cfg.RateLimitBurst, ipResolver, keyFn)
 		slog.Info("rate limiter enabled",
 			slog.Int("rpm", cfg.RateLimitRPM),
 			slog.Int("burst", cfg.RateLimitBurst),
 			slog.Bool("trusted_proxies", cfg.TrustedProxiesConfigured()),
+			slog.Bool("by_api_key", cfg.RateLimitByAPIKey),
 		)
 	} else {
 		slog.Info("rate limiter disabled (NEXUS_RATE_LIMIT_RPM<=0)")
@@ -343,6 +425,14 @@ func main() {
 	// Handler() call stay in the late-setup block below.
 	routeCounters := observability.NewRouteCounters()
 
+	// Wire the local-route cooldown failure observer into the route
+	// counters after both are initialised (issue #530).
+	if localCooldown != nil {
+		localCooldown.SetFailureObserver(func() {
+			routeCounters.IncLocalCooldownTriggers()
+		})
+	}
+
 	// Circuit breaker metrics collector (issue #304). Created early so it
 	// is available for wiring into the chat handler Deps.
 	circuitCollector := observability.NewCollector()
@@ -377,7 +467,7 @@ func main() {
 					slog.String("path", cfg.JudgeDBPath),
 					slog.Any("err", err),
 				)
-				storage = judge.NewMemoryStorage()
+				storage = judge.NewMemoryStorage(0)
 			} else {
 				storage = store
 				slog.Info("judge SQLite store opened",
@@ -385,7 +475,7 @@ func main() {
 				)
 			}
 		} else {
-			storage = judge.NewMemoryStorage()
+			storage = judge.NewMemoryStorage(0)
 			slog.Info("judge SQLite store disabled (NEXUS_JUDGE_DB is empty); using in-memory store")
 		}
 
@@ -433,6 +523,7 @@ func main() {
 				Instruction: c.Instruction,
 				Output:      c.Output,
 				LocalModel:  c.LocalModel,
+				Route:       c.Route,
 				TraceParent: c.TraceParent,
 				TraceState:  c.TraceState,
 			}) {
@@ -473,6 +564,28 @@ func main() {
 			slog.Error("telemetry close", slog.Any("err", err))
 		}
 	}()
+
+	// Distributed tracing OTLP exporter (issue #41, #804). When
+	// NEXUS_TRACING_ENDPOINT is set, start the exporter and register
+	// it as the process-wide tracer so middleware and the chat handler
+	// can guard span creation with tracing.Enabled. The timeout is
+	// configurable via NEXUS_TRACING_TIMEOUT (default 10s) so
+	// high-latency collectors don't cause premature POST failures.
+	if endpoint := os.Getenv("NEXUS_TRACING_ENDPOINT"); endpoint != "" {
+		exp := tracing.NewExporter(tracing.ExporterConfig{
+			Endpoint:  endpoint,
+			Timeout:   cfg.TracingTimeout,
+			BatchSize: cfg.TracingBatchSize,
+		})
+		if exp != nil {
+			tracing.RegisterExporter(exp)
+			slog.Info("tracing exporter started",
+				slog.String("endpoint", endpoint),
+				slog.Duration("timeout", cfg.TracingTimeout),
+				slog.Int("batch_size", cfg.TracingBatchSize),
+			)
+		}
+	}
 
 	// Frontier provider registry (issue #223). When NEXUS_FRONTIER_PROVIDERS
 	// is set, ParseProvidersFromEnv parses the JSON array and returns a
@@ -603,10 +716,224 @@ func main() {
 		}
 	}()
 
+	// Wire dropped-counter gauge providers into /metrics (issue #442).
+	// Each provider reads the cumulative drop count from its backing
+	// store at scrape time so the Prometheus counter stays live.
+	routeCounters.SetGaugeProviders(
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var v uint64
+			if verifier != nil {
+				v = verifier.Dropped()
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_quality_dropped_total",
+				Value: float64(v),
+			}}
+		}),
+		// Judge queue-depth and concurrency gauges (issue #890).
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var qd int
+			var cc int
+			if judgeEval != nil {
+				qd = judgeEval.QueueDepth()
+				cc = judgeEval.Concurrency()
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_judge_queue_depth", Value: float64(qd)},
+				{Name: "nexus_judge_concurrency", Value: float64(cc)},
+			}
+		}),
+		// Judge dropped counter (issue #892).
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var v uint64
+			if judgeEval != nil {
+				v = judgeEval.Dropped()
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_judge_dropped_total",
+				Value: float64(v),
+			}}
+		}),
+		// Quality queue-depth and concurrency gauges (issue #890).
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var qd int
+			var cc int
+			if verifier != nil {
+				qd = verifier.QueueDepth()
+				cc = verifier.Concurrency()
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_quality_queue_depth", Value: float64(qd)},
+				{Name: "nexus_quality_concurrency", Value: float64(cc)},
+			}
+		}),
+		// Quality dropped ring capacity gauge (issue #1066).
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var rc int
+			if verifier != nil {
+				rc = verifier.DroppedRingCapacity()
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_quality_dropped_ring_capacity", Value: float64(rc)},
+			}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var v uint64
+			if ms, ok := metricsStore.(*metrics.SQLiteStore); ok {
+				v = ms.Dropped()
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_metrics_dropped_total",
+				Value: float64(v),
+			}}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			ms, ok := metricsStore.(*metrics.SQLiteStore)
+			if !ok || cfg.MetricsRetentionDays <= 0 {
+				return nil
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_metrics_prune_last_rows", Value: float64(ms.PruneLastRows())},
+				{Name: "nexus_metrics_prune_last_timestamp_seconds", Value: float64(ms.PruneLastTimestamp())},
+			}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var v uint64
+			if d, ok := recorder.(interface{ Dropped() uint64 }); ok {
+				v = d.Dropped()
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_telemetry_dropped_total",
+				Value: float64(v),
+			}}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var v uint64
+			if r, ok := recorder.(interface{ Rotations() uint64 }); ok {
+				v = r.Rotations()
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_telemetry_rotations_total",
+				Value: float64(v),
+			}}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var v uint64
+			if w, ok := recorder.(interface{ WriteErrors() uint64 }); ok {
+				v = w.WriteErrors()
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_telemetry_write_errors_total",
+				Value: float64(v),
+			}}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			exp := tracing.GlobalExporter()
+			if exp == nil {
+				return nil
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_tracing_dropped_total",
+				Value: float64(exp.Dropped()),
+			}}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			exp := tracing.GlobalExporter()
+			if exp == nil {
+				return nil
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_tracing_flush_failures_total",
+				Value: float64(exp.FlushFailures()),
+			}}
+		}),
+		// Tracing queue-depth gauge (issue #596). Exposes the live
+		// number of spans buffered in the export queue so operators
+		// can alert on exporter saturation before spans are dropped.
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			exp := tracing.GlobalExporter()
+			if exp == nil {
+				return nil
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_tracing_queue_depth",
+				Value: float64(exp.QueueDepth()),
+			}}
+		}),
+		// Tracing batch-size gauge (issue #826). Exposes the configured
+		// batch cap so operators can see what's set at a glance.
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			exp := tracing.GlobalExporter()
+			if exp == nil {
+				return nil
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_tracing_batch_size",
+				Value: float64(exp.BatchCap()),
+			}}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			if localConcLimiter == nil {
+				return nil
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_local_concurrency_effective_slots", Value: float64(localConcLimiter.Effective())},
+				{Name: "nexus_local_concurrency_in_flight", Value: float64(localConcLimiter.InFlight())},
+			}
+		}),
+		// Local-route cooldown gauge (issue #530).
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			if localCooldown == nil {
+				return nil
+			}
+			var v float64
+			if localCooldown.Active() {
+				v = 1
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_local_cooldown_active",
+				Value: v,
+			}}
+		}),
+		// Confidence store rows gauge (issue #834).
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			if confidenceStore == nil {
+				return nil
+			}
+			return []observability.GaugeSample{{
+				Name:  "nexus_confidence_store_rows_total",
+				Value: float64(confidenceStore.RowsTotal()),
+			}}
+		}),
+		// Build info gauge (issue #529). Static metadata — always 1.
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			return []observability.GaugeSample{{
+				Name: "nexus_build_info",
+				Labels: map[string]string{
+					"version":    version,
+					"commit":     commit,
+					"go_version": runtime.Version(),
+				},
+				Value: 1,
+			}}
+		}),
+		// Judge queue depth gauge (issue #881). Reads live queue depth
+		// from the evaluator at scrape time so operators can alert on
+		// saturation before overflow events fire.
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			if judgeEval == nil {
+				return nil
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_judge_queue_depth", Value: float64(judgeEval.QueueDepth())},
+			}
+		}),
+	)
+
 	// Middleware chain (issue #224). Initialize the middleware registry
 	// with the config values so closures capture the per-config state.
 	// Empty MiddlewareChain uses the built-in default chain.
-	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.PromptInjectionIsolated())
+	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.TOONUnfenced, cfg.PromptInjectionIsolated())
 	var mwChain []middleware.Middleware
 	if cfg.MiddlewareChain != "" {
 		var err error
@@ -623,7 +950,7 @@ func main() {
 	// Nil when the chain doesn't contain "rag" (operator removed it).
 	var ctxAwareRAG middleware.ContextMiddleware
 	if len(mwChain) > 0 || cfg.MiddlewareChain == "" {
-		ctxAwareRAG = middleware.NewRAGMiddleware(store, cfg.RAGThreshold)
+		ctxAwareRAG = middleware.NewRAGMiddleware(store)
 	}
 
 	mux := http.NewServeMux()
@@ -645,6 +972,17 @@ func main() {
 		} else {
 			routeCounters.ObserveSLMCacheMiss()
 		}
+		// Issue #875: record DSL fast-pass hits and misses.
+		// e.Source == "dsl" when the DSL matched; e.Reason carries the
+		// category (fusion, formatting, local, unicode).
+		if e.Source == "dsl" {
+			routeCounters.ObserveDSLHit(e.Reason)
+		}
+		// e.DSLMiss is true when the DSL had no opinion and the request
+		// fell through to the SLM.
+		if e.DSLMiss {
+			routeCounters.ObserveDSLMiss()
+		}
 	})
 	// Rejection observer (issue #119). The chat handler dispatches
 	// one RejectionEvent per early-return path; the closure forwards
@@ -655,11 +993,11 @@ func main() {
 	rejectionObs := handlers.RejectionObserverFunc(func(e handlers.RejectionEvent) {
 		routeCounters.ObserveRejection(e.Reason)
 	})
-	// Fusion outcome observer (issue #187). Records whether the fusion
-	// arbiter was skipped (panel members agreed) or invoked (disagreement).
-	// Surfaces as nexus_fusion_arbiter_total{outcome="skipped"|"invoked"}.
+	// Fusion outcome observer (issue #187, extended by #882). Records the
+	// reason the fusion arbiter was skipped or empty when invoked.
+	// Surfaces as nexus_fusion_arbiter_total{reason="agreement"|"tool_calls"|"one_member"|"cache_hit"|""}.
 	fusionOutcomeObs := handlers.FusionOutcomeObserverFunc(func(e handlers.FusionOutcomeEvent) {
-		routeCounters.ObserveFusionOutcome(e.ArbiterSkipped)
+		routeCounters.ObserveFusionOutcome(e.SkipReason)
 	})
 	// Cascade fallback observer (issue #205): the chat handler dispatches
 	// one CascadeFallbackEvent per request when a retryable step failure
@@ -686,14 +1024,35 @@ func main() {
 	panelPanicObs := func() {
 		routeCounters.ObservePanelPanic()
 	}
-	// Arbiter synthesis cache (issue #232). Created when TTL > 0;
+	// Prompt-injection hit observer (issue #482). The chat handler calls
+	// this once per request that produced >=1 suspicious-pattern hit,
+	// forwarding the injection mode ("warn" or "strict") so the
+	// nexus_prompt_injection_hits_total{mode} counter can be alerted on.
+	injectionHitObs := func(mode string) {
+		routeCounters.ObservePromptInjectionHit(mode)
+	}
+	// Upstream response body cap (issue #533). Configure once at startup
+	// so the configured NEXUS_MAX_RESPONSE_BYTES value is authoritative
+	// for BufferedFetchWithContext, FetchPanel, and fetchCascadeStep.
+	upstream.ConfigureMaxResponseBytes(int64(cfg.EffectiveMaxResponseBytes()))
+	if cfg.EffectiveMaxResponseBytes() < config.DefaultMaxResponseBytes {
+		slog.Warn("upstream response body cap is below the 64 MiB default",
+			slog.Int("max_response_bytes", cfg.EffectiveMaxResponseBytes()),
+			slog.String("hint", "operator is tightening the cap; confirm this is intentional"),
+		)
+	}
+	// Arbiter synthesis cache (issue #232, #773). Created when TTL > 0;
 	// nil means caching is disabled.
 	var arbiterCache *upstream.ArbiterCache
 	if cfg.ArbiterCacheTTL > 0 {
-		arbiterCache = upstream.NewArbiterCache(cfg.ArbiterCacheTTL)
+		arbiterCache = upstream.NewArbiterCache(cfg.ArbiterCacheTTL, cfg.ArbiterCacheMaxEntries)
 		slog.Info("fusion arbiter cache enabled",
 			slog.Duration("ttl", cfg.ArbiterCacheTTL),
+			slog.Int("max_entries", cfg.ArbiterCacheMaxEntries),
 		)
+		arbiterCache.SetEvictionObserver(func(reason string) {
+			routeCounters.ObserveArbiterCacheEviction(reason)
+		})
 	}
 	mux.Handle("/metrics", routeCounters.Handler())
 	slog.Info("metrics endpoint serves prometheus text format",
@@ -713,9 +1072,22 @@ func main() {
 
 	ragObserver := handlers.RAGObserverFunc(func(e handlers.RAGEvent) {
 		if e.Hit {
-			routeCounters.ObserveRAGHit(e.Filename)
+			routeCounters.ObserveRAGHit()
 		} else {
 			routeCounters.ObserveRAGMiss(e.MissReason)
+		}
+		// RAG similarity histogram (issue #447, #671). Only recorded when
+		// Retrieve actually performed a search — empty-store and
+		// embed-error events carry no path/score so we skip them to
+		// avoid spurious bucket advancement for the "no candidate
+		// scored" sentinel. The effective threshold label (e.EffectiveThreshold)
+		// enables per-domain tuning visibility.
+		if e.IndexPath != "" {
+			outcome := "miss"
+			if e.Hit {
+				outcome = "hit"
+			}
+			circuitCollector.ObserveRAGSimilarity(e.IndexPath, outcome, e.Score, e.EffectiveThreshold)
 		}
 	})
 
@@ -734,27 +1106,76 @@ func main() {
 	var slmCache *router.SLMCache
 	if cfg.SLMCacheEnabled() {
 		if cfg.SLMCacheSemanticThreshold > 0 {
-			slmCache = router.NewSLMCacheWithEmbedder(cfg.SLMCacheTTL, ragEmbedder, cfg.SLMCacheSemanticThreshold)
+			slmCache = router.NewSLMCacheWithEmbedder(cfg.SLMCacheTTL, cfg.SLMCacheMaxEntries, ragEmbedder, cfg.SLMCacheSemanticThreshold)
 			slog.Info("slm decision cache enabled (with semantic deduplication)",
 				slog.Duration("ttl", cfg.SLMCacheTTL),
+				slog.Int("max_entries", cfg.SLMCacheMaxEntries),
 				slog.Float64("semantic_threshold", cfg.SLMCacheSemanticThreshold),
 			)
 		} else {
-			slmCache = router.NewSLMCache(cfg.SLMCacheTTL)
+			slmCache = router.NewSLMCache(cfg.SLMCacheTTL, cfg.SLMCacheMaxEntries)
 			slog.Info("slm decision cache enabled",
 				slog.Duration("ttl", cfg.SLMCacheTTL),
+				slog.Int("max_entries", cfg.SLMCacheMaxEntries),
 			)
 		}
+		// Issue #449: forward every TTL/LRU eviction into the route
+		// counters so /metrics shows nexus_slm_cache_evictions_total
+		// with reason="ttl" or "lru". Distinguishing the two paths lets
+		// operators tell whether the cache is undersized (high lru) or
+		// its TTL is too short (high ttl) without changing the cache
+		// configuration.
+		slmCache.SetEvictionObserver(func(reason string) {
+			routeCounters.ObserveSLMCacheEviction(reason)
+		})
+		// Wire the embed-error observer so embedder degradation is
+		// observable as nexus_slm_cache_embedding_errors_total instead
+		// of silently appearing as cache misses (issue #741).
+		slmCache.SetEmbedErrorObserver(func() {
+			routeCounters.ObserveSLMCacheEmbedError()
+		})
+		slmCache.SetMaxStale(cfg.SLMCacheMaxStale)                           // issue #835
+		slmCache.SetStaleCleanupThreshold(cfg.SLMCacheStaleCleanupThreshold) // issue #1037
+		slmCache.SetMaxScanEntries(cfg.SLMCacheSemanticScanLimit)            // issue #933
 	} else {
 		slog.Info("slm decision cache disabled (NEXUS_SLMCACHE_TTL<=0)")
 	}
+
+	// SLM decision cache gauges (issue #531).
+	routeCounters.SetGaugeProviders(
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			if slmCache == nil {
+				return nil
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_slm_cache_entries", Value: float64(slmCache.Len())},
+				{Name: "nexus_slm_cache_max_entries", Value: float64(slmCache.MaxEntries())},
+				{Name: "nexus_slm_cache_stale_entries", Value: float64(slmCache.Stale())},
+			}
+		}),
+	)
 
 	// Wire circuit breaker metrics into the /metrics output (issue #304).
 	routeCounters.SetCollector(circuitCollector)
 
 	circuitBreakerObs := circuitBreakerAdapter{
-		recordFailure:  circuitCollector.RecordCircuitFailure,
-		recordRecovery: circuitCollector.RecordCircuitRecovery,
+		recordFailure:      circuitCollector.RecordCircuitFailure,
+		recordRecovery:     circuitCollector.RecordCircuitRecovery,
+		incEmbedderFailure: circuitCollector.IncEmbedderFailure,
+		incRAGCircuitTrip:  circuitCollector.IncRAGCircuitTrip,
+		incRAGCircuitRecov: circuitCollector.IncRAGCircuitRecover,
+	}
+
+	// Set the RAG circuit breaker trip callback so trips are counted
+	// synchronously when the threshold is crossed, not lazily on the next
+	// request (issue #971).
+	if ragEmbed != nil {
+		// Determine the embedder kind from config.
+		kind := string(cfg.EmbedderType)
+		if kind == "" {
+			kind = "ollama" // default
+		}
+		ragEmbed.SetTripCallback(kind, circuitBreakerObs.IncRAGCircuitTrip)
 	}
 
 	chatHandler := handlers.Chat(handlers.Deps{
@@ -765,6 +1186,7 @@ func main() {
 		MiddlewareChain:         mwChain,
 		ContextAwareRAG:         ctxAwareRAG,
 		Confidence:              confidenceObs,
+		ConfidenceErrorHook:     func(category string, err error) { circuitCollector.IncConfidenceError() },
 		SLMCache:                slmCache,
 		JudgeObserver:           judgeObs,
 		QualityObserver:         qualityO,
@@ -783,6 +1205,7 @@ func main() {
 		CascadeFallbackObserver: cascadeFallbackObs,
 		ArbiterCacheObserver:    arbiterCacheObserver,
 		PanelPanicObserver:      panelPanicObs,
+		InjectionHitObserver:    injectionHitObs,
 		CircuitBreakerObserver:  circuitBreakerObs,
 		ArbiterCache:            arbiterCache,
 		Providers:               providerRegistry,
@@ -794,6 +1217,8 @@ func main() {
 					TOONCompressionMs:   e.TOONCompressionMs,
 					SLMRoutingMs:        e.SLMRoutingMs,
 					UpstreamFirstByteMs: e.UpstreamFirstByteMs,
+					SLMConfidence:       e.SLMConfidence,
+					SLMTaskType:         e.SLMTaskType,
 				})
 			},
 		),
@@ -811,6 +1236,11 @@ func main() {
 	if rateLimiter != nil {
 		rateLimiter.SetRejectionHook(func() {
 			routeCounters.ObserveRejection(handlers.RejectionRateLimit)
+		})
+		// Issue #746: install the allow hook so bucket utilization is
+		// recorded before the token is consumed.
+		rateLimiter.SetAllowHook(func(bucketID string, utilizationPct float64) {
+			circuitCollector.ObserveRateLimitUtilization(bucketID, utilizationPct)
 		})
 		chatHandler = rateLimiter.Wrap(chatHandler)
 	}
@@ -877,6 +1307,60 @@ func main() {
 			return emb.IsHealthy(ctx)
 		},
 		RAGIndexedExamples: func() int { return store.Size() },
+		RAGDiagnostics: func(ctx context.Context) handlers.RAGStatus {
+			documentCount := store.Size()
+			stats := rag.StoreStats{}
+			if provider, ok := store.(interface{ Stats() rag.StoreStats }); ok {
+				stats = provider.Stats()
+			}
+			healthy := ragEmbedder.IsHealthy(ctx)
+			storeType := "memory"
+			storePath := ""
+			if persistentStore != nil {
+				storeType = "sqlite"
+				storePath = persistentStore.Path()
+			}
+			hitRate := 0.0
+			if stats.RetrievalAttempts > 0 {
+				hitRate = float64(stats.RetrievalHits) / float64(stats.RetrievalAttempts)
+			}
+			status := handlers.RAGStatus{
+				Healthy:         healthy,
+				IndexedExamples: documentCount,
+				StoreType:       storeType,
+				StorePath:       storePath,
+				DocumentCount:   documentCount,
+				Threshold:       store.Threshold(),
+				IndexMode:       store.IndexMode(),
+				IndexGeneration: stats.IndexGeneration,
+				LastIndexAt:     stats.LastIndexAt,
+			}
+			status.Embedder.Type = string(cfg.EmbedderType)
+			status.Embedder.Model = cfg.EmbeddingModel
+			status.Embedder.Healthy = healthy
+			status.Embedder.CircuitOpen = store.IsBreakerOpen()
+			status.Retrieval.Attempts = stats.RetrievalAttempts
+			status.Retrieval.Hits = stats.RetrievalHits
+			status.Retrieval.Misses = stats.RetrievalMisses
+			status.Retrieval.HitRate = hitRate
+			status.Retrieval.EmptyStoreMisses = stats.EmptyStoreMisses
+			status.Retrieval.ThresholdMisses = stats.ThresholdMisses
+			status.Retrieval.EmbedErrors = stats.EmbedErrors
+			status.Retrieval.InjectionSkippedSizeLimit = stats.InjectionSkippedSizeLimit
+			status.Retrieval.MissesByReason = map[string]uint64{
+				"empty_store": stats.EmptyStoreMisses,
+				"threshold":   stats.ThresholdMisses,
+				"embed_error": stats.EmbedErrors,
+			}
+			status.Cache.Enabled = cfg.RAGEmbedCacheSize > 0 && cfg.RAGEmbedCacheTTL > 0
+			status.Cache.Hits = stats.CacheHits
+			status.Cache.Misses = stats.CacheMisses
+			total := stats.CacheHits + stats.CacheMisses
+			if total > 0 {
+				status.Cache.HitRate = float64(stats.CacheHits) / float64(total)
+			}
+			return status
+		},
 		RoutingSnapshot: func() handlers.RoutingSnapshot {
 			snap := routeCounters.Snapshot()
 			return handlers.RoutingSnapshot{Decisions: snap}
@@ -941,6 +1425,7 @@ func main() {
 			}
 			return arbiterCache.TTLSeconds()
 		},
+		Version: func() string { return version },
 	}))
 	slog.Info("status endpoint serves async subsystem diagnostics")
 
@@ -977,8 +1462,8 @@ func main() {
 	// when NEXUS_STATUS_PUBLIC=true. When the key is empty the
 	// middleware is a pass-through (zero overhead).
 	var rootHandler http.Handler = mux
+	var authLimiter *ratelimit.AuthLimiter
 	if cfg.AuthEnabled() {
-		var authLimiter *ratelimit.AuthLimiter
 		if cfg.AuthRateLimitEnabled() {
 			authLimiter = ratelimit.NewAuthLimiter(
 				cfg.AuthRateLimitRPM,
@@ -986,13 +1471,29 @@ func main() {
 				cfg.AuthRateLimitWindow,
 				ipResolver,
 			)
-			authLimiter.SetOnBlock(func() {
-				circuitCollector.IncAuthRateLimitRejected()
+			authLimiter.SetOnBlock(func(reason string) {
+				routeCounters.ObserveRejection(handlers.RejectionAuthRateLimit)
+				circuitCollector.IncAuthBlocked(reason)
+			})
+			authLimiter.SetOnReap(func() {
+				routeCounters.IncAuthReaperEvictions()
 			})
 			slog.Info("auth brute-force protection enabled",
 				slog.Int("rpm", cfg.AuthRateLimitRPM),
 				slog.Int("burst", cfg.AuthRateLimitBurst),
 				slog.Duration("window", cfg.AuthRateLimitWindow),
+			)
+			// Auth limiter gauges (issue #744).
+			routeCounters.SetGaugeProviders(
+				observability.GaugeProviderFunc(func() []observability.GaugeSample {
+					if authLimiter == nil {
+						return nil
+					}
+					return []observability.GaugeSample{
+						{Name: "nexus_auth_limiter_tracked_ips", Value: float64(authLimiter.BucketCount())},
+						{Name: "nexus_auth_limiter_blocked_ips", Value: float64(authLimiter.BlockedCount())},
+					}
+				}),
 			)
 		}
 		authMw := auth.NewMiddleware(cfg.ProxyAPIKey, publicPathExempt(cfg), authLimiter, circuitCollector)
@@ -1004,17 +1505,27 @@ func main() {
 		slog.Info("inbound auth disabled (NEXUS_PROXY_API_KEY unset)")
 	}
 
-	// Security headers (issue #235) are the OUTERMOST layer so every
-	// response — including 401, 429, and 500 error envelopes — carries
-	// the hardening headers. Inside that we apply panic recovery so a
-	// nil dereference or surprise regex anywhere downstream is turned
+	// Security headers (issue #235, hardened in #444) are the OUTERMOST
+	// layer so every response — including 401, 429, and 500 error
+	// envelopes — carries the hardening headers. The middleware takes the
+	// effective TLS posture (cfg.TLSEnabled, derived from NEXUS_TLS_ENABLED
+	// or yaml `tls_enabled:`) and gates Strict-Transport-Security on it:
+	// HSTS is only stamped when the operator declares the inbound as TLS
+	// (direct termination OR a TLS-terminating reverse proxy in front).
+	// Emitting HSTS over plaintext is a spec violation and is silently
+	// ignored by browsers, so the canonical implementation is the single
+	// source of truth — there is no longer a duplicate middleware that
+	// unconditionally stamps HSTS. Inside that we apply panic recovery so
+	// a nil dereference or surprise regex anywhere downstream is turned
 	// into a structured slog.Error plus a 500 JSON envelope (or a
 	// trailing SSE error frame when the response already started
-	// streaming) instead of a TCP reset with no body. Zero overhead
-	// on the happy path.
+	// streaming) instead of a TCP reset with no body. Zero overhead on
+	// the happy path.
 	srv := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           middleware.SecurityHeaders()(handlers.Recover()(rootHandler)),
+		Addr: cfg.Addr,
+		Handler: handlers.SecurityHeaders(cfg.TLSEnabled)(handlers.Recover(func(path string) {
+			routeCounters.ObserveHandlerPanic(path)
+		})(rootHandler)),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
@@ -1042,6 +1553,17 @@ func main() {
 				slog.Warn("judge close", slog.Any("err", err))
 			}
 		}
+		if rateLimiter != nil {
+			rateLimiter.Close()
+		}
+		if authLimiter != nil {
+			authLimiter.Stop()
+		}
+		if exporterCloser != nil {
+			if err := exporterCloser(); err != nil {
+				slog.Warn("tracing exporter close", slog.Any("err", err))
+			}
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -1063,6 +1585,15 @@ func main() {
 				rateLimiter.SetRPM(newCfg.RateLimitRPM)
 				rateLimiter.SetBurst(newCfg.RateLimitBurst)
 			}
+			// Update auth brute-force limiter (issue #895).
+			if authLimiter != nil {
+				authLimiter.SetRPM(newCfg.AuthRateLimitRPM)
+				authLimiter.SetBurst(newCfg.AuthRateLimitBurst)
+				authLimiter.SetWindow(newCfg.AuthRateLimitWindow)
+			}
+			// Update trusted-proxy allowlist so rate limiter sees the new CIDRs
+			// without requiring a restart (issue #896).
+			ipResolver.SetTrustedProxies(newCfg.TrustedProxies)
 			// Update structured logger level and format.
 			newLogger := newCfg.NewLogger()
 			slog.SetDefault(newLogger)
@@ -1070,6 +1601,9 @@ func main() {
 			slog.Info("config reloaded via SIGHUP",
 				slog.Int("rate_limit_rpm", newCfg.RateLimitRPM),
 				slog.Int("rate_limit_burst", newCfg.RateLimitBurst),
+				slog.Int("auth_rate_limit_rpm", newCfg.AuthRateLimitRPM),
+				slog.Int("auth_rate_limit_burst", newCfg.AuthRateLimitBurst),
+				slog.Duration("auth_rate_limit_window", newCfg.AuthRateLimitWindow),
 				slog.String("log_level", newCfg.LogLevel.String()),
 				slog.String("log_format", newCfg.LogFormat.String()),
 				slog.Bool("debug", newCfg.Debug),
@@ -1079,6 +1613,9 @@ func main() {
 					slog.String("setting", name),
 					slog.String("hint", "send SIGTERM/SIGINT to gracefully restart"),
 				)
+			}
+			for _, warn := range result.Warnings {
+				slog.Warn("config reload warning", slog.String("warning", warn))
 			}
 		}
 	}()
@@ -1132,17 +1669,41 @@ func (b *confidenceBridge) forget(requestID string) {
 	b.mu.Unlock()
 }
 
-// Record resolves the category for the scored request and feeds a local
+// Record resolves the category for the scored request and feeds the
 // outcome into the confidence store, then delegates to the inner storage.
-// Parse-failure scores (Err set, or Score outside 1..5) are persisted by
-// the inner storage but excluded from the confidence aggregate.
+// Parse-failure scores (Err set, Score outside 1..5, or Score==0 with no Err)
+// are persisted by the inner storage but excluded from the confidence aggregate.
+//
+// NOTE(issue #1017): A previous version of this function had an "else if"
+// branch that called RecordOutcome with a hardcoded RouteLocal before the
+// route-aware call, causing duplicate RecordOutcome invocations for in-range
+// scores (1-5). The fix consolidates into a single RecordOutcome call
+// inside the else block, with empty s.Route defaulting to RouteLocal.
 func (b *confidenceBridge) Record(s judge.JudgeScore) error {
 	b.mu.Lock()
 	cat, ok := b.cats[s.RequestID]
 	delete(b.cats, s.RequestID)
 	b.mu.Unlock()
-	if ok && s.Err == nil && s.Score >= 1 {
-		b.conf.RecordOutcome(cat, router.RouteLocal, s.Score)
+	if ok && s.Err == nil {
+		if s.Score < 1 || s.Score > 5 {
+			slog.Warn("confidence: judge score out of range, dropped",
+				slog.String("request_id", s.RequestID),
+				slog.Int("score", s.Score),
+			)
+		} else if s.Score == 0 {
+			slog.Debug("confidence: score=0 with no error, treating as parse failure")
+		} else {
+			route := s.Route
+			if route == "" {
+				route = string(router.RouteLocal) // safety default; empty Route should not occur
+			}
+			if err := b.conf.RecordOutcome(cat, router.Route(route), s.Score); err != nil {
+				slog.Warn("confidence: record outcome rejected",
+					slog.String("request_id", s.RequestID),
+					slog.Any("err", err),
+				)
+			}
+		}
 	}
 	return b.inner.Record(s)
 }
@@ -1174,19 +1735,19 @@ func (b *confidenceBridge) Close() error { return b.inner.Close() }
 // The watcher is started only when persistence is enabled AND
 // NEXUS_RAG_POLL_INTERVAL > 0; an interval of zero leaves
 // persistence on but disables runtime updates (boot-only load).
-func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context) (rag.RAGStore, *rag.PersistentStore, *rag.Watcher) {
+func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context) (rag.RAGStore, *rag.PersistentStore, *rag.Watcher, rag.Embedder) {
 	// emb is already wrapped with EmbedCache by the caller (issue #115, #303)
 	cachedEmb := emb
 	if !cfg.RAGPersistentEnabled() {
 		slog.Info("rag persistent store disabled (NEXUS_RAG_DB is empty); using in-memory store")
-		store := rag.NewStore(cachedEmb, cfg.RAGThreshold)
+		store := rag.NewStore(cachedEmb, cfg.RAGThreshold, rag.WithBatchSize(cfg.RAGBatchSize))
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
-		return store, nil, nil
+		return store, nil, nil, cachedEmb
 	}
 
-	ps, err := rag.OpenPersistentStore(cfg.RAGDBPath, cachedEmb, cfg.RAGThreshold)
+	ps, err := rag.OpenPersistentStore(cfg.RAGDBPath, cachedEmb, cfg.RAGThreshold, rag.WithBatchSize(cfg.RAGBatchSize))
 	if err != nil {
 		// Persistence is a best-effort optimisation. Fall back to
 		// the in-memory store so the proxy still serves traffic —
@@ -1196,11 +1757,11 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 			slog.String("path", cfg.RAGDBPath),
 			slog.Any("err", err),
 		)
-		store := rag.NewStore(cachedEmb, cfg.RAGThreshold)
+		store := rag.NewStore(cachedEmb, cfg.RAGThreshold, rag.WithBatchSize(cfg.RAGBatchSize))
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
-		return store, nil, nil
+		return store, nil, nil, cachedEmb
 	}
 
 	n, err := ps.LoadOrIndex(bootCtx, cfg.ExamplesDir)
@@ -1217,7 +1778,7 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
-		return store, nil, nil
+		return store, nil, nil, cachedEmb
 	}
 	slog.Info("rag persistent store ready",
 		slog.String("path", cfg.RAGDBPath),
@@ -1236,7 +1797,7 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 		slog.Info("rag file watcher disabled (NEXUS_RAG_POLL_INTERVAL=0); boot-time load only")
 	}
 
-	return ps, ps, watcher
+	return ps, ps, watcher, cachedEmb
 }
 
 // buildRecorder constructs the telemetry recorder from config. A disabled
@@ -1246,12 +1807,26 @@ func buildRecorder(cfg config.Config) telemetry.Recorder {
 		slog.Info("telemetry disabled (NEXUS_TELEMETRY_PATH is empty)")
 		return telemetry.Noop{}
 	}
-	r, err := telemetry.NewJSONLRecorder(cfg.TelemetryPath)
+	r, err := telemetry.NewJSONLRecorder(cfg.TelemetryPath, int64(cfg.TelemetryMaxBytes), cfg.TelemetryMaxFiles, cfg.TelemetryBufferSize, cfg.TelemetryFlushInterval)
 	if err != nil {
 		slog.Error("telemetry recorder init failed, falling back to Noop", slog.Any("err", err))
 		return telemetry.Noop{}
 	}
-	slog.Info("telemetry recording", slog.String("path", r.Path()))
+	if cfg.TelemetryMaxBytes > 0 {
+		slog.Info("telemetry rotation enabled",
+			slog.Int("max_bytes", cfg.TelemetryMaxBytes),
+			slog.Int("max_files", cfg.TelemetryMaxFiles),
+			slog.Int("buffer_size", cfg.TelemetryBufferSize),
+			slog.Duration("flush_interval", cfg.TelemetryFlushInterval),
+			slog.String("path", r.Path()),
+		)
+	} else {
+		slog.Info("telemetry recording",
+			slog.Int("buffer_size", cfg.TelemetryBufferSize),
+			slog.Duration("flush_interval", cfg.TelemetryFlushInterval),
+			slog.String("path", r.Path()),
+		)
+	}
 	return r
 }
 
@@ -1266,13 +1841,16 @@ func buildMetrics(cfg config.Config) (metrics.Store, handlers.MetricsObserver) {
 		slog.Info("metrics disabled (NEXUS_METRICS_DB is empty)")
 		return nil, nil
 	}
-	store, err := metrics.Open(cfg.MetricsDBPath)
+	store, err := metrics.OpenWithRetention(cfg.MetricsDBPath, cfg.MetricsRetentionDays, nil)
 	if err != nil {
 		slog.Error("metrics open failed, metrics disabled", slog.Any("err", err))
 		return nil, nil
 	}
 	if ss, ok := store.(*metrics.SQLiteStore); ok {
-		slog.Info("metrics recording", slog.String("path", ss.Path()))
+		slog.Info("metrics recording",
+			slog.String("path", ss.Path()),
+			slog.Int("retention_days", cfg.MetricsRetentionDays),
+		)
 	}
 	obs := handlers.MetricsObserverFunc(func(e handlers.MetricsEvent) {
 		// The adapter does its own error handling — RecordRequest

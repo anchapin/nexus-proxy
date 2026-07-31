@@ -1,8 +1,13 @@
 package tracing
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -192,6 +197,42 @@ func TestSpanRecordErrorSetsStatus(t *testing.T) {
 	}
 }
 
+func TestSpanAddEvent(t *testing.T) {
+	_, s := StartSpan(Context{}, "op")
+	s.AddEvent("first_token")
+	s.AddEvent("stream_complete")
+	s.End()
+	if len(s.Events) != 2 {
+		t.Errorf("event count = %d, want 2", len(s.Events))
+	}
+	if s.Events[0].Name != "first_token" {
+		t.Errorf("event[0].name = %q, want first_token", s.Events[0].Name)
+	}
+	if s.Events[1].Name != "stream_complete" {
+		t.Errorf("event[1].name = %q, want stream_complete", s.Events[1].Name)
+	}
+	if s.Events[0].Timestamp.IsZero() {
+		t.Error("event[0].timestamp not set")
+	}
+}
+
+func TestSpanAddEventWithAttributes(t *testing.T) {
+	_, s := StartSpan(Context{}, "op")
+	s.AddEvent("first_token", map[string]any{"ttft_ms": 42.5})
+	s.End()
+	if len(s.Events) != 1 {
+		t.Errorf("event count = %d, want 1", len(s.Events))
+	}
+	if s.Events[0].Attributes["ttft_ms"] != 42.5 {
+		t.Errorf("event attr ttft_ms = %v, want 42.5", s.Events[0].Attributes["ttft_ms"])
+	}
+}
+
+func TestSpanNilAddEvent(t *testing.T) {
+	var s *Span
+	s.AddEvent("first_token") // must not panic
+}
+
 func TestSpanEndTwiceIdempotent(t *testing.T) {
 	_, s := StartSpan(Context{}, "op")
 	first := time.Now()
@@ -244,3 +285,228 @@ func TestSpanConcurrentAttributes(t *testing.T) {
 type errFake string
 
 func (e errFake) Error() string { return string(e) }
+
+func TestStatusString(t *testing.T) {
+	if StatusOK.String() != "OK" {
+		t.Errorf("StatusOK.String() = %q, want %q", StatusOK.String(), "OK")
+	}
+	if StatusError.String() != "ERROR" {
+		t.Errorf("StatusError.String() = %q, want %q", StatusError.String(), "ERROR")
+	}
+	if StatusUnset.String() != "UNSET" {
+		t.Errorf("StatusUnset.String() = %q, want %q", StatusUnset.String(), "UNSET")
+	}
+}
+
+func TestStatusValues(t *testing.T) {
+	if StatusUnset != 0 {
+		t.Errorf("StatusUnset = %d, want %d", StatusUnset, 0)
+	}
+	if StatusOK != 1 {
+		t.Errorf("StatusOK = %d, want %d", StatusOK, 1)
+	}
+	if StatusError != 2 {
+		t.Errorf("StatusError = %d, want %d", StatusError, 2)
+	}
+	if StatusUnset >= StatusOK {
+		t.Errorf("StatusUnset >= StatusOK, want StatusUnset < StatusOK")
+	}
+	if StatusOK >= StatusError {
+		t.Errorf("StatusOK >= StatusError, want StatusOK < StatusError")
+	}
+}
+
+func TestStartSpanFromContextDisabled(t *testing.T) {
+	RegisterExporter(nil)
+	ctx := context.Background()
+	gotCtx, span := StartSpanFromContext(ctx, "op")
+	if gotCtx != ctx {
+		t.Errorf("ctx not returned unchanged when disabled")
+	}
+	if span != nil {
+		t.Errorf("span = %v, want nil when disabled", span)
+	}
+}
+
+func TestStartSpanFromContextNoParent(t *testing.T) {
+	e := NewExporter(ExporterConfig{Endpoint: "http://unused"})
+	RegisterExporter(e)
+	defer func() {
+		RegisterExporter(nil)
+		e.Close()
+	}()
+
+	ctx := context.Background()
+	_, span := StartSpanFromContext(ctx, "root")
+	if span == nil {
+		t.Fatal("span is nil with exporter registered")
+	}
+	if span.TraceID == "" {
+		t.Error("span should have a fresh trace id")
+	}
+	if span.ParentSpanID != "" {
+		t.Errorf("root span parent = %q, want empty", span.ParentSpanID)
+	}
+	if span.Name != "root" {
+		t.Errorf("span name = %q, want root", span.Name)
+	}
+}
+
+func TestStartSpanFromContextWithParent(t *testing.T) {
+	e := NewExporter(ExporterConfig{Endpoint: "http://unused"})
+	RegisterExporter(e)
+	defer func() {
+		RegisterExporter(nil)
+		e.Close()
+	}()
+
+	parent := Context{TraceID: "0af7651916cd43dd8448eb211c80319c", SpanID: "b7ad6b7169203331"}
+	ctx := WithSpanContext(context.Background(), parent)
+
+	gotCtx, span := StartSpanFromContext(ctx, "child")
+	if span == nil {
+		t.Fatal("span is nil with parent context")
+	}
+	if span.TraceID != parent.TraceID {
+		t.Errorf("span trace = %q, want parent %q", span.TraceID, parent.TraceID)
+	}
+	if span.ParentSpanID != parent.SpanID {
+		t.Errorf("span parent = %q, want parent span %q", span.ParentSpanID, parent.SpanID)
+	}
+	if span.SpanID == parent.SpanID || span.SpanID == "" {
+		t.Errorf("span id not fresh: %q", span.SpanID)
+	}
+
+	got, ok := SpanContextFromContext(gotCtx)
+	if !ok {
+		t.Fatal("returned ctx does not carry span context")
+	}
+	if got.TraceID != parent.TraceID {
+		t.Errorf("returned ctx trace = %q, want %q", got.TraceID, parent.TraceID)
+	}
+}
+
+func TestWithRootSpanAndRootSpanFromContext(t *testing.T) {
+	_, rootSpan := StartSpan(Context{}, "root")
+	rootSpan.SetAttr("initial", "value")
+
+	ctx := WithRootSpan(context.Background(), rootSpan)
+
+	got, ok := RootSpanFromContext(ctx)
+	if !ok {
+		t.Fatal("RootSpanFromContext returned ok=false, want true")
+	}
+	if got != rootSpan {
+		t.Errorf("RootSpanFromContext returned %v, want %v", got, rootSpan)
+	}
+	if got.Attributes["initial"] != "value" {
+		t.Errorf("root span attr[initial] = %v, want 'value'", got.Attributes["initial"])
+	}
+
+	//nolint:staticcheck
+	got, ok = RootSpanFromContext(nil)
+	if ok || got != nil {
+		t.Errorf("RootSpanFromContext(nil) = (%v, %v), want (nil, false)", got, ok)
+	}
+
+	// missing root span returns ok=false
+	got, ok = RootSpanFromContext(context.Background())
+	if ok {
+		t.Errorf("RootSpanFromContext(plain ctx) = (%v, %v), want (nil, false)", got, ok)
+	}
+}
+
+func TestRootSpanFromContextNotOverwrittenByWithSpanContext(t *testing.T) {
+	_, rootSpan := StartSpan(Context{}, "root")
+	ctx := WithRootSpan(context.Background(), rootSpan)
+
+	parent := Context{TraceID: "0af7651916cd43dd8448eb211c80319c", SpanID: "b7ad6b7169203331"}
+	ctx = WithSpanContext(ctx, parent)
+
+	got, ok := RootSpanFromContext(ctx)
+	if !ok {
+		t.Fatal("RootSpanFromContext returned ok=false after WithSpanContext")
+	}
+	if got != rootSpan {
+		t.Errorf("RootSpanFromContext returned %v, want rootSpan %v", got, rootSpan)
+	}
+}
+
+func TestEnabledFalse(t *testing.T) {
+	RegisterExporter(nil)
+	if Enabled() {
+		t.Error("Enabled() = true, want false with nil exporter")
+	}
+}
+
+func TestGlobalExporterNil(t *testing.T) {
+	RegisterExporter(nil)
+	if GlobalExporter() != nil {
+		t.Error("GlobalExporter() = nil, want nil when no exporter registered")
+	}
+}
+
+func TestRegisterExporterIdempotent(t *testing.T) {
+	e := NewExporter(ExporterConfig{Endpoint: "http://unused"})
+	RegisterExporter(e)
+	RegisterExporter(e)
+	RegisterExporter(e)
+
+	if !Enabled() {
+		t.Error("Enabled() = false, want true after RegisterExporter")
+	}
+	if GlobalExporter() != e {
+		t.Errorf("GlobalExporter() = %v, want %v", GlobalExporter(), e)
+	}
+
+	RegisterExporter(nil)
+	e.Close()
+}
+
+// TestRegisterExporterEnablesGlobalWiring is the regression test for issue #787:
+// RegisterExporter must be called so that GlobalExporter() returns the registered
+// exporter and spans submitted via GlobalExporter() are actually exported.
+func TestRegisterExporterEnablesGlobalWiring(t *testing.T) {
+	RegisterExporter(nil)
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	e := NewExporter(ExporterConfig{
+		Endpoint:  srv.URL,
+		QueueSize: 4,
+	})
+	RegisterExporter(e)
+	defer func() {
+		RegisterExporter(nil)
+		e.Close()
+	}()
+
+	if GlobalExporter() == nil {
+		t.Fatal("GlobalExporter() = nil, want non-nil after RegisterExporter")
+	}
+	if GlobalExporter() != e {
+		t.Errorf("GlobalExporter() = %v, want %v", GlobalExporter(), e)
+	}
+
+	// Spans submitted through GlobalExporter() must reach the collector.
+	const n = 4
+	for i := 0; i < n; i++ {
+		ctx, s := GlobalExporter().StartSpan(Context{TraceID: NewTraceID()}, "test")
+		s.SetAttr("k", "v")
+		s.End()
+		_ = ctx
+	}
+
+	if err := GlobalExporter().Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if hits.Load() == 0 {
+		t.Error("collector received no requests — spans submitted via GlobalExporter() were not exported")
+	}
+}

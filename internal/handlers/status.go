@@ -26,10 +26,52 @@ type QualityStatus struct {
 	Workers  int  `json:"quality_workers"`
 }
 
+type ragEmbedderStatus struct {
+	Type        string `json:"type"`
+	Model       string `json:"model"`
+	Healthy     bool   `json:"healthy"`
+	CircuitOpen bool   `json:"circuit_open"`
+}
+
+type ragRetrievalStatus struct {
+	Attempts         uint64            `json:"attempts"`
+	Hits             uint64            `json:"hits"`
+	Misses           uint64            `json:"misses"`
+	HitRate          float64           `json:"hit_rate"`
+	EmptyStoreMisses uint64            `json:"empty_store_misses"`
+	ThresholdMisses  uint64            `json:"threshold_misses"`
+	EmbedErrors      uint64            `json:"embed_errors"`
+	MissesByReason   map[string]uint64 `json:"misses_by_reason"`
+	// InjectionSkippedSizeLimit counts RAG injections aborted because the
+	// retrieved context block would have exceeded NEXUS_MAX_BODY_BYTES
+	// (issue #594).
+	InjectionSkippedSizeLimit uint64 `json:"last_injection_skipped_size_limit"`
+}
+
+// ragCacheStatus reports the LRU embed-cache hit/miss counters plus
+// the derived cache hit rate. HitRate is 0 when the cache has not
+// been exercised yet (issue #446).
+type ragCacheStatus struct {
+	Enabled bool    `json:"enabled"`
+	Hits    uint64  `json:"hits"`
+	Misses  uint64  `json:"misses"`
+	HitRate float64 `json:"hit_rate"`
+}
+
 // RAGStatus reports the health of the RAG embedder.
 type RAGStatus struct {
-	Healthy         bool `json:"rag_embedding_healthy"`
-	IndexedExamples int  `json:"rag_indexed_examples"`
+	Healthy         bool               `json:"rag_embedding_healthy"`
+	IndexedExamples int                `json:"rag_indexed_examples"`
+	StoreType       string             `json:"store_type"`
+	StorePath       string             `json:"store_path"`
+	DocumentCount   int                `json:"document_count"`
+	Threshold       float64            `json:"threshold"`
+	IndexMode       string             `json:"index_mode"`
+	IndexGeneration int64              `json:"rag_index_generation"`
+	Embedder        ragEmbedderStatus  `json:"embedder"`
+	LastIndexAt     time.Time          `json:"last_index_at"`
+	Retrieval       ragRetrievalStatus `json:"retrieval"`
+	Cache           ragCacheStatus     `json:"cache"`
 }
 
 // RoutingSnapshot is a point-in-time copy of the routing decision counters.
@@ -84,6 +126,7 @@ type StatusDeps struct {
 
 	RAGHealthy         func(context.Context) bool // returns true if RAG embedder is reachable
 	RAGIndexedExamples func() int                 // returns number of indexed examples (0 if none/disabled)
+	RAGDiagnostics     func(context.Context) RAGStatus
 
 	RoutingSnapshot func() RoutingSnapshot // returns a point-in-time snapshot of routing counters
 
@@ -111,6 +154,9 @@ type StatusDeps struct {
 	// ArbiterCache reports the fusion arbiter synthesis cache state.
 	ArbiterCacheEnabled    func() bool
 	ArbiterCacheTTLSeconds func() int
+
+	// Version returns the build version string (issue #529).
+	Version func() string
 }
 
 // Status returns an http.Handler that serves a JSON diagnostic snapshot of
@@ -138,9 +184,18 @@ func Status(d StatusDeps) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
-		ragHealthy := false
-		if d.RAGHealthy != nil {
-			ragHealthy = d.RAGHealthy(ctx)
+		var ragStatus RAGStatus
+		if d.RAGDiagnostics != nil {
+			ragStatus = d.RAGDiagnostics(ctx)
+		} else {
+			ragHealthy := false
+			if d.RAGHealthy != nil {
+				ragHealthy = d.RAGHealthy(ctx)
+			}
+			ragStatus = RAGStatus{
+				Healthy:         ragHealthy,
+				IndexedExamples: intOrZero(d.RAGIndexedExamples),
+			}
 		}
 
 		snapshot := RoutingSnapshot{}
@@ -154,6 +209,7 @@ func Status(d StatusDeps) http.Handler {
 		}
 
 		resp := struct {
+			Version      string             `json:"version"`
 			Judge        JudgeStatus        `json:"judge"`
 			Quality      QualityStatus      `json:"quality"`
 			RAG          RAGStatus          `json:"rag"`
@@ -165,6 +221,7 @@ func Status(d StatusDeps) http.Handler {
 			SLMCache     SLMCacheStatus     `json:"slm_cache"`
 			ArbiterCache ArbiterCacheStatus `json:"arbiter_cache"`
 		}{
+			Version: stringOrZero(d.Version),
 			Judge: JudgeStatus{
 				Enabled:  d.JudgeEnabled != nil && d.JudgeEnabled(),
 				Depth:    intOrZero(d.JudgeDepth),
@@ -177,10 +234,7 @@ func Status(d StatusDeps) http.Handler {
 				Capacity: intOrZero(d.QualityCapacity),
 				Workers:  intOrZero(d.QualityWorkers),
 			},
-			RAG: RAGStatus{
-				Healthy:         ragHealthy,
-				IndexedExamples: intOrZero(d.RAGIndexedExamples),
-			},
+			RAG:     ragStatus,
 			Routing: snapshot,
 			Uptime:  uptimeMs,
 			RateLimiter: RateLimiterStatus{

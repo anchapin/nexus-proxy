@@ -37,6 +37,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/health"
 )
@@ -340,9 +341,11 @@ type HealthStatusDeps struct {
 	Probe         ProbeStats
 	Judge         JudgeStats
 	Quality       QualityStats
+	LocalCooldown *circuit.Cooldown
 	Config        config.Config
 	ReadinessMode string
 	StartTime     time.Time
+	Version       string
 }
 
 // StatusHandler returns the /status handler. The handler returns a
@@ -377,6 +380,7 @@ func StatusHandler(deps HealthStatusDeps) http.HandlerFunc {
 		}
 
 		resp := statusResponse{
+			Version: deps.Version,
 			Ollama: statusOllama{
 				Healthy:      healthy,
 				FailureCount: failures,
@@ -401,6 +405,11 @@ func StatusHandler(deps HealthStatusDeps) http.HandlerFunc {
 				Concurrency: deps.Quality.Concurrency(),
 				Dropped:     deps.Quality.Dropped(),
 			},
+			LocalCooldown: statusLocalCooldown{
+				Enabled:   deps.LocalCooldown != nil && deps.LocalCooldown.Duration > 0,
+				Active:    deps.LocalCooldown != nil && deps.LocalCooldown.Active(),
+				ExpiresAt: deps.LocalCooldown.ExpiresAt(),
+			},
 			UptimeSeconds: uptime,
 			ReadinessMode: NormalizeReadinessMode(deps.ReadinessMode),
 		}
@@ -413,13 +422,15 @@ func StatusHandler(deps HealthStatusDeps) http.HandlerFunc {
 // on fields that would be noisy when absent (e.g. dropped == 0
 // for a verifier that never overflowed its queue).
 type statusResponse struct {
-	Ollama        statusOllama   `json:"ollama"`
-	Frontier      statusFrontier `json:"frontier"`
-	VRAMProbe     statusProbe    `json:"vram_probe"`
-	Judge         statusJudge    `json:"judge"`
-	Quality       statusQuality  `json:"quality"`
-	UptimeSeconds int64          `json:"uptime_seconds"`
-	ReadinessMode string         `json:"readiness_mode"`
+	Version       string              `json:"version"`
+	Ollama        statusOllama        `json:"ollama"`
+	Frontier      statusFrontier      `json:"frontier"`
+	VRAMProbe     statusProbe         `json:"vram_probe"`
+	Judge         statusJudge         `json:"judge"`
+	Quality       statusQuality       `json:"quality"`
+	LocalCooldown statusLocalCooldown `json:"local_cooldown"`
+	UptimeSeconds int64               `json:"uptime_seconds"`
+	ReadinessMode string              `json:"readiness_mode"`
 }
 
 type statusOllama struct {
@@ -449,6 +460,12 @@ type statusQuality struct {
 	QueueDepth  int    `json:"queue_depth"`
 	Concurrency int    `json:"concurrency"`
 	Dropped     uint64 `json:"dropped"`
+}
+
+type statusLocalCooldown struct {
+	Enabled   bool      `json:"enabled"`
+	Active    bool      `json:"active"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 // HealthzHandler returns the /healthz handler, preserved verbatim as

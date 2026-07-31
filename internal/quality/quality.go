@@ -120,11 +120,12 @@ func (f ObserverFunc) Submit(v Verdict) { f(v) }
 // NewShellVerifier so callers can construct from a partial config
 // without exploding.
 type Config struct {
-	Concurrency int           // max parallel workers (default 2)
-	QueueDepth  int           // buffered channel size (default 64)
-	Timeout     time.Duration // per-check timeout (default 60s)
-	StderrCap   int           // stderr bytes retained per verdict (default 2 KiB)
-	Observer    Observer      // required at runtime; nil is replaced with a no-op
+	Concurrency     int           // max parallel workers (default 2)
+	QueueDepth      int           // buffered channel size (default 64)
+	Timeout         time.Duration // per-check timeout (default 60s)
+	StderrCap       int           // stderr bytes retained per verdict (default 2 KiB)
+	Observer        Observer      // required at runtime; nil is replaced with a no-op
+	DroppedRingSize int           // ring buffer capacity for dropped events (default 256)
 	// Now is overridable for tests. Real callers leave it nil and the
 	// verifier uses time.Now.
 	Now func() time.Time
@@ -149,6 +150,9 @@ func (c *Config) applyDefaults() {
 	if c.Now == nil {
 		c.Now = time.Now
 	}
+	if c.DroppedRingSize <= 0 {
+		c.DroppedRingSize = 256
+	}
 }
 
 // Verifier detects project-bearing edits and runs the project's check
@@ -167,8 +171,54 @@ type Verifier interface {
 	QueueDepth() int
 	// Dropped returns the number of events that overflowed the queue.
 	Dropped() uint64
+	// DroppedEvents returns the most recently dropped events.
+	DroppedEvents() []Event
+	// DroppedRingCapacity returns the maximum number of dropped events
+	// retained in the ring buffer for inspection.
+	DroppedRingCapacity() int
 	// Close drains the queue and stops the worker pool.
 	Close() error
+}
+
+// droppedRing is a lock-free ring buffer for recently dropped events.
+// It stores up to c events in a fixed-size circular buffer.
+type droppedRing struct {
+	events []Event
+	idx    atomic.Int64
+	size   int
+}
+
+func newDroppedRing(size int) *droppedRing {
+	return &droppedRing{
+		events: make([]Event, size),
+		size:   size,
+	}
+}
+
+// Push records one dropped event into the ring buffer.
+func (r *droppedRing) Push(e Event) {
+	pos := r.idx.Add(1) - 1
+	r.events[pos%int64(r.size)] = e
+}
+
+// Events returns the recorded dropped events in chronological order,
+// newest first. The slice is a copy and safe to retain.
+func (r *droppedRing) Events() []Event {
+	count := r.idx.Load()
+	if count == 0 {
+		return nil
+	}
+	size := int(count)
+	if size > r.size {
+		size = r.size
+	}
+	// start is the oldest index we need to return
+	start := count - int64(size)
+	result := make([]Event, size)
+	for i := 0; i < size; i++ {
+		result[i] = r.events[(start+int64(i))%int64(r.size)]
+	}
+	return result
 }
 
 // ShellVerifier is the production Verifier: it runs `cargo check`
@@ -180,21 +230,26 @@ type ShellVerifier struct {
 	cfg   Config
 	cache sync.Map // map[string]projectHint (key = absDir of source file)
 
-	queue     chan Event
-	wg        sync.WaitGroup
-	closed    chan struct{}
-	closeOnce sync.Once
-
-	dropped atomic.Uint64 // queue overflow counter
+	queue       chan Event
+	wg          sync.WaitGroup
+	closed      chan struct{}
+	closeOnce   sync.Once
+	dropped     atomic.Uint64 // queue overflow counter
+	droppedRing *droppedRing
 }
 
 // projectHint caches the result of a directory walk: where the project
 // root landed and which Kind of project it is. The (root == "") case
 // is cached too — the same falsey answer avoids re-stat'ing a deep
 // non-project tree for every edit.
+//
+// mtime records the modification time of the discovered manifest file
+// at cache-prime time so we can detect when a manifest is created or
+// deleted after the entry was cached (issue #1067).
 type projectHint struct {
-	root string
-	kind Kind
+	root  string
+	kind  Kind
+	mtime int64 // UnixNano of the manifest at cache-prime; 0 for negative entries
 }
 
 // Compile-time assertion: ShellVerifier satisfies the Verifier interface.
@@ -209,9 +264,10 @@ var _ Verifier = (*ShellVerifier)(nil)
 func NewShellVerifier(cfg Config) *ShellVerifier {
 	cfg.applyDefaults()
 	v := &ShellVerifier{
-		cfg:    cfg,
-		queue:  make(chan Event, cfg.QueueDepth),
-		closed: make(chan struct{}),
+		cfg:         cfg,
+		queue:       make(chan Event, cfg.QueueDepth),
+		closed:      make(chan struct{}),
+		droppedRing: newDroppedRing(cfg.DroppedRingSize),
 	}
 	if cfg.Concurrency <= 0 {
 		close(v.closed)
@@ -254,6 +310,24 @@ func (v *ShellVerifier) Dropped() uint64 {
 	return v.dropped.Load()
 }
 
+// DroppedEvents returns the most recently dropped events up to the
+// configured ring size, newest first.
+func (v *ShellVerifier) DroppedEvents() []Event {
+	if v == nil {
+		return nil
+	}
+	return v.droppedRing.Events()
+}
+
+// DroppedRingCapacity returns the maximum number of dropped events
+// retained in the ring buffer for inspection.
+func (v *ShellVerifier) DroppedRingCapacity() int {
+	if v == nil {
+		return 0
+	}
+	return v.droppedRing.size
+}
+
 // Submit enqueues e for asynchronous verification. It is the non-
 // blocking dispatch entry point: callers (the chat handler) invoke it
 // and return immediately, never waiting on the worker pool.
@@ -275,6 +349,7 @@ func (v *ShellVerifier) Submit(e Event) bool {
 		return true
 	default:
 		v.dropped.Add(1)
+		v.droppedRing.Push(e)
 		slog.Warn("quality queue full, dropped edit",
 			slog.String("request_id", e.RequestID),
 			slog.String("path", e.Path),
@@ -352,6 +427,11 @@ func (v *ShellVerifier) Verify(e Event) Verdict {
 // lookupProject walks up from filePath's directory looking for a
 // recognised manifest. Returns (root, kind, nil); returns ("", "", err)
 // only on a context-like cancellation — currently always nil.
+//
+// Cache entries store the mtime of the discovered manifest so that
+// future calls detect when the manifest file is created or deleted
+// after cache prime (issue #1067). Negative entries (no manifest) have
+// mtime=0 and are invalidated by checking whether any manifest now exists.
 func (v *ShellVerifier) lookupProject(filePath string) (string, Kind, error) {
 	if filePath == "" {
 		return "", KindUnknown, nil
@@ -374,7 +454,28 @@ func (v *ShellVerifier) lookupProject(filePath string) (string, Kind, error) {
 		cacheKey := dir
 		if cached, ok := v.cache.Load(cacheKey); ok {
 			h := cached.(projectHint)
-			return h.root, h.kind, nil
+			// mtime-based invalidation: rewalk if manifest changed.
+			if h.root != "" && h.kind != KindUnknown {
+				marker := h.kind.Marker()
+				if marker == "" {
+					return h.root, h.kind, nil
+				}
+				candidate := filepath.Join(h.root, marker)
+				fi, err := os.Stat(candidate)
+				if err != nil || fi.ModTime().UnixNano() != h.mtime {
+					// Manifest missing or mtime changed — invalidate and rewalk.
+					v.cache.Delete(cacheKey)
+				} else {
+					return h.root, h.kind, nil
+				}
+			} else {
+				// Negative entry: rewalk only if a manifest now exists.
+				if hasAnyManifest(dir) {
+					v.cache.Delete(cacheKey)
+				} else {
+					return h.root, h.kind, nil
+				}
+			}
 		}
 		for _, k := range AllKinds {
 			marker := k.Marker()
@@ -382,8 +483,9 @@ func (v *ShellVerifier) lookupProject(filePath string) (string, Kind, error) {
 				continue
 			}
 			candidate := filepath.Join(dir, marker)
-			if _, err := os.Stat(candidate); err == nil {
-				v.cache.Store(cacheKey, projectHint{root: dir, kind: k})
+			fi, err := os.Stat(candidate)
+			if err == nil {
+				v.cache.Store(cacheKey, projectHint{root: dir, kind: k, mtime: fi.ModTime().UnixNano()})
 				return dir, k, nil
 			}
 		}
@@ -397,6 +499,22 @@ func (v *ShellVerifier) lookupProject(filePath string) (string, Kind, error) {
 		dir = parent
 	}
 	return "", KindUnknown, nil
+}
+
+// hasAnyManifest returns true if any recognised project manifest
+// exists in dir. Used to invalidate negative cache entries when a
+// manifest is created after cache prime.
+func hasAnyManifest(dir string) bool {
+	for _, k := range AllKinds {
+		marker := k.Marker()
+		if marker == "" {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // runCheck executes the project's check command inside repoRoot. The

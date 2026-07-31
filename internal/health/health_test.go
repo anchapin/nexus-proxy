@@ -1,11 +1,14 @@
 package health
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -432,4 +435,126 @@ func TestCalcBackoffInterval(t *testing.T) {
 			t.Errorf("calcBackoffInterval(%d) = %v, want %v", tc.count, got, want)
 		}
 	}
+}
+
+// TestCalcBackoffIntervalTier4Plus verifies the 15x ceiling (tier 4+)
+// is enforced. Tier 4 nominally yields a 16x multiplier but is capped
+// at maxBackoffMultiplier (15). This exercises the capping branch in
+// calcBackoffInterval that the tier 0–3 table does not reach.
+func TestCalcBackoffIntervalTier4Plus(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+	pollInterval := 100 * time.Millisecond
+	h := New(srv.URL, "qwen3-coder:8b", pollInterval, 3, time.Second, nil)
+
+	want := pollInterval * maxBackoffMultiplier
+
+	// count=9 → tier (9-1)>>1 = 4 → multiplier 16, capped to 15.
+	if got := h.calcBackoffInterval(9); got != want {
+		t.Errorf("calcBackoffInterval(9) = %v, want %v (capped 15x)", got, want)
+	}
+	// count=100 → tier 49 → multiplier far above cap, still 15x.
+	if got := h.calcBackoffInterval(100); got != want {
+		t.Errorf("calcBackoffInterval(100) = %v, want %v (capped 15x)", got, want)
+	}
+}
+
+// TestCalcBackoffIntervalZeroOrNegative exercises the tier < 0 guard in
+// calcBackoffInterval. A non-positive count yields a negative tier
+// ((count-1)>>1 < 0) which is clamped back to tier 0 (1x multiplier).
+func TestCalcBackoffIntervalZeroOrNegative(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+	pollInterval := 100 * time.Millisecond
+	h := New(srv.URL, "qwen3-coder:8b", pollInterval, 3, time.Second, nil)
+
+	want := pollInterval // tier clamped to 0 → 1x multiplier
+
+	for _, count := range []int{0, -1, -5} {
+		if got := h.calcBackoffInterval(count); got != want {
+			t.Errorf("calcBackoffInterval(%d) = %v, want %v (tier<0 clamped to 1x)", count, got, want)
+		}
+	}
+}
+
+// TestRecordFailureBackoffCapsAtMax drives recordFailure through enough
+// consecutive failures to reach tier 4 inside recordFailure, covering
+// the multiplier > maxBackoffMultiplier capping branch (lines 396–397)
+// and confirming the stored interval never exceeds 15x pollInterval.
+func TestRecordFailureBackoffCapsAtMax(t *testing.T) {
+	srv := newFlakyServer()
+	defer srv.Close()
+	pollInterval := 100 * time.Millisecond
+	// Low threshold so the backoff path runs from the first failure.
+	h := New(srv.URL, "qwen3-coder:8b", pollInterval, 3, time.Second, nil)
+
+	maxInterval := pollInterval * maxBackoffMultiplier
+	err := errors.New("probe failed")
+
+	// 9 failures → tier 4 → multiplier 16, capped to 15.
+	for i := 0; i < 9; i++ {
+		h.recordFailure(err)
+	}
+
+	if got := h.PollingInterval(); got != maxInterval {
+		t.Errorf("PollingInterval after 9 failures = %v, want %v (capped 15x)", got, maxInterval)
+	}
+
+	// Additional failures must not exceed the cap.
+	for i := 0; i < 20; i++ {
+		h.recordFailure(err)
+	}
+	if got := h.PollingInterval(); got != maxInterval {
+		t.Errorf("PollingInterval after 29 failures = %v, want %v (still capped 15x)", got, maxInterval)
+	}
+}
+
+// TestRecordFailureNilErrOmitsErrField ensures recordFailure(nil) does
+// not render a "<nil>" placeholder in its structured logs. Both the
+// below-threshold debug log and the breaker-tripped warn log must omit
+// the err field entirely when err is nil (issue #697).
+func TestRecordFailureNilErrOmitsErrField(t *testing.T) {
+	// Redirect the default slog logger into an in-memory buffer so we
+	// can assert on the rendered output, then restore the original at
+	// exit to avoid leaking state into sibling tests.
+	orig := slog.Default()
+	defer slog.SetDefault(orig)
+
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	srv := newFlakyServer()
+	defer srv.Close()
+
+	// Below-threshold failure (count < threshold) → debug log path.
+	t.Run("below_threshold_debug", func(t *testing.T) {
+		buf.Reset()
+		// threshold 3 → first failure stays below threshold; wasHealthy=true.
+		h := New(srv.URL, "qwen3-coder:8b", 100*time.Millisecond, 3, time.Second, nil)
+		h.recordFailure(nil) // would previously render err=<nil>
+
+		out := buf.String()
+		if strings.Contains(out, "<nil>") {
+			t.Errorf("below-threshold debug log contains <nil>:\n%s", out)
+		}
+		if !strings.Contains(out, "ollama probe failed (below threshold)") {
+			t.Errorf("expected debug log line, got:\n%s", out)
+		}
+	})
+
+	// Threshold-reaching failure (count >= threshold) → warn log path.
+	t.Run("breaker_tripped_warn", func(t *testing.T) {
+		buf.Reset()
+		// threshold 1 → first failure trips the breaker; wasHealthy=true.
+		h := New(srv.URL, "qwen3-coder:8b", 100*time.Millisecond, 1, time.Second, nil)
+		h.recordFailure(nil) // would previously render err=<nil>
+
+		out := buf.String()
+		if strings.Contains(out, "<nil>") {
+			t.Errorf("breaker-tripped warn log contains <nil>:\n%s", out)
+		}
+		if !strings.Contains(out, "ollama health: breaker tripped") {
+			t.Errorf("expected warn log line, got:\n%s", out)
+		}
+	})
 }

@@ -814,6 +814,50 @@ func TestRunRateLimitProxyConfigRPMPositiveWithTrustedProxiesIsPass(t *testing.T
 	}
 }
 
+// TestRunRateLimitProxyConfigPassDetailIncludesRawProxies verifies that
+// TrustedProxiesRaw is surfaced in the diagnostic detail (issue #603):
+// the field was previously stored but never read, making it useless
+// diagnostics baggage. It must now appear in `nexus check --json`
+// output (the Detail field is JSON-serialised).
+func TestRunRateLimitProxyConfigPassDetailIncludesRawProxies(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.RateLimitRPM = 100
+	cfg.TrustedProxies = make([]*net.IPNet, 1)
+	_, cfg.TrustedProxies[0], _ = net.ParseCIDR("10.0.0.0/8")
+	cfg.TrustedProxiesRaw = "10.0.0.0/8,172.16.0.0/12"
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkRateLimitProxyConfig)
+	if got.Status != StatusPass {
+		t.Fatalf("rate_limit_proxy_config = %s (detail=%s), want pass", got.Status, got.Detail)
+	}
+	if !strings.Contains(got.Detail, cfg.TrustedProxiesRaw) {
+		t.Errorf("detail %q should contain raw trusted proxies %q", got.Detail, cfg.TrustedProxiesRaw)
+	}
+}
+
+// TestRunRateLimitProxyConfigFailDetailIncludesRawOnParseGap covers the
+// edge case where the YAML loader swallowed a parse error: raw is set
+// but parsed to zero CIDRs. The detail must surface the offending raw
+// value so the operator can correct it (issue #603).
+func TestRunRateLimitProxyConfigFailDetailIncludesRawOnParseGap(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.RateLimitRPM = 100
+	cfg.TrustedProxies = nil
+	cfg.TrustedProxiesRaw = "not-a-cidr"
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkRateLimitProxyConfig)
+	if got.Status != StatusFail {
+		t.Fatalf("rate_limit_proxy_config = %s (detail=%s), want fail", got.Status, got.Detail)
+	}
+	if !strings.Contains(got.Detail, "not-a-cidr") {
+		t.Errorf("detail %q should surface the unparseable raw value", got.Detail)
+	}
+}
+
 func TestRunProviderRegistryMalformedJSON(t *testing.T) {
 	ollama := newOllamaFixture(t)
 	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")

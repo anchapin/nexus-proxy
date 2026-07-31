@@ -148,3 +148,112 @@ func TestCooldown_Concurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestCooldown_FailureObserverCalled(t *testing.T) {
+	t.Parallel()
+	clk := newFakeClock()
+	c := NewWithClock(10*time.Second, clk.Now)
+
+	var calls atomic.Int64
+	c.SetFailureObserver(func() {
+		calls.Add(1)
+	})
+
+	c.RecordFailure()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("observer called %d times after one RecordFailure, want 1", got)
+	}
+
+	// Second failure should call observer again.
+	c.RecordFailure()
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("observer called %d times after two RecordFailure calls, want 2", got)
+	}
+}
+
+func TestCooldown_FailureObserverNotCalledWhenDisabled(t *testing.T) {
+	t.Parallel()
+	c := New(0) // disabled
+
+	var calls atomic.Int64
+	c.SetFailureObserver(func() {
+		calls.Add(1)
+	})
+
+	c.RecordFailure()
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("observer called %d times when cooldown is disabled, want 0", got)
+	}
+}
+
+func TestCooldown_FailureObserverNilClearsObserver(t *testing.T) {
+	t.Parallel()
+	clk := newFakeClock()
+	c := NewWithClock(10*time.Second, clk.Now)
+
+	var calls atomic.Int64
+	c.SetFailureObserver(func() {
+		calls.Add(1)
+	})
+
+	c.RecordFailure()
+	c.SetFailureObserver(nil) // clear
+
+	c.RecordFailure()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("observer called %d times after clear, want 1", got)
+	}
+}
+
+func TestCooldown_FailureObserverNilSafe(t *testing.T) {
+	t.Parallel()
+	var c *Cooldown
+	c.SetFailureObserver(func() {}) // must not panic
+}
+
+func TestCooldown_NewWithClockNilFallsBackToTimeNow(t *testing.T) {
+	t.Parallel()
+	c := NewWithClock(10*time.Second, nil)
+	if c == nil {
+		t.Fatal("NewWithClock with nil now should not return nil")
+	}
+	if c.now == nil {
+		t.Fatal("NewWithClock with nil now should fall back to time.Now, not nil")
+	}
+	if c.Active() {
+		t.Fatal("cooldown should be inactive before any failure")
+	}
+	c.RecordFailure()
+	if !c.Active() {
+		t.Fatal("cooldown with nil clock should be active after failure")
+	}
+}
+
+func TestCooldown_ExpiresAtNilSafe(t *testing.T) {
+	t.Parallel()
+	var c *Cooldown
+	if !c.ExpiresAt().IsZero() {
+		t.Fatal("ExpiresAt on nil cooldown should return zero time")
+	}
+}
+
+func TestCooldown_NewWithClockWithRealClock(t *testing.T) {
+	t.Parallel()
+	clk := newFakeClock()
+	c := NewWithClock(10*time.Second, clk.Now)
+	if c.now == nil {
+		t.Fatal("NewWithClock with non-nil now should preserve it")
+	}
+	if c.Active() {
+		t.Fatal("cooldown should be inactive before any failure")
+	}
+	c.RecordFailure()
+	clk.Advance(9 * time.Second)
+	if !c.Active() {
+		t.Fatal("cooldown with injected clock should be active within the window")
+	}
+	clk.Advance(2 * time.Second)
+	if c.Active() {
+		t.Fatal("cooldown with injected clock should expire after Duration")
+	}
+}

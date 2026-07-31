@@ -19,10 +19,10 @@ jobs:
       # churning existing PRs. Raise as coverage improves.
       COVERAGE_THRESHOLD: "70"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: '1.26'
           cache: true
@@ -41,7 +41,7 @@ jobs:
 
       - name: Upload coverage
         if: github.event_name == 'push'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage.txt
@@ -86,10 +86,10 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: '1.26'
           cache: true
@@ -102,7 +102,7 @@ jobs:
 
       - name: Upload benchmark output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench
           path: bench.txt
@@ -112,19 +112,36 @@ jobs:
     name: golangci-lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # golangci-lint v2.12.2 supports Go 1.25+ and replaces the old v1.x
       # series. The old comment about Go 1.24 is retained for context but
       # the lint job now uses the same Go 1.26 toolchain as the rest of CI.
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: '1.26'
           cache: true
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v7
+        uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
           args: --timeout=5m
+
+  # ── Docker image smoke build (issue #541) ───────────────────────
+  # Builds the container image on every PR so a Dockerfile / go.mod Go
+  # version drift can never again slip past CI undetected. Build only —
+  # no push, no multi-arch, no signing. Release publishing stays in
+  # release.yml. The Go-test guard (cmd/nexus/docker_build_test.go)
+  # catches the version drift cheaply in every `go test` run; this job
+  # catches Dockerfile-level breakage (syntax, missing COPY sources,
+  # toolchain rejection) that the version comparison cannot.
+  docker:
+    name: docker build (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: docker build
+        run: make docker-build

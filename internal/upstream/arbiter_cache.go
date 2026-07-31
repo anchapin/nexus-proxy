@@ -2,10 +2,16 @@
 package upstream
 
 import (
-	"hash/fnv"
+	"bytes"
+	"crypto/sha256"
 	"sync"
 	"time"
 )
+
+// DefaultArbiterCacheMaxEntries is the default max entries cap. 512 covers
+// a typical burst of distinct panel disagreements without excessive memory
+// use (issue #773).
+const DefaultArbiterCacheMaxEntries = 512
 
 // ArbiterCacheEntry is a single cached arbiter synthesis response.
 type ArbiterCacheEntry struct {
@@ -15,14 +21,18 @@ type ArbiterCacheEntry struct {
 }
 
 // ArbiterCache is a concurrency-safe in-memory TTL cache for arbiter
-// synthesis responses (issue #232). It is keyed by a FNV hash of
-// (first.Content, second.Content) so identical panel-member outputs
+// synthesis responses (issue #232). It is keyed by a SHA-256 hash of
+// (first.Content, second.Content) so identical panel disagreements
 // share one cache entry regardless of order. The zero value is ready
 // to use; constructing via NewArbiterCache is optional but allows
 // injecting a time source for deterministic testing.
+//
+// When maxEntries > 0, the cache enforces an LRU eviction policy: the
+// least-recently-used entry is removed when Set would exceed the cap
+// (issue #773).
 type ArbiterCache struct {
 	mu    sync.RWMutex
-	items map[uint64]*ArbiterCacheEntry
+	items map[[32]byte]*ArbiterCacheEntry
 
 	// Time source for expiration checks. Defaults to time.Now if nil.
 	NowFunc func() time.Time
@@ -30,28 +40,118 @@ type ArbiterCache struct {
 	// ttl is the configured TTL for cache entries. Enabled() returns
 	// true when ttl > 0.
 	ttl time.Duration
+
+	// maxEntries caps the number of cached entries. 0 means unlimited.
+	// When reached, Set evicts the least-recently-used entry (issue #773).
+	maxEntries int
+
+	// lru tracks access order for LRU eviction: older entries are at the
+	// front. The slice is rebuilt on each eviction to stay in sync with
+	// the items map.
+	lru [][32]byte
+
+	// EvictionObserver, when non-nil, is invoked once per evicted entry
+	// with reason = "lru". The callback runs after the cache lock is
+	// released so it is safe to call into observability or any other
+	// subsystem. The pointer is captured under mu; callbacks should not
+	// mutate it.
+	EvictionObserver func(reason string)
 }
 
 // NewArbiterCache constructs an empty, ready-to-use cache with the
-// given TTL. Pass ttl > 0 to enable caching; ttl <= 0 creates a cache
-// where Enabled() returns false. The NowFunc is defaulted to time.Now.
-func NewArbiterCache(ttl time.Duration) *ArbiterCache {
+// given TTL and max entries. Pass ttl > 0 to enable caching; ttl <= 0
+// creates a cache where Enabled() returns false. Pass maxEntries > 0 to
+// cap memory at a fixed entry count with LRU eviction; pass 0 to use
+// DefaultArbiterCacheMaxEntries (512). The NowFunc is defaulted to
+// time.Now.
+func NewArbiterCache(ttl time.Duration, maxEntries int) *ArbiterCache {
+	if maxEntries <= 0 {
+		maxEntries = DefaultArbiterCacheMaxEntries
+	}
 	return &ArbiterCache{
-		items:   make(map[uint64]*ArbiterCacheEntry),
-		NowFunc: time.Now,
-		ttl:     ttl,
+		items:      make(map[[32]byte]*ArbiterCacheEntry),
+		NowFunc:    time.Now,
+		ttl:        ttl,
+		maxEntries: maxEntries,
+		lru:        make([][32]byte, 0, maxEntries),
 	}
 }
 
-// cacheKey computes a deterministic FNV-64a hash of the two panel-member
-// contents. The order does not matter (r1 vs r2 swapped produces the
-// same key) so cache lookups are symmetric.
-func cacheKey(r1Content, r2Content string) uint64 {
-	h := fnv.New64a()
-	// XOR the two contents so swapping r1/r2 yields the same key.
-	h.Write([]byte(r1Content))
-	h.Write([]byte(r2Content))
-	return h.Sum64()
+// cacheKey computes a deterministic SHA-256 hash of the two panel-member
+// contents. Each content is hashed independently and the two 32-byte
+// hashes are concatenated in sorted order and re-hashed to produce a
+// collision-resistant key while preserving order-independence:
+// cacheKey(a, b) == cacheKey(b, a). This is critical because panel
+// members write to a shared channel in non-deterministic goroutine-arrival
+// order.
+//
+// When r1Content == r2Content (perfect agreement), the sentinel prefix
+// avoids any key collision by ensuring distinct entries per content even
+// when both panels agree perfectly.
+func cacheKey(r1Content, r2Content string) [32]byte {
+	if r1Content == r2Content {
+		h := sha256.Sum256([]byte(r1Content + "|SAME|"))
+		return h
+	}
+	h1 := sha256.Sum256([]byte(r1Content))
+	h2 := sha256.Sum256([]byte(r2Content))
+	combined := canonicalize(&h1, &h2)
+	return sha256.Sum256(combined[:])
+}
+
+// canonicalize returns the two 32-byte hashes in a fixed byte order so
+// that cacheKey(a, b) == cacheKey(b, a) regardless of arrival order.
+func canonicalize(h1, h2 *[32]byte) [64]byte {
+	var a, b [32]byte
+	if bytes.Compare(h1[:], h2[:]) < 0 {
+		a, b = *h1, *h2
+	} else {
+		a, b = *h2, *h1
+	}
+	var combined [64]byte
+	copy(combined[:32], a[:])
+	copy(combined[32:], b[:])
+	return combined
+}
+
+// touch moves the given key to the end of the LRU list (most recently used).
+// Caller must hold c.mu.
+func (c *ArbiterCache) touch(key [32]byte) {
+	for i, k := range c.lru {
+		if k == key {
+			c.lru = append(c.lru[:i], c.lru[i+1:]...)
+			c.lru = append(c.lru, key)
+			return
+		}
+	}
+	c.lru = append(c.lru, key)
+}
+
+// evictLru removes the least-recently-used entry from the cache.
+// It skips entries that have already been removed via Delete (stale lru entries).
+// Caller must hold c.mu.
+func (c *ArbiterCache) evictLru() {
+	if len(c.lru) == 0 {
+		return
+	}
+	key := c.lru[0]
+	c.lru = c.lru[1:]
+	delete(c.items, key)
+}
+
+// SetEvictionObserver registers a callback that is invoked once per
+// evicted entry with reason = "lru" (issue #798). Pass nil to clear
+// the observer. The callback runs after the cache lock is released so
+// it is safe to call into observability or logging. Callers that want
+// to record into observability.RouteCounters should pass a closure
+// that forwards to ObserveArbiterCacheEviction.
+func (c *ArbiterCache) SetEvictionObserver(fn func(reason string)) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.EvictionObserver = fn
+	c.mu.Unlock()
 }
 
 // Get returns the cached synthesis text and true if the entry exists
@@ -63,8 +163,8 @@ func (c *ArbiterCache) Get(r1Content, r2Content string) (string, bool) {
 	}
 	now := c.now()
 	key := cacheKey(r1Content, r2Content)
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	entry, ok := c.items[key]
 	if !ok {
 		return "", false
@@ -72,23 +172,37 @@ func (c *ArbiterCache) Get(r1Content, r2Content string) (string, bool) {
 	if now.Sub(entry.CachedAt) > entry.TTLDuration {
 		return "", false
 	}
+	c.touch(key)
 	return entry.Synthesis, true
 }
 
 // Set stores a synthesis text under the hash of (r1Content, r2Content).
 // If an entry already exists for this key it is overwritten with a fresh
-// timestamp. Thread-safe.
+// timestamp. When the cache is at maxEntries capacity, the least-recently-
+// used entry is evicted to make room. Thread-safe.
 func (c *ArbiterCache) Set(r1Content, r2Content, synthesis string, ttl time.Duration) {
 	if c == nil {
 		return
 	}
 	key := cacheKey(r1Content, r2Content)
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	evicted := false
+	if c.maxEntries > 0 && len(c.items) >= c.maxEntries {
+		c.evictLru()
+		evicted = true
+	}
+
 	c.items[key] = &ArbiterCacheEntry{
 		Synthesis:   synthesis,
 		CachedAt:    c.now(),
 		TTLDuration: ttl,
+	}
+	c.touch(key)
+	onEvict := c.EvictionObserver
+	c.mu.Unlock()
+
+	if evicted && onEvict != nil {
+		onEvict("lru")
 	}
 }
 
@@ -102,6 +216,12 @@ func (c *ArbiterCache) Delete(r1Content, r2Content string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.items, key)
+	for i, k := range c.lru {
+		if k == key {
+			c.lru = append(c.lru[:i], c.lru[i+1:]...)
+			return
+		}
+	}
 }
 
 // Len returns the number of entries in the cache. For testing/monitoring.
@@ -139,7 +259,8 @@ func (c *ArbiterCache) Purge() {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.items = make(map[uint64]*ArbiterCacheEntry)
+	c.items = make(map[[32]byte]*ArbiterCacheEntry)
+	c.lru = c.lru[:0]
 }
 
 // now returns the current time, delegating to TimeFunc if set.
@@ -148,4 +269,13 @@ func (c *ArbiterCache) now() time.Time {
 		return time.Now()
 	}
 	return c.NowFunc()
+}
+
+// MaxEntries returns the configured max entries capacity. Returns 0 when
+// the cache is nil or was constructed with unlimited capacity.
+func (c *ArbiterCache) MaxEntries() int {
+	if c == nil {
+		return 0
+	}
+	return c.maxEntries
 }

@@ -26,9 +26,11 @@ coverage.html
 # Local config & secrets
 .env
 .env.local
-.env.example
 config.yaml
 config.local.yaml
+
+# Template only — not a build input or runtime secret
+.env.example
 
 # IDE / editor
 .idea/

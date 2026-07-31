@@ -4,11 +4,16 @@
 package ratelimit
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
 // Middleware is an http.Handler decorator that bounds the number of
@@ -30,16 +35,35 @@ import (
 // (RPM <= 0); always construct via NewMiddleware.
 type Middleware struct {
 	resolver *ClientIPResolver
-	rpm      int           // steady-state requests per minute
-	burst    int           // bucket capacity
-	ttl      time.Duration // idle bucket retention before reaping
+	rpm      int            // steady-state requests per minute
+	burst    int            // bucket capacity
+	ttl      time.Duration  // idle bucket retention before reaping
+	stopCh   chan struct{}  // closed when reaper should exit
+	reaperWG sync.WaitGroup // tracks reaper goroutine for deterministic exit (issue #960)
+
+	// keyFn computes the bucket key from an inbound request. It composes
+	// on top of the ClientIPResolver. The default (nil) uses IP-only;
+	// when set to APIKeyAwareKeyFunc it uses SHA256(IP + ":" + APIKey)
+	// truncated to 8 hex chars (issue #776).
+	keyFn func(*http.Request) string
+
+	// keyType records which key mode is active, exposed via the
+	// X-Nexus-RateLimit-Key-Type response header.
+	keyType string
 
 	// onReject, when non-nil, is invoked once for each request the
 	// middleware rejects with 429 (issue #119). It is intended for
-	// telemetry / observability hooks and must not block — the
+	// telemetry / observability hooks and must not block —
 	// request goroutine calls it inline. Set via SetRejectionHook
 	// after construction so NewMiddleware stays a pure constructor.
 	onReject func()
+
+	// onAllow, when non-nil, is invoked once for each request the
+	// middleware allows (issue #746). It receives the hashed bucket ID
+	// and the fractional token utilization (tokens/burst) at the moment
+	// of acquisition, before the token is consumed. Intended for the
+	// rate-limit bucket utilization histogram. Must not block.
+	onAllow func(bucketID string, utilizationPct float64)
 
 	mu      sync.Mutex
 	buckets map[string]*bucket
@@ -63,20 +87,41 @@ type bucket struct {
 // falls back to rpm (one second's worth at full rate) so an operator
 // who sets only RPM still gets a sane capacity. resolver may be nil; a
 // nil resolver uses the direct peer IP (trust-nobody).
-func NewMiddleware(rpm, burst int, resolver *ClientIPResolver) *Middleware {
+//
+// keyFn, when non-nil, computes the per-request bucket key. It receives
+// the resolved client IP and the inbound request; it returns the string
+// used as the bucket map key. The default (nil) uses IP-only. When
+// NEXUS_RATE_LIMIT_BY_API_KEY=true the caller passes APIKeyAwareKeyFunc
+// so different API keys behind the same IP occupy separate buckets
+// (issue #776).
+//
+// The background reaper goroutine is started here (issue #978), not in
+// Wrap(), so that even if Wrap() is called multiple times by mistake,
+// exactly one reaper runs and exits when Stop()/Close() is called.
+func NewMiddleware(rpm, burst int, resolver *ClientIPResolver, keyFn func(*http.Request) string) *Middleware {
 	if rpm <= 0 {
 		return &Middleware{rpm: 0}
 	}
 	if burst <= 0 {
 		burst = rpm
 	}
-	return &Middleware{
+	keyType := "ip"
+	if keyFn != nil {
+		keyType = "apikey"
+	}
+	m := &Middleware{
 		resolver: resolver,
 		rpm:      rpm,
 		burst:    burst,
 		ttl:      10 * time.Minute, // reap buckets idle for 10 min
+		stopCh:   make(chan struct{}),
 		buckets:  make(map[string]*bucket),
+		keyFn:    keyFn,
+		keyType:  keyType,
 	}
+	m.reaperWG.Add(1)
+	go m.reaper()
+	return m
 }
 
 // SetRejectionHook installs a callback invoked once per 429 rejection
@@ -91,26 +136,92 @@ func (m *Middleware) SetRejectionHook(fn func()) {
 	m.onReject = fn
 }
 
+// SetAllowHook installs a callback invoked once per allowed request
+// before the token is consumed (issue #746). fn receives the hashed
+// bucket ID and the fractional token utilization (tokens/burst) at the
+// moment of acquisition. Pass nil to remove a previously installed hook.
+func (m *Middleware) SetAllowHook(fn func(bucketID string, utilizationPct float64)) {
+	if m == nil {
+		return
+	}
+	m.onAllow = fn
+}
+
+// hashedBucketKey returns a SHA256 hash of input truncated to 16 hex characters,
+// suitable for use as a high-cardinality-safe bucket identifier in
+// telemetry labels.
+func hashedBucketKey(v string) string {
+	h := sha256.Sum256([]byte(v))
+	return hex.EncodeToString(h[:8])
+}
+
+// APIKeyAwareKeyFunc returns a key-fn that composes the resolved client
+// IP with the Bearer API key from the Authorization header, producing
+// SHA256(IP + ":" + APIKey) truncated to 16 hex chars. When no Authorization
+// header is present the key falls back to IP-only so unauthenticated
+// requests are still bucketed by IP (the auth middleware runs before the
+// rate limiter so this is only hit in health-check / metrics paths).
+//
+// The returned function is safe for concurrent use.
+func APIKeyAwareKeyFunc(ip string, r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		return ip
+	}
+	// Strip "Bearer " prefix if present (case-insensitive per RFC 6750).
+	// The raw token casing is preserved for bucket-key computation so that
+	// "Bearer MYKEY" and "Bearer mykey" occupy distinct buckets — consistent
+	// with auth.go using case-sensitive ConstantTimeCompare — preventing an
+	// attacker from bypassing a victim's per-key rate limit via token-casing
+	// variation (issue #977).
+	var key string
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		key = strings.TrimSpace(auth[7:])
+	} else {
+		key = auth
+	}
+	h := sha256.Sum256([]byte(ip + ":" + key))
+	return hex.EncodeToString(h[:8])
+}
+
 // Wrap returns an http.Handler that applies the rate limit before
 // delegating to next. A disabled middleware (rpm <= 0) returns next
 // unchanged so the hot path is zero-cost when rate limiting is off.
+// The reaper is started in NewMiddleware (issue #978), not here, so
+// Wrap may be called any number of times without starting extra goroutines.
 func (m *Middleware) Wrap(next http.Handler) http.Handler {
 	if m == nil || m.rpm <= 0 {
 		return next
 	}
-	// Kick off the idle-bucket reaper once. It stops itself when the
-	// process exits; there is no Close because the middleware lives for
-	// the lifetime of the server.
-	go m.reaper()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ip := m.resolver.Resolve(r)
-		if !m.allow(ip, time.Now()) {
+		bucketKey := ip
+		if m.keyFn != nil {
+			bucketKey = m.keyFn(r)
+		}
+		var span *tracing.Span
+		if tracing.Enabled() {
+			r2, s := tracing.StartSpanFromContext(r.Context(), "ratelimit.check")
+			span = s
+			r = r.WithContext(r2)
+			defer span.End()
+			span.SetAttr("ratelimit.key_type", m.keyType)
+		}
+		allowed := m.allow(bucketKey, ip, time.Now())
+		if span != nil {
+			span.SetAttr("ratelimit.allowed", allowed)
+		}
+		if !allowed {
+			if span != nil {
+				span.SetAttr("ratelimit.reason", "rate_exceeded")
+			}
 			if m.onReject != nil {
 				m.onReject()
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Retry-After", "60")
 			w.Header().Set("X-Nexus-RateLimit-Remaining", "0")
+			w.Header().Set("X-Nexus-RateLimit-Key-Type", m.keyType)
 			w.WriteHeader(http.StatusTooManyRequests)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"error": map[string]any{
@@ -125,15 +236,18 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			)
 			return
 		}
+		w.Header().Set("X-Nexus-RateLimit-Key-Type", m.keyType)
 		next.ServeHTTP(w, r)
 	})
 }
 
-// allow reports whether ip may issue a request now, consuming one token
-// if so. It lazily creates the bucket and refills it from the elapsed
-// time since the last request.
-func (m *Middleware) allow(ip string, now time.Time) bool {
-	b := m.bucketFor(ip, now)
+// allow reports whether the client identified by bucketKey may issue a
+// request now, consuming one token if so. ip is used only for the
+// telemetry callback (bucketID is computed from bucketKey). It lazily
+// creates the bucket and refills it from the elapsed time since the
+// last request.
+func (m *Middleware) allow(bucketKey, ip string, now time.Time) bool {
+	b := m.bucketFor(bucketKey, now)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -152,21 +266,24 @@ func (m *Middleware) allow(ip string, now time.Time) bool {
 	b.lastSeen = now
 
 	if b.tokens >= 1 {
+		if m.onAllow != nil {
+			m.onAllow(hashedBucketKey(bucketKey), float64(b.tokens)/float64(m.burst))
+		}
 		b.tokens--
 		return true
 	}
 	return false
 }
 
-// bucketFor returns the bucket for ip, creating it on first sighting.
+// bucketFor returns the bucket for bucketKey, creating it on first sighting.
 // All bucket allocation and map insertion happen atomically inside the
 // per-map critical section so no bucket is ever orphaned by a concurrent
-// bucketFor call for the same IP. The per-bucket lock (in allow)
+// bucketFor call for the same key. The per-bucket lock (in allow)
 // serializes token consumption.
-func (m *Middleware) bucketFor(ip string, now time.Time) *bucket {
+func (m *Middleware) bucketFor(bucketKey string, now time.Time) *bucket {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if b, ok := m.buckets[ip]; ok {
+	if b, ok := m.buckets[bucketKey]; ok {
 		return b
 	}
 	// Start full so a brand-new client gets its full burst.
@@ -178,7 +295,7 @@ func (m *Middleware) bucketFor(ip string, now time.Time) *bucket {
 		lastRefill: now,
 		lastSeen:   now,
 	}
-	m.buckets[ip] = b
+	m.buckets[bucketKey] = b
 	return b
 }
 
@@ -186,10 +303,16 @@ func (m *Middleware) bucketFor(ip string, now time.Time) *bucket {
 // only goroutine that deletes from the map outside of allow (which
 // only ever adds).
 func (m *Middleware) reaper() {
+	defer m.reaperWG.Done()
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
-	for range t.C {
-		m.reap(time.Now())
+	for {
+		select {
+		case <-t.C:
+			m.reap(time.Now())
+		case <-m.stopCh:
+			return
+		}
 	}
 }
 
@@ -207,6 +330,23 @@ func (m *Middleware) reap(now time.Time) {
 			delete(m.buckets, ip)
 		}
 	}
+}
+
+// Stop signals the reaper goroutine to exit. It is safe to call on
+// a disabled limiter (rpm <= 0) or nil limiter; it is a no-op in those
+// cases.
+func (m *Middleware) Stop() {
+	if m == nil || m.rpm <= 0 {
+		return
+	}
+	close(m.stopCh)
+	m.reaperWG.Wait()
+}
+
+// Close is an alias for Stop, provided to mirror the closer interface
+// pattern used by other shutdown-aware components.
+func (m *Middleware) Close() {
+	m.Stop()
 }
 
 // SetRPM updates the steady-state requests per minute. A value <= 0

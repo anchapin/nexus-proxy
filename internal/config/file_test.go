@@ -335,3 +335,90 @@ func TestSetConfigPathOverride(t *testing.T) {
 		t.Errorf("override not cleared")
 	}
 }
+
+func TestJoinYAMLList(t *testing.T) {
+	cases := []struct {
+		name string
+		list []any
+		want string
+	}{
+		{
+			name: "plain elements",
+			list: []any{"css", "format", "docstring"},
+			want: "css,format,docstring",
+		},
+		{
+			name: "element containing comma",
+			list: []any{"a,b", "c"},
+			want: `"a,b",c`,
+		},
+		{
+			name: "multiple elements with commas",
+			list: []any{"x,y", "z,w"},
+			want: `"x,y","z,w"`,
+		},
+		{
+			name: "empty list",
+			list: []any{},
+			want: "",
+		},
+		{
+			name: "single element",
+			list: []any{"only"},
+			want: "only",
+		},
+		{
+			name: "single element with comma",
+			list: []any{"one,two"},
+			want: `"one,two"`,
+		},
+		{
+			name: "mixed string and int",
+			list: []any{"css", 42, "format"},
+			want: "css,42,format",
+		},
+		{
+			name: "int elements only",
+			list: []any{1, 2, 3},
+			want: "1,2,3",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := joinYAMLList(tc.list)
+			if got != tc.want {
+				t.Errorf("joinYAMLList(%v) = %q, want %q", tc.list, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseYAMLWithList(t *testing.T) {
+	src := []string{
+		"routing:",
+		"  dsl_formatted_patterns: [css, format, docstring]",
+	}
+	got, err := ParseYAML(strings.Join(src, "\n"))
+	if err != nil {
+		t.Fatalf("ParseYAML: %v", err)
+	}
+	want := "css,format,docstring"
+	if v := got["routing.dsl_formatted_patterns"]; v != want {
+		t.Errorf("routing.dsl_formatted_patterns = %q, want %q", v, want)
+	}
+}
+
+func TestParseYAMLWithListContainingCommas(t *testing.T) {
+	src := []string{
+		"routing:",
+		`  dsl_formatted_patterns: ["a,b", "c,d"]`,
+	}
+	got, err := ParseYAML(strings.Join(src, "\n"))
+	if err != nil {
+		t.Fatalf("ParseYAML: %v", err)
+	}
+	want := `"a,b","c,d"`
+	if v := got["routing.dsl_formatted_patterns"]; v != want {
+		t.Errorf("routing.dsl_formatted_patterns = %q, want %q", v, want)
+	}
+}

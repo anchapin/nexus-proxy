@@ -1,9 +1,15 @@
 package auth
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/ratelimit"
+	"github.com/anchapin/nexus-proxy/internal/tracingtest"
 )
 
 // okHandler is a simple 200-OK handler used across tests.
@@ -12,6 +18,15 @@ func okHandler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
+}
+
+func mustCIDRs(t *testing.T, raw string) []*net.IPNet {
+	t.Helper()
+	out, err := ratelimit.ParseTrustedCIDRs(raw)
+	if err != nil {
+		t.Fatalf("ParseTrustedCIDRs(%q): %v", raw, err)
+	}
+	return out
 }
 
 func TestDisabledWhenNoKey(t *testing.T) {
@@ -44,6 +59,24 @@ func TestRejectsWithoutToken(t *testing.T) {
 	}
 }
 
+func TestAuthMissingToken(t *testing.T) {
+	m := NewMiddleware("secret-key", nil, nil, nil)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("no token: status = %d, want 401", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", ct, "application/json")
+	}
+	if rr.Body.String() != `{"error":"missing or malformed Authorization header"}` {
+		t.Errorf("body = %q, want %q", rr.Body.String(), `{"error":"missing or malformed Authorization header"}`)
+	}
+}
+
 func TestRejectsWrongToken(t *testing.T) {
 	m := NewMiddleware("secret-key", nil, nil, nil)
 
@@ -54,6 +87,25 @@ func TestRejectsWrongToken(t *testing.T) {
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Errorf("wrong token: status = %d, want 401", rr.Code)
+	}
+}
+
+func TestAuthInvalidToken(t *testing.T) {
+	m := NewMiddleware("secret-key", nil, nil, nil)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer wrong-key")
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("invalid token: status = %d, want 401", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", ct, "application/json")
+	}
+	if rr.Body.String() != `{"error":"invalid API key"}` {
+		t.Errorf("body = %q, want %q", rr.Body.String(), `{"error":"invalid API key"}`)
 	}
 }
 
@@ -201,14 +253,23 @@ func TestConstantTimeComparisonRegression(t *testing.T) {
 	}
 }
 
-// mockObserver implements AuthObserver for testing (issue #295).
+// mockObserver implements AuthObserver for testing (issue #295/#1061).
 type mockObserver struct {
+	accepted        int
 	rejectedInvalid int
 	rejectedMissing int
+	lastClientIP    string
 }
 
-func (m *mockObserver) IncAuthRejectedInvalid() { m.rejectedInvalid++ }
-func (m *mockObserver) IncAuthRejectedMissing() { m.rejectedMissing++ }
+func (m *mockObserver) IncAuthAccepted(clientIP string) { m.accepted++; m.lastClientIP = clientIP }
+func (m *mockObserver) IncAuthRejectedInvalid(clientIP string) {
+	m.rejectedInvalid++
+	m.lastClientIP = clientIP
+}
+func (m *mockObserver) IncAuthRejectedMissing(clientIP string) {
+	m.rejectedMissing++
+	m.lastClientIP = clientIP
+}
 
 // TestAuthObserverMissingToken verifies that IncAuthRejectedMissing is called
 // when a request arrives without a token (issue #295).
@@ -272,5 +333,489 @@ func TestAuthObserverNoCallbackOnSuccess(t *testing.T) {
 	}
 	if obs.rejectedMissing != 0 {
 		t.Errorf("IncAuthRejectedMissing call count = %d, want 0", obs.rejectedMissing)
+	}
+}
+
+// TestAuthObserverAccepted verifies that IncAuthAccepted is called
+// when auth succeeds (issue #847).
+func TestAuthObserverAccepted(t *testing.T) {
+	obs := &mockObserver{}
+	m := NewMiddleware("secret-key", nil, nil, obs)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer secret-key")
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if obs.accepted != 1 {
+		t.Errorf("IncAuthAccepted call count = %d, want 1", obs.accepted)
+	}
+	if obs.rejectedInvalid != 0 {
+		t.Errorf("IncAuthRejectedInvalid call count = %d, want 0", obs.rejectedInvalid)
+	}
+	if obs.rejectedMissing != 0 {
+		t.Errorf("IncAuthRejectedMissing call count = %d, want 0", obs.rejectedMissing)
+	}
+}
+
+// TestAuthLimiterBlockedIP gets a 429 when the limiter marks the IP blocked.
+// The exempt check happens AFTER the block check, so blocked IPs always get 429.
+func TestAuthLimiterBlockedIP(t *testing.T) {
+	trusted := mustCIDRs(t, "10.0.0.0/8")
+	resolver := ratelimit.NewClientIPResolver(trusted)
+	al := ratelimit.NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	m := NewMiddleware("secret-key", nil, al, nil)
+
+	blockedIP := "203.0.113.50"
+	for i := 0; i < 3; i++ {
+		al.RecordFailure(blockedIP, "missing")
+	}
+	if !al.IsBlocked(blockedIP) {
+		t.Fatal("IP should be blocked after 3 failures")
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("X-Real-IP", blockedIP)
+	req.RemoteAddr = "10.0.0.5:12345"
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusTooManyRequests {
+		t.Errorf("blocked IP: status = %d, want 429", rr.Code)
+	}
+	if rr.Header().Get("Retry-After") == "" {
+		t.Error("Retry-After header not set on 429")
+	}
+	if rr.Header().Get("Content-Type") != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", rr.Header().Get("Content-Type"))
+	}
+	// X-Nexus-RateLimit-Key-Type header is set to "auth-brute-force" (issue #983)
+	if got := rr.Header().Get("X-Nexus-RateLimit-Key-Type"); got != "auth-brute-force" {
+		t.Errorf("X-Nexus-RateLimit-Key-Type = %q, want %q", got, "auth-brute-force")
+	}
+}
+
+// TestAuthLimiterFailureIncrementsMap verifies that auth failures are recorded
+// in the limiter's failure map.
+func TestAuthLimiterFailureIncrementsMap(t *testing.T) {
+	resolver := ratelimit.NewClientIPResolver(nil)
+	al := ratelimit.NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	m := NewMiddleware("secret-key", nil, al, nil)
+
+	clientIP := "198.51.100.20"
+	if al.BucketCount() != 0 {
+		t.Fatalf("initial bucket count = %d, want 0", al.BucketCount())
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("X-Real-IP", clientIP)
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("no token: status = %d, want 401", rr.Code)
+	}
+	if al.BucketCount() != 1 {
+		t.Errorf("after 1 failure: bucket count = %d, want 1", al.BucketCount())
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("X-Real-IP", clientIP)
+	req.Header.Set("Authorization", "Bearer wrong-key")
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong token: status = %d, want 401", rr.Code)
+	}
+	if al.BucketCount() != 1 {
+		t.Errorf("after 2 failures same IP: bucket count = %d, want 1", al.BucketCount())
+	}
+}
+
+// TestAuthLimiterNoOpWhenDisabled verifies that a disabled limiter does not
+// affect auth behavior (nil or rpm<=0 limiter is a no-op).
+func TestAuthLimiterNoOpWhenDisabled(t *testing.T) {
+	al := ratelimit.NewAuthLimiter(0, 3, 5*time.Minute, nil)
+	m := NewMiddleware("secret-key", nil, al, nil)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("disabled limiter: status = %d, want 401", rr.Code)
+	}
+	if al.BucketCount() != 0 {
+		t.Errorf("disabled limiter: bucket count = %d, want 0", al.BucketCount())
+	}
+}
+
+// TestAuthLimiterExemptPathBypassesLimiter verifies that exempt paths skip
+// both the auth check and the limiter check.
+func TestAuthLimiterExemptPathBypassesLimiter(t *testing.T) {
+	resolver := ratelimit.NewClientIPResolver(nil)
+	al := ratelimit.NewAuthLimiter(60, 1, 5*time.Minute, resolver)
+	exempt := func(r *http.Request) bool { return r.URL.Path == "/healthz" }
+	m := NewMiddleware("secret-key", exempt, al, nil)
+
+	clientIP := "192.0.2.10"
+	al.RecordFailure(clientIP, "invalid")
+	if !al.IsBlocked(clientIP) {
+		t.Fatal("IP should be blocked after 1 failure with burst=1")
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	req.Header.Set("X-Real-IP", clientIP)
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("exempt path: status = %d, want 200", rr.Code)
+	}
+}
+
+// TestAuthLimiterCorrectTokenNoRecord verifies that successful auth does not
+// record a failure.
+func TestAuthLimiterCorrectTokenNoRecord(t *testing.T) {
+	resolver := ratelimit.NewClientIPResolver(nil)
+	al := ratelimit.NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	m := NewMiddleware("secret-key", nil, al, nil)
+
+	clientIP := "203.0.113.99"
+	if al.BucketCount() != 0 {
+		t.Fatalf("initial bucket count = %d, want 0", al.BucketCount())
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("X-Real-IP", clientIP)
+	req.Header.Set("Authorization", "Bearer secret-key")
+	m.Wrap(okHandler()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("correct token: status = %d, want 200", rr.Code)
+	}
+	if al.BucketCount() != 0 {
+		t.Errorf("after successful auth: bucket count = %d, want 0", al.BucketCount())
+	}
+}
+
+// TestAuthLimiterOnBlockCallback verifies that the SetOnBlock callback is
+// invoked when the burst threshold is crossed (issue #831/#937). The callback
+// fires each time the failure count reaches the burst threshold.
+func TestAuthLimiterOnBlockCallback(t *testing.T) {
+	resolver := ratelimit.NewClientIPResolver(nil)
+
+	// burst=3: onBlock fires on the 3rd RecordFailure
+	al := ratelimit.NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	calls := 0
+	al.SetOnBlock(func(reason string) { calls++ })
+
+	clientIP := "198.51.100.5"
+	al.RecordFailure(clientIP, "missing")
+	if calls != 0 {
+		t.Errorf("onBlock callback calls after 1 failure (burst=3) = %d, want 0", calls)
+	}
+	al.RecordFailure(clientIP, "missing")
+	if calls != 0 {
+		t.Errorf("onBlock callback calls after 2 failures (burst=3) = %d, want 0", calls)
+	}
+	al.RecordFailure(clientIP, "missing")
+	if calls != 1 {
+		t.Errorf("onBlock callback calls after 3rd failure (burst=3) = %d, want 1", calls)
+	}
+
+	// burst=2: onBlock fires on 2nd RecordFailure
+	al2 := ratelimit.NewAuthLimiter(60, 2, 5*time.Minute, resolver)
+	calls2 := 0
+	al2.SetOnBlock(func(reason string) { calls2++ })
+	al2.RecordFailure(clientIP, "invalid")
+	if calls2 != 0 {
+		t.Errorf("onBlock callback calls before threshold = %d, want 0", calls2)
+	}
+	al2.RecordFailure(clientIP, "invalid")
+	if calls2 != 1 {
+		t.Errorf("onBlock callback calls after reaching burst=2 = %d, want 1", calls2)
+	}
+	// Each subsequent failure within the window also fires onBlock since
+	// the same reason count remains >= burst (2), so callers that want "once per
+	// blocked transition" must de-duplicate at their level.
+	al2.RecordFailure(clientIP, "invalid")
+	if calls2 != 2 {
+		t.Errorf("onBlock callback calls after 3rd failure (burst=2) = %d, want 2", calls2)
+	}
+}
+
+// TestAuthLimiterOnBlockCallbackFiresEachThresholdCrossing verifies that
+// onBlock fires each time the failure count re-enters the blocked state
+// (issue #831/#937). This is the underlying mechanism that increments the
+// nexus_auth_limiter_blocked_total counter.
+func TestAuthLimiterOnBlockCallbackFiresEachThresholdCrossing(t *testing.T) {
+	resolver := ratelimit.NewClientIPResolver(nil)
+	al := ratelimit.NewAuthLimiter(60, 2, 5*time.Minute, resolver)
+	calls := 0
+	al.SetOnBlock(func(reason string) { calls++ })
+
+	ip := "203.0.2.1"
+	al.RecordFailure(ip, "missing")
+	al.RecordFailure(ip, "missing") // burst reached → onBlock fires (calls=1)
+
+	// Subsequent failures within window also trigger onBlock since
+	// the same reason count >= burst is still true.
+	for i := 0; i < 4; i++ {
+		al.RecordFailure(ip, "missing")
+	}
+	// calls = 1 (2nd failure) + 4 (subsequent) = 5
+	if calls != 5 {
+		t.Errorf("onBlock calls after 6 total failures = %d, want 5", calls)
+	}
+}
+
+// TestAuthSpanAttributesOnAccept verifies that when auth succeeds, it emits
+// an "auth.check" span with auth.exempt=false, auth.token_present=true,
+// and auth.outcome="accept" (issue #936).
+func TestAuthSpanAttributesOnAccept(t *testing.T) {
+	m := NewMiddleware("secret-key", nil, nil, nil)
+
+	// Set up a tracing collector to capture spans.
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+	defer exp.Close()
+
+	h := m.Wrap(okHandler())
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer secret-key")
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("request should succeed, got %d", rec.Code)
+	}
+
+	// Close the exporter to drain the queue before checking spans.
+	if err := exp.Close(); err != nil {
+		t.Fatalf("exporter Close: %v", err)
+	}
+
+	// Verify the span was captured with the correct attributes.
+	span := coll.FindSpan(t, "auth.check")
+	if span == nil {
+		t.Fatal("no auth.check span found in captured spans")
+	}
+	if exempt := tracingtest.AttrBool(span, "auth.exempt"); exempt {
+		t.Errorf("auth.exempt = true, want false")
+	}
+	if tokenPresent := tracingtest.AttrBool(span, "auth.token_present"); !tokenPresent {
+		t.Errorf("auth.token_present = false, want true")
+	}
+	if outcome := tracingtest.AttrString(span, "auth.outcome"); outcome != "accept" {
+		t.Errorf("auth.outcome = %q, want %q", outcome, "accept")
+	}
+}
+
+// TestAuthSpanAttributesOnRejectMissing verifies that when auth fails due
+// to missing token, it emits an "auth.check" span with auth.outcome="reject"
+// (issue #936).
+func TestAuthSpanAttributesOnRejectMissing(t *testing.T) {
+	m := NewMiddleware("secret-key", nil, nil, nil)
+
+	// Set up a tracing collector to capture spans.
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+	defer exp.Close()
+
+	h := m.Wrap(okHandler())
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("request should be rejected, got %d", rec.Code)
+	}
+
+	// Close the exporter to drain the queue before checking spans.
+	if err := exp.Close(); err != nil {
+		t.Fatalf("exporter Close: %v", err)
+	}
+
+	// Verify the span was captured with the correct attributes.
+	span := coll.FindSpan(t, "auth.check")
+	if span == nil {
+		t.Fatal("no auth.check span found in captured spans")
+	}
+	if outcome := tracingtest.AttrString(span, "auth.outcome"); outcome != "reject" {
+		t.Errorf("auth.outcome = %q, want %q", outcome, "reject")
+	}
+}
+
+// TestAuthSpanAttributesOnRejectInvalid verifies that when auth fails due
+// to invalid token, it emits an "auth.check" span with auth.outcome="invalid"
+// (issue #936).
+func TestAuthSpanAttributesOnRejectInvalid(t *testing.T) {
+	m := NewMiddleware("secret-key", nil, nil, nil)
+
+	// Set up a tracing collector to capture spans.
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+	defer exp.Close()
+
+	h := m.Wrap(okHandler())
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer wrong-key")
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("request should be rejected, got %d", rec.Code)
+	}
+
+	// Close the exporter to drain the queue before checking spans.
+	if err := exp.Close(); err != nil {
+		t.Fatalf("exporter Close: %v", err)
+	}
+
+	// Verify the span was captured with the correct attributes.
+	span := coll.FindSpan(t, "auth.check")
+	if span == nil {
+		t.Fatal("no auth.check span found in captured spans")
+	}
+	if outcome := tracingtest.AttrString(span, "auth.outcome"); outcome != "invalid" {
+		t.Errorf("auth.outcome = %q, want %q", outcome, "invalid")
+	}
+}
+
+// TestAuthSpanAttributesOnExempt verifies that when a request is exempt
+// from auth, it emits an "auth.check" span with auth.exempt=true and
+// auth.outcome="accept" (issue #936).
+func TestAuthSpanAttributesOnExempt(t *testing.T) {
+	exempt := func(r *http.Request) bool {
+		return r.URL.Path == "/healthz"
+	}
+	m := NewMiddleware("secret-key", exempt, nil, nil)
+
+	// Set up a tracing collector to capture spans.
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+	defer exp.Close()
+
+	h := m.Wrap(okHandler())
+
+	req := httptest.NewRequest("GET", "/healthz", nil)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("request should succeed, got %d", rec.Code)
+	}
+
+	// Close the exporter to drain the queue before checking spans.
+	if err := exp.Close(); err != nil {
+		t.Fatalf("exporter Close: %v", err)
+	}
+
+	// Verify the span was captured with the correct attributes.
+	span := coll.FindSpan(t, "auth.check")
+	if span == nil {
+		t.Fatal("no auth.check span found in captured spans")
+	}
+	if exemptAttr := tracingtest.AttrBool(span, "auth.exempt"); !exemptAttr {
+		t.Errorf("auth.exempt = false, want true")
+	}
+	if outcome := tracingtest.AttrString(span, "auth.outcome"); outcome != "accept" {
+		t.Errorf("auth.outcome = %q, want %q", outcome, "accept")
+	}
+}
+
+// TestAuthSlotPerIPNotBlocking verifies that concurrent auth attempts from
+// different IPs don't block each other. A slow attacker holding a slot on
+// their IP should not prevent other IPs from being authenticated (issue #1062).
+func TestAuthSlotPerIPNotBlocking(t *testing.T) {
+	m := NewMiddleware("secret-key", nil, nil, nil)
+	h := m.Wrap(okHandler())
+
+	ip1 := "192.0.2.10"
+	ip2 := "192.0.2.20"
+	ip3 := "192.0.2.30"
+
+	type result struct {
+		ip   string
+		code int
+	}
+
+	results := make(chan result, 3)
+	var wg sync.WaitGroup
+
+	for _, ip := range []string{ip1, ip2, ip3} {
+		wg.Add(1)
+		go func(clientIP string) {
+			defer wg.Done()
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			req.Header.Set("X-Real-IP", clientIP)
+			req.Header.Set("Authorization", "Bearer secret-key")
+			h.ServeHTTP(rr, req)
+			results <- result{ip: clientIP, code: rr.Code}
+		}(ip)
+	}
+
+	wg.Wait()
+	close(results)
+
+	found := make(map[string]bool)
+	for r := range results {
+		found[r.ip] = true
+		if r.code != http.StatusOK {
+			t.Errorf("IP %s: status = %d, want 200", r.ip, r.code)
+		}
+	}
+	if len(found) != 3 {
+		t.Errorf("expected 3 results, got %d", len(found))
+	}
+}
+
+// TestAuthSlotRenewedOnSuccess verifies that a successful auth renews the slot
+// so subsequent requests from the same IP can proceed.
+func TestAuthSlotRenewedOnSuccess(t *testing.T) {
+	m := NewMiddleware("secret-key", nil, nil, nil)
+	h := m.Wrap(okHandler())
+
+	ip := "198.51.100.50"
+
+	for i := 0; i < 3; i++ {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+		req.Header.Set("X-Real-IP", ip)
+		req.Header.Set("Authorization", "Bearer secret-key")
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Errorf("attempt %d: status = %d, want 200", i+1, rr.Code)
+		}
+	}
+}
+
+// TestAuthSlotRenewedOnFailure verifies that a failed auth renews the slot
+// so subsequent requests from the same IP can proceed.
+func TestAuthSlotRenewedOnFailure(t *testing.T) {
+	m := NewMiddleware("secret-key", nil, nil, nil)
+	h := m.Wrap(okHandler())
+
+	ip := "198.51.100.51"
+
+	for i := 0; i < 3; i++ {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+		req.Header.Set("X-Real-IP", ip)
+		req.Header.Set("Authorization", "Bearer wrong-key")
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("attempt %d: status = %d, want 401", i+1, rr.Code)
+		}
 	}
 }

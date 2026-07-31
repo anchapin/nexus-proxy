@@ -36,9 +36,14 @@ func (benchEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
 	return []float64{1.0}, nil
 }
 
-func (benchEmbedder) IsHealthy(context.Context) bool { return true }
-func (benchEmbedder) IsBreakerOpen() bool            { return false }
-func (benchEmbedder) RecordBreakerSuccess()          {}
+func (benchEmbedder) EmbedBatch(_ context.Context, _ []string) ([][]float64, error) {
+	return [][]float64{{1.0}}, nil
+}
+
+func (benchEmbedder) IsHealthy(context.Context) bool                    { return true }
+func (benchEmbedder) IsBreakerOpen() bool                               { return false }
+func (benchEmbedder) RecordBreakerSuccess()                             {}
+func (benchEmbedder) SetTripCallback(kind string, cb func(kind string)) {}
 
 // jsonStringLit wraps a string in a JSON string literal via fmt %q.
 func jsonStringLit(s string) string {

@@ -3,11 +3,34 @@ package rag
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// writeOversizeBody writes exactly want bytes to w using a fixed-size chunk
+// buffer, so the test never holds the full oversize payload in a single
+// allocation. Aborts silently on write errors.
+func writeOversizeBody(w http.ResponseWriter, want int) {
+	const chunkSize = 4096
+	chunk := make([]byte, chunkSize)
+	written := 0
+	for written < want {
+		n := want - written
+		if n > len(chunk) {
+			n = len(chunk)
+		}
+		if _, err := w.Write(chunk[:n]); err != nil {
+			return
+		}
+		written += n
+	}
+}
 
 // TestNewEmbedder_Ollama verifies that the factory produces an OllamaEmbedder
 // when the type is Ollama (the default).
@@ -78,7 +101,7 @@ func TestOllamaEmbedder_CircuitBreaker_TripsAfterThreshold(t *testing.T) {
 	// Three failures should trip the breaker.
 	for i := 0; i < 3; i++ {
 		_, err := emb.Embed(ctx, "test")
-		if err == ErrCircuitOpen {
+		if errors.Is(err, ErrCircuitOpen) {
 			t.Fatalf("call %d: got ErrCircuitOpen before threshold", i+1)
 		}
 	}
@@ -101,7 +124,7 @@ func TestOllamaEmbedder_CircuitBreaker_TripsAfterThreshold(t *testing.T) {
 		BreakerConfig{Threshold: 1, Cooldown: 10 * time.Second})
 	_, _ = emb2.Embed(ctx, "test") // trips the breaker (firstCall=true, doesn't count)
 	_, err := emb2.Embed(ctx, "test")
-	if err != ErrCircuitOpen {
+	if !errors.Is(err, ErrCircuitOpen) {
 		t.Fatalf("expected ErrCircuitOpen, got %v", err)
 	}
 	if calls != 0 {
@@ -121,13 +144,13 @@ func TestOllamaEmbedder_CircuitBreaker_BlocksWhileOpen(t *testing.T) {
 	ctx := context.Background()
 	// First call fails and trips the breaker.
 	_, err := emb.Embed(ctx, "test")
-	if err == ErrCircuitOpen {
+	if errors.Is(err, ErrCircuitOpen) {
 		t.Fatalf("first call: expected non-circuit error, got %v", err)
 	}
 
 	// Second call should be blocked by circuit breaker.
 	_, err = emb.Embed(ctx, "test")
-	if err != ErrCircuitOpen {
+	if !errors.Is(err, ErrCircuitOpen) {
 		t.Fatalf("second call: expected ErrCircuitOpen, got %v", err)
 	}
 
@@ -161,12 +184,95 @@ func TestOllamaEmbedder_CircuitBreaker_RecoversAfterCooldown(t *testing.T) {
 	// recordFailure increments failureCount to 1, and since threshold=1 the
 	// breaker re-trips immediately. IsBreakerOpen() is true AFTER the call.
 	_, err := emb.Embed(ctx, "test")
-	if err == ErrCircuitOpen {
+	if errors.Is(err, ErrCircuitOpen) {
 		t.Error("expected HTTP error after cooldown, not ErrCircuitOpen")
 	}
 	if !emb.IsBreakerOpen() {
 		// After a post-cooldown failure the breaker should be open again.
 		t.Error("breaker should be open after post-cooldown failure")
+	}
+}
+
+func TestOllamaEmbedder_CircuitBreaker_HalfOpenAdmitsOneProbe(t *testing.T) {
+	var calls atomic.Int32
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch calls.Add(1) {
+		case 1:
+			w.WriteHeader(http.StatusInternalServerError)
+		case 2:
+			close(probeStarted)
+			<-releaseProbe
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"embedding": []float64{0.1, 0.2, 0.3},
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"embedding": []float64{0.1, 0.2, 0.3},
+			})
+		}
+	}))
+	defer svr.Close()
+
+	emb := NewOllamaEmbedder(svr.URL, "nomic-embed-text", svr.Client(),
+		BreakerConfig{Threshold: 1, Cooldown: 20 * time.Millisecond})
+	if _, err := emb.Embed(context.Background(), "initial"); err == nil {
+		t.Fatal("initial request should fail")
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	const callers = 32
+	start := make(chan struct{})
+	results := make(chan error, callers)
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := emb.Embed(context.Background(), "probe")
+			results <- err
+		}()
+	}
+	close(start)
+
+	probeTimedOut := false
+	select {
+	case <-probeStarted:
+	case <-time.After(time.Second):
+		probeTimedOut = true
+	}
+
+	rejected := 0
+	for i := 0; i < callers-1 && !probeTimedOut; i++ {
+		select {
+		case err := <-results:
+			if !errors.Is(err, ErrCircuitOpen) {
+				t.Errorf("concurrent caller %d: expected ErrCircuitOpen, got %v", i, err)
+			}
+			rejected++
+		case <-time.After(time.Second):
+			probeTimedOut = true
+		}
+	}
+
+	close(releaseProbe)
+	wg.Wait()
+	if probeTimedOut {
+		t.Fatal("half-open probe did not admit exactly one request")
+	}
+	if rejected != callers-1 {
+		t.Fatalf("rejected callers = %d, want %d", rejected, callers-1)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("provider requests = %d, want 2 including initial failure", got)
+	}
+	if err := <-results; err != nil {
+		t.Fatalf("half-open probe: %v", err)
+	}
+	if emb.IsBreakerOpen() {
+		t.Fatal("breaker should close after a successful half-open probe")
 	}
 }
 
@@ -192,7 +298,7 @@ func TestOllamaEmbedder_CircuitBreaker_ResetsOnSuccess(t *testing.T) {
 	// Two failures: failureCount should be 2 after.
 	for i := 0; i < 2; i++ {
 		_, err := emb.Embed(ctx, "test")
-		if err == ErrCircuitOpen {
+		if errors.Is(err, ErrCircuitOpen) {
 			t.Fatalf("call %d: got ErrCircuitOpen before threshold", i+1)
 		}
 	}
@@ -202,30 +308,29 @@ func TestOllamaEmbedder_CircuitBreaker_ResetsOnSuccess(t *testing.T) {
 
 	// Third failure trips the breaker (threshold=3).
 	_, err := emb.Embed(ctx, "test")
-	if err == ErrCircuitOpen {
+	if errors.Is(err, ErrCircuitOpen) {
 		t.Fatal("3rd call should not be blocked before cooldown starts")
 	}
 	// Breaker is now open due to cooldown. Subsequent failures are blocked.
 	_, err = emb.Embed(ctx, "test")
-	if err != ErrCircuitOpen {
+	if !errors.Is(err, ErrCircuitOpen) {
 		t.Fatalf("call 4: expected ErrCircuitOpen (blocked by cooldown), got %v", err)
 	}
 
 	// Wait for cooldown to expire.
 	time.Sleep(600 * time.Millisecond)
 
-	// After cooldown: isOpen resets failureCount to 0 and cooldownUntil to 0.
-	// The call proceeds, fails, and records failureCount=1 (NOT re-tripped,
-	// since 1 < threshold=3). Breaker remains closed.
+	// After cooldown, a failure from the half-open probe re-trips the breaker
+	// immediately, even though the normal threshold is three failures.
 	_, err = emb.Embed(ctx, "test")
-	if err == ErrCircuitOpen {
+	if errors.Is(err, ErrCircuitOpen) {
 		t.Fatal("post-cooldown call should not be blocked")
 	}
-	if emb.IsBreakerOpen() {
-		t.Error("breaker should be closed after post-cooldown failure (count=1 < threshold=3)")
+	if !emb.IsBreakerOpen() {
+		t.Error("breaker should reopen after a failed half-open probe")
 	}
 
-	// After cooldown, a success resets the counter.
+	// After a failed probe, a success resets the counter.
 	// Temporarily make server succeed.
 	svr.Close()
 	svr = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -256,7 +361,7 @@ func TestOllamaEmbedder_CircuitBreaker_ZeroConfigDefaults(t *testing.T) {
 	_, err := emb.Embed(ctx, "test")
 	// With zero threshold the breaker is disabled; we should get a connection
 	// error, not ErrCircuitOpen.
-	if err == ErrCircuitOpen {
+	if errors.Is(err, ErrCircuitOpen) {
 		t.Error("breaker should be disabled with zero threshold")
 	}
 }
@@ -300,3 +405,402 @@ func TestNewEmbedder_UnknownType_FallsBackToOllama(t *testing.T) {
 var _ Embedder = (*OllamaEmbedder)(nil)
 var _ Embedder = (*OpenAIEmbedder)(nil)
 var _ Embedder = (*CohereEmbedder)(nil)
+
+// TestOllamaEmbedder_BoundsResponseBody ensures that an Ollama embedder
+// response larger than defaultMaxResponseBytes is bounded, returns a
+// wrapped size-limit error, and records exactly one breaker failure
+// (issue #435).
+func TestOllamaEmbedder_BoundsResponseBody(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping oversize-body test in -short mode (transfers 64 MiB)")
+	}
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeOversizeBody(w, defaultMaxResponseBytes+1)
+	}))
+	defer svr.Close()
+
+	emb := NewOllamaEmbedder(svr.URL, "nomic-embed-text", svr.Client(),
+		BreakerConfig{Threshold: 5, Cooldown: 5 * time.Second})
+
+	vec, err := emb.Embed(context.Background(), "test")
+	if err == nil {
+		t.Fatal("expected error from oversize body, got nil")
+	}
+	if vec != nil {
+		t.Errorf("expected nil embedding on oversize body, got %v", vec)
+	}
+	if !strings.Contains(err.Error(), "size limit") {
+		t.Errorf("expected error to mention size limit, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "ollama embed") {
+		t.Errorf("expected error to mention ollama embed, got %v", err)
+	}
+	if got := emb.FailureCount(); got != 1 {
+		t.Errorf("breaker failure count = %d, want 1", got)
+	}
+	if emb.IsBreakerOpen() {
+		t.Error("breaker should not be open after a single failure (threshold=5)")
+	}
+}
+
+// TestCohereEmbedder_BoundsResponseBody ensures that a Cohere embedder
+// response larger than defaultMaxResponseBytes is bounded, returns a
+// wrapped size-limit error, and records exactly one breaker failure
+// (issue #435).
+func TestCohereEmbedder_BoundsResponseBody(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping oversize-body test in -short mode (transfers 64 MiB)")
+	}
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeOversizeBody(w, defaultMaxResponseBytes+1)
+	}))
+	defer svr.Close()
+
+	emb := NewCohereEmbedder(svr.URL, "embed-english-v3.0", "test-key", svr.Client(),
+		BreakerConfig{Threshold: 5, Cooldown: 5 * time.Second})
+
+	vec, err := emb.Embed(context.Background(), "test")
+	if err == nil {
+		t.Fatal("expected error from oversize body, got nil")
+	}
+	if vec != nil {
+		t.Errorf("expected nil embedding on oversize body, got %v", vec)
+	}
+	if !strings.Contains(err.Error(), "size limit") {
+		t.Errorf("expected error to mention size limit, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "cohere embed") {
+		t.Errorf("expected error to mention cohere embed, got %v", err)
+	}
+	if got := emb.breaker.FailureCount(); got != 1 {
+		t.Errorf("breaker failure count = %d, want 1", got)
+	}
+	if emb.IsBreakerOpen() {
+		t.Error("breaker should not be open after a single failure (threshold=5)")
+	}
+}
+
+// TestOpenAIEmbedder_IsHealthy_BreakerOpen verifies that IsHealthy returns false
+// immediately when the circuit breaker is open, without making an HTTP call.
+func TestOpenAIEmbedder_IsHealthy_BreakerOpen(t *testing.T) {
+	var calls atomic.Int32
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer svr.Close()
+
+	emb := NewOpenAIEmbedder(svr.URL, "text-embedding-3-small", "sk-testkey", svr.Client(),
+		BreakerConfig{Threshold: 1, Cooldown: 10 * time.Second})
+
+	ctx := context.Background()
+	// First call trips the breaker.
+	_, _ = emb.Embed(ctx, "trigger")
+	if !emb.IsBreakerOpen() {
+		t.Fatal("breaker should be open after one failure")
+	}
+	// Reset call counter after the triggering call.
+	calls.Store(0)
+
+	// IsHealthy should return false without calling the server.
+	if emb.IsHealthy(ctx) {
+		t.Error("IsHealthy: expected false when breaker is open")
+	}
+	if calls.Load() != 0 {
+		t.Error("IsHealthy: server should not be called when breaker is open")
+	}
+}
+
+// TestOpenAIEmbedder_IsHealthy_ServerError verifies that IsHealthy returns false
+// when the breaker is closed but the server responds with an error.
+func TestOpenAIEmbedder_IsHealthy_ServerError(t *testing.T) {
+	var calls atomic.Int32
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer svr.Close()
+
+	emb := NewOpenAIEmbedder(svr.URL, "text-embedding-3-small", "sk-testkey", svr.Client(),
+		BreakerConfig{Threshold: 3, Cooldown: 10 * time.Second})
+
+	ctx := context.Background()
+	// IsHealthy should call the server, get an error, and return false.
+	if emb.IsHealthy(ctx) {
+		t.Error("IsHealthy: expected false when server returns error")
+	}
+	if calls.Load() != 1 {
+		t.Errorf("IsHealthy: expected 1 server call, got %d", calls.Load())
+	}
+}
+
+// TestCohereEmbedder_IsHealthy_BreakerOpen verifies that IsHealthy returns false
+// immediately when the circuit breaker is open, without making an HTTP call.
+func TestCohereEmbedder_IsHealthy_BreakerOpen(t *testing.T) {
+	var calls atomic.Int32
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer svr.Close()
+
+	emb := NewCohereEmbedder(svr.URL, "embed-english-v3.0", "cohere-key-123", svr.Client(),
+		BreakerConfig{Threshold: 1, Cooldown: 10 * time.Second})
+
+	ctx := context.Background()
+	// First call trips the breaker.
+	_, _ = emb.Embed(ctx, "trigger")
+	if !emb.IsBreakerOpen() {
+		t.Fatal("breaker should be open after one failure")
+	}
+	// Reset call counter after the triggering call.
+	calls.Store(0)
+
+	// IsHealthy should return false without calling the server.
+	if emb.IsHealthy(ctx) {
+		t.Error("IsHealthy: expected false when breaker is open")
+	}
+	if calls.Load() != 0 {
+		t.Error("IsHealthy: server should not be called when breaker is open")
+	}
+}
+
+// TestCohereEmbedder_IsHealthy_ServerError verifies that IsHealthy returns false
+// when the breaker is closed but the server responds with an error.
+func TestCohereEmbedder_IsHealthy_ServerError(t *testing.T) {
+	var calls atomic.Int32
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer svr.Close()
+
+	emb := NewCohereEmbedder(svr.URL, "embed-english-v3.0", "cohere-key-123", svr.Client(),
+		BreakerConfig{Threshold: 3, Cooldown: 10 * time.Second})
+
+	ctx := context.Background()
+	// IsHealthy should call the server, get an error, and return false.
+	if emb.IsHealthy(ctx) {
+		t.Error("IsHealthy: expected false when server returns error")
+	}
+	if calls.Load() != 1 {
+		t.Errorf("IsHealthy: expected 1 server call, got %d", calls.Load())
+	}
+}
+
+// TestOllamaEmbedder_EmbedBatch verifies that EmbedBatch correctly unpacks
+// the batch response and returns vectors in the same order as input texts.
+func TestOllamaEmbedder_EmbedBatch(t *testing.T) {
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model   string   `json:"model"`
+			Prompts []string `json:"prompts"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if len(req.Prompts) != 3 {
+			t.Fatalf("expected 3 prompts, got %d", len(req.Prompts))
+		}
+		resp := map[string]any{
+			"embeddings": [][]float64{
+				{0.1, 0.2, 0.3},
+				{0.4, 0.5, 0.6},
+				{0.7, 0.8, 0.9},
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer svr.Close()
+
+	emb := NewOllamaEmbedder(svr.URL, "nomic-embed-text", svr.Client(), BreakerConfig{})
+	vecs, err := emb.EmbedBatch(context.Background(), []string{"a", "b", "c"})
+	if err != nil {
+		t.Fatalf("EmbedBatch: %v", err)
+	}
+	if len(vecs) != 3 {
+		t.Fatalf("expected 3 vectors, got %d", len(vecs))
+	}
+	if vecs[0][0] != 0.1 || vecs[1][1] != 0.5 || vecs[2][2] != 0.9 {
+		t.Errorf("unexpected vector values: %v", vecs)
+	}
+}
+
+// TestOllamaEmbedder_EmbedBatch_ShortResponse verifies that EmbedBatch returns
+// an error when the server returns fewer embeddings than requested (issue #932).
+func TestOllamaEmbedder_EmbedBatch_ShortResponse(t *testing.T) {
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model   string   `json:"model"`
+			Prompts []string `json:"prompts"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		// Simulate Ollama silently returning fewer embeddings than requested.
+		resp := map[string]any{
+			"embeddings": [][]float64{
+				{0.1, 0.2, 0.3}, // only 1 embedding returned, but 3 were requested
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer svr.Close()
+
+	emb := NewOllamaEmbedder(svr.URL, "nomic-embed-text", svr.Client(), BreakerConfig{})
+	_, err := emb.EmbedBatch(context.Background(), []string{"a", "b", "c"})
+	if err == nil {
+		t.Fatal("expected error for short response, got nil")
+	}
+	if !strings.Contains(err.Error(), "response has 1 embeddings, want 3") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestOllamaEmbedder_EmbedBatch_DimensionMismatch verifies that EmbedBatch returns
+// an error when embeddings have inconsistent dimensions (issue #1039).
+func TestOllamaEmbedder_EmbedBatch_DimensionMismatch(t *testing.T) {
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"embeddings": [][]float64{
+				{0.1, 0.2, 0.3},
+				{0.4, 0.5},            // dim=2, inconsistent with first (dim=3)
+				{0.7, 0.8, 0.9, 0.10}, // dim=4, also inconsistent
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer svr.Close()
+
+	emb := NewOllamaEmbedder(svr.URL, "nomic-embed-text", svr.Client(), BreakerConfig{})
+	_, err := emb.EmbedBatch(context.Background(), []string{"a", "b", "c"})
+	if err == nil {
+		t.Fatal("expected error for dimension mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "embedding at index 1 has dimension 2, want 3") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestOpenAIEmbedder_EmbedBatch verifies that EmbedBatch correctly sends
+// an array input and unpacks the batch response.
+func TestOpenAIEmbedder_EmbedBatch(t *testing.T) {
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string   `json:"model"`
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if len(req.Input) != 2 {
+			t.Fatalf("expected 2 inputs, got %d", len(req.Input))
+		}
+		resp := map[string]any{
+			"data": []map[string]any{
+				{"embedding": []float64{0.1, 0.2}},
+				{"embedding": []float64{0.3, 0.4}},
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer svr.Close()
+
+	emb := NewOpenAIEmbedder(svr.URL, "text-embedding-3-small", "sk-test", svr.Client(), BreakerConfig{})
+	vecs, err := emb.EmbedBatch(context.Background(), []string{"hello", "world"})
+	if err != nil {
+		t.Fatalf("EmbedBatch: %v", err)
+	}
+	if len(vecs) != 2 {
+		t.Fatalf("expected 2 vectors, got %d", len(vecs))
+	}
+	if vecs[0][0] != 0.1 || vecs[1][1] != 0.4 {
+		t.Errorf("unexpected vector values: %v", vecs)
+	}
+}
+
+// TestOpenAIEmbedder_EmbedBatch_DimensionMismatch verifies that EmbedBatch returns
+// an error when embeddings have inconsistent dimensions (issue #1039).
+func TestOpenAIEmbedder_EmbedBatch_DimensionMismatch(t *testing.T) {
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"data": []map[string]any{
+				{"embedding": []float64{0.1, 0.2, 0.3}},
+				{"embedding": []float64{0.4, 0.5}}, // dim=2, inconsistent with first (dim=3)
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer svr.Close()
+
+	emb := NewOpenAIEmbedder(svr.URL, "text-embedding-3-small", "sk-test", svr.Client(), BreakerConfig{})
+	_, err := emb.EmbedBatch(context.Background(), []string{"hello", "world"})
+	if err == nil {
+		t.Fatal("expected error for dimension mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "embedding at index 1 has dimension 2, want 3") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestCohereEmbedder_EmbedBatch verifies that EmbedBatch correctly sends
+// a texts array and unpacks the batch response.
+func TestCohereEmbedder_EmbedBatch(t *testing.T) {
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string   `json:"model"`
+			Texts []string `json:"texts"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if len(req.Texts) != 2 {
+			t.Fatalf("expected 2 texts, got %d", len(req.Texts))
+		}
+		resp := map[string]any{
+			"embeddings": [][]float64{
+				{0.1, 0.2, 0.3},
+				{0.4, 0.5, 0.6},
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer svr.Close()
+
+	emb := NewCohereEmbedder(svr.URL, "embed-english-v3.0", "cohere-key", svr.Client(), BreakerConfig{})
+	vecs, err := emb.EmbedBatch(context.Background(), []string{"hello", "world"})
+	if err != nil {
+		t.Fatalf("EmbedBatch: %v", err)
+	}
+	if len(vecs) != 2 {
+		t.Fatalf("expected 2 vectors, got %d", len(vecs))
+	}
+	if vecs[0][0] != 0.1 || vecs[1][2] != 0.6 {
+		t.Errorf("unexpected vector values: %v", vecs)
+	}
+}
+
+// TestCohereEmbedder_EmbedBatch_DimensionMismatch verifies that EmbedBatch returns
+// an error when embeddings have inconsistent dimensions (issue #1039).
+func TestCohereEmbedder_EmbedBatch_DimensionMismatch(t *testing.T) {
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"embeddings": [][]float64{
+				{0.1, 0.2, 0.3},
+				{0.4, 0.5},           // dim=2, inconsistent with first (dim=3)
+				{0.6, 0.7, 0.8, 0.9}, // dim=4, also inconsistent
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer svr.Close()
+
+	emb := NewCohereEmbedder(svr.URL, "embed-english-v3.0", "cohere-key", svr.Client(), BreakerConfig{})
+	_, err := emb.EmbedBatch(context.Background(), []string{"hello", "world", "foo"})
+	if err == nil {
+		t.Fatal("expected error for dimension mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "embedding at index 1 has dimension 2, want 3") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}

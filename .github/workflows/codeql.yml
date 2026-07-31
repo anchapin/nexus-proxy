@@ -8,7 +8,8 @@
 # credentials, and SQL injection into the SQLite metrics store.
 #
 # Triggers:
-#   - push / pull_request to main      (per-PR feedback)
+#   - push / pull_request to main & develop (per-PR feedback; develop is
+#     the default integration branch)
 #   - schedule (weekly, Monday 03:45)  (catches new queries + new deps)
 #
 # Permissions: CodeQL needs `security-events: write` to upload the
@@ -19,9 +20,9 @@ name: CodeQL
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
   schedule:
     - cron: '45 3 * * 1'
 

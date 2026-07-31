@@ -79,6 +79,7 @@ func (f *fakeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	f.mu.Unlock()
 	rec := httptest.NewRecorder()
+	rec.Header().Set("Content-Type", "application/json")
 	h(rec, req)
 	return rec.Result(), nil
 }
@@ -143,7 +144,7 @@ func TestCascadePrimarySucceeds(t *testing.T) {
 	client := &http.Client{Transport: ft}
 
 	rw := newSSERW()
-	res, err := twoStepCascade().Run(context.Background(), rw, client, map[string]interface{}{"messages": []interface{}{}})
+	res, err := twoStepCascade().Run(context.Background(), rw, client, map[string]interface{}{"messages": []interface{}{}}, "")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -191,7 +192,7 @@ func TestCascadeFallsBackOn5xx(t *testing.T) {
 	client := &http.Client{Transport: ft}
 
 	rw := newSSERW()
-	res, err := twoStepCascade().Run(context.Background(), rw, client, map[string]interface{}{"messages": []interface{}{}})
+	res, err := twoStepCascade().Run(context.Background(), rw, client, map[string]interface{}{"messages": []interface{}{}}, "")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -221,9 +222,12 @@ func TestCascadeFallsBackOn429(t *testing.T) {
 		w.WriteHeader(200)
 		_, _ = io.WriteString(w, chatBody200)
 	})
-	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
+	}
+	if res.FallbackReason != "rate_limited" {
+		t.Errorf("FallbackReason=%q, want rate_limited", res.FallbackReason)
 	}
 }
 
@@ -236,7 +240,7 @@ func TestCascadeFallsBackOn408(t *testing.T) {
 		w.WriteHeader(200)
 		_, _ = io.WriteString(w, chatBody200)
 	})
-	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
 	}
@@ -251,9 +255,140 @@ func TestCascadeFallsBackOnTransportError(t *testing.T) {
 		_, _ = io.WriteString(w, chatBody200)
 	})
 	client := &http.Client{Transport: ft}
-	res, err := twoStepCascade().Run(context.Background(), newSSERW(), client, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), client, nil, "")
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
+	}
+}
+
+// TestCascadeFallbackReasonHTTPError verifies issue #534: HTTP 5xx/408
+// (but not 429) responses from the upstream are labeled "http_error", not
+// "transport_error". 429 is labeled "rate_limited" (issue #750).
+// transport_error is reserved for real transport-layer failures (DNS, connection
+// refused, etc.). HTTP 429 is tested separately in TestCascadeFallbackReasonRateLimited.
+func TestCascadeFallbackReasonHTTPError(t *testing.T) {
+	cases := []struct {
+		statusCode int
+		name       string
+	}{
+		{503, "503 Service Unavailable"},
+		{504, "504 Gateway Timeout"},
+		{408, "408 Request Timeout"},
+		{500, "500 Internal Server Error"},
+		{502, "502 Bad Gateway"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ft := newFakeTransport()
+			ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.statusCode)
+				_, _ = io.WriteString(w, "upstream error")
+			})
+			ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(200)
+				_, _ = io.WriteString(w, chatBody200)
+			})
+			res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if res.ServedBy != "frontier" {
+				t.Errorf("ServedBy=%q, want frontier", res.ServedBy)
+			}
+			if res.FallbackReason != "http_error" {
+				t.Errorf("FallbackReason=%q, want http_error for status %d", res.FallbackReason, tc.statusCode)
+			}
+		})
+	}
+}
+
+// TestCascadeFallbackReasonRateLimited verifies issue #750: HTTP 429 responses
+// from the upstream are labeled "rate_limited", not "http_error", so operators
+// can distinguish rate-limiting (transient, likely to resolve quickly) from
+// server errors (may not resolve on their own).
+func TestCascadeFallbackReasonRateLimited(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, "rate limited")
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.ServedBy != "frontier" {
+		t.Errorf("ServedBy=%q, want frontier", res.ServedBy)
+	}
+	if res.FallbackReason != "rate_limited" {
+		t.Errorf("FallbackReason=%q, want rate_limited for status 429", res.FallbackReason)
+	}
+}
+
+// TestCascadeFallbackReasonTransportError verifies issue #534: a true
+// transport error (no handler registered = connection refused at client.Do)
+// is still labeled "transport_error", distinct from "http_error".
+func TestCascadeFallbackReasonTransportError(t *testing.T) {
+	ft := newFakeTransport()
+	// nil handler = client.Do gets a connection-refused-style error
+	ft.handlers["http://primary.local/v1/chat/completions"] = nil
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.ServedBy != "frontier" {
+		t.Errorf("ServedBy=%q, want frontier", res.ServedBy)
+	}
+	if res.FallbackReason != "transport_error" {
+		t.Errorf("FallbackReason=%q, want transport_error for true transport error", res.FallbackReason)
+	}
+}
+
+// TestCascadeFallbackReasonUnknown verifies issue #664: CascadeFallbackReason
+// returns "unknown" instead of "" when err is nil, not a cascadeErr, or when
+// the cascadeErr carries an empty reason. Empty-string reason labels cause
+// cascade_fallback_total{reason=""} metric collision in Prometheus.
+func TestCascadeFallbackReasonUnknown(t *testing.T) {
+	// nil error → "unknown"
+	if got := CascadeFallbackReason(nil); got != "unknown" {
+		t.Errorf("CascadeFallbackReason(nil) = %q, want unknown", got)
+	}
+
+	// plain error (not a cascadeErr) → "unknown"
+	plainErr := errors.New("some network glitch")
+	if got := CascadeFallbackReason(plainErr); got != "unknown" {
+		t.Errorf("CascadeFallbackReason(plainErr) = %q, want unknown", got)
+	}
+
+	// cascadeErr with empty reason (non-retryable, e.g. 401 auth failure) → "unknown"
+	nonRetryableErr := newCascadeErr(false, "", "status 401: unauthorized")
+	if got := CascadeFallbackReason(nonRetryableErr); got != "unknown" {
+		t.Errorf("CascadeFallbackReason(nonRetryableErr) = %q, want unknown", got)
+	}
+
+	// cascadeErr with known reason → that reason unchanged
+	retryableErr := newCascadeErr(true, "timeout", "context deadline exceeded")
+	if got := CascadeFallbackReason(retryableErr); got != "timeout" {
+		t.Errorf("CascadeFallbackReason(retryableErr) = %q, want timeout", got)
+	}
+}
+
+// TestCascadeFallbackReason_ModelUnavailable verifies issue #790: a
+// cascadeErr with reason="model_unavailable" (local 404) is labeled
+// "model_unavailable", not "unknown", so the metric
+// cascade_fallback_total{reason="model_unavailable"} is emitted.
+func TestCascadeFallbackReason_ModelUnavailable(t *testing.T) {
+	modelUnavailableErr := newCascadeErr(true, "model_unavailable", "local model not found (404)")
+	if got := CascadeFallbackReason(modelUnavailableErr); got != "model_unavailable" {
+		t.Errorf("CascadeFallbackReason(modelUnavailableErr) = %q, want model_unavailable", got)
 	}
 }
 
@@ -279,7 +414,7 @@ func TestCascadeFallsBackOnTimeout(t *testing.T) {
 		},
 	}
 	start := time.Now()
-	res, err := cas.Run(context.Background(), newSSERW(), http.DefaultClient, nil)
+	res, err := cas.Run(context.Background(), newSSERW(), http.DefaultClient, nil, "")
 	elapsed := time.Since(start)
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
@@ -299,7 +434,7 @@ func TestCascadeFallsBackOnMalformedJSON(t *testing.T) {
 		w.WriteHeader(200)
 		_, _ = io.WriteString(w, chatBody200)
 	})
-	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
 	}
@@ -315,7 +450,7 @@ func TestCascadeFallsBackOnEmptyChoices(t *testing.T) {
 		w.WriteHeader(200)
 		_, _ = io.WriteString(w, chatBody200)
 	})
-	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
 	}
@@ -333,7 +468,7 @@ func TestCascadeFallsBackOnMalformedToolCall(t *testing.T) {
 		w.WriteHeader(200)
 		_, _ = io.WriteString(w, chatBody200)
 	})
-	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
 	}
@@ -349,7 +484,7 @@ func TestCascadeFallsBackOnMissingToolCallFields(t *testing.T) {
 		w.WriteHeader(200)
 		_, _ = io.WriteString(w, chatBody200)
 	})
-	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
 	if err != nil || res.ServedBy != "frontier" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
 	}
@@ -364,7 +499,7 @@ func TestCascadeAcceptsValidToolCall(t *testing.T) {
 	ft.on("http://fallback.local/v1/chat/completions", func(_ http.ResponseWriter, _ *http.Request) {
 		t.Error("fallback should not fire when tool_call is valid")
 	})
-	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
 	if err != nil || res.ServedBy != "local" {
 		t.Errorf("err=%v servedBy=%q", err, res.ServedBy)
 	}
@@ -379,7 +514,7 @@ func TestCascadeAllFailReturnsLastError(t *testing.T) {
 		w.WriteHeader(502)
 	})
 	rw := newSSERW()
-	res, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil, "")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -403,6 +538,30 @@ func TestCascadeAllFailReturnsLastError(t *testing.T) {
 	}
 }
 
+func TestCascadeAllFailSetsFallbackReason(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(500)
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(502)
+	})
+	rw := newSSERW()
+	res, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil, "")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if res.Succeeded {
+		t.Fatal("Succeeded should be false")
+	}
+	if res.FallbackReason == "" {
+		t.Fatal("FallbackReason should be non-empty when all steps fail with retryable errors (issue #740)")
+	}
+	if res.FallbackReason != "http_error" {
+		t.Errorf("FallbackReason=%q, want http_error", res.FallbackReason)
+	}
+}
+
 func TestCascadeNonRetryableStopsImmediately(t *testing.T) {
 	// Primary returns 401 — retrying won't help, so cascade should not
 	// call the fallback.
@@ -414,7 +573,7 @@ func TestCascadeNonRetryableStopsImmediately(t *testing.T) {
 	ft.on("http://fallback.local/v1/chat/completions", func(_ http.ResponseWriter, _ *http.Request) {
 		t.Error("fallback should NOT have been called for non-retryable 401")
 	})
-	_, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
+	_, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -424,7 +583,7 @@ func TestCascadeNonRetryableStopsImmediately(t *testing.T) {
 }
 
 func TestCascadeEmptyStepsReturnsError(t *testing.T) {
-	_, err := (&Cascade{}).Run(context.Background(), newSSERW(), http.DefaultClient, nil)
+	_, err := (&Cascade{}).Run(context.Background(), newSSERW(), http.DefaultClient, nil, "")
 	if err == nil || !strings.Contains(err.Error(), "no steps") {
 		t.Errorf("got %v", err)
 	}
@@ -446,9 +605,36 @@ func TestCascadeDefaultTimeoutWhenZero(t *testing.T) {
 		w.WriteHeader(200)
 		_, _ = io.WriteString(w, chatBody200)
 	})
-	res, err := cas.Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := cas.Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
 	if err != nil || !res.Succeeded {
 		t.Errorf("err=%v res=%+v", err, res)
+	}
+}
+
+func TestCascadeMaxResponseBytesTriggersBoundedRead(t *testing.T) {
+	ft := newFakeTransport()
+	largeBody := `{"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"` + strings.Repeat("x", 1024) + `"}}]}`
+	ft.on("http://x/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, largeBody)
+	})
+	cas := &Cascade{
+		Timeout:          2 * time.Second,
+		MaxResponseBytes: 512,
+		Steps: []CascadeStep{
+			{Name: "local", URL: "http://x/v1/chat/completions", Model: "m"},
+		},
+	}
+	rw := newSSERW()
+	res, err := cas.Run(context.Background(), rw, &http.Client{Transport: ft}, nil, "")
+	if err == nil {
+		t.Fatal("expected error when response exceeds MaxResponseBytes")
+	}
+	if res.Succeeded {
+		t.Error("Succeeded = true, want false")
+	}
+	if rw.status != 0 {
+		t.Errorf("status written before error: %d", rw.status)
 	}
 }
 
@@ -529,6 +715,17 @@ func TestBuildLocalCascadeSkipsMissingKeys(t *testing.T) {
 	}
 }
 
+func TestBuildLocalCascadeRespectsMaxResponseBytes(t *testing.T) {
+	cas := BuildLocalCascade(CascadeConfig{
+		LocalURL:         "http://localhost:11434",
+		LocalModel:       "qwen3-coder:8b",
+		MaxResponseBytes: 12345,
+	})
+	if cas.MaxResponseBytes != 12345 {
+		t.Errorf("MaxResponseBytes = %d, want 12345", cas.MaxResponseBytes)
+	}
+}
+
 func TestCascadeValidatesBeforeWritingBytes(t *testing.T) {
 	// Critical acceptance criterion: the response must NOT be written to
 	// the client if it would later fail validation. Here the primary
@@ -544,7 +741,7 @@ func TestCascadeValidatesBeforeWritingBytes(t *testing.T) {
 		_, _ = io.WriteString(w, chatBody200)
 	})
 	rw := newSSERW()
-	_, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil)
+	_, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil, "")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -560,7 +757,7 @@ func TestCascadeSSEChunkStructure(t *testing.T) {
 		_, _ = io.WriteString(w, chatBody200)
 	})
 	rw := newSSERW()
-	_, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil)
+	_, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil, "")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -606,7 +803,7 @@ func TestCascadeLocalStepFailedOn5xx(t *testing.T) {
 	})
 	client := &http.Client{Transport: ft}
 
-	res, err := twoStepCascade().Run(context.Background(), newSSERW(), client, map[string]interface{}{"messages": []interface{}{}})
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), client, map[string]interface{}{"messages": []interface{}{}}, "")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -625,7 +822,7 @@ func TestCascadeLocalStepFailedNotSetOnSuccess(t *testing.T) {
 	})
 	client := &http.Client{Transport: ft}
 
-	res, err := twoStepCascade().Run(context.Background(), newSSERW(), client, map[string]interface{}{"messages": []interface{}{}})
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), client, map[string]interface{}{"messages": []interface{}{}}, "")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -644,12 +841,121 @@ func TestCascadeLocalStepFailedNotSetOnNonRetryable(t *testing.T) {
 	})
 	client := &http.Client{Transport: ft}
 
-	_, err := twoStepCascade().Run(context.Background(), newSSERW(), client, map[string]interface{}{"messages": []interface{}{}})
+	_, err := twoStepCascade().Run(context.Background(), newSSERW(), client, map[string]interface{}{"messages": []interface{}{}}, "")
 	if err == nil {
 		t.Fatal("expected error for 401, got nil")
 	}
 	// Non-retryable means the cascade stops immediately; fallback is
 	// never called and LocalStepFailed should be false.
+}
+
+// --- Issue #438: local model 404 cascade tests --------------------------------
+
+// TestCascadeFallsBackOnLocal404 verifies that a 404 from the local step
+// (model missing/not pulled) triggers cascade to the frontier instead of
+// aborting. The outcome must record LocalStepFailed=true and FallbackReason="model_unavailable".
+func TestCascadeFallsBackOnLocal404(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"error":"model \"missing-model\" not found"}`)
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	res, err := twoStepCascade().Run(context.Background(), rw, client, map[string]interface{}{"messages": []interface{}{}}, "")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Succeeded {
+		t.Error("Succeeded = false, want true (frontier should have served)")
+	}
+	if res.ServedBy != "frontier" {
+		t.Errorf("ServedBy = %q, want frontier", res.ServedBy)
+	}
+	if res.RouteAttempted != "local->frontier" {
+		t.Errorf("RouteAttempted = %q, want local->frontier", res.RouteAttempted)
+	}
+	if !res.LocalStepFailed {
+		t.Error("LocalStepFailed = false, want true (local 404 should flag cooldown)")
+	}
+	if res.FallbackReason != "model_unavailable" {
+		t.Errorf("FallbackReason = %q, want model_unavailable", res.FallbackReason)
+	}
+	if !strings.Contains(rw.body.String(), "hello from local") {
+		t.Errorf("body missing frontier content: %q", rw.body.String())
+	}
+}
+
+// TestCascadeLocal404LocalStepFailedSet verifies LocalStepFailed is set
+// when local returns 404 and frontier serves (issue #438 acceptance criteria).
+func TestCascadeLocal404LocalStepFailedSet(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.LocalStepFailed {
+		t.Error("LocalStepFailed = false, want true after local 404 + frontier fallback")
+	}
+	if res.FallbackReason != "model_unavailable" {
+		t.Errorf("FallbackReason = %q, want model_unavailable", res.FallbackReason)
+	}
+}
+
+// TestCascadeFrontier404Stops verifies that a 404 from a frontier step is
+// terminal — a missing frontier model is a configuration error, not a
+// transient condition worth retrying (issue #438 acceptance criteria).
+func TestCascadeFrontier404Stops(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, "local down")
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"error":"model not found"}`)
+	})
+	client := &http.Client{Transport: ft}
+
+	_, err := twoStepCascade().Run(context.Background(), newSSERW(), client, nil, "")
+	if err == nil {
+		t.Fatal("expected error when frontier returns 404")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Errorf("err should mention 404: %v", err)
+	}
+}
+
+// TestCascadeLocal403Stops verifies that a 403 from the local step is
+// terminal — auth failures should not cascade (issue #438 acceptance criteria).
+func TestCascadeLocal403Stops(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, "forbidden")
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("fallback should NOT have been called for non-retryable 403")
+	})
+	_, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
+	if err == nil {
+		t.Fatal("expected error for 403")
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Errorf("err = %v", err)
+	}
 }
 
 // --- Issue #72: tool_calls preservation tests --------------------------------
@@ -670,7 +976,7 @@ func TestCascadeToolCallsStreamedAsDeltaToolCalls(t *testing.T) {
 		t.Error("fallback should not fire for valid tool_calls")
 	})
 	rw := newSSERW()
-	res, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil, "")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -736,7 +1042,7 @@ func TestCascadeEmptyContentWithToolCallsAccepted(t *testing.T) {
 	ft.on("http://fallback.local/v1/chat/completions", func(_ http.ResponseWriter, _ *http.Request) {
 		t.Error("fallback should not fire")
 	})
-	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -755,7 +1061,7 @@ func TestCascadeContentOnlyBackwardCompat(t *testing.T) {
 		_, _ = io.WriteString(w, chatBody200)
 	})
 	rw := newSSERW()
-	res, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil, "")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -793,7 +1099,7 @@ func TestCascadeMultipleToolCallsIndexed(t *testing.T) {
 		]}}]}`)
 	})
 	rw := newSSERW()
-	res, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil)
+	res, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil, "")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -824,7 +1130,7 @@ func TestCascadeContentAndToolCallsBothPresent(t *testing.T) {
 		_, _ = io.WriteString(w, `{"model":"qwen","choices":[{"message":{"content":"Let me check that.","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{}"}}]}}]}`)
 	})
 	rw := newSSERW()
-	_, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil)
+	_, err := twoStepCascade().Run(context.Background(), rw, &http.Client{Transport: ft}, nil, "")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -868,5 +1174,144 @@ func TestExtractAssistantMessageToolCalls(t *testing.T) {
 	}
 	if msg.ToolCalls[0].Function.Name != "bash" {
 		t.Errorf("Name = %q", msg.ToolCalls[0].Function.Name)
+	}
+}
+
+// --- Issue #667: truncateForLog off-by-one tests -----------------------------
+
+func TestTruncateForLogTruncates(t *testing.T) {
+	// Acceptance criterion: truncateForLog(make([]byte, 300), 200) returns
+	// exactly 200 bytes + "...(truncated)".
+	got := truncateForLog(make([]byte, 300), 200)
+	if len(got) != 200 {
+		t.Errorf("len(got) = %d, want 200", len(got))
+	}
+	if !strings.HasSuffix(got, "...(truncated)") {
+		t.Errorf("got does not end with \"...(truncated)\": %q", got)
+	}
+}
+
+func TestTruncateForLogExactFit(t *testing.T) {
+	// Acceptance criterion: truncateForLog(make([]byte, 200), 200) returns
+	// exactly 200 bytes with no suffix.
+	got := truncateForLog(make([]byte, 200), 200)
+	if len(got) != 200 {
+		t.Errorf("len(got) = %d, want 200", len(got))
+	}
+	if strings.Contains(got, "...(truncated)") {
+		t.Errorf("got should not contain suffix: %q", got)
+	}
+}
+
+func TestTruncateForLogEmpty(t *testing.T) {
+	// Acceptance criterion: truncateForLog(nil, 200) returns empty string.
+	got := truncateForLog(nil, 200)
+	if got != "" {
+		t.Errorf("got = %q, want empty string", got)
+	}
+}
+
+func TestTruncateForLogMaxTooSmall(t *testing.T) {
+	// When max is <= len("...(truncated)"), the function must not panic
+	// and must return an empty string.
+	got := truncateForLog(make([]byte, 100), 5)
+	if got != "" {
+		t.Errorf("got = %q, want empty string when max <= suffix len", got)
+	}
+}
+
+func TestTruncateForLogBoundary(t *testing.T) {
+	// At the boundary: max = 20, suffix = 13, so 20-13 = 7 bytes of content fit.
+	// len(b) == 7: exactly fits within max, no suffix appended.
+	got := truncateForLog(make([]byte, 7), 20)
+	if len(got) != 7 {
+		t.Errorf("len(got) = %d, want 7 (no truncation needed)", len(got))
+	}
+	// len(b) == 21: exceeds max, so suffix is appended.
+	// Result = 21-13 = 8 content bytes + 13 suffix = 20 total.
+	got = truncateForLog(make([]byte, 21), 20)
+	if len(got) != 20 {
+		t.Errorf("len(got) = %d, want 20 (8 content + 13 suffix)", len(got))
+	}
+	if !strings.HasSuffix(got, "...(truncated)") {
+		t.Errorf("got does not end with suffix: %q", got)
+	}
+}
+
+// --- Issue #665: classifyFailure retry=false branch tests ---------------------
+
+// TestCascadeClassifyFailureNonRetryable verifies that classifyFailure returns
+// false when err is a cascadeErr tagged with retry=false (e.g. 401/403 auth
+// failures). This is the previously untested branch.
+func TestCascadeClassifyFailureNonRetryable(t *testing.T) {
+	cases := []struct {
+		name  string
+		retry bool
+	}{
+		{"retry=false cascadeErr", false},
+		{"retry=false cascadeErr with reason", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var err error
+			if tc.retry {
+				err = newCascadeErr(true, "http_error", "status 500: internal error")
+			} else {
+				err = newCascadeErr(false, "", "status 401: unauthorized")
+			}
+			got := classifyFailure(err)
+			if got != tc.retry {
+				t.Errorf("classifyFailure(_) = %v, want %v", got, tc.retry)
+			}
+		})
+	}
+}
+
+// TestCascadeClassifyFailureRetryable verifies that classifyFailure returns
+// true for both a retryable cascadeErr and a plain error (unknown error).
+func TestCascadeClassifyFailureRetryable(t *testing.T) {
+	// retry=true cascadeErr → classifyFailure returns true
+	retryableErr := newCascadeErr(true, "http_error", "status 503: service unavailable")
+	if got := classifyFailure(retryableErr); !got {
+		t.Errorf("classifyFailure(retryableErr) = %v, want true", got)
+	}
+
+	// plain error (not a cascadeErr) → classifyFailure defaults to true
+	plainErr := errors.New("some network glitch")
+	if got := classifyFailure(plainErr); !got {
+		t.Errorf("classifyFailure(plainErr) = %v, want true", got)
+	}
+
+	// nil error → classifyFailure defaults to true
+	if got := classifyFailure(nil); !got {
+		t.Errorf("classifyFailure(nil) = %v, want true", got)
+	}
+}
+
+// TestCascadeRunAuthErrorSurfacesToCallerWithoutRetry exercises the full Run
+// path with a 401 step and asserts that no retry attempt is made (fallback is
+// never called). This distinguishes non-retryable errors from retryable ones.
+func TestCascadeRunAuthErrorSurfacesToCallerWithoutRetry(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, "unauthorized")
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("fallback should NOT have been called for non-retryable 401")
+	})
+	client := &http.Client{Transport: ft}
+
+	rw := newSSERW()
+	_, err := twoStepCascade().Run(context.Background(), rw, client, map[string]interface{}{"messages": []interface{}{}}, "")
+	if err == nil {
+		t.Fatal("expected error for 401, got nil")
+	}
+	if !strings.Contains(err.Error(), "401") {
+		t.Errorf("err should mention 401: %v", err)
+	}
+	// Primary counter should be exactly 1 — no retry of the primary step.
+	if *ft.counter("http://primary.local/v1/chat/completions") != 1 {
+		t.Errorf("primary counter = %d, want 1 (no retry for auth error)", *ft.counter("http://primary.local/v1/chat/completions"))
 	}
 }

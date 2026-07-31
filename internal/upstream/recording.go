@@ -61,8 +61,7 @@ func (r *RecordingTransport) RoundTrip(req *http.Request) (*http.Response, error
 	}
 	// Snapshot the body so the handler can still read it.
 	if req.Body != nil {
-		body, _ := readAndRestoreBody(req)
-		_ = body
+		_, _ = readAndRestoreBody(req) // side-effect only: req.Body is restored for the handler
 	}
 	r.calls = append(r.calls, RecordedCall{URL: req.URL.String(), Req: req})
 	r.mu.Unlock()
@@ -124,6 +123,12 @@ func (r *recorderRW) WriteHeader(s int)           { r.status = s }
 func (r *recorderRW) Result() *http.Response {
 	if r.status == 0 {
 		r.status = http.StatusOK
+	}
+	// Set a default Content-Type for streaming responses if none was set.
+	// Real upstreams always set this; the default is needed because many
+	// test mocks call Write without explicitly setting Content-Type.
+	if r.headers.Get("Content-Type") == "" {
+		r.headers.Set("Content-Type", "text/event-stream")
 	}
 	return &http.Response{
 		StatusCode: r.status,

@@ -22,6 +22,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,6 +53,14 @@ const (
 	SourceStatic Source = "static-fallback"
 )
 
+// GPUInfo holds per-GPU VRAM data reported by nvidia-smi (issue #775).
+type GPUInfo struct {
+	Index       int // GPU index from nvidia-smi (0, 1, ...)
+	Name        string
+	MemoryFree  int64 // bytes free on this GPU
+	MemoryTotal int64 // bytes total on this GPU
+}
+
 // Budget is one snapshot of the per-request token budget the chat
 // router should use to decide whether a prompt is too large for the
 // local model.
@@ -64,6 +75,10 @@ type Budget struct {
 	FreeVRAMBytes int64 // free VRAM in bytes, 0 if unknown
 	BytesPerToken int   // bytes-per-token heuristic used to convert VRAM -> tokens
 	Source        Source
+	// PerGPU holds per-GPU VRAM readings (issue #775). nil when
+	// no NVIDIA GPU is detected; a nil/free slice element means
+	// that GPU's free VRAM could not be determined.
+	PerGPU []GPUInfo
 }
 
 // Disabled reports whether the probe could not produce a budget.
@@ -107,6 +122,13 @@ const (
 	// 8-12 GiB VRAM, where the formula yields ~32k-48k tokens
 	// of safe headroom.
 	DefaultBytesPerToken = 256 * 1024
+	// DefaultThermalThreshold is the GPU junction temperature
+	// (degrees Celsius) above which the probe treats the GPU as
+	// VRAM-starved (issue #597). 90 °C is the typical AMD Radeon
+	// thermal-throttle ceiling; better-cooled cards can raise the
+	// knob via NEXUS_PROBE_THERMAL_THRESHOLD, and 0 disables the
+	// check entirely.
+	DefaultThermalThreshold = 90
 )
 
 // Manager owns the lifetime of the periodic probe. It performs an
@@ -318,6 +340,69 @@ func (m *Manager) Close() error {
 // the chat handler uses it on the "no BudgetObserver wired" path.
 func StaticBudget(tokens int) Budget {
 	return Budget{Tokens: tokens, Source: SourceStatic}
+}
+
+// ReadPerGPUVRAM shells out to nvidia-smi and returns per-GPU VRAM
+// info (issue #775). The command is:
+//
+//	nvidia-smi --query-gpu=index,name,memory.free,memory.total
+//	  --format=csv,noheader,nounits
+//
+// Returns nil when nvidia-smi is unavailable or returns a non-zero
+// exit code (e.g. no NVIDIA GPU present). The error is only non-nil
+// when the command could not be executed at all; a successful command
+// that finds no GPUs returns (nil, nil).
+func ReadPerGPUVRAM() ([]GPUInfo, error) {
+	out, err := exec.Command("nvidia-smi",
+		"--query-gpu=index,name,memory.free,memory.total",
+		"--format=csv,noheader,nounits").Output()
+	if err != nil {
+		return nil, nil // no NVIDIA GPU or nvidia-smi not installed
+	}
+	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	gpus := make([]GPUInfo, 0, len(lines))
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		// CSV fields: index, name, memory.free (MiB), memory.total (MiB)
+		fields := strings.Split(line, ",")
+		for i := range fields {
+			fields[i] = strings.TrimSpace(fields[i])
+		}
+		if len(fields) < 4 {
+			continue
+		}
+		idx, err := strconv.Atoi(fields[0])
+		if err != nil {
+			continue
+		}
+		free, err := strconv.ParseInt(fields[2], 10, 64)
+		if err != nil {
+			free = 0
+		}
+		total, err := strconv.ParseInt(fields[3], 10, 64)
+		if err != nil {
+			total = 0
+		}
+		gpus = append(gpus, GPUInfo{
+			Index:       idx,
+			Name:        fields[1],
+			MemoryFree:  free * 1024 * 1024, // nvidia-smi reports MiB
+			MemoryTotal: total * 1024 * 1024,
+		})
+	}
+	return gpus, nil
+}
+
+// GPUCount returns the number of NVIDIA GPUs detected via nvidia-smi.
+// Returns 0 when nvidia-smi is unavailable or reports no GPUs.
+func GPUCount() int {
+	gpus, err := ReadPerGPUVRAM()
+	if err != nil || len(gpus) == 0 {
+		return 0
+	}
+	return len(gpus)
 }
 
 // String renders the budget for log/JSON use. Kept tiny so the

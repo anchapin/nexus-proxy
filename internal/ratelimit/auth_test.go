@@ -48,7 +48,7 @@ func TestAuthLimiter_BlockedAfterBurst(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/", nil)
 		req.RemoteAddr = "10.0.0.1:1000"
-		al.RecordFailure(resolver.Resolve(req))
+		al.RecordFailure(resolver.Resolve(req), "missing")
 	}
 
 	// 4th failure should block
@@ -67,6 +67,10 @@ func TestAuthLimiter_BlockedAfterBurst(t *testing.T) {
 	if rec.Header().Get("Retry-After") == "" {
 		t.Error("Retry-After header not set on 429")
 	}
+	// X-Nexus-RateLimit-Key-Type header is set to "auth-brute-force" (issue #983)
+	if got := rec.Header().Get("X-Nexus-RateLimit-Key-Type"); got != "auth-brute-force" {
+		t.Errorf("X-Nexus-RateLimit-Key-Type = %q, want %q", got, "auth-brute-force")
+	}
 }
 
 // Different IPs get independent failure tracking.
@@ -74,9 +78,9 @@ func TestAuthLimiter_PerClientIsolation(t *testing.T) {
 	resolver := NewClientIPResolver(nil)
 	al := NewAuthLimiter(60, 2, 5*time.Minute, resolver) // burst 2
 
-	// Exhaust burst for IP 1
+	// Exhaust burst for IP 1 (using "invalid" reason)
 	for i := 0; i < 2; i++ {
-		al.RecordFailure("10.0.0.1")
+		al.RecordFailure("10.0.0.1", "invalid")
 	}
 
 	// IP 1 should be blocked, IP 2 should not
@@ -93,13 +97,13 @@ func TestAuthLimiter_OnBlockFires(t *testing.T) {
 	resolver := NewClientIPResolver(nil)
 	al := NewAuthLimiter(60, 2, 5*time.Minute, resolver) // burst 2
 	var blocked int64
-	al.SetOnBlock(func() {
+	al.SetOnBlock(func(reason string) {
 		atomic.AddInt64(&blocked, 1)
 	})
 
 	// Exhaust burst
-	al.RecordFailure("10.0.0.1")
-	al.RecordFailure("10.0.0.1")
+	al.RecordFailure("10.0.0.1", "invalid")
+	al.RecordFailure("10.0.0.1", "invalid")
 
 	if blocked != 1 {
 		t.Errorf("onBlock fired %d times, want 1", blocked)
@@ -113,7 +117,7 @@ func TestAuthLimiter_WindowExpiry(t *testing.T) {
 
 	// Record 3 failures
 	for i := 0; i < 3; i++ {
-		al.RecordFailure("10.0.0.1")
+		al.RecordFailure("10.0.0.1", "missing")
 	}
 	if !al.IsBlocked("10.0.0.1") {
 		t.Error("IP should be blocked after 3 failures")
@@ -146,7 +150,7 @@ func TestAuthLimiter_Concurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 10; j++ {
-				al.RecordFailure("10.0.0.1")
+				al.RecordFailure("10.0.0.1", "missing")
 			}
 		}()
 	}
@@ -173,7 +177,7 @@ func TestAuthLimiter_429Body(t *testing.T) {
 	}), resolver)
 
 	// Exhaust burst
-	al.RecordFailure("10.0.0.1")
+	al.RecordFailure("10.0.0.1", "missing")
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
@@ -191,4 +195,258 @@ func TestAuthLimiter_429Body(t *testing.T) {
 	if body == "" || len(body) < 10 {
 		t.Errorf("body too short: %q", body)
 	}
+}
+
+// BucketCount returns 0 for nil limiter.
+func TestAuthLimiter_BucketCount_Nil(t *testing.T) {
+	var al *AuthLimiter
+	if al.BucketCount() != 0 {
+		t.Error("nil limiter should return 0 buckets")
+	}
+}
+
+// BucketCount returns 0 when limiter is disabled.
+func TestAuthLimiter_BucketCount_Disabled(t *testing.T) {
+	al := NewAuthLimiter(0, 3, 5*time.Minute, nil)
+	if al.BucketCount() != 0 {
+		t.Error("disabled limiter should return 0 buckets")
+	}
+}
+
+// BucketCount returns correct count of tracked IPs.
+func TestAuthLimiter_BucketCount_Active(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	al := NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	defer al.Stop()
+
+	if al.BucketCount() != 0 {
+		t.Error("fresh limiter should have 0 buckets")
+	}
+
+	al.RecordFailure("10.0.0.1", "missing")
+	if al.BucketCount() != 1 {
+		t.Errorf("BucketCount = %d, want 1", al.BucketCount())
+	}
+
+	al.RecordFailure("10.0.0.2", "missing")
+	al.RecordFailure("10.0.0.3", "missing")
+	if al.BucketCount() != 3 {
+		t.Errorf("BucketCount = %d, want 3", al.BucketCount())
+	}
+}
+
+// BucketCount reflects entries removed by reaper eviction.
+func TestAuthLimiter_BucketCount_AfterReap(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	al := NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	defer al.Stop()
+
+	// Add entries directly to the map
+	now := time.Now()
+	al.mu.Lock()
+	al.failures["10.0.0.1"] = &authFailure{lastSeen: now.Add(-15 * time.Minute)} // idle > 10 min
+	al.failures["10.0.0.2"] = &authFailure{lastSeen: now.Add(-5 * time.Minute)}  // idle < 10 min
+	al.mu.Unlock()
+
+	if al.BucketCount() != 2 {
+		t.Errorf("before reaping: BucketCount = %d, want 2", al.BucketCount())
+	}
+
+	// Manually trigger reaper eviction logic (simulates what reaper goroutine does on tick)
+	al.mu.Lock()
+	for ip, f := range al.failures {
+		f.mu.Lock()
+		al.pruneLocked(f, now)
+		idle := now.Sub(f.lastSeen)
+		f.mu.Unlock()
+		if idle > 10*time.Minute && len(f.missingTs) == 0 && len(f.invalidTs) == 0 {
+			delete(al.failures, ip)
+		}
+	}
+	al.mu.Unlock()
+
+	if al.BucketCount() != 1 {
+		t.Errorf("after reaping idle: BucketCount = %d, want 1", al.BucketCount())
+	}
+}
+
+// Enabled returns false for nil limiter.
+func TestAuthLimiter_Enabled_Nil(t *testing.T) {
+	var al *AuthLimiter
+	if al.Enabled() {
+		t.Error("nil limiter should not be enabled")
+	}
+}
+
+// Enabled returns false when rpm <= 0.
+func TestAuthLimiter_Enabled_Disabled(t *testing.T) {
+	al := NewAuthLimiter(0, 3, 5*time.Minute, nil)
+	if al.Enabled() {
+		t.Error("disabled limiter (rpm=0) should not be enabled")
+	}
+}
+
+// Enabled returns true when rpm > 0.
+func TestAuthLimiter_Enabled_Active(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	al := NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	defer al.Stop()
+
+	if !al.Enabled() {
+		t.Error("active limiter should be enabled")
+	}
+}
+
+// Stop is safe to call on nil limiter.
+func TestAuthLimiter_Stop_Nil(t *testing.T) {
+	var al *AuthLimiter
+	al.Stop() // must not panic
+}
+
+// Stop is safe to call on disabled limiter.
+func TestAuthLimiter_Stop_Disabled(t *testing.T) {
+	al := NewAuthLimiter(0, 3, 5*time.Minute, nil)
+	al.Stop() // must not panic
+}
+
+// Stop signals reaper goroutine to exit without hanging.
+func TestAuthLimiter_Stop_ExitsGoroutine(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	al := NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+
+	done := make(chan struct{})
+	go func() {
+		al.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Stop completed successfully
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() did not complete within 2s — possible goroutine leak")
+	}
+}
+
+// Reaper evicts entries that are both idle > 10 min and have no failure timestamps.
+func TestAuthLimiter_Reaper_Eviction(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	al := NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	defer al.Stop()
+
+	now := time.Now()
+
+	// Three entries: idle >10min with no failures, idle <10min, and active
+	al.mu.Lock()
+	al.failures["stale-empty"] = &authFailure{
+		missingTs: nil,
+		invalidTs: nil,
+		lastSeen:  now.Add(-15 * time.Minute), // idle > 10 min, no failures → evicted
+	}
+	al.failures["stale-with-failures"] = &authFailure{
+		missingTs: []time.Time{now.Add(-5 * time.Minute)}, // has recent failure → kept
+		invalidTs: nil,
+		lastSeen:  now.Add(-15 * time.Minute),
+	}
+	al.failures["recent"] = &authFailure{
+		missingTs: nil,
+		invalidTs: nil,
+		lastSeen:  now.Add(-5 * time.Minute), // idle < 10 min → kept
+	}
+	al.mu.Unlock()
+
+	if al.BucketCount() != 3 {
+		t.Fatalf("initial BucketCount = %d, want 3", al.BucketCount())
+	}
+
+	// Simulate one reaper tick: prune and evict
+	al.mu.Lock()
+	for ip, f := range al.failures {
+		f.mu.Lock()
+		al.pruneLocked(f, now)
+		idle := now.Sub(f.lastSeen)
+		f.mu.Unlock()
+		if idle > 10*time.Minute && len(f.missingTs) == 0 && len(f.invalidTs) == 0 {
+			delete(al.failures, ip)
+		}
+	}
+	al.mu.Unlock()
+
+	if al.BucketCount() != 2 {
+		t.Errorf("after reaping: BucketCount = %d, want 2 (stale-empty evicted)", al.BucketCount())
+	}
+	if al.IsBlocked("stale-empty") {
+		t.Error("stale-empty should have been evicted")
+	}
+	if al.IsBlocked("stale-with-failures") {
+		t.Error("stale-with-failures should still exist")
+	}
+	if al.IsBlocked("recent") {
+		t.Error("recent should still exist")
+	}
+}
+
+// SetOnReap callback fires when the reaper evicts an idle IP.
+func TestAuthLimiter_SetOnReap_Fires(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	al := NewAuthLimiter(60, 3, 5*time.Minute, resolver)
+	defer al.Stop()
+
+	var evictions int64
+	al.SetOnReap(func() {
+		atomic.AddInt64(&evictions, 1)
+	})
+
+	now := time.Now()
+
+	// Three entries: two will be evicted, one will not
+	al.mu.Lock()
+	al.failures["stale-evict1"] = &authFailure{
+		missingTs: nil,
+		invalidTs: nil,
+		lastSeen:  now.Add(-15 * time.Minute), // idle > 10 min, no failures → evicted
+	}
+	al.failures["stale-evict2"] = &authFailure{
+		missingTs: nil,
+		invalidTs: nil,
+		lastSeen:  now.Add(-20 * time.Minute), // idle > 10 min, no failures → evicted
+	}
+	al.failures["stale-kept"] = &authFailure{
+		missingTs: []time.Time{now.Add(-1 * time.Minute)}, // has recent failure → kept
+		invalidTs: nil,
+		lastSeen:  now.Add(-15 * time.Minute),
+	}
+	al.mu.Unlock()
+
+	if al.BucketCount() != 3 {
+		t.Fatalf("initial BucketCount = %d, want 3", al.BucketCount())
+	}
+
+	// Trigger one reaper tick via Reap()
+	al.Reap()
+
+	if evictions != 2 {
+		t.Errorf("evictions = %d, want 2", evictions)
+	}
+	if al.BucketCount() != 1 {
+		t.Errorf("after Reap: BucketCount = %d, want 1", al.BucketCount())
+	}
+}
+
+// Reap is safe to call on nil limiter.
+func TestAuthLimiter_Reap_Nil(t *testing.T) {
+	var al *AuthLimiter
+	al.Reap() // must not panic
+}
+
+// Reap is safe to call on disabled limiter.
+func TestAuthLimiter_Reap_Disabled(t *testing.T) {
+	al := NewAuthLimiter(0, 3, 5*time.Minute, nil)
+	al.Reap() // must not panic
+}
+
+// SetOnReap is safe to call on nil limiter.
+func TestAuthLimiter_SetOnReap_Nil(t *testing.T) {
+	var al *AuthLimiter
+	al.SetOnReap(func() {}) // must not panic
 }

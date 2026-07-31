@@ -5,8 +5,20 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"runtime/debug"
+	"strings"
 )
+
+// HandlerPanicObserver is the hook handlers.Recover invokes when it
+// catches a panic in the request hot path (issue #480). The path
+// argument is the mux route template (not the raw URL) so label
+// cardinality stays bounded. Implementations must be safe to call
+// concurrently and must not block; the Recover middleware invokes the
+// observer synchronously after logging, before writing the response.
+// A nil observer is a no-op so the middleware works unchanged when no
+// metrics collection is wired.
+type HandlerPanicObserver func(path string)
 
 // Recover returns HTTP middleware that catches panics arising anywhere in
 // the downstream handler chain (issue #110). Without it a panic — a nil
@@ -22,40 +34,67 @@ import (
 // panics in every downstream middleware and handler are caught. It has
 // zero overhead on the happy path: the deferred recover is cheap and the
 // requestID lookup runs only when a panic actually fires.
-func Recover() func(http.Handler) http.Handler {
+//
+// obs is an optional HandlerPanicObserver invoked after the slog.Error
+// call (issue #480). Pass nil when no metrics collection is needed; the
+// middleware is nil-safe.
+func Recover(obs HandlerPanicObserver) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			rw := &panicRecorder{ResponseWriter: w}
+			var flusher http.Flusher
+			if f, ok := w.(http.Flusher); ok {
+				flusher = f
+			}
+			rw := &panicRecorder{ResponseWriter: w, flusher: flusher}
 			defer func() {
 				rv := recover()
 				if rv == nil {
 					return
 				}
 				reqID := requestID(r)
-				slog.Error("panic recovered",
-					slog.String("component", "recovery"),
-					slog.Any("panic", rv),
-					slog.String("request_id", reqID),
-					slog.String("method", r.Method),
-					slog.String("path", r.URL.Path),
-					slog.String("stack", string(debug.Stack())),
-				)
+				route := routePattern(r)
+				redacted, wasRedacted := redactPanicValue(rv)
+				if wasRedacted {
+					slog.Warn("panic contained secrets — redacted before logging",
+						slog.String("component", "recovery"),
+						slog.String("panic", redacted),
+						slog.String("request_id", reqID),
+						slog.String("method", r.Method),
+						slog.String("path", r.URL.Path),
+						slog.String("stack", string(debug.Stack())),
+					)
+				} else {
+					slog.Error("panic recovered",
+						slog.String("component", "recovery"),
+						slog.String("panic", redacted),
+						slog.String("request_id", reqID),
+						slog.String("method", r.Method),
+						slog.String("path", r.URL.Path),
+						slog.String("stack", string(debug.Stack())),
+					)
+				}
+				if obs != nil {
+					obs(route)
+				}
 				if rw.headerWritten {
 					// The response already started (e.g. a partial SSE
 					// flush after WriteHeader(200)). We can no longer
 					// change the status code, so emit a trailing SSE
 					// error frame and terminate the stream so the client
 					// gets a parseable ending instead of a TCP reset.
-					payload, _ := json.Marshal(map[string]string{
-						"message": "internal server error",
-						"type":    "internal_error",
-					})
-					_, _ = fmt.Fprintf(rw, "data: {\"error\":%s}\n\n", payload)
-					_, _ = fmt.Fprint(rw, "data: [DONE]\n\n")
-					if f, ok := any(rw).(http.Flusher); ok {
-						f.Flush()
+					// If the underlying writer does not implement
+					// http.Flusher, fall back to the 500 envelope path
+					// to avoid silently hanging the client (issue #686).
+					if rw.flusher != nil {
+						payload, _ := json.Marshal(map[string]string{
+							"message": "internal server error",
+							"type":    "internal_error",
+						})
+						_, _ = fmt.Fprintf(rw, "data: {\"error\":%s}\n\n", payload)
+						_, _ = fmt.Fprint(rw, "data: [DONE]\n\n")
+						rw.Flush()
+						return
 					}
-					return
 				}
 				// Headers not yet written — return a clean 500 envelope
 				// in the OpenAI-compatible error shape so existing
@@ -74,6 +113,83 @@ func Recover() func(http.Handler) http.Handler {
 	}
 }
 
+var (
+	bearerTokenRe   = regexp.MustCompile(`(?i)(Bearer\s+)[a-zA-Z0-9\-_.~+/]+`)
+	apiKeyRe        = regexp.MustCompile(`(?i)(api[_-]?key|apikey|api[_-]?secret|api[_-]?token|secret[_-]?key|auth[_-]?token|access[_-]?token)\s*[:=]\s*["']?[a-zA-Z0-9\-_.~+/]+["']?`)
+	awsKeyRe        = regexp.MustCompile(`(?i)(aws[_-]?access[_-]?key[_-]?id|aws[_-]?secret[_-]?access[_-]?key)\s*[:=]\s*["']?[A-Z0-9]{20}["']?`)
+	awsSecretRe     = regexp.MustCompile(`(?i)(aws[_-]?secret)\s*[:=]\s*["']?[a-zA-Z0-9/+=]{40}["']?`)
+	passwordURLRe   = regexp.MustCompile(`(?i)://[^:]+:[^@]+@`)
+	genericSecretRe = regexp.MustCompile(`(?i)\b(auth_token|token|password|passwd|pwd|credential|private[_-]?key)\s*[:=]\s*["']?[a-zA-Z0-9\-_.~+/ ]+(?:[ "'/]|$)`)
+)
+
+func redactPanicValue(rv any) (string, bool) {
+	var raw string
+	switch v := rv.(type) {
+	case string:
+		raw = v
+	case error:
+		raw = v.Error()
+	default:
+		raw = fmt.Sprintf("%v", v)
+	}
+
+	redacted := raw
+	redacted = bearerTokenRe.ReplaceAllString(redacted, "${1}****")
+	redacted = genericSecretRe.ReplaceAllStringFunc(redacted, func(s string) string {
+		i := strings.Index(s, ":")
+		if i < 0 {
+			i = strings.Index(s, "=")
+		}
+		if i < 0 {
+			return "****"
+		}
+		return s[:i+1] + "****"
+	})
+	redacted = apiKeyRe.ReplaceAllStringFunc(redacted, func(s string) string {
+		i := strings.Index(s, ":")
+		if i < 0 {
+			i = strings.Index(s, "=")
+		}
+		if i < 0 {
+			return "****"
+		}
+		return s[:i+1] + "****"
+	})
+	redacted = awsKeyRe.ReplaceAllStringFunc(redacted, func(s string) string {
+		i := strings.Index(s, ":")
+		if i < 0 {
+			i = strings.Index(s, "=")
+		}
+		if i < 0 {
+			return "****"
+		}
+		return s[:i+1] + "****"
+	})
+	redacted = awsSecretRe.ReplaceAllStringFunc(redacted, func(s string) string {
+		i := strings.Index(s, ":")
+		if i < 0 {
+			i = strings.Index(s, "=")
+		}
+		if i < 0 {
+			return "****"
+		}
+		return s[:i+1] + "****"
+	})
+	redacted = passwordURLRe.ReplaceAllString(redacted, "://****:****@")
+	redacted = genericSecretRe.ReplaceAllStringFunc(redacted, func(s string) string {
+		i := strings.Index(s, ":")
+		if i < 0 {
+			i = strings.Index(s, "=")
+		}
+		if i < 0 {
+			return "****"
+		}
+		return s[:i+1] + "****"
+	})
+
+	return redacted, redacted != raw
+}
+
 // panicRecorder wraps the underlying http.ResponseWriter to track whether
 // any response bytes or status code have been committed to the client.
 // The recover middleware uses this to decide whether a panic can still be
@@ -82,6 +198,7 @@ func Recover() func(http.Handler) http.Handler {
 type panicRecorder struct {
 	http.ResponseWriter
 	headerWritten bool
+	flusher       http.Flusher // nil if underlying writer does not implement Flusher
 }
 
 // WriteHeader marks the response as started and delegates to the inner
@@ -104,4 +221,24 @@ func (p *panicRecorder) Write(b []byte) (int, error) {
 		p.headerWritten = true
 	}
 	return p.ResponseWriter.Write(b)
+}
+
+// Flush delegates to the stored flusher. If the underlying writer does not
+// implement http.Flusher, this is a no-op and the SSE panic path will use
+// the 500 envelope instead (issue #686).
+func (p *panicRecorder) Flush() {
+	if p.flusher != nil {
+		p.flusher.Flush()
+	}
+}
+
+// routePattern returns the mux route template for r, falling back to the
+// URL path when the request did not traverse a ServeMux (or the mux has
+// not yet set the pattern). Using the template rather than the raw URL
+// keeps the panic counter's label cardinality bounded (issue #480).
+func routePattern(r *http.Request) string {
+	if r.Pattern != "" {
+		return r.Pattern
+	}
+	return r.URL.Path
 }

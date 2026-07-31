@@ -2,6 +2,7 @@ package budget
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -191,4 +192,104 @@ func TestGuardNilAlerterNoPanic(t *testing.T) {
 		g.Record(context.Background(), 50.0, "frontier")
 		g.CheckApproaching(context.Background())
 	}()
+}
+
+// TestCheckApproachingRaceTwoGuards drives two independent Guard instances
+// past the 80% threshold concurrently. Before the fix (issue #543) the
+// approaching-alert flag was a package-global, so two Guards shared it
+// with no mutual exclusion across instances — a data race that
+// `make test-race` is required to be free of. This test must pass under
+// -race.
+func TestCheckApproachingRaceTwoGuards(t *testing.T) {
+	const goroutines = 32
+
+	makePrimed := func() *Guard {
+		g := NewGuard(100.0)
+		g.Record(context.Background(), 90.0, "frontier") // 90% > 80% threshold
+		return g
+	}
+
+	guards := make([]*Guard, 2)
+	for i := range guards {
+		guards[i] = makePrimed()
+	}
+
+	var wg sync.WaitGroup
+	for _, g := range guards {
+		wg.Add(goroutines)
+		for i := 0; i < goroutines; i++ {
+			go func(guard *Guard) {
+				defer wg.Done()
+				// Hammer CheckApproaching; the first call on each guard
+				// returns true, the rest false. The race detector catches
+				// the unsynchronised global access from the old code.
+				_ = guard.CheckApproaching(context.Background())
+			}(g)
+		}
+	}
+	wg.Wait()
+}
+
+// TestSetLimitDoesNotResetOtherGuardApproaching asserts that reconfiguring
+// one Guard's limit (SetLimit) does not reset the approaching-alert state
+// of a concurrently-existing Guard. Before the fix (issue #543) SetLimit
+// reset the shared package-global, so the second guard would spuriously
+// re-fire its approaching alert.
+func TestSetLimitDoesNotResetOtherGuardApproaching(t *testing.T) {
+	gA := NewGuard(100.0)
+	gB := NewGuard(100.0)
+
+	// Push both past the 80% threshold and arm the approaching flag.
+	gA.Record(context.Background(), 90.0, "frontier")
+	gB.Record(context.Background(), 90.0, "frontier")
+
+	if !gA.CheckApproaching(context.Background()) {
+		t.Fatal("gA.CheckApproaching should fire on first crossing")
+	}
+	if !gB.CheckApproaching(context.Background()) {
+		t.Fatal("gB.CheckApproaching should fire on first crossing")
+	}
+
+	// Reconfigure gA. Under the buggy (global) code this also reset gB's
+	// flag, causing gB to spuriously re-fire below.
+	gA.SetLimit(200.0)
+
+	// gB's spend is still above its threshold and its flag must still be
+	// armed — so this returns false. If SetLimit reset gB's state, it
+	// would return true again (spurious re-fire).
+	if gB.CheckApproaching(context.Background()) {
+		t.Fatal("gB.CheckApproaching re-fired after gA.SetLimit; cross-instance state reset detected")
+	}
+}
+
+// TestCheckApproachingRefiresAfterDipBelow verifies the per-instance flag
+// is reset when spend drops below the threshold, so it can fire again on a
+// fresh crossing — guarding against over-coupling the flag to the limit.
+func TestCheckApproachingRefiresAfterDipBelow(t *testing.T) {
+	g := NewGuard(100.0)
+	// 90% > 80%: crossing.
+	g.Record(context.Background(), 90.0, "frontier")
+	if !g.CheckApproaching(context.Background()) {
+		t.Fatal("first crossing should fire")
+	}
+	if g.CheckApproaching(context.Background()) {
+		t.Fatal("second call without dip should not re-fire")
+	}
+
+	// Backdate the recorded entry so the next eviction drops it, dropping
+	// spend to 0 (< threshold) and resetting the flag.
+	past := time.Now().Add(-Window - time.Second)
+	g.mu.Lock()
+	g.window = []Entry{{At: past, Cost: 90.0, Source: "frontier"}}
+	g.mu.Unlock()
+
+	// The backdated entry is evicted → spent=0 < threshold, which resets
+	// g.approachingSent. A subsequent record above threshold re-arms it.
+	if g.CheckApproaching(context.Background()) {
+		t.Fatal("after spend dropped below threshold, CheckApproaching should return false (no alert)")
+	}
+	g.Record(context.Background(), 90.0, "frontier")
+	if !g.CheckApproaching(context.Background()) {
+		t.Fatal("after re-crossing, CheckApproaching should fire again")
+	}
 }

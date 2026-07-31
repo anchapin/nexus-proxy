@@ -8,57 +8,53 @@
 package budget
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
 
-// defaultWindow is the rolling spend window. Matches the issue #38
-// spec: "rolling daily spend cap".
 const defaultWindow = 24 * time.Hour
 
-// entry is a single spend record inside the rolling window.
 type entry struct {
 	at     time.Time
 	amount float64
 }
 
-// BudgetObserverFunc is the function-typed hook invoked by a
-// SpendTracker on every spend and exceed event (issue #70). The event
-// label is one of ObserverEventSpent or ObserverEventExceeded.
-//
-// Implementations must be safe to call concurrently from many
-// request goroutines and must be allocation-free on the hot path
-// (the production observer is a single atomic add per call).
 type BudgetObserverFunc func(event string, amount float64)
 
-// Event labels passed to BudgetObserverFunc (issue #70). Using
-// named constants instead of bare strings avoids typos at the wiring
-// site and survives an event-namespace refactor cleanly.
 const (
-	// ObserverEventSpent is emitted after a Record(amount) call
-	// appends the amount to the rolling window.
-	ObserverEventSpent = "spent"
-	// ObserverEventExceeded is emitted when WouldExceed(amount)
-	// returns true (i.e. recording amount would cross the cap).
+	ObserverEventSpent    = "spent"
 	ObserverEventExceeded = "exceeded"
 )
 
-// SpendTracker is a rolling-window sum of frontier-route spend. It
-// is safe for concurrent use. A nil SpendTracker is treated as
-// "disabled" everywhere it is referenced, so the chat handler can
-// leave Deps.SpendGuard unset (preserving the pre-issue-#38
-// behaviour) and tests can opt in per-case.
+type bucket struct {
+	entries  []entry
+	sum      float64
+	oldestAt time.Time
+}
+
 type SpendTracker struct {
 	mu       sync.Mutex
 	window   time.Duration
 	budget   float64
-	entries  []entry
 	observer BudgetObserverFunc
+
+	buckets    map[int64]*bucket
+	sortedKeys []int64
+	total      float64
 }
 
-// SetObserver installs an observer hook. A nil hook clears any prior
-// observer; calling SetObserver on a nil receiver is a no-op (the
-// tracker is "disabled" so no observations are possible). Issue #70.
+func NewSpendTracker(dailyBudgetUSD float64) *SpendTracker {
+	if dailyBudgetUSD <= 0 {
+		return nil
+	}
+	return &SpendTracker{
+		window:  defaultWindow,
+		budget:  dailyBudgetUSD,
+		buckets: make(map[int64]*bucket),
+	}
+}
+
 func (st *SpendTracker) SetObserver(observer BudgetObserverFunc) {
 	if st == nil {
 		return
@@ -68,74 +64,61 @@ func (st *SpendTracker) SetObserver(observer BudgetObserverFunc) {
 	st.observer = observer
 }
 
-// RunningTotal returns the current spend inside the rolling window.
-// It is identical to CurrentSpend but exposes the issue-#70 gauge
-// name nexus_budget_spend_usd so the collector can render the
-// rolling total separately from the cumulative RecordedUSD counter.
 func (st *SpendTracker) RunningTotal() float64 {
 	return st.CurrentSpend()
 }
 
-// NewSpendTracker creates a SpendTracker with the given daily budget
-// and a 24-hour rolling window. A dailyBudget <= 0 returns nil so
-// callers can gate "disabled" off a single nil-check at the use site,
-// exactly like ratelimit.New and concurrencylimit.New.
-func NewSpendTracker(dailyBudgetUSD float64) *SpendTracker {
-	if dailyBudgetUSD <= 0 {
-		return nil
-	}
-	return &SpendTracker{
-		window:  defaultWindow,
-		budget:  dailyBudgetUSD,
-		entries: make([]entry, 0, 128),
-	}
+func (st *SpendTracker) bucketKey(t time.Time) int64 {
+	return t.Unix() / 60
 }
 
-// pruneLocked removes entries older than the rolling window. Must be
-// called with the mutex held. After pruning, entries[0] is the oldest
-// surviving record (or the slice is empty). Uses a simple forward
-// scan rather than a ring buffer: the entry count is bounded by the
-// request rate, which for a local-development proxy is at most a few
-// thousand per day.
 func (st *SpendTracker) pruneLocked(now time.Time) {
+	if len(st.buckets) == 0 {
+		return
+	}
 	cutoff := now.Add(-st.window)
-	// Find the first surviving entry.
-	idx := 0
-	for idx < len(st.entries) && st.entries[idx].at.Before(cutoff) {
-		idx++
+
+	i := 0
+	for i < len(st.sortedKeys) {
+		bk := st.sortedKeys[i]
+		b := st.buckets[bk]
+
+		if b.oldestAt.Before(cutoff) {
+			st.total -= b.sum
+			delete(st.buckets, bk)
+			i++
+			continue
+		}
+
+		j := 0
+		for j < len(b.entries) && b.entries[j].at.Before(cutoff) {
+			j++
+		}
+		if j > 0 {
+			expired := b.entries[:j]
+			for _, e := range expired {
+				st.total -= e.amount
+			}
+			b.entries = b.entries[j:]
+			if len(b.entries) > 0 {
+				b.oldestAt = b.entries[0].at
+			}
+			b.sum = 0
+			for _, e := range b.entries {
+				b.sum += e.amount
+			}
+			if len(b.entries) == 0 {
+				delete(st.buckets, bk)
+				i++
+			}
+		}
+		break
 	}
-	if idx > 0 {
-		// Shift surviving entries to the front and reslice.
-		copy(st.entries, st.entries[idx:])
-		st.entries = st.entries[:len(st.entries)-idx]
+	if i > 0 {
+		st.sortedKeys = st.sortedKeys[i:]
 	}
 }
 
-// sumLocked returns the total spend inside the rolling window. Must
-// be called with the mutex held and after pruneLocked.
-func (st *SpendTracker) sumLocked() float64 {
-	var total float64
-	for _, e := range st.entries {
-		total += e.amount
-	}
-	return total
-}
-
-// WouldExceed reports whether recording amount would push the
-// rolling 24-hour spend past the configured daily budget. The check
-// is advisory: it does not reserve the amount, so concurrent
-// requests that all pass the check can collectively exceed the cap.
-// This is acceptable for a local-development guardrail — the
-// alternative (a hard reservation) would require undoing the
-// reservation on failure, which is out of scope for issue #38.
-//
-// When the configured observer is non-nil and this call returns
-// true, the observer is invoked with event="exceeded" and the
-// (would-have-been) amount so the Prometheus collector can count
-// budget hits without a separate wrapper.
-//
-// A nil receiver returns false (never blocks) so the handler can
-// call WouldExceed unconditionally.
 func (st *SpendTracker) WouldExceed(amount float64) bool {
 	if st == nil {
 		return false
@@ -146,23 +129,13 @@ func (st *SpendTracker) WouldExceed(amount float64) bool {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.pruneLocked(time.Now())
-	current := st.sumLocked()
-	over := current+amount > st.budget
+	over := st.total+amount > st.budget
 	if over && st.observer != nil {
 		st.observer(ObserverEventExceeded, amount)
 	}
 	return over
 }
 
-// Record adds amount to the rolling window. Called after a
-// frontier-route request completes (success or upstream error — the
-// frontier API consumed tokens either way). Safe for concurrent use.
-//
-// When the configured observer is non-nil it is invoked with
-// event="spent" and the recorded amount so the Prometheus collector
-// can accumulate cumulative recorded USD without a separate wrapper.
-//
-// A nil receiver is a no-op.
 func (st *SpendTracker) Record(amount float64) {
 	if st == nil || amount <= 0 {
 		return
@@ -171,14 +144,24 @@ func (st *SpendTracker) Record(amount float64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.pruneLocked(now)
-	st.entries = append(st.entries, entry{at: now, amount: amount})
+
+	bk := st.bucketKey(now)
+	b, ok := st.buckets[bk]
+	if !ok {
+		b = &bucket{oldestAt: now}
+		st.buckets[bk] = b
+		st.sortedKeys = append(st.sortedKeys, bk)
+		sort.Slice(st.sortedKeys, func(i, j int) bool { return st.sortedKeys[i] < st.sortedKeys[j] })
+	}
+	b.entries = append(b.entries, entry{at: now, amount: amount})
+	b.sum += amount
+	st.total += amount
+
 	if st.observer != nil {
 		st.observer(ObserverEventSpent, amount)
 	}
 }
 
-// CurrentSpend returns the sum of all entries inside the rolling
-// window. Exported for /healthz and operator introspection.
 func (st *SpendTracker) CurrentSpend() float64 {
 	if st == nil {
 		return 0
@@ -186,10 +169,9 @@ func (st *SpendTracker) CurrentSpend() float64 {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.pruneLocked(time.Now())
-	return st.sumLocked()
+	return st.total
 }
 
-// Budget returns the configured daily cap. Zero when disabled.
 func (st *SpendTracker) Budget() float64 {
 	if st == nil {
 		return 0
@@ -197,10 +179,6 @@ func (st *SpendTracker) Budget() float64 {
 	return st.budget
 }
 
-// RetryAfter returns a hint for how long the client should wait
-// before retrying when the budget is exhausted. It is the time until
-// the oldest entry in the window expires (which would free up that
-// portion of the budget). Returns 0 when the window is empty.
 func (st *SpendTracker) RetryAfter() time.Duration {
 	if st == nil {
 		return 0
@@ -208,11 +186,11 @@ func (st *SpendTracker) RetryAfter() time.Duration {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.pruneLocked(time.Now())
-	if len(st.entries) == 0 {
+	if len(st.sortedKeys) == 0 {
 		return 0
 	}
-	oldest := st.entries[0].at
-	reset := oldest.Add(st.window)
+	oldestBucket := st.buckets[st.sortedKeys[0]]
+	reset := oldestBucket.oldestAt.Add(st.window)
 	d := time.Until(reset)
 	if d < 0 {
 		return 0

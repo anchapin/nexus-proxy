@@ -55,11 +55,11 @@ type stubConf struct {
 	queried []string
 }
 
-func (s *stubConf) RecordOutcome(_ string, _ Route, _ int) {}
+func (s *stubConf) RecordOutcome(_ string, _ Route, _ int) error { return nil }
 
-func (s *stubConf) LocalConfidence(category string) float64 {
+func (s *stubConf) LocalConfidence(category string) (float64, error) {
 	s.queried = append(s.queried, category)
-	return s.value
+	return s.value, nil
 }
 
 // formattingPatterns matches the handler's NEXUS_DSL_FORMATTING_PATTERNS default.
@@ -70,6 +70,29 @@ var fusionPatterns = []*regexp.Regexp{regexp.MustCompile(`(?i)\b(architectural d
 
 // localPatterns matches common coding task keywords (issue #202, #305).
 var localPatterns = []*regexp.Regexp{regexp.MustCompile(`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis)\b`)}
+
+func TestDecisionSourceTraceReason(t *testing.T) {
+	tests := []struct {
+		name   string
+		source DecisionSource
+		want   string
+	}{
+		{name: "guardrail", source: SourceGuardrail, want: "guardrail"},
+		{name: "dsl", source: SourceDSL, want: "dsl"},
+		{name: "clean slm", source: SourceSLM, want: "slm"},
+		{name: "slm error", source: SourceSLMError, want: "slm-error"},
+		{name: "slm no client", source: SourceEscalation, want: "slm-no-client"},
+		{name: "slm low confidence", source: SourceSLMEscalation, want: "slm-low-confidence"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.source.TraceReason(); got != tt.want {
+				t.Errorf("TraceReason() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
 
 func TestPlanner_Plan(t *testing.T) {
 	tests := []struct {
@@ -442,7 +465,7 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 		}
 	})
 
-	t.Run("nil confidence uses plain Decide", func(t *testing.T) {
+	t.Run("nil confidence uses plain Decide and still populates TaskType", func(t *testing.T) {
 		slm := &stubSLM{route: RouteFrontier}
 		p := &Planner{
 			SLM:                slm,
@@ -451,8 +474,10 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 			FormattingRegex:    formattingPatterns,
 			LocalPatternsRegex: localPatterns,
 		}
+		// "bug" is a Debugging keyword but NOT in DSL, so DSL won't match
+		// and Decide will be called. Categorize finds "bug" with word boundaries (issue #797).
 		req := PlanRequest{
-			Prompt:          "analyze why this code keeps crashing",
+			Prompt:          "there is a bug in the code",
 			GuardrailBudget: 6000,
 			GuardrailSource: "static-fallback",
 			Context:         context.Background(),
@@ -468,8 +493,8 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 		if dec.Confidence != NeutralConfidence {
 			t.Errorf("Decision.Confidence = %v, want NeutralConfidence (%v)", dec.Confidence, NeutralConfidence)
 		}
-		if dec.TaskType != "" {
-			t.Errorf("Decision.TaskType = %q, want empty (no categorization on nil store)", dec.TaskType)
+		if dec.TaskType != CategoryDebugging {
+			t.Errorf("Decision.TaskType = %q, want %q (issue #441: TaskType must be populated even without ConfidenceStore)", dec.TaskType, CategoryDebugging)
 		}
 	})
 
@@ -502,6 +527,182 @@ func TestPlanner_ConfidenceEscalation(t *testing.T) {
 		}
 		if dec.TaskType != CategoryDebugging {
 			t.Errorf("TaskType = %q, want %q", dec.TaskType, CategoryDebugging)
+		}
+	})
+}
+
+// TestPlanner_ConfidenceStoreError tests issue #927: when LocalConfidence
+// returns an error, the planner still returns a Decision (falling back to
+// NeutralConfidence) and the error is observable via the hook.
+func TestPlanner_ConfidenceStoreError(t *testing.T) {
+	t.Run("LocalConfidence error still returns Decision and calls hook", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		dbErr := errors.New("db locked")
+		conf := &errorStubConf{err: dbErr}
+		var hookedErr error
+		var hookedCat string
+		p := &Planner{
+			SLM:                slm,
+			Confidence:         conf,
+			FusionPatterns:     fusionPatterns,
+			FormattingRegex:    formattingPatterns,
+			LocalPatternsRegex: localPatterns,
+			ConfidenceErrorHook: func(category string, err error) {
+				hookedCat = category
+				hookedErr = err
+			},
+		}
+		req := PlanRequest{
+			// Prompt that reaches the SLM stage (does not match DSL) and
+			// categorizes as a non-trivial category so the category variable
+			// passed to LocalConfidence is not empty.
+			Prompt:          "simplify this complex function",
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		// A decision must be returned even when confidence lookup fails.
+		if dec.Route != RouteLocal {
+			t.Errorf("Route = %q, want %q", dec.Route, RouteLocal)
+		}
+		// Confidence should be NeutralConfidence on error.
+		if dec.Confidence != NeutralConfidence {
+			t.Errorf("Decision.Confidence = %v, want NeutralConfidence (%v)", dec.Confidence, NeutralConfidence)
+		}
+		// The hook must have been called with the error.
+		if hookedErr == nil {
+			t.Fatal("ConfidenceErrorHook was not called")
+		}
+		if hookedErr != dbErr {
+			t.Errorf("hookedErr = %v, want %v", hookedErr, dbErr)
+		}
+		// Category must be non-empty (issue #441).
+		if hookedCat == "" {
+			t.Error("hookedCat is empty, want non-empty category")
+		}
+		// SLM must have been called with NeutralConfidence.
+		if !slm.calledWithConf {
+			t.Fatal("DecideWithConfidence was not called")
+		}
+		if slm.lastConfidence != NeutralConfidence {
+			t.Errorf("lastConfidence = %v, want NeutralConfidence (%v)", slm.lastConfidence, NeutralConfidence)
+		}
+	})
+}
+
+// errorStubConf is a ConfidenceStore that always returns an error.
+type errorStubConf struct {
+	err error
+}
+
+func (s *errorStubConf) RecordOutcome(_ string, _ Route, _ int) error { return nil }
+
+func (s *errorStubConf) LocalConfidence(category string) (float64, error) {
+	return NeutralConfidence, s.err
+}
+
+// TestPlanner_NilConfidenceTaskType verifies issue #441: every decision
+// reaching the SLM stage must have a non-empty TaskType even when no
+// ConfidenceStore is wired. This ensures Prometheus and JSONL telemetry
+// always carry the per-category dimension.
+func TestPlanner_NilConfidenceTaskType(t *testing.T) {
+	t.Run("nil confidence success path populates TaskType", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		p := &Planner{
+			SLM:                slm,
+			Confidence:         nil,
+			FusionPatterns:     fusionPatterns,
+			FormattingRegex:    formattingPatterns,
+			LocalPatternsRegex: localPatterns,
+		}
+		req := PlanRequest{
+			Prompt:          "analyze why this exception keeps happening",
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		if dec.TaskType == "" {
+			t.Error("Decision.TaskType must not be empty on nil-confidence SLM path")
+		}
+		if dec.TaskType != CategoryDebugging {
+			t.Errorf("Decision.TaskType = %q, want %q", dec.TaskType, CategoryDebugging)
+		}
+		if dec.Source != SourceSLM {
+			t.Errorf("Source = %q, want %q", dec.Source, SourceSLM)
+		}
+	})
+
+	t.Run("nil confidence error path populates TaskType", func(t *testing.T) {
+		slm := &stubSLM{err: errors.New("connection refused")}
+		p := &Planner{
+			SLM:                slm,
+			Confidence:         nil,
+			FusionPatterns:     fusionPatterns,
+			FormattingRegex:    formattingPatterns,
+			LocalPatternsRegex: localPatterns,
+		}
+		req := PlanRequest{
+			Prompt:          "analyze this stack trace that keeps appearing",
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		if dec.TaskType == "" {
+			t.Error("Decision.TaskType must not be empty on nil-confidence SLM-error path")
+		}
+		if dec.TaskType != CategoryDebugging {
+			t.Errorf("Decision.TaskType = %q, want %q", dec.TaskType, CategoryDebugging)
+		}
+	})
+
+	t.Run("nil confidence unmatched prompt gets other category", func(t *testing.T) {
+		slm := &stubSLM{route: RouteFrontier}
+		p := &Planner{
+			SLM:                slm,
+			Confidence:         nil,
+			FusionPatterns:     fusionPatterns,
+			FormattingRegex:    formattingPatterns,
+			LocalPatternsRegex: localPatterns,
+		}
+		req := PlanRequest{
+			Prompt:          "write a small helper function", // no category keyword match
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		if dec.TaskType != CategoryOther {
+			t.Errorf("Decision.TaskType = %q, want %q", dec.TaskType, CategoryOther)
+		}
+	})
+
+	t.Run("hard override path populates TaskType with nil confidence", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		p := &Planner{
+			SLM:                 slm,
+			Confidence:          nil,
+			FusionPatterns:      fusionPatterns,
+			FormattingRegex:     formattingPatterns,
+			LocalPatternsRegex:  localPatterns,
+			ConfidenceThreshold: 0.3,
+		}
+		req := PlanRequest{
+			Prompt:          "fix the bug in this function",
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		if dec.TaskType == "" {
+			t.Error("Decision.TaskType must not be empty on hard override path")
 		}
 	})
 }
@@ -683,6 +884,64 @@ func TestPlanner_ConfidenceThresholdHardOverride(t *testing.T) {
 		}
 		if dec.Source != SourceSLMEscalation {
 			t.Errorf("Source = %q, want %q", dec.Source, SourceSLMEscalation)
+		}
+	})
+
+	t.Run("nil confidence store with threshold > 0 does not escalate (issue #928)", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		// Confidence is nil — no ConfidenceStore wired.
+		p := &Planner{
+			SLM:                 slm,
+			Confidence:          nil,
+			FusionPatterns:      fusionPatterns,
+			FormattingRegex:     formattingPatterns,
+			LocalPatternsRegex:  localPatterns,
+			ConfidenceThreshold: 0.6,
+		}
+		req := PlanRequest{
+			Prompt:          "analyze this exception that keeps happening", // no DSL match
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		// Without a ConfidenceStore, confidence defaults to NeutralConfidence (0.5)
+		// but the threshold check is guarded by p.Confidence != nil, so no escalation.
+		if dec.Route != RouteLocal {
+			t.Errorf("Route = %q, want local (nil ConfidenceStore should not escalate)", dec.Route)
+		}
+		if dec.Source != SourceSLM {
+			t.Errorf("Source = %q, want %q", dec.Source, SourceSLM)
+		}
+		if dec.Reason != "" {
+			t.Errorf("Reason = %q, want empty (no escalation)", dec.Reason)
+		}
+	})
+
+	t.Run("nil confidence store with threshold = 0 does not escalate (control)", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		p := &Planner{
+			SLM:                 slm,
+			Confidence:          nil,
+			FusionPatterns:      fusionPatterns,
+			FormattingRegex:     formattingPatterns,
+			LocalPatternsRegex:  localPatterns,
+			ConfidenceThreshold: 0, // disabled
+		}
+		req := PlanRequest{
+			Prompt:          "analyze this exception that keeps happening",
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+
+		if dec.Route != RouteLocal {
+			t.Errorf("Route = %q, want local", dec.Route)
+		}
+		if dec.Source != SourceSLM {
+			t.Errorf("Source = %q, want %q", dec.Source, SourceSLM)
 		}
 	})
 }

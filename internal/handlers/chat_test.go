@@ -22,9 +22,12 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/middleware"
+	"github.com/anchapin/nexus-proxy/internal/providers"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/tracing"
+	"github.com/anchapin/nexus-proxy/internal/tracingtest"
 	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
 
@@ -34,9 +37,14 @@ func (s stubEmbedder) Embed(_ context.Context, _ string) ([]float64, error) {
 	return s.vec, nil
 }
 
-func (s stubEmbedder) IsHealthy(context.Context) bool { return true }
-func (s stubEmbedder) IsBreakerOpen() bool            { return false }
-func (s stubEmbedder) RecordBreakerSuccess()          {}
+func (s stubEmbedder) EmbedBatch(_ context.Context, _ []string) ([][]float64, error) {
+	return [][]float64{s.vec}, nil
+}
+
+func (s stubEmbedder) IsHealthy(context.Context) bool                    { return true }
+func (s stubEmbedder) IsBreakerOpen() bool                               { return false }
+func (s stubEmbedder) RecordBreakerSuccess()                             {}
+func (s stubEmbedder) SetTripCallback(kind string, cb func(kind string)) {}
 
 func baseDeps(t *testing.T) (Deps, *upstream.RecordingTransport) {
 	t.Helper()
@@ -63,7 +71,7 @@ func baseDeps(t *testing.T) (Deps, *upstream.RecordingTransport) {
 	}
 	// Re-initialize the middleware chain so closures capture cfg values
 	// instead of the empty defaults from the package init (issue #224).
-	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.PromptInjectionIsolated())
+	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.TOONUnfenced, cfg.PromptInjectionIsolated())
 	store := rag.NewStore(stubEmbedder{vec: []float64{0, 0, 0}}, 0.55)
 	store.Add("no-match.go", "x", []float64{0, 1, 0})
 	rt := upstream.NewRecordingTransport()
@@ -403,6 +411,54 @@ func TestChatRouteLocalCascadeAllFail(t *testing.T) {
 	}
 	if len(rt.Calls()) != 2 {
 		t.Errorf("expected 2 calls (all steps), got %d", len(rt.Calls()))
+	}
+}
+
+// TestChatProviderCascadeRespectsCascadeMaxResponseBytes verifies issue #929:
+// when the provider-based cascade path is used (Providers registry is set),
+// the handler honours NEXUS_CASCADE_MAX_RESPONSE_BYTES (via EffectiveCascadeMaxResponseBytes)
+// rather than the general NEXUS_MAX_RESPONSE_BYTES (via EffectiveMaxResponseBytes).
+func TestChatProviderCascadeRespectsCascadeMaxResponseBytes(t *testing.T) {
+	deps, rt := baseDeps(t)
+	// Populate the providers registry so the handler takes the provider-based
+	// cascade path instead of the legacy BuildLocalCascade path.
+	deps.Providers = providers.NewProviderRegistry()
+	deps.Providers.Register(providers.ProviderConfig{
+		NameVal:    "test-frontier",
+		BaseURLVal: "http://frontier.local",
+		ModelVal:   "gpt-4o",
+		APIKeyVal:  "sk-test",
+	})
+	// Set CascadeMaxResponseBytes to a small value (512) so a large upstream
+	// response triggers the bound and causes the cascade to fail.
+	deps.Config.CascadeMaxResponseBytes = 512
+	// Ensure the general MaxResponseBytes is much larger so the test would
+	// fail differently if the handler accidentally used EffectiveMaxResponseBytes().
+	deps.Config.MaxResponseBytes = 1024 * 1024 // 1 MiB — far above the 512-byte cascade cap
+
+	// The upstream returns a response larger than 512 bytes.
+	largeContent := strings.Repeat("x", 1024) // 1 KiB
+	rt.On("POST", "http://frontier.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"`+largeContent+`"},"finish_reason":"stop"}]}`)
+	})
+	// Also register local so we can verify it was attempted.
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `not openai json`)
+	})
+
+	// A formatting request triggers route=local → cascade → provider-based fallback.
+	body := `{"messages":[{"role":"user","content":"format this css"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+
+	// The cascade should fail because the response exceeds CascadeMaxResponseBytes (512).
+	// This results in a 502 Bad Gateway.
+	if rw.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502 (cascade failed due to MaxResponseBytes); body=%q", rw.Code, rw.Body.String())
 	}
 }
 
@@ -891,6 +947,8 @@ func (c *capturingRecorder) Record(r telemetry.Record) {
 
 func (c *capturingRecorder) Close() error { return nil }
 
+func (c *capturingRecorder) Sync() {}
+
 func (c *capturingRecorder) Snapshot() []telemetry.Record {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1161,7 +1219,7 @@ func TestChatFrontierStreamTruncationObserverNilSafe(t *testing.T) {
 func TestChatTelemetryJSONLRecorderEndToEnd(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "tel.jsonl")
-	r, err := telemetry.NewJSONLRecorder(path)
+	r, err := telemetry.NewJSONLRecorder(path, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}
@@ -1494,12 +1552,16 @@ func TestChatRejectsOversizedBodyBeforeUnmarshal(t *testing.T) {
 	}
 }
 
-// TestWriteJSONError confirms the helper emits a parseable envelope.
+// TestWriteJSONError confirms the helper emits a parseable envelope
+// carrying a stable error type, message, and code (issue #453).
 func TestWriteJSONError(t *testing.T) {
 	rw := httptest.NewRecorder()
-	writeJSONError(rw, http.StatusRequestEntityTooLarge, "boom")
+	writeJSONError(rw, http.StatusRequestEntityTooLarge, ErrTypeRequestTooLarge, "boom")
 	if rw.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("status = %d, want 413", rw.Code)
+	}
+	if got := rw.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("content-type = %q, want application/json", got)
 	}
 	var env struct {
 		Error map[string]string `json:"error"`
@@ -1510,8 +1572,28 @@ func TestWriteJSONError(t *testing.T) {
 	if env.Error["message"] != "boom" {
 		t.Errorf("message = %q, want boom", env.Error["message"])
 	}
-	if env.Error["type"] != "Request Entity Too Large" {
-		t.Errorf("type = %q, want %q", env.Error["type"], "Request Entity Too Large")
+	if env.Error["type"] != ErrTypeRequestTooLarge {
+		t.Errorf("type = %q, want %q", env.Error["type"], ErrTypeRequestTooLarge)
+	}
+	if env.Error["code"] != "Request Entity Too Large" {
+		t.Errorf("code = %q, want %q", env.Error["code"], "Request Entity Too Large")
+	}
+}
+
+// TestWriteJSONErrorDefaultsType verifies that an empty type fallback
+// falls back to the generic server_error classifier instead of an
+// empty string, so SDKs always see a non-empty `error.type`.
+func TestWriteJSONErrorDefaultsType(t *testing.T) {
+	rw := httptest.NewRecorder()
+	writeJSONError(rw, http.StatusInternalServerError, "", "boom")
+	var env struct {
+		Error map[string]string `json:"error"`
+	}
+	if err := json.Unmarshal(rw.Body.Bytes(), &env); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if env.Error["type"] != ErrTypeServerError {
+		t.Errorf("type = %q, want default %q", env.Error["type"], ErrTypeServerError)
 	}
 }
 
@@ -2025,7 +2107,7 @@ func TestChatFusionProgressiveDisabledBackwardCompat(t *testing.T) {
 func TestChatFusionProgressiveTelemetryFlag(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "tel.jsonl")
-	r, err := telemetry.NewJSONLRecorder(path)
+	r, err := telemetry.NewJSONLRecorder(path, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("NewJSONLRecorder: %v", err)
 	}
@@ -2277,5 +2359,77 @@ func TestChatFrontierCostUsesFrontierCostPer1K(t *testing.T) {
 		t.Errorf("Cost ratio = %v, want ~5.0 (FrontierCostPer1K=0.010 / JudgeCostPer1KUSD=0.002); got ratio %.2f which indicates %s",
 			ratio, ratio,
 			map[bool]string{true: "CORRECT use of FrontierCostPer1K", false: "INCORRECT use of JudgeCostPer1KUSD"}[ratio > 4.5])
+	}
+}
+
+func TestChatRootSpanAttributes(t *testing.T) {
+	deps, _ := baseDeps(t)
+	deps.Client = &http.Client{Transport: upstream.NewRecordingTransport()}
+
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+	defer exp.Close()
+
+	spanCtx, rootSpan := tracing.StartSpan(tracing.Context{}, "nexus.chat_completions")
+	ctx := tracing.WithRootSpan(tracing.WithSpanContext(context.Background(), spanCtx), rootSpan)
+
+	body := `{"messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req = req.WithContext(ctx)
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	rootSpan.End()
+
+	if err := exp.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	s := coll.FindSpan(t, "nexus.chat_completions")
+	if s == nil {
+		t.Fatal("missing nexus.chat_completions span")
+	}
+
+	if got := tracingtest.AttrBool(s, "streaming"); !got {
+		t.Error("streaming = false, want true (default streaming request)")
+	}
+
+	if got := tracingtest.AttrInt(s, "input_tokens"); got <= 0 {
+		t.Errorf("input_tokens = %d, want > 0", got)
+	}
+
+	if got := tracingtest.AttrInt(s, "output_tokens"); got <= 0 {
+		t.Errorf("output_tokens = %d, want > 0", got)
+	}
+}
+
+func TestChatRootSpanErrorAttribute(t *testing.T) {
+	deps, _ := baseDeps(t)
+	deps.Client = &http.Client{Transport: errTransport{}}
+
+	coll := tracingtest.NewCapturedSpans(t)
+	exp := tracingtest.StartTestExporter(t, coll)
+	defer exp.Close()
+
+	spanCtx, rootSpan := tracing.StartSpan(tracing.Context{}, "nexus.chat_completions")
+	ctx := tracing.WithRootSpan(tracing.WithSpanContext(context.Background(), spanCtx), rootSpan)
+
+	body := `{"messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req = req.WithContext(ctx)
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	rootSpan.End()
+
+	if err := exp.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	s := coll.FindSpan(t, "nexus.chat_completions")
+	if s == nil {
+		t.Fatal("missing nexus.chat_completions span")
+	}
+
+	if got := tracingtest.AttrString(s, "error"); got == "" {
+		t.Error("error = empty, want non-empty for upstream failure")
 	}
 }

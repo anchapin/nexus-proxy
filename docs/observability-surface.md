@@ -20,10 +20,30 @@ snake_case naming.
 | `nexus_route_decisions_total` | counter | `route`, `source` | 3 × 5 = 15 | `routemetrics.go` |
 | `nexus_slm_decisions_total` | counter | `route`, `confidence_bucket`, `task_type` | 3 × 4 × 8 = 96 | `routemetrics.go` |
 | `nexus_slm_low_confidence_escalations_total` | counter | `task_type` | 8 | `routemetrics.go` |
+| `nexus_slm_cache_hits_total` | counter | `kind` | 2 (`exact`, `semantic`) | `routemetrics.go` |
+| `nexus_slm_cache_misses_total` | counter | *(none)* | 1 | `routemetrics.go` |
+| `nexus_slm_cache_evictions_total` | counter | `reason` | 2 (`ttl`, `lru`) | `routemetrics.go` |
+| `nexus_slm_cache_entries` | gauge | *(none)* | 1 | `prometheus.go` (issue #531) |
+| `nexus_slm_cache_max_entries` | gauge | *(none)* | 1 | `prometheus.go` (issue #531) |
+| `nexus_slm_cache_stale_entries` | gauge | *(none)* | 1 | `prometheus.go` (issue #801) |
+| `nexus_local_cooldown_active` | gauge | *(none)* | 1 | `prometheus.go` (issue #530) |
+| `nexus_local_cooldown_triggers_total` | counter | *(none)* | 1 | `routemetrics.go` (issue #530) |
 | `nexus_requests_rejected_total` | counter | `reason` | 4 | `routemetrics.go` |
+| `nexus_cascade_fallback_total` | counter | `reason` | 6 (`timeout`, `transport_error`, `rate_limited`, `http_error`, `malformed_toolcall`, `malformed_response`) | `routemetrics.go` |
+| `nexus_rag_retrieval_total` | counter | `hit`, `reason` (miss only) | 1 + 3 = 4 | `routemetrics.go` |
 | `nexus_judge_dropped_total` | counter | *(none)* | 1 | `routemetrics.go` |
+| `nexus_fusion_client_abort_total` | counter | *(none)* | 1 | `prometheus.go` (issue #1046) |
+| `nexus_rate_limit_bucket_utilization` | histogram | `bucket_id` | dynamic (≤ concurrent client IPs) | `prometheus.go` (issue #746) |
+| `nexus_build_info` | gauge | `version`, `commit`, `go_version` | 1 | `prometheus.go` (issue #529) |
 
-**Maximum theoretical series**: 15 + 96 + 8 + 4 + 1 = 124 series.
+**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 1 + 1 + 4 + 6 + 4 + 1 + 1 + 1 + 1 = 144 series.
+
+> **Note (issue #486):** `nexus_rag_retrieval_total` previously carried
+> a `filename` label whose value was the raw RAG source filename, which
+> produced one series per indexed document — unbounded cardinality. The
+> label has been removed; hits are now collapsed into a single
+> `{hit="true"}` sample line. The per-filename breakdown is preserved
+> in the SQLite `rag_filename` column for offline analysis.
 
 ### Label value catalog
 
@@ -83,6 +103,57 @@ Defined in `internal/handlers/chat.go`:
 | `bad_request` | `RejectionBadRequest` | 400 |
 | `rate_limit` | `RejectionRateLimit` | 429 |
 
+For the `nexus_slm_cache_evictions_total` family, `reason` is a
+separate bounded label set defined in `internal/router/slm_cache.go`
+(issue #449):
+
+| Value | Constant | Meaning |
+|-------|----------|---------|
+| `ttl` | `router.EvictionReasonTTL` | Entry removed because its TTL elapsed |
+| `lru` | `router.EvictionReasonLRU` | Entry removed to make room at capacity |
+
+`ttl` events indicate that the configured
+`NEXUS_SLM_CACHE_TTL` (default 30s) is shorter than the natural
+burst window of duplicate prompts — operators can raise the TTL to
+absorb more duplicate traffic. `lru` events indicate the cache is
+saturated (`NEXUS_SLM_CACHE_MAX_ENTRIES` is too small) — operators
+can raise the cap to keep more prompts warm. Together the two
+counters let operators diagnose cache effectiveness without changing
+configuration: a high `ttl / (ttl + lru)` ratio points at TTL churn;
+a high `lru / (ttl + lru)` ratio points at capacity pressure.
+
+For the `nexus_cascade_fallback_total` family, `reason` is a separate
+bounded label set defined in `internal/upstream/cascade.go` (issue #205,
+extended in #497, #534):
+
+| Value | Meaning |
+|-------|---------|
+| `timeout` | Per-attempt context deadline exceeded (`context.DeadlineExceeded`) |
+| `transport_error` | Real transport error from `client.Do` (DNS failure, connection refused, TCP reset, TLS handshake) |
+| `rate_limited` | Upstream returned HTTP 429 (Too Many Requests) — the upstream is rate-limiting, which is transient and likely to resolve quickly |
+| `http_error` | Upstream returned a retryable HTTP status (408, 500, 502, 503, 504) — the upstream is present but overloaded or buggy |
+| `malformed_toolcall` | Upstream returned a `tool_calls` entry with missing required fields or invalid JSON arguments |
+| `malformed_response` | Upstream returned a 200 but the body could not be JSON-decoded, or the `choices` array was empty |
+
+> **Dashboard impact (issue #534):** `http_error` was previously conflated
+> with `transport_error`. Dashboards or alerts that aggregate
+> `nexus_cascade_fallback_total{reason="transport_error"}` will see its
+> value drop after this change (the 5xx/408/429 counts move to
+> `http_error`). Splitting the two lets operators distinguish a broken
+> network (`transport_error`) from an overloaded upstream (`http_error`)
+> — these have completely different remediations. Update any PromQL panels
+> that keyed on the old four-value closed set.
+
+> **Prior dashboard impact (issue #497):** `malformed_response` was
+> previously conflated with `transport_error`. Dashboards or alerts that
+> aggregate `nexus_cascade_fallback_total{reason="transport_error"}` will
+> see its value drop after this change (the decode-failure and empty-choices
+> counts move to `malformed_response`). Splitting the two lets operators
+> distinguish a broken network (`transport_error`) from an upstream that
+> returns invalid responses (`malformed_response`) — these have
+> completely different remediations. Update any PromQL/JSON-stat panels
+> that keyed on the old three-value closed set.
+
 ### Naming convention audit
 
 | Check | Result |
@@ -101,10 +172,22 @@ Defined in `internal/handlers/chat.go`:
 | `source` | Yes | 5 | Fixed enum: guardrail, dsl, slm, slm-error, escalation |
 | `confidence_bucket` | Yes | 4 | Collapsed from float64 to 4 ordinal buckets |
 | `task_type` | Yes | 8 | Fixed set from Categorize() + empty |
-| `reason` | Yes | 4 | Fixed set of rejection reasons |
+| `reason` (rejections) | Yes | 4 | Fixed set of rejection reasons |
+| `reason` (SLM cache evictions) | Yes | 2 | `ttl`, `lru` — closed set defined in `internal/router/slm_cache.go` (issue #449) |
+| `kind` (SLM cache hits) | Yes | 2 | `exact`, `semantic` |
+| `hit` (RAG retrieval) | Yes | 2 | `true`, `false` (issue #186, #486) |
+| `reason` (RAG retrieval miss) | Yes | 3 | `empty_store`, `threshold`, `embed_error` — closed set emitted only when `hit="false"` |
+| SLM cache gauges (issue #531) | N/A | 2 | `nexus_slm_cache_entries` and `nexus_slm_cache_max_entries` are unlabelled gauges (cardinality 1 each); no label cardinality concerns. |
+| Local-route cooldown (issue #530) | N/A | 2 | `nexus_local_cooldown_active` (gauge, cardinality 1) and `nexus_local_cooldown_triggers_total` (counter, cardinality 1) are both unlabelled; no label cardinality concerns. |
+| `bucket_id` (rate-limit utilization, issue #746) | Yes | ≤ concurrent client IPs | Each distinct bucket ID (SHA256 of client IP, 8 hex chars) creates 6 series (4 quartile buckets + sum + count). Bounded by the number of distinct IPs seen within the bucket TTL window (10 minutes). Operators who need per-IP granularity can hash the `bucket_id` label downstream. |
 
 **No unbounded cardinality labels exist.** All label values are
-short, pre-defined strings with no user-controlled input.
+short, pre-defined strings with no user-controlled input. The
+`filename` label that previously adorned
+`nexus_rag_retrieval_total{hit="true"}` was removed in issue #486
+because it derived from raw RAG source filenames and grew one series
+per indexed document; the per-filename breakdown now lives only in
+the SQLite `rag_filename` column.
 
 ## SQLite metrics store (`internal/metrics`)
 
@@ -156,11 +239,71 @@ appended to the file. Fields mirror the SQLite schema. No Prometheus
 labels are derived directly from the JSONL — the JSONL is a
 tail-friendly log, not a metrics source.
 
+### File rotation (issue #485)
+
+`NEXUS_TELEMETRY_MAX_BYTES` (default `0` = disabled) enables size-based
+rotation. When the next record would push the active file past the cap
+it is atomically renamed to `path.<unix-nanoseconds>` and a fresh file
+is opened. `NEXUS_TELEMETRY_MAX_FILES` (default `5`) bounds the number
+of rotated files retained; the oldest is evicted at the cap. Both knobs
+require a restart — the file handle is swapped atomically at boot, so
+they are intentionally excluded from hot-reload.
+
+| Metric | Source | Notes |
+|--------|--------|-------|
+| `nexus_telemetry_rotations_total` | `JSONLRecorder.Rotations()` | Counter; always 0 when rotation is disabled. Confirm operators can see this climbing to verify rotation is firing. |
+| `nexus_telemetry_dropped_total` | `JSONLRecorder.Dropped()` | Counter; buffer-full drops (unchanged by #485). |
+| `nexus_telemetry_write_errors_total` | `JSONLRecorder.WriteErrors()` | Counter; write/flush error events in the JSONL background loop (issue #795). Distinct from `nexus_telemetry_dropped_total`: operators can distinguish disk/filesystem trouble from buffer back-pressure. |
+
+## Response headers (`X-Nexus-Route-*`)
+
+Every `/v1/chat/completions` response carries four routing-decision
+headers (set in `internal/handlers/chat.go`, issue #74) so clients and
+intermediate proxies can reason about routing without scraping logs:
+
+| Header | Source | Example |
+|--------|--------|---------|
+| `X-Nexus-Route` | `decision.Route` | `local`, `frontier`, `fusion` |
+| `X-Nexus-Route-Source` | `decision.Source` | `guardrail`, `dsl`, `slm`, `slm-error`, `escalation` |
+| `X-Nexus-Route-Reason` | `decision.Reason` | short reason string; may echo SLM error text |
+| `X-Nexus-Route-Confidence` | `formatConfidence(decision.Confidence)` | `0.85` |
+
+Each value passes through `SanitizeHeaderValue`
+(`internal/handlers/sanitize.go`), which strips CR/LF (header
+injection prevention), collapses other control characters to spaces,
+trims whitespace, and caps the value at **`MaxHeaderValue` = 128
+runes**. Values that exceed 128 runes after cleaning are truncated and
+a trailing **`...(+N)`** marker is appended, where *N* is the count of
+dropped runes (issue #494) — for example a 200-rune reason becomes the
+first 128 runes followed by `...(+72)`. The marker is consistent with
+the `TruncateForDebug` precedent in `debug.go`. Clean values and values
+exactly 128 runes long are returned unchanged (no false positive at the
+boundary). The marker adds at most a few bytes, keeping total header
+value length well under HTTP sane bounds.
+
 ## Distributed tracing (`internal/tracing`)
 
-Referenced in AGENTS.md as an OTLP/JSON exporter (#41). **Not yet
-implemented in the current codebase** — the `internal/tracing` package
-does not exist. The span/metric pairing will be:
+The OTLP/JSON exporter (#41) buffers spans and POSTs them as a single
+batch to the configured collector endpoint. Two counters expose
+distinct modes of silent span loss so operators can tell buffer
+pressure apart from collector trouble:
+
+| Metric | Backing source | Meaning |
+|--------|----------------|---------|
+| `nexus_tracing_dropped_total` | `Exporter.Dropped()` | Per-span count of spans shed at `Submit` time because the in-memory buffer was full (back-pressure). |
+| `nexus_tracing_flush_failures_total` | `Exporter.FlushFailures()` | Per-batch count of flushes that failed to POST (HTTP 4xx/5xx, timeout, or transport error). Each failure drops up to 64 spans (#484). |
+
+**Distinguishing the two:** `nexus_tracing_dropped_total` rising with
+`nexus_tracing_flush_failures_total` flat indicates the proxy is
+producing spans faster than the background loop drains them (raise
+`NEXUS_TRACING_QUEUE_SIZE`). `nexus_tracing_flush_failures_total`
+rising on its own indicates the collector is unreachable or rejecting
+batches (check `NEXUS_TRACING_ENDPOINT`, collector health, network);
+the proxy will not retry — the dropped batch is gone. A flat
+`nexus_tracing_dropped_total` while traces silently disappear is the
+exact symptom #484 fixed: flush failures previously had no metric.
+
+The span/metric attribute pairing is:
 
 | Span attribute | Prometheus metric/label | Notes |
 |----------------|------------------------|-------|
@@ -170,9 +313,113 @@ does not exist. The span/metric pairing will be:
 | `nexus.task_type` | `nexus_slm_decisions_total{task_type}` | Task category |
 | `nexus.rejection_reason` | `nexus_requests_rejected_total{reason}` | Rejection reason |
 
-When the tracing package is implemented, span attributes should use
-the same values as the Prometheus labels so cross-referencing is
-trivial.
+Span attributes use the same values as the Prometheus labels so
+cross-referencing is trivial.
+
+## Concurrency / VRAM
+
+The VRAM-aware local-route concurrency limiter (`internal/concurrencylimit`,
+issue #81) shrinks its effective slot count dynamically from the latest
+probe snapshot. Two gauges (issue #487) let operators see whether
+requests are saturating the local path and how low the ceiling dropped:
+
+| Metric | Type | Backing source | Meaning |
+|--------|------|----------------|---------|
+| `nexus_local_concurrency_effective_slots` | gauge | `Limiter.Effective()` | Current slot count the limiter honours: `min(Ceiling, freeVRAM / BytesPerSlot)`. 0 when the limiter is disabled (`NEXUS_LOCAL_MAX_CONCURRENT<=0`). |
+| `nexus_local_concurrency_in_flight` | gauge | `Limiter.InFlight()` | Number of currently held slots. Equals `effective_slots` under saturation. |
+
+Both gauges are unlabelled (cardinality 1 each) and are wired as
+`GaugeProvider` closures in `cmd/nexus/main.go`, reading from the
+concrete `*concurrencylimit.Limiter` instance. When the limiter is
+disabled the provider returns `nil` so neither series appears in a
+fresh scrape.
+
+## SLM cache fill ratio (issue #531)
+
+The SLM decision cache (`internal/router/slm_cache.go`, issue #206)
+holds prompt → route mappings for the configured TTL window to reduce
+SLM call frequency for duplicate prompts. Without a live entry count,
+operators cannot see cache pressure building until LRU evictions appear.
+Two gauges (issue #531) let operators chart the fill ratio
+`nexus_slm_cache_entries / nexus_slm_cache_max_entries` and raise
+`NEXUS_SLM_CACHE_MAX_ENTRIES` before LRU churn degrades cache
+effectiveness:
+
+| Metric | Type | Backing source | Meaning |
+|--------|------|----------------|---------|
+| `nexus_slm_cache_entries` | gauge | `SLMCache.Len()` | Current number of entries in the cache (including expired entries not yet evicted). |
+| `nexus_slm_cache_max_entries` | gauge | `SLMCache.MaxEntries()` | Configured maximum entry capacity. |
+| `nexus_slm_cache_stale_entries` | gauge | `SLMCache.StaleEntries()` | Number of entries that have passed their TTL but have not yet been evicted (issue #801). |
+
+Both gauges are unlabelled (cardinality 1 each) and are wired as
+`GaugeProvider` closures in `cmd/nexus/main.go`, reading from the
+concrete `*router.SLMCache` instance. When the cache is disabled
+(`NEXUS_SLM_CACHE_TTL=0`) the provider returns `nil` so neither
+series appears in a fresh scrape. Operators can compute the fill ratio
+directly in PromQL: `nexus_slm_cache_entries / nexus_slm_cache_max_entries`.
+
+## Local-route cooldown (issue #530)
+
+The local-route cooldown circuit (`internal/circuit/cooldown.go`, issue #80)
+arms a short window after the cascade detects an Ollama failure, skipping the
+local arm on subsequent `route=local` and `route=fusion` requests until the
+window expires. Without it, every subsequent request pays the full upstream
+timeout before falling back — a window of repeated slow local attempts.
+
+Two Prometheus signals (issue #530) let operators observe the cooldown
+arm/fire cycle directly from `/metrics` without correlating logs:
+
+| Metric | Type | Backing source | Meaning |
+|--------|------|----------------|---------|
+| `nexus_local_cooldown_active` | gauge | `circuit.Cooldown.Active()` | `1` when the cooldown window is active; `0` otherwise. Absent from `/metrics` when the cooldown is disabled (`NEXUS_LOCAL_COOLDOWN<=0`). |
+| `nexus_local_cooldown_triggers_total` | counter | `routeCounters.IncLocalCooldownTriggers()` | Cumulative cooldown arm events — each increment corresponds to one cascade failure that armed the cooldown. |
+
+The gauge is wired as a `GaugeProvider` closure in `cmd/nexus/main.go`,
+reading `localCooldown.Active()` at scrape time. The counter is incremented
+via a failure observer callback (`circuit.Cooldown.SetFailureObserver`)
+that forwards to `routeCounters.IncLocalCooldownTriggers()` — the circuit
+package does not import observability, preserving the existing dependency
+direction.
+
+The `/status` endpoint also surfaces a `local_cooldown` sub-object:
+
+```json
+{
+  "local_cooldown": {
+    "enabled": true,
+    "active": true,
+    "expires_at": "2024-01-01T00:00:10Z"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `enabled` | bool | Whether the cooldown circuit is wired (`NEXUS_LOCAL_COOLDOWN > 0`) |
+| `active` | bool | Whether the cooldown window is currently in effect |
+| `expires_at` | time | Wall-clock time when the active window ends (zero if inactive or disabled) |
+
+## Per-route latency percentiles (issue #774, #1051)
+
+Three gauge families expose request-latency percentiles per route,
+computed from a sliding-window ring buffer of recent samples (capacity
+1000). The ring buffer gives exact percentile values from actual
+observations — operators can set precise SLO alerts (e.g. `p95 < 2s`)
+without client-side estimation.
+
+Values are expressed in **seconds** (Prometheus convention for latency).
+
+| Metric | Type | Labels | Source |
+|--------|------|--------|--------|
+| `nexus_upstream_request_latency_p50_seconds` | gauge | `route` | `latencyPercentileBuffer.Perc()` (issue #774) |
+| `nexus_upstream_request_latency_p95_seconds` | gauge | `route` | `latencyPercentileBuffer.Perc()` (issue #774) |
+| `nexus_upstream_request_latency_p99_seconds` | gauge | `route` | `latencyPercentileBuffer.Perc()` (issue #1051) |
+
+`route` label values: `local`, `frontier`, `fusion`.
+
+p99 is critical for SLA monitoring: p95 misses the tail outliers that
+cause user-visible issues. With p99, operators can alert on the latency
+that only 1% of requests exceed.
 
 ## Observer wiring
 
@@ -199,6 +446,7 @@ health) **plus** a `judge` sub-object (always present):
 
 ```json
 {
+  "version": "v1.2.3",
   "frontier": { ... },
   "judge": {
     "enabled": true,
@@ -211,9 +459,8 @@ health) **plus** a `judge` sub-object (always present):
 }
 ```
 
+Top-level fields:
+
 | Field | Type | Description |
 |-------|------|-------------|
-| `enabled` | bool | Whether the judge evaluator is active (`NEXUS_JUDGE_SAMPLE_RATE > 0`) |
-| `queue_depth` | int | Buffered channel capacity (`NEXUS_JUDGE_QUEUE`) |
-| `dropped` | uint64 | Cumulative samples rejected because the queue was full |
-| `concurrency` | int | Number of worker goroutines (`NEXUS_JUDGE_CONCURRENCY`)
+| `version` | string | Build version string injected via `-ldflags "-X main.version=..."` at compile time (issue #529); `"dev"` when built without ldflags. |

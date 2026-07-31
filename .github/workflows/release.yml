@@ -2,11 +2,14 @@
 #
 # Triggered by semver tags (v*) or manually via workflow_dispatch.
 # Produces:
-#   - Cross-compiled binaries (linux/amd64, linux/arm64, darwin/arm64)
-#   - SHA256 checksums file
+#   - Cross-compiled binaries (linux/amd64, linux/arm64, darwin/arm64,
+#     windows/amd64)
+#   - Per-binary SBOM (SPDX JSON via syft) — one per cross-compiled binary
+#     so binary-only operators have a component inventory (issue #585)
+#   - SHA256 checksums file (covers binaries + their SBOMs)
 #   - GitHub Release with all artifacts attached
 #   - Multi-arch (amd64 + arm64) GHCR image
-#   - SBOM (SPDX JSON) attached to the release
+#   - Source-level SBOM (SPDX JSON) attached to the release
 #   - Keyless cosign signature on the image (requires OIDC permissions)
 #
 # workflow_dispatch lets operators smoke-test the full pipeline from the
@@ -47,24 +50,140 @@ env:
   GO_VERSION: '1.26'
 
 jobs:
-  # ── Cross-compile binaries + checksums ──────────────────────────
-  build-binaries:
-    name: Build binaries
+  # ── Pre-release gate: vet, build, test, lint ─────────────────────
+  # Mirrors the merge gate from ci.yml so a failing test or lint on the
+  # tagged commit blocks every downstream artifact (binaries, GHCR image,
+  # SBOM, GitHub Release). Coverage gate is intentionally omitted from
+  # the release path — it gates merges, not tags. Issue #479.
+  prereq:
+    name: vet, build, test, lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./cmd/nexus
+
+      - name: go test (with race detector)
+        run: go test -race -covermode=atomic ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+          args: --timeout=5m
+
+  # ── darwin/arm64 cross-compile smoke test (issue #693) ────────
+  # GitHub Actions does not provide macOS runners on public repos, so we
+  # cannot execute the darwin/arm64 binary in CI. This job cross-compiles
+  # the full project for darwin/arm64 and runs the test suite with -trimpath
+  # to verify compilation correctness. A full smoke test (running the binary
+  # and exercising its commands) must be performed manually before release:
+  #   1. Download the darwin-arm64 binary from the release artifacts
+  #   2. Run: chmod +x nexus-*-darwin-arm64 && ./nexus-*-darwin-arm64 check
+  #   3. Confirm exit code is 0 before publishing the release
+  darwin-smoke:
+    name: darwin/arm64 cross-compile test
+    needs: [prereq]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: go test darwin/arm64 (cross-compile)
+        env:
+          CGO_ENABLED: '0'
+          GOOS: darwin
+          GOARCH: arm64
+        run: go test -trimpath ./...
+
+  # ── windows/amd64 cross-compile smoke test (issue #692) ────────
+  # Mirrors the darwin/arm64 job above: cross-compile the full project
+  # for windows/amd64 on an ubuntu runner and run the test suite with
+  # -trimpath to verify compilation correctness. The test step itself
+  # is gated behind continue-on-error at the job level because the
+  # cross-compiled test binaries are Windows PE executables that cannot
+  # run on the ubuntu runner, so `go test` will report execution errors
+  # for packages with tests even when compilation succeeds. Compilation
+  # failures (the real risk — a Windows-specific build breakage shipping
+  # undetected) surface as build errors in the log regardless.
+  #
+  # A full runtime smoke test (executing the binary and exercising its
+  # commands on a real Windows host) must be performed manually before
+  # release:
+  #   1. Download nexus-*-windows-amd64.exe from the release artifacts
+  #   2. Run: .\nexus-*-windows-amd64.exe --version
+  #   3. Run: .\nexus-*-windows-amd64.exe check
+  #   4. Confirm exit code is 0 before publishing the release
+  windows-smoke:
+    name: windows/amd64 cross-compile test
+    needs: [prereq]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: go test windows/amd64 (cross-compile)
+        env:
+          CGO_ENABLED: '0'
+          GOOS: windows
+          GOARCH: amd64
+        run: go test -trimpath ./...
+
+  # ── Cross-compile binaries + checksums + SLSA provenance ───────
+  build-binaries:
+    name: Build binaries
+    needs: [prereq]
+    runs-on: ubuntu-latest
+    outputs:
+      binaries-matrix: ${{ steps.meta.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
       - name: Determine version
         id: ver
-        # inputs.version is set on workflow_dispatch; empty (falsy) on
-        # tag push, so we fall through to GITHUB_REF_NAME (the tag).
         run: echo "version=${{ inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate build matrix
+        id: meta
+        run: |
+          echo "matrix=[\"linux-amd64\",\"linux-arm64\",\"darwin-arm64\"]" >> "$GITHUB_OUTPUT"
 
       - name: Build binaries
         env:
@@ -74,7 +193,6 @@ jobs:
           mkdir -p dist
           LDFLAGS="-s -w -X main.version=${VERSION}"
 
-          # Targets: OS/ARCH -> output filename
           build_one() {
             local goos="$1" goarch="$2" name="$3"
             echo "::group::Building ${goos}/${goarch}"
@@ -87,13 +205,52 @@ jobs:
           build_one linux   amd64 "nexus-${VERSION}-linux-amd64"
           build_one linux   arm64 "nexus-${VERSION}-linux-arm64"
           build_one darwin  arm64 "nexus-${VERSION}-darwin-arm64"
+          build_one windows amd64 "nexus-${VERSION}-windows-amd64.exe"
+
+      # ── SBOM generation ─────────────────────────────────────────────
+      # syft is version-pinned to avoid supply-chain risk from main-branch
+      # installs (issue #689). Update to a new release tag periodically,
+      # e.g. after each quarterly syft release, and verify the SBOM
+      # generation step still succeeds before merging.
+      - name: Install syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.20.0/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Generate per-binary SBOM (SPDX JSON)
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          # syft reads the Go module list from the runtime.buildinfo
+          # section embedded by the toolchain, which survives the
+          # -s -w -trimpath flags used above. Each binary gets its own
+          # SPDX JSON so binary-only operators have a complete component
+          # inventory without pulling the container image (issue #585).
+          for bin in nexus-${VERSION}-linux-amd64 \
+                     nexus-${VERSION}-linux-arm64 \
+                     nexus-${VERSION}-darwin-arm64; do
+            echo "::group::SBOM for ${bin}"
+            syft packages "${bin}" -o spdx-json="${bin}.spdx.json"
+            echo "::endgroup::"
+          done
 
       - name: Generate SHA256 checksums
         working-directory: dist
         run: |
+          # Covers binaries AND their per-binary SBOMs (the nexus-* glob
+          # matches both), satisfying the checksum contract in #585.
           sha256sum nexus-* > checksums-sha256.txt
           echo "Checksums:"
           cat checksums-sha256.txt
+
+      - name: Generate SLSA provenance
+        uses: slsa-framework/slsa-github-generator/actions/create-action@main
+        with:
+          artifact-name: release-binaries
+          artifact-path: dist
+          retention-days: 7
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -105,6 +262,7 @@ jobs:
   # ── Build & publish multi-arch GHCR image + cosign signature ────
   docker:
     name: GHCR image + signature
+    needs: [prereq]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -146,7 +304,9 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          build-args: VERSION=${{ steps.ver.outputs.version }}
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
+            GO_VERSION=${{ env.GO_VERSION }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -157,6 +317,101 @@ jobs:
         # overrides `tags`/`push`, leaving the image untagged. The
         # `digest` output is populated regardless and used for cosign
         # signing below.
+
+      # ── Post-build smoke test (issue #582, #690) ────────────────
+      # The image is already pushed by build-push-action above. Pull
+      # BOTH pushed variants (amd64 + arm64) back onto the runner and
+      # prove each container actually runs BEFORE cosign signs the
+      # multi-arch digest and the release job advertises it. A broken
+      # image of either architecture (bad entrypoint, missing binary,
+      # wrong UID, ARM-incompatible build flag) fails here and marks
+      # the docker job failed, which blocks both the cosign step below
+      # and the `release` job (`needs: [build-binaries, docker, sbom]`).
+      # This stops broken images from being cosign-signed and attached
+      # to the GitHub Release.
+      #
+      # ARM64 smoke-test constraints (issue #690):
+      # The runner is x86_64, so the arm64 variant executes under the
+      # QEMU user-space emulator set up earlier in this job. QEMU
+      # emulation is markedly slower than native execution — a cold
+      # start of the Go binary can take 10-20s — so the /healthz poll
+      # loop below uses a 60s budget per platform (vs. 30s for the old
+      # amd64-only test). The arm64 test is intentionally NOT marked
+      # continue-on-error: a broken arm64 image must block cosign
+      # signing and the release, matching how amd64 is treated. If a
+      # future change makes QEMU startup exceed the 60s budget, raise
+      # the budget rather than weakening the gate.
+      - name: Smoke test image (amd64 + arm64)
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.version }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Both platforms are built & pushed above, so both must be
+          # proven to start. amd64 runs natively; arm64 runs under QEMU.
+          PLATFORMS="linux/amd64 linux/arm64"
+
+          smoke_one() {
+            local platform="$1" port="$2"
+            local shortname="${platform//\//-}"
+
+            echo "::group::Smoke test ${platform}"
+            echo "Pulling ${IMAGE} (${platform})..."
+            docker pull --platform "${platform}" "${IMAGE}"
+
+            # Verify the binary runs and reports the version injected
+            # at build time. The distroless ENTRYPOINT is /nexus, so
+            # --version is passed as the sole argument.
+            echo "nexus --version (${platform})"
+            docker run --rm --platform "${platform}" "${IMAGE}" --version \
+              | tee "/tmp/version-${shortname}.out"
+            grep -F "nexus ${VERSION}" "/tmp/version-${shortname}.out"
+
+            # Verify /healthz responds 200 once the HTTP server is up.
+            # Distroless has no shell or wget, so the check runs from
+            # the runner against the host-mapped port. /healthz is
+            # auth-exempt and always returns 200 while the binary is
+            # alive. Distinct ports per platform avoid "address already
+            # in use" if a prior container is slow to release its port.
+            echo "/healthz responds 200 (${platform})"
+            local cid
+            cid=$(docker run -d --rm --platform "${platform}" -p "${port}:8000" "${IMAGE}")
+
+            local code=""
+            for i in $(seq 1 60); do
+              code=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+                --max-time 2 "http://localhost:${port}/healthz" || true)
+              if [ "${code}" = "200" ]; then
+                echo "/healthz returned 200 on attempt ${i} (${platform})"
+                break
+              fi
+              echo "attempt ${i}: status=${code}, retrying... (${platform})"
+              sleep 1
+            done
+
+            if [ "${code}" != "200" ]; then
+              echo "::error::/healthz did not return 200 within 60s for ${platform} (last=${code})"
+              docker logs "${cid}" || true
+              docker stop "${cid}" >/dev/null 2>&1 || true
+              exit 1
+            fi
+            docker stop "${cid}" >/dev/null 2>&1 || true
+            echo "Smoke test passed for ${platform}."
+            echo "::endgroup::"
+          }
+
+          # Run each platform sequentially. A failure in ANY platform
+          # exits the step non-zero, which fails the `docker` job and
+          # blocks both the cosign signing step below and the `release`
+          # job (needs: [build-binaries, docker, sbom]).
+          PORT=18000
+          for platform in ${PLATFORMS}; do
+            smoke_one "${platform}" "${PORT}"
+            PORT=$((PORT + 1))
+          done
+
+          echo "All platform smoke tests passed."
 
       # ── Keyless cosign signing (requires id-token: write) ───────
       - name: Install cosign
@@ -190,12 +445,13 @@ jobs:
   # ── SBOM generation ─────────────────────────────────────────────
   sbom:
     name: Generate SBOM
+    needs: [prereq]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -238,7 +494,10 @@ jobs:
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-binaries, sbom]
+    # `docker` is a dependency (issue #541) so a failed GHCR image
+    # build blocks the release — otherwise the release body would
+    # advertise a `docker pull` of an image that was never published.
+    needs: [build-binaries, docker, sbom]
     steps:
       - name: Determine version
         id: ver
@@ -256,8 +515,14 @@ jobs:
           name: sbom
           path: dist/
 
+      - name: Download SLSA provenance attestation
+        uses: actions/download-artifact@v8
+        with:
+          name: release-binaries-attestation
+          path: dist/
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.ver.outputs.version }}
           name: ${{ steps.ver.outputs.version }}
@@ -268,6 +533,7 @@ jobs:
             dist/nexus-*
             dist/checksums-sha256.txt
             dist/*.spdx.json
+            dist/*.intoto.jsonl
           body: |
             ## Artifacts
 
@@ -276,14 +542,38 @@ jobs:
             | `nexus-*-linux-amd64` | Linux x86_64 binary |
             | `nexus-*-linux-arm64` | Linux ARM64 binary |
             | `nexus-*-darwin-arm64` | macOS Apple Silicon binary |
-            | `checksums-sha256.txt` | SHA256 checksums for all binaries |
-            | `*-sbom.spdx.json` | SPDX SBOM |
+            | `nexus-*-windows-amd64.exe` | Windows x86_64 binary |
+            | `nexus-*-linux-amd64.spdx.json` | Per-binary SBOM (SPDX JSON) — Linux x86_64 |
+            | `nexus-*-linux-arm64.spdx.json` | Per-binary SBOM (SPDX JSON) — Linux ARM64 |
+            | `nexus-*-darwin-arm64.spdx.json` | Per-binary SBOM (SPDX JSON) — macOS Apple Silicon |
+            | `checksums-sha256.txt` | SHA256 checksums for binaries + SBOMs |
+            | `*-sbom.spdx.json` | Source-level SPDX SBOM |
+            | `*.intoto.jsonl` | SLSA provenance attestation |
 
-            ## Verify
+            ## Verify checksums
 
             ```bash
             sha256sum -c checksums-sha256.txt
             ```
+
+            ## Verify binary SLSA provenance
+
+            Install the [slsa-verifier](https://github.com/slsa-framework/slsa-verifier) and verify provenance for each binary:
+
+            ```bash
+            # Example for linux/amd64 — repeat for each platform
+            PLATFORM="linux-amd64"
+            TAG="${{ steps.ver.outputs.version }}"
+            BINARY="nexus-${TAG}-${PLATFORM}"
+            ATTESTATION="${BINARY}.intoto.jsonl"
+
+            slsa-verifier verify-artifact "${BINARY}" \
+              --provenance-path "${ATTESTATION}" \
+              --source-repo "https://github.com/${{ github.repository }}" \
+              --tag "${TAG}"
+            ```
+
+            The provenance attestation cryptographically verifies that the binary was built from the exact source commit by GitHub Actions.
 
             ## Docker image
 

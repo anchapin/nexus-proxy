@@ -16,6 +16,10 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
+// defaultMaxResponseBytes is the default cap on upstream response bodies.
+// Used by ReadAllLimited to prevent memory exhaustion.
+const defaultMaxResponseBytes = 64 << 20 // 64 MiB
+
 // CascadeStep is one member of a Cascade: a single model endpoint the
 // runner will try in order. Name is a short identifier used in logs and
 // the telemetry route_attempted field (e.g. "local", "frontier", "zai").
@@ -26,16 +30,6 @@ type CascadeStep struct {
 	Model  string
 }
 
-// Provider is the interface for a frontier provider. It is satisfied by
-// providers.ProviderConfig and allows the cascade to build steps from
-// any provider implementation.
-type Provider interface {
-	Name() string
-	BaseURL() string
-	Model() string
-	APIKey() string
-}
-
 // Cascade runs an ordered list of steps and falls back to the next one on
 // retryable failures: transport errors, HTTP 5xx/408/429, timeouts, and
 // malformed upstream responses (unparseable JSON or malformed tool_calls).
@@ -43,8 +37,9 @@ type Provider interface {
 // Cascade is stateless; build a fresh one per request so it picks up env
 // changes without restarting the process (issue #14 acceptance criteria).
 type Cascade struct {
-	Steps   []CascadeStep
-	Timeout time.Duration // per-attempt; <=0 falls back to cascadeDefaultTimeout
+	Steps            []CascadeStep
+	Timeout          time.Duration // per-attempt; <=0 falls back to cascadeDefaultTimeout
+	MaxResponseBytes int           // per-response cap; <=0 falls back to defaultMaxResponseBytes (64 MiB)
 }
 
 // CascadeResult is the per-request outcome suitable for telemetry.
@@ -76,9 +71,10 @@ type CascadeResult struct {
 	// FallbackReason is the reason label for the cascade_fallback_total
 	// metric (issue #205). It is set whenever a retryable step failure
 	// causes the cascade to fall back to the next step. The value is one
-	// of "timeout", "transport_error", or "malformed_toolcall". Empty
-	// when no fallback occurred (cascade succeeded on first step or all
-	// steps failed without retryable errors).
+	// of "timeout", "transport_error", "http_error", "rate_limited",
+	// "malformed_toolcall", or "malformed_response". Empty when no
+	// fallback occurred (cascade succeeded on first step or all steps
+	// failed without retryable errors).
 	FallbackReason string
 }
 
@@ -96,8 +92,9 @@ var ErrSSEPartialWrite = errors.New("cascade: SSE partial write after headers co
 // cascadeErr tags a per-step failure so the runner knows whether to fall
 // back (retry=true) or surface the error immediately (retry=false — e.g.
 // upstream returned 401, retrying won't help). The reason field carries
-// one of three values used for cascade_fallback_total{reason} metrics:
-// "timeout", "transport_error", or "malformed_toolcall".
+// one of seven values used for cascade_fallback_total{reason} metrics:
+// "timeout", "transport_error", "rate_limited", "http_error",
+// "malformed_toolcall", "malformed_response", or "model_unavailable".
 type cascadeErr struct {
 	retry  bool
 	reason string // "" when non-retryable
@@ -108,7 +105,8 @@ func (e *cascadeErr) Error() string { return e.msg }
 
 // newCascadeErr creates a cascadeErr. reason is the label for the
 // cascade_fallback_total metric: "timeout", "transport_error",
-// "malformed_toolcall", or "" for non-retryable errors.
+// "rate_limited", "http_error", "malformed_toolcall", "malformed_response",
+// "model_unavailable", or "" for non-retryable errors.
 func newCascadeErr(retry bool, reason, format string, args ...interface{}) error {
 	return &cascadeErr{retry: retry, reason: reason, msg: fmt.Sprintf(format, args...)}
 }
@@ -144,7 +142,7 @@ func ShouldRetry(statusCode int, err error) bool {
 // HTTP handler). When the client disconnects, ctx is cancelled and the
 // in-flight upstream call is cancelled within 1 second rather than waiting
 // for the full timeout (issue #297).
-func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client, payload map[string]interface{}) (CascadeResult, error) {
+func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client, payload map[string]interface{}, requestID string) (CascadeResult, error) {
 	if len(c.Steps) == 0 {
 		return CascadeResult{}, errors.New("cascade: no steps configured")
 	}
@@ -160,10 +158,11 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 		res.RouteAttempted = joinStepNames(c.Steps[:i+1])
 
 		ctx, cancel := context.WithTimeout(ctx, timeout)
-		msg, servedModel, err := fetchCascadeStep(ctx, client, step, payload)
+		msg, servedModel, err := c.fetchCascadeStep(ctx, client, step, payload)
 		cancel()
 		if err == nil {
 			slog.Info("cascade served",
+				slog.String("request_id", requestID),
 				slog.String("step", step.Name),
 				slog.Int("attempt", i+1),
 				slog.Int("total", len(c.Steps)),
@@ -195,6 +194,7 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 			res.FallbackReason = CascadeFallbackReason(err)
 		}
 		slog.Warn("cascade step failed",
+			slog.String("request_id", requestID),
 			slog.String("step", step.Name),
 			slog.Int("attempt", i+1),
 			slog.Int("total", len(c.Steps)),
@@ -209,6 +209,7 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 	if lastErr == nil {
 		lastErr = errors.New("cascade: no steps attempted")
 	}
+	res.FallbackReason = CascadeFallbackReason(lastErr)
 	return res, fmt.Errorf("cascade: all %d steps failed; last error: %w", len(c.Steps), lastErr)
 }
 
@@ -224,17 +225,26 @@ func classifyFailure(err error) bool {
 
 // CascadeFallbackReason extracts the reason label from err if it is a
 // cascadeErr with a non-empty reason field. The returned string is one
-// of "timeout", "transport_error", or "malformed_toolcall". Empty string
-// is returned when err is nil or the error carries no fallback reason.
+// of "timeout", "transport_error", "http_error", "rate_limited",
+// "malformed_toolcall", "malformed_response", "model_unavailable", or
+// "unknown". "unknown" is returned when err is nil or the error carries no
+// fallback reason, preventing empty-string label collisions in
+// cascade_fallback_total{reason=""} metrics (issue #664).
 func CascadeFallbackReason(err error) string {
 	if err == nil {
-		return ""
+		return "unknown"
 	}
 	var cf *cascadeErr
 	if errors.As(err, &cf) {
+		if cf.reason == "" {
+			return "unknown"
+		}
+		if cf.reason == "model_unavailable" {
+			return "model_unavailable"
+		}
 		return cf.reason
 	}
-	return ""
+	return "unknown"
 }
 
 func joinStepNames(steps []CascadeStep) string {
@@ -249,7 +259,7 @@ func joinStepNames(steps []CascadeStep) string {
 // the response, and returns the assistant message + the model name echoed
 // back by the upstream (used in the SSE response). All returned errors are
 // tagged via newCascadeErr so the runner knows whether to fall back.
-func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payload map[string]interface{}) (AssistantMessage, string, error) {
+func (c *Cascade) fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payload map[string]interface{}) (AssistantMessage, string, error) {
 	body := make(map[string]interface{}, len(payload)+2)
 	for k, v := range payload {
 		body[k] = v
@@ -284,10 +294,24 @@ func fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payl
 		return AssistantMessage{}, "", newCascadeErr(true, reason, "transport: %v", dErr)
 	}
 	defer resp.Body.Close()
-	respBody, _ := ioutils.ReadAllLimited(resp.Body, defaultMaxResponseBytes)
+	maxBytes := c.MaxResponseBytes
+	if maxBytes <= 0 {
+		maxBytes = defaultMaxResponseBytes
+	}
+	respBody, _ := ioutils.ReadAllLimited(resp.Body, maxBytes)
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return AssistantMessage{}, "", newCascadeErr(true, "rate_limited", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
+	}
 	if ShouldRetry(resp.StatusCode, nil) {
-		return AssistantMessage{}, "", newCascadeErr(true, "transport_error", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
+		return AssistantMessage{}, "", newCascadeErr(true, "http_error", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
+	}
+	// Issue #438: A 404 from the local step means the model is missing or
+	// not pulled. Treat as retryable so the cascade falls through to the
+	// frontier. Frontier 404s remain terminal — a missing frontier model
+	// is a configuration error, not a transient condition.
+	if resp.StatusCode == http.StatusNotFound && step.Name == "local" {
+		return AssistantMessage{}, "", newCascadeErr(true, "model_unavailable", "local model not found (404): %s", truncateForLog(respBody, 200))
 	}
 	if resp.StatusCode != http.StatusOK {
 		// Non-retryable 4xx (auth, bad request, etc.). Surface to caller.
@@ -353,10 +377,10 @@ func (m AssistantMessage) HasToolCalls() bool { return len(m.ToolCalls) > 0 }
 func extractAssistantMessage(body []byte) (AssistantMessage, string, error) {
 	var raw assistantResponse
 	if uErr := json.Unmarshal(body, &raw); uErr != nil {
-		return AssistantMessage{}, "", newCascadeErr(true, "transport_error", "decode: %v", uErr)
+		return AssistantMessage{}, "", newCascadeErr(true, "malformed_response", "decode: %v", uErr)
 	}
 	if len(raw.Choices) == 0 {
-		return AssistantMessage{}, "", newCascadeErr(true, "transport_error", "empty choices")
+		return AssistantMessage{}, "", newCascadeErr(true, "malformed_response", "empty choices")
 	}
 	msg := raw.Choices[0].Message
 	for i, tc := range msg.ToolCalls {
@@ -470,6 +494,10 @@ type CascadeConfig struct {
 	ZAIKey        string
 	Timeout       time.Duration
 
+	// MaxResponseBytes caps per-response bodies in the cascade. Zero or
+	// negative falls back to defaultMaxResponseBytes (64 MiB).
+	MaxResponseBytes int
+
 	// SkipLocal removes the local Ollama step from the cascade.
 	// The chat handler sets this when internal/health reports
 	// Ollama is unreachable (issue #8): callers still get the
@@ -513,32 +541,20 @@ func BuildLocalCascade(cfg CascadeConfig) *Cascade {
 			Model:  cfg.ZAIModel,
 		})
 	}
-	return &Cascade{Steps: steps, Timeout: cfg.Timeout}
+	return &Cascade{Steps: steps, Timeout: cfg.Timeout, MaxResponseBytes: cfg.MaxResponseBytes}
 }
 
-// BuildCascadeFromProviders builds a cascade from a slice of providers.
-// It appends each provider as a CascadeStep with the provider's Name as
-// the step name, BaseURL as the URL, Model as the model, and APIKey as
-// the API key. The timeout is taken from cfg.Timeout.
-func BuildCascadeFromProviders(providers []Provider, timeout time.Duration) *Cascade {
-	steps := make([]CascadeStep, 0, len(providers))
-	for _, p := range providers {
-		steps = append(steps, CascadeStep{
-			Name:   p.Name(),
-			URL:    strings.TrimRight(p.BaseURL(), "/") + "/v1/chat/completions",
-			Model:  p.Model(),
-			APIKey: p.APIKey(),
-		})
-	}
-	return &Cascade{Steps: steps, Timeout: timeout}
-}
+const truncateSuffix = "...(truncated)"
 
 // truncateForLog clamps a response body for log/error messages. Bodies
 // from upstream providers can include full chat dumps; 200 bytes is enough
 // to identify the failure mode without spamming logs.
 func truncateForLog(b []byte, max int) string {
+	if max <= len(truncateSuffix) {
+		return ""
+	}
 	if len(b) <= max {
 		return string(b)
 	}
-	return string(b[:max]) + "...(truncated)"
+	return string(b[:max-len(truncateSuffix)]) + truncateSuffix
 }

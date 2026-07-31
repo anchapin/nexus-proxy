@@ -9,20 +9,23 @@ import (
 
 // mockStore implements rag.RAGStore for testing.
 type mockStore struct {
-	retrieveFn func(ctx context.Context, query string) (*rag.FewShotExample, float64, error)
+	retrieveFn func(ctx context.Context, query string) (*rag.FewShotExample, float64, rag.IndexPath, error)
 }
 
-func (m *mockStore) Retrieve(ctx context.Context, query string) (*rag.FewShotExample, float64, error) {
+func (m *mockStore) Retrieve(ctx context.Context, query string) (*rag.FewShotExample, float64, rag.IndexPath, error) {
 	if m.retrieveFn != nil {
 		return m.retrieveFn(ctx, query)
 	}
-	return nil, 0, nil
+	return nil, 0, "", nil
 }
 func (m *mockStore) Add(filename, content string, embedding []float64) {}
 func (m *mockStore) Size() int                                         { return 0 }
 func (m *mockStore) Threshold() float64                                { return 0.5 }
+func (m *mockStore) ThresholdFor(dir string) float64                   { return 0.5 }
+func (m *mockStore) IndexMode() string                                 { return rag.IndexModeNone }
 func (m *mockStore) IsBreakerOpen() bool                               { return false }
 func (m *mockStore) RecordBreakerSuccess()                             {}
+func (m *mockStore) LastSuccessfulKind() string                        { return "" }
 
 // --- MiddlewareFunc tests ---
 
@@ -66,7 +69,7 @@ func TestNewMiddleware(t *testing.T) {
 
 func TestRAGMiddleware_Name(t *testing.T) {
 	store := &mockStore{}
-	r := NewRAGMiddleware(store, 0.5).(*ragMiddleware)
+	r := NewRAGMiddleware(store).(*ragMiddleware)
 	if r.Name() != "rag" {
 		t.Errorf("Name() = %q, want %q", r.Name(), "rag")
 	}
@@ -74,7 +77,7 @@ func TestRAGMiddleware_Name(t *testing.T) {
 
 func TestRAGMiddleware_Transform_ReturnsInput(t *testing.T) {
 	store := &mockStore{}
-	r := NewRAGMiddleware(store, 0.5)
+	r := NewRAGMiddleware(store)
 	msgs := []interface{}{"hello"}
 	got, err := r.Transform(msgs)
 	if err != nil {
@@ -88,11 +91,11 @@ func TestRAGMiddleware_Transform_ReturnsInput(t *testing.T) {
 
 func TestRAGMiddleware_TransformContext_NoMatch(t *testing.T) {
 	store := &mockStore{
-		retrieveFn: func(ctx context.Context, query string) (*rag.FewShotExample, float64, error) {
-			return nil, 0, nil
+		retrieveFn: func(ctx context.Context, query string) (*rag.FewShotExample, float64, rag.IndexPath, error) {
+			return nil, 0, "", nil
 		},
 	}
-	r := NewRAGMiddleware(store, 0.5)
+	r := NewRAGMiddleware(store)
 	msgs := []interface{}{"hello"}
 	got, err := r.TransformContext(context.Background(), msgs)
 	if err != nil {
@@ -106,15 +109,15 @@ func TestRAGMiddleware_TransformContext_NoMatch(t *testing.T) {
 
 func TestRAGMiddleware_TransformContext_WithMatch(t *testing.T) {
 	store := &mockStore{
-		retrieveFn: func(ctx context.Context, query string) (*rag.FewShotExample, float64, error) {
+		retrieveFn: func(ctx context.Context, query string) (*rag.FewShotExample, float64, rag.IndexPath, error) {
 			return &rag.FewShotExample{
 				Filename:  "test.go",
 				Content:   "test content",
 				Embedding: []float64{0.1, 0.2},
-			}, 0.9, nil
+			}, 0.9, rag.IndexPathBruteForce, nil
 		},
 	}
-	r := NewRAGMiddleware(store, 0.5)
+	r := NewRAGMiddleware(store)
 	// InjectRAG looks for a user-role message with a string content field
 	msgs := []interface{}{
 		map[string]interface{}{"role": "user", "content": "hello"},
@@ -141,7 +144,7 @@ func TestRAGMiddleware_TransformContext_WithMatch(t *testing.T) {
 
 func TestNewRAGMiddleware(t *testing.T) {
 	store := &mockStore{}
-	mw := NewRAGMiddleware(store, 0.7)
+	mw := NewRAGMiddleware(store)
 	if mw.Name() != "rag" {
 		t.Errorf("Name() = %q, want %q", mw.Name(), "rag")
 	}
@@ -150,7 +153,7 @@ func TestNewRAGMiddleware(t *testing.T) {
 // --- Registry tests ---
 
 func TestRegister_Success(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	m := NewMiddleware("register-test", func([]interface{}) ([]interface{}, error) {
 		return nil, nil
 	})
@@ -161,7 +164,7 @@ func TestRegister_Success(t *testing.T) {
 }
 
 func TestRegister_DuplicatePanics(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	m := NewMiddleware("dup-test", func([]interface{}) ([]interface{}, error) {
 		return nil, nil
 	})
@@ -175,7 +178,7 @@ func TestRegister_DuplicatePanics(t *testing.T) {
 }
 
 func TestGet_NotFound(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	if Get("nonexistent") != nil {
 		t.Error("Get() should return nil for unknown name")
 	}
@@ -184,7 +187,7 @@ func TestGet_NotFound(t *testing.T) {
 // --- BuildChain tests ---
 
 func TestBuildChain_EmptySpec(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	chain, err := BuildChain("")
 	if err != nil {
 		t.Fatalf("BuildChain() error = %v", err)
@@ -195,7 +198,7 @@ func TestBuildChain_EmptySpec(t *testing.T) {
 }
 
 func TestBuildChain_ValidSpec(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	chain, err := BuildChain("promptEngineering,compressJSONBlocks")
 	if err != nil {
 		t.Fatalf("BuildChain() error = %v", err)
@@ -212,7 +215,7 @@ func TestBuildChain_ValidSpec(t *testing.T) {
 }
 
 func TestBuildChain_UnknownName(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	_, err := BuildChain("promptEngineering,unknownMiddleware,compressJSONBlocks")
 	if err == nil {
 		t.Fatal("BuildChain() expected error for unknown middleware, got nil")
@@ -220,7 +223,7 @@ func TestBuildChain_UnknownName(t *testing.T) {
 }
 
 func TestBuildChain_EmptyAfterTrim(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	_, err := BuildChain("promptEngineering, , compressJSONBlocks")
 	if err != nil {
 		t.Fatalf("BuildChain() should skip empty entries, got error: %v", err)
@@ -228,7 +231,7 @@ func TestBuildChain_EmptyAfterTrim(t *testing.T) {
 }
 
 func TestBuildChain_AllEmpty(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	_, err := BuildChain(" , ")
 	if err == nil {
 		t.Fatal("BuildChain() expected error for all-empty chain")
@@ -238,7 +241,7 @@ func TestBuildChain_AllEmpty(t *testing.T) {
 // --- DefaultChain tests ---
 
 func TestDefaultChain_HasFourEntries(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	chain := DefaultChain()
 	if len(chain) != 4 {
 		t.Errorf("DefaultChain() len = %d, want 4", len(chain))
@@ -258,14 +261,14 @@ func TestDefaultChain_HasFourEntries(t *testing.T) {
 // --- Init tests ---
 
 func TestInit_ReInitializesRegistry(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	// Register a custom middleware under a name not in the built-in set
 	Register(NewMiddleware("custom-init-test", func([]interface{}) ([]interface{}, error) {
 		return []interface{}{"custom"}, nil
 	}))
 
 	// Re-init should clear the registry and re-register only built-ins
-	Init("sysprompt", "toon", false)
+	Init("sysprompt", "toon", true, false)
 
 	// custom-init-test should be gone after re-init
 	if Get("custom-init-test") != nil {
@@ -286,7 +289,7 @@ func TestInit_ReInitializesRegistry(t *testing.T) {
 // --- Integration: full chain ---
 
 func TestBuildChain_CanBuildPartialChain(t *testing.T) {
-	Init("", "", false)
+	Init("", "", true, false)
 	// Operator can drop RAG from the chain
 	chain, err := BuildChain("promptEngineering,compressJSONBlocks,appendSystemNote")
 	if err != nil {
