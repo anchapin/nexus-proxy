@@ -202,7 +202,7 @@ func (g *Guard) evictLocked() {
 		return !g.window[i].At.Before(cutoff)
 	})
 	if i > 0 {
-		g.window = append(g.window[:0:0], g.window[i:]...)
+		g.window = append(g.window[:0], g.window[i:]...)
 	}
 }
 
