@@ -138,12 +138,16 @@ func (c *CachedEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 	defer c.mu.Unlock()
 	for i, idx := range uncached {
 		vec := fetched[i]
-		result[idx] = vec
+		resultCopy := make([]float64, len(vec))
+		copy(resultCopy, vec)
+		result[idx] = resultCopy
 		// Double-check if another goroutine populated this key while we were fetching.
 		if el, ok := c.cache[texts[idx]]; ok {
 			c.ll.MoveToFront(el)
 		} else {
-			entry := &cacheEntry{key: texts[idx], vec: vec}
+			cacheCopy := make([]float64, len(vec))
+			copy(cacheCopy, vec)
+			entry := &cacheEntry{key: texts[idx], vec: cacheCopy}
 			el := c.ll.PushFront(entry)
 			c.cache[texts[idx]] = el
 			if c.ll.Len() > c.maxEntries {
