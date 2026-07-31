@@ -165,5 +165,3 @@ func hasUpperUnicode(s string) bool {
 	}
 	return false
 }
-
-
