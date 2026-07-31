@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"runtime/debug"
 	"strings"
+
+	"github.com/anchapin/nexus-proxy/internal/observability"
 )
 
 // HandlerPanicObserver is the hook handlers.Recover invokes when it
@@ -90,8 +92,22 @@ func Recover(obs HandlerPanicObserver) func(http.Handler) http.Handler {
 							"message": "internal server error",
 							"type":    "internal_error",
 						})
-						_, _ = fmt.Fprintf(rw, "data: {\"error\":%s}\n\n", payload)
-						_, _ = fmt.Fprint(rw, "data: [DONE]\n\n")
+						if _, err := fmt.Fprintf(rw, "data: {\"error\":%s}\n\n", payload); err != nil {
+							slog.Error("panic SSE error frame write failed",
+								slog.String("component", "recovery"),
+								slog.String("request_id", reqID),
+								slog.String("err", err.Error()),
+							)
+							observability.IncrementPanicSSEWriteFailuresCounter()
+						}
+						if _, err := fmt.Fprint(rw, "data: [DONE]\n\n"); err != nil {
+							slog.Error("panic SSE done sentinel write failed",
+								slog.String("component", "recovery"),
+								slog.String("request_id", reqID),
+								slog.String("err", err.Error()),
+							)
+							observability.IncrementPanicSSEWriteFailuresCounter()
+						}
 						rw.Flush()
 						return
 					}

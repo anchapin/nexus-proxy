@@ -53,6 +53,26 @@ func SetTruncationCounter(p *uint64) {
 	responseTruncated = p
 }
 
+// panicSSEWriteFailuresCounter is a package-level counter for SSE error frame
+// write failures in the panic recovery path (issue #1115). It is set by
+// SetPanicSSEWriteFailuresCounter and incremented by
+// IncrementPanicSSEWriteFailuresCounter. When nil, increments are no-ops.
+var panicSSEWriteFailuresCounter *uint64
+
+// SetPanicSSEWriteFailuresCounter configures the package-level SSE write
+// failure counter. Called once at startup from main.go.
+func SetPanicSSEWriteFailuresCounter(p *uint64) {
+	panicSSEWriteFailuresCounter = p
+}
+
+// IncrementPanicSSEWriteFailuresCounter atomically increments the SSE write
+// failure counter. Safe for concurrent use. Nil counter is a no-op.
+func IncrementPanicSSEWriteFailuresCounter() {
+	if panicSSEWriteFailuresCounter != nil {
+		atomic.AddUint64(panicSSEWriteFailuresCounter, 1)
+	}
+}
+
 // IncrementTruncationCounter atomically increments the truncation counter.
 // Safe for concurrent use. Nil counter is a no-op.
 func IncrementTruncationCounter() {
@@ -1038,6 +1058,18 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 		return total, err
 	} else {
 		total += n
+	}
+	// nexus_panic_sse_write_failures_total (issue #1115): SSE error frame write
+	// failures in the panic recovery path. Incremented when fmt.Fprintf or
+	// fmt.Fprint fails while sending the trailing SSE error+[DONE] frames.
+	sseWriteFailuresVal := uint64(0)
+	if panicSSEWriteFailuresCounter != nil {
+		sseWriteFailuresVal = atomic.LoadUint64(panicSSEWriteFailuresCounter)
+	}
+	if n, err := fmt.Fprintf(w, "# HELP nexus_panic_sse_write_failures_total SSE error frame write failures in panic recovery path (issue #1115).\n# TYPE nexus_panic_sse_write_failures_total counter\nnexus_panic_sse_write_failures_total %d\n", sseWriteFailuresVal); err != nil {
+		return total, err
+	} else {
+		total += int64(n)
 	}
 	if n, err := writeLabelledSeries(w, "nexus_prompt_injection_hits_total",
 		"Requests that produced suspicious prompt-injection pattern hits, by injection mode (issue #482).",
