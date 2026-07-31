@@ -473,6 +473,10 @@ func (v *ShellVerifier) lookupProject(filePath string) (string, Kind, error) {
 				if err != nil || fi.ModTime().UnixNano() != h.mtime {
 					// Manifest missing or mtime changed — invalidate and rewalk.
 					v.cache.Delete(cacheKey)
+				} else if hasOtherKindAtRoot(h.root, h.kind) {
+					// Another manifest kind appeared at the same root — invalidate
+					// and rewalk so the correct kind is discovered (issue #1124).
+					v.cache.Delete(cacheKey)
 				} else {
 					return h.root, h.kind, nil
 				}
@@ -507,6 +511,26 @@ func (v *ShellVerifier) lookupProject(filePath string) (string, Kind, error) {
 		dir = parent
 	}
 	return "", KindUnknown, nil
+}
+
+// hasOtherKindAtRoot returns true if any recognised project manifest
+// of a *different* kind than `skip` exists in dir. Used to invalidate
+// positive cache entries when a manifest of another kind appears at the
+// same root after cache prime (issue #1124).
+func hasOtherKindAtRoot(dir string, skip Kind) bool {
+	for _, k := range AllKinds {
+		if k == skip {
+			continue
+		}
+		marker := k.Marker()
+		if marker == "" {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // hasAnyManifest returns true if any recognised project manifest
