@@ -120,8 +120,8 @@ func serializeToTOONData(data []map[string]interface{}) (string, error) {
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "items[%d]{%s}:\n", len(data), strings.Join(keys, ","))
+	vals := make([]string, len(keys))
 	for _, item := range data {
-		vals := make([]string, len(keys))
 		for i, k := range keys {
 			v := fmt.Sprintf("%v", item[k])
 			v = strings.ReplaceAll(v, ",", "，") // protect column separator
