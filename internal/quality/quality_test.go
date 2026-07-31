@@ -775,3 +775,30 @@ func TestVerifierCacheHitIsFast(t *testing.T) {
 		}
 	}
 }
+
+// TestDroppedRingArgsTruncation verifies that droppedRing.Push truncates
+// Event.Args to droppedEventArgsCap bytes so that large tool payloads
+// cannot cause unbounded memory growth in the ring buffer.
+func TestDroppedRingArgsTruncation(t *testing.T) {
+	r := newDroppedRing(2)
+
+	large := make([]byte, 500)
+	for i := range large {
+		large[i] = 'x'
+	}
+
+	r.Push(Event{RequestID: "large-1", Path: "/a/b.go", ToolName: "write_file", Args: large})
+	r.Push(Event{RequestID: "small", Path: "/c/d.go", ToolName: "edit_file", Args: []byte("hi")})
+	r.Push(Event{RequestID: "large-2", Path: "/e/f.go", ToolName: "apply_patch", Args: large})
+
+	events := r.Events()
+	if len(events) != 2 {
+		t.Fatalf("got %d events, want 2", len(events))
+	}
+
+	for _, e := range events {
+		if len(e.Args) > droppedEventArgsCap {
+			t.Errorf("Args length = %d, want <= %d", len(e.Args), droppedEventArgsCap)
+		}
+	}
+}
