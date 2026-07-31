@@ -379,7 +379,7 @@ After the cascade detects an Ollama failure and falls back, `circuit.Cooldown`
 arms a short cooldown so subsequent requests skip local and go directly to
 fallback. Set `NEXUS_LOCAL_COOLDOWN=0` to disable (pre-issue-#80 behaviour).
 
-## Newer routing and RAG knobs
+## Additional routing and RAG knobs
 
 Key knobs not covered elsewhere (verify defaults in `.env.example`):
 - **`NEXUS_SLM_CONFIDENCE_THRESHOLD`** (default 0.3): SLM decisions below this bypass DSL/SLM and go to frontier.
@@ -388,7 +388,7 @@ Key knobs not covered elsewhere (verify defaults in `.env.example`):
 - **`NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT`** (default 5s): max waiter time for concurrent in-flight Embeds; 0 = wait indefinitely (issue #800).
 - **`NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD`** (default 3): consecutive embed failures before RAG circuit trips.
 - **`NEXUS_ARBITER_CACHE_MAX_ENTRIES`** (default 512): LRU cap for arbiter synthesis cache.
-- **`NEXUS_READINESS_MODE`** (`degraded`|`strict`): `/readyz` returns 503 in `strict` mode when Ollama is down.
+- **`NEXUS_READINESS_MODE`** (`degraded`|`strict`): `/readyz` returns 503 in `strict` mode when Ollama is degraded or down.
 
 ## `nexus check` exit codes
 
