@@ -259,4 +259,3 @@ func TestMustCompileDefaultPatternFatal(t *testing.T) {
 		})
 	}
 }
-
