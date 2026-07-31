@@ -928,6 +928,21 @@ func main() {
 				{Name: "nexus_judge_queue_depth", Value: float64(judgeEval.QueueDepth())},
 			}
 		}),
+		// Ollama health gauges (issue #1118). Expose the live health poller
+		// state so operators can set up Prometheus alerting rules.
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			if hpoller == nil {
+				return nil
+			}
+			var healthy float64
+			if hpoller.IsLocalHealthy() {
+				healthy = 1
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_ollama_healthy", Value: healthy},
+				{Name: "nexus_ollama_failure_count", Value: float64(hpoller.FailureCount())},
+			}
+		}),
 	)
 
 	// Middleware chain (issue #224). Initialize the middleware registry
