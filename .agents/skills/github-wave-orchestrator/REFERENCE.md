@@ -43,20 +43,12 @@ Steps:
    <one-paragraph description of the change>
    EOF
    )"
-<<<<<<< HEAD
-=======
     ```
-    The body must contain exactly one `Closes #N` line. Do NOT include other
-    `#NNNN` references in the body or title — see
-    `docs/orchestration/pr-body-conventions.md` for the rationale.
- 9. Verify closingReferences count is exactly 1:
->>>>>>> a4e71cb (fix: resolve #960 — wave orchestrator silent failure hardening)
-    ```
-    The body must list ALL issues that this PR resolves (issue #961). If the
-    commit also fixes a related issue, add a second `Closes #N` line.
+    The body must list ALL issues that this PR resolves. If the
+    commit also fixes a related issue, add another `Closes #N` line.
     Do NOT include issue numbers in the title — see
     `docs/orchestration/pr-body-conventions.md` for the rationale.
-  9. Verify closingReferences count matches the number of issues this PR resolves:
+ 9. Verify closingReferences count matches the number of issues this PR resolves:
     ```
     bash scripts/check_pr_closing_refs.sh <PR_NUMBER> <COUNT>
     ```

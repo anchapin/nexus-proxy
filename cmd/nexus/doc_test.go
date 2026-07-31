@@ -45,6 +45,44 @@ func readDoc(t *testing.T, relPath string) string {
 	return string(b)
 }
 
+// TestWaveOrchestratorReferenceImplementationTemplateIsConflictFree
+// guards the implementation sub-agent template against stray merge
+// markers and ensures the key PR-body verification step still appears
+// in the expected flow for orchestrator sub-agents consuming the
+// reference.
+func TestWaveOrchestratorReferenceImplementationTemplateIsConflictFree(t *testing.T) {
+	doc := readDoc(t, ".agents/skills/github-wave-orchestrator/REFERENCE.md")
+
+	start := strings.Index(doc, "## Implementation Sub-agent Template")
+	if start < 0 {
+		t.Fatal("REFERENCE.md has no `## Implementation Sub-agent Template` heading")
+	}
+	section := doc[start:]
+	if next := strings.Index(section, "\n## "); next >= 0 {
+		section = section[:next]
+	}
+
+	for _, marker := range []string{"<<<<<<<", "=======", ">>>>>>>"} {
+		if strings.Contains(section, marker) {
+			t.Errorf("implementation sub-agent template must not contain git conflict marker %q", marker)
+		}
+	}
+
+	if !strings.Contains(section, "bash scripts/check_pr_closing_refs.sh <PR_NUMBER> <COUNT>") {
+		t.Error("implementation sub-agent template must include the closingReferences verification step")
+	}
+
+	openPRIdx := strings.Index(section, "8. Open PR with an EXPLICIT body")
+	verifyIdx := strings.Index(section, "9. Verify closingReferences count matches the number of issues this PR resolves:")
+	finalOutputIdx := strings.Index(section, "10. **FINAL OUTPUT**")
+	if openPRIdx < 0 || verifyIdx < 0 || finalOutputIdx < 0 {
+		t.Fatal("implementation sub-agent template is missing the Open PR, closingReferences, or FINAL OUTPUT step")
+	}
+	if !(openPRIdx < verifyIdx && verifyIdx < finalOutputIdx) {
+		t.Errorf("implementation sub-agent template step ordering is invalid: open PR=%d verify=%d final output=%d", openPRIdx, verifyIdx, finalOutputIdx)
+	}
+}
+
 // TestReadmeDocumentsNexusCheckAsQuickstartVerificationStep enforces
 // the first acceptance criterion of issue #455: the Quickstart must
 // surface `nexus check` as the first verification step. We assert that
