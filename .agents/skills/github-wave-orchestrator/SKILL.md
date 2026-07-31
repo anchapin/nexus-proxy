@@ -63,6 +63,12 @@ gh issue list --state open --json number,title,body,labels \
   | node .agents/skills/github-wave-orchestrator/scripts/wave-planner.js
 ```
 
+The planner defaults to the `go-packages` collision strategy, which only
+marks two issues as conflicting when they touch the same Go package
+directory — enabling parallelism across independent `internal/*` packages.
+Override with `--collision-strategy {none|go-packages|legacy}` or audit
+file derivation with `--dry-run` (see REFERENCE.md › Collision Strategy).
+
 **Present the plan to the user before executing.** Wait for confirmation.
 
 ## Phase 3: Wave Execution (per wave)
