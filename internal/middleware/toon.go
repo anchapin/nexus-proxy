@@ -87,18 +87,50 @@ func findArrayEnd(content string, i int) int {
 	return -1
 }
 
-// isObjectArray validates that the trimmed content is a JSON array of objects.
-// It returns the array bytes on success (trimmed) or "" on failure.
-func isObjectArray(content []byte) bool {
+// parseObjectArray validates that the trimmed content is a JSON array of objects
+// with at least 2 elements. It returns the unmarshaled data on success or false.
+func parseObjectArray(content []byte) ([]map[string]interface{}, bool) {
 	content = bytes.TrimSpace(content)
 	if len(content) < 2 || content[0] != '[' || content[len(content)-1] != ']' {
-		return false
+		return nil, false
 	}
 	var data []map[string]interface{}
 	if err := json.Unmarshal(content, &data); err != nil {
-		return false
+		return nil, false
 	}
-	return len(data) >= 2
+	if len(data) < 2 {
+		return nil, false
+	}
+	return data, true
+}
+
+// serializeToTOONData converts already-unmarshaled JSON array of objects into the
+// canonical TOON shape. Exposed so scanUnfencedArrays can reuse the unmarshaled
+// data from parseObjectArray instead of double-parsing.
+func serializeToTOONData(data []map[string]interface{}) (string, error) {
+	if len(data) == 0 {
+		return "items[0]{}:\n", nil
+	}
+
+	keys := make([]string, 0, len(data[0]))
+	for k := range data[0] {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "items[%d]{%s}:\n", len(data), strings.Join(keys, ","))
+	for _, item := range data {
+		vals := make([]string, len(keys))
+		for i, k := range keys {
+			v := fmt.Sprintf("%v", item[k])
+			v = strings.ReplaceAll(v, ",", "，") // protect column separator
+			v = strings.ReplaceAll(v, "\n", " ")
+			vals[i] = v
+		}
+		sb.WriteString("  " + strings.Join(vals, ",") + "\n")
+	}
+	return sb.String(), nil
 }
 
 // scanUnfencedArrays scans content for unfenced JSON arrays of objects using
@@ -124,10 +156,11 @@ func scanUnfencedArrays(content string, didUnfenced *bool) string {
 			continue
 		}
 		arrayContent := bytes.TrimSpace([]byte(content[i:end]))
-		if !isObjectArray(arrayContent) {
+		data, ok := parseObjectArray(arrayContent)
+		if !ok {
 			continue
 		}
-		toon, err := SerializeToTOON(arrayContent)
+		toon, err := serializeToTOONData(data)
 		if err != nil {
 			continue
 		}
@@ -266,29 +299,7 @@ func SerializeToTOON(jsonBytes []byte) (string, error) {
 	if err := json.Unmarshal(jsonBytes, &data); err != nil {
 		return "", fmt.Errorf("toon: unmarshal: %w", err)
 	}
-	if len(data) == 0 {
-		return "items[0]{}:\n", nil
-	}
-
-	keys := make([]string, 0, len(data[0]))
-	for k := range data[0] {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "items[%d]{%s}:\n", len(data), strings.Join(keys, ","))
-	for _, item := range data {
-		vals := make([]string, len(keys))
-		for i, k := range keys {
-			v := fmt.Sprintf("%v", item[k])
-			v = strings.ReplaceAll(v, ",", "，") // protect column separator
-			v = strings.ReplaceAll(v, "\n", " ")
-			vals[i] = v
-		}
-		sb.WriteString("  " + strings.Join(vals, ",") + "\n")
-	}
-	return sb.String(), nil
+	return serializeToTOONData(data)
 }
 
 // AppendSystemNote adds a trailing notice to the first system message,
