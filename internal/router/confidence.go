@@ -94,9 +94,9 @@ type ConfidenceStore interface {
 // prompt matches several categories, so the list runs from most-
 // specific/most-complex (architecture, debugging) to least
 // (documentation) before falling through to "other". Keywords are
-// matched against the Unicode-lowercased prompt using word-boundary
-// matching (containsWord) so that e.g. "test" does not match inside
-// "contest", ensuring consistent routing with the DSL \b...\b patterns.
+// matched against the Unicode-lowercased prompt using \b...\b patterns
+// so that e.g. "test" does not match inside "contest", ensuring
+// consistent routing with the DSL word-boundary patterns.
 var categoryKeywords = []struct {
 	category string
 	keywords []string
