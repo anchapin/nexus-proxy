@@ -1,6 +1,7 @@
 # Nexus Proxy — Agent Guide
 
-Hardware-aware AI routing gateway in Go. Intercepts OpenAI-compatible
+Hardware-aware AI routing gateway in Go (module
+`github.com/anchapin/nexus-proxy`). Intercepts OpenAI-compatible
 `/v1/chat/completions`, optimizes prompts (TOON compression, RAG,
 meta-prompting), and routes to local Ollama or a frontier API based
 on complexity.
@@ -36,7 +37,7 @@ ignore `errcheck` on `fmt.Fprint*` writes intentionally — write errors cannot 
 after headers are committed (issue #276). `resp.Body.Close`, `rows.Close`, `stmt.Close`
 are also excluded in non-critical paths.
 
-**Subcommands** (`cmd/nexus/main.go` dispatches on `os.Args[1]`; no args =
+**Subcommands** (`cmd/nexus/dispatch.go` dispatches on `os.Args[1]`; no args =
 start the proxy):
 - `nexus check` (alias `nexus doctor`) — boot-time diagnostic suite. Exits
   **0 when every check passes** (warn/skip are fine), **1 when at least one
