@@ -333,7 +333,8 @@ For hot-reloadable knobs add the field to `ReloadHotReloadable()` in
 - `NEXUS_LOG_LEVEL`, `NEXUS_LOG_FORMAT`, `NEXUS_DEBUG`
 - `NEXUS_RATE_LIMIT_RPM`, `NEXUS_RATE_LIMIT_BURST`
 - `NEXUS_AUTH_RATE_LIMIT_RPM`, `NEXUS_AUTH_RATE_LIMIT_BURST`, `NEXUS_AUTH_RATE_LIMIT_WINDOW`
-- `NEXUS_SHUTDOWN_TIMEOUT`
+- `NEXUS_SHUTDOWN_TIMEOUT`, `NEXUS_SERVER_READ_TIMEOUT`
+- `NEXUS_BUDGET_ALERT_THRESHOLD`, `NEXUS_FUSION_AGREEMENT_THRESHOLD`, `NEXUS_TRACING_SAMPLE_RATE`
 - `NEXUS_TRUSTED_PROXIES` (issue #896 — re-parsed without restart)
 Everything else requires a full restart.
 The `env_example_audit_test.go` bidirectional test enforces that every
@@ -383,7 +384,7 @@ fallback. Set `NEXUS_LOCAL_COOLDOWN=0` to disable (pre-issue-#80 behaviour).
 
 Key knobs not covered elsewhere (verify defaults in `.env.example`):
 - **`NEXUS_SLM_CONFIDENCE_THRESHOLD`** (default 0.3): SLM decisions below this bypass DSL/SLM and go to frontier.
-- **`NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT`** (default 0 = unlimited): bounds O(n) cosine scan during semantic dedup in `getSemantic` (issue #933).
+- **`NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT`** (default 0): retained for backward compat; fix for issue #1038 makes semantic dedup always scan all entries and exit early only on perfect score=1.0, so this var has no effect.
 - **`NEXUS_RAG_EMBED_CACHE_*`** (size 256, TTL 24h): LRU cache for prompt embeddings — repeat prompts skip Ollama entirely.
 - **`NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT`** (default 5s): max waiter time for concurrent in-flight Embeds; 0 = wait indefinitely (issue #800).
 - **`NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD`** (default 3): consecutive embed failures before RAG circuit trips.
