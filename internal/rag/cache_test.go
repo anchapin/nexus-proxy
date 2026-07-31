@@ -526,6 +526,46 @@ func TestCachedEmbedderCacheStatsWithEmbedCache(t *testing.T) {
 	}
 }
 
+// TestCachedEmbedderEmbedBatchCacheMissReturnsCopy verifies that on a cache miss
+// within EmbedBatch, both the returned slice and the stored cache entry are
+// defensive copies so that mutating the returned vector does not corrupt the
+// cache entry (issue #1116).
+func TestCachedEmbedderEmbedBatchCacheMissReturnsCopy(t *testing.T) {
+	inner := newCountingEmbedder()
+	cached := NewCachedEmbedder(inner, 64)
+	ctx := context.Background()
+	texts := []string{"alpha", "beta", "gamma"}
+
+	// First EmbedBatch call: all cache misses — vectors stored in cache.
+	result1, err := cached.EmbedBatch(ctx, texts)
+	if err != nil {
+		t.Fatalf("first EmbedBatch: %v", err)
+	}
+	if inner.batchCallCount() != 1 {
+		t.Errorf("after first EmbedBatch: batch calls = %d, want 1", inner.batchCallCount())
+	}
+	if len(result1) != len(texts) {
+		t.Fatalf("result1 length = %d, want %d", len(result1), len(texts))
+	}
+
+	// Mutate all returned vectors.
+	for i := range result1 {
+		result1[i][0] = 9999
+	}
+
+	// Second EmbedBatch call: all cache hits — must return original values.
+	result2, err := cached.EmbedBatch(ctx, texts)
+	if err != nil {
+		t.Fatalf("second EmbedBatch: %v", err)
+	}
+	for i, text := range texts {
+		expected := float64(len(text))
+		if result2[i][0] != expected {
+			t.Errorf("after mutating result1, result2[%d][0] = %v, want original %v — cache entry was corrupted", i, result2[i][0], expected)
+		}
+	}
+}
+
 // TestCachedEmbedderSetTripCallback verifies that SetTripCallback is
 // forwarded to the inner embedder, enabling circuit-breaker trip
 // observability hooks to fire (issue #1041).
