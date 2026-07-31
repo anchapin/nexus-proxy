@@ -31,9 +31,13 @@ func newTestPersistentStore(t *testing.T) *PersistentStore {
 
 // logOutput redirects slog's default logger into w and returns the
 // previous logger so callers can restore it via slog.SetDefault.
+var logOutputMu sync.Mutex
+
 func logOutput(w io.Writer) *slog.Logger {
 	prev := slog.Default()
+	logOutputMu.Lock()
 	slog.SetDefault(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	logOutputMu.Unlock()
 	return prev
 }
 
