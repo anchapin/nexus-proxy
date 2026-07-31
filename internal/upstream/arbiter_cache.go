@@ -85,15 +85,19 @@ func NewArbiterCache(ttl time.Duration, maxEntries int) *ArbiterCache {
 // members write to a shared channel in non-deterministic goroutine-arrival
 // order.
 //
-// When r1Content == r2Content (perfect agreement), the sentinel prefix
-// avoids any key collision by ensuring distinct entries per content even
-// when both panels agree perfectly.
+// When r1Content == r2Content (perfect agreement), we compute sha256 once
+// and reuse it for the combined hash to avoid redundant computation.
+// Since h1 == h2 in this case, canonicalize produces [h1, h1] and the
+// final sha256(h1 + h1) differs from a plain sha256(content) or any
+// sentinel-based approach, ensuring distinct cache keys per content.
 func cacheKey(r1Content, r2Content string) [32]byte {
-	if r1Content == r2Content {
-		h := sha256.Sum256([]byte(r1Content + "|SAME|"))
-		return h
-	}
 	h1 := sha256.Sum256([]byte(r1Content))
+	if r1Content == r2Content {
+		var combined [64]byte
+		copy(combined[:32], h1[:])
+		copy(combined[32:], h1[:])
+		return sha256.Sum256(combined[:])
+	}
 	h2 := sha256.Sum256([]byte(r2Content))
 	combined := canonicalize(&h1, &h2)
 	return sha256.Sum256(combined[:])

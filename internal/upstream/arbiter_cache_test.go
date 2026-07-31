@@ -487,3 +487,18 @@ func TestArbiterCacheDeleteRemovesFromLRU(t *testing.T) {
 		t.Error("cache.Get miss for 'g', 'h', want hit")
 	}
 }
+
+func BenchmarkCacheKeySameContent(b *testing.B) {
+	content := "identical panel output that could appear in both local and frontier responses during fusion"
+	for i := 0; i < b.N; i++ {
+		cacheKey(content, content)
+	}
+}
+
+func BenchmarkCacheKeyDifferentContent(b *testing.B) {
+	content1 := "local model output with specific reasoning trace"
+	content2 := "frontier model output with different reasoning approach"
+	for i := 0; i < b.N; i++ {
+		cacheKey(content1, content2)
+	}
+}
