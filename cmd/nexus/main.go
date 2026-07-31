@@ -119,7 +119,6 @@ func main() {
 	}
 }
 
-
 // printVersion writes the build version to w. Extracted from main()
 // so it can be unit-tested without os.Exec.
 func printVersion(w io.Writer) {

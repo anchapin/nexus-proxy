@@ -1155,7 +1155,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 	parts.authLimiter = authLimiter
 
 	srv := &http.Server{
-		Addr:    cfg.Addr,
+		Addr: cfg.Addr,
 		Handler: handlers.SecurityHeaders(cfg.TLSEnabled)(handlers.Recover(func(path string) {
 			routeCounters.ObserveHandlerPanic(path)
 		})(rootHandler)),
@@ -1230,5 +1230,3 @@ func (p *serverParts) handleSIGHUP(cfg config.Config) config.Config {
 	}
 	return newCfg
 }
-
-
