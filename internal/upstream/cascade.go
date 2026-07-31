@@ -298,7 +298,10 @@ func (c *Cascade) fetchCascadeStep(ctx context.Context, client Client, step Casc
 	if maxBytes <= 0 {
 		maxBytes = defaultMaxResponseBytes
 	}
-	respBody, _ := ioutils.ReadAllLimited(resp.Body, maxBytes)
+	respBody, readErr := ioutils.ReadAllLimited(resp.Body, maxBytes)
+	if readErr != nil {
+		return AssistantMessage{}, "", newCascadeErr(true, "transport_error", "body read: %v", readErr)
+	}
 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return AssistantMessage{}, "", newCascadeErr(true, "rate_limited", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
