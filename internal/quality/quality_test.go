@@ -666,6 +666,86 @@ func TestVerifierCacheInvalidationOnManifestCreate(t *testing.T) {
 	}
 }
 
+// TestVerifierCacheInvalidationOnParentManifestCreate verifies that adding
+// a manifest of a different kind to the project root after cache prime
+// causes cache miss and correct verification (issue #1124).
+func TestVerifierCacheInvalidationOnParentManifestCreate(t *testing.T) {
+	// Make a TS repo: tsconfig.json at dir (root), source file in dir/src.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "tsconfig.json"), []byte("{\"compilerOptions\":{\"strict\":true}}\n"), 0o644); err != nil {
+		t.Fatalf("write tsconfig.json: %v", err)
+	}
+	withShellOverride(t, "exit 0")
+
+	obs := &recordingObserver{}
+	v := NewShellVerifier(Config{
+		Concurrency: 1,
+		QueueDepth:  4,
+		Timeout:     5 * time.Second,
+		Observer:    obs,
+	})
+
+	// First edit: tsconfig.json at dir, source file in dir/src.
+	// lookupProject starts at dir/src, walks up, finds tsconfig.json at dir,
+	// and caches h.root=dir, h.kind=KindTS.
+	file1 := filepath.Join(dir, "src", "lib.rs")
+	if err := os.MkdirAll(filepath.Dir(file1), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(file1, []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	v.Submit(Event{RequestID: "ts-initial", Path: file1})
+	got := waitForVerdicts(t, obs, 1, 2*time.Second)
+	if err := v.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d verdicts, want 1", len(got))
+	}
+	vv := got[0]
+	if vv.RepoRoot != dir {
+		t.Errorf("initial: RepoRoot = %q, want %q", vv.RepoRoot, dir)
+	}
+	if vv.Kind != KindTS {
+		t.Errorf("initial: Kind = %q, want %q", vv.Kind, KindTS)
+	}
+
+	// Now add Cargo.toml at dir (same root) — cache should detect this.
+	cargoPath := filepath.Join(dir, "Cargo.toml")
+	if err := os.WriteFile(cargoPath, []byte("[package]\nname=\"x\"\nversion=\"0.0.0\"\nedition=\"2021\"\n"), 0o644); err != nil {
+		t.Fatalf("write Cargo.toml: %v", err)
+	}
+
+	// Verify again — should detect the new manifest and return KindRust.
+	obs2 := &recordingObserver{}
+	v2 := NewShellVerifier(Config{
+		Concurrency: 1,
+		QueueDepth:  4,
+		Timeout:     5 * time.Second,
+		Observer:    obs2,
+	})
+	file2 := filepath.Join(dir, "src", "main.rs")
+	if err := os.WriteFile(file2, []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	v2.Submit(Event{RequestID: "rust-after-cargo", Path: file2})
+	got2 := waitForVerdicts(t, obs2, 1, 2*time.Second)
+	if err := v2.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if len(got2) != 1 {
+		t.Fatalf("got %d verdicts after parent manifest create, want 1", len(got2))
+	}
+	vv2 := got2[0]
+	if vv2.RepoRoot != dir {
+		t.Errorf("after cargo: RepoRoot = %q, want %q", vv2.RepoRoot, dir)
+	}
+	if vv2.Kind != KindRust {
+		t.Errorf("after cargo: Kind = %q, want %q", vv2.Kind, KindRust)
+	}
+}
+
 // TestVerifierCacheInvalidationOnManifestDelete verifies that deleting
 // a manifest file after cache prime causes cache miss and correct
 // verification (issue #1067).
