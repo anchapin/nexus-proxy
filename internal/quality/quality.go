@@ -50,6 +50,11 @@ const (
 	KindTS      Kind = "tsconfig.json"
 )
 
+// droppedEventArgsCap bounds the size of Args stored in the dropped
+// ring so that large tool payloads cannot cause unbounded memory growth.
+// EncodeEvent also uses this limit when truncating args for log lines.
+const droppedEventArgsCap = 200
+
 // AllKinds is the ordered list of supported project markers. The
 // verifier recognises the same set; tests and dashboards use this list
 // to enumerate valid options.
@@ -198,6 +203,9 @@ func newDroppedRing(size int) *droppedRing {
 // Push records one dropped event into the ring buffer.
 func (r *droppedRing) Push(e Event) {
 	pos := r.idx.Add(1) - 1
+	if len(e.Args) > droppedEventArgsCap {
+		e.Args = e.Args[:droppedEventArgsCap]
+	}
 	r.events[pos%int64(r.size)] = e
 }
 
@@ -645,12 +653,10 @@ func EncodeEvent(e Event) string {
 	b.WriteString(e.ToolName)
 	if len(e.Args) > 0 {
 		b.WriteString(" args=")
-		// Truncate to keep log lines readable.
-		const cap = 200
-		if len(e.Args) <= cap {
+		if len(e.Args) <= droppedEventArgsCap {
 			b.Write(e.Args)
 		} else {
-			b.Write(e.Args[:cap])
+			b.Write(e.Args[:droppedEventArgsCap])
 			b.WriteString("...[truncated]")
 		}
 	}
