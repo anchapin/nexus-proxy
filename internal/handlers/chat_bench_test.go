@@ -15,6 +15,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/testutil"
 )
 
 // silenceLogs swaps the default slog handler for one that discards all
@@ -22,9 +23,7 @@ import (
 // is restored on Cleanup.
 func silenceLogs(b *testing.B) {
 	b.Helper()
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})))
-	b.Cleanup(func() { slog.SetDefault(prev) })
+	testutil.SetDefault(b, slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})))
 }
 
 // benchEmbedder is a zero-cost embedder used in benchmarks so the RAG

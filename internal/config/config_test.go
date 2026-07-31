@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/testutil"
 )
 
 func TestLoadDefaults(t *testing.T) {
@@ -1173,9 +1175,7 @@ func TestReloadHotReloadable_TrustedProxiesInvalid(t *testing.T) {
 func captureSlog(t *testing.T) func() ([]map[string]any, string) {
 	t.Helper()
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	testutil.SetDefault(t, slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	return func() ([]map[string]any, string) {
 		raw := buf.String()
 		lines := strings.Split(strings.TrimSpace(raw), "\n")

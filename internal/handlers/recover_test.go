@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/anchapin/nexus-proxy/internal/observability"
+	"github.com/anchapin/nexus-proxy/internal/testutil"
 )
 
 // panicHandler returns an http.HandlerFunc that panics with v after
@@ -118,9 +119,7 @@ func TestRecover_NoPanicPassThrough(t *testing.T) {
 // request_id, and the path — the acceptance criterion from the issue.
 func TestRecover_LogsStructuredPanic(t *testing.T) {
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	testutil.SetDefault(t, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	r.Header.Set("X-Request-Id", "req-test-123")
@@ -354,9 +353,7 @@ func TestRedactPanicValue_PartialSecretRedaction(t *testing.T) {
 
 func TestRecover_LogsRedactedPanicWithWarning(t *testing.T) {
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	testutil.SetDefault(t, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	h := Recover(nil)(http.HandlerFunc(panicHandler(t, false, "Bearer sk-12345abcdef")))
@@ -377,9 +374,7 @@ func TestRecover_LogsRedactedPanicWithWarning(t *testing.T) {
 
 func TestRecover_LogsNonRedactedPanicWithError(t *testing.T) {
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	testutil.SetDefault(t, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	h := Recover(nil)(http.HandlerFunc(panicHandler(t, false, "something went wrong")))
@@ -543,9 +538,7 @@ func (f *failingFlusherResponseWriter) SetFlusher(flusher http.Flusher) {
 // incremented. This is the acceptance criterion from issue #1115.
 func TestRecover_SSEWriteFailureLogsAndIncrementsCounter(t *testing.T) {
 	var logBuf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	testutil.SetDefault(t, slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	var counter uint64
 	observability.SetPanicSSEWriteFailuresCounter(&counter)

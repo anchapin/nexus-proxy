@@ -14,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/testutil"
 )
 
 // newTestPersistentStore opens an in-memory PersistentStore with a
@@ -29,16 +31,11 @@ func newTestPersistentStore(t *testing.T) *PersistentStore {
 	return ps
 }
 
-// logOutput redirects slog's default logger into w and returns the
-// previous logger so callers can restore it via slog.SetDefault.
-var logOutputMu sync.Mutex
-
-func logOutput(w io.Writer) *slog.Logger {
-	prev := slog.Default()
-	logOutputMu.Lock()
-	slog.SetDefault(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	logOutputMu.Unlock()
-	return prev
+// logOutput redirects slog's default logger into w via the shared,
+// mutex-serialized testutil.SetDefault helper (issue #1138) so that
+// parallel tests do not race on slog.SetDefault's global mutation.
+func logOutput(tb testing.TB, w io.Writer) {
+	testutil.SetDefault(tb, slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug})))
 }
 
 func TestOpenPersistentStoreRejectsEmptyPath(t *testing.T) {
@@ -883,8 +880,7 @@ func (m *modelErrEmbedder) Model() string                             { return m
 func TestOpenPersistentStore_ProbeFailureLogged(t *testing.T) {
 	// Capture slog output so we can assert the WARN was emitted.
 	var buf bytes.Buffer
-	prev := logOutput(&buf)
-	defer slog.SetDefault(prev)
+	logOutput(t, &buf)
 
 	ps, err := OpenPersistentStore(":memory:",
 		&modelErrEmbedder{model: "unreachable-model", err: errors.New("connection refused")},
@@ -1168,8 +1164,7 @@ func TestPersistentStoreIndexDir_BatchUpsertFailureLogsWarning(t *testing.T) {
 
 	// Capture log output.
 	var buf bytes.Buffer
-	prev := logOutput(&buf)
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	logOutput(t, &buf)
 
 	// Second IndexDir: EmbedBatch succeeds (embedder doesn't need DB),
 	// but Upsert fails because DB is closed.
