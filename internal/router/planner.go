@@ -71,6 +71,13 @@ const (
 	// dispatch-time SpendGuard.Check remains as a final safety net
 	// (race guard) since budget can change between routing and dispatch.
 	SourceBudgetDownTier DecisionSource = "budget-down-tier"
+
+	// SourceDSLPromoted (issue #1165) means the decision came from an
+	// auto-promoted DSL fast-pass rule — an n-gram pattern that the
+	// PatternPromoter extracted from historical SLM decisions and
+	// promoted into the DSL fast-pass. Checked before manual DSL patterns
+	// so auto-discovered rules take precedence.
+	SourceDSLPromoted DecisionSource = "dsl-promoted"
 )
 
 // TraceReason returns the stable machine-readable trace label for a decision source:
@@ -94,6 +101,8 @@ func (s DecisionSource) TraceReason() string {
 		return "slm-low-confidence"
 	case SourceBudgetDownTier:
 		return "budget-down-tier"
+	case SourceDSLPromoted:
+		return "dsl-promoted"
 	default:
 		return "slm"
 	}
@@ -264,6 +273,14 @@ type Planner struct {
 	// heuristic (1 token ≈ 1 microcent, i.e. cost = tokens / 1e6) so
 	// a misconfigured cost still produces a conservative estimate.
 	FrontierCostPer1K float64
+
+	// Promoter is the optional auto-promoted DSL pattern matcher
+	// (issue #1165). When non-nil, the planner checks promoted patterns
+	// before the manual DSL fast-pass. A hit returns the promoted route
+	// with Source = SourceDSLPromoted and increments the
+	// nexus_route_dsl_promoted_total counter. When nil the planner
+	// behaves identically to the pre-issue-1165 path.
+	Promoter *PatternPromoter
 }
 
 // PlanRequest carries the per-request inputs the planner needs. The
@@ -348,7 +365,29 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 		}
 	}
 
-	// Stage 2: DSL fast-pass. Use default patterns when config fields are nil.
+	// Stage 2a: Auto-promoted DSL patterns (issue #1165).
+	//
+	// Promoted patterns are checked BEFORE the manual DSL fast-pass so
+	// auto-discovered rules take precedence. These are n-gram patterns
+	// that the PatternPromoter extracted from historical SLM decisions
+	// and promoted into the DSL fast-pass. A hit eliminates the SLM
+	// round-trip for predictable routing patterns.
+	if p.Promoter != nil {
+		if route, pattern, hit := p.Promoter.Match(req.Prompt); hit {
+			p.Promoter.IncPromotedTotal()
+			return Decision{
+				Route:           route,
+				Source:          SourceDSLPromoted,
+				Reason:          "promoted:" + pattern,
+				Confidence:      NeutralConfidence,
+				EstimatedTokens: estimatedTokens,
+				BudgetSource:    req.GuardrailSource,
+				BudgetTokens:    req.GuardrailBudget,
+			}
+		}
+	}
+
+	// Stage 2b: DSL fast-pass. Use default patterns when config fields are nil.
 	//
 	// DSL PATTERN PRECEDENCE (issue #876): when a prompt matches multiple
 	// pattern groups, the FIRST match wins. The fixed check order is:

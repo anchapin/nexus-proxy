@@ -193,6 +193,15 @@ type Config struct {
 	DSLLocalPatterns      []*regexp.Regexp // NEXUS_DSL_LOCAL_PATTERNS
 	DSLUnicodePatterns    []*regexp.Regexp // NEXUS_DSL_UNICODE_PATTERNS (issue #422)
 
+	// DSL auto-promotion (issue #1165). The PatternPromoter periodically
+	// scans historical SLM decisions and promotes frequently-routed n-gram
+	// patterns into the DSL fast-pass, eliminating SLM latency for
+	// predictable routing patterns. Setting all three to zero disables
+	// auto-promotion (backward compatible).
+	DSLPromotionMinSamples int           // NEXUS_DSL_PROMOTION_MIN_SAMPLES (default 20)
+	DSLPromotionConfidence float64       // NEXUS_DSL_PROMOTION_CONFIDENCE (default 0.90)
+	DSLPromotionInterval   time.Duration // NEXUS_DSL_PROMOTION_INTERVAL (default 1h)
+
 	// Frontier provider selector (issue #45). When more than one
 	// frontier provider is configured (frontier + z.ai), the chat
 	// handler consults a router.ProviderSelector to pick the cheaper
@@ -1160,6 +1169,24 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.DSLUnicodePatterns = dslUnicode
+
+	// DSL auto-promotion (issue #1165). Setting all three to zero disables
+	// auto-promotion entirely (backward compatible).
+	dslPromoMinSamples, err := getEnvInt("NEXUS_DSL_PROMOTION_MIN_SAMPLES", 20)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.DSLPromotionMinSamples = dslPromoMinSamples
+	dslPromoConf, err := getEnvFloat("NEXUS_DSL_PROMOTION_CONFIDENCE", 0.90)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.DSLPromotionConfidence = dslPromoConf
+	dslPromotionInterval, err := getEnvDuration("NEXUS_DSL_PROMOTION_INTERVAL", time.Hour)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.DSLPromotionInterval = dslPromotionInterval
 
 	// Frontier provider selector (issue #45). Look-back window,
 	// observation floor, and cache cadence. Defaults match the

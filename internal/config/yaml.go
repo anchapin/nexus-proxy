@@ -130,6 +130,11 @@ type YAMLConfig struct {
 	CacheWarmOnBoot           bool    `yaml:"cache_warm_on_boot"`
 	CacheWarmLimit            int     `yaml:"cache_warm_limit"`
 
+	// DSL auto-promotion (issue #1165)
+	DSLPromotionMinSamples int     `yaml:"dsl_promotion_min_samples"`
+	DSLPromotionConfidence float64 `yaml:"dsl_promotion_confidence"`
+	DSLPromotionInterval   string  `yaml:"dsl_promotion_interval"`
+
 	// Health
 	HealthPollInterval     string `yaml:"health_poll_interval"`
 	HealthBreakerThreshold int    `yaml:"health_breaker_threshold"`
@@ -725,6 +730,28 @@ func LoadYAML(path string) (Config, error) {
 			n = 0
 		}
 		cfg.SLMCacheSemanticScanLimit = n
+	}
+	// DSL auto-promotion env overrides (issue #1165)
+	if v := os.Getenv("NEXUS_DSL_PROMOTION_MIN_SAMPLES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_DSL_PROMOTION_MIN_SAMPLES: %w", err)
+		}
+		cfg.DSLPromotionMinSamples = n
+	}
+	if v := os.Getenv("NEXUS_DSL_PROMOTION_CONFIDENCE"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_DSL_PROMOTION_CONFIDENCE: %w", err)
+		}
+		cfg.DSLPromotionConfidence = clampFloat(f, 0, 1)
+	}
+	if v := os.Getenv("NEXUS_DSL_PROMOTION_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_DSL_PROMOTION_INTERVAL: %w", err)
+		}
+		cfg.DSLPromotionInterval = d
 	}
 	if v := os.Getenv("NEXUS_FUSION_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -1444,6 +1471,10 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		ArbiterCacheMaxEntries:    yc.intDefault(yc.ArbiterCacheMaxEntries, 512),
 		CacheWarmOnBoot:           yc.CacheWarmOnBoot, // default false (opt-in, issue #1176)
 		CacheWarmLimit:            yc.intDefault(yc.CacheWarmLimit, 256),
+
+		DSLPromotionMinSamples: yc.intDefault(yc.DSLPromotionMinSamples, 20),
+		DSLPromotionConfidence: clampFloat(yc.floatDefault(yc.DSLPromotionConfidence, 0.90), 0, 1),
+		DSLPromotionInterval:   yc.durationDefault(yc.DSLPromotionInterval, time.Hour),
 
 		JudgeURL:          yc.stringDefault(yc.JudgeURL, "https://api.z.ai/v1/chat/completions"),
 		JudgeModel:        yc.stringDefault(yc.JudgeModel, ""), // Falls back to FrontierModel later
