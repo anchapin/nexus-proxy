@@ -323,6 +323,17 @@ type Collector struct {
 	ragJudgeScoreSumBitsFalse atomic.Uint64
 	ragJudgeScoreCountTrue    atomic.Uint64
 	ragJudgeScoreCountFalse   atomic.Uint64
+
+	// --- Frontier provider health metrics (issue #1158) -----------------
+	//
+	// frontierProbeTotal records the cumulative probe count per
+	// (provider, result) pair. Keyed by "provider|result" so the
+	// Prometheus renderer can emit a labelled counter family.
+	// frontierCircuitOpenTotal records the cumulative count of
+	// circuit-open transitions per provider.
+	frontierHealthMu         sync.RWMutex
+	frontierProbeTotal       map[string]*atomic.Uint64 // keyed by "provider|result"
+	frontierCircuitOpenTotal map[string]*atomic.Uint64 // keyed by provider
 }
 
 // circuitBreakerState holds the atomic state for one named circuit.
@@ -1007,6 +1018,70 @@ func (c *Collector) RAGJudgeScoreCount(injected bool) uint64 {
 		return c.ragJudgeScoreCountTrue.Load()
 	}
 	return c.ragJudgeScoreCountFalse.Load()
+}
+
+// --- Frontier provider health metrics (issue #1158) --------------------
+
+// IncFrontierProbe increments the probe counter for the given
+// (provider, result) pair. result is "success" or "failure". Called
+// from the frontier health poller after every probe via the probe
+// callback wired in server.go.
+func (c *Collector) IncFrontierProbe(provider, result string) {
+	if provider == "" || result == "" {
+		return
+	}
+	key := provider + "|" + result
+	c.frontierHealthMu.Lock()
+	defer c.frontierHealthMu.Unlock()
+	if c.frontierProbeTotal == nil {
+		c.frontierProbeTotal = make(map[string]*atomic.Uint64)
+	}
+	if c.frontierProbeTotal[key] == nil {
+		c.frontierProbeTotal[key] = new(atomic.Uint64)
+	}
+	c.frontierProbeTotal[key].Add(1)
+}
+
+// IncFrontierCircuitOpen increments the circuit-open counter for the
+// given provider. Called from the frontier health poller when a
+// provider's circuit transitions from closed to open.
+func (c *Collector) IncFrontierCircuitOpen(provider string) {
+	if provider == "" {
+		return
+	}
+	c.frontierHealthMu.Lock()
+	defer c.frontierHealthMu.Unlock()
+	if c.frontierCircuitOpenTotal == nil {
+		c.frontierCircuitOpenTotal = make(map[string]*atomic.Uint64)
+	}
+	if c.frontierCircuitOpenTotal[provider] == nil {
+		c.frontierCircuitOpenTotal[provider] = new(atomic.Uint64)
+	}
+	c.frontierCircuitOpenTotal[provider].Add(1)
+}
+
+// FrontierProbeTotals returns the cumulative probe counts keyed by
+// "provider|result". Used by the Prometheus renderer (issue #1158).
+func (c *Collector) FrontierProbeTotals() map[string]uint64 {
+	c.frontierHealthMu.RLock()
+	defer c.frontierHealthMu.RUnlock()
+	out := make(map[string]uint64, len(c.frontierProbeTotal))
+	for k, v := range c.frontierProbeTotal {
+		out[k] = v.Load()
+	}
+	return out
+}
+
+// FrontierCircuitOpenTotals returns the cumulative circuit-open counts
+// keyed by provider. Used by the Prometheus renderer (issue #1158).
+func (c *Collector) FrontierCircuitOpenTotals() map[string]uint64 {
+	c.frontierHealthMu.RLock()
+	defer c.frontierHealthMu.RUnlock()
+	out := make(map[string]uint64, len(c.frontierCircuitOpenTotal))
+	for k, v := range c.frontierCircuitOpenTotal {
+		out[k] = v.Load()
+	}
+	return out
 }
 
 // --- Pipeline stage latency breakdown (issue #300) -------------------

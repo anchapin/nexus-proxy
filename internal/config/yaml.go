@@ -142,6 +142,11 @@ type YAMLConfig struct {
 	HealthBreakerThreshold int    `yaml:"health_breaker_threshold"`
 	HealthProbeTimeout     string `yaml:"health_probe_timeout"`
 
+	// Frontier health poller (issue #1158).
+	FrontierHealthPollInterval     string `yaml:"frontier_health_poll_interval"`
+	FrontierHealthBreakerThreshold int    `yaml:"frontier_health_breaker_threshold"`
+	FrontierHealthTimeout          string `yaml:"frontier_health_timeout"`
+
 	// Probe
 	ProbeInterval         string `yaml:"probe_interval"`
 	ProbeTimeout          string `yaml:"probe_timeout"`
@@ -901,6 +906,29 @@ func LoadYAML(path string) (Config, error) {
 		cfg.HealthProbeTimeout = d
 	}
 
+	// Frontier health poller env overrides (issue #1158).
+	if v := os.Getenv("NEXUS_FRONTIER_HEALTH_POLL_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_FRONTIER_HEALTH_POLL_INTERVAL: %w", err)
+		}
+		cfg.FrontierHealthPollInterval = d
+	}
+	if v := os.Getenv("NEXUS_FRONTIER_HEALTH_BREAKER_THRESHOLD"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_FRONTIER_HEALTH_BREAKER_THRESHOLD: %w", err)
+		}
+		cfg.FrontierHealthBreakerThreshold = n
+	}
+	if v := os.Getenv("NEXUS_FRONTIER_HEALTH_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_FRONTIER_HEALTH_TIMEOUT: %w", err)
+		}
+		cfg.FrontierHealthTimeout = d
+	}
+
 	// Probe
 	if v := os.Getenv("NEXUS_PROBE_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -1523,6 +1551,10 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		HealthPollInterval:     yc.durationDefault(yc.HealthPollInterval, 30*time.Second),
 		HealthBreakerThreshold: yc.intDefault(yc.HealthBreakerThreshold, 3),
 		HealthProbeTimeout:     yc.durationDefault(yc.HealthProbeTimeout, 5*time.Second),
+
+		FrontierHealthPollInterval:     yc.durationDefault(yc.FrontierHealthPollInterval, 60*time.Second),
+		FrontierHealthBreakerThreshold: yc.intDefault(yc.FrontierHealthBreakerThreshold, 3),
+		FrontierHealthTimeout:          yc.durationDefault(yc.FrontierHealthTimeout, 5*time.Second),
 
 		ProbePollInterval:     yc.durationDefault(yc.ProbeInterval, 60*time.Second),
 		ProbeTimeout:          yc.durationDefault(yc.ProbeTimeout, 5*time.Second),

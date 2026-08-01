@@ -6,6 +6,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/providers"
 )
 
 // ProviderStats is the per-provider snapshot the selector scores. It is
@@ -129,6 +131,14 @@ type ProviderSelector struct {
 	// [0,1] at boot; negative values here are treated as 0 so a
 	// misconfigured selector never inverts the ranking.
 	TailWeight float64
+
+	// Health (issue #1158) is the optional frontier provider health
+	// checker. When non-nil, SelectFrontier excludes any provider
+	// whose circuit is open before scoring — traffic fails over to a
+	// healthy provider within one poll interval instead of waiting
+	// for the error-rate refresh. A nil HealthChecker preserves the
+	// legacy error-rate-only exclusion.
+	Health providers.HealthChecker
 }
 
 // NewProviderSelector constructs a selector with default thresholds.
@@ -191,6 +201,13 @@ func (s *ProviderSelector) SelectFrontier(stats []ProviderStats) (string, Provid
 			// observations came from a cache hit). Skip —
 			// the cost-adjusted score would be near
 			// infinite and could mask real differences.
+			continue
+		}
+		// Issue #1158: skip providers whose health-check circuit
+		// is open. This is checked after the stats filters so a
+		// nil HealthChecker (the common case when frontier health
+		// probing is disabled) adds zero overhead.
+		if s.Health != nil && !s.Health.IsHealthy(p.Name) {
 			continue
 		}
 		filtered = append(filtered, p)

@@ -289,6 +289,15 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total LocalConfidence errors in the planner where the SQLite confidence store returned an error (DB locked, query failed, etc.).",
 		typ:  "counter",
 	},
+	// Frontier provider health counters (issue #1158).
+	"nexus_frontier_probe_total": {
+		help: "Total frontier provider health probes by provider and result (success/failure) (issue #1158).",
+		typ:  "counter",
+	},
+	"nexus_frontier_circuit_open_total": {
+		help: "Total frontier provider circuit-open transitions (issue #1158).",
+		typ:  "counter",
+	},
 }
 
 // RenderPrometheus writes the full /metrics body in Prometheus
@@ -513,6 +522,47 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 			{value: "true", n: c.RAGJudgeScoreCount(true)},
 			{value: "false", n: c.RAGJudgeScoreCount(false)},
 		})
+
+	// Frontier provider health probe counter (issue #1158).
+	if probes := c.FrontierProbeTotals(); len(probes) > 0 {
+		type pr struct {
+			provider string
+			result   string
+			n        uint64
+		}
+		var samples []pr
+		for key, count := range probes {
+			parts := strings.SplitN(key, "|", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			samples = append(samples, pr{provider: parts[0], result: parts[1], n: count})
+		}
+		sort.Slice(samples, func(i, j int) bool {
+			if samples[i].provider != samples[j].provider {
+				return samples[i].provider < samples[j].provider
+			}
+			return samples[i].result < samples[j].result
+		})
+		writeMeta(w, "nexus_frontier_probe_total",
+			"Total frontier provider health probes by provider and result (success/failure) (issue #1158).", "counter")
+		for _, s := range samples {
+			//nolint:errcheck // cannot check error after headers committed
+			fmt.Fprintf(w, "nexus_frontier_probe_total{provider=%q,result=%q} %d\n",
+				s.provider, s.result, s.n)
+		}
+	}
+
+	// Frontier provider circuit-open counter (issue #1158).
+	if opens := c.FrontierCircuitOpenTotals(); len(opens) > 0 {
+		samples := make([]labelSample, 0, len(opens))
+		for provider, count := range opens {
+			samples = append(samples, labelSample{value: provider, n: count})
+		}
+		writeCounterLabeled(w, "nexus_frontier_circuit_open_total",
+			"Total frontier provider circuit-open transitions (issue #1158).",
+			"provider", samples)
+	}
 
 	// --- Histograms -----------------------------------------------------
 

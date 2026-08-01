@@ -40,6 +40,8 @@ snake_case naming.
 | `nexus_rag_judge_score_sum` | counter | `injected` | 2 (`true`, `false`) | `prometheus.go` (issue #1167) |
 | `nexus_rag_judge_score_count` | counter | `injected` | 2 (`true`, `false`) | `prometheus.go` (issue #1167) |
 | `nexus_fusion_client_abort_total` | counter | *(none)* | 1 | `prometheus.go` (issue #1046) |
+| `nexus_frontier_probe_total` | counter | `provider`, `result` | 2 × N providers | `collector.go` (issue #1158) |
+| `nexus_frontier_circuit_open_total` | counter | `provider` | N providers | `collector.go` (issue #1158) |
 | `nexus_rate_limit_bucket_utilization` | histogram | `bucket_id` | dynamic (≤ concurrent client IPs) | `prometheus.go` (issue #746) |
 | `nexus_build_info` | gauge | `version`, `commit`, `go_version` | 1 | `prometheus.go` (issue #529) |
 

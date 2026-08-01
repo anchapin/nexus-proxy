@@ -292,6 +292,54 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 
 	circuitCollector := observability.NewCollector()
 
+	// Frontier provider health poller (issue #1158). Builds a probe
+	// target per configured frontier provider and starts a background
+	// poller that probes GET <BaseURL>/models. The per-provider circuit
+	// state is surfaced in /healthz and /metrics; the router selector
+	// consults it to skip providers whose circuit is open.
+	var frontierHealthPoller *health.FrontierHealth
+	if cfg.FrontierHealthPollInterval > 0 && cfg.FrontierEnabled() {
+		var targets []health.FrontierProbeTarget
+		for _, fp := range cfg.FrontierProviders() {
+			targets = append(targets, health.FrontierProbeTarget{
+				Name:    fp.Name,
+				BaseURL: fp.URL,
+				APIKey:  fp.APIKey,
+			})
+		}
+		if len(targets) > 0 {
+			frontierHealthPoller = health.NewFrontierHealth(
+				targets,
+				cfg.FrontierHealthPollInterval,
+				cfg.FrontierHealthBreakerThreshold,
+				cfg.FrontierHealthTimeout,
+				httpClient,
+			)
+			frontierHealthPoller.SetProbeCallback(func(provider, result string) {
+				circuitCollector.IncFrontierProbe(provider, result)
+			})
+			frontierHealthPoller.SetTripCallback(func(provider string) {
+				circuitCollector.IncFrontierCircuitOpen(provider)
+			})
+			go frontierHealthPoller.Run(bgCtx)
+			addCleanup(func() {
+				if err := frontierHealthPoller.Close(); err != nil {
+					slog.Warn("frontier health poller close", slog.Any("err", err))
+				}
+			})
+			slog.Info("frontier health poller enabled",
+				slog.Int("providers", len(targets)),
+				slog.Duration("poll_interval", cfg.FrontierHealthPollInterval),
+				slog.Int("breaker_threshold", cfg.FrontierHealthBreakerThreshold),
+				slog.Duration("probe_timeout", cfg.FrontierHealthTimeout),
+			)
+		}
+	} else {
+		if cfg.FrontierHealthPollInterval <= 0 {
+			slog.Info("frontier health poller disabled (NEXUS_FRONTIER_HEALTH_POLL_INTERVAL=0)")
+		}
+	}
+
 	stageCollector := observability.NewCollector()
 	if cfg.JudgeEnabled && cfg.JudgeAPIKey != "" {
 		evalCfg := judge.Config{
@@ -1012,7 +1060,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 	}
 	mux.Handle("/v1/chat/completions", chatHandler)
 
-	mux.HandleFunc("/healthz", healthzHandler(hpoller, probeMgr, cfg))
+	mux.HandleFunc("/healthz", healthzHandler(hpoller, frontierHealthPoller, probeMgr, cfg))
 	slog.Info("healthz endpoint serves dynamic budget JSON",
 		slog.String("ollama_url", cfg.OllamaURL),
 	)
@@ -1173,6 +1221,20 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 			return arbiterCache.TTLSeconds()
 		},
 		Version: func() string { return version },
+		FrontierHealth: func() []handlers.FrontierProviderHealth {
+			if frontierHealthPoller == nil {
+				return nil
+			}
+			var out []handlers.FrontierProviderHealth
+			for _, st := range frontierHealthPoller.States() {
+				out = append(out, handlers.FrontierProviderHealth{
+					Name:         st.Name,
+					Healthy:      st.Healthy,
+					FailureCount: st.FailureCount,
+				})
+			}
+			return out
+		},
 	}))
 	slog.Info("status endpoint serves async subsystem diagnostics")
 

@@ -742,3 +742,80 @@ func TestProviderStatsCache_Run_RefreshErrorKeepsLoopAlive(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// stubHealthChecker is a test double for providers.HealthChecker.
+type stubHealthChecker struct {
+	unhealthy map[string]bool
+}
+
+func (s stubHealthChecker) IsHealthy(name string) bool {
+	return !s.unhealthy[name]
+}
+
+func (s stubHealthChecker) UnhealthyProviders() []string {
+	var out []string
+	for name := range s.unhealthy {
+		out = append(out, name)
+	}
+	return out
+}
+
+// TestSelectFrontier_SkipsUnhealthy (issue #1158) verifies that the
+// selector excludes providers whose health circuit is open.
+func TestSelectFrontier_SkipsUnhealthy(t *testing.T) {
+	t.Parallel()
+	sel := &ProviderSelector{
+		MinSamples:   1,
+		MaxErrorRate: 1.0,
+		Health: stubHealthChecker{
+			unhealthy: map[string]bool{"cheap": true},
+		},
+	}
+	stats := []ProviderStats{
+		{Name: "cheap", P50LatencyMs: 100, AvgCostUSD: 0.0001, SampleCount: 10},
+		{Name: "expensive", P50LatencyMs: 500, AvgCostUSD: 0.01, SampleCount: 10},
+	}
+	name, _ := sel.SelectFrontier(stats)
+	if name != "expensive" {
+		t.Fatalf("expected 'expensive' (cheap is unhealthy), got %q", name)
+	}
+}
+
+// TestSelectFrontier_AllUnhealthy (issue #1158) verifies that when all
+// providers are unhealthy the selector returns "" so the caller falls
+// back to the first configured provider.
+func TestSelectFrontier_AllUnhealthy(t *testing.T) {
+	t.Parallel()
+	sel := &ProviderSelector{
+		MinSamples:   1,
+		MaxErrorRate: 1.0,
+		Health: stubHealthChecker{
+			unhealthy: map[string]bool{"a": true, "b": true},
+		},
+	}
+	stats := []ProviderStats{
+		{Name: "a", P50LatencyMs: 100, AvgCostUSD: 0.001, SampleCount: 10},
+		{Name: "b", P50LatencyMs: 200, AvgCostUSD: 0.002, SampleCount: 10},
+	}
+	name, _ := sel.SelectFrontier(stats)
+	if name != "" {
+		t.Fatalf("expected empty when all providers are unhealthy, got %q", name)
+	}
+}
+
+// TestSelectFrontier_NilHealthChecker (issue #1158) verifies that a nil
+// HealthChecker preserves the legacy error-rate-only exclusion.
+func TestSelectFrontier_NilHealthChecker(t *testing.T) {
+	t.Parallel()
+	sel := &ProviderSelector{
+		MinSamples:   1,
+		MaxErrorRate: 1.0,
+	}
+	stats := []ProviderStats{
+		{Name: "a", P50LatencyMs: 100, AvgCostUSD: 0.001, SampleCount: 10},
+	}
+	name, _ := sel.SelectFrontier(stats)
+	if name != "a" {
+		t.Fatalf("expected 'a', got %q", name)
+	}
+}

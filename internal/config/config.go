@@ -314,6 +314,18 @@ type Config struct {
 	HealthBreakerThreshold int           // consecutive failures before trip (3)
 	HealthProbeTimeout     time.Duration // per-probe HTTP timeout (5s)
 
+	// Frontier health poller (issue #1158). Mirrors the Ollama health
+	// poller but probes each configured frontier API provider via
+	// GET <BaseURL>/models. The ProviderSelector consults the per-
+	// provider circuit state to skip providers whose circuit is open
+	// so traffic fails over within one poll interval instead of
+	// waiting for the 60s error-rate refresh. Set
+	// NEXUS_FRONTIER_HEALTH_POLL_INTERVAL to 0 to disable (the selector
+	// then falls back to error-rate-based exclusion).
+	FrontierHealthPollInterval     time.Duration // background poll cadence (60s)
+	FrontierHealthBreakerThreshold int           // consecutive failures before trip (3)
+	FrontierHealthTimeout          time.Duration // per-probe HTTP timeout (5s)
+
 	// Hardware-aware VRAM probe (issue #6). The probe replaces the
 	// static NEXUS_TOKEN_GUARDRAIL with a live measurement of the
 	// loaded model's context_length (Ollama /api/ps) and free VRAM
@@ -1466,6 +1478,28 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.HealthProbeTimeout = healthProbe
+
+	// Frontier health poller (issue #1158). Defaults: 60s poll cadence,
+	// 3-failure breaker, 5s per-probe HTTP timeout. Set
+	// NEXUS_FRONTIER_HEALTH_POLL_INTERVAL to 0 to disable; the selector
+	// then falls back to error-rate-based provider exclusion.
+	frontierHealthPoll, err := getEnvDuration("NEXUS_FRONTIER_HEALTH_POLL_INTERVAL", 60*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.FrontierHealthPollInterval = frontierHealthPoll
+
+	frontierHealthBreaker, err := getEnvInt("NEXUS_FRONTIER_HEALTH_BREAKER_THRESHOLD", 3)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.FrontierHealthBreakerThreshold = frontierHealthBreaker
+
+	frontierHealthTimeout, err := getEnvDuration("NEXUS_FRONTIER_HEALTH_TIMEOUT", 5*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.FrontierHealthTimeout = frontierHealthTimeout
 
 	// Hardware-aware VRAM probe (issue #6). Defaults: 60s poll,
 	// 5s per-probe timeout, 256 KiB per token heuristic (which
