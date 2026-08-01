@@ -281,6 +281,108 @@ func TestBuildServerHealthzExempt(t *testing.T) {
 	}
 }
 
+// TestBuildServerDashboardDisabledDefault (issue #1182) verifies the
+// dashboard route is absent when NEXUS_DASHBOARD_ENDPOINT is left at
+// its false default — a stock deployment must not expose extra surface.
+func TestBuildServerDashboardDisabledDefault(t *testing.T) {
+	serverTestEnv(t)
+	// DashboardEndpoint defaults to false; do not set the env var.
+	srv, _, cleanup := buildTestServerFromCfg(t)
+	defer cleanup()
+	ts := httptest.NewServer(srv.Handler)
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/dashboard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("dashboard disabled default: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestBuildServerDashboardEnabledServesHTML (issue #1182) verifies that
+// opting in registers the route and serves a self-contained HTML page.
+func TestBuildServerDashboardEnabledServesHTML(t *testing.T) {
+	serverTestEnv(t)
+	t.Setenv("NEXUS_DASHBOARD_ENDPOINT", "true")
+	srv, _, cleanup := buildTestServerFromCfg(t)
+	defer cleanup()
+	ts := httptest.NewServer(srv.Handler)
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/dashboard?range=24h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("dashboard enabled: got %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("Content-Type = %q, want text/html", ct)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "Nexus Proxy Dashboard") {
+		t.Error("dashboard HTML page missing expected title")
+	}
+}
+
+// TestBuildServerDashboardAuthGated (issue #1182) verifies that when
+// the dashboard is enabled but NOT public, it sits behind the auth
+// wall exactly like /status.
+func TestBuildServerDashboardAuthGated(t *testing.T) {
+	serverTestEnv(t)
+	t.Setenv("NEXUS_PROXY_API_KEY", "test-secret-key")
+	t.Setenv("NEXUS_DASHBOARD_ENDPOINT", "true")
+	t.Setenv("NEXUS_DASHBOARD_PUBLIC", "false")
+	srv, _, cleanup := buildTestServerFromCfg(t)
+	defer cleanup()
+	ts := httptest.NewServer(srv.Handler)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/dashboard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("dashboard gated: got %d, want 401", resp.StatusCode)
+	}
+
+	// With the key it passes through.
+	req, _ := http.NewRequest("GET", ts.URL+"/dashboard", nil)
+	req.Header.Set("Authorization", "Bearer test-secret-key")
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode == http.StatusUnauthorized {
+		t.Error("dashboard should pass with correct key")
+	}
+}
+
+// TestBuildServerDashboardPublic (issue #1182) verifies that
+// NEXUS_DASHBOARD_PUBLIC=true bypasses the auth gate.
+func TestBuildServerDashboardPublic(t *testing.T) {
+	serverTestEnv(t)
+	t.Setenv("NEXUS_PROXY_API_KEY", "test-secret-key")
+	t.Setenv("NEXUS_DASHBOARD_ENDPOINT", "true")
+	t.Setenv("NEXUS_DASHBOARD_PUBLIC", "true")
+	srv, _, cleanup := buildTestServerFromCfg(t)
+	defer cleanup()
+	ts := httptest.NewServer(srv.Handler)
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/dashboard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("dashboard public: got %d, want 200", resp.StatusCode)
+	}
+}
+
 // --- config variation tests ---
 
 func TestBuildServerWithTracing(t *testing.T) {

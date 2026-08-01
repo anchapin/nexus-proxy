@@ -485,6 +485,18 @@ type Config struct {
 	ModelsEndpointEnabled bool
 	ModelsCacheTTL        time.Duration
 
+	// Built-in web dashboard (issue #1182). When DashboardEndpointEnabled
+	// is true the proxy serves GET <DashboardEndpoint> — a self-contained
+	// HTML page (inline CSS/JS, no external assets) rendering savings and
+	// routing metrics from the SQLite metrics store. Disabled by default
+	// so a stock deployment exposes no extra surface. DashboardPublic
+	// mirrors StatusPublic: when true the route bypasses inbound auth
+	// (handy for an operator-only LAN). When false (default) the route is
+	// gated by NEXUS_PROXY_API_KEY exactly like /status.
+	DashboardEndpointEnabled bool
+	DashboardEndpoint        string
+	DashboardPublic          bool
+
 	// Trusted-proxy enforcement + rate limiting (issue #75).
 	//
 	// TrustedProxies is the parsed CIDR allowlist sourced from
@@ -1538,6 +1550,18 @@ func Load() (Config, error) {
 		cfg.ModelAliases = aliases
 	}
 	cfg.ModelAliasesStrict = parseBoolEnv("NEXUS_MODEL_ALIASES_STRICT", false)
+
+	// Built-in web dashboard (issue #1182). Disabled by default so a
+	// stock deployment exposes no extra HTTP surface; opt in with
+	// NEXUS_DASHBOARD_ENDPOINT=true. The endpoint path defaults to
+	// /dashboard. NEXUS_DASHBOARD_PUBLIC mirrors NEXUS_STATUS_PUBLIC:
+	// when true the route bypasses the inbound auth gate.
+	cfg.DashboardEndpointEnabled = parseBoolEnv("NEXUS_DASHBOARD_ENDPOINT", false)
+	cfg.DashboardEndpoint = getEnvAllowEmpty("NEXUS_DASHBOARD_PATH", "/dashboard")
+	if cfg.DashboardEndpoint == "" {
+		cfg.DashboardEndpoint = "/dashboard"
+	}
+	cfg.DashboardPublic = parseBoolEnv("NEXUS_DASHBOARD_PUBLIC", false)
 
 	// Prompt-injection hardening (issue #76). Defaults to warn so a
 	// stock deployment logs injection attempts out of the box.
