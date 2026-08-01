@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -186,6 +187,10 @@ type YAMLConfig struct {
 	// Models
 	ModelsEndpointEnabled bool   `yaml:"models_endpoint_enabled"`
 	ModelsCacheTTL        string `yaml:"models_cache_ttl"`
+
+	// Model aliasing (issue #1184)
+	ModelAliases       map[string]string `yaml:"model_aliases"`
+	ModelAliasesStrict bool              `yaml:"model_aliases_strict"`
 
 	// Trusted proxies
 	TrustedProxies    string `yaml:"trusted_proxies"`
@@ -1010,6 +1015,18 @@ func LoadYAML(path string) (Config, error) {
 		cfg.ModelsCacheTTL = d
 	}
 
+	// Model aliasing (issue #1184)
+	if v := os.Getenv("NEXUS_MODEL_ALIASES"); v != "" {
+		var aliases map[string]string
+		if err := json.Unmarshal([]byte(v), &aliases); err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_MODEL_ALIASES: %w", err)
+		}
+		cfg.ModelAliases = aliases
+	}
+	if v := os.Getenv("NEXUS_MODEL_ALIASES_STRICT"); v != "" {
+		cfg.ModelAliasesStrict = parseBoolEnvStr(v, false)
+	}
+
 	// Trusted proxies
 	if v := os.Getenv("NEXUS_TRUSTED_PROXIES"); v != "" {
 		cfg.TrustedProxiesRaw = v
@@ -1273,6 +1290,9 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 
 		ModelsEndpointEnabled: yc.boolFieldDefault(yc.ModelsEndpointEnabled, true),
 		ModelsCacheTTL:        yc.durationDefault(yc.ModelsCacheTTL, 5*time.Minute),
+
+		ModelAliases:       yc.ModelAliases,
+		ModelAliasesStrict: yc.ModelAliasesStrict,
 
 		RAGPollInterval: yc.durationDefault(yc.RAGPollInterval, 30*time.Second),
 

@@ -111,6 +111,16 @@ bounding O(n) cosine similarity to a cap. Default 0 = unlimited.
 models plus cached Ollama `/api/tags` results (TTL: `NEXUS_MODELS_CACHE_TTL`,
 default 5m). Set `NEXUS_MODELS_ENDPOINT=false` to disable entirely.
 
+**Model aliasing** (issue #1184): `NEXUS_MODEL_ALIASES` is a JSON map
+(`{"gpt-4":"anthropic/claude-3-5-sonnet"}`) that translates
+client-requested model names to `"providerName/upstreamModel"`. When a
+request's `model` field matches an alias, the proxy rewrites the body
+model and routes directly to the target provider (bypassing the SLM
+routing pipeline). The `providerName` must match a provider registered
+via `NEXUS_FRONTIER_PROVIDERS`. Aliases are surfaced in
+`GET /v1/models` (owned_by: `"alias"`). `NEXUS_MODEL_ALIASES_STRICT=true`
+rejects unknown models with HTTP 400; default false passes through.
+
 **Distributed tracing config**: `NEXUS_TRACING_ENDPOINT` enables OTLP/JSON export.
 Tune with `NEXUS_TRACING_TIMEOUT` (default 10s), `NEXUS_TRACING_MAX_RETRIES` (3),
 `NEXUS_TRACING_RETRY_BASE_DELAY` (100ms), `NEXUS_TRACING_RETRY_MAX_DELAY` (2s),
