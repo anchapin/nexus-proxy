@@ -45,6 +45,9 @@ start the proxy):
   `cmd/nexus/doc_test.go` (issue #455).
 - `nexus config validate <file>` — parse + validate a YAML config against
   the same rules as `Load()`. Exits 0/1.
+- `nexus config migrate <file>` — rewrite deprecated env-var/YAML keys to
+  current names in place (writes a `.bak` backup). Uses the compile-time
+  registry in `internal/config/deprecations.go` (issue #1180).
 - `nexus dashboard` — daily savings summary view.
 - `nexus --version` (`-v` / `version`) — build version (`dev` unless
   `-ldflags -X main.version=...` overrides it; Makefile + release.yml set it).

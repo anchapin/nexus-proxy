@@ -1445,11 +1445,9 @@ func Load() (Config, error) {
 	}
 	cfg.QualityStderrCap = stderrCap
 
-	// Backward-compat alias (issue #924)
-	if v := os.Getenv("NEXUS_QUALITY_DROPED_RING_SIZE"); v != "" {
-		slog.Warn("NEXUS_QUALITY_DROPED_RING_SIZE is deprecated; use NEXUS_QUALITY_DROPPED_RING_SIZE",
-			slog.String("component", "config"))
-	}
+	// Deprecated-key warnings are emitted centrally via the registry
+	// (issue #1180). The #924 alias (NEXUS_QUALITY_DROPED_RING_SIZE)
+	// is tracked there; value parsing still reads the current name.
 	droppedRingSize, err := getEnvInt("NEXUS_QUALITY_DROPPED_RING_SIZE", 256)
 	if err != nil {
 		return cfg, err
@@ -1688,6 +1686,11 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	ValidateShutdownTimeout(cfg)
+
+	// Emit structured warnings for any deprecated env vars that are set
+	// (issue #1180). Advisory only — does not alter parsed values.
+	WarnDeprecatedEnv()
+
 	return cfg, nil
 }
 

@@ -903,11 +903,9 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.QualityStderrCap = n
 	}
-	// Backward-compat alias (issue #924)
-	if v := os.Getenv("NEXUS_QUALITY_DROPED_RING_SIZE"); v != "" {
-		slog.Warn("NEXUS_QUALITY_DROPED_RING_SIZE is deprecated; use NEXUS_QUALITY_DROPPED_RING_SIZE",
-			slog.String("component", "config"))
-	}
+	// Deprecated-key warnings are emitted centrally via the registry
+	// (issue #1180). The #924 alias (NEXUS_QUALITY_DROPED_RING_SIZE)
+	// is tracked there; value parsing still reads the current name.
 	if v := os.Getenv("NEXUS_QUALITY_DROPPED_RING_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
@@ -1119,6 +1117,12 @@ func LoadYAML(path string) (Config, error) {
 	}
 
 	ValidateShutdownTimeout(cfg)
+
+	// Emit structured warnings for deprecated env vars and YAML keys
+	// (issue #1180). Advisory only — does not alter parsed values.
+	WarnDeprecatedEnv()
+	warnDeprecatedYAMLKeysFromData(data)
+
 	return cfg, nil
 }
 
