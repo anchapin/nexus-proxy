@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/middleware"
+	"github.com/anchapin/nexus-proxy/internal/providers"
 	ragpkg "github.com/anchapin/nexus-proxy/internal/rag"
 	"gopkg.in/yaml.v3"
 )
@@ -75,6 +76,12 @@ type YAMLConfig struct {
 	SelectorMinSamples      int     `yaml:"selector_min_samples"`
 	SelectorRefreshInterval string  `yaml:"selector_refresh_interval"`
 	ProviderTailWeight      float64 `yaml:"provider_tail_weight"`
+
+	// Providers (issue #1185). An optional explicit list of frontier
+	// providers with their adapter type. Mirrors the env-driven
+	// NEXUS_PROVIDER_<NAME>_* surface; each entry's `type` is validated
+	// against the providers package's allowed set.
+	Providers []yamlProviderEntry `yaml:"providers"`
 
 	// RAG
 	ExamplesDir              string  `yaml:"examples_dir"`
@@ -1452,7 +1459,30 @@ func (yc YAMLConfig) validate() error {
 		return fmt.Errorf("config: routing_confidence_ceiling must be in range [0,1], got %f", yc.RoutingConfidenceCeiling)
 	}
 
+	// Provider adapter types (issue #1185). Each entry's `type` must be
+	// in the providers package's allowed set so a typo fails config
+	// validation rather than producing a silent no-op at request time.
+	for i, p := range yc.Providers {
+		if p.Type == "" {
+			continue // empty == openai default
+		}
+		if !providers.IsValidAdapterType(p.Type) {
+			return fmt.Errorf("config: providers[%d] (%s): type %q is not valid (allowed: %s)",
+				i, p.Name, p.Type, strings.Join(providers.ValidAdapterTypes(), ", "))
+		}
+	}
+
 	return nil
+}
+
+// yamlProviderEntry is one element of the optional YAML `providers:` list
+// (issue #1185). It mirrors the env-driven NEXUS_PROVIDER_<NAME>_* vars.
+type yamlProviderEntry struct {
+	Name   string `yaml:"name"`
+	URL    string `yaml:"url"`
+	Model  string `yaml:"model"`
+	APIKey string `yaml:"api_key"`
+	Type   string `yaml:"type"`
 }
 
 // validateRawBoolFields checks that boolean fields in the raw YAML data

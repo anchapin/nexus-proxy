@@ -1111,3 +1111,72 @@ func TestParseBoolEnvStr(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadYAMLProviderTypeValidation (issue #1185) ensures the YAML
+// `providers:` list validates each entry's `type` against the allowed
+// set, so `nexus config validate` rejects a typo before boot.
+func TestLoadYAMLProviderTypeValidation(t *testing.T) {
+	t.Run("valid types accepted", func(t *testing.T) {
+		tmp := t.TempDir()
+		path := filepath.Join(tmp, "config.yaml")
+		yamlContent := `
+providers:
+  - name: openai
+    url: https://api.openai.com/v1/chat/completions
+    model: gpt-4o
+    type: openai
+  - name: claude
+    url: https://api.anthropic.com
+    model: claude-opus-4
+    type: anthropic
+`
+		if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if _, err := LoadYAML(path); err != nil {
+			t.Errorf("LoadYAML valid types: unexpected error: %v", err)
+		}
+	})
+
+	t.Run("unknown type rejected", func(t *testing.T) {
+		tmp := t.TempDir()
+		path := filepath.Join(tmp, "config.yaml")
+		yamlContent := `
+providers:
+  - name: bad
+    url: https://example.com
+    model: x
+    type: cohere
+`
+		if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		_, err := LoadYAML(path)
+		if err == nil {
+			t.Fatal("LoadYAML: expected error for unknown provider type")
+		}
+		if !strings.Contains(err.Error(), "type") {
+			t.Errorf("error should mention type: %v", err)
+		}
+		if !strings.Contains(err.Error(), "cohere") {
+			t.Errorf("error should name the bad value: %v", err)
+		}
+	})
+
+	t.Run("empty type accepted (defaults to openai)", func(t *testing.T) {
+		tmp := t.TempDir()
+		path := filepath.Join(tmp, "config.yaml")
+		yamlContent := `
+providers:
+  - name: oai
+    url: https://api.openai.com/v1/chat/completions
+    model: gpt-4o
+`
+		if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if _, err := LoadYAML(path); err != nil {
+			t.Errorf("LoadYAML empty type: unexpected error: %v", err)
+		}
+	})
+}
