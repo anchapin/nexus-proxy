@@ -310,6 +310,31 @@ latency + cost. Tunable via `NEXUS_SELECTOR_WINDOW` (look-back window),
 (P95 blend factor, range 0–1). When multiple providers are registered via
 `NEXUS_PROVIDERS`, the legacy `NEXUS_FRONTIER_*` vars are ignored.
 
+## Provider adapter interface (issue #1185)
+
+`internal/providers/adapter.go` defines a `ProviderAdapter` that translates
+between the proxy's canonical OpenAI request/response shape and a
+non-OpenAI provider's native API. The proxy's hot path always speaks
+OpenAI internally; the adapter is the single place that knows the
+provider's auth headers, request path, request-body schema, and SSE
+event shape.
+
+- Methods: `AuthHeaders(apiKey)`, `RequestPath(baseURL)`,
+  `TransformRequest(body)`, `NormalizeSSE(io.Reader) io.Reader`.
+- `NewAdapter(type)` resolves the type (default `openai` is a byte-for-byte
+  no-op so the existing OpenAI path is unchanged); unknown types error.
+- Allowed types: `openai`, `anthropic`, `azure`, `gemini`
+  (`providers.ValidAdapterTypes()`).
+- Per-provider selection: `NEXUS_PROVIDER_<NAME>_TYPE` (env) or the
+  `type` field on a YAML `providers:` list entry.
+- The `anthropic` adapter authenticates via `x-api-key` +
+  `anthropic-version`, POSTs to `/v1/messages`, and normalises Anthropic's
+  `content_block_delta` SSE events into OpenAI `chat.completion.chunk`
+  frames.
+
+Config validation rejects an unknown `type` at boot
+(`LoadFromEnv` / `nexus config validate` both enforce the closed set).
+
 ## Adding new env vars
 
 Config env vars are split across two files. New vars need **both**:
