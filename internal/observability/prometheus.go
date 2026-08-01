@@ -241,6 +241,11 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Build metadata for the running nexus-proxy binary (issue #529). Always 1.",
 		typ:  "gauge",
 	},
+	// Arbiter cache pre-warming gauge (issue #1176). Set once at boot.
+	"nexus_cache_warmed_entries": {
+		help: "Number of entries loaded into the arbiter cache from historical SQLite metrics during boot-time pre-warming (issue #1176). 0 when pre-warming is disabled or no data was found.",
+		typ:  "gauge",
+	},
 	// Per-route latency percentile gauges (issue #774). Computed from a
 	// sliding window ring buffer per route (local/frontier/fusion).
 	// Values are in seconds (ms → s conversion at render time).
@@ -488,22 +493,40 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 		"Total LocalConfidence errors in the planner where the SQLite confidence store returned an error (DB locked, query failed, etc.).",
 		c.ConfidenceErrors())
 
+	// RAG-vs-judge quality correlation (issue #1167). Sum and count of
+	// judge scores partitioned by whether RAG context was injected.
+	// Operators compute avg = sum/count per label to measure retrieval
+	// effectiveness.
+	writeMeta(w, "nexus_rag_judge_score_sum",
+		"Cumulative judge quality score sum partitioned by RAG injection (issue #1167). Compute avg via nexus_rag_judge_score_sum / nexus_rag_judge_score_count.", "counter")
+	//nolint:errcheck // ResponseWriter error cannot be handled after headers committed.
+	fmt.Fprintf(w, "nexus_rag_judge_score_sum{injected=\"true\"} %s\n", formatFloat(c.RAGJudgeScoreSum(true)))
+	//nolint:errcheck // ResponseWriter error cannot be handled after headers committed.
+	fmt.Fprintf(w, "nexus_rag_judge_score_sum{injected=\"false\"} %s\n", formatFloat(c.RAGJudgeScoreSum(false)))
+	writeCounterLabeled(w, "nexus_rag_judge_score_count",
+		"Count of judge quality scores partitioned by RAG injection (issue #1167).",
+		"injected", []labelSample{
+			{value: "true", n: c.RAGJudgeScoreCount(true)},
+			{value: "false", n: c.RAGJudgeScoreCount(false)},
+		})
+
 	// --- Histograms -----------------------------------------------------
 
+	exemplars := c.ExemplarsEnabled()
 	writeHistogramLabeled(w, "nexus_request_duration_ms",
 		"End-to-end request duration in milliseconds, from body read to final flush, by route.",
 		"route", map[string]*Histogram{
 			"local":    c.latencyLocal,
 			"frontier": c.latencyFrontier,
 			"fusion":   c.latencyFusion,
-		})
+		}, exemplars)
 	writeHistogramLabeled(w, "nexus_ttft_ms",
 		"Time to first token in milliseconds (0 / unobserved for non-streaming responses), by route.",
 		"route", map[string]*Histogram{
 			"local":    c.ttftLocal,
 			"frontier": c.ttftFrontier,
 			"fusion":   c.ttftFusion,
-		})
+		}, exemplars)
 	// Per-stage pipeline latency histograms (issue #300).
 	writeStageHistogram(w, c)
 
@@ -618,8 +641,12 @@ func writeCounterLabeled2(w io.Writer, name, help, label1, label2 string, sample
 // Routes are emitted in a fixed order (local, frontier, fusion) for
 // deterministic output.
 //
+// When exemplars is true, non-+Inf bucket lines carry the most recent
+// trace exemplar (issue #1171): `... %d # {trace_id="...",span_id="..."} %s`.
+// +Inf, _sum, and _count lines never carry exemplars.
+//
 //nolint:errcheck
-func writeHistogramLabeled(w io.Writer, name, help, label string, histograms map[string]*Histogram) {
+func writeHistogramLabeled(w io.Writer, name, help, label string, histograms map[string]*Histogram, exemplars bool) {
 	writeMeta(w, name, help, "histogram")
 	// Fixed route order for deterministic output.
 	for _, route := range []string{"local", "frontier", "fusion"} {
@@ -627,13 +654,38 @@ func writeHistogramLabeled(w io.Writer, name, help, label string, histograms map
 		if !ok || h == nil {
 			continue
 		}
-		cum, upperBounds, sum, count := h.Snapshot()
-		for i, ub := range upperBounds {
-			fmt.Fprintf(w, "%s_bucket{%s=%q,le=%q} %d\n", name, label, route, formatFloat(ub), cum[i])
+		if exemplars {
+			cum, upperBounds, sum, count, exs := h.SnapshotWithExemplars()
+			for i, ub := range upperBounds {
+				writeBucketLineWithExemplar(w, fmt.Sprintf("%s_bucket{%s=%q,le=%q}", name, label, route, formatFloat(ub)), cum[i], exs[i])
+			}
+			fmt.Fprintf(w, "%s_bucket{%s=%q,le=%q} %d\n", name, label, route, "+Inf", cum[len(upperBounds)])
+			fmt.Fprintf(w, "%s_sum{%s=%q} %s\n", name, label, route, formatFloat(sum))
+			fmt.Fprintf(w, "%s_count{%s=%q} %d\n", name, label, route, count)
+		} else {
+			cum, upperBounds, sum, count := h.Snapshot()
+			for i, ub := range upperBounds {
+				fmt.Fprintf(w, "%s_bucket{%s=%q,le=%q} %d\n", name, label, route, formatFloat(ub), cum[i])
+			}
+			fmt.Fprintf(w, "%s_bucket{%s=%q,le=%q} %d\n", name, label, route, "+Inf", cum[len(upperBounds)])
+			fmt.Fprintf(w, "%s_sum{%s=%q} %s\n", name, label, route, formatFloat(sum))
+			fmt.Fprintf(w, "%s_count{%s=%q} %d\n", name, label, route, count)
 		}
-		fmt.Fprintf(w, "%s_bucket{%s=%q,le=%q} %d\n", name, label, route, "+Inf", cum[len(upperBounds)])
-		fmt.Fprintf(w, "%s_sum{%s=%q} %s\n", name, label, route, formatFloat(sum))
-		fmt.Fprintf(w, "%s_count{%s=%q} %d\n", name, label, route, count)
+	}
+}
+
+// writeBucketLineWithExemplar emits one non-+Inf histogram bucket line
+// with an optional exemplar suffix (issue #1171). When ex.TraceID is
+// non-empty, the line carries `# {trace_id="...",span_id="..."} <value>`;
+// otherwise it is a plain bucket line (byte-compatible with pre-exemplar
+// output when no exemplar was stored for this bucket).
+//
+//nolint:errcheck
+func writeBucketLineWithExemplar(w io.Writer, prefix string, count uint64, ex Exemplar) {
+	if ex.TraceID != "" {
+		fmt.Fprintf(w, "%s %d # {trace_id=%q,span_id=%q} %s\n", prefix, count, ex.TraceID, ex.SpanID, formatFloat(ex.Value))
+	} else {
+		fmt.Fprintf(w, "%s %d\n", prefix, count)
 	}
 }
 
@@ -662,6 +714,7 @@ func writeHistogram(w io.Writer, name, help string, h *Histogram) {
 //
 //nolint:errcheck
 func writeStageHistogram(w io.Writer, c *Collector) {
+	exemplars := c.ExemplarsEnabled()
 	stages := []struct {
 		name string
 		h    *Histogram
@@ -679,17 +732,32 @@ func writeStageHistogram(w io.Writer, c *Collector) {
 		if s.h == nil {
 			continue
 		}
-		cum, upperBounds, sum, count := s.h.Snapshot()
-		for i, ub := range upperBounds {
+		if exemplars {
+			cum, upperBounds, sum, count, exs := s.h.SnapshotWithExemplars()
+			for i, ub := range upperBounds {
+				writeBucketLineWithExemplar(w,
+					fmt.Sprintf("nexus_pipeline_stage_latency_ms_bucket{stage=%q,le=%q}", s.name, formatFloat(ub)),
+					cum[i], exs[i])
+			}
 			fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_bucket{stage=%q,le=%q} %d\n",
-				s.name, formatFloat(ub), cum[i])
+				s.name, "+Inf", cum[len(upperBounds)])
+			fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_sum{stage=%q} %s\n",
+				s.name, formatFloat(sum))
+			fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_count{stage=%q} %d\n",
+				s.name, count)
+		} else {
+			cum, upperBounds, sum, count := s.h.Snapshot()
+			for i, ub := range upperBounds {
+				fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_bucket{stage=%q,le=%q} %d\n",
+					s.name, formatFloat(ub), cum[i])
+			}
+			fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_bucket{stage=%q,le=%q} %d\n",
+				s.name, "+Inf", cum[len(upperBounds)])
+			fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_sum{stage=%q} %s\n",
+				s.name, formatFloat(sum))
+			fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_count{stage=%q} %d\n",
+				s.name, count)
 		}
-		fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_bucket{stage=%q,le=%q} %d\n",
-			s.name, "+Inf", cum[len(upperBounds)])
-		fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_sum{stage=%q} %s\n",
-			s.name, formatFloat(sum))
-		fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_count{stage=%q} %d\n",
-			s.name, count)
 	}
 }
 

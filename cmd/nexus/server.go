@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -24,6 +25,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/handlers"
 	"github.com/anchapin/nexus-proxy/internal/health"
+	"github.com/anchapin/nexus-proxy/internal/ioutils"
 	"github.com/anchapin/nexus-proxy/internal/judge"
 	"github.com/anchapin/nexus-proxy/internal/metrics"
 	"github.com/anchapin/nexus-proxy/internal/middleware"
@@ -57,6 +59,12 @@ type serverParts struct {
 // boot error. The cleanup function closes resources in reverse order.
 func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverParts, func(), error) {
 	parts := &serverParts{}
+
+	// Configure the response-body buffer pool retention cap (issue #1177).
+	// This is a global setting because sync.Pool is package-level in
+	// ioutils. Values <= 0 disable pooling — GetBuffer still allocates
+	// but PutBuffer discards instead of returning to the pool.
+	ioutils.SetPoolBufferMaxBytes(cfg.PoolBufferMaxBytes)
 
 	// Root context for background goroutines (probe manager, health
 	// poller). Cancelled during cleanup so those goroutines exit before
@@ -167,6 +175,9 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		)
 	}
 	probeMgr := probe.NewManager(probeImpl, cfg.ProbePollInterval, cfg.ProbeTimeout)
+	if cfg.ProbeNVIDIAInterval > 0 {
+		probeMgr.EnableNVIDIARefresh(cfg.ProbeNVIDIAInterval)
+	}
 	go probeMgr.Run(bgCtx)
 	addCleanup(func() {
 		if err := probeMgr.Close(); err != nil {
@@ -340,6 +351,14 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		}
 
 		judgeEval = judge.NewEvaluator(evalCfg, httpClient, storage)
+		// Wire the score callback so RAG-vs-quality correlation metrics
+		// are updated on the worker goroutine after each judge attempt
+		// (issue #1167). Only valid scores (1..5) feed the correlation
+		// counters; parse failures (Score==0 / Err set) are skipped by
+		// ObserveJudgeScore.
+		judgeEval.SetScoreCallback(func(s judge.JudgeScore) {
+			circuitCollector.ObserveJudgeScore(s.RAGInjected, s.Score)
+		})
 		judgeObs = handlers.JudgeObserverFunc(func(c handlers.LocalCompletion) bool {
 			if !judgeEval.Sample() {
 				return false
@@ -348,13 +367,15 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 				bridge.note(c.RequestID, router.Categorize(c.Instruction))
 			}
 			if !judgeEval.Enqueue(judge.Sample{
-				RequestID:   c.RequestID,
-				Instruction: c.Instruction,
-				Output:      c.Output,
-				LocalModel:  c.LocalModel,
-				Route:       c.Route,
-				TraceParent: c.TraceParent,
-				TraceState:  c.TraceState,
+				RequestID:     c.RequestID,
+				Instruction:   c.Instruction,
+				Output:        c.Output,
+				LocalModel:    c.LocalModel,
+				Route:         c.Route,
+				TraceParent:   c.TraceParent,
+				TraceState:    c.TraceState,
+				RAGInjected:   c.RAGInjected,
+				RAGSimilarity: c.RAGSimilarity,
 			}) {
 				if bridge != nil {
 					bridge.forget(c.RequestID)
@@ -434,6 +455,9 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 	}
 
 	metricsStore, metricsObs := buildMetrics(cfg)
+	// cacheWarmedEntries is set after the arbiter cache is created below;
+	// declared here so the gauge provider closure can capture it (issue #1176).
+	var cacheWarmedEntries int
 	addCleanup(func() {
 		if metricsStore != nil {
 			if err := metricsStore.Close(); err != nil {
@@ -700,6 +724,11 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 				{Name: "nexus_ollama_failure_count", Value: float64(hpoller.FailureCount())},
 			}
 		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			return []observability.GaugeSample{{
+				Name: "nexus_cache_warmed_entries", Value: float64(cacheWarmedEntries),
+			}}
+		}),
 	)
 
 	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.TOONUnfenced, cfg.PromptInjectionIsolated())
@@ -735,6 +764,9 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		}
 		if e.DSLMiss {
 			routeCounters.ObserveDSLMiss()
+		}
+		if e.Source == string(router.SourceBudgetDownTier) {
+			routeCounters.IncBudgetDowntier()
 		}
 	})
 	rejectionObs := handlers.RejectionObserverFunc(func(e handlers.RejectionEvent) {
@@ -775,6 +807,12 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		arbiterCache.SetEvictionObserver(func(reason string) {
 			routeCounters.ObserveArbiterCacheEviction(reason)
 		})
+		// Boot-time pre-warming from historical SQLite metrics (issue #1176).
+		// Only fires when explicitly opted in and the metrics store is a
+		// SQLiteStore with recent arbiter synthesis data.
+		if cfg.CacheWarmOnBoot && cfg.CacheWarmLimit > 0 {
+			cacheWarmedEntries = warmArbiterCache(arbiterCache, metricsStore, cfg)
+		}
 	}
 	mux.Handle("/metrics", routeCounters.Handler())
 	slog.Info("metrics endpoint serves prometheus text format",
@@ -851,6 +889,10 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		}),
 	)
 
+	// Enable exemplars on both collectors based on config (issue #1171).
+	circuitCollector.SetExemplarsEnabled(cfg.MetricsExemplars)
+	stageCollector.SetExemplarsEnabled(cfg.MetricsExemplars)
+
 	routeCounters.SetCollector(circuitCollector)
 
 	circuitBreakerObs := circuitBreakerAdapter{
@@ -886,6 +928,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		Health:                  hpoller,
 		BudgetObserver:          budgetObserver(probeMgr),
 		SpendGuard:              budgetGuard,
+		BudgetChecker:           budgetGuard,
 		LocalLimiter:            localLimiter,
 		LocalCooldown:           localCooldown,
 		RouteDecisionObserver:   routeDecisionObs,
@@ -898,8 +941,11 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		PanelPanicObserver:      panelPanicObs,
 		InjectionHitObserver:    injectionHitObs,
 		CircuitBreakerObserver:  circuitBreakerObs,
-		ArbiterCache:            arbiterCache,
-		Providers:               providerRegistry,
+		RedactionObserver: func(profile string, substitutions int64) {
+			routeCounters.ObserveRedaction(profile, substitutions)
+		},
+		ArbiterCache: arbiterCache,
+		Providers:    providerRegistry,
 		PipelineStageObserver: handlers.PipelineStageObserverFunc(
 			func(e handlers.PipelineStageEvent) {
 				stageCollector.ObservePipelineStage(observability.PipelineStageEvent{
@@ -910,7 +956,21 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 					UpstreamFirstByteMs: e.UpstreamFirstByteMs,
 					SLMConfidence:       e.SLMConfidence,
 					SLMTaskType:         e.SLMTaskType,
+					TraceID:             e.TraceID,
+					SpanID:              e.SpanID,
 				})
+			},
+		),
+		LatencyObserver: handlers.LatencyObserverFunc(
+			func(e handlers.LatencyEvent) {
+				circuitCollector.Submit(observability.ObservabilityEvent{
+					Route:          e.Route,
+					TotalLatencyMs: int64(e.LatencySeconds * 1000),
+					TTFTMs:         int64(e.TTFTSeconds * 1000),
+					TraceID:        e.TraceID,
+					SpanID:         e.SpanID,
+				})
+				circuitCollector.ObserveLatency(e.Route, int64(e.LatencySeconds*1000))
 			},
 		),
 		LocalPatternsRegex: cfg.DSLLocalPatterns,
@@ -1104,6 +1164,39 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		slog.Info("models endpoint disabled (NEXUS_MODELS_ENDPOINT=false)")
 	}
 
+	// Built-in web dashboard (issue #1182). Opt-in via
+	// NEXUS_DASHBOARD_ENDPOINT; serves a self-contained HTML page from
+	// the SQLite metrics store. The route lives on the same mux that
+	// SecurityHeaders wraps, so it inherits response hardening. It is
+	// rate-limited (when a limiter is configured) exactly like the
+	// chat path, and auth-gated like /status (NEXUS_DASHBOARD_PUBLIC).
+	if cfg.DashboardEndpointEnabled {
+		endpoint := cfg.DashboardEndpoint
+		if endpoint == "" {
+			endpoint = "/dashboard"
+		}
+		// dashStore stays a nil interface when metrics is disabled;
+		// the handler degrades to a static "metrics disabled" page.
+		var dashStore handlers.DashboardStore
+		if metricsStore != nil {
+			dashStore = metricsStore
+		}
+		dashH := http.Handler(handlers.Dashboard(handlers.DashboardDeps{
+			Store:     dashStore,
+			CostPer1K: cfg.FrontierCostPer1K,
+		}))
+		if rateLimiter != nil {
+			dashH = rateLimiter.Wrap(dashH)
+		}
+		mux.Handle(endpoint, dashH)
+		slog.Info("dashboard endpoint enabled",
+			slog.String("path", endpoint),
+			slog.Bool("public", cfg.DashboardPublic),
+		)
+	} else {
+		slog.Info("dashboard endpoint disabled (NEXUS_DASHBOARD_ENDPOINT=false)")
+	}
+
 	slog.Info("starting nexus proxy",
 		slog.String("addr", cfg.Addr),
 		slog.String("local_model", cfg.LocalModel),
@@ -1229,4 +1322,61 @@ func (p *serverParts) handleSIGHUP(cfg config.Config) config.Config {
 		slog.Warn("config reload warning", slog.String("warning", warn))
 	}
 	return newCfg
+}
+
+// warmArbiterCache pre-warms the arbiter synthesis cache from historical
+// SQLite metrics data (issue #1176). It queries the metrics store for
+// the most recent arbiter syntheses within the cache TTL window, decodes
+// the hex-encoded cache keys, and calls ArbiterCache.Warm. Returns the
+// number of entries loaded. Errors are logged and non-fatal — a failed
+// warm does not prevent the proxy from starting.
+func warmArbiterCache(cache *upstream.ArbiterCache, store metrics.Store, cfg config.Config) int {
+	reader, ok := store.(metrics.ArbiterSynthesisReader)
+	if !ok || reader == nil {
+		slog.Info("arbiter cache warm skipped (metrics store does not support synthesis queries)",
+			slog.String("source", "sqlite"),
+		)
+		return 0
+	}
+	since := time.Now().Add(-cfg.ArbiterCacheTTL)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	rows, err := reader.RecentArbiterSyntheses(ctx, cfg.CacheWarmLimit, since)
+	if err != nil {
+		slog.Warn("arbiter cache warm query failed",
+			slog.Any("err", err),
+			slog.String("source", "sqlite"),
+		)
+		return 0
+	}
+	if len(rows) == 0 {
+		slog.Info("arbiter cache warm: no historical syntheses found",
+			slog.String("source", "sqlite"),
+		)
+		return 0
+	}
+	entries := make([]upstream.ArbiterCacheWarmEntry, 0, len(rows))
+	for _, r := range rows {
+		keyBytes, err := hex.DecodeString(r.CacheKeyHex)
+		if err != nil || len(keyBytes) != 32 {
+			slog.Debug("arbiter cache warm: skipping unparseable key",
+				slog.String("cache_key_hex", r.CacheKeyHex),
+			)
+			continue
+		}
+		var key [32]byte
+		copy(key[:], keyBytes)
+		entries = append(entries, upstream.ArbiterCacheWarmEntry{
+			Key:       key,
+			Synthesis: r.Synthesis,
+			WrittenAt: r.Timestamp,
+		})
+	}
+	loaded, skippedStale := cache.Warm(entries)
+	slog.Info("arbiter cache warmed",
+		slog.Int("entries", loaded),
+		slog.Int("skipped_stale", skippedStale),
+		slog.String("source", "sqlite"),
+	)
+	return loaded
 }

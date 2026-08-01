@@ -17,6 +17,7 @@ make test           # unit tests
 make test-race      # race detector — required to merge
 make lint           # golangci-lint v2.12.2
 make fmt            # gofmt -w (in place)
+make bench-baseline # regenerate bench/baseline.txt for benchstat (issue #1186)
 make ci             # vet + build + test + test-race + lint + bench-short
 ```
 
@@ -25,10 +26,12 @@ make ci             # vet + build + test + test-race + lint + bench-short
 **Coverage floor is 70%** — CI fails if total drops below `COVERAGE_THRESHOLD`.
 Per-package numbers print for visibility; only the total gates.
 
-**CI runs four jobs** (`.github/workflows/ci.yml`): `test` (vet → build →
+**CI runs five jobs** (`.github/workflows/ci.yml`): `test` (vet → build →
 `go test -race -coverprofile=coverage.txt -covermode=atomic ./...` + coverage
 gate), `bench` (non-blocking `bench-short`, `continue-on-error: true`),
-`lint` (`golangci-lint-action@v9`, golangci-lint **v2.12.2**), and `docker`
+`bench-regression` (benchstat comparison against `bench/baseline.txt`, posts
+PR comment, `continue-on-error: true` — issue #1186), `lint`
+(`golangci-lint-action@v9`, golangci-lint **v2.12.2**), and `docker`
 (smoke `make docker-build` — catches Dockerfile↔go.mod Go-version drift,
 issue #541). `make ci` is a local convenience wrapper; CI does not invoke it.
 
@@ -45,6 +48,9 @@ start the proxy):
   `cmd/nexus/doc_test.go` (issue #455).
 - `nexus config validate <file>` — parse + validate a YAML config against
   the same rules as `Load()`. Exits 0/1.
+- `nexus config migrate <file>` — rewrite deprecated env-var/YAML keys to
+  current names in place (writes a `.bak` backup). Uses the compile-time
+  registry in `internal/config/deprecations.go` (issue #1180).
 - `nexus dashboard` — daily savings summary view.
 - `nexus --version` (`-v` / `version`) — build version (`dev` unless
   `-ldflags -X main.version=...` overrides it; Makefile + release.yml set it).
@@ -103,10 +109,27 @@ success. Separate from the Ollama health breaker that governs chat routing.
 when > 0, `getSemantic` stops scanning after examining this many entries,
 bounding O(n) cosine similarity to a cap. Default 0 = unlimited.
 
+**Arbiter cache pre-warming** (`NEXUS_CACHE_WARM_ON_BOOT`, default false):
+when true, the proxy queries the SQLite metrics store on boot for recent
+arbiter syntheses still within `NEXUS_ARBITER_CACHE_TTL` and loads them
+into the arbiter cache, cutting cold-start latency (issue #1176).
+`NEXUS_CACHE_WARM_LIMIT` (default 256) caps how many entries are queried.
+Exposes `nexus_cache_warmed_entries` gauge on `/metrics`.
+
 **Models discovery endpoint** (`GET /v1/models`): served when
 `NEXUS_MODELS_ENDPOINT=true` (default). Lists configured local/router/frontier
 models plus cached Ollama `/api/tags` results (TTL: `NEXUS_MODELS_CACHE_TTL`,
 default 5m). Set `NEXUS_MODELS_ENDPOINT=false` to disable entirely.
+
+**Model aliasing** (issue #1184): `NEXUS_MODEL_ALIASES` is a JSON map
+(`{"gpt-4":"anthropic/claude-3-5-sonnet"}`) that translates
+client-requested model names to `"providerName/upstreamModel"`. When a
+request's `model` field matches an alias, the proxy rewrites the body
+model and routes directly to the target provider (bypassing the SLM
+routing pipeline). The `providerName` must match a provider registered
+via `NEXUS_FRONTIER_PROVIDERS`. Aliases are surfaced in
+`GET /v1/models` (owned_by: `"alias"`). `NEXUS_MODEL_ALIASES_STRICT=true`
+rejects unknown models with HTTP 400; default false passes through.
 
 **Distributed tracing config**: `NEXUS_TRACING_ENDPOINT` enables OTLP/JSON export.
 Tune with `NEXUS_TRACING_TIMEOUT` (default 10s), `NEXUS_TRACING_MAX_RETRIES` (3),
@@ -117,12 +140,13 @@ Tune with `NEXUS_TRACING_TIMEOUT` (default 10s), `NEXUS_TRACING_MAX_RETRIES` (3)
 
 ## Routing pipeline
 
-`internal/router`: Guardrail → DSL → SLM.Decide. Every failure defaults
-to **frontier** (safe choice).
+`internal/router`: Guardrail → Budget → DSL → SLM.Decide. Every failure
+defaults to **frontier** (safe choice).
 
 | Trigger | Route |
 | ------- | ----- |
 | `len(prompt)/4 > NEXUS_TOKEN_GUARDRAIL` | `frontier` (VRAM guardrail) |
+| Estimated frontier cost > remaining 24h budget (issue #1163) | `local` (budget down-tier) |
 | Prompt matches `NEXUS_DSL_FUSION_PATTERNS` (default: `architectural design\|system architecture`) | `fusion` |
 | Prompt matches `NEXUS_DSL_FORMATTING_PATTERNS` (default: `css\|format\|docstring\|lint\|typo\|boilerplate\|debug\|fix bug\|git commit\|sql query\|parse json\|validate input\|regex\|api endpoint\|test\|optimize\|readme`) | `local` |
 | Prompt matches `NEXUS_DSL_LOCAL_PATTERNS` (default: `refactor\|security scan\|generate tests\|explain this code\|performance analysis`) | `local` |
@@ -224,6 +248,16 @@ historical scores aggregated by task category feed back to the SLM as a
 confidence signal. Dormant when judge is off — routing is byte-for-byte
 identical to non-adaptive path.
 
+**RAG-vs-judge quality correlation** (issue #1167): each `JudgeScore`
+carries `RAGInjected bool` and `RAGSimilarity float64` populated from
+the chat handler's RAG state. The `Evaluator.SetScoreCallback` hook
+feeds these into Prometheus metrics
+(`nexus_rag_judge_score_sum{injected}` /
+`nexus_rag_judge_score_count{injected}`) so operators can compute the
+average judge score for RAG-injected vs non-injected requests. SQLite
+columns `rag_injected` / `rag_similarity` persist the data for offline
+analysis. Dormant when judge is off.
+
 ## Request body and response guards
 
 `NEXUS_MAX_BODY_BYTES` (default 1 MiB) caps inbound request bodies.
@@ -285,6 +319,7 @@ flagged regardless of this setting.
 - `nexus_health_circuit_*` — Ollama circuit breaker state transitions
 - `nexus_rag_circuit_*` — RAG embedder circuit breaker state transitions
 - `nexus_upstream_*` — per-route/upstream counters and histograms
+- `nexus_route_budget_downtier_total` — requests down-tiered to local because the frontier budget was exhausted (issue #1163)
 
 See `docs/observability-surface.md` for the full metric reference.
 
@@ -298,6 +333,17 @@ body preview capped at `NEXUS_DEBUG_BODY_BYTES` (default 512).
 **Distributed tracing** (`NEXUS_TRACING_ENDPOINT`): OTLP/JSON exporter.
 See `docs/tracing.example.md` for setup.
 
+## Adaptive cascade timeout (issue #1175)
+
+The cascade per-attempt timeout scales with prompt token count instead of
+a fixed value: `effective = clamp(floor + per1k * tokens/1000, floor, ceiling)`.
+- `NEXUS_CASCADE_TIMEOUT_FLOOR` (default 5s): minimum per-attempt timeout.
+- `NEXUS_CASCADE_TIMEOUT_CEILING` (default 120s): maximum per-attempt timeout.
+- `NEXUS_CASCADE_TIMEOUT_PER_1K_TOKENS` (default 1500ms): additive per-1k
+  estimated prompt tokens. Set `<=0` to disable adaptive scaling and revert to
+  the fixed `NEXUS_CASCADE_TIMEOUT` (default 30s). Prompt tokens are estimated
+  via the shared `internal/tokenizer` (tiktoken cl100k_base).
+
 ## Provider selector (issue #45)
 
 The multi-provider registry picks the cheapest provider based on observed
@@ -306,6 +352,48 @@ latency + cost. Tunable via `NEXUS_SELECTOR_WINDOW` (look-back window),
 `NEXUS_SELECTOR_REFRESH` (recompute cadence), and `NEXUS_PROVIDER_TAIL_WEIGHT`
 (P95 blend factor, range 0–1). When multiple providers are registered via
 `NEXUS_PROVIDERS`, the legacy `NEXUS_FRONTIER_*` vars are ignored.
+
+## Provider adapter interface (issue #1185)
+
+`internal/providers/adapter.go` defines a `ProviderAdapter` that translates
+between the proxy's canonical OpenAI request/response shape and a
+non-OpenAI provider's native API. The proxy's hot path always speaks
+OpenAI internally; the adapter is the single place that knows the
+provider's auth headers, request path, request-body schema, and SSE
+event shape.
+
+- Methods: `AuthHeaders(apiKey)`, `RequestPath(baseURL)`,
+  `TransformRequest(body)`, `NormalizeSSE(io.Reader) io.Reader`.
+- `NewAdapter(type)` resolves the type (default `openai` is a byte-for-byte
+  no-op so the existing OpenAI path is unchanged); unknown types error.
+- Allowed types: `openai`, `anthropic`, `azure`, `gemini`
+  (`providers.ValidAdapterTypes()`).
+- Per-provider selection: `NEXUS_PROVIDER_<NAME>_TYPE` (env) or the
+  `type` field on a YAML `providers:` list entry.
+- The `anthropic` adapter authenticates via `x-api-key` +
+  `anthropic-version`, POSTs to `/v1/messages`, and normalises Anthropic's
+  `content_block_delta` SSE events into OpenAI `chat.completion.chunk`
+  frames.
+
+Config validation rejects an unknown `type` at boot
+(`LoadFromEnv` / `nexus config validate` both enforce the closed set).
+
+## Per-provider cost model (issue #1183)
+
+`NEXUS_COST_USE_OUTPUT_TOKENS` (default `false`) switches the per-request
+cost estimate from the legacy flat input-only rate to a per-provider
+input/output token split. When enabled, `frontierCostEstimate` looks up the
+serving provider via `ProviderRegistry.ByModel(model)` and computes
+`inputTokens*inputRate/1000 + outputTokens*outputRate/1000`, counting output
+tokens with the tiktoken tokenizer. When disabled (default), the estimate is
+byte-for-byte identical to the pre-issue-#1183 single-rate path.
+
+`NEXUS_FRONTIER_PROVIDERS` JSON entries accept `inputCostPer1K` and
+`outputCostPer1K` (the flat `costPer1K` still parses and seeds the input rate
+when the split keys are absent). `ProviderConfig` exposes
+`InputCostPer1KUSD()` / `OutputCostPer1KUSD()`; `CostPer1KUSD()` is retained
+as the selector weight. The metrics row surfaces `input_cost_usd` and
+`output_cost_usd` as distinct SQLite columns.
 
 ## Adding new env vars
 
@@ -394,6 +482,7 @@ Key knobs not covered elsewhere (verify defaults in `.env.example`):
 - **`NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT`** (default 5s): max waiter time for concurrent in-flight Embeds; 0 = wait indefinitely (issue #800).
 - **`NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD`** (default 3): consecutive embed failures before RAG circuit trips.
 - **`NEXUS_ARBITER_CACHE_MAX_ENTRIES`** (default 512): LRU cap for arbiter synthesis cache.
+- **`NEXUS_PROBE_NVIDIA_INTERVAL`** (default 0): cadence of the periodic NVIDIA free-VRAM refresh (issue #1178). On NVIDIA-only hosts the AMD sysfs path returns nothing, so without this refresh the VRAM-aware limiter's `FreeVRAMBytes` is frozen at boot. When > 0 (e.g. `5m`), a background goroutine shells out to `nvidia-smi` and republishes the budget so the limiter adapts to model-swap / co-tenant VRAM-grab events. Missing `nvidia-smi` is a silent no-op; 0 = boot-only.
 - **`NEXUS_READINESS_MODE`** (`degraded`|`strict`): `/readyz` returns 503 in `strict` mode when Ollama is degraded or down.
 
 ## `nexus check` exit codes

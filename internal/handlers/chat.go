@@ -44,6 +44,17 @@ type LocalCompletion struct {
 	Output      string
 	LocalModel  string
 	Route       string // routing path that produced this output: "local", "fusion", or "frontier"
+
+	// RAGInjected reports whether a RAG few-shot snippet was injected
+	// into the prompt for this request (issue #1167). Carried through
+	// to the judge so quality scores can be partitioned by
+	// injected=true|false.
+	RAGInjected bool
+
+	// RAGSimilarity is the cosine-similarity score of the best RAG
+	// match (0 when RAG was not injected). Persisted alongside the
+	// judge score for offline retrieval-effectiveness analysis.
+	RAGSimilarity float64
 }
 
 // JudgeObserver is the hook the chat handler invokes when a
@@ -70,6 +81,11 @@ type LatencyEvent struct {
 	LatencySeconds float64
 	TTFTSeconds    float64
 	IsError        bool
+
+	// Trace context for exemplar attachment (issue #1171). Populated
+	// from the root span; empty when tracing is not active.
+	TraceID string
+	SpanID  string
 }
 
 // LatencyObserver is called after each request completes with timing
@@ -103,6 +119,10 @@ type PipelineStageEvent struct {
 	// SLM confidence for histogram recording (issue #425).
 	SLMConfidence float64
 	SLMTaskType   string
+
+	// Trace context for exemplar attachment (issue #1171).
+	TraceID string
+	SpanID  string
 }
 
 // PipelineStageObserver is called after each request completes with
@@ -447,6 +467,13 @@ type MetricsEvent struct {
 	RAGCacheHit      bool // true when the RAG embedding was served from the embed cache (issue #227)
 	EstimatedCostUSD float64
 
+	// InputCostUSD / OutputCostUSD break the EstimatedCostUSD total into
+	// the input-token and output-token components (issue #1183). When
+	// NEXUS_COST_USE_OUTPUT_TOKENS is false the output component is zero
+	// and InputCostUSD equals EstimatedCostUSD (legacy flat-rate path).
+	InputCostUSD  float64
+	OutputCostUSD float64
+
 	// BaselineCostUSD is what the request would have cost at the
 	// configured frontier baseline rate (issue #73). SavingsUSD is
 	// max(BaselineCostUSD - EstimatedCostUSD, 0).
@@ -470,6 +497,13 @@ type MetricsEvent struct {
 	RouteReason   string
 	SLMConfidence float64
 	SLMTaskType   string
+
+	// ArbiterCacheKeyHex + ArbiterSynthesis (issue #1176): populated only
+	// when a fresh arbiter synthesis was computed and cached (route=fusion,
+	// cache miss, non-streaming). Forwarded to the metrics store so a
+	// subsequent boot can pre-warm the cache.
+	ArbiterCacheKeyHex string
+	ArbiterSynthesis   string
 }
 
 // MetricsObserver is the hook the chat handler invokes once per
@@ -676,6 +710,20 @@ type Deps struct {
 		Record(ctx context.Context, cost float64, source string)
 	}
 
+	// BudgetChecker is the pre-routing budget quick-check (issue #1163).
+	// When non-nil the planner checks whether the estimated frontier
+	// cost would exceed the remaining 24h budget BEFORE the DSL stage,
+	// down-tiering to RouteLocal to avoid wasting the SLM call on a
+	// request that would be rejected with 429 at dispatch time. The
+	// dispatch-time SpendGuard.Check remains as a final safety net.
+	// Nil means the pre-routing budget check is disabled (backward
+	// compatible). Typically wired to the same *budget.Guard as
+	// SpendGuard.
+	BudgetChecker interface {
+		Remaining() float64
+		WouldExceed(estimatedCost float64) bool
+	}
+
 	// LocalLimiter bounds concurrent local-route requests (issue
 	// #81). When non-nil the handler Acquires a slot before issuing
 	// the local upstream dispatch and Releases it once the dispatch
@@ -806,6 +854,14 @@ type Deps struct {
 	// circuit breaker metrics are not recorded. The hot path is
 	// unaffected when nil.
 	CircuitBreakerObserver CircuitBreakerObserver
+
+	// RedactionObserver is invoked after the upstream dispatch
+	// completes with the total number of patterns replaced during
+	// this request (issue #1172). When substitutions > 0 the
+	// observer increments nexus_redacted_total. Nil means "no
+	// observer"; the hot path is unaffected and redaction is
+	// disabled regardless of Config settings.
+	RedactionObserver func(profile string, substitutions int64)
 
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
@@ -1025,6 +1081,43 @@ func Chat(d Deps) http.Handler {
 					return
 				}
 				middleware.LogSuspicious(hits, reqID)
+			}
+		}
+
+		// Model aliasing (issue #1184). Resolve the client-requested
+		// model against the configured alias map before routing. When a
+		// match is found the request body's model is rewritten to the
+		// upstream model and the route is forced to frontier using the
+		// target provider's endpoint. In strict mode an unknown model
+		// (no alias and no exact provider match) is rejected with 400.
+		var aliasTarget providers.AliasTarget
+		aliasResolved := false
+		if requestedModel, ok := body["model"].(string); ok && requestedModel != "" {
+			if target, found := providers.ResolveAlias(d.Config.ModelAliases, d.Providers, requestedModel); found {
+				aliasTarget = target
+				aliasResolved = true
+				body["model"] = target.Model
+				trace.Request.ModelRequested = requestedModel // preserve original for trace
+				slog.Info("model alias resolved",
+					slog.String("alias", requestedModel),
+					slog.String("provider", target.ProviderName),
+					slog.String("model", target.Model),
+					slog.String("request_id", reqID),
+				)
+			} else if d.Config.ModelAliasesStrict {
+				// Strict mode: reject when the model matches no alias
+				// and no exact provider model. This prevents silently
+				// forwarding unknown models to the default frontier.
+				if !providers.HasProviderModel(d.Providers, requestedModel) {
+					slog.Info("strict mode rejecting unknown model",
+						slog.String("model", requestedModel),
+						slog.String("request_id", reqID),
+					)
+					recordRejection(RejectionBadRequest)
+					writeJSONError(w, http.StatusBadRequest, ErrTypeInvalidRequest,
+						fmt.Sprintf("Model '%s' is not a known alias or configured provider model", requestedModel))
+					return
+				}
 			}
 		}
 
@@ -1249,6 +1342,8 @@ func Chat(d Deps) http.Handler {
 			SLMCache:             d.SLMCache,
 			ConfidenceThreshold:  d.Config.SLMConfidenceThreshold,
 			ConfidenceErrorHook:  d.ConfidenceErrorHook,
+			Budget:               d.BudgetChecker,
+			FrontierCostPer1K:    d.Config.FrontierCostPer1K,
 		}
 		if d.Config.SLMConfidenceThreshold > 0 && d.Confidence == nil {
 			slog.Warn("planner: ConfidenceThreshold set but no ConfidenceStore — threshold disabled")
@@ -1261,6 +1356,14 @@ func Chat(d Deps) http.Handler {
 		})
 		slmRoutingMs = time.Since(started).Milliseconds() - promptEngineeringMs - ragRetrievalMs - toonCompressionMs
 		route := decision.Route
+
+		// Model aliasing (issue #1184): when an alias was resolved
+		// earlier, force the route to frontier so the request is
+		// dispatched to the target provider regardless of what the
+		// planner decided.
+		if aliasResolved {
+			route = router.RouteFrontier
+		}
 
 		// Surface route-decision metadata on the response and via the
 		// observer hook (issue #74). The four X-Nexus-Route-* headers
@@ -1438,6 +1541,10 @@ func Chat(d Deps) http.Handler {
 		var upErr error
 		var fusionArbiterSkipped bool
 		var fusionJaccardSimilarity float64
+		// fusionArbiterCacheKeyHex / fusionArbiterSynthesis capture the
+		// cache key + synthesis for metrics persistence (issue #1176).
+		// Only set when a fresh synthesis was cached (non-streaming Panel).
+		var fusionArbiterCacheKeyHex, fusionArbiterSynthesis string
 		// toolCallCount is populated from the cascade result on the
 		// local streaming route (issue #72) and forwarded to telemetry
 		// + metrics so the dashboard can report how many tool calls
@@ -1464,6 +1571,37 @@ func Chat(d Deps) http.Handler {
 		// and decide whether to enable captureWriter globally in a
 		// follow-up.
 		var capw *captureWriter
+
+		// Writer chain (outermost first):
+		//   upstream.Write -> ResponseRedactor (issue #1172, when enabled) ->
+		//   captureWriter (judge + quality tee OR debug) ->
+		//   ObservingWriter (telemetry byte count + TTFT + status) ->
+		//   underlying ResponseWriter.
+		//
+		// ResponseRedactor sits between captureWriter and obs so that
+		// captured content (judge samples, debug traces) is also
+		// redacted. When redaction is disabled, redactW aliases obs
+		// and the chain is byte-for-byte identical to the pre-#1172
+		// path.
+		redactW := http.ResponseWriter(obs)
+		var redactor *ResponseRedactor
+		if RedactionEnabled(d.Config.RedactEnabled, d.Config.RedactProfile) && d.RedactionObserver != nil {
+			customRegexes := compileCustomPatternsOrNil(d.Config.RedactPatternsRaw)
+			patterns := PatternsForProfile(d.Config.RedactProfile, customRegexes)
+			bufBytes := d.Config.RedactBufferBytes
+			if bufBytes <= 0 {
+				bufBytes = config.DefaultRedactBufferBytes
+			}
+			redactor = NewResponseRedactor(obs, patterns, 0)
+			redactor.maxBuffer = bufBytes
+			redactW = redactor
+		}
+		rw := redactW
+		if d.JudgeObserver != nil || d.QualityObserver != nil || d.Config.Debug {
+			capw = newCaptureWriter(redactW, d.maxObservedBytes)
+			rw = capw
+		}
+
 		switch route {
 		case router.RouteFusion:
 			slog.Info("starting fusion panel", slog.String("request_id", reqID))
@@ -1502,7 +1640,7 @@ func Chat(d Deps) http.Handler {
 				var outcome upstream.PanelOutcome
 				outcome, upErr = upstream.PanelStreaming(
 					r.Context(),
-					obs, d.Client,
+					redactW, d.Client,
 					d.Config.OllamaURL, d.Config.LocalModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
@@ -1516,6 +1654,8 @@ func Chat(d Deps) http.Handler {
 				)
 				fusionArbiterSkipped = outcome.ArbiterSkipped
 				fusionJaccardSimilarity = outcome.Similarity
+				fusionArbiterCacheKeyHex = outcome.ArbiterCacheKeyHex
+				fusionArbiterSynthesis = outcome.ArbiterSynthesis
 				if d.ArbiterCacheObserver != nil {
 					d.ArbiterCacheObserver(outcome.ArbiterCacheHit)
 				}
@@ -1538,7 +1678,7 @@ func Chat(d Deps) http.Handler {
 				var cacheHit bool
 				outcome, cacheHit, upErr = upstream.Panel(
 					r.Context(),
-					obs, d.Client,
+					redactW, d.Client,
 					d.Config.OllamaURL, d.Config.LocalModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
@@ -1553,6 +1693,8 @@ func Chat(d Deps) http.Handler {
 				if d.ArbiterCacheObserver != nil {
 					d.ArbiterCacheObserver(cacheHit)
 				}
+				fusionArbiterCacheKeyHex = outcome.ArbiterCacheKeyHex
+				fusionArbiterSynthesis = outcome.ArbiterSynthesis
 				if d.FusionOutcomeObserver != nil {
 					d.FusionOutcomeObserver.ObserveFusionOutcome(FusionOutcomeEvent{
 						RequestID:      reqID,
@@ -1653,37 +1795,34 @@ func Chat(d Deps) http.Handler {
 						APIKey: p.APIKey(),
 					})
 				}
-				cas = &upstream.Cascade{Steps: steps, Timeout: d.Config.CascadeTimeout, MaxResponseBytes: d.Config.EffectiveCascadeMaxResponseBytes()}
+				cas = &upstream.Cascade{
+					Steps:              steps,
+					Timeout:            d.Config.CascadeTimeout,
+					TimeoutFloor:       d.Config.CascadeTimeoutFloor,
+					TimeoutCeiling:     d.Config.CascadeTimeoutCeiling,
+					TimeoutPer1kTokens: d.Config.CascadeTimeoutPer1kTokens,
+					MaxResponseBytes:   d.Config.EffectiveCascadeMaxResponseBytes(),
+				}
 			} else {
 				// Legacy path: build cascade from config (frontier + z.ai).
 				cas = upstream.BuildLocalCascade(upstream.CascadeConfig{
-					LocalURL:         d.Config.OllamaURL,
-					LocalModel:       d.Config.LocalModel,
-					FrontierURL:      d.Config.FrontierURL,
-					FrontierModel:    d.Config.FrontierModel,
-					FrontierKey:      d.Config.FrontierKey,
-					ZAIURL:           d.Config.ZAIURL,
-					ZAIModel:         d.Config.ZAIModel,
-					ZAIKey:           d.Config.ZAIKey,
-					Timeout:          d.Config.CascadeTimeout,
-					MaxResponseBytes: d.Config.EffectiveCascadeMaxResponseBytes(),
-					SkipLocal:        skipLocal,
+					LocalURL:           d.Config.OllamaURL,
+					LocalModel:         d.Config.LocalModel,
+					FrontierURL:        d.Config.FrontierURL,
+					FrontierModel:      d.Config.FrontierModel,
+					FrontierKey:        d.Config.FrontierKey,
+					ZAIURL:             d.Config.ZAIURL,
+					ZAIModel:           d.Config.ZAIModel,
+					ZAIKey:             d.Config.ZAIKey,
+					Timeout:            d.Config.CascadeTimeout,
+					TimeoutFloor:       d.Config.CascadeTimeoutFloor,
+					TimeoutCeiling:     d.Config.CascadeTimeoutCeiling,
+					TimeoutPer1kTokens: d.Config.CascadeTimeoutPer1kTokens,
+					MaxResponseBytes:   d.Config.EffectiveCascadeMaxResponseBytes(),
+					SkipLocal:          skipLocal,
 				})
 			}
 
-			// Writer chain (outermost first):
-			//   upstream.Write -> captureWriter (judge + quality tee OR debug) ->
-			//   ObservingWriter (telemetry byte count + TTFT + status) ->
-			//   underlying ResponseWriter.
-			// captureWriter is installed when at least one observer
-			// is set OR debug tracing is on (issue #33); otherwise
-			// the dispatch writes directly through obs with zero
-			// overhead.
-			rw := http.ResponseWriter(obs)
-			if d.JudgeObserver != nil || d.QualityObserver != nil || d.Config.Debug {
-				capw = newCaptureWriter(obs, d.maxObservedBytes)
-				rw = capw
-			}
 			if streaming {
 				// Cascade (issue #14): try local Ollama first, fall
 				// back to configured frontier endpoints (frontier,
@@ -1738,11 +1877,13 @@ func Chat(d Deps) http.Handler {
 					if res.Succeeded && capw != nil {
 						if d.JudgeObserver != nil {
 							d.JudgeObserver.Submit(LocalCompletion{
-								RequestID:   reqID,
-								Instruction: latestPrompt,
-								Output:      capw.Buffer(),
-								LocalModel:  d.Config.LocalModel,
-								Route:       string(route),
+								RequestID:     reqID,
+								Instruction:   latestPrompt,
+								Output:        capw.Buffer(),
+								LocalModel:    d.Config.LocalModel,
+								Route:         string(route),
+								RAGInjected:   ragInjected,
+								RAGSimilarity: ragScore,
 							})
 						}
 						if d.QualityObserver != nil {
@@ -1814,11 +1955,13 @@ func Chat(d Deps) http.Handler {
 					if capw != nil {
 						if d.JudgeObserver != nil {
 							d.JudgeObserver.Submit(LocalCompletion{
-								RequestID:   reqID,
-								Instruction: latestPrompt,
-								Output:      capw.Buffer(),
-								LocalModel:  d.Config.LocalModel,
-								Route:       string(route),
+								RequestID:     reqID,
+								Instruction:   latestPrompt,
+								Output:        capw.Buffer(),
+								LocalModel:    d.Config.LocalModel,
+								Route:         string(route),
+								RAGInjected:   ragInjected,
+								RAGSimilarity: ragScore,
 							})
 						}
 						if d.QualityObserver != nil {
@@ -1844,7 +1987,18 @@ func Chat(d Deps) http.Handler {
 			}
 
 		default:
-			model = d.Config.FrontierModel
+			// Model aliasing (issue #1184): when an alias was resolved,
+			// dispatch to the target provider's endpoint and model
+			// instead of the default frontier config.
+			frontierURL := d.Config.FrontierURL
+			frontierKey := d.Config.FrontierKey
+			if aliasResolved {
+				model = aliasTarget.Model
+				frontierURL = strings.TrimRight(aliasTarget.BaseURL, "/") + "/v1/chat/completions"
+				frontierKey = aliasTarget.APIKey
+			} else {
+				model = d.Config.FrontierModel
+			}
 			// Budget guard: check before frontier dispatch (issue #220).
 			if d.SpendGuard != nil && frontierCost > 0 && d.SpendGuard.Check(r.Context(), frontierCost) {
 				slog.Warn("budget exhausted, rejecting frontier request",
@@ -1861,11 +2015,11 @@ func Chat(d Deps) http.Handler {
 			// BufferedFetch collects the full body and returns a
 			// single chatCompletionResponse JSON object.
 			if streaming {
-				upErr = upstream.Stream(obs, d.Client,
-					d.Config.FrontierURL, d.Config.FrontierKey, body)
+				upErr = upstream.Stream(redactW, d.Client,
+					frontierURL, frontierKey, body)
 			} else {
-				upErr = upstream.BufferedFetch(obs, d.Client,
-					d.Config.FrontierURL, d.Config.FrontierKey, body)
+				upErr = upstream.BufferedFetch(redactW, d.Client,
+					frontierURL, frontierKey, body)
 			}
 			if upErr != nil {
 				if errors.Is(upErr, upstream.ErrUpstreamTruncated) {
@@ -1900,7 +2054,7 @@ func Chat(d Deps) http.Handler {
 			trace.Upstream.Route = string(route)
 			trace.Upstream.Streaming = streaming
 			trace.Upstream.Model = model
-			trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
+			trace.Upstream.TargetHost = HostOfURL(frontierURL)
 			if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
 				rootSpan.SetAttr("ai.model", model)
 				rootSpan.SetAttr("upstream_target", trace.Upstream.TargetHost)
@@ -1920,6 +2074,12 @@ func Chat(d Deps) http.Handler {
 		// truncation used to flip to 0 on fast hardware and
 		// exposed a write race against the recorder's reader.
 		totalMs := float64(time.Since(started).Microseconds()) / 1000.0
+		// Response-content redaction metric (issue #1172). Report the
+		// total substitution count for this request so the observer
+		// can increment nexus_redacted_total.
+		if redactor != nil && d.RedactionObserver != nil {
+			d.RedactionObserver(d.Config.RedactProfile, redactor.Substitutions())
+		}
 		var ttftMs int64
 		if streaming && firstWriteAt.Load() > 0 {
 			ttftMs = time.Unix(0, firstWriteAt.Load()).Sub(started).Milliseconds()
@@ -1933,7 +2093,11 @@ func Chat(d Deps) http.Handler {
 			postCompressionChars := totalMessageChars(messages)
 			savings := totalTokenSavings(preCompressionChars, postCompressionChars)
 			inputTokens := telemetry.EstimateTokens(latestPrompt)
-			cost := frontierCostEstimate(string(route), model, inputTokens, d.Config.FrontierCostPer1K)
+			res := frontierCostEstimate(
+				string(route), model, inputTokens, outputTokens,
+				d.Config.FrontierCostPer1K, d.Config.CostUseOutputTokens, d.Providers,
+			)
+			cost := res.Total
 			baselineCost := baselineCostEstimate(inputTokens+outputTokens, d.Config.CostBaselineRatePer1K)
 			savingsCost := baselineCost - cost
 			if savingsCost < 0 {
@@ -1944,11 +2108,16 @@ func Chat(d Deps) http.Handler {
 			// FrontierCostPer1K. The arbiter prompt is approximately
 			// the latestPrompt plus the two panel responses; we use
 			// inputTokens as a conservative proxy since the streamed
-			// responses are not retained after serving.
+			// responses are not retained after serving. Output tokens
+			// are not counted for the arbiter (its output is folded
+			// into the main response stream) so we pass 0.
 			var fusionArbiterCostUSD float64
 			if route == router.RouteFusion && !fusionArbiterSkipped {
-				fusionArbiterCostUSD = frontierCostEstimate(
-					string(router.RouteFrontier), model, inputTokens, d.Config.FrontierCostPer1K)
+				arb := frontierCostEstimate(
+					string(router.RouteFrontier), model, inputTokens, 0,
+					d.Config.FrontierCostPer1K, d.Config.CostUseOutputTokens, d.Providers,
+				)
+				fusionArbiterCostUSD = arb.Total
 			}
 			tps := telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 			d.MetricsObserver.Submit(MetricsEvent{
@@ -1963,6 +2132,8 @@ func Chat(d Deps) http.Handler {
 				RAGFilename:             ragFilename,
 				RAGCacheHit:             false, // issue #227: EmbedCache tracking not active with CachedEmbedder (issue #115)
 				EstimatedCostUSD:        cost,
+				InputCostUSD:            res.InputCost,
+				OutputCostUSD:           res.OutputCost,
 				BaselineCostUSD:         baselineCost,
 				SavingsUSD:              savingsCost,
 				OutputTokens:            outputTokens,
@@ -1979,6 +2150,8 @@ func Chat(d Deps) http.Handler {
 				RouteReason:             decision.Reason,
 				SLMConfidence:           decision.Confidence,
 				SLMTaskType:             decision.TaskType,
+				ArbiterCacheKeyHex:      fusionArbiterCacheKeyHex,
+				ArbiterSynthesis:        fusionArbiterSynthesis,
 			})
 		}
 		// Both observers receive the record when both are wired (issue #164).
@@ -2005,6 +2178,13 @@ func Chat(d Deps) http.Handler {
 		// LatencyObserver (issue #165): fired after the upstream response
 		// completes so callers can record end-to-end latency histograms.
 		// ttftMs is already computed above; convert to float64 seconds.
+		// Trace context (issue #1171): extract from root span so the
+		// collector can attach exemplars to histogram buckets.
+		var traceID, spanID string
+		if rs, ok := tracing.RootSpanFromContext(r.Context()); ok {
+			traceID = rs.TraceID
+			spanID = rs.SpanID
+		}
 		if d.LatencyObserver != nil {
 			var ttftSecs float64
 			if ttftMs > 0 {
@@ -2019,6 +2199,8 @@ func Chat(d Deps) http.Handler {
 				LatencySeconds: totalMs / 1000.0,
 				TTFTSeconds:    ttftSecs,
 				IsError:        isErr,
+				TraceID:        traceID,
+				SpanID:         spanID,
 			})
 		}
 
@@ -2035,6 +2217,8 @@ func Chat(d Deps) http.Handler {
 				UpstreamFirstByteMs: ttftMs,
 				SLMConfidence:       decision.Confidence,
 				SLMTaskType:         decision.TaskType,
+				TraceID:             traceID,
+				SpanID:              spanID,
 			})
 		}
 
@@ -2463,21 +2647,79 @@ func totalTokenSavings(preChars, postChars int) int {
 	return (preChars - postChars) / 4
 }
 
-// frontierCostEstimate multiplies input tokens by the configured
-// cost-per-1k. Returns zero for non-frontier routes so local +
-// fusion-trail rows count as zero cost in the dashboard.
+// costEstimateResult holds the per-request cost split computed by
+// frontierCostEstimate (issue #1183). Total = InputCost + OutputCost.
+type costEstimateResult struct {
+	Total      float64
+	InputCost  float64
+	OutputCost float64
+}
+
+// frontierCostEstimate multiplies tokens by the configured cost-per-1k
+// and returns the per-direction split (issue #1183). Returns zero for
+// non-frontier routes so local + fusion-trail rows count as zero cost
+// in the dashboard.
+//
+// Legacy path (useOutputTokens == false): computes
+// inputTokens * costPer1KUSD / 1000 byte-for-byte identical to the
+// pre-issue-#1183 estimate; OutputCost is zero and InputCost == Total.
+//
+// Split path (useOutputTokens == true): looks up the serving provider
+// by model in the registry. When found, uses the provider's
+// InputCostPer1K / OutputCostPer1K rates; when no provider matches (or
+// the registry is nil) it falls back to costPer1KUSD as the input rate
+// and a zero output rate. Output tokens are counted via the tiktoken
+// tokenizer (passed in by the caller, which already computed them) so
+// the output stream is costed accurately instead of bytes/4.
 //
 //gitleaks:ignore
-func frontierCostEstimate(route, model string, inputTokens int, costPer1KUSD float64) float64 {
-	// model is reserved for future per-model pricing tables.
-	_ = model
+func frontierCostEstimate(
+	route, model string,
+	inputTokens, outputTokens int,
+	costPer1KUSD float64,
+	useOutputTokens bool,
+	registry *providers.ProviderRegistry,
+) costEstimateResult {
 	if route != string(router.RouteFrontier) {
-		return 0
+		return costEstimateResult{}
 	}
-	if costPer1KUSD <= 0 || inputTokens <= 0 {
-		return 0
+	if costPer1KUSD <= 0 && inputTokens <= 0 {
+		return costEstimateResult{}
 	}
-	return float64(inputTokens) * costPer1KUSD / 1000.0
+
+	// Legacy single-rate estimate (default). Reproduces the
+	// pre-issue-#1183 behaviour exactly so savings numbers are stable
+	// when the operator has not opted into the split model.
+	if !useOutputTokens {
+		if costPer1KUSD <= 0 || inputTokens <= 0 {
+			return costEstimateResult{}
+		}
+		total := float64(inputTokens) * costPer1KUSD / 1000.0
+		return costEstimateResult{Total: total, InputCost: total}
+	}
+
+	// Per-provider split (issue #1183). Resolve input/output rates from
+	// the registry; fall back to the flat config rate for input and a
+	// zero output rate when no provider matches.
+	inputRate := costPer1KUSD
+	outputRate := 0.0
+	if registry != nil {
+		if p := registry.ByModel(model); p != nil {
+			if r := p.InputCostPer1KUSD(); r > 0 {
+				inputRate = r
+			}
+			outputRate = p.OutputCostPer1KUSD()
+		}
+	}
+
+	var in, out float64
+	if inputRate > 0 && inputTokens > 0 {
+		in = float64(inputTokens) * inputRate / 1000.0
+	}
+	if outputRate > 0 && outputTokens > 0 {
+		out = float64(outputTokens) * outputRate / 1000.0
+	}
+	return costEstimateResult{Total: in + out, InputCost: in, OutputCost: out}
 }
 
 // formatConfidence renders a [0,1] confidence as the X-Nexus-Route-

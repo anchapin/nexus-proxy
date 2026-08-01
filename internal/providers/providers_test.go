@@ -382,3 +382,67 @@ func contains(haystack, needle string) bool {
 	}
 	return false
 }
+
+// TestLoadFromEnvProviderType covers the NEXUS_PROVIDER_<NAME>_TYPE field
+// (issue #1185): valid types are stored lowercased, an empty type
+// defaults to openai, and an unknown type fails boot with a clear error.
+func TestLoadFromEnvProviderType(t *testing.T) {
+	t.Run("valid type stored lowercased", func(t *testing.T) {
+		withEnv(t, map[string]string{
+			"NEXUS_PROVIDERS":               "claude",
+			"NEXUS_PROVIDER_CLAUDE_URL":     "https://api.anthropic.com",
+			"NEXUS_PROVIDER_CLAUDE_MODEL":   "claude-opus-4",
+			"NEXUS_PROVIDER_CLAUDE_API_KEY": "sk-test",
+			"NEXUS_PROVIDER_CLAUDE_TYPE":    "Anthropic",
+		})
+		reg, err := LoadFromEnv()
+		if err != nil {
+			t.Fatalf("LoadFromEnv: %v", err)
+		}
+		got, ok := reg.Get("claude")
+		if !ok {
+			t.Fatal("provider claude not found")
+		}
+		if got.Type != AdapterTypeAnthropic {
+			t.Errorf("Type = %q, want anthropic", got.Type)
+		}
+	})
+
+	t.Run("empty type defaults to openai", func(t *testing.T) {
+		withEnv(t, map[string]string{
+			"NEXUS_PROVIDERS":            "oai",
+			"NEXUS_PROVIDER_OAI_URL":     "https://api.openai.com/v1/chat/completions",
+			"NEXUS_PROVIDER_OAI_MODEL":   "gpt-4o",
+			"NEXUS_PROVIDER_OAI_API_KEY": "sk-test",
+			"NEXUS_PROVIDER_OAI_TYPE":    "",
+		})
+		reg, err := LoadFromEnv()
+		if err != nil {
+			t.Fatalf("LoadFromEnv: %v", err)
+		}
+		got, _ := reg.Get("oai")
+		if got.Type != "" && got.Type != AdapterTypeOpenAI {
+			t.Errorf("Type = %q, want empty/openai", got.Type)
+		}
+	})
+
+	t.Run("unknown type fails with clear error", func(t *testing.T) {
+		withEnv(t, map[string]string{
+			"NEXUS_PROVIDERS":            "bad",
+			"NEXUS_PROVIDER_BAD_URL":     "https://example.com",
+			"NEXUS_PROVIDER_BAD_MODEL":   "x",
+			"NEXUS_PROVIDER_BAD_API_KEY": "sk",
+			"NEXUS_PROVIDER_BAD_TYPE":    "cohere",
+		})
+		_, err := LoadFromEnv()
+		if err == nil {
+			t.Fatal("expected error for unknown type")
+		}
+		if !contains(err.Error(), "TYPE") {
+			t.Errorf("error should reference the TYPE var: %v", err)
+		}
+		if !contains(err.Error(), "cohere") {
+			t.Errorf("error should name the bad value: %v", err)
+		}
+	})
+}

@@ -6,6 +6,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -86,6 +87,17 @@ type Config struct {
 	ZAIModel string // "glm-4.6"
 	ZAIKey   string // empty == skipped from cascade
 
+	// Model aliasing (issue #1184). Maps client-requested model names
+	// to "providerName/upstreamModel" so an operator can transparently
+	// remap e.g. "gpt-4" to "anthropic/claude-3-5-sonnet". When a
+	// request's model matches an alias the handler rewrites the body
+	// and routes directly to the target provider. Empty map = disabled
+	// (backward compatible). ModelAliasesStrict, when true, returns
+	// HTTP 400 for a model that matches no alias and no exact provider
+	// model; false (default) passes unknown models through unchanged.
+	ModelAliases       map[string]string // NEXUS_MODEL_ALIASES JSON
+	ModelAliasesStrict bool              // NEXUS_MODEL_ALIASES_STRICT
+
 	// Inbound auth (issue #109). When ProxyAPIKey is non-empty, every
 	// non-exempt endpoint requires a matching Bearer token in the
 	// Authorization header. /healthz and /metrics stay exempt for K8s
@@ -148,6 +160,9 @@ type Config struct {
 	SLMConfidenceThreshold        float64       // hard escalation threshold: local/fusion decisions below this force frontier (default 0.3, issue #301)
 	FusionTimeout                 time.Duration // per-panel-member fetch timeout (120s)
 	CascadeTimeout                time.Duration // per-attempt timeout for cascade fallback (30s)
+	CascadeTimeoutFloor           time.Duration // adaptive floor: minimum per-attempt timeout (5s, issue #1175)
+	CascadeTimeoutCeiling         time.Duration // adaptive ceiling: maximum per-attempt timeout (120s, issue #1175)
+	CascadeTimeoutPer1kTokens     time.Duration // additive per-1k prompt tokens; <=0 disables adaptive (1500ms, issue #1175)
 	ArbiterTimeout                time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
 	// DSL fast-pass patterns (issue #305). DSLFormattingPatterns
@@ -197,6 +212,16 @@ type Config struct {
 	CostBaselineModel     string  // NEXUS_FRONTIER_MODEL (default) or a custom model
 	CostBaselineRatePer1K float64 // USD per 1k tokens for baseline valuation
 
+	// CostUseOutputTokens (issue #1183) switches the per-request cost
+	// estimate from the legacy flat input-only rate to a per-provider
+	// input+output token split. When false (default) the estimate is
+	// byte-for-byte identical to the pre-issue-#1183 behaviour, so a
+	// stock deployment's savings numbers are unaffected. When true the
+	// handler looks up the serving provider's InputCostPer1K /
+	// OutputCostPer1K via the registry and counts output tokens with
+	// the tiktoken tokenizer instead of the bytes/4 heuristic.
+	CostUseOutputTokens bool // true => per-provider input/output cost split (issue #1183)
+
 	// Fusion progressive delivery (issue #48). When enabled and the
 	// harness requests a streaming response, the chat handler
 	// dispatches route=fusion to upstream.PanelStreaming instead of
@@ -220,6 +245,14 @@ type Config struct {
 	// caps memory at a fixed entry count with LRU eviction.
 	ArbiterCacheTTL        time.Duration // NEXUS_ARBITER_CACHE_TTL; default 5m (0 disables)
 	ArbiterCacheMaxEntries int           // NEXUS_ARBITER_CACHE_MAX_ENTRIES; default 512
+
+	// Arbiter cache boot-time pre-warming (issue #1176). When
+	// CacheWarmOnBoot is true, the boot sequence queries the SQLite
+	// metrics store for recent arbiter syntheses still within the cache
+	// TTL and loads them into the arbiter cache, cutting cold-start
+	// latency. CacheWarmLimit caps the number of entries queried.
+	CacheWarmOnBoot bool // NEXUS_CACHE_WARM_ON_BOOT; default false (opt-in)
+	CacheWarmLimit  int  // NEXUS_CACHE_WARM_LIMIT; default 256
 
 	// Judge-guided adaptive routing (issue #47). Historical judge
 	// scores are aggregated by task category in a SQLite table and fed
@@ -268,6 +301,14 @@ type Config struct {
 	// which the probe treats free VRAM as 0 and forces the static
 	// guardrail (issue #597). 0 disables the thermal check.
 	ProbeThermalThreshold int // GPU temp (°C) threshold; default 90, 0 disables
+	// ProbeNVIDIAInterval is the cadence of the periodic NVIDIA
+	// free-VRAM refresh (issue #1178). On NVIDIA-only hosts the AMD
+	// sysfs path returns nothing, so without this refresh the
+	// budget's FreeVRAMBytes — read on every Acquire by the
+	// concurrency limiter — would stay frozen at boot for the whole
+	// process lifetime. Zero (default) keeps the boot-only behaviour
+	// (nvidia-smi is invoked once at boot and by `nexus check`).
+	ProbeNVIDIAInterval time.Duration // periodic nvidia-smi refresh; 0 disables
 
 	// Local-route concurrency ceiling (issue #81). The limiter bounds
 	// in-flight local-route requests so a small GPU does not OOM under
@@ -463,6 +504,18 @@ type Config struct {
 	ModelsEndpointEnabled bool
 	ModelsCacheTTL        time.Duration
 
+	// Built-in web dashboard (issue #1182). When DashboardEndpointEnabled
+	// is true the proxy serves GET <DashboardEndpoint> — a self-contained
+	// HTML page (inline CSS/JS, no external assets) rendering savings and
+	// routing metrics from the SQLite metrics store. Disabled by default
+	// so a stock deployment exposes no extra surface. DashboardPublic
+	// mirrors StatusPublic: when true the route bypasses inbound auth
+	// (handy for an operator-only LAN). When false (default) the route is
+	// gated by NEXUS_PROXY_API_KEY exactly like /status.
+	DashboardEndpointEnabled bool
+	DashboardEndpoint        string
+	DashboardPublic          bool
+
 	// Trusted-proxy enforcement + rate limiting (issue #75).
 	//
 	// TrustedProxies is the parsed CIDR allowlist sourced from
@@ -499,6 +552,12 @@ type Config struct {
 	// bounds separately (issue #742). Zero or negative falls back to
 	// DefaultMaxResponseBytes.
 	CascadeMaxResponseBytes int
+
+	// PoolBufferMaxBytes is the maximum capacity a pooled *bytes.Buffer
+	// may retain to be returned to the sync.Pool (issue #1177). Buffers
+	// that grew beyond this are discarded so a single huge response never
+	// pins pool memory. Default 1 MiB. Zero or negative disables pooling.
+	PoolBufferMaxBytes int
 
 	// Auth brute-force protection (issue #296). Tracks per-client-IP
 	// auth failures and blocks the client after AuthRateLimitBurst
@@ -538,6 +597,59 @@ type Config struct {
 	// traced request's context carries trace_id and span_id attributes.
 	// Default true so operators get log-to-trace correlation by default.
 	LogTraceID bool
+
+	// MetricsExemplars controls whether histogram buckets carry OTLP
+	// trace exemplars in the Prometheus exposition (issue #1171).
+	// When true, non-+Inf bucket lines carry a
+	// `# {trace_id="...",span_id="..."} <value>` suffix so Grafana
+	// can link latency outliers to the trace that produced them.
+	// Defaults to true when NEXUS_TRACING_ENDPOINT is set.
+	MetricsExemplars bool
+
+	// Response-content redaction (issue #1172). When RedactEnabled is
+	// true and RedactProfile is one of {secrets, pii, custom}, the chat
+	// handler wraps the response writer with a ResponseRedactor that
+	// scans every write against the profile's regex set and replaces
+	// matches with [REDACTED]. Disabled by default (RedactEnabled=false)
+	// so a stock deployment is byte-for-byte identical to the pre-#1172
+	// behaviour.
+	//
+	// RedactProfile selects the built-in pattern set ("secrets" for
+	// bearer tokens / private keys, "pii" for credit cards / SSNs /
+	// emails) or "custom" to use operator-supplied regexes from
+	// RedactPatternsRaw.
+	//
+	// RedactBufferBytes caps the rolling buffer used for cross-chunk
+	// multi-line pattern matching (e.g. PEM private keys split across
+	// SSE chunks). Defaults to 4096.
+	RedactEnabled     bool
+	RedactProfile     string
+	RedactPatternsRaw string
+	RedactBufferBytes int
+
+	// SSRF egress guard (issue #1174). When EgressGuardEnabled is true
+	// (the default), the shared HTTP client rejects redirects and
+	// dial-time connections to private, loopback, and link-local IP
+	// ranges — preventing server-side request forgery via upstream
+	// redirect chains. EgressAllowCIDRs is an operator-supplied
+	// comma-separated CIDR allowlist that overrides the block list,
+	// so local-Ollama deployments can permit 127.0.0.0/8 while still
+	// blocking other private ranges.
+	EgressGuardEnabled bool
+	EgressAllowCIDRs   string // raw comma-separated CIDR string from env/YAML
+
+	// Secret management (issue #1173). SecretBackend selects the credential
+	// resolution backend: "env" (default, backward-compatible), "vault", or
+	// "awssm". When a non-env backend is selected, config.Load consults the
+	// external store before falling back to env vars, and an unreachable
+	// configured backend causes boot to fail (fail-closed).
+	SecretBackend string
+	VaultAddr     string
+	VaultToken    string
+	VaultRole     string
+	VaultPath     string
+	AWSSMPrefix   string
+	SecretRefresh time.Duration
 }
 
 // DefaultMetricsDBPath returns the canonical metrics DB location:
@@ -680,6 +792,20 @@ func Load() (Config, error) {
 	cfg.ZAIModel = getFileString("zai_model", "NEXUS_ZAI_MODEL", "glm-4.6")
 	cfg.ZAIKey = getEnv("NEXUS_ZAI_API_KEY", "")        // secrets via env only
 	cfg.ProxyAPIKey = getEnv("NEXUS_PROXY_API_KEY", "") // secrets via env only
+
+	// Secret-manager backend configuration (issue #1173). These are always
+	// read from env — they configure the resolver itself, not secrets.
+	cfg.SecretBackend = getEnv("NEXUS_SECRET_BACKEND", "env")
+	cfg.VaultAddr = getEnv("NEXUS_VAULT_ADDR", "")
+	cfg.VaultToken = getEnv("NEXUS_VAULT_TOKEN", "")
+	cfg.VaultRole = getEnv("NEXUS_VAULT_ROLE", "")
+	cfg.VaultPath = getEnv("NEXUS_VAULT_PATH", "secret")
+	cfg.AWSSMPrefix = getEnv("NEXUS_AWSSM_PREFIX", "")
+	secretRefresh, err := getEnvDuration("NEXUS_SECRET_REFRESH", 0)
+	if err != nil {
+		return cfg, fmt.Errorf("config: NEXUS_SECRET_REFRESH: %w", err)
+	}
+	cfg.SecretRefresh = secretRefresh
 	cfg.StatusPublic = getFileBool("status_public", "NEXUS_STATUS_PUBLIC", false)
 	cfg.ExamplesDir = getFileString("examples_dir", "NEXUS_EXAMPLES_DIR", "./few_shot_examples")
 	cfg.MetaPrompt = defaultMetaPrompt
@@ -927,6 +1053,29 @@ func Load() (Config, error) {
 	}
 	cfg.CascadeTimeout = cascadeTimeout
 
+	// Adaptive cascade per-attempt timeout (issue #1175). Scales the
+	// timeout by prompt token count instead of a single fixed value:
+	// clamp(floor + per1k * tokens/1000, floor, ceiling). When
+	// PER_1K_TOKENS <= 0 the fixed NEXUS_CASCADE_TIMEOUT is used
+	// (backward compatible).
+	cascadeFloor, err := getEnvDuration("NEXUS_CASCADE_TIMEOUT_FLOOR", 5*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.CascadeTimeoutFloor = cascadeFloor
+
+	cascadeCeiling, err := getEnvDuration("NEXUS_CASCADE_TIMEOUT_CEILING", 120*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.CascadeTimeoutCeiling = cascadeCeiling
+
+	cascadePer1k, err := getEnvDuration("NEXUS_CASCADE_TIMEOUT_PER_1K_TOKENS", 1500*time.Millisecond)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.CascadeTimeoutPer1kTokens = cascadePer1k
+
 	// Fusion arbiter synthesis (issue #12). Shorter than FusionTimeout
 	// because the arbiter is doing synthesis, not generation — a slow
 	// arbiter should not pin the whole request indefinitely.
@@ -1010,7 +1159,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if tailWeight < 0 || tailWeight > 1 {
-		return cfg, fmt.Errorf("config: NEXUS_PROVIDER_TAIL_WEIGHT must be in [0,1], got %v", tailWeight)
+		return cfg, configError("NEXUS_PROVIDER_TAIL_WEIGHT", "must be a number in [0,1]", os.Getenv("NEXUS_PROVIDER_TAIL_WEIGHT"), strconv.FormatFloat(0.0, 'f', -1, 64))
 	}
 	cfg.ProviderTailWeight = tailWeight
 
@@ -1053,6 +1202,12 @@ func Load() (Config, error) {
 	}
 	cfg.CostBaselineRatePer1K = baselineRate
 
+	// Per-provider cost model with input/output token split (issue #1183).
+	// Defaults to false so the per-request estimate stays byte-for-byte
+	// identical to the legacy flat input-only rate. Operators opt in to
+	// the richer per-provider model that counts output tokens separately.
+	cfg.CostUseOutputTokens = getEnvBool("NEXUS_COST_USE_OUTPUT_TOKENS", false)
+
 	// Fusion progressive delivery (issue #48). Defaults to ON so a
 	// stock `.env.example` boots into the new behaviour; operators
 	// who want to opt out (e.g. to A/B test against the old
@@ -1087,6 +1242,21 @@ func Load() (Config, error) {
 		arbiterCacheMax = 0
 	}
 	cfg.ArbiterCacheMaxEntries = arbiterCacheMax
+
+	// Arbiter cache boot-time pre-warming (issue #1176). Opt-in: the
+	// default is false so boot is byte-for-byte identical to pre-#1176
+	// behaviour. When true the boot sequence queries the SQLite metrics
+	// store for recent arbiter syntheses within the cache TTL window.
+	cfg.CacheWarmOnBoot = getEnvBool("NEXUS_CACHE_WARM_ON_BOOT", false)
+
+	cacheWarmLimit, err := getEnvInt("NEXUS_CACHE_WARM_LIMIT", 256)
+	if err != nil {
+		return cfg, err
+	}
+	if cacheWarmLimit < 0 {
+		cacheWarmLimit = 0
+	}
+	cfg.CacheWarmLimit = cacheWarmLimit
 
 	// Judge-guided adaptive routing (issue #47). Defaults keep the
 	// feature dormant unless the judge is enabled and a DB path is
@@ -1250,6 +1420,20 @@ func Load() (Config, error) {
 	}
 	cfg.ProbeThermalThreshold = probeThermal
 
+	// Periodic NVIDIA free-VRAM refresh (issue #1178). The default
+	// of 0 keeps the boot-only nvidia-smi behaviour; a positive
+	// duration arms a background goroutine in the probe Manager that
+	// republishes the budget so the VRAM-aware limiter adapts to
+	// model-swap and co-tenant VRAM-grab events on NVIDIA-only hosts.
+	probeNVIDIAInterval, err := getEnvDuration("NEXUS_PROBE_NVIDIA_INTERVAL", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if probeNVIDIAInterval < 0 {
+		probeNVIDIAInterval = 0
+	}
+	cfg.ProbeNVIDIAInterval = probeNVIDIAInterval
+
 	// Local-route concurrency ceiling (issue #81). The limiter is
 	// dormant unless the operator sets NEXUS_LOCAL_MAX_CONCURRENT
 	// above zero, so a stock deployment is byte-for-byte identical to
@@ -1309,7 +1493,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if readTimeout < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_SERVER_READ_TIMEOUT must not be negative, got %s", readTimeout)
+		return cfg, configError("NEXUS_SERVER_READ_TIMEOUT", "must not be negative", os.Getenv("NEXUS_SERVER_READ_TIMEOUT"), DefaultServerReadTimeout.String())
 	}
 	cfg.ReadTimeout = readTimeout
 
@@ -1318,7 +1502,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if writeTimeout < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_SERVER_WRITE_TIMEOUT must not be negative, got %s", writeTimeout)
+		return cfg, configError("NEXUS_SERVER_WRITE_TIMEOUT", "must not be negative", os.Getenv("NEXUS_SERVER_WRITE_TIMEOUT"), DefaultServerWriteTimeout.String())
 	}
 	cfg.WriteTimeout = writeTimeout
 
@@ -1327,7 +1511,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if idleTimeout < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_SERVER_IDLE_TIMEOUT must not be negative, got %s", idleTimeout)
+		return cfg, configError("NEXUS_SERVER_IDLE_TIMEOUT", "must not be negative", os.Getenv("NEXUS_SERVER_IDLE_TIMEOUT"), DefaultServerIdleTimeout.String())
 	}
 	cfg.IdleTimeout = idleTimeout
 
@@ -1336,7 +1520,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if maxHeader < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_SERVER_MAX_HEADER_BYTES must not be negative, got %d", maxHeader)
+		return cfg, configError("NEXUS_SERVER_MAX_HEADER_BYTES", "must not be negative", os.Getenv("NEXUS_SERVER_MAX_HEADER_BYTES"), strconv.Itoa(DefaultServerMaxHeaderBytes))
 	}
 	cfg.MaxHeaderBytes = maxHeader
 
@@ -1364,7 +1548,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if shutdownTimeout < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_SHUTDOWN_TIMEOUT must not be negative, got %s", shutdownTimeout)
+		return cfg, configError("NEXUS_SHUTDOWN_TIMEOUT", "must not be negative", os.Getenv("NEXUS_SHUTDOWN_TIMEOUT"), DefaultShutdownTimeout.String())
 	}
 	if shutdownTimeout == 0 {
 		shutdownTimeout = DefaultShutdownTimeout
@@ -1451,11 +1635,9 @@ func Load() (Config, error) {
 	}
 	cfg.QualityStderrCap = stderrCap
 
-	// Backward-compat alias (issue #924)
-	if v := os.Getenv("NEXUS_QUALITY_DROPED_RING_SIZE"); v != "" {
-		slog.Warn("NEXUS_QUALITY_DROPED_RING_SIZE is deprecated; use NEXUS_QUALITY_DROPPED_RING_SIZE",
-			slog.String("component", "config"))
-	}
+	// Deprecated-key warnings are emitted centrally via the registry
+	// (issue #1180). The #924 alias (NEXUS_QUALITY_DROPED_RING_SIZE)
+	// is tracked there; value parsing still reads the current name.
 	droppedRingSize, err := getEnvInt("NEXUS_QUALITY_DROPPED_RING_SIZE", 256)
 	if err != nil {
 		return cfg, err
@@ -1497,6 +1679,31 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.ModelsCacheTTL = modelsCacheTTL
+
+	// Model aliasing (issue #1184). NEXUS_MODEL_ALIASES is a JSON map
+	// of client-requested model names to "providerName/upstreamModel".
+	// Empty/unset = disabled (backward compatible). Invalid JSON fails
+	// boot so an operator typo does not silently pass models through.
+	if raw := os.Getenv("NEXUS_MODEL_ALIASES"); raw != "" {
+		var aliases map[string]string
+		if err := json.Unmarshal([]byte(raw), &aliases); err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_MODEL_ALIASES: %w", err)
+		}
+		cfg.ModelAliases = aliases
+	}
+	cfg.ModelAliasesStrict = parseBoolEnv("NEXUS_MODEL_ALIASES_STRICT", false)
+
+	// Built-in web dashboard (issue #1182). Disabled by default so a
+	// stock deployment exposes no extra HTTP surface; opt in with
+	// NEXUS_DASHBOARD_ENDPOINT=true. The endpoint path defaults to
+	// /dashboard. NEXUS_DASHBOARD_PUBLIC mirrors NEXUS_STATUS_PUBLIC:
+	// when true the route bypasses the inbound auth gate.
+	cfg.DashboardEndpointEnabled = parseBoolEnv("NEXUS_DASHBOARD_ENDPOINT", false)
+	cfg.DashboardEndpoint = getEnvAllowEmpty("NEXUS_DASHBOARD_PATH", "/dashboard")
+	if cfg.DashboardEndpoint == "" {
+		cfg.DashboardEndpoint = "/dashboard"
+	}
+	cfg.DashboardPublic = parseBoolEnv("NEXUS_DASHBOARD_PUBLIC", false)
 
 	// Prompt-injection hardening (issue #76). Defaults to warn so a
 	// stock deployment logs injection attempts out of the box.
@@ -1615,6 +1822,14 @@ func Load() (Config, error) {
 	}
 	cfg.CascadeMaxResponseBytes = cascadeMaxRespBytes
 
+	// PoolBufferMaxBytes caps retained pooled buffer capacity (issue
+	// #1177). Default 1 MiB; zero or negative disables pooling entirely.
+	poolBufMax, err := getEnvInt("NEXUS_POOL_BUFFER_MAX_BYTES", DefaultPoolBufferMaxBytes)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.PoolBufferMaxBytes = poolBufMax
+
 	// Auth brute-force protection (issue #296). Defaults: RPM 5, burst 3,
 	// window 5 min. When RPM <= 0 the limiter is disabled so a stock
 	// deployment with no NEXUS_AUTH_RATE_LIMIT_RPM is byte-for-byte
@@ -1662,7 +1877,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if tracingTimeout < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT must not be negative, got %s", tracingTimeout)
+		return cfg, configError("NEXUS_TRACING_TIMEOUT", "must not be negative", os.Getenv("NEXUS_TRACING_TIMEOUT"), DefaultTracingTimeout.String())
 	}
 	cfg.TracingTimeout = tracingTimeout
 
@@ -1694,10 +1909,41 @@ func Load() (Config, error) {
 	// get log-to-trace correlation by default when tracing is enabled.
 	cfg.LogTraceID = getEnvBool("NEXUS_LOG_TRACE_ID", true)
 
+	// Metrics exemplars (issue #1171). Defaults to true when tracing
+	// is active (TracingEndpoint set) so operators get exemplars
+	// automatically; explicitly false when tracing is off.
+	cfg.MetricsExemplars = getEnvBool("NEXUS_METRICS_EXEMPLARS", cfg.TracingEndpoint != "")
+
+	// Response-content redaction (issue #1172).
+	cfg.RedactEnabled = getEnvBool("NEXUS_REDACT_ENABLED", false)
+	cfg.RedactProfile = getEnv("NEXUS_REDACT_PROFILE", RedactProfileDefault)
+	cfg.RedactPatternsRaw = getEnvAllowEmpty("NEXUS_REDACT_PATTERNS", "")
+
+	redactBuffer, err := getEnvInt("NEXUS_REDACT_BUFFER_BYTES", DefaultRedactBufferBytes)
+	if err != nil {
+		return cfg, err
+	}
+	if redactBuffer < 0 {
+		redactBuffer = DefaultRedactBufferBytes
+	}
+	cfg.RedactBufferBytes = redactBuffer
+
+	// SSRF egress guard (issue #1174). Defaults to enabled=true so a
+	// stock deployment is protected out of the box. The allowlist
+	// defaults to empty (no override); operators running local Ollama
+	// should set NEXUS_EGRESS_ALLOW=127.0.0.0/8 to permit loopback.
+	cfg.EgressGuardEnabled = getEnvBool("NEXUS_EGRESS_BLOCK_PRIVATE", true)
+	cfg.EgressAllowCIDRs = getEnvAllowEmpty("NEXUS_EGRESS_ALLOW", "")
+
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}
 	ValidateShutdownTimeout(cfg)
+
+	// Emit structured warnings for any deprecated env vars that are set
+	// (issue #1180). Advisory only — does not alter parsed values.
+	WarnDeprecatedEnv()
+
 	return cfg, nil
 }
 
@@ -1710,7 +1956,22 @@ func (c Config) Validate() error {
 	case "strict", "degraded":
 		// Recognised values.
 	default:
-		return fmt.Errorf("config: NEXUS_READINESS_MODE value %q is not recognised; want \"strict\" or \"degraded\"", c.ReadinessMode)
+		return configError("NEXUS_READINESS_MODE", `must be "strict" or "degraded"`, c.ReadinessMode, "degraded")
+	}
+	switch c.SecretBackend {
+	case "", "env", "vault", "awssm":
+		// Recognised values.
+	default:
+		return fmt.Errorf("config: NEXUS_SECRET_BACKEND value %q is not recognised; want \"env\", \"vault\", or \"awssm\"", c.SecretBackend)
+	}
+	switch c.RedactProfile {
+	case "off", "secrets", "pii", "custom":
+		// Recognised values.
+	default:
+		return fmt.Errorf("config: NEXUS_REDACT_PROFILE value %q is not recognised; want \"off\", \"secrets\", \"pii\", or \"custom\"", c.RedactProfile)
+	}
+	if c.RedactProfile == "custom" && c.RedactPatternsRaw == "" {
+		return fmt.Errorf("config: NEXUS_REDACT_PROFILE is \"custom\" but NEXUS_REDACT_PATTERNS is empty; supply comma-separated regex patterns")
 	}
 	return nil
 }
@@ -1825,6 +2086,12 @@ const DefaultMaxBodyBytes = 1 << 20 // 1 MiB
 // preventing memory exhaustion from a malicious upstream.
 const DefaultMaxResponseBytes = 64 << 20 // 64 MiB
 
+// DefaultPoolBufferMaxBytes is the default retention cap for pooled
+// response-body buffers (issue #1177). 1 MiB is generous for typical
+// multi-KiB completions while preventing a single huge response from
+// pinning pool memory. Zero or negative disables pooling entirely.
+const DefaultPoolBufferMaxBytes = 1 << 20 // 1 MiB
+
 // EffectiveMaxBodyBytes returns the request-body cap the chat handler should
 // enforce. Zero or negative values fall back to DefaultMaxBodyBytes so a
 // zero-value Config (e.g. inside unit tests) still gets a sane cap.
@@ -1869,6 +2136,16 @@ const DefaultDebugBodyBytes = 512
 // only affects the dynamic shrink path; when the probe is unavailable
 // the full NEXUS_LOCAL_MAX_CONCURRENT ceiling is used regardless.
 const DefaultLocalVRAMBytesPerSlot int64 = 2 << 30 // 2 GiB
+
+// Redaction defaults (issue #1172).
+const (
+	// RedactProfileDefault is the default profile when NEXUS_REDACT_PROFILE
+	// is unset. "off" disables redaction entirely.
+	RedactProfileDefault = "off"
+	// DefaultRedactBufferBytes is the default rolling buffer cap for
+	// cross-chunk multi-line pattern matching.
+	DefaultRedactBufferBytes = 4 * 1024
+)
 
 // EffectiveDebugBodyBytes returns the response-body preview cap the
 // debug trace should honour. Zero or negative falls back to
@@ -1995,7 +2272,7 @@ func parseTrustedProxies(raw string) ([]*net.IPNet, error) {
 			}
 			continue
 		}
-		return nil, fmt.Errorf("config: invalid NEXUS_TRUSTED_PROXIES entry %q (expected CIDR or IP)", p)
+		return nil, fmt.Errorf("config: invalid NEXUS_TRUSTED_PROXIES entry %q (expected CIDR or IP); see .env.example", p)
 	}
 	return out, nil
 }
@@ -2227,6 +2504,24 @@ func getEnv(key, def string) string {
 	return def
 }
 
+// configError renders an actionable config-validation error (issue #1181).
+// The message bundles the offending env var, a human-readable constraint,
+// the raw value the operator supplied, the safe default, and a pointer to
+// .env.example so the fix is self-evident without reading the source:
+//
+//	config: NEXUS_SERVER_READ_TIMEOUT must not be negative; got "-5s".
+//	        Unset the var to use the default (30s); see .env.example
+//
+// The result is a plain error (not a custom type) so the existing error
+// contract is preserved — callers assert on err != nil or substrings, and
+// wrapping the underlying parse error (%w) keeps errors.Is working.
+func configError(key, constraint, gotValue, defaultStr string) error {
+	return fmt.Errorf(
+		"config: %s %s; got %q. Unset the var to use the default (%s); see .env.example",
+		key, constraint, gotValue, defaultStr,
+	)
+}
+
 // parseInjectionScanRoles canonicalises the comma-separated role list
 // from NEXUS_INJECTION_SCAN_ROLES (issue #481). It lower-cases, trims,
 // deduplicates, and keeps only recognised roles ("system", "user"). An
@@ -2278,7 +2573,7 @@ func getEnvInt(key string, def int) (int, error) {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return 0, fmt.Errorf("config: %s must be an integer: %w", key, err)
+		return 0, configError(key, "must be an integer", v, strconv.Itoa(def))
 	}
 	return n, nil
 }
@@ -2306,7 +2601,7 @@ func getEnvFloat(key string, def float64) (float64, error) {
 	}
 	f, err := strconv.ParseFloat(v, 64)
 	if err != nil {
-		return 0, fmt.Errorf("config: %s must be a number: %w", key, err)
+		return 0, configError(key, "must be a number", v, strconv.FormatFloat(def, 'f', -1, 64))
 	}
 	return f, nil
 }
@@ -2318,7 +2613,7 @@ func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
-		return 0, fmt.Errorf("config: %s must be a duration (e.g. 8s, 2m): %w", key, err)
+		return 0, configError(key, `must be a Go duration string (e.g. "8s", "2m")`, v, def.String())
 	}
 	return d, nil
 }
@@ -2345,7 +2640,7 @@ func getEnvRegexps(key string, defaultPattern string) ([]*regexp.Regexp, error) 
 		}
 		re, err := regexp.Compile(p)
 		if err != nil {
-			return nil, fmt.Errorf("config: %s pattern %q is not a valid regex: %w", key, p, err)
+			return nil, fmt.Errorf("config: %s pattern %q is not a valid regex: %w. Unset the var to restore the built-in default; see .env.example", key, p, err)
 		}
 		result = append(result, re)
 	}
@@ -2409,7 +2704,7 @@ func parseLogLevel(raw string) (slog.Level, error) {
 	case "", "info":
 		return slog.LevelInfo, nil
 	default:
-		return slog.LevelInfo, fmt.Errorf("config: invalid NEXUS_LOG_LEVEL %q", raw)
+		return slog.LevelInfo, fmt.Errorf("config: invalid NEXUS_LOG_LEVEL %q; want debug, info, warn, or error; see .env.example", raw)
 	}
 }
 

@@ -63,6 +63,14 @@ const (
 	// This is a hard override — the SLM made a decision but the low
 	// confidence signal triggered an automatic escalation.
 	SourceSLMEscalation DecisionSource = "slm-escalation"
+
+	// SourceBudgetDownTier (issue #1163) means the planner down-tiered
+	// to RouteLocal because the estimated frontier cost would exceed
+	// the remaining 24h budget. This fires between the guardrail and
+	// DSL stages — the VRAM guardrail always wins precedence. The
+	// dispatch-time SpendGuard.Check remains as a final safety net
+	// (race guard) since budget can change between routing and dispatch.
+	SourceBudgetDownTier DecisionSource = "budget-down-tier"
 )
 
 // TraceReason returns the stable machine-readable trace label for a decision source:
@@ -84,6 +92,8 @@ func (s DecisionSource) TraceReason() string {
 		return "slm-no-client"
 	case SourceSLMEscalation:
 		return "slm-low-confidence"
+	case SourceBudgetDownTier:
+		return "budget-down-tier"
 	default:
 		return "slm"
 	}
@@ -158,6 +168,20 @@ type SLMDecider interface {
 	DecideWithConfidence(ctx context.Context, prompt string, confidence float64) (Route, error)
 }
 
+// BudgetChecker is the minimal interface the planner needs from the
+// budget guard to decide whether a frontier/fusion dispatch would
+// exceed the remaining 24h spend cap (issue #1163). *budget.Guard
+// satisfies it; tests substitute a stub.
+type BudgetChecker interface {
+	// Remaining returns the USD remaining in the rolling 24h window.
+	// Returns 0 (or negative) when the guard is disabled or over budget.
+	Remaining() float64
+	// WouldExceed reports whether recording a frontier call of the
+	// given estimated cost would exceed the daily budget. Returns
+	// false when the guard has no limit configured (disabled).
+	WouldExceed(estimatedCost float64) bool
+}
+
 // Planner is the single route-planning seam (issue #82). Construct one
 // per request (or reuse — it holds no mutable state) and call Plan to
 // get a Decision. The planner is pure logic: it performs SLM HTTP calls
@@ -221,6 +245,25 @@ type Planner struct {
 	// (issue #927). The hook logs at Warn level and increments the
 	// nexus_confidence_errors_total counter. Nil is a safe no-op.
 	ConfidenceErrorHook func(category string, err error)
+
+	// Budget is the optional 24h spend guard (issue #1163). When
+	// non-nil the planner checks whether the estimated frontier cost
+	// would exceed the remaining budget BEFORE the DSL stage. If it
+	// would, the planner down-tiers to RouteLocal with Source
+	// SourceBudgetDownTier — but only when the guardrail has not
+	// already forced frontier (VRAM protection always wins).
+	// When nil (budget enforcement disabled) this stage is skipped
+	// entirely and routing is byte-for-byte identical to pre-#1163
+	// behaviour.
+	Budget BudgetChecker
+
+	// FrontierCostPer1K is the USD cost per 1K input tokens used to
+	// estimate the frontier dispatch cost for the budget check. When
+	// Budget is nil this field is unused. When Budget is non-nil and
+	// FrontierCostPer1K <= 0 the planner falls back to a token-count
+	// heuristic (1 token ≈ 1 microcent, i.e. cost = tokens / 1e6) so
+	// a misconfigured cost still produces a conservative estimate.
+	FrontierCostPer1K float64
 }
 
 // PlanRequest carries the per-request inputs the planner needs. The
@@ -274,6 +317,34 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 			EstimatedTokens: estimatedTokens,
 			BudgetSource:    req.GuardrailSource,
 			BudgetTokens:    req.GuardrailBudget,
+		}
+	}
+
+	// Stage 1b: Budget-aware down-tier (issue #1163).
+	//
+	// When a BudgetChecker is wired and the estimated frontier cost
+	// would exceed the remaining 24h budget, the planner down-tiers
+	// to RouteLocal instead of routing to frontier/fusion (which
+	// would then be rejected with 429 at dispatch time, wasting the
+	// SLM call). This fires AFTER the guardrail (VRAM protection
+	// always wins) but BEFORE the DSL fast-pass so that obvious
+	// local/fusion matches still take their normal path — only
+	// requests that would have gone to frontier are down-tiered.
+	//
+	// The dispatch-time SpendGuard.Check remains as a final safety
+	// net because the budget can change between routing and dispatch.
+	if p.Budget != nil {
+		cost := estimateFrontierCost(estimatedTokens, p.FrontierCostPer1K)
+		if cost > 0 && p.Budget.WouldExceed(cost) {
+			return Decision{
+				Route:           RouteLocal,
+				Source:          SourceBudgetDownTier,
+				Reason:          "budget-exhausted",
+				Confidence:      NeutralConfidence,
+				EstimatedTokens: estimatedTokens,
+				BudgetSource:    req.GuardrailSource,
+				BudgetTokens:    req.GuardrailBudget,
+			}
 		}
 	}
 
@@ -457,3 +528,15 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 // Compile-time assertion: *SLMClient satisfies SLMDecider so the handler
 // can pass it directly to the Planner without an adapter.
 var _ SLMDecider = (*SLMClient)(nil)
+
+// estimateFrontierCost converts a token count into an estimated USD cost
+// using the configured cost-per-1K rate. When the rate is zero or
+// negative (misconfigured) a conservative microcent heuristic is used
+// (1 token ≈ 1 microcent) so the budget check still fires on very
+// large prompts.
+func estimateFrontierCost(tokens int, costPer1K float64) float64 {
+	if costPer1K <= 0 {
+		return float64(tokens) / 1e6
+	}
+	return float64(tokens) * costPer1K / 1000.0
+}
