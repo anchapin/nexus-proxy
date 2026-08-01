@@ -14,7 +14,7 @@ LINT        ?= golangci-lint
 VERSION     ?= dev
 LDFLAGS     := -s -w -X main.version=$(VERSION)
 
-.PHONY: help build run test test-race bench bench-short bench-baseline vet fmt lint tidy ci clean docker-build install-hooks
+.PHONY: help build run test test-race bench bench-short bench-baseline vet fmt lint tidy ci clean docker-build install-hooks release release-snapshot
 
 help:
 	@echo "Targets:"
@@ -33,6 +33,8 @@ help:
 	@echo "  docker-build - build the container image (smoke; needs Docker)"
 	@echo "  clean       - remove ./bin/ and coverage files"
 	@echo "  install-hooks - install git pre-commit hook (gofmt check)"
+	@echo "  release     - run goreleaser release (requires tag + secrets)"
+	@echo "  release-snapshot - dry-run goreleaser locally (no upload)"
 
 build:
 	@mkdir -p bin
@@ -102,3 +104,21 @@ clean:
 install-hooks:
 	git config core.hooksPath .githooks
 	chmod +x .githooks/pre-commit
+
+# release and release-snapshot wrap GoReleaser (issue #1179). The
+# Homebrew formula is generated from .goreleaser.yml and pushed to
+# anchapin/homebrew-nexus on real releases.
+#
+# `make release-snapshot` is a local dry-run — it builds archives and
+# generates the formula into ./dist/ without uploading anything.
+# `make release` runs the full pipeline and requires:
+#   - A clean git tag (e.g. git tag v1.0.0)
+#   - GITHUB_TOKEN env var
+#   - HOMEBREW_TAP_GITHUB_TOKEN env var (PAT for the tap repo)
+GORELEASER ?= goreleaser
+
+release:
+	$(GORELEASER) release --clean
+
+release-snapshot:
+	$(GORELEASER) release --snapshot --clean
