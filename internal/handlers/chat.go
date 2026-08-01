@@ -488,6 +488,13 @@ type MetricsEvent struct {
 	RouteReason   string
 	SLMConfidence float64
 	SLMTaskType   string
+
+	// ArbiterCacheKeyHex + ArbiterSynthesis (issue #1176): populated only
+	// when a fresh arbiter synthesis was computed and cached (route=fusion,
+	// cache miss, non-streaming). Forwarded to the metrics store so a
+	// subsequent boot can pre-warm the cache.
+	ArbiterCacheKeyHex string
+	ArbiterSynthesis   string
 }
 
 // MetricsObserver is the hook the chat handler invokes once per
@@ -1501,6 +1508,10 @@ func Chat(d Deps) http.Handler {
 		var upErr error
 		var fusionArbiterSkipped bool
 		var fusionJaccardSimilarity float64
+		// fusionArbiterCacheKeyHex / fusionArbiterSynthesis capture the
+		// cache key + synthesis for metrics persistence (issue #1176).
+		// Only set when a fresh synthesis was cached (non-streaming Panel).
+		var fusionArbiterCacheKeyHex, fusionArbiterSynthesis string
 		// toolCallCount is populated from the cascade result on the
 		// local streaming route (issue #72) and forwarded to telemetry
 		// + metrics so the dashboard can report how many tool calls
@@ -1579,6 +1590,8 @@ func Chat(d Deps) http.Handler {
 				)
 				fusionArbiterSkipped = outcome.ArbiterSkipped
 				fusionJaccardSimilarity = outcome.Similarity
+				fusionArbiterCacheKeyHex = outcome.ArbiterCacheKeyHex
+				fusionArbiterSynthesis = outcome.ArbiterSynthesis
 				if d.ArbiterCacheObserver != nil {
 					d.ArbiterCacheObserver(outcome.ArbiterCacheHit)
 				}
@@ -1616,6 +1629,8 @@ func Chat(d Deps) http.Handler {
 				if d.ArbiterCacheObserver != nil {
 					d.ArbiterCacheObserver(cacheHit)
 				}
+				fusionArbiterCacheKeyHex = outcome.ArbiterCacheKeyHex
+				fusionArbiterSynthesis = outcome.ArbiterSynthesis
 				if d.FusionOutcomeObserver != nil {
 					d.FusionOutcomeObserver.ObserveFusionOutcome(FusionOutcomeEvent{
 						RequestID:      reqID,
@@ -2068,6 +2083,8 @@ func Chat(d Deps) http.Handler {
 				RouteReason:             decision.Reason,
 				SLMConfidence:           decision.Confidence,
 				SLMTaskType:             decision.TaskType,
+				ArbiterCacheKeyHex:      fusionArbiterCacheKeyHex,
+				ArbiterSynthesis:        fusionArbiterSynthesis,
 			})
 		}
 		// Both observers receive the record when both are wired (issue #164).

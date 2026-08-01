@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -454,6 +455,9 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 	}
 
 	metricsStore, metricsObs := buildMetrics(cfg)
+	// cacheWarmedEntries is set after the arbiter cache is created below;
+	// declared here so the gauge provider closure can capture it (issue #1176).
+	var cacheWarmedEntries int
 	addCleanup(func() {
 		if metricsStore != nil {
 			if err := metricsStore.Close(); err != nil {
@@ -720,6 +724,11 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 				{Name: "nexus_ollama_failure_count", Value: float64(hpoller.FailureCount())},
 			}
 		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			return []observability.GaugeSample{{
+				Name: "nexus_cache_warmed_entries", Value: float64(cacheWarmedEntries),
+			}}
+		}),
 	)
 
 	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.TOONUnfenced, cfg.PromptInjectionIsolated())
@@ -795,6 +804,12 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		arbiterCache.SetEvictionObserver(func(reason string) {
 			routeCounters.ObserveArbiterCacheEviction(reason)
 		})
+		// Boot-time pre-warming from historical SQLite metrics (issue #1176).
+		// Only fires when explicitly opted in and the metrics store is a
+		// SQLiteStore with recent arbiter synthesis data.
+		if cfg.CacheWarmOnBoot && cfg.CacheWarmLimit > 0 {
+			cacheWarmedEntries = warmArbiterCache(arbiterCache, metricsStore, cfg)
+		}
 	}
 	mux.Handle("/metrics", routeCounters.Handler())
 	slog.Info("metrics endpoint serves prometheus text format",
@@ -1282,4 +1297,61 @@ func (p *serverParts) handleSIGHUP(cfg config.Config) config.Config {
 		slog.Warn("config reload warning", slog.String("warning", warn))
 	}
 	return newCfg
+}
+
+// warmArbiterCache pre-warms the arbiter synthesis cache from historical
+// SQLite metrics data (issue #1176). It queries the metrics store for
+// the most recent arbiter syntheses within the cache TTL window, decodes
+// the hex-encoded cache keys, and calls ArbiterCache.Warm. Returns the
+// number of entries loaded. Errors are logged and non-fatal — a failed
+// warm does not prevent the proxy from starting.
+func warmArbiterCache(cache *upstream.ArbiterCache, store metrics.Store, cfg config.Config) int {
+	reader, ok := store.(metrics.ArbiterSynthesisReader)
+	if !ok || reader == nil {
+		slog.Info("arbiter cache warm skipped (metrics store does not support synthesis queries)",
+			slog.String("source", "sqlite"),
+		)
+		return 0
+	}
+	since := time.Now().Add(-cfg.ArbiterCacheTTL)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	rows, err := reader.RecentArbiterSyntheses(ctx, cfg.CacheWarmLimit, since)
+	if err != nil {
+		slog.Warn("arbiter cache warm query failed",
+			slog.Any("err", err),
+			slog.String("source", "sqlite"),
+		)
+		return 0
+	}
+	if len(rows) == 0 {
+		slog.Info("arbiter cache warm: no historical syntheses found",
+			slog.String("source", "sqlite"),
+		)
+		return 0
+	}
+	entries := make([]upstream.ArbiterCacheWarmEntry, 0, len(rows))
+	for _, r := range rows {
+		keyBytes, err := hex.DecodeString(r.CacheKeyHex)
+		if err != nil || len(keyBytes) != 32 {
+			slog.Debug("arbiter cache warm: skipping unparseable key",
+				slog.String("cache_key_hex", r.CacheKeyHex),
+			)
+			continue
+		}
+		var key [32]byte
+		copy(key[:], keyBytes)
+		entries = append(entries, upstream.ArbiterCacheWarmEntry{
+			Key:       key,
+			Synthesis: r.Synthesis,
+			WrittenAt: r.Timestamp,
+		})
+	}
+	loaded, skippedStale := cache.Warm(entries)
+	slog.Info("arbiter cache warmed",
+		slog.Int("entries", loaded),
+		slog.Int("skipped_stale", skippedStale),
+		slog.String("source", "sqlite"),
+	)
+	return loaded
 }

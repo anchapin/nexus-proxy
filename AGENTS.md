@@ -109,6 +109,13 @@ success. Separate from the Ollama health breaker that governs chat routing.
 when > 0, `getSemantic` stops scanning after examining this many entries,
 bounding O(n) cosine similarity to a cap. Default 0 = unlimited.
 
+**Arbiter cache pre-warming** (`NEXUS_CACHE_WARM_ON_BOOT`, default false):
+when true, the proxy queries the SQLite metrics store on boot for recent
+arbiter syntheses still within `NEXUS_ARBITER_CACHE_TTL` and loads them
+into the arbiter cache, cutting cold-start latency (issue #1176).
+`NEXUS_CACHE_WARM_LIMIT` (default 256) caps how many entries are queried.
+Exposes `nexus_cache_warmed_entries` gauge on `/metrics`.
+
 **Models discovery endpoint** (`GET /v1/models`): served when
 `NEXUS_MODELS_ENDPOINT=true` (default). Lists configured local/router/frontier
 models plus cached Ollama `/api/tags` results (TTL: `NEXUS_MODELS_CACHE_TTL`,

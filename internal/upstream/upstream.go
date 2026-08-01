@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -834,6 +835,11 @@ func Panel(
 	// Cache the synthesis for future identical panel members (issue #232).
 	if arbiterCache != nil && arbiterCacheTTL > 0 && synthesis != "" {
 		arbiterCache.Set(r1.Content, r2.Content, synthesis, arbiterCacheTTL)
+		// Expose the cache key + synthesis so the handler can persist
+		// them for boot-time pre-warming (issue #1176).
+		key := CacheKey(r1.Content, r2.Content)
+		outcome.ArbiterCacheKeyHex = hex.EncodeToString(key[:])
+		outcome.ArbiterSynthesis = synthesis
 	}
 
 	if isFusion {
@@ -894,6 +900,16 @@ type PanelOutcome struct {
 	// or "cache_hit" when the synthesis was served from the arbiter cache.
 	// Empty when ArbiterSkipped is false.
 	SkipReason string
+	// ArbiterCacheKeyHex is the hex-encoded cache key for the synthesis,
+	// populated only when a new synthesis was fetched and cached (issue
+	// #1176). Empty on cache hits, skips, and non-fusion paths. The handler
+	// forwards it to the metrics store so a subsequent boot can pre-warm
+	// the cache without re-computing the key.
+	ArbiterCacheKeyHex string
+	// ArbiterSynthesis is the synthesis text that was cached, populated
+	// alongside ArbiterCacheKeyHex (issue #1176). Empty unless a fresh
+	// synthesis was computed and stored in the cache.
+	ArbiterSynthesis string
 }
 
 // PanelStreaming runs the fusion panel with progressive delivery
@@ -971,6 +987,8 @@ func PanelStreaming(
 		outcome.ArbiterCacheHit = cacheHit
 		outcome.ArbiterSkipped = panelOutcome.ArbiterSkipped
 		outcome.SkipReason = panelOutcome.SkipReason
+		outcome.ArbiterCacheKeyHex = panelOutcome.ArbiterCacheKeyHex
+		outcome.ArbiterSynthesis = panelOutcome.ArbiterSynthesis
 		return outcome, nil
 	}
 

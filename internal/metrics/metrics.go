@@ -135,6 +135,14 @@ type Request struct {
 	RouteReason   string
 	SLMConfidence float64
 	SLMTaskType   string
+
+	// Arbiter cache key + synthesis for boot-time pre-warming (issue
+	// #1176). Populated only when a fresh arbiter synthesis was computed
+	// and cached (route=fusion, cache miss, stream=false). Empty on all
+	// other paths so the columns default to '' and add negligible
+	// storage overhead.
+	ArbiterCacheKeyHex string
+	ArbiterSynthesis   string
 }
 
 // Summary is the per-day roll-up returned by Store.DailySummary.
@@ -261,8 +269,9 @@ type DroppedCounter interface {
 // Compile-time guards: keep the sealed-shape door closed if the SQLite
 // implementation grows.
 var (
-	_ Store          = (*SQLiteStore)(nil)
-	_ DroppedCounter = (*SQLiteStore)(nil)
+	_ Store                  = (*SQLiteStore)(nil)
+	_ DroppedCounter         = (*SQLiteStore)(nil)
+	_ ArbiterSynthesisReader = (*SQLiteStore)(nil)
 )
 
 // closeOnce guards Close against accidental double-close from a
