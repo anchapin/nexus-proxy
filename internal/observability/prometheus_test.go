@@ -1082,10 +1082,10 @@ func TestExemplarFormat(t *testing.T) {
 	c := NewCollector()
 	c.SetExemplarsEnabled(true)
 	c.Submit(ObservabilityEvent{
-		Route:         "local",
+		Route:          "local",
 		TotalLatencyMs: 42,
-		TraceID:       "0af7651916cd43dd8448eb211c80319c",
-		SpanID:        "b7ad6b7169203331",
+		TraceID:        "0af7651916cd43dd8448eb211c80319c",
+		SpanID:         "b7ad6b7169203331",
 	})
 
 	var sb strings.Builder
@@ -1120,10 +1120,10 @@ func TestExemplarsDisabledByteCompat(t *testing.T) {
 	c := NewCollector()
 	c.SetExemplarsEnabled(false)
 	c.Submit(ObservabilityEvent{
-		Route:         "local",
+		Route:          "local",
 		TotalLatencyMs: 42,
-		TraceID:       "0af7651916cd43dd8448eb211c80319c",
-		SpanID:        "b7ad6b7169203331",
+		TraceID:        "0af7651916cd43dd8448eb211c80319c",
+		SpanID:         "b7ad6b7169203331",
 	})
 
 	var sb strings.Builder
@@ -1191,7 +1191,7 @@ func TestExemplarsStressBoundedMemory(t *testing.T) {
 			route = "fusion"
 		}
 		c.Submit(ObservabilityEvent{
-			Route:         route,
+			Route:          route,
 			TotalLatencyMs: int64(i + 1),
 			TraceID:        fmt.Sprintf("%032x", i),
 			SpanID:         fmt.Sprintf("%016x", i),

@@ -964,11 +964,11 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		LatencyObserver: handlers.LatencyObserverFunc(
 			func(e handlers.LatencyEvent) {
 				circuitCollector.Submit(observability.ObservabilityEvent{
-					Route:         e.Route,
+					Route:          e.Route,
 					TotalLatencyMs: int64(e.LatencySeconds * 1000),
-					TTFTMs:        int64(e.TTFTSeconds * 1000),
-					TraceID:       e.TraceID,
-					SpanID:        e.SpanID,
+					TTFTMs:         int64(e.TTFTSeconds * 1000),
+					TraceID:        e.TraceID,
+					SpanID:         e.SpanID,
 				})
 				circuitCollector.ObserveLatency(e.Route, int64(e.LatencySeconds*1000))
 			},
