@@ -527,11 +527,32 @@ func (s *SQLiteStore) pruneOnce(retentionDays int) {
 func (s *SQLiteStore) DailySummary(date time.Time) (Summary, error) {
 	day := date.UTC().Truncate(24 * time.Hour)
 	next := day.Add(24 * time.Hour)
+	return s.scanRange(day, next, day)
+}
 
-	// One aggregate per metric — the statement is built once
-	// per call because the date range is parametric. Indexes on
-	// idx_requests_timestamp keep the range scan cheap.
-	const summarySQL = `
+// RangeSummary returns a single Summary aggregating every request whose
+// timestamp falls in the half-open interval [start, end). It collapses a
+// weekly / monthly / quarterly window into one row in a single SQL
+// round-trip, replacing N per-day DailySummary calls for long-horizon
+// dashboard views (issue #1170). The Date field of the returned Summary
+// is the truncated start. An empty range (start not before end) returns
+// an error so a caller never silently sees a zero-row aggregate that
+// masquerades as "no traffic". Safe to call concurrently with writes.
+func (s *SQLiteStore) RangeSummary(start, end time.Time) (Summary, error) {
+	s0 := start.UTC().Truncate(24 * time.Hour)
+	e0 := end.UTC().Truncate(24 * time.Hour)
+	if !s0.Before(e0) {
+		return Summary{}, fmt.Errorf("metrics: range summary: empty range [%s, %s)", s0.Format("2006-01-02"), e0.Format("2006-01-02"))
+	}
+	return s.scanRange(s0, e0, s0)
+}
+
+// rangeAggregateSQL is the shared aggregation statement used by both
+// DailySummary and RangeSummary. It collapses all rows whose timestamp
+// falls in the half-open interval [from, to) into a single Summary.
+// The idx_requests_timestamp index keeps the range scan cheap even over
+// months of data.
+const rangeAggregateSQL = `
 SELECT
     COUNT(*),
     COALESCE(SUM(CASE WHEN route = 'local'    THEN 1 ELSE 0 END), 0),
@@ -548,12 +569,16 @@ SELECT
 FROM requests
 WHERE timestamp >= ? AND timestamp < ?`
 
+// scanRange executes rangeAggregateSQL over the half-open [from, to)
+// window and returns the single aggregated Summary, stamping its Date
+// field with dateLabel. Callers pre-truncate the bounds to UTC days.
+func (s *SQLiteStore) scanRange(from, to, dateLabel time.Time) (Summary, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), recordRequestErrorTimeout)
 	defer cancel()
 
-	row := s.db.QueryRowContext(ctx, summarySQL, day, next)
+	row := s.db.QueryRowContext(ctx, rangeAggregateSQL, from, to)
 	var sum Summary
-	sum.Date = day
+	sum.Date = dateLabel
 	if err := row.Scan(
 		&sum.RequestCount,
 		&sum.LocalCount,
@@ -568,7 +593,7 @@ WHERE timestamp >= ? AND timestamp < ?`
 		&sum.TotalLatencyMsSum,
 		&sum.ErrorCount,
 	); err != nil {
-		return Summary{}, fmt.Errorf("metrics: daily summary: %w", err)
+		return Summary{}, fmt.Errorf("metrics: range summary: %w", err)
 	}
 	return sum, nil
 }
