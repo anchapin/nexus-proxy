@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -480,6 +481,16 @@ type RAGStore interface {
 	// embedder (e.g. "ollama", "openai", "cohere"), or "" if no embedder
 	// has succeeded yet. Used for RAG circuit breaker observability (issue #886).
 	LastSuccessfulKind() string
+}
+
+// TopKRetriever is an optional interface implemented by *Store (and
+// inherited by *PersistentStore) for retrieving the K most-relevant
+// examples above threshold (issue #1166). The chat handler type-asserts
+// d.RAG to this interface when Config.RAGTopK > 1; when the assertion
+// fails it transparently falls back to the single-example Retrieve
+// path.
+type TopKRetriever interface {
+	RetrieveTopK(ctx context.Context, prompt string, k int) ([]FewShotExample, []float64, IndexPath, error)
 }
 
 // EmbedCacheStats is the observability surface for the prompt embedding cache.
@@ -1064,6 +1075,119 @@ func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, f
 	return nil, bestScore, IndexPathBruteForce, nil
 }
 
+// RetrieveTopK returns up to k examples whose cosine similarity to the
+// prompt embedding meets the configured threshold, ordered by descending
+// score. When fewer than k examples clear the threshold, only those that
+// do are returned. An empty store or empty prompt always yields empty
+// slices. k <= 0 returns empty slices without searching.
+//
+// The IndexPath and stats counters behave identically to Retrieve.
+// PersistentStore inherits this method via the embedded *Store.
+func (s *Store) RetrieveTopK(ctx context.Context, prompt string, k int) ([]FewShotExample, []float64, IndexPath, error) {
+	if k <= 0 {
+		return nil, nil, IndexPathNone, nil
+	}
+	atomic.AddUint64(&s.retrievalAttempts, 1)
+	s.mu.RLock()
+	n := len(s.examples)
+	s.mu.RUnlock()
+	if n == 0 {
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.emptyStoreMisses, 1)
+		return nil, nil, IndexPathNone, nil
+	}
+	if prompt == "" {
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.thresholdMisses, 1)
+		return nil, nil, IndexPathNone, nil
+	}
+	promptEmb, err := s.embedder.Embed(ctx, prompt)
+	if err != nil {
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.embedErrors, 1)
+		return nil, nil, IndexPathNone, err
+	}
+
+	s.maybeRebuildIndex()
+
+	type scored struct {
+		ex    FewShotExample
+		score float64
+	}
+
+	s.mu.RLock()
+	useIndex := n >= indexThreshold && s.index != nil && s.index.Size() >= n
+	examples := s.examples
+	var idx *HNSWIndex
+	if useIndex {
+		idx = s.index
+	}
+	s.mu.RUnlock()
+
+	var candidates []scored
+
+	if useIndex && idx != nil {
+		// HNSW path: search for enough candidates to re-rank and filter.
+		searchK := k
+		if searchK < 10 {
+			searchK = 10
+		}
+		candidateIDs := idx.Search(promptEmb, searchK)
+		s.mu.RLock()
+		for _, id := range candidateIDs {
+			if id < 0 || id >= len(examples) {
+				continue
+			}
+			score := CosineSimilarity(promptEmb, examples[id].Embedding)
+			if score > s.ThresholdFor(examples[id].Dir) {
+				candidates = append(candidates, scored{ex: examples[id], score: score})
+			}
+		}
+		s.mu.RUnlock()
+	} else {
+		// Brute-force path: O(n) scan.
+		s.mu.RLock()
+		for i := range s.examples {
+			score := CosineSimilarity(promptEmb, s.examples[i].Embedding)
+			if score > s.ThresholdFor(s.examples[i].Dir) {
+				candidates = append(candidates, scored{ex: s.examples[i], score: score})
+			}
+		}
+		s.mu.RUnlock()
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].score > candidates[j].score
+	})
+
+	if len(candidates) > k {
+		candidates = candidates[:k]
+	}
+
+	if len(candidates) == 0 {
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.thresholdMisses, 1)
+		path := IndexPathBruteForce
+		if useIndex && idx != nil {
+			path = IndexPathHNSW
+		}
+		return nil, nil, path, nil
+	}
+
+	result := make([]FewShotExample, len(candidates))
+	scores := make([]float64, len(candidates))
+	for i, c := range candidates {
+		result[i] = c.ex
+		scores[i] = c.score
+	}
+	atomic.AddUint64(&s.retrievalHits, 1)
+	path := IndexPathBruteForce
+	if useIndex && idx != nil {
+		path = IndexPathHNSW
+	}
+	return result, scores, path, nil
+}
+
 // CosineSimilarity returns the cosine of the angle between a and b. A zero
 // vector on either side yields 0 (rather than NaN) so callers can sort
 // scores without a special case. Inputs large enough to overflow the
@@ -1209,6 +1333,21 @@ func splitByBlankLines(content string) []string {
 		blocks = append(blocks, strings.Join(current, "\n"))
 	}
 	return blocks
+}
+
+// FormatInjectionMulti formats multiple few-shot examples as concatenated
+// [PROXY RETRIEVAL CONTEXT] blocks (issue #1166). The examples slice must
+// be ordered by descending relevance. Returns an empty string when no
+// examples are provided.
+func FormatInjectionMulti(examples []*FewShotExample) string {
+	if len(examples) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for _, ex := range examples {
+		sb.WriteString(FormatInjection(ex))
+	}
+	return sb.String()
 }
 
 // Add is a test/seed helper to insert a precomputed example directly into

@@ -100,6 +100,8 @@ type YAMLConfig struct {
 	RAGEmbedCacheWaitTimeout string  `yaml:"rag_embed_cache_wait_timeout"`
 	RAGBatchSize             int     `yaml:"rag_batch_size"`
 	RAGChunkTokens           int     `yaml:"rag_chunk_tokens"`
+	RAGTopK                  int     `yaml:"rag_top_k"`
+	RAGMaxInjectionTokens    int     `yaml:"rag_max_injection_tokens"`
 
 	// Routing
 	TokenGuardrail                int     `yaml:"token_guardrail"`
@@ -622,6 +624,26 @@ func LoadYAML(path string) (Config, error) {
 			n = 0
 		}
 		cfg.RAGBatchSize = n
+	}
+	if v := os.Getenv("NEXUS_RAG_TOP_K"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_RAG_TOP_K: %w", err)
+		}
+		if n < 1 {
+			n = 1
+		}
+		cfg.RAGTopK = n
+	}
+	if v := os.Getenv("NEXUS_RAG_MAX_INJECTION_TOKENS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_RAG_MAX_INJECTION_TOKENS: %w", err)
+		}
+		if n < 1 {
+			n = 4096
+		}
+		cfg.RAGMaxInjectionTokens = n
 	}
 
 	if v := os.Getenv("NEXUS_RAG_CHUNK_TOKENS"); v != "" {
@@ -1396,6 +1418,8 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		RAGEmbedCacheWaitTimeout:      yc.durationDefault(yc.RAGEmbedCacheWaitTimeout, 5*time.Second),
 		RAGBatchSize:                  yc.intDefault(yc.RAGBatchSize, 32),
 		RAGChunkTokens:                yc.intDefault(yc.RAGChunkTokens, 0),
+		RAGTopK:                       yc.intDefault(yc.RAGTopK, 1),
+		RAGMaxInjectionTokens:         yc.intDefault(yc.RAGMaxInjectionTokens, 4096),
 		TokenGuardrail:                yc.intDefault(yc.TokenGuardrail, 6000),
 		SLMTimeout:                    yc.durationDefault(yc.SLMTimeout, 8*time.Second),
 		SLMCacheMaxEntries:            yc.intDefault(yc.SLMCacheMaxEntries, 512),

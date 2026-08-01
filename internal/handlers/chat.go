@@ -27,6 +27,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/tokenizer"
 	"github.com/anchapin/nexus-proxy/internal/tracing"
 	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
@@ -1150,111 +1151,240 @@ func Chat(d Deps) http.Handler {
 			cacheHitCountBefore = statsProvider.EmbedHitCount()
 		}
 
-		ragEx, ragScore, ragIndexPath, ragErr := d.RAG.Retrieve(r.Context(), latestPrompt)
-		switch {
-		case ragErr != nil:
-			slog.Info("rag miss",
-				slog.String("reason", "embed_error"),
-				slog.String("request_id", reqID),
-			)
-			if d.RAGObserver != nil {
-				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "embed_error"})
-			}
-			// Record circuit failure for rag only when the circuit is open
-			// (transient embed errors are not circuit breaker events).
-			if d.CircuitBreakerObserver != nil {
-				if s, ok := d.RAG.(interface{ IsBreakerOpen() bool }); ok && s.IsBreakerOpen() {
-					d.CircuitBreakerObserver.RecordCircuitFailure("rag")
-					// Also record the embedder-specific failure counter (issue #423, #886).
-					if kind := rag.CircuitKind(ragErr); kind != "" {
-						d.CircuitBreakerObserver.IncEmbedderFailure(kind)
-						d.CircuitBreakerObserver.IncRAGCircuitTrip(kind)
+		// Top-K retrieval path (issue #1166). When RAGTopK > 1 and the
+		// store supports RetrieveTopK, fetch K examples, apply token
+		// budget capping, and inject them as concatenated context blocks.
+		// When RAGTopK <= 1 or the type assertion fails, fall through to
+		// the existing single-example path (byte-for-byte backward compat).
+		topKHandled := false
+		if d.Config.RAGTopK > 1 {
+			if topKStore, ok := d.RAG.(rag.TopKRetriever); ok {
+				topKHandled = true
+				topKExamples, topKScores, topKIdxPath, topKErr := topKStore.RetrieveTopK(r.Context(), latestPrompt, d.Config.RAGTopK)
+				switch {
+				case topKErr != nil:
+					slog.Info("rag miss",
+						slog.String("reason", "embed_error"),
+						slog.String("request_id", reqID),
+					)
+					if d.RAGObserver != nil {
+						d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "embed_error"})
+					}
+					if d.CircuitBreakerObserver != nil {
+						if s, ok := d.RAG.(interface{ IsBreakerOpen() bool }); ok && s.IsBreakerOpen() {
+							d.CircuitBreakerObserver.RecordCircuitFailure("rag")
+							if kind := rag.CircuitKind(topKErr); kind != "" {
+								d.CircuitBreakerObserver.IncEmbedderFailure(kind)
+								d.CircuitBreakerObserver.IncRAGCircuitTrip(kind)
+							}
+						}
+					}
+				case len(topKExamples) > 0:
+					// Apply token budget cap: accumulate from highest-ranked
+					// to lowest, dropping examples that would exceed the cap.
+					remaining := d.Config.RAGMaxInjectionTokens
+					var kept []*rag.FewShotExample
+					for i := range topKExamples {
+						tokens := tokenizer.CountTokens(topKExamples[i].Content)
+						if tokens > remaining && len(kept) > 0 {
+							break
+						}
+						remaining -= tokens
+						kept = append(kept, &topKExamples[i])
+					}
+					if len(kept) > 0 {
+						contextBlock := rag.FormatInjectionMulti(kept)
+						messages, ragInjected = middleware.InjectRAGWithLimit(
+							messages, contextBlock, d.Config.EffectiveMaxBodyBytes(),
+						)
+						if ragInjected {
+							ragFilename = topKExamples[0].Filename
+							ragScore = topKScores[0]
+							ragIndexPath = topKIdxPath
+							slog.Info("rag hit (top-k)",
+								slog.String("filename", ragFilename),
+								slog.Int("examples_injected", len(kept)),
+								slog.Float64("score", ragScore),
+								slog.String("index_path", string(ragIndexPath)),
+								slog.String("request_id", reqID),
+							)
+							if d.RAGObserver != nil {
+								d.RAGObserver.ObserveRAG(RAGEvent{
+									Hit:                true,
+									Filename:           ragFilename,
+									Score:              ragScore,
+									IndexPath:          string(ragIndexPath),
+									EffectiveThreshold: d.RAG.ThresholdFor(topKExamples[0].Dir),
+								})
+							}
+						} else {
+							slog.Warn("rag injection skipped: context block exceeds size guard",
+								slog.Int("examples", len(kept)),
+								slog.Int("context_block_bytes", len(contextBlock)),
+								slog.Int("max_body_bytes", d.Config.EffectiveMaxBodyBytes()),
+								slog.String("request_id", reqID),
+							)
+							if rec, ok := d.RAG.(rag.InjectionSkipRecorder); ok {
+								rec.IncInjectionSkippedSizeLimit()
+							}
+							if d.RAGObserver != nil {
+								d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "size_limit"})
+							}
+						}
+						if d.CircuitBreakerObserver != nil {
+							d.CircuitBreakerObserver.RecordCircuitRecovery("rag")
+						}
+						if s, ok := d.RAG.(interface{ RecordBreakerSuccess() }); ok {
+							s.RecordBreakerSuccess()
+						}
+						if d.CircuitBreakerObserver != nil {
+							if rec, ok := d.RAG.(interface{ LastSuccessfulKind() string }); ok {
+								if kind := rec.LastSuccessfulKind(); kind != "" {
+									d.CircuitBreakerObserver.IncRAGCircuitRecover(kind)
+								}
+							}
+						}
+					} else {
+						slog.Info("rag miss",
+							slog.String("reason", "token_budget_exhausted"),
+							slog.String("request_id", reqID),
+						)
+						if d.RAGObserver != nil {
+							d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "token_budget"})
+						}
+					}
+				case d.RAG.Size() == 0:
+					slog.Info("rag miss",
+						slog.String("reason", "empty_store"),
+						slog.String("request_id", reqID),
+					)
+					if d.RAGObserver != nil {
+						d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "empty_store"})
+					}
+				default:
+					slog.Info("rag miss",
+						slog.String("reason", "threshold"),
+						slog.String("index_path", string(topKIdxPath)),
+						slog.String("request_id", reqID),
+					)
+					if d.RAGObserver != nil {
+						d.RAGObserver.ObserveRAG(RAGEvent{
+							Hit:                false,
+							MissReason:         "threshold",
+							IndexPath:          string(topKIdxPath),
+							EffectiveThreshold: d.RAG.Threshold(),
+						})
 					}
 				}
 			}
-		case ragEx != nil:
-			// Size guard (issue #594): a retrieved few-shot example can
-			// be large enough to overflow the model's context window.
-			// InjectRAGWithLimit skips the context block when appending it
-			// would push the latest user message past NEXUS_MAX_BODY_BYTES.
-			contextBlock := rag.FormatInjection(ragEx)
-			messages, ragInjected = middleware.InjectRAGWithLimit(
-				messages, contextBlock, d.Config.EffectiveMaxBodyBytes(),
-			)
-			if ragInjected {
-				slog.Info("rag hit",
-					slog.String("filename", ragEx.Filename),
+		}
+		if !topKHandled {
+			ragEx, ragScore, ragIndexPath, ragErr := d.RAG.Retrieve(r.Context(), latestPrompt)
+			switch {
+			case ragErr != nil:
+				slog.Info("rag miss",
+					slog.String("reason", "embed_error"),
+					slog.String("request_id", reqID),
+				)
+				if d.RAGObserver != nil {
+					d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "embed_error"})
+				}
+				// Record circuit failure for rag only when the circuit is open
+				// (transient embed errors are not circuit breaker events).
+				if d.CircuitBreakerObserver != nil {
+					if s, ok := d.RAG.(interface{ IsBreakerOpen() bool }); ok && s.IsBreakerOpen() {
+						d.CircuitBreakerObserver.RecordCircuitFailure("rag")
+						// Also record the embedder-specific failure counter (issue #423, #886).
+						if kind := rag.CircuitKind(ragErr); kind != "" {
+							d.CircuitBreakerObserver.IncEmbedderFailure(kind)
+							d.CircuitBreakerObserver.IncRAGCircuitTrip(kind)
+						}
+					}
+				}
+			case ragEx != nil:
+				// Size guard (issue #594): a retrieved few-shot example can
+				// be large enough to overflow the model's context window.
+				// InjectRAGWithLimit skips the context block when appending it
+				// would push the latest user message past NEXUS_MAX_BODY_BYTES.
+				contextBlock := rag.FormatInjection(ragEx)
+				messages, ragInjected = middleware.InjectRAGWithLimit(
+					messages, contextBlock, d.Config.EffectiveMaxBodyBytes(),
+				)
+				if ragInjected {
+					slog.Info("rag hit",
+						slog.String("filename", ragEx.Filename),
+						slog.Float64("score", ragScore),
+						slog.String("index_path", string(ragIndexPath)),
+						slog.String("request_id", reqID),
+					)
+					ragFilename = ragEx.Filename
+					if d.RAGObserver != nil {
+						d.RAGObserver.ObserveRAG(RAGEvent{
+							Hit:                true,
+							Filename:           ragEx.Filename,
+							Score:              ragScore,
+							IndexPath:          string(ragIndexPath),
+							EffectiveThreshold: d.RAG.ThresholdFor(ragEx.Dir),
+						})
+					}
+				} else {
+					slog.Warn("rag injection skipped: context block exceeds size guard",
+						slog.String("filename", ragEx.Filename),
+						slog.Int("context_block_bytes", len(contextBlock)),
+						slog.Int("max_body_bytes", d.Config.EffectiveMaxBodyBytes()),
+						slog.String("request_id", reqID),
+					)
+					if rec, ok := d.RAG.(rag.InjectionSkipRecorder); ok {
+						rec.IncInjectionSkippedSizeLimit()
+					}
+					if d.RAGObserver != nil {
+						d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "size_limit"})
+					}
+				}
+				// Retrieval itself succeeded regardless of whether the
+				// context block was injected, so reset the RAG embedder's
+				// circuit-breaker state (issue #304).
+				if d.CircuitBreakerObserver != nil {
+					d.CircuitBreakerObserver.RecordCircuitRecovery("rag")
+				}
+				if s, ok := d.RAG.(interface{ RecordBreakerSuccess() }); ok {
+					s.RecordBreakerSuccess()
+				}
+				// Track per-embedder recovery for observability (issue #886).
+				if d.CircuitBreakerObserver != nil {
+					if rec, ok := d.RAG.(interface{ LastSuccessfulKind() string }); ok {
+						if kind := rec.LastSuccessfulKind(); kind != "" {
+							d.CircuitBreakerObserver.IncRAGCircuitRecover(kind)
+						}
+					}
+				}
+			case d.RAG.Size() == 0:
+				slog.Info("rag miss",
+					slog.String("reason", "empty_store"),
+					slog.String("request_id", reqID),
+				)
+				if d.RAGObserver != nil {
+					d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "empty_store"})
+				}
+			default:
+				slog.Info("rag miss",
+					slog.String("reason", "threshold"),
 					slog.Float64("score", ragScore),
 					slog.String("index_path", string(ragIndexPath)),
 					slog.String("request_id", reqID),
 				)
-				ragFilename = ragEx.Filename
 				if d.RAGObserver != nil {
+					// For threshold misses, we don't have access to the best candidate's
+					// directory, so we use the global threshold as an approximation.
+					// This still provides useful visibility into threshold behavior.
 					d.RAGObserver.ObserveRAG(RAGEvent{
-						Hit:                true,
-						Filename:           ragEx.Filename,
+						Hit:                false,
+						MissReason:         "threshold",
 						Score:              ragScore,
 						IndexPath:          string(ragIndexPath),
-						EffectiveThreshold: d.RAG.ThresholdFor(ragEx.Dir),
+						EffectiveThreshold: d.RAG.Threshold(),
 					})
 				}
-			} else {
-				slog.Warn("rag injection skipped: context block exceeds size guard",
-					slog.String("filename", ragEx.Filename),
-					slog.Int("context_block_bytes", len(contextBlock)),
-					slog.Int("max_body_bytes", d.Config.EffectiveMaxBodyBytes()),
-					slog.String("request_id", reqID),
-				)
-				if rec, ok := d.RAG.(rag.InjectionSkipRecorder); ok {
-					rec.IncInjectionSkippedSizeLimit()
-				}
-				if d.RAGObserver != nil {
-					d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "size_limit"})
-				}
-			}
-			// Retrieval itself succeeded regardless of whether the
-			// context block was injected, so reset the RAG embedder's
-			// circuit-breaker state (issue #304).
-			if d.CircuitBreakerObserver != nil {
-				d.CircuitBreakerObserver.RecordCircuitRecovery("rag")
-			}
-			if s, ok := d.RAG.(interface{ RecordBreakerSuccess() }); ok {
-				s.RecordBreakerSuccess()
-			}
-			// Track per-embedder recovery for observability (issue #886).
-			if d.CircuitBreakerObserver != nil {
-				if rec, ok := d.RAG.(interface{ LastSuccessfulKind() string }); ok {
-					if kind := rec.LastSuccessfulKind(); kind != "" {
-						d.CircuitBreakerObserver.IncRAGCircuitRecover(kind)
-					}
-				}
-			}
-		case d.RAG.Size() == 0:
-			slog.Info("rag miss",
-				slog.String("reason", "empty_store"),
-				slog.String("request_id", reqID),
-			)
-			if d.RAGObserver != nil {
-				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "empty_store"})
-			}
-		default:
-			slog.Info("rag miss",
-				slog.String("reason", "threshold"),
-				slog.Float64("score", ragScore),
-				slog.String("index_path", string(ragIndexPath)),
-				slog.String("request_id", reqID),
-			)
-			if d.RAGObserver != nil {
-				// For threshold misses, we don't have access to the best candidate's
-				// directory, so we use the global threshold as an approximation.
-				// This still provides useful visibility into threshold behavior.
-				d.RAGObserver.ObserveRAG(RAGEvent{
-					Hit:                false,
-					MissReason:         "threshold",
-					Score:              ragScore,
-					IndexPath:          string(ragIndexPath),
-					EffectiveThreshold: d.RAG.Threshold(),
-				})
 			}
 		}
 		// Determine embedding cache hit by diffing the hit counter before/after
