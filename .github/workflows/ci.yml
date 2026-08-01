@@ -237,6 +237,35 @@ jobs:
           version: v2.12.2
           args: --timeout=5m
 
+  # ── Go native fuzz tests (issue #1161) ──────────────────────────
+  # Runs each fuzz target for a bounded duration on develop pushes.
+  # Non-blocking initially — fuzz failures surface as warnings, not
+  # red builds.
+  fuzz:
+    name: fuzz (smoke)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Fuzz TOON compression
+        run: go test -run='^$' -fuzz=FuzzSerializeToTOON -fuzztime=30s ./internal/middleware/
+
+      - name: Fuzz DSL regex matching
+        run: go test -run='^$' -fuzz=FuzzDSLRegex -fuzztime=30s ./internal/router/
+
+      - name: Fuzz RAG similarity scoring
+        run: go test -run='^$' -fuzz=FuzzSimilarity -fuzztime=30s ./internal/rag/
+
   # ── Docker image smoke build (issue #541) ───────────────────────
   # Builds the container image on every PR so a Dockerfile / go.mod Go
   # version drift can never again slip past CI undetected. Build only —

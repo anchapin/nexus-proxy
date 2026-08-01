@@ -1041,7 +1041,10 @@ func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, f
 
 // CosineSimilarity returns the cosine of the angle between a and b. A zero
 // vector on either side yields 0 (rather than NaN) so callers can sort
-// scores without a special case.
+// scores without a special case. Inputs large enough to overflow the
+// intermediate dot/norm accumulators also return 0, and the result is
+// clamped to [-1, 1] to guard against floating-point drift from
+// denormalized numbers (issue #1161).
 func CosineSimilarity(a, b []float64) float64 {
 	n := len(a)
 	if len(b) < n {
@@ -1056,7 +1059,17 @@ func CosineSimilarity(a, b []float64) float64 {
 	if na == 0 || nb == 0 {
 		return 0
 	}
-	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+	result := dot / (math.Sqrt(na) * math.Sqrt(nb))
+	if math.IsNaN(result) || math.IsInf(result, 0) {
+		return 0
+	}
+	if result > 1 {
+		return 1
+	}
+	if result < -1 {
+		return -1
+	}
+	return result
 }
 
 // FormatInjection returns the standard "[PROXY RETRIEVAL CONTEXT]" block
