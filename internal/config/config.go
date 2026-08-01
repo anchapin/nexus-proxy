@@ -209,6 +209,16 @@ type Config struct {
 	CostBaselineModel     string  // NEXUS_FRONTIER_MODEL (default) or a custom model
 	CostBaselineRatePer1K float64 // USD per 1k tokens for baseline valuation
 
+	// CostUseOutputTokens (issue #1183) switches the per-request cost
+	// estimate from the legacy flat input-only rate to a per-provider
+	// input+output token split. When false (default) the estimate is
+	// byte-for-byte identical to the pre-issue-#1183 behaviour, so a
+	// stock deployment's savings numbers are unaffected. When true the
+	// handler looks up the serving provider's InputCostPer1K /
+	// OutputCostPer1K via the registry and counts output tokens with
+	// the tiktoken tokenizer instead of the bytes/4 heuristic.
+	CostUseOutputTokens bool // true => per-provider input/output cost split (issue #1183)
+
 	// Fusion progressive delivery (issue #48). When enabled and the
 	// harness requests a streaming response, the chat handler
 	// dispatches route=fusion to upstream.PanelStreaming instead of
@@ -1058,6 +1068,12 @@ func Load() (Config, error) {
 		baselineRate = 0
 	}
 	cfg.CostBaselineRatePer1K = baselineRate
+
+	// Per-provider cost model with input/output token split (issue #1183).
+	// Defaults to false so the per-request estimate stays byte-for-byte
+	// identical to the legacy flat input-only rate. Operators opt in to
+	// the richer per-provider model that counts output tokens separately.
+	cfg.CostUseOutputTokens = getEnvBool("NEXUS_COST_USE_OUTPUT_TOKENS", false)
 
 	// Fusion progressive delivery (issue #48). Defaults to ON so a
 	// stock `.env.example` boots into the new behaviour; operators

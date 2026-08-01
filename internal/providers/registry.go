@@ -27,7 +27,21 @@ type ProviderV2 interface {
 	APIKey() string
 	// CostPer1KUSD returns the USD cost per 1k input tokens, used
 	// by the router.ProviderSelector as a cost weight.
+	//
+	// Deprecated: this flat rate ignores the input/output split that
+	// real frontier pricing exposes. Prefer InputCostPer1KUSD() /
+	// OutputCostPer1KUSD() for cost estimation (issue #1183). The
+	// selector still calls CostPer1KUSD() for backward compatibility.
 	CostPer1KUSD() float64
+	// InputCostPer1KUSD returns the USD cost per 1k input tokens for
+	// the serving provider (issue #1183). Callers that want accurate
+	// per-request cost should use this together with OutputCostPer1KUSD.
+	InputCostPer1KUSD() float64
+	// OutputCostPer1KUSD returns the USD cost per 1k output tokens for
+	// the serving provider (issue #1183). Frontier models typically
+	// charge 3-5x for output vs input, so combining both streams yields
+	// a materially more accurate estimate than the flat CostPer1KUSD.
+	OutputCostPer1KUSD() float64
 }
 
 // AuthProviderV2 is a ProviderV2 that carries an API key for transport-level
@@ -44,19 +58,29 @@ type AuthProviderV2 interface {
 // ProviderConfig is a plain-data struct that satisfies ProviderV2.
 // It is the concrete type stored in the registry and parsed from
 // NEXUS_FRONTIER_PROVIDERS.
+//
+// Cost fields (issue #1183): InputCostPer1KVal / OutputCostPer1KVal
+// carry the per-direction rates. CostPer1KVal is retained for the
+// selector weight and as the legacy single-rate value; when an
+// operator only sets "costPer1K" in JSON it is mirrored into
+// InputCostPer1KVal so the split estimate degrades gracefully.
 type ProviderConfig struct {
-	NameVal      string
-	BaseURLVal   string
-	ModelVal     string
-	APIKeyVal    string
-	CostPer1KVal float64
+	NameVal            string
+	BaseURLVal         string
+	ModelVal           string
+	APIKeyVal          string
+	CostPer1KVal       float64 // flat rate — selector weight / legacy
+	InputCostPer1KVal  float64 // USD per 1k input tokens (issue #1183)
+	OutputCostPer1KVal float64 // USD per 1k output tokens (issue #1183)
 }
 
-func (p ProviderConfig) Name() string          { return p.NameVal }
-func (p ProviderConfig) BaseURL() string       { return p.BaseURLVal }
-func (p ProviderConfig) Model() string         { return p.ModelVal }
-func (p ProviderConfig) APIKey() string        { return p.APIKeyVal }
-func (p ProviderConfig) CostPer1KUSD() float64 { return p.CostPer1KVal }
+func (p ProviderConfig) Name() string                { return p.NameVal }
+func (p ProviderConfig) BaseURL() string             { return p.BaseURLVal }
+func (p ProviderConfig) Model() string               { return p.ModelVal }
+func (p ProviderConfig) APIKey() string              { return p.APIKeyVal }
+func (p ProviderConfig) CostPer1KUSD() float64       { return p.CostPer1KVal }
+func (p ProviderConfig) InputCostPer1KUSD() float64  { return p.InputCostPer1KVal }
+func (p ProviderConfig) OutputCostPer1KUSD() float64 { return p.OutputCostPer1KVal }
 
 // ProviderRegistry holds registered providers and allows lookup by name.
 // It is safe for concurrent use.
@@ -99,6 +123,25 @@ func (r *ProviderRegistry) ByName(name string) ProviderV2 {
 	return r.providers[name]
 }
 
+// ByModel returns the provider whose Model() matches model, or nil if
+// none exists. Used by the chat handler's cost estimator to look up the
+// serving provider's per-direction rates by the upstream model name
+// (issue #1183). When two providers share the same model the first one
+// registered wins; operators are expected to keep model names unique.
+func (r *ProviderRegistry) ByModel(model string) ProviderV2 {
+	if model == "" {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, name := range r.orderedNames {
+		if p := r.providers[name]; p.Model() == model {
+			return p
+		}
+	}
+	return nil
+}
+
 // All returns a slice of all registered providers in insertion order.
 func (r *ProviderRegistry) All() []ProviderV2 {
 	r.mu.RLock()
@@ -136,7 +179,11 @@ func (r *ProviderRegistry) Len() int {
 //   - url: (required) base URL e.g. "https://api.openai.com/v1"
 //   - model: (required) OpenAI-compatible model name
 //   - apiKey: (optional) bearer token; empty strings are registered as-is
-//   - costPer1K: (required) USD cost per 1k input tokens
+//   - costPer1K: (optional) flat USD cost per 1k tokens; legacy selector
+//     weight. When set and inputCostPer1K is absent it is also used as
+//     the input rate so the split estimate degrades gracefully.
+//   - inputCostPer1K: (optional, issue #1183) USD cost per 1k input tokens
+//   - outputCostPer1K: (optional, issue #1183) USD cost per 1k output tokens
 //
 // When the env var is empty, ParseProvidersFromEnv returns a nil registry
 // and nil error (no providers registered).
@@ -146,11 +193,13 @@ func ParseProvidersFromEnv() (*ProviderRegistry, error) {
 		return nil, nil
 	}
 	var configs []struct {
-		Name      string  `json:"name"`
-		URL       string  `json:"url"`
-		Model     string  `json:"model"`
-		APIKey    string  `json:"apiKey"`
-		CostPer1K float64 `json:"costPer1K"`
+		Name            string  `json:"name"`
+		URL             string  `json:"url"`
+		Model           string  `json:"model"`
+		APIKey          string  `json:"apiKey"`
+		CostPer1K       float64 `json:"costPer1K"`
+		InputCostPer1K  float64 `json:"inputCostPer1K"`
+		OutputCostPer1K float64 `json:"outputCostPer1K"`
 	}
 	if err := json.Unmarshal([]byte(raw), &configs); err != nil {
 		return nil, fmt.Errorf("NEXUS_FRONTIER_PROVIDERS: parse JSON: %w", err)
@@ -170,12 +219,22 @@ func ParseProvidersFromEnv() (*ProviderRegistry, error) {
 		if c.Model == "" {
 			return nil, fmt.Errorf("NEXUS_FRONTIER_PROVIDERS: entry %q missing required field 'model'", c.Name)
 		}
+		// Legacy "costPer1K" is the flat selector weight. When an
+		// operator does not set the per-direction "inputCostPer1K",
+		// fall back to the flat rate so the split estimator still has
+		// a non-zero input rate (issue #1183).
+		inputRate := c.InputCostPer1K
+		if inputRate == 0 {
+			inputRate = c.CostPer1K
+		}
 		reg.Register(ProviderConfig{
-			NameVal:      c.Name,
-			BaseURLVal:   strings.TrimRight(c.URL, "/"),
-			ModelVal:     c.Model,
-			APIKeyVal:    c.APIKey,
-			CostPer1KVal: c.CostPer1K,
+			NameVal:            c.Name,
+			BaseURLVal:         strings.TrimRight(c.URL, "/"),
+			ModelVal:           c.Model,
+			APIKeyVal:          c.APIKey,
+			CostPer1KVal:       c.CostPer1K,
+			InputCostPer1KVal:  inputRate,
+			OutputCostPer1KVal: c.OutputCostPer1K,
 		})
 	}
 	return reg, nil

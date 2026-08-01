@@ -103,6 +103,13 @@ type Request struct {
 	RAGCacheHit           bool // true when the RAG embedding was served from the embed cache (issue #227)
 	EstimatedCostUSD      float64
 
+	// InputCostUSD / OutputCostUSD split EstimatedCostUSD into the
+	// input-token and output-token components (issue #1183). When the
+	// per-provider split model is disabled the output component is zero
+	// and InputCostUSD equals EstimatedCostUSD.
+	InputCostUSD  float64
+	OutputCostUSD float64
+
 	// BaselineCostUSD is what this request would have cost if sent
 	// to the configured baseline (frontier) provider at the baseline
 	// rate, regardless of the actual route taken (issue #73).
@@ -146,6 +153,14 @@ type Summary struct {
 	RAGInjectedCount   int
 	RAGCacheHitCount   int // number of requests whose RAG embedding was served from the embed cache (issue #227)
 	EstimatedCostTotal float64
+
+	// InputCostTotal / OutputCostTotal (issue #1183) roll up the
+	// per-request input_cost_usd and output_cost_usd columns so the
+	// dashboard can surface the input/output cost split. When the split
+	// model is disabled, OutputCostTotal is zero and InputCostTotal
+	// equals EstimatedCostTotal.
+	InputCostTotal  float64
+	OutputCostTotal float64
 
 	// BaselineCostTotal and SavingsTotal roll up the per-request
 	// baseline_cost_usd and savings_usd columns (issue #73).

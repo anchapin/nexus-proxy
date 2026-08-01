@@ -2432,3 +2432,87 @@ func TestChatRootSpanErrorAttribute(t *testing.T) {
 		t.Error("error = empty, want non-empty for upstream failure")
 	}
 }
+
+// TestFrontierCostEstimateLegacy (issue #1183) verifies the default
+// (NEXUS_COST_USE_OUTPUT_TOKENS unset) reproduces the pre-issue-#1183
+// single-rate estimate byte-for-byte: output tokens are ignored and
+// InputCostUSD equals the total.
+func TestFrontierCostEstimateLegacy(t *testing.T) {
+	res := frontierCostEstimate(
+		string(router.RouteFrontier), "gpt-4o",
+		1000, 2000, // output ignored in legacy mode
+		0.005, false, nil,
+	)
+	want := 1000 * 0.005 / 1000.0
+	if res.Total != want {
+		t.Errorf("Total = %v, want %v", res.Total, want)
+	}
+	if res.InputCost != want {
+		t.Errorf("InputCost = %v, want %v (= Total in legacy mode)", res.InputCost, want)
+	}
+	if res.OutputCost != 0 {
+		t.Errorf("OutputCost = %v, want 0 in legacy mode", res.OutputCost)
+	}
+}
+
+// TestFrontierCostEstimateNonFrontier (issue #1183) verifies local and
+// fusion routes record zero cost regardless of the split flag.
+func TestFrontierCostEstimateNonFrontier(t *testing.T) {
+	for _, route := range []router.Route{router.RouteLocal, router.RouteFusion} {
+		res := frontierCostEstimate(string(route), "m", 1000, 2000, 0.005, true, nil)
+		if res.Total != 0 || res.InputCost != 0 || res.OutputCost != 0 {
+			t.Errorf("route=%v: got %+v, want all zero", route, res)
+		}
+	}
+}
+
+// TestFrontierCostEstimateSplit (issue #1183) verifies the per-provider
+// input/output split. A provider with inputCostPer1K=0.005,
+// outputCostPer1K=0.015 serving 1000 input + 2000 output tokens must
+// record input=0.005 and output=0.03.
+func TestFrontierCostEstimateSplit(t *testing.T) {
+	reg := providers.NewProviderRegistry()
+	reg.Register(providers.ProviderConfig{
+		NameVal:            "openai",
+		ModelVal:           "gpt-4o",
+		InputCostPer1KVal:  0.005,
+		OutputCostPer1KVal: 0.015,
+	})
+
+	res := frontierCostEstimate(
+		string(router.RouteFrontier), "gpt-4o",
+		1000, 2000,
+		0.999, // flat rate ignored when provider found
+		true, reg,
+	)
+	wantIn := 1000 * 0.005 / 1000.0
+	wantOut := 2000 * 0.015 / 1000.0
+	if res.InputCost != wantIn {
+		t.Errorf("InputCost = %v, want %v", res.InputCost, wantIn)
+	}
+	if res.OutputCost != wantOut {
+		t.Errorf("OutputCost = %v, want %v", res.OutputCost, wantOut)
+	}
+	if res.Total != wantIn+wantOut {
+		t.Errorf("Total = %v, want %v", res.Total, wantIn+wantOut)
+	}
+}
+
+// TestFrontierCostEstimateSplitNoProvider (issue #1183) verifies that
+// when the split model is enabled but no provider matches the model,
+// the estimator falls back to the flat config rate for input and a
+// zero output rate (graceful degradation).
+func TestFrontierCostEstimateSplitNoProvider(t *testing.T) {
+	res := frontierCostEstimate(
+		string(router.RouteFrontier), "unknown-model",
+		1000, 2000,
+		0.005, true, nil, // no registry
+	)
+	wantIn := 1000 * 0.005 / 1000.0
+	if res.InputCost != wantIn {
+		t.Errorf("InputCost = %v, want %v (flat fallback)", res.InputCost, wantIn)
+	}
+	if res.OutputCost != 0 {
+		t.Errorf("OutputCost = %v, want 0 (no output rate without provider)", res.OutputCost)
+	}
+}
