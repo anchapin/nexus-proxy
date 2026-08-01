@@ -24,6 +24,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/handlers"
 	"github.com/anchapin/nexus-proxy/internal/health"
+	"github.com/anchapin/nexus-proxy/internal/ioutils"
 	"github.com/anchapin/nexus-proxy/internal/judge"
 	"github.com/anchapin/nexus-proxy/internal/metrics"
 	"github.com/anchapin/nexus-proxy/internal/middleware"
@@ -57,6 +58,12 @@ type serverParts struct {
 // boot error. The cleanup function closes resources in reverse order.
 func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverParts, func(), error) {
 	parts := &serverParts{}
+
+	// Configure the response-body buffer pool retention cap (issue #1177).
+	// This is a global setting because sync.Pool is package-level in
+	// ioutils. Values <= 0 disable pooling — GetBuffer still allocates
+	// but PutBuffer discards instead of returning to the pool.
+	ioutils.SetPoolBufferMaxBytes(cfg.PoolBufferMaxBytes)
 
 	// Root context for background goroutines (probe manager, health
 	// poller). Cancelled during cleanup so those goroutines exit before

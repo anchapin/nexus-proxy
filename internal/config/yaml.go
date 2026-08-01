@@ -114,6 +114,7 @@ type YAMLConfig struct {
 	ArbiterTimeout                string  `yaml:"arbiter_timeout"`
 	CascadeMaxResponseBytes       int     `yaml:"cascade_max_response_bytes"`
 	MaxResponseBytes              int     `yaml:"max_response_bytes"`
+	PoolBufferMaxBytes            int     `yaml:"pool_buffer_max_bytes"`
 
 	// Fusion
 	FusionProgressiveDelivery bool    `yaml:"fusion_progressive_delivery"`
@@ -685,6 +686,13 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.CascadeMaxResponseBytes = n
 	}
+	if v := os.Getenv("NEXUS_POOL_BUFFER_MAX_BYTES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_POOL_BUFFER_MAX_BYTES: %w", err)
+		}
+		cfg.PoolBufferMaxBytes = n
+	}
 
 	// Fusion
 	if v := os.Getenv("NEXUS_FUSION_PROGRESSIVE"); v != "" {
@@ -1221,6 +1229,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		ArbiterTimeout:                yc.durationDefault(yc.ArbiterTimeout, 60*time.Second),
 		CascadeMaxResponseBytes:       yc.intDefault(yc.CascadeMaxResponseBytes, DefaultMaxResponseBytes),
 		MaxResponseBytes:              yc.intDefault(yc.MaxResponseBytes, DefaultMaxResponseBytes),
+		PoolBufferMaxBytes:            yc.intDefault(yc.PoolBufferMaxBytes, DefaultPoolBufferMaxBytes),
 
 		FusionProgressiveDelivery: yc.boolFieldDefault(yc.FusionProgressiveDelivery, true),
 		FusionAgreementThreshold:  yc.floatDefault(yc.FusionAgreementThreshold, 0.85),
