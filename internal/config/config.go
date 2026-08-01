@@ -500,6 +500,12 @@ type Config struct {
 	// DefaultMaxResponseBytes.
 	CascadeMaxResponseBytes int
 
+	// PoolBufferMaxBytes is the maximum capacity a pooled *bytes.Buffer
+	// may retain to be returned to the sync.Pool (issue #1177). Buffers
+	// that grew beyond this are discarded so a single huge response never
+	// pins pool memory. Default 1 MiB. Zero or negative disables pooling.
+	PoolBufferMaxBytes int
+
 	// Auth brute-force protection (issue #296). Tracks per-client-IP
 	// auth failures and blocks the client after AuthRateLimitBurst
 	// consecutive failures within a sliding AuthRateLimitWindow
@@ -1609,6 +1615,14 @@ func Load() (Config, error) {
 	}
 	cfg.CascadeMaxResponseBytes = cascadeMaxRespBytes
 
+	// PoolBufferMaxBytes caps retained pooled buffer capacity (issue
+	// #1177). Default 1 MiB; zero or negative disables pooling entirely.
+	poolBufMax, err := getEnvInt("NEXUS_POOL_BUFFER_MAX_BYTES", DefaultPoolBufferMaxBytes)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.PoolBufferMaxBytes = poolBufMax
+
 	// Auth brute-force protection (issue #296). Defaults: RPM 5, burst 3,
 	// window 5 min. When RPM <= 0 the limiter is disabled so a stock
 	// deployment with no NEXUS_AUTH_RATE_LIMIT_RPM is byte-for-byte
@@ -1814,6 +1828,12 @@ const DefaultMaxBodyBytes = 1 << 20 // 1 MiB
 // (issue #365). 64 MiB accommodates large frontier completions while
 // preventing memory exhaustion from a malicious upstream.
 const DefaultMaxResponseBytes = 64 << 20 // 64 MiB
+
+// DefaultPoolBufferMaxBytes is the default retention cap for pooled
+// response-body buffers (issue #1177). 1 MiB is generous for typical
+// multi-KiB completions while preventing a single huge response from
+// pinning pool memory. Zero or negative disables pooling entirely.
+const DefaultPoolBufferMaxBytes = 1 << 20 // 1 MiB
 
 // EffectiveMaxBodyBytes returns the request-body cap the chat handler should
 // enforce. Zero or negative values fall back to DefaultMaxBodyBytes so a

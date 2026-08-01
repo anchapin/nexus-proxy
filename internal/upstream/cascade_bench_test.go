@@ -1,11 +1,15 @@
 package upstream
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/anchapin/nexus-proxy/internal/ioutils"
 )
 
 // genCompletionBody builds an OpenAI-compatible chat completion JSON
@@ -88,5 +92,55 @@ func BenchmarkShouldRetry(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		ShouldRetry(503, nil)
+	}
+}
+
+// BenchmarkFetchCascadeStepPooled measures the full cascade response-read +
+// JSON-decode path with pooled response-body buffers (issue #1177). This is
+// the hot path for every RouteLocal request: read body → validate → return
+// message. The pool recycles the intermediate *bytes.Buffer across calls so
+// allocs/op should be lower than the un-pooled baseline at 4/16 KiB.
+func BenchmarkFetchCascadeStepPooled(b *testing.B) {
+	cases := []struct {
+		name string
+		kb   int
+	}{
+		{"4KB", 4},
+		{"16KB", 16},
+	}
+	for _, tc := range cases {
+		body := genCompletionBody(tc.kb)
+		// Each iteration hits a fresh httptest server cycle: the server
+		// writes the completion body, the cascade reads it into a pooled
+		// buffer, validates the JSON, and returns. The server is created
+		// outside the b.N loop so only the fetch+validate path is measured.
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+		}))
+		b.Cleanup(srv.Close)
+
+		cas := &Cascade{
+			Steps:            []CascadeStep{{Name: "local", URL: srv.URL, Model: "test"}},
+			MaxResponseBytes: 64 << 20,
+		}
+		// Warm up the pool.
+		warm := ioutils.GetBuffer()
+		ioutils.PutBuffer(warm)
+
+		b.Run(tc.name, func(b *testing.B) {
+			b.SetBytes(int64(len(body)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				msg, _, err := cas.fetchCascadeStep(context.Background(), http.DefaultClient, cas.Steps[0], map[string]interface{}{})
+				if err != nil {
+					b.Fatal(err)
+				}
+				if msg.Content == "" {
+					b.Fatal("expected non-empty content")
+				}
+			}
+		})
 	}
 }

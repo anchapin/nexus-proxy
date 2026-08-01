@@ -298,7 +298,13 @@ func (c *Cascade) fetchCascadeStep(ctx context.Context, client Client, step Casc
 	if maxBytes <= 0 {
 		maxBytes = defaultMaxResponseBytes
 	}
-	respBody, readErr := ioutils.ReadAllLimited(resp.Body, maxBytes)
+	// Use a pooled buffer to reduce GC pressure on the cascade hot path
+	// (issue #1177). The defer guarantees the buffer is returned to the
+	// pool on every code path — success, validation error, and read
+	// error. PutBuffer discards buffers larger than the retention cap.
+	respBuf, readErr := ioutils.ReadAllLimitedPooled(resp.Body, maxBytes)
+	defer ioutils.PutBuffer(respBuf)
+	respBody := respBuf.Bytes()
 	if readErr != nil {
 		return AssistantMessage{}, "", newCascadeErr(true, "transport_error", "body read: %v", readErr)
 	}
