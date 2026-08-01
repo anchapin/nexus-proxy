@@ -237,6 +237,16 @@ historical scores aggregated by task category feed back to the SLM as a
 confidence signal. Dormant when judge is off — routing is byte-for-byte
 identical to non-adaptive path.
 
+**RAG-vs-judge quality correlation** (issue #1167): each `JudgeScore`
+carries `RAGInjected bool` and `RAGSimilarity float64` populated from
+the chat handler's RAG state. The `Evaluator.SetScoreCallback` hook
+feeds these into Prometheus metrics
+(`nexus_rag_judge_score_sum{injected}` /
+`nexus_rag_judge_score_count{injected}`) so operators can compute the
+average judge score for RAG-injected vs non-injected requests. SQLite
+columns `rag_injected` / `rag_similarity` persist the data for offline
+analysis. Dormant when judge is off.
+
 ## Request body and response guards
 
 `NEXUS_MAX_BODY_BYTES` (default 1 MiB) caps inbound request bodies.

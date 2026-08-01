@@ -293,6 +293,19 @@ type Collector struct {
 	// Tracks LocalConfidence errors so operators can detect DB/locking
 	// issues in the SQLite-backed confidence store.
 	confidenceErrorsTotal atomic.Uint64
+
+	// --- RAG-vs-judge quality correlation (issue #1167) -------------
+	//
+	// Sum and count of judge scores partitioned by whether RAG context
+	// was injected. Two label values (true|false) so four atomics
+	// total. The sum is stored as IEEE-754 bits (same trick as
+	// estimatedCostUSDBits) so the hot path accumulates a float
+	// without a mutex. Only valid scores (1..5) are recorded; parse
+	// failures are excluded.
+	ragJudgeScoreSumBitsTrue  atomic.Uint64
+	ragJudgeScoreSumBitsFalse atomic.Uint64
+	ragJudgeScoreCountTrue    atomic.Uint64
+	ragJudgeScoreCountFalse   atomic.Uint64
 }
 
 // circuitBreakerState holds the atomic state for one named circuit.
@@ -878,6 +891,48 @@ func (c *Collector) IncConfidenceError() { c.confidenceErrorsTotal.Add(1) }
 // ConfidenceErrors returns the cumulative confidence store error count.
 // Used by the Prometheus renderer (issue #927).
 func (c *Collector) ConfidenceErrors() uint64 { return c.confidenceErrorsTotal.Load() }
+
+// --- RAG-vs-judge quality correlation (issue #1167) -------------------
+
+// ObserveJudgeScore records a judge quality score partitioned by whether
+// RAG context was injected. Called from the judge worker's score callback
+// (wired in cmd/nexus). Only valid scores (1..5) are recorded; parse
+// failures (score == 0 or out of range) are silently skipped so the
+// correlation metrics reflect actual model quality, not judge errors.
+// Safe for concurrent use — all updates are lock-free atomic operations.
+func (c *Collector) ObserveJudgeScore(ragInjected bool, score int) {
+	if c == nil {
+		return
+	}
+	if score < 1 || score > 5 {
+		return
+	}
+	if ragInjected {
+		atomicAddFloat(&c.ragJudgeScoreSumBitsTrue, float64(score))
+		c.ragJudgeScoreCountTrue.Add(1)
+	} else {
+		atomicAddFloat(&c.ragJudgeScoreSumBitsFalse, float64(score))
+		c.ragJudgeScoreCountFalse.Add(1)
+	}
+}
+
+// RAGJudgeScoreSum returns the cumulative judge score sum for the given
+// injected label. Used by the Prometheus renderer (issue #1167).
+func (c *Collector) RAGJudgeScoreSum(injected bool) float64 {
+	if injected {
+		return math.Float64frombits(c.ragJudgeScoreSumBitsTrue.Load())
+	}
+	return math.Float64frombits(c.ragJudgeScoreSumBitsFalse.Load())
+}
+
+// RAGJudgeScoreCount returns the cumulative judge score count for the
+// given injected label. Used by the Prometheus renderer (issue #1167).
+func (c *Collector) RAGJudgeScoreCount(injected bool) uint64 {
+	if injected {
+		return c.ragJudgeScoreCountTrue.Load()
+	}
+	return c.ragJudgeScoreCountFalse.Load()
+}
 
 // --- Pipeline stage latency breakdown (issue #300) -------------------
 //

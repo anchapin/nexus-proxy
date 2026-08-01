@@ -37,11 +37,13 @@ snake_case naming.
 | `nexus_cascade_fallback_total` | counter | `reason` | 6 (`timeout`, `transport_error`, `rate_limited`, `http_error`, `malformed_toolcall`, `malformed_response`) | `routemetrics.go` |
 | `nexus_rag_retrieval_total` | counter | `hit`, `reason` (miss only) | 1 + 3 = 4 | `routemetrics.go` |
 | `nexus_judge_dropped_total` | counter | *(none)* | 1 | `routemetrics.go` |
+| `nexus_rag_judge_score_sum` | counter | `injected` | 2 (`true`, `false`) | `prometheus.go` (issue #1167) |
+| `nexus_rag_judge_score_count` | counter | `injected` | 2 (`true`, `false`) | `prometheus.go` (issue #1167) |
 | `nexus_fusion_client_abort_total` | counter | *(none)* | 1 | `prometheus.go` (issue #1046) |
 | `nexus_rate_limit_bucket_utilization` | histogram | `bucket_id` | dynamic (≤ concurrent client IPs) | `prometheus.go` (issue #746) |
 | `nexus_build_info` | gauge | `version`, `commit`, `go_version` | 1 | `prometheus.go` (issue #529) |
 
-**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 1 + 1 + 4 + 6 + 4 + 1 + 1 + 1 + 1 = 144 series.
+**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 1 + 1 + 4 + 6 + 4 + 1 + 2 + 2 + 1 + 1 = 151 series.
 
 > **Note (issue #486):** `nexus_rag_retrieval_total` previously carried
 > a `filename` label whose value was the raw RAG source filename, which
@@ -158,6 +160,24 @@ extended in #497, #534):
 > returns invalid responses (`malformed_response`) — these have
 > completely different remediations. Update any PromQL/JSON-stat panels
 > that keyed on the old three-value closed set.
+
+#### `injected`
+
+Used by the RAG-vs-judge quality correlation metrics (issue #1167):
+
+| Value | Meaning |
+|-------|---------|
+| `true` | A RAG few-shot snippet was injected into the prompt for the sampled request |
+| `false` | No RAG context was injected |
+
+`nexus_rag_judge_score_sum{injected}` and
+`nexus_rag_judge_score_count{injected}` let operators compute the
+average judge quality score per label via
+`sum / count by (injected)`. A higher average for `injected="true"`
+indicates the RAG corpus is improving model output; a flat or lower
+average suggests `NEXUS_RAG_THRESHOLD` should be tightened or the
+corpus needs better examples. Only valid scores (1–5) are recorded;
+parse failures are excluded.
 
 ### Naming convention audit
 
