@@ -203,9 +203,10 @@ type envProviderConfig struct {
 // dispatching to /dev/null at request time.
 //
 // LoadFromEnv returns an empty Registry (no error) when NEXUS_PROVIDERS
-// is unset or empty — the config loader is responsible for the
-// backward-compat fallback that synthesises a registry from the
-// legacy NEXUS_FRONTIER_* / NEXUS_ZAI_* vars in that case.
+// is unset or empty — LoadProviderRegistry is then responsible for the
+// fallback to the NEXUS_FRONTIER_PROVIDERS JSON system, and ultimately
+// the legacy NEXUS_FRONTIER_* / NEXUS_ZAI_* vars handled by the config
+// layer.
 func LoadFromEnv() (Registry, error) {
 	raw := strings.TrimSpace(os.Getenv("NEXUS_PROVIDERS"))
 	if raw == "" {
@@ -237,6 +238,63 @@ func LoadFromEnv() (Registry, error) {
 		out = append(out, prov)
 	}
 	return NewRegistry(out), nil
+}
+
+// ToConfig adapts the env-var Provider value type to the ProviderV2
+// ProviderConfig stored by the live ProviderRegistry. The cost weight
+// uses InputCostPer1K (the rate the cost-latency selector keys on);
+// OutputCostPer1K is reserved for future input/output-split dashboards
+// and is not exposed by the ProviderV2 interface. The trailing slash is
+// trimmed to match the base-URL convention ParseProvidersFromEnv
+// already establishes (callers append the /chat/completions path).
+func (p Provider) ToConfig() ProviderConfig {
+	return ProviderConfig{
+		NameVal:      p.Name,
+		BaseURLVal:   strings.TrimRight(p.URL, "/"),
+		ModelVal:     p.Model,
+		APIKeyVal:    p.APIKey,
+		CostPer1KVal: p.InputCostPer1K,
+	}
+}
+
+// LoadProviderRegistry is the single entry point the server uses to
+// obtain the frontier provider registry (issue #1159). It honours two
+// configuration surfaces:
+//
+//  1. NEXUS_PROVIDERS + NEXUS_PROVIDER_<NAME>_* (the per-provider
+//     env-var system; see LoadFromEnv). Takes precedence when set and
+//     sorted by Priority so operators can order the cascade.
+//  2. NEXUS_FRONTIER_PROVIDERS (the JSON-array system; see
+//     ParseProvidersFromEnv). Used when NEXUS_PROVIDERS is unset.
+//
+// Setting BOTH is a configuration error: the two systems are mutually
+// exclusive and mixing them would silently shadow one set of providers.
+// A clear error is returned so an operator notices at boot instead of
+// debugging missing providers at request time.
+//
+// Returns (nil, nil) when neither is set — callers fall back to the
+// legacy NEXUS_FRONTIER_* / NEXUS_ZAI_* vars in the config layer.
+func LoadProviderRegistry() (*ProviderRegistry, error) {
+	reg, err := LoadFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	if reg.Len() > 0 {
+		if strings.TrimSpace(os.Getenv("NEXUS_FRONTIER_PROVIDERS")) != "" {
+			return nil, fmt.Errorf(
+				"NEXUS_PROVIDERS and NEXUS_FRONTIER_PROVIDERS are mutually exclusive; set only one "+
+					"(got %d providers from NEXUS_PROVIDERS and a non-empty NEXUS_FRONTIER_PROVIDERS)",
+				reg.Len(),
+			)
+		}
+		out := NewProviderRegistry()
+		for _, p := range SortByPriority(reg.FrontierProviders()) {
+			out.Register(p.ToConfig())
+		}
+		return out, nil
+	}
+	// NEXUS_PROVIDERS unset — fall back to the JSON system.
+	return ParseProvidersFromEnv()
 }
 
 // loadOneProvider reads the per-provider env vars for cfg and returns

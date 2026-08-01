@@ -406,7 +406,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		}
 	}
 
-	providerRegistry, err := providers.ParseProvidersFromEnv()
+	providerRegistry, err := providers.LoadProviderRegistry()
 	if err != nil {
 		cleanup()
 		return nil, nil, nil, fmt.Errorf("providers: %w", err)
