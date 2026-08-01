@@ -436,6 +436,17 @@ when the split keys are absent). `ProviderConfig` exposes
 as the selector weight. The metrics row surfaces `input_cost_usd` and
 `output_cost_usd` as distinct SQLite columns.
 
+## Frontier per-provider failover (issue #1157)
+
+When `NEXUS_FRONTIER_FAILOVER=true` (default) and more than one frontier
+provider is registered, the `route=frontier` dispatch wraps in a
+frontier-only cascade: on a retryable failure (5xx, timeout, connection
+reset) the next provider is tried before returning an error. The cascade
+reuses `upstream.Cascade.Run` (streaming) and `Cascade.RunBuffered`
+(non-streaming). `NEXUS_FRONTIER_FAILOVER_MAX_ATTEMPTS` (default 3) caps
+the number of providers tried. Set `NEXUS_FRONTIER_FAILOVER=false` to
+restore single-endpoint behaviour.
+
 ## Adding new env vars
 
 Config env vars are split across two files. New vars need **both**:

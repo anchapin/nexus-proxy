@@ -177,7 +177,7 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 		res.RouteAttempted = joinStepNames(c.Steps[:i+1])
 
 		ctx, cancel := context.WithTimeout(ctx, timeout)
-		msg, servedModel, err := c.fetchCascadeStep(ctx, client, step, payload)
+		msg, servedModel, _, err := c.fetchCascadeStep(ctx, client, step, payload)
 		cancel()
 		if err == nil {
 			slog.Info("cascade served",
@@ -232,6 +232,71 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 	}
 	res.FallbackReason = CascadeFallbackReason(lastErr)
 	return res, fmt.Errorf("cascade: all %d steps failed; last error: %w", len(c.Steps), lastErr)
+}
+
+// RunBuffered executes the cascade like Run, but writes the raw upstream
+// response body as a single JSON object (Content-Type: application/json)
+// instead of an SSE chunk. Used by the route=frontier failover path for
+// non-streaming requests (issue #1157). The same retry / fallback logic
+// as Run applies: retryable failures advance to the next step.
+func (c *Cascade) RunBuffered(ctx context.Context, w http.ResponseWriter, client Client, payload map[string]interface{}, requestID string) (CascadeResult, error) {
+	if len(c.Steps) == 0 {
+		return CascadeResult{}, errors.New("cascade: no steps configured")
+	}
+	timeout := c.Timeout
+	if timeout <= 0 {
+		timeout = cascadeDefaultTimeout
+	}
+
+	res := CascadeResult{}
+	var lastErr error
+	for i, step := range c.Steps {
+		res.Attempts = i + 1
+		res.RouteAttempted = joinStepNames(c.Steps[:i+1])
+
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		_, _, rawBody, err := c.fetchCascadeStep(ctx, client, step, payload)
+		cancel()
+		if err == nil {
+			slog.Info("frontier cascade served (buffered)",
+				slog.String("request_id", requestID),
+				slog.String("step", step.Name),
+				slog.Int("attempt", i+1),
+				slog.Int("total", len(c.Steps)),
+			)
+			res.Succeeded = true
+			res.ServedBy = step.Name
+			h := w.Header()
+			h.Set("Content-Type", "application/json")
+			h.Set("X-Nexus-Cascade-Served-By", step.Name)
+			w.WriteHeader(http.StatusOK)
+			if _, werr := w.Write(rawBody); werr != nil {
+				return res, werr
+			}
+			return res, nil
+		}
+		lastErr = err
+		retry := classifyFailure(err)
+		if retry {
+			res.FallbackReason = CascadeFallbackReason(err)
+		}
+		slog.Warn("frontier cascade step failed",
+			slog.String("request_id", requestID),
+			slog.String("step", step.Name),
+			slog.Int("attempt", i+1),
+			slog.Int("total", len(c.Steps)),
+			slog.Bool("retry", retry),
+			slog.Any("err", err),
+		)
+		if !retry {
+			return res, err
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("cascade: no steps attempted")
+	}
+	res.FallbackReason = CascadeFallbackReason(lastErr)
+	return res, fmt.Errorf("frontier cascade: all %d providers failed; last error: %w", len(c.Steps), lastErr)
 }
 
 // classifyFailure reports whether err was tagged as retryable. Unknown
@@ -351,9 +416,11 @@ func estimatePromptTokens(payload map[string]interface{}) int {
 
 // fetchCascadeStep does a single non-streaming POST to step.URL, validates
 // the response, and returns the assistant message + the model name echoed
-// back by the upstream (used in the SSE response). All returned errors are
-// tagged via newCascadeErr so the runner knows whether to fall back.
-func (c *Cascade) fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payload map[string]interface{}) (AssistantMessage, string, error) {
+// back by the upstream (used in the SSE response) + the raw validated
+// response body (used by RunBuffered to forward the upstream JSON verbatim).
+// All returned errors are tagged via newCascadeErr so the runner knows
+// whether to fall back.
+func (c *Cascade) fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payload map[string]interface{}) (AssistantMessage, string, []byte, error) {
 	body := make(map[string]interface{}, len(payload)+2)
 	for k, v := range payload {
 		body[k] = v
@@ -363,11 +430,11 @@ func (c *Cascade) fetchCascadeStep(ctx context.Context, client Client, step Casc
 
 	jsonPayload, mErr := json.Marshal(body)
 	if mErr != nil {
-		return AssistantMessage{}, "", newCascadeErr(false, "", "marshal: %v", mErr)
+		return AssistantMessage{}, "", nil, newCascadeErr(false, "", "marshal: %v", mErr)
 	}
 	req, rErr := http.NewRequestWithContext(ctx, http.MethodPost, step.URL, bytes.NewReader(jsonPayload))
 	if rErr != nil {
-		return AssistantMessage{}, "", newCascadeErr(false, "", "build request: %v", rErr)
+		return AssistantMessage{}, "", nil, newCascadeErr(false, "", "build request: %v", rErr)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if step.APIKey != "" {
@@ -385,7 +452,7 @@ func (c *Cascade) fetchCascadeStep(ctx context.Context, client Client, step Casc
 		if errors.Is(dErr, context.DeadlineExceeded) {
 			reason = "timeout"
 		}
-		return AssistantMessage{}, "", newCascadeErr(true, reason, "transport: %v", dErr)
+		return AssistantMessage{}, "", nil, newCascadeErr(true, reason, "transport: %v", dErr)
 	}
 	defer resp.Body.Close()
 	maxBytes := c.MaxResponseBytes
@@ -400,32 +467,32 @@ func (c *Cascade) fetchCascadeStep(ctx context.Context, client Client, step Casc
 	defer ioutils.PutBuffer(respBuf)
 	respBody := respBuf.Bytes()
 	if readErr != nil {
-		return AssistantMessage{}, "", newCascadeErr(true, "transport_error", "body read: %v", readErr)
+		return AssistantMessage{}, "", nil, newCascadeErr(true, "transport_error", "body read: %v", readErr)
 	}
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return AssistantMessage{}, "", newCascadeErr(true, "rate_limited", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
+		return AssistantMessage{}, "", nil, newCascadeErr(true, "rate_limited", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
 	}
 	if ShouldRetry(resp.StatusCode, nil) {
-		return AssistantMessage{}, "", newCascadeErr(true, "http_error", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
+		return AssistantMessage{}, "", nil, newCascadeErr(true, "http_error", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
 	}
 	// Issue #438: A 404 from the local step means the model is missing or
 	// not pulled. Treat as retryable so the cascade falls through to the
 	// frontier. Frontier 404s remain terminal — a missing frontier model
 	// is a configuration error, not a transient condition.
 	if resp.StatusCode == http.StatusNotFound && step.Name == "local" {
-		return AssistantMessage{}, "", newCascadeErr(true, "model_unavailable", "local model not found (404): %s", truncateForLog(respBody, 200))
+		return AssistantMessage{}, "", nil, newCascadeErr(true, "model_unavailable", "local model not found (404): %s", truncateForLog(respBody, 200))
 	}
 	if resp.StatusCode != http.StatusOK {
 		// Non-retryable 4xx (auth, bad request, etc.). Surface to caller.
-		return AssistantMessage{}, "", newCascadeErr(false, "", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
+		return AssistantMessage{}, "", nil, newCascadeErr(false, "", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
 	}
 
 	msg, model, vErr := extractAssistantMessage(respBody)
 	if vErr != nil {
-		return AssistantMessage{}, "", vErr
+		return AssistantMessage{}, "", nil, vErr
 	}
-	return msg, model, nil
+	return msg, model, respBody, nil
 }
 
 // assistantResponse is the slice of the OpenAI-compatible chat-completion

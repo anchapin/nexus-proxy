@@ -2166,6 +2166,70 @@ func Chat(d Deps) http.Handler {
 					"Frontier budget exhausted for the rolling 24h window")
 				break
 			}
+			// Issue #1157: per-provider failover for route=frontier. When
+			// enabled and more than one frontier provider is registered,
+			// wrap the dispatch in a frontier-only cascade so a retryable
+			// failure (5xx, timeout, connection reset) advances to the
+			// next provider before returning an error to the client.
+			if d.Config.FrontierFailover && d.Providers != nil && d.Providers.Len() > 1 {
+				allProviders := d.Providers.All()
+				steps := make([]upstream.CascadeStep, 0, len(allProviders))
+				for _, p := range allProviders {
+					steps = append(steps, upstream.CascadeStep{
+						Name:   p.Name(),
+						URL:    strings.TrimRight(p.BaseURL(), "/") + "/v1/chat/completions",
+						Model:  p.Model(),
+						APIKey: p.APIKey(),
+					})
+				}
+				if d.Config.FrontierFailoverMaxAttempts < len(steps) {
+					steps = steps[:d.Config.FrontierFailoverMaxAttempts]
+				}
+				fcas := &upstream.Cascade{
+					Steps:            steps,
+					Timeout:          d.Config.CascadeTimeout,
+					MaxResponseBytes: d.Config.EffectiveCascadeMaxResponseBytes(),
+				}
+
+				var res upstream.CascadeResult
+				if streaming {
+					res, upErr = fcas.Run(r.Context(), obs, d.Client, body, reqID)
+				} else {
+					res, upErr = fcas.RunBuffered(r.Context(), obs, d.Client, body, reqID)
+				}
+				logCascadeTelemetry(res, upErr, reqID)
+				if res.FallbackReason != "" && d.CascadeFallbackObserver != nil {
+					d.CascadeFallbackObserver.ObserveCascadeFallback(CascadeFallbackEvent{
+						RequestID: reqID,
+						Reason:    res.FallbackReason,
+					})
+				}
+				if upErr != nil {
+					slog.Error("frontier failover exhausted",
+						slog.Any("err", upErr),
+						slog.String("route_attempted", res.RouteAttempted),
+						slog.String("request_id", reqID),
+					)
+					writeJSONError(w, http.StatusBadGateway, ErrTypeUpstreamError,
+						"Frontier failover exhausted; all providers errored")
+				} else if d.SpendGuard != nil && frontierCost > 0 {
+					d.SpendGuard.Record(r.Context(), frontierCost, "frontier")
+				}
+				trace.Upstream.Route = string(route)
+				trace.Upstream.Streaming = streaming
+				trace.Upstream.Model = model
+				trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
+				if res.RouteAttempted != "" {
+					trace.Upstream.CascadeSteps = strings.Split(res.RouteAttempted, "->")
+				}
+				trace.Upstream.CascadeServedBy = res.ServedBy
+				trace.Upstream.CascadeSuccess = res.Succeeded
+				if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
+					rootSpan.SetAttr("ai.model", model)
+					rootSpan.SetAttr("upstream_target", trace.Upstream.TargetHost)
+				}
+				break
+			}
 			// Honor the harness's stream flag (issue #10). Stream
 			// preserves SSE framing for chunked deliveries;
 			// BufferedFetch collects the full body and returns a
