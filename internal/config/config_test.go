@@ -494,6 +494,56 @@ func TestLoadProviderTailWeightBounds(t *testing.T) {
 	}
 }
 
+// TestLoadValidationErrorHints (issue #1181) verifies that every
+// config-validation error surfaced by Load() carries an actionable
+// remediation hint: the offending var name, the safe default value, and a
+// pointer to .env.example. The table covers int, duration, float-range, and
+// regex failure modes plus the inline negative/range checks.
+func TestLoadValidationErrorHints(t *testing.T) {
+	cases := []struct {
+		name        string
+		key         string
+		val         string
+		wantDefault string // the safe default that should appear in the message
+		wantSubstr  string // a stable constraint fragment
+	}{
+		// getEnvInt parse failure
+		{"bad int names default", "NEXUS_TOKEN_GUARDRAIL", "not-a-number", "6000", "must be an integer"},
+		// getEnvFloat parse failure
+		{"bad float names default", "NEXUS_RAG_THRESHOLD", "0.5x", "0.55", "must be a number"},
+		// getEnvDuration parse failure
+		{"bad duration names default", "NEXUS_SLM_TIMEOUT", "eight seconds", "8s", "must be a Go duration string"},
+		// getEnvRegexps compile failure
+		{"bad regex names hint", "NEXUS_DSL_FORMATTING_PATTERNS", "[invalid", ".env.example", "not a valid regex"},
+		// inline negative-duration check
+		{"negative read timeout names default", "NEXUS_SERVER_READ_TIMEOUT", "-5s", "30s", "must not be negative"},
+		// inline [0,1] range check
+		{"out of range tail weight names range", "NEXUS_PROVIDER_TAIL_WEIGHT", "5", "0", "must be a number in [0,1]"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.key, tc.val)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("expected error for %s=%s, got nil", tc.key, tc.val)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, tc.key) {
+				t.Errorf("error %q does not name the var %s", msg, tc.key)
+			}
+			if !strings.Contains(msg, tc.wantSubstr) {
+				t.Errorf("error %q does not contain %q", msg, tc.wantSubstr)
+			}
+			if !strings.Contains(msg, tc.wantDefault) {
+				t.Errorf("error %q does not name the default %q", msg, tc.wantDefault)
+			}
+			if !strings.Contains(msg, ".env.example") {
+				t.Errorf("error %q does not point to .env.example", msg)
+			}
+		})
+	}
+}
+
 func TestOllamaURLTrimmed(t *testing.T) {
 	t.Setenv("NEXUS_OLLAMA_URL", "http://localhost:11434/")
 	cfg, err := Load()
