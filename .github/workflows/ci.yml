@@ -118,6 +118,9 @@ jobs:
     name: bench (regression check)
     runs-on: ubuntu-latest
     continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: write
     env:
       NEXUS_BENCH_REGRESSION_THRESHOLD: "15"
     steps:
