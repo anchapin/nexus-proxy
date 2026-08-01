@@ -99,6 +99,7 @@ type YAMLConfig struct {
 	RAGEmbedCacheTTL         string  `yaml:"rag_embed_cache_ttl"`
 	RAGEmbedCacheWaitTimeout string  `yaml:"rag_embed_cache_wait_timeout"`
 	RAGBatchSize             int     `yaml:"rag_batch_size"`
+	RAGChunkTokens           int     `yaml:"rag_chunk_tokens"`
 
 	// Routing
 	TokenGuardrail                int     `yaml:"token_guardrail"`
@@ -621,6 +622,17 @@ func LoadYAML(path string) (Config, error) {
 			n = 0
 		}
 		cfg.RAGBatchSize = n
+	}
+
+	if v := os.Getenv("NEXUS_RAG_CHUNK_TOKENS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_RAG_CHUNK_TOKENS: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.RAGChunkTokens = n
 	}
 
 	// Routing
@@ -1383,6 +1395,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		RAGEmbedCacheTTL:              yc.durationDefault(yc.RAGEmbedCacheTTL, 24*time.Hour),
 		RAGEmbedCacheWaitTimeout:      yc.durationDefault(yc.RAGEmbedCacheWaitTimeout, 5*time.Second),
 		RAGBatchSize:                  yc.intDefault(yc.RAGBatchSize, 32),
+		RAGChunkTokens:                yc.intDefault(yc.RAGChunkTokens, 0),
 		TokenGuardrail:                yc.intDefault(yc.TokenGuardrail, 6000),
 		SLMTimeout:                    yc.durationDefault(yc.SLMTimeout, 8*time.Second),
 		SLMCacheMaxEntries:            yc.intDefault(yc.SLMCacheMaxEntries, 512),

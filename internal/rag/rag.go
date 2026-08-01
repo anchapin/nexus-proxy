@@ -27,6 +27,7 @@ import (
 
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/ioutils"
+	"github.com/anchapin/nexus-proxy/internal/tokenizer"
 
 	"time"
 )
@@ -85,10 +86,11 @@ type BreakerConfig struct {
 
 // FewShotExample is one indexed code snippet with its embedding.
 type FewShotExample struct {
-	Filename  string // base filename only (no path)
-	Dir       string // directory from which this example was indexed
-	Content   string
-	Embedding []float64
+	Filename   string // base filename only (no path)
+	Dir        string // directory from which this example was indexed
+	Content    string
+	Embedding  []float64
+	ChunkIndex int // 0 for whole-file; 0..N for chunked files (issue #1168)
 }
 
 // Embedder turns text into a vector. Implementations must be safe for
@@ -530,6 +532,7 @@ type Store struct {
 	index              *HNSWIndex
 	indexConfig        HNSWConfig
 	batchSize          int // number of files to embed per batch; 0 disables batching
+	chunkTokens        int // max tokens per chunk; 0 disables chunking (issue #1168)
 
 	lastIndexAt               int64
 	retrievalAttempts         uint64
@@ -550,6 +553,15 @@ type StoreOption func(*Store)
 // A value of 0 disables batching (each file is embedded individually).
 func WithBatchSize(n int) StoreOption {
 	return func(s *Store) { s.batchSize = n }
+}
+
+// WithChunkTokens enables token-aware file chunking (issue #1168).
+// When > 0, files whose token count exceeds the threshold are split into
+// overlapping chunks that prefer natural code boundaries (blank lines).
+// Each chunk is stored as a separate FewShotExample with a unique ChunkIndex.
+// A value of 0 (default) disables chunking — whole-file indexing.
+func WithChunkTokens(n int) StoreOption {
+	return func(s *Store) { s.chunkTokens = n }
 }
 
 // indexThreshold is the minimum store size before the HNSW index is used.
@@ -882,15 +894,24 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 				end = len(validFiles)
 			}
 			batch := validFiles[i:end]
-			texts := make([]string, len(batch))
-			for j, fi := range batch {
-				texts[j] = fi.content
+			// Expand files into chunks (issue #1168).
+			var chunkTexts []string
+			var chunkMeta []struct {
+				name string
+				idx  int
 			}
-			embs, err := s.embedder.EmbedBatch(ctx, texts)
+			for _, fi := range batch {
+				chunks := chunkFile(fi.content, s.chunkTokens)
+				for _, c := range chunks {
+					chunkTexts = append(chunkTexts, c.Content)
+					chunkMeta = append(chunkMeta, struct {
+						name string
+						idx  int
+					}{fi.name, c.Index})
+				}
+			}
+			embs, err := s.embedder.EmbedBatch(ctx, chunkTexts)
 			if err != nil {
-				// Partial batch: entries were appended to s.examples but
-				// upsertExample was never called, so the HNSW index is stale.
-				// Invalidate it so Retrieve falls back to brute-force.
 				s.mu.Lock()
 				s.index = nil
 				s.mu.Unlock()
@@ -902,33 +923,37 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 				continue
 			}
 			s.mu.Lock()
-			for j, fi := range batch {
+			for j := range chunkTexts {
 				s.examples = append(s.examples, FewShotExample{
-					Filename:  fi.name,
-					Dir:       safeDir,
-					Content:   fi.content,
-					Embedding: embs[j],
+					Filename:   chunkMeta[j].name,
+					Dir:        safeDir,
+					Content:    chunkTexts[j],
+					Embedding:  embs[j],
+					ChunkIndex: chunkMeta[j].idx,
 				})
-				s.markIndexed(time.Now().UTC())
-				slog.Info("rag indexed", slog.String("filename", fi.name))
 			}
+			s.markIndexed(time.Now().UTC())
 			s.mu.Unlock()
 		}
 	} else {
 		for _, fi := range validFiles {
-			emb, err := s.embedder.Embed(ctx, fi.content)
-			if err != nil {
-				slog.Error("rag embed file", slog.String("filename", fi.name), slog.Any("err", err))
-				continue
+			chunks := chunkFile(fi.content, s.chunkTokens)
+			for _, c := range chunks {
+				emb, err := s.embedder.Embed(ctx, c.Content)
+				if err != nil {
+					slog.Error("rag embed file", slog.String("filename", fi.name), slog.Any("err", err))
+					continue
+				}
+				s.mu.Lock()
+				s.examples = append(s.examples, FewShotExample{
+					Filename:   fi.name,
+					Dir:        safeDir,
+					Content:    c.Content,
+					Embedding:  emb,
+					ChunkIndex: c.Index,
+				})
+				s.mu.Unlock()
 			}
-			s.mu.Lock()
-			s.examples = append(s.examples, FewShotExample{
-				Filename:  fi.name,
-				Dir:       safeDir,
-				Content:   fi.content,
-				Embedding: emb,
-			})
-			s.mu.Unlock()
 			s.markIndexed(time.Now().UTC())
 			slog.Info("rag indexed", slog.String("filename", fi.name))
 		}
@@ -1074,11 +1099,116 @@ func CosineSimilarity(a, b []float64) float64 {
 
 // FormatInjection returns the standard "[PROXY RETRIEVAL CONTEXT]" block
 // appended to a user message when a high-similarity example is found.
+// When the example is a chunk (ChunkIndex > 0), the label includes the
+// chunk suffix (e.g. "handler.go#chunk2") for traceability.
 func FormatInjection(ex *FewShotExample) string {
+	label := ex.Filename
+	if ex.ChunkIndex > 0 {
+		label = fmt.Sprintf("%s#chunk%d", ex.Filename, ex.ChunkIndex)
+	}
 	return fmt.Sprintf(
 		"\n\n[PROXY RETRIEVAL CONTEXT]: Here is a highly relevant, validated few-shot example from the local codebase (%s):\n```\n%s\n```\nAnalyze its architecture and apply its patterns if relevant to this task.",
-		ex.Filename, ex.Content,
+		label, ex.Content,
 	)
+}
+
+// chunkInfo represents a single chunk of a file's content.
+type chunkInfo struct {
+	Content string
+	Index   int
+}
+
+// chunkFile splits content into overlapping chunks of approximately maxTokens
+// tokens each, preferring natural code boundaries (blank lines). Returns a
+// single chunk containing the entire content when maxTokens <= 0 or the
+// content fits within the threshold. Each chunk has a 25% overlap with the
+// preceding chunk so that related code split across boundaries remains
+// retrievable (issue #1168).
+func chunkFile(content string, maxTokens int) []chunkInfo {
+	if maxTokens <= 0 {
+		return []chunkInfo{{Content: content, Index: 0}}
+	}
+	if tokenizer.CountTokens(content) <= maxTokens {
+		return []chunkInfo{{Content: content, Index: 0}}
+	}
+
+	blocks := splitByBlankLines(content)
+
+	var chunks []chunkInfo
+	var currentParts []string
+	currentTokens := 0
+	chunkIdx := 0
+	overlapTokens := maxTokens / 4
+
+	for i, block := range blocks {
+		var sep string
+		if i > 0 {
+			sep = "\n\n"
+		}
+		bText := sep + block
+		bTokens := tokenizer.CountTokens(bText)
+
+		if currentTokens > 0 && currentTokens+bTokens > maxTokens {
+			chunks = append(chunks, chunkInfo{
+				Content: strings.Join(currentParts, ""),
+				Index:   chunkIdx,
+			})
+			chunkIdx++
+
+			var overlap []string
+			overlapSum := 0
+			for j := len(currentParts) - 1; j >= 0; j-- {
+				bt := tokenizer.CountTokens(currentParts[j])
+				if overlapSum+bt > overlapTokens && len(overlap) > 0 {
+					break
+				}
+				overlap = append([]string{currentParts[j]}, overlap...)
+				overlapSum += bt
+			}
+			currentParts = overlap
+			currentTokens = overlapSum
+		}
+
+		currentParts = append(currentParts, bText)
+		currentTokens += bTokens
+	}
+
+	if len(currentParts) > 0 {
+		chunks = append(chunks, chunkInfo{
+			Content: strings.Join(currentParts, ""),
+			Index:   chunkIdx,
+		})
+	}
+
+	if len(chunks) <= 1 {
+		return []chunkInfo{{Content: content, Index: 0}}
+	}
+
+	return chunks
+}
+
+// splitByBlankLines splits content into blocks separated by one or more
+// blank lines. This aligns chunk boundaries with natural code structure
+// (function/method boundaries, paragraph breaks in prose).
+func splitByBlankLines(content string) []string {
+	lines := strings.Split(content, "\n")
+	var blocks []string
+	var current []string
+
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			if len(current) > 0 {
+				blocks = append(blocks, strings.Join(current, "\n"))
+				current = nil
+			}
+		} else {
+			current = append(current, line)
+		}
+	}
+	if len(current) > 0 {
+		blocks = append(blocks, strings.Join(current, "\n"))
+	}
+	return blocks
 }
 
 // Add is a test/seed helper to insert a precomputed example directly into
@@ -1194,7 +1324,7 @@ func (s *Store) upsertExample(ex FewShotExample) {
 	defer s.mu.Unlock()
 	existingIdx := -1
 	for i := range s.examples {
-		if s.examples[i].Filename == ex.Filename {
+		if s.examples[i].Filename == ex.Filename && s.examples[i].ChunkIndex == ex.ChunkIndex {
 			existingIdx = i
 			break
 		}

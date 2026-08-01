@@ -149,6 +149,14 @@ type Config struct {
 	// Set to 0 to disable batching (backward compatible with existing tests).
 	RAGBatchSize int
 
+	// RAG chunk token threshold (issue #1168). When > 0, files whose
+	// token count exceeds this value are split into overlapping chunks
+	// that prefer natural code boundaries (blank lines). Each chunk is
+	// embedded and stored as a separate FewShotExample, enabling
+	// finer-grained retrieval for large files. Set to 0 to disable
+	// chunking (whole-file indexing, backward compatible).
+	RAGChunkTokens int
+
 	// Routing
 	TokenGuardrail                int           // estimated tokens above this force frontier (6000)
 	SLMTimeout                    time.Duration // Qwen3-Coder routing timeout (8s)
@@ -1002,6 +1010,15 @@ func Load() (Config, error) {
 		ragBatchSize = 0
 	}
 	cfg.RAGBatchSize = ragBatchSize
+
+	ragChunkTokens, err := getEnvInt("NEXUS_RAG_CHUNK_TOKENS", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if ragChunkTokens < 0 {
+		ragChunkTokens = 0
+	}
+	cfg.RAGChunkTokens = ragChunkTokens
 
 	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
 	if err != nil {

@@ -1424,3 +1424,281 @@ func TestPersistentStoreHNSWFallbackRebuild(t *testing.T) {
 		t.Errorf("Retrieve path = %q, want %q (fallback rebuild should use HNSW)", path, IndexPathHNSW)
 	}
 }
+
+// --- Issue #1168: Chunked RAG persistence tests ---
+
+func TestPersistentStoreChunkedUpsertAndLoad(t *testing.T) {
+	t.Parallel()
+	ps, err := OpenPersistentStore(":memory:", &stubEmbedder{}, 0.55, WithChunkTokens(0))
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+
+	ctx := context.Background()
+
+	// Upsert multiple chunks for the same file.
+	for i := 0; i < 3; i++ {
+		if err := ps.Upsert(ctx, FewShotExample{
+			Filename:   "handler.go",
+			ChunkIndex: i,
+			Content:    fmt.Sprintf("chunk %d content", i),
+			Embedding:  []float64{float64(i), 0, 0},
+		}); err != nil {
+			t.Fatalf("Upsert chunk %d: %v", i, err)
+		}
+	}
+
+	if got := ps.Size(); got != 3 {
+		t.Fatalf("Size = %d, want 3", got)
+	}
+
+	// Persist and reload to verify chunk_index round-trips through SQLite.
+	onDisk := filepath.Join(t.TempDir(), "rag_chunk.db")
+	disk, err := OpenPersistentStore(onDisk, &stubEmbedder{}, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore(disk): %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := disk.Upsert(ctx, FewShotExample{
+			Filename:   "handler.go",
+			ChunkIndex: i,
+			Content:    fmt.Sprintf("chunk %d content", i),
+			Embedding:  []float64{float64(i), 0, 0},
+		}); err != nil {
+			t.Fatalf("disk Upsert chunk %d: %v", i, err)
+		}
+	}
+	if err := disk.Close(); err != nil {
+		t.Fatalf("disk Close: %v", err)
+	}
+
+	disk2, err := OpenPersistentStore(onDisk, &stubEmbedder{}, 0.55)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = disk2.Close() })
+
+	n, err := disk2.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("Load returned %d, want 3", n)
+	}
+
+	// Verify chunk indices and content survived the round-trip.
+	snap := disk2.snapshot()
+	chunkIndices := make(map[int]bool)
+	for _, ex := range snap {
+		if ex.Filename != "handler.go" {
+			continue
+		}
+		chunkIndices[ex.ChunkIndex] = true
+		expected := fmt.Sprintf("chunk %d content", ex.ChunkIndex)
+		if ex.Content != expected {
+			t.Errorf("chunk %d content = %q, want %q", ex.ChunkIndex, ex.Content, expected)
+		}
+	}
+	if len(chunkIndices) != 3 {
+		t.Errorf("expected 3 distinct chunk indices, got %d", len(chunkIndices))
+	}
+}
+
+func TestPersistentStoreRemoveDeletesAllChunks(t *testing.T) {
+	t.Parallel()
+	ps := newTestPersistentStore(t)
+	ctx := context.Background()
+
+	// Insert 3 chunks for the same file.
+	for i := 0; i < 3; i++ {
+		if err := ps.Upsert(ctx, FewShotExample{
+			Filename:   "big.go",
+			ChunkIndex: i,
+			Content:    fmt.Sprintf("content %d", i),
+			Embedding:  []float64{float64(i)},
+		}); err != nil {
+			t.Fatalf("Upsert chunk %d: %v", i, err)
+		}
+	}
+
+	// Insert a different file to ensure it survives.
+	if err := ps.Upsert(ctx, FewShotExample{
+		Filename:  "other.go",
+		Content:   "other",
+		Embedding: []float64{9},
+	}); err != nil {
+		t.Fatalf("Upsert other.go: %v", err)
+	}
+
+	if got := ps.Size(); got != 4 {
+		t.Fatalf("Size = %d, want 4", got)
+	}
+
+	// Remove big.go — should delete all 3 chunks.
+	if err := ps.Remove(ctx, "big.go"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	if got := ps.Size(); got != 1 {
+		t.Fatalf("Size after remove = %d, want 1", got)
+	}
+
+	snap := ps.snapshot()
+	if snap[0].Filename != "other.go" {
+		t.Errorf("remaining example = %q, want other.go", snap[0].Filename)
+	}
+}
+
+func TestPersistentStoreIndexDirChunking(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	// Create a large file that should split into multiple chunks.
+	var blocks []string
+	for i := 0; i < 20; i++ {
+		blocks = append(blocks, fmt.Sprintf("// section %d\nfunc f%d() {}", i, i))
+	}
+	largeContent := strings.Join(blocks, "\n\n")
+	if err := os.WriteFile(filepath.Join(dir, "big.go"), []byte(largeContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a small file.
+	if err := os.WriteFile(filepath.Join(dir, "small.go"), []byte("package main"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ps, err := OpenPersistentStore(":memory:", &stubEmbedder{}, 0.55, WithChunkTokens(30))
+	if err != nil {
+		t.Fatalf("OpenPersistentStore: %v", err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+
+	ctx := context.Background()
+	if err := ps.IndexDir(ctx, dir); err != nil {
+		t.Fatalf("IndexDir: %v", err)
+	}
+
+	// Should have more examples than files (large.go was chunked).
+	snap := ps.snapshot()
+	if len(snap) < 3 {
+		t.Fatalf("expected >=3 examples, got %d", len(snap))
+	}
+
+	// Verify persistence: close and reload.
+	onDisk := filepath.Join(t.TempDir(), "rag_idx.db")
+	disk, err := OpenPersistentStore(onDisk, &stubEmbedder{}, 0.55, WithChunkTokens(30))
+	if err != nil {
+		t.Fatalf("OpenPersistentStore(disk): %v", err)
+	}
+	if err := disk.IndexDir(ctx, dir); err != nil {
+		t.Fatalf("disk IndexDir: %v", err)
+	}
+	if err := disk.Close(); err != nil {
+		t.Fatalf("disk Close: %v", err)
+	}
+
+	disk2, err := OpenPersistentStore(onDisk, &stubEmbedder{}, 0.55)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = disk2.Close() })
+
+	n, err := disk2.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if n != len(snap) {
+		t.Errorf("reload returned %d rows, want %d", n, len(snap))
+	}
+}
+
+func TestMigrationV4CompositePK(t *testing.T) {
+	t.Parallel()
+
+	// Open a fresh in-memory DB and create the OLD schema (v3) with
+	// filename PRIMARY KEY, then insert a row, then run migrations to v4.
+	dbPath := filepath.Join(t.TempDir(), "migrate_v4.db")
+
+	// Create old-schema DB manually.
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	oldSchema := `
+CREATE TABLE IF NOT EXISTS rag_examples (
+    filename TEXT PRIMARY KEY,
+    content TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    indexed_at DATETIME NOT NULL,
+    embedder_model TEXT NOT NULL DEFAULT '',
+    dims INTEGER NOT NULL DEFAULT 0,
+    hnsw_index BLOB
+);
+CREATE INDEX IF NOT EXISTS idx_rag_indexed_at ON rag_examples(indexed_at);
+CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);
+INSERT INTO schema_version (version) VALUES (3);
+`
+	if _, err := db.Exec(oldSchema); err != nil {
+		t.Fatalf("create old schema: %v", err)
+	}
+
+	// Insert a row in old format.
+	blob, err := encodeEmbedding([]float64{1, 0, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec("INSERT INTO rag_examples (filename, content, embedding, indexed_at) VALUES (?, ?, ?, ?)",
+		"test.go", "test content", blob, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("insert old row: %v", err)
+	}
+
+	// Close and reopen via OpenPersistentStore to trigger migration.
+	if err := db.Close(); err != nil {
+		t.Fatalf("close old db: %v", err)
+	}
+
+	ps, err := OpenPersistentStore(dbPath, &stubEmbedder{}, 0.55)
+	if err != nil {
+		t.Fatalf("OpenPersistentStore after migration: %v", err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+
+	// Migration should have run and preserved the row.
+	ctx := context.Background()
+	n, err := ps.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after migration: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("Load returned %d rows after migration, want 1", n)
+	}
+
+	// Verify we can upsert chunked entries (composite PK works).
+	for i := 0; i < 3; i++ {
+		if err := ps.Upsert(ctx, FewShotExample{
+			Filename:   "chunked.go",
+			ChunkIndex: i,
+			Content:    fmt.Sprintf("chunk %d", i),
+			Embedding:  []float64{float64(i)},
+		}); err != nil {
+			t.Fatalf("Upsert chunk %d after migration: %v", i, err)
+		}
+	}
+
+	if got := ps.Size(); got != 4 { // 1 migrated + 3 new chunks
+		t.Errorf("Size = %d, want 4", got)
+	}
+
+	// Verify the migrated row has chunk_index = 0.
+	snap := ps.snapshot()
+	for _, ex := range snap {
+		if ex.Filename == "test.go" && ex.ChunkIndex != 0 {
+			t.Errorf("migrated row chunk_index = %d, want 0", ex.ChunkIndex)
+		}
+	}
+}
