@@ -162,11 +162,19 @@ type Summary struct {
 // Store persists per-request metrics. Implementations MUST return
 // promptly from RecordRequest; chat-path latency must never depend on
 // disk I/O timing. Buffered / async implementations are the expected
-// shape — the only synchronous call is DailySummary, which the
-// dashboard invokes explicitly.
+// shape — the only synchronous calls are DailySummary and RangeSummary,
+// which the dashboard invokes explicitly.
 type Store interface {
 	RecordRequest(req Request) error
 	DailySummary(date time.Time) (Summary, error)
+	// RangeSummary collapses every request whose timestamp falls in the
+	// half-open interval [start, end) into a single Summary. The Date
+	// field of the returned Summary is set to the truncated start. This
+	// is the long-horizon counterpart to DailySummary: a single SQL
+	// round-trip replaces N per-day queries for weekly / monthly
+	// rollups (issue #1170). When start is not before end an empty-range
+	// error is returned.
+	RangeSummary(start, end time.Time) (Summary, error)
 	Close() error
 }
 
