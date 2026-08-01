@@ -197,6 +197,10 @@ type YAMLConfig struct {
 	TracingQueueSize  int     `yaml:"tracing_queue_size"`
 	TracingBatchSize  int     `yaml:"tracing_batch_size"`
 	TracingSampleRate float64 `yaml:"tracing_sample_rate"`
+
+	// SSRF egress guard (issue #1174)
+	EgressGuardEnabled bool   `yaml:"egress_block_private"`
+	EgressAllowCIDRs   string `yaml:"egress_allow"`
 }
 
 // LoadYAML reads configuration from a YAML file at path, then overlays
@@ -1118,6 +1122,14 @@ func LoadYAML(path string) (Config, error) {
 		cfg.TracingSampleRate = f
 	}
 
+	// SSRF egress guard (issue #1174)
+	if v := os.Getenv("NEXUS_EGRESS_BLOCK_PRIVATE"); v != "" {
+		cfg.EgressGuardEnabled = parseBoolEnvStr(v, true)
+	}
+	if v := os.Getenv("NEXUS_EGRESS_ALLOW"); v != "" {
+		cfg.EgressAllowCIDRs = v
+	}
+
 	ValidateShutdownTimeout(cfg)
 	return cfg, nil
 }
@@ -1282,6 +1294,11 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		TracingQueueSize:  yc.intDefault(yc.TracingQueueSize, 256),
 		TracingBatchSize:  yc.intDefault(yc.TracingBatchSize, 64),
 		TracingSampleRate: yc.floatDefault(yc.TracingSampleRate, 1.0),
+
+		// SSRF egress guard (issue #1174). Default enabled so a stock
+		// deployment is protected out of the box.
+		EgressGuardEnabled: true,
+		EgressAllowCIDRs:   yc.EgressAllowCIDRs,
 	}
 
 	// Warn if yaml had unrecognized injection scan roles (issue #845)

@@ -532,6 +532,17 @@ type Config struct {
 	TracingQueueSize  int
 	TracingBatchSize  int
 	TracingSampleRate float64
+
+	// SSRF egress guard (issue #1174). When EgressGuardEnabled is true
+	// (the default), the shared HTTP client rejects redirects and
+	// dial-time connections to private, loopback, and link-local IP
+	// ranges — preventing server-side request forgery via upstream
+	// redirect chains. EgressAllowCIDRs is an operator-supplied
+	// comma-separated CIDR allowlist that overrides the block list,
+	// so local-Ollama deployments can permit 127.0.0.0/8 while still
+	// blocking other private ranges.
+	EgressGuardEnabled bool
+	EgressAllowCIDRs   string // raw comma-separated CIDR string from env/YAML
 }
 
 // DefaultMetricsDBPath returns the canonical metrics DB location:
@@ -1683,6 +1694,13 @@ func Load() (Config, error) {
 		tracingSampleRate = 1
 	}
 	cfg.TracingSampleRate = tracingSampleRate
+
+	// SSRF egress guard (issue #1174). Defaults to enabled=true so a
+	// stock deployment is protected out of the box. The allowlist
+	// defaults to empty (no override); operators running local Ollama
+	// should set NEXUS_EGRESS_ALLOW=127.0.0.0/8 to permit loopback.
+	cfg.EgressGuardEnabled = getEnvBool("NEXUS_EGRESS_BLOCK_PRIVATE", true)
+	cfg.EgressAllowCIDRs = getEnvAllowEmpty("NEXUS_EGRESS_ALLOW", "")
 
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
