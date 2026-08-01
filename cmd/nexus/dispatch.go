@@ -31,17 +31,21 @@ func dispatch(args []string, stdout, stderr io.Writer) (exitCode int, handled bo
 		return runInit(args[2:], stdout, stderr), true
 	case "judge":
 		return runJudgeStats(args[2:], stdout, stderr), true
+	case "route":
+		return runRoute(args[2:], stdout, stderr), true
 	case "routing-preview":
 		return runRoutingPreview(args[2:], stdout, stderr), true
 	case "-h", "--help", "help":
-		fmt.Fprintln(stderr, "Usage: nexus [init|check|doctor|config|dashboard|judge|routing-preview]")
+		fmt.Fprintln(stderr, "Usage: nexus [init|check|doctor|config|dashboard|judge|route|routing-preview]")
 		fmt.Fprintln(stderr, "")
 		fmt.Fprintln(stderr, "Run with no arguments to start the proxy.")
 		fmt.Fprintln(stderr, "Run `nexus init` to launch the interactive config wizard.")
 		fmt.Fprintln(stderr, "Run `nexus check` to validate boot-time configuration.")
 		fmt.Fprintln(stderr, "Run `nexus dashboard` to view the daily savings summary.")
 		fmt.Fprintln(stderr, "Run `nexus config validate <file>` to validate a config file.")
+		fmt.Fprintln(stderr, "Run `nexus config migrate <file>` to upgrade deprecated config keys.")
 		fmt.Fprintln(stderr, "Run `nexus judge stats` to view adaptive routing confidence.")
+		fmt.Fprintln(stderr, "Run `nexus route patterns` to view auto-promoted DSL patterns.")
 		fmt.Fprintln(stderr, "Run `nexus routing-preview \"prompt\"` to preview routing decisions.")
 		fmt.Fprintln(stderr, "Run `nexus --version` to print the build version.")
 		return 0, true
@@ -50,7 +54,7 @@ func dispatch(args []string, stdout, stderr io.Writer) (exitCode int, handled bo
 		return 0, true
 	default:
 		fmt.Fprintf(stderr, "nexus: unknown subcommand %q\n\n", args[1])
-		fmt.Fprintln(stderr, "Usage: nexus [init|check|doctor|config|dashboard|judge|routing-preview]")
+		fmt.Fprintln(stderr, "Usage: nexus [init|check|doctor|config|dashboard|judge|route|routing-preview]")
 		return 2, true
 	}
 }

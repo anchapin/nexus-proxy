@@ -228,12 +228,22 @@ type RouteCounters struct {
 	// the other map-based counters.
 	localCooldownTriggers uint64
 
+	// budgetDowntier counts how many times the planner down-tiered to
+	// local because the estimated frontier cost would exceed the
+	// remaining 24h budget (issue #1163).
+	budgetDowntier uint64
+
 	// DSL fast-pass counters (issue #875). dslHits is keyed by reason
 	// ("fusion", "formatting", "local", "unicode"); dslMisses is a
 	// single counter incremented when DSL had no opinion and the
 	// request fell through to SLM.
 	dslHits   map[string]*uint64
 	dslMisses *uint64
+
+	// Response-content redaction counter (issue #1172). Labelled by
+	// profile ("secrets", "pii", "custom"). Incremented by the
+	// substitution count for each request that produced >=1 redaction.
+	redacted map[string]*uint64
 
 	// collector is an optional Collector whose CircuitBreakerGauges()
 	// are merged into the /metrics output when non-nil.
@@ -279,6 +289,7 @@ func NewRouteCounters() *RouteCounters {
 		promptInjectionHits:      make(map[string]*uint64),
 		dslHits:                  make(map[string]*uint64),
 		dslMisses:                &dslMisses,
+		redacted:                 make(map[string]*uint64),
 	}
 }
 
@@ -529,6 +540,16 @@ func (rc *RouteCounters) IncLocalCooldownTriggers() {
 	atomic.AddUint64(&rc.localCooldownTriggers, 1)
 }
 
+// IncBudgetDowntier increments the budget-down-tier counter (issue
+// #1163). Called when the planner routes to local because the frontier
+// budget is exhausted. Nil receivers are safe — no-op.
+func (rc *RouteCounters) IncBudgetDowntier() {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(&rc.budgetDowntier, 1)
+}
+
 // IncAuthReaperEvictions increments the auth limiter reaper evictions counter
 // (issue #839). Forwarded to the attached Collector when set. Nil receivers
 // are safe — no-op.
@@ -691,6 +712,29 @@ func (rc *RouteCounters) ObservePromptInjectionHit(mode string) {
 		return
 	}
 	atomic.AddUint64(rc.promptInjectionSlot(mode), 1)
+}
+
+// ObserveRedaction records the number of pattern substitutions made
+// during a single request (issue #1172). profile labels the active
+// redaction profile ("secrets", "pii", "custom"). Safe for concurrent
+// use; nil receivers are a no-op.
+func (rc *RouteCounters) ObserveRedaction(profile string, substitutions int64) {
+	if rc == nil || profile == "" || substitutions <= 0 {
+		return
+	}
+	atomic.AddUint64(rc.redactedSlot(profile), uint64(substitutions))
+}
+
+func (rc *RouteCounters) redactedSlot(profile string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.redacted[profile]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.redacted[profile] = p
+	}
+	rc.mu.Unlock()
+	return p
 }
 
 // promptInjectionSlot returns the *uint64 for the mode label, creating
@@ -971,6 +1015,13 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += int64(n)
 	}
+	// Budget down-tier events (issue #1163).
+	budgetDowntier := atomic.LoadUint64(&rc.budgetDowntier)
+	if n, err := fmt.Fprintf(w, "# HELP nexus_route_budget_downtier_total Total requests down-tiered to local because the frontier budget was exhausted (issue #1163).\n# TYPE nexus_route_budget_downtier_total counter\nnexus_route_budget_downtier_total %d\n", budgetDowntier); err != nil {
+		return total, err
+	} else {
+		total += int64(n)
+	}
 	if n, err := writeRejectionSeries(w, "nexus_requests_rejected_total",
 		"Requests the proxy rejected before they reached an upstream.",
 		rc.rejections); err != nil {
@@ -1086,6 +1137,14 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	// DSL fast-pass counters (issue #875): nexus_router_dsl_hits_total{reason}
 	// and nexus_router_dsl_misses_total.
 	if n, err := writeDSLHitSeries(w, rc.dslHits, rc.dslMisses); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	// Response-content redaction counter (issue #1172).
+	if n, err := writeLabelledSeries(w, "nexus_redacted_total",
+		"Total response-content redactions (pattern substitutions) by profile (issue #1172).",
+		"profile", rc.redacted); err != nil {
 		return total, err
 	} else {
 		total += n

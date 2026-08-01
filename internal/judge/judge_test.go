@@ -535,6 +535,54 @@ func TestSampleRateDistribution(t *testing.T) {
 	}
 }
 
+// TestSampleFrontierRateDisabled verifies that SampleFrontier returns false
+// when FrontierSampleRate is 0 (issue #1162).
+func TestSampleFrontierRateDisabled(t *testing.T) {
+	e := NewEvaluator(Config{SampleRate: 0.1}, nil, nil)
+	defer e.Close()
+	for i := 0; i < 100; i++ {
+		if e.SampleFrontier() {
+			t.Fatal("SampleFrontier() should always be false when FrontierSampleRate is 0")
+		}
+	}
+}
+
+// TestSampleFrontierRateDistribution verifies the frontier sample rate
+// produces the expected fraction of hits (issue #1162).
+func TestSampleFrontierRateDistribution(t *testing.T) {
+	const (
+		rate  = 0.02
+		tries = 10000
+	)
+	e := NewEvaluator(Config{SampleRate: 0.1, FrontierSampleRate: rate}, nil, nil)
+	defer e.Close()
+	hits := 0
+	for i := 0; i < tries; i++ {
+		if e.SampleFrontier() {
+			hits++
+		}
+	}
+	frac := float64(hits) / float64(tries)
+	if frac < rate-0.01 || frac > rate+0.01 {
+		t.Errorf("frontier sample fraction %.4f, want ~%.4f", frac, rate)
+	}
+	if got := e.FrontierSampled(); got != uint64(hits) {
+		t.Errorf("FrontierSampled = %d, want %d", got, hits)
+	}
+}
+
+// TestSampleFrontierNilSafe verifies that SampleFrontier on a nil evaluator
+// does not panic.
+func TestSampleFrontierNilSafe(t *testing.T) {
+	var e *Evaluator
+	if e.SampleFrontier() {
+		t.Error("nil evaluator SampleFrontier should return false")
+	}
+	if e.FrontierSampled() != 0 {
+		t.Error("nil evaluator FrontierSampled should return 0")
+	}
+}
+
 // TestEvaluateEntryPoint exercises the standalone Evaluate path so a
 // future CLI tool (or test harness) can drive one judge call without
 // spinning up the worker pool.
@@ -946,5 +994,156 @@ func TestNewSeededRandDistinct(t *testing.T) {
 		if r1.Float64() == r2.Float64() {
 			t.Fatalf("identical first draw on iteration %d — seeds collided (issue #589)", i)
 		}
+	}
+}
+
+// TestScoreCarriesRAGState confirms that the RAGInjected and
+// RAGSimilarity fields on Sample propagate to the persisted JudgeScore
+// (issue #1167).
+func TestScoreCarriesRAGState(t *testing.T) {
+	fn := rtFunc(func(_ *http.Request) (*http.Response, error) {
+		resp := `{"choices":[{"message":{"content":"5"}}]}`
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(resp)),
+		}, nil
+	})
+	e, store := newTestEvaluator(t, Config{}, fn)
+	defer e.Close()
+
+	s := Sample{
+		RequestID:     "rag-req",
+		Instruction:   "refactor this",
+		Output:        "done",
+		LocalModel:    "qwen3-coder:8b",
+		Route:         "local",
+		RAGInjected:   true,
+		RAGSimilarity: 0.92,
+	}
+	if !e.Enqueue(s) {
+		t.Fatal("Enqueue should accept")
+	}
+	scores := waitForScores(t, store, 1, 2*time.Second)
+	if len(scores) != 1 {
+		t.Fatalf("got %d scores, want 1", len(scores))
+	}
+	got := scores[0]
+	if !got.RAGInjected {
+		t.Error("JudgeScore.RAGInjected = false, want true")
+	}
+	if got.RAGSimilarity != 0.92 {
+		t.Errorf("JudgeScore.RAGSimilarity = %v, want 0.92", got.RAGSimilarity)
+	}
+}
+
+// TestScoreRAGStateDefaultsFalse confirms non-RAG samples carry
+// RAGInjected=false and RAGSimilarity=0 (issue #1167).
+func TestScoreRAGStateDefaultsFalse(t *testing.T) {
+	fn := rtFunc(func(_ *http.Request) (*http.Response, error) {
+		resp := `{"choices":[{"message":{"content":"3"}}]}`
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(resp)),
+		}, nil
+	})
+	e, store := newTestEvaluator(t, Config{}, fn)
+	defer e.Close()
+
+	s := Sample{
+		RequestID:   "plain-req",
+		Instruction: "hello",
+		Output:      "world",
+	}
+	if !e.Enqueue(s) {
+		t.Fatal("Enqueue should accept")
+	}
+	scores := waitForScores(t, store, 1, 2*time.Second)
+	if len(scores) != 1 {
+		t.Fatalf("got %d scores, want 1", len(scores))
+	}
+	got := scores[0]
+	if got.RAGInjected {
+		t.Error("JudgeScore.RAGInjected = true, want false")
+	}
+	if got.RAGSimilarity != 0 {
+		t.Errorf("JudgeScore.RAGSimilarity = %v, want 0", got.RAGSimilarity)
+	}
+}
+
+// TestScoreCallbackFires confirms that the onScore callback registered
+// via SetScoreCallback is invoked with the resulting JudgeScore after
+// each evaluation, including RAG state (issue #1167).
+func TestScoreCallbackFires(t *testing.T) {
+	fn := rtFunc(func(_ *http.Request) (*http.Response, error) {
+		resp := `{"choices":[{"message":{"content":"4"}}]}`
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(resp)),
+		}, nil
+	})
+	e, store := newTestEvaluator(t, Config{}, fn)
+	defer e.Close()
+
+	var (
+		cbMu     sync.Mutex
+		cbScores []JudgeScore
+	)
+	e.SetScoreCallback(func(s JudgeScore) {
+		cbMu.Lock()
+		cbScores = append(cbScores, s)
+		cbMu.Unlock()
+	})
+
+	s := Sample{
+		RequestID:     "cb-req",
+		Instruction:   "test",
+		Output:        "output",
+		RAGInjected:   true,
+		RAGSimilarity: 0.88,
+	}
+	if !e.Enqueue(s) {
+		t.Fatal("Enqueue should accept")
+	}
+	// Wait for storage to confirm the worker ran.
+	_ = waitForScores(t, store, 1, 2*time.Second)
+
+	cbMu.Lock()
+	defer cbMu.Unlock()
+	if len(cbScores) != 1 {
+		t.Fatalf("callback fired %d times, want 1", len(cbScores))
+	}
+	got := cbScores[0]
+	if got.Score != 4 {
+		t.Errorf("callback score = %d, want 4", got.Score)
+	}
+	if !got.RAGInjected {
+		t.Error("callback JudgeScore.RAGInjected = false, want true")
+	}
+}
+
+// TestScoreCallbackNilSafe confirms a nil callback (the default) does
+// not panic (issue #1167).
+func TestScoreCallbackNilSafe(t *testing.T) {
+	fn := rtFunc(func(_ *http.Request) (*http.Response, error) {
+		resp := `{"choices":[{"message":{"content":"2"}}]}`
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(resp)),
+		}, nil
+	})
+	e, store := newTestEvaluator(t, Config{}, fn)
+	defer e.Close()
+	// Do NOT call SetScoreCallback — onScore stays nil.
+
+	if !e.Enqueue(Sample{RequestID: "nil-cb", Instruction: "x", Output: "y"}) {
+		t.Fatal("Enqueue should accept")
+	}
+	scores := waitForScores(t, store, 1, 2*time.Second)
+	if len(scores) != 1 {
+		t.Fatalf("got %d scores, want 1 (callback should not interfere)", len(scores))
 	}
 }

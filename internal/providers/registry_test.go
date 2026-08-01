@@ -293,6 +293,98 @@ func TestProviderConfigImplementsProvider(t *testing.T) {
 	var _ ProviderV2 = ProviderConfig{}
 }
 
+// TestProviderConfigInputOutputCosts (issue #1183) verifies the
+// per-direction cost accessors and that the flat CostPer1KUSD stays
+// independent of the input/output split fields.
+func TestProviderConfigInputOutputCosts(t *testing.T) {
+	p := ProviderConfig{
+		NameVal:            "openai",
+		ModelVal:           "gpt-4o",
+		CostPer1KVal:       0.005,
+		InputCostPer1KVal:  0.005,
+		OutputCostPer1KVal: 0.015,
+	}
+	if got, want := p.InputCostPer1KUSD(), 0.005; got != want {
+		t.Errorf("InputCostPer1KUSD() = %v, want %v", got, want)
+	}
+	if got, want := p.OutputCostPer1KUSD(), 0.015; got != want {
+		t.Errorf("OutputCostPer1KUSD() = %v, want %v", got, want)
+	}
+	// Flat rate is preserved for the selector weight.
+	if got, want := p.CostPer1KUSD(), 0.005; got != want {
+		t.Errorf("CostPer1KUSD() = %v, want %v", got, want)
+	}
+}
+
+// TestParseProvidersFromEnvInputOutputCost (issue #1183) verifies the
+// JSON parser accepts inputCostPer1K / outputCostPer1K and that a bare
+// costPer1K still seeds the input rate for backward compatibility.
+func TestParseProvidersFromEnvInputOutputCost(t *testing.T) {
+	envVal := `[{"name":"openai","url":"https://api.openai.com/v1","model":"gpt-4o","apiKey":"sk-xxx","inputCostPer1K":0.005,"outputCostPer1K":0.015},` +
+		`{"name":"legacy","url":"https://api.legacy.com/v1","model":"legacy-model","costPer1K":0.002}]`
+	os.Setenv("NEXUS_FRONTIER_PROVIDERS", envVal)
+	defer os.Unsetenv("NEXUS_FRONTIER_PROVIDERS")
+
+	reg, err := ParseProvidersFromEnv()
+	if err != nil {
+		t.Fatalf("ParseProvidersFromEnv() error = %v", err)
+	}
+
+	p := reg.ByName("openai")
+	if p == nil {
+		t.Fatal("ByName(\"openai\") returned nil")
+	}
+	if got, want := p.InputCostPer1KUSD(), 0.005; got != want {
+		t.Errorf("openai InputCostPer1KUSD() = %v, want %v", got, want)
+	}
+	if got, want := p.OutputCostPer1KUSD(), 0.015; got != want {
+		t.Errorf("openai OutputCostPer1KUSD() = %v, want %v", got, want)
+	}
+
+	// Legacy entry: only costPer1K set → input rate mirrors it, output
+	// rate is zero, flat rate preserved.
+	l := reg.ByName("legacy")
+	if l == nil {
+		t.Fatal("ByName(\"legacy\") returned nil")
+	}
+	if got, want := l.InputCostPer1KUSD(), 0.002; got != want {
+		t.Errorf("legacy InputCostPer1KUSD() = %v, want %v (mirrored from costPer1K)", got, want)
+	}
+	if got, want := l.OutputCostPer1KUSD(), 0.0; got != want {
+		t.Errorf("legacy OutputCostPer1KUSD() = %v, want %v", got, want)
+	}
+	if got, want := l.CostPer1KUSD(), 0.002; got != want {
+		t.Errorf("legacy CostPer1KUSD() = %v, want %v", got, want)
+	}
+}
+
+// TestRegistryByModel (issue #1183) verifies the cost estimator's
+// model-based provider lookup, including the empty-model and
+// no-match cases.
+func TestRegistryByModel(t *testing.T) {
+	reg := NewProviderRegistry()
+	reg.Register(ProviderConfig{
+		NameVal:            "openai",
+		ModelVal:           "gpt-4o",
+		InputCostPer1KVal:  0.005,
+		OutputCostPer1KVal: 0.015,
+	})
+	reg.Register(ProviderConfig{NameVal: "zai", ModelVal: "glm-4.6"})
+
+	if p := reg.ByModel("gpt-4o"); p == nil || p.Name() != "openai" {
+		t.Errorf("ByModel(\"gpt-4o\") = %v, want openai", p)
+	}
+	if p := reg.ByModel("glm-4.6"); p == nil || p.Name() != "zai" {
+		t.Errorf("ByModel(\"glm-4.6\") = %v, want zai", p)
+	}
+	if p := reg.ByModel("nope"); p != nil {
+		t.Errorf("ByModel(\"nope\") = %v, want nil", p)
+	}
+	if p := reg.ByModel(""); p != nil {
+		t.Errorf("ByModel(\"\") = %v, want nil", p)
+	}
+}
+
 // TestRegistryConcurrent exercises concurrent Register/All/ByName calls.
 func TestRegistryConcurrent(t *testing.T) {
 	reg := NewProviderRegistry()

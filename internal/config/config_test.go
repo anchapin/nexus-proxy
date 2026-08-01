@@ -65,6 +65,15 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.CascadeTimeout != 30*time.Second {
 		t.Errorf("CascadeTimeout = %v, want 30s", cfg.CascadeTimeout)
 	}
+	if cfg.CascadeTimeoutFloor != 5*time.Second {
+		t.Errorf("CascadeTimeoutFloor = %v, want 5s", cfg.CascadeTimeoutFloor)
+	}
+	if cfg.CascadeTimeoutCeiling != 120*time.Second {
+		t.Errorf("CascadeTimeoutCeiling = %v, want 120s", cfg.CascadeTimeoutCeiling)
+	}
+	if cfg.CascadeTimeoutPer1kTokens != 1500*time.Millisecond {
+		t.Errorf("CascadeTimeoutPer1kTokens = %v, want 1500ms", cfg.CascadeTimeoutPer1kTokens)
+	}
 	if cfg.ZAIURL != "https://api.z.ai/v1/chat/completions" {
 		t.Errorf("ZAIURL = %q", cfg.ZAIURL)
 	}
@@ -138,6 +147,9 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("NEXUS_RAG_THRESHOLD", "0.7")
 	t.Setenv("NEXUS_SLM_TIMEOUT", "3s")
 	t.Setenv("NEXUS_CASCADE_TIMEOUT", "15s")
+	t.Setenv("NEXUS_CASCADE_TIMEOUT_FLOOR", "8s")
+	t.Setenv("NEXUS_CASCADE_TIMEOUT_CEILING", "200s")
+	t.Setenv("NEXUS_CASCADE_TIMEOUT_PER_1K_TOKENS", "2s")
 	t.Setenv("NEXUS_ZAI_API_KEY", "zai-test")
 	t.Setenv("NEXUS_ZAI_MODEL", "glm-4.5")
 	t.Setenv("NEXUS_TELEMETRY_PATH", "")
@@ -145,6 +157,7 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("NEXUS_PROBE_TIMEOUT", "2s")
 	t.Setenv("NEXUS_PROBE_BYTES_PER_TOKEN", "131072")
 	t.Setenv("NEXUS_PROBE_THERMAL_THRESHOLD", "75")
+	t.Setenv("NEXUS_PROBE_NVIDIA_INTERVAL", "5m")
 	t.Setenv("NEXUS_PROVIDER_TAIL_WEIGHT", "0.25")
 
 	cfg, err := Load()
@@ -169,6 +182,15 @@ func TestLoadOverrides(t *testing.T) {
 	if cfg.CascadeTimeout != 15*time.Second {
 		t.Errorf("CascadeTimeout = %v, want 15s", cfg.CascadeTimeout)
 	}
+	if cfg.CascadeTimeoutFloor != 8*time.Second {
+		t.Errorf("CascadeTimeoutFloor = %v, want 8s", cfg.CascadeTimeoutFloor)
+	}
+	if cfg.CascadeTimeoutCeiling != 200*time.Second {
+		t.Errorf("CascadeTimeoutCeiling = %v, want 200s", cfg.CascadeTimeoutCeiling)
+	}
+	if cfg.CascadeTimeoutPer1kTokens != 2*time.Second {
+		t.Errorf("CascadeTimeoutPer1kTokens = %v, want 2s", cfg.CascadeTimeoutPer1kTokens)
+	}
 	if cfg.ZAIKey != "zai-test" {
 		t.Errorf("ZAIKey = %q", cfg.ZAIKey)
 	}
@@ -189,6 +211,9 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if cfg.ProbeThermalThreshold != 75 {
 		t.Errorf("ProbeThermalThreshold = %d, want 75", cfg.ProbeThermalThreshold)
+	}
+	if cfg.ProbeNVIDIAInterval != 5*time.Minute {
+		t.Errorf("ProbeNVIDIAInterval = %v, want 5m", cfg.ProbeNVIDIAInterval)
 	}
 	if cfg.ProviderTailWeight != 0.25 {
 		t.Errorf("ProviderTailWeight = %v, want 0.25", cfg.ProviderTailWeight)
@@ -404,6 +429,19 @@ func TestLoadProbeDisabledByZeroInterval(t *testing.T) {
 	}
 }
 
+// TestLoadProbeNVIDIAIntervalDefaultZero verifies the periodic NVIDIA
+// refresh defaults to boot-only (issue #1178): no background goroutine
+// unless the operator opts in.
+func TestLoadProbeNVIDIAIntervalDefaultZero(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ProbeNVIDIAInterval != 0 {
+		t.Errorf("ProbeNVIDIAInterval = %v, want 0 (boot-only default)", cfg.ProbeNVIDIAInterval)
+	}
+}
+
 func TestLoadProbeInvalidValues(t *testing.T) {
 	cases := []struct {
 		name string
@@ -414,6 +452,7 @@ func TestLoadProbeInvalidValues(t *testing.T) {
 		{"bad timeout", "NEXUS_PROBE_TIMEOUT", "ten seconds"},
 		{"bad bytes per token", "NEXUS_PROBE_BYTES_PER_TOKEN", "lots"},
 		{"bad thermal threshold", "NEXUS_PROBE_THERMAL_THRESHOLD", "hot"},
+		{"bad nvidia interval", "NEXUS_PROBE_NVIDIA_INTERVAL", "5 min"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -489,6 +528,56 @@ func TestLoadProviderTailWeightBounds(t *testing.T) {
 			}
 			if cfg.ProviderTailWeight != want {
 				t.Errorf("ProviderTailWeight = %v, want %v", cfg.ProviderTailWeight, want)
+			}
+		})
+	}
+}
+
+// TestLoadValidationErrorHints (issue #1181) verifies that every
+// config-validation error surfaced by Load() carries an actionable
+// remediation hint: the offending var name, the safe default value, and a
+// pointer to .env.example. The table covers int, duration, float-range, and
+// regex failure modes plus the inline negative/range checks.
+func TestLoadValidationErrorHints(t *testing.T) {
+	cases := []struct {
+		name        string
+		key         string
+		val         string
+		wantDefault string // the safe default that should appear in the message
+		wantSubstr  string // a stable constraint fragment
+	}{
+		// getEnvInt parse failure
+		{"bad int names default", "NEXUS_TOKEN_GUARDRAIL", "not-a-number", "6000", "must be an integer"},
+		// getEnvFloat parse failure
+		{"bad float names default", "NEXUS_RAG_THRESHOLD", "0.5x", "0.55", "must be a number"},
+		// getEnvDuration parse failure
+		{"bad duration names default", "NEXUS_SLM_TIMEOUT", "eight seconds", "8s", "must be a Go duration string"},
+		// getEnvRegexps compile failure
+		{"bad regex names hint", "NEXUS_DSL_FORMATTING_PATTERNS", "[invalid", ".env.example", "not a valid regex"},
+		// inline negative-duration check
+		{"negative read timeout names default", "NEXUS_SERVER_READ_TIMEOUT", "-5s", "30s", "must not be negative"},
+		// inline [0,1] range check
+		{"out of range tail weight names range", "NEXUS_PROVIDER_TAIL_WEIGHT", "5", "0", "must be a number in [0,1]"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.key, tc.val)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("expected error for %s=%s, got nil", tc.key, tc.val)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, tc.key) {
+				t.Errorf("error %q does not name the var %s", msg, tc.key)
+			}
+			if !strings.Contains(msg, tc.wantSubstr) {
+				t.Errorf("error %q does not contain %q", msg, tc.wantSubstr)
+			}
+			if !strings.Contains(msg, tc.wantDefault) {
+				t.Errorf("error %q does not name the default %q", msg, tc.wantDefault)
+			}
+			if !strings.Contains(msg, ".env.example") {
+				t.Errorf("error %q does not point to .env.example", msg)
 			}
 		})
 	}
@@ -785,6 +874,64 @@ func TestLoadShutdownTimeoutInvalidValue(t *testing.T) {
 	t.Setenv("NEXUS_SHUTDOWN_TIMEOUT", "soon")
 	if _, err := Load(); err == nil {
 		t.Errorf("expected error for NEXUS_SHUTDOWN_TIMEOUT=soon")
+	}
+}
+
+// --- Fusion per-member timeouts (issue #1164) ---
+
+func TestLoadFusionLocalTimeoutDefault(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.FusionLocalTimeout != 90*time.Second {
+		t.Errorf("FusionLocalTimeout = %v, want 90s", cfg.FusionLocalTimeout)
+	}
+}
+
+func TestLoadFusionFrontierTimeoutDefault(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.FusionFrontierTimeout != 30*time.Second {
+		t.Errorf("FusionFrontierTimeout = %v, want 30s", cfg.FusionFrontierTimeout)
+	}
+}
+
+func TestLoadFusionLocalTimeoutHonoursOverride(t *testing.T) {
+	t.Setenv("NEXUS_FUSION_LOCAL_TIMEOUT", "45s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.FusionLocalTimeout != 45*time.Second {
+		t.Errorf("FusionLocalTimeout = %v, want 45s", cfg.FusionLocalTimeout)
+	}
+}
+
+func TestLoadFusionFrontierTimeoutHonoursOverride(t *testing.T) {
+	t.Setenv("NEXUS_FUSION_FRONTIER_TIMEOUT", "15s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.FusionFrontierTimeout != 15*time.Second {
+		t.Errorf("FusionFrontierTimeout = %v, want 15s", cfg.FusionFrontierTimeout)
+	}
+}
+
+func TestLoadFusionLocalTimeoutInvalidValue(t *testing.T) {
+	t.Setenv("NEXUS_FUSION_LOCAL_TIMEOUT", "soon")
+	if _, err := Load(); err == nil {
+		t.Errorf("expected error for NEXUS_FUSION_LOCAL_TIMEOUT=soon")
+	}
+}
+
+func TestLoadFusionFrontierTimeoutInvalidValue(t *testing.T) {
+	t.Setenv("NEXUS_FUSION_FRONTIER_TIMEOUT", "soon")
+	if _, err := Load(); err == nil {
+		t.Errorf("expected error for NEXUS_FUSION_FRONTIER_TIMEOUT=soon")
 	}
 }
 
