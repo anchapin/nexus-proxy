@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1579,5 +1580,243 @@ func TestIndexDirBatchFailureStillBuildsIndex(t *testing.T) {
 	mode := store.IndexMode()
 	if mode != IndexModeHNSW {
 		t.Errorf("IndexMode = %q, want %q (index should be rebuilt after batch failure)", mode, IndexModeHNSW)
+	}
+}
+
+// --- Issue #1168: Chunk large files for finer-grained RAG retrieval ---
+
+func TestChunkFileDisabled(t *testing.T) {
+	t.Parallel()
+	content := "func main() {}"
+	chunks := chunkFile(content, 0)
+	if len(chunks) != 1 {
+		t.Fatalf("expected 1 chunk, got %d", len(chunks))
+	}
+	if chunks[0].Content != content || chunks[0].Index != 0 {
+		t.Errorf("unexpected chunk: %+v", chunks[0])
+	}
+}
+
+func TestChunkFileSmallContentReturnsSingleChunk(t *testing.T) {
+	t.Parallel()
+	content := "small file content"
+	chunks := chunkFile(content, 1000)
+	if len(chunks) != 1 {
+		t.Fatalf("small file should produce 1 chunk, got %d", len(chunks))
+	}
+	if chunks[0].Index != 0 {
+		t.Errorf("chunk index should be 0, got %d", chunks[0].Index)
+	}
+}
+
+func TestChunkFileLargeContentProducesMultipleChunks(t *testing.T) {
+	t.Parallel()
+	// Generate content large enough to exceed the token threshold.
+	// Each block is separated by a blank line for natural boundaries.
+	var blocks []string
+	for i := 0; i < 30; i++ {
+		blocks = append(blocks, fmt.Sprintf("// Block %d\nfunc handler%d() {\n\treturn\n}", i, i))
+	}
+	content := strings.Join(blocks, "\n\n")
+
+	// Use a small threshold to force multiple chunks.
+	maxTokens := 50
+	chunks := chunkFile(content, maxTokens)
+	if len(chunks) <= 1 {
+		t.Fatalf("expected >1 chunks for large content with maxTokens=%d, got %d", maxTokens, len(chunks))
+	}
+
+	// Verify chunk indices are sequential starting from 0.
+	for i, c := range chunks {
+		if c.Index != i {
+			t.Errorf("chunk %d has Index=%d, want %d", i, c.Index, i)
+		}
+	}
+
+	// Verify each chunk is non-empty.
+	for i, c := range chunks {
+		if len(c.Content) == 0 {
+			t.Errorf("chunk %d is empty", i)
+		}
+	}
+}
+
+func TestChunkFileOverlapBetweenChunks(t *testing.T) {
+	t.Parallel()
+	// Create content with distinct blocks.
+	var blocks []string
+	for i := 0; i < 20; i++ {
+		blocks = append(blocks, fmt.Sprintf("BLOCK_%d_MARKER", i))
+	}
+	content := strings.Join(blocks, "\n\n")
+
+	chunks := chunkFile(content, 20)
+	if len(chunks) < 2 {
+		t.Skip("not enough chunks to test overlap")
+	}
+
+	// The last block(s) of chunk[i] should appear at the start of chunk[i+1]
+	// (overlap). Check at least one block from chunk 0 appears in chunk 1.
+	chunk0LastBlock := ""
+	blk0 := splitByBlankLines(chunks[0].Content)
+	if len(blk0) > 0 {
+		chunk0LastBlock = blk0[len(blk0)-1]
+	}
+	if chunk0LastBlock == "" {
+		t.Fatal("could not extract last block from chunk 0")
+	}
+
+	found := false
+	for _, b := range splitByBlankLines(chunks[1].Content) {
+		if b == chunk0LastBlock {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected overlap: last block of chunk 0 should appear in chunk 1")
+	}
+}
+
+func TestStoreIndexDirWithChunking(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	// Create a large file that should be chunked.
+	var blocks []string
+	for i := 0; i < 20; i++ {
+		blocks = append(blocks, fmt.Sprintf("// section %d\nfunc f%d() {}", i, i))
+	}
+	largeContent := strings.Join(blocks, "\n\n")
+	if err := os.WriteFile(filepath.Join(dir, "large.go"), []byte(largeContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a small file that should NOT be chunked.
+	if err := os.WriteFile(filepath.Join(dir, "small.go"), []byte("package main"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewStore(&stubEmbedder{}, 0.0, WithChunkTokens(30))
+	if err := store.IndexDir(context.Background(), dir); err != nil {
+		t.Fatalf("IndexDir: %v", err)
+	}
+
+	snap := store.snapshot()
+	if len(snap) < 3 {
+		t.Fatalf("expected at least 3 examples (1 small + >=2 chunks), got %d", len(snap))
+	}
+
+	// Verify small.go has exactly 1 entry (chunk_index 0).
+	var smallCount int
+	var largeChunks []int
+	for _, ex := range snap {
+		if ex.Filename == "small.go" {
+			smallCount++
+		}
+		if ex.Filename == "large.go" {
+			largeChunks = append(largeChunks, ex.ChunkIndex)
+		}
+	}
+	if smallCount != 1 {
+		t.Errorf("small.go should have 1 entry, got %d", smallCount)
+	}
+	if len(largeChunks) < 2 {
+		t.Errorf("large.go should have >=2 chunks, got %d", len(largeChunks))
+	}
+	// Verify chunk indices are sequential.
+	for i, idx := range largeChunks {
+		if idx != i {
+			t.Errorf("large.go chunk %d has index %d, want %d", i, idx, i)
+		}
+	}
+}
+
+func TestStoreIndexDirChunkingDisabledByDefault(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	largeContent := strings.Repeat("package main\n\n", 50)
+	if err := os.WriteFile(filepath.Join(dir, "big.go"), []byte(largeContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewStore(&stubEmbedder{}, 0.0) // no WithChunkTokens
+	if err := store.IndexDir(context.Background(), dir); err != nil {
+		t.Fatalf("IndexDir: %v", err)
+	}
+
+	snap := store.snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("expected 1 example (no chunking), got %d", len(snap))
+	}
+	if snap[0].ChunkIndex != 0 {
+		t.Errorf("chunk index should be 0 when chunking disabled, got %d", snap[0].ChunkIndex)
+	}
+}
+
+func TestUpsertExampleChunkAware(t *testing.T) {
+	t.Parallel()
+	store := NewStore(&stubEmbedder{}, 0.0)
+
+	// Insert chunk 0 and chunk 1 for the same file.
+	store.upsertExample(FewShotExample{Filename: "f.go", ChunkIndex: 0, Content: "part0", Embedding: []float64{1}})
+	store.upsertExample(FewShotExample{Filename: "f.go", ChunkIndex: 1, Content: "part1", Embedding: []float64{2}})
+
+	if store.Size() != 2 {
+		t.Fatalf("expected 2 examples, got %d", store.Size())
+	}
+
+	// Upsert chunk 0 again — should replace, not add.
+	store.upsertExample(FewShotExample{Filename: "f.go", ChunkIndex: 0, Content: "updated", Embedding: []float64{3}})
+
+	if store.Size() != 2 {
+		t.Fatalf("expected 2 examples after upsert, got %d", store.Size())
+	}
+
+	// Verify the content was updated.
+	for _, ex := range store.snapshot() {
+		if ex.Filename == "f.go" && ex.ChunkIndex == 0 {
+			if ex.Content != "updated" {
+				t.Errorf("chunk 0 content = %q, want %q", ex.Content, "updated")
+			}
+		}
+	}
+}
+
+func TestRemoveExampleDeletesAllChunks(t *testing.T) {
+	t.Parallel()
+	store := NewStore(&stubEmbedder{}, 0.0)
+
+	store.upsertExample(FewShotExample{Filename: "f.go", ChunkIndex: 0, Content: "c0", Embedding: []float64{1}})
+	store.upsertExample(FewShotExample{Filename: "f.go", ChunkIndex: 1, Content: "c1", Embedding: []float64{2}})
+	store.upsertExample(FewShotExample{Filename: "g.go", ChunkIndex: 0, Content: "g0", Embedding: []float64{3}})
+
+	store.removeExample("f.go")
+
+	if store.Size() != 1 {
+		t.Fatalf("expected 1 example after remove, got %d", store.Size())
+	}
+	snap := store.snapshot()
+	if snap[0].Filename != "g.go" {
+		t.Errorf("remaining example = %q, want g.go", snap[0].Filename)
+	}
+}
+
+func TestFormatInjectionChunkLabel(t *testing.T) {
+	t.Parallel()
+
+	// Non-chunked example: no suffix.
+	ex0 := &FewShotExample{Filename: "handler.go", ChunkIndex: 0, Content: "code"}
+	text0 := FormatInjection(ex0)
+	if !strings.Contains(text0, "handler.go") || strings.Contains(text0, "#chunk") {
+		t.Errorf("non-chunked label should not contain chunk suffix: %s", text0)
+	}
+
+	// Chunked example: suffix present.
+	ex1 := &FewShotExample{Filename: "handler.go", ChunkIndex: 2, Content: "code"}
+	text1 := FormatInjection(ex1)
+	if !strings.Contains(text1, "handler.go#chunk2") {
+		t.Errorf("chunked label should contain '#chunk2': %s", text1)
 	}
 }
