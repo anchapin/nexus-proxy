@@ -132,6 +132,7 @@ type YAMLConfig struct {
 	ProbeTimeout          string `yaml:"probe_timeout"`
 	ProbeBytesPerToken    int    `yaml:"probe_bytes_per_token"`
 	ProbeThermalThreshold int    `yaml:"probe_thermal_threshold"`
+	ProbeNVIDIAInterval   string `yaml:"probe_nvidia_interval"`
 
 	// Local concurrency
 	LocalMaxConcurrent    int    `yaml:"local_max_concurrent"`
@@ -790,6 +791,16 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.ProbeThermalThreshold = n
 	}
+	if v := os.Getenv("NEXUS_PROBE_NVIDIA_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_PROBE_NVIDIA_INTERVAL: %w", err)
+		}
+		if d < 0 {
+			d = 0
+		}
+		cfg.ProbeNVIDIAInterval = d
+	}
 
 	// Local concurrency
 	if v := os.Getenv("NEXUS_LOCAL_MAX_CONCURRENT"); v != "" {
@@ -1282,6 +1293,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		ProbeTimeout:          yc.durationDefault(yc.ProbeTimeout, 5*time.Second),
 		ProbeBytesPerToken:    yc.intDefault(yc.ProbeBytesPerToken, 256*1024),
 		ProbeThermalThreshold: yc.intDefault(yc.ProbeThermalThreshold, 90),
+		ProbeNVIDIAInterval:   yc.durationDefault(yc.ProbeNVIDIAInterval, 0),
 
 		LocalMaxConcurrent:    yc.intDefault(yc.LocalMaxConcurrent, 0),
 		LocalVRAMBytesPerSlot: yc.int64Default(yc.LocalVRAMBytesPerSlot, DefaultLocalVRAMBytesPerSlot),

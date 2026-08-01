@@ -47,6 +47,11 @@ const (
 	// min(model-context, free-vram-tokens). This is the common
 	// production case.
 	SourceBoth Source = "ollama-ps+amd-sysfs"
+	// SourceNVIDIA means the budget's free-VRAM figure was last
+	// updated by a periodic nvidia-smi refresh (issue #1178). The
+	// AMD sysfs path does not run on NVIDIA-only hosts, so without
+	// the refresh FreeVRAMBytes would be frozen at boot.
+	SourceNVIDIA Source = "nvidia-smi"
 	// SourceStatic means the dynamic probe could not produce a
 	// budget and the caller is falling back to
 	// NEXUS_TOKEN_GUARDRAIL.
@@ -157,6 +162,17 @@ type Manager struct {
 	// this channel. WaitForProbes is the public accessor.
 	tickCh chan struct{}
 
+	// nvidiaInterval is the cadence of the periodic NVIDIA VRAM
+	// refresh (issue #1178). Zero (the default) means the NVIDIA
+	// path is boot-only and no goroutine is started. Set via
+	// EnableNVIDIARefresh before Run.
+	nvidiaInterval time.Duration
+	// nvidiaRefresh returns per-GPU NVIDIA VRAM. It defaults to
+	// the package-level ReadPerGPUVRAM; tests override it with a
+	// deterministic stub. Guarded so a nil function is treated as
+	// "no NVIDIA" rather than panicking.
+	nvidiaRefresh func() ([]GPUInfo, error)
+
 	latest atomic.Pointer[Budget]
 }
 
@@ -219,15 +235,30 @@ func (m *Manager) Run(ctx context.Context) {
 		slog.Info("probe: polling disabled (NEXUS_PROBE_INTERVAL=0); boot snapshot only",
 			slog.Any("budget", m.Get()),
 		)
-		return
+	} else {
+		slog.Info("probe: running",
+			slog.Duration("interval", m.interval),
+			slog.Duration("timeout", m.timeout),
+		)
+		m.wg.Add(1)
+		go m.loop(ctx)
 	}
 
-	slog.Info("probe: running",
-		slog.Duration("interval", m.interval),
-		slog.Duration("timeout", m.timeout),
-	)
-	m.wg.Add(1)
-	go m.loop(ctx)
+	// Periodic NVIDIA VRAM refresh (issue #1178). On NVIDIA-only
+	// hosts the AMD sysfs path returns nothing, so the budget's
+	// FreeVRAMBytes would otherwise be frozen at boot for the whole
+	// process lifetime. When enabled, a goroutine shells out to
+	// nvidia-smi on this cadence and republishes the budget so the
+	// VRAM-aware limiter (internal/concurrencylimit) sees model-swap
+	// and co-tenant VRAM-grab events. Boot-only when the interval is
+	// zero — no goroutine, no extra fork cost.
+	if m.nvidiaInterval > 0 {
+		slog.Info("probe: periodic NVIDIA VRAM refresh enabled",
+			slog.Duration("interval", m.nvidiaInterval),
+		)
+		m.wg.Add(1)
+		go m.nvidiaLoop(ctx)
+	}
 }
 
 // loop runs probes on a ticker until ctx is canceled or Close is
@@ -246,6 +277,106 @@ func (m *Manager) loop(ctx context.Context) {
 			m.doProbe(ctx)
 		}
 	}
+}
+
+// EnableNVIDIARefresh arms a periodic NVIDIA VRAM refresh (issue
+// #1178). It must be called before Run. A non-positive interval is a
+// no-op so the boot-only behaviour is preserved when the operator
+// leaves NEXUS_PROBE_NVIDIA_INTERVAL unset. The refresh function
+// defaults to the package-level ReadPerGPUVRAM; callers in the same
+// package can override Manager.nvidiaRefresh with a deterministic stub.
+func (m *Manager) EnableNVIDIARefresh(interval time.Duration) {
+	if m == nil || interval <= 0 {
+		return
+	}
+	m.nvidiaInterval = interval
+	if m.nvidiaRefresh == nil {
+		m.nvidiaRefresh = ReadPerGPUVRAM
+	}
+}
+
+// nvidiaLoop runs mergeNVIDIA on a ticker until ctx is canceled or
+// Close is called. It is the NVIDIA-side companion to loop; the two
+// run independently because the AMD sysfs poll and the nvidia-smi
+// fork have very different cost profiles and cadences.
+func (m *Manager) nvidiaLoop(ctx context.Context) {
+	defer m.wg.Done()
+	t := time.NewTicker(m.nvidiaInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-m.closed:
+			return
+		case <-t.C:
+			m.mergeNVIDIA()
+		}
+	}
+}
+
+// mergeNVIDIA reads the current NVIDIA VRAM snapshot and republishes
+// the budget with the NVIDIA contribution merged in (issue #1178). On
+// NVIDIA-only hosts this is the only source of free VRAM, so the
+// published FreeVRAMBytes (read on every Acquire by the concurrency
+// limiter) would otherwise stay frozen at boot. Missing nvidia-smi or
+// an empty GPU list is a silent no-op so AMD-only and headless hosts
+// are unaffected.
+//
+// The NVIDIA sum is authoritative: when nvidia-smi reports GPUs the
+// published FreeVRAMBytes is overwritten. This is correct on
+// NVIDIA-only hosts (the AMD sysfs value is 0) and on hosts where
+// Ollama runs against CUDA; mixed AMD+NVIDIA hosts are out of scope
+// and the hard ceiling (NEXUS_LOCAL_MAX_CONCURRENT) remains the
+// ultimate safety bound regardless of the VRAM reading.
+func (m *Manager) mergeNVIDIA() {
+	refresh := m.nvidiaRefresh
+	if refresh == nil {
+		refresh = ReadPerGPUVRAM
+	}
+	gpus, err := refresh()
+	if err != nil || len(gpus) == 0 {
+		// Missing nvidia-smi / no NVIDIA GPU — nothing to merge.
+		return
+	}
+	var nvidiaFree int64
+	for _, g := range gpus {
+		if g.MemoryFree > 0 {
+			nvidiaFree += g.MemoryFree
+		}
+	}
+	if nvidiaFree <= 0 {
+		return
+	}
+
+	cur := m.Get()
+	merged := cur
+	merged.PerGPU = gpus
+	merged.FreeVRAMBytes = nvidiaFree
+	merged.BytesPerToken = cur.BytesPerToken
+	if merged.BytesPerToken <= 0 {
+		merged.BytesPerToken = DefaultBytesPerToken
+	}
+	// Keep the budget internally consistent: re-derive Tokens from
+	// the (now NVIDIA-driven) free VRAM and the retained model
+	// context, mirroring the min() rule in OllamaProbe.Budget.
+	fromVRAM := vramBytesToTokens(merged.FreeVRAMBytes, merged.BytesPerToken)
+	toks := merged.ModelContext
+	if fromVRAM > 0 && (toks == 0 || fromVRAM < toks) {
+		toks = fromVRAM
+	}
+	merged.Tokens = toks
+	merged.Source = SourceNVIDIA
+
+	m.latest.Store(&merged)
+	m.signalTick()
+	slog.Info("probe updated",
+		slog.String("source", string(merged.Source)),
+		slog.Int("budget_tokens", merged.Tokens),
+		slog.Int("model_context", merged.ModelContext),
+		slog.Int64("free_vram_bytes", merged.FreeVRAMBytes),
+		slog.Int("nvidia_gpus", len(gpus)),
+	)
 }
 
 // Probe runs a single probe synchronously and returns the resulting

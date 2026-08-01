@@ -91,6 +91,7 @@ probe_interval: "90s"
 probe_timeout: "3s"
 probe_bytes_per_token: 131072
 probe_thermal_threshold: 75
+probe_nvidia_interval: "5m"
 local_max_concurrent: 4
 local_vram_bytes_per_slot: 1073741824
 local_cooldown: "20s"
@@ -169,6 +170,9 @@ auth_rate_limit_window: "3m"
 	}
 	if cfg.ProbeThermalThreshold != 75 {
 		t.Errorf("ProbeThermalThreshold = %d, want 75", cfg.ProbeThermalThreshold)
+	}
+	if cfg.ProbeNVIDIAInterval != 5*time.Minute {
+		t.Errorf("ProbeNVIDIAInterval = %v, want 5m", cfg.ProbeNVIDIAInterval)
 	}
 	if cfg.LocalMaxConcurrent != 4 {
 		t.Errorf("LocalMaxConcurrent = %d", cfg.LocalMaxConcurrent)
