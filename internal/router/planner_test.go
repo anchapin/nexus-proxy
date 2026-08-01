@@ -963,8 +963,8 @@ type stubBudget struct {
 	wouldExceed bool
 }
 
-func (s *stubBudget) Remaining() float64            { return s.remaining }
-func (s *stubBudget) WouldExceed(float64) bool      { return s.wouldExceed }
+func (s *stubBudget) Remaining() float64       { return s.remaining }
+func (s *stubBudget) WouldExceed(float64) bool { return s.wouldExceed }
 
 // TestPlanner_BudgetDownTier verifies that when the budget checker
 // reports the estimated frontier cost would exceed the remaining
@@ -973,12 +973,12 @@ func (s *stubBudget) WouldExceed(float64) bool      { return s.wouldExceed }
 func TestPlanner_BudgetDownTier(t *testing.T) {
 	slm := &stubSLM{route: RouteFrontier}
 	p := &Planner{
-		SLM:                 slm,
-		FusionPatterns:      fusionPatterns,
-		FormattingRegex:     formattingPatterns,
-		LocalPatternsRegex:  localPatterns,
-		Budget:              &stubBudget{remaining: 0.01, wouldExceed: true},
-		FrontierCostPer1K:   0.005,
+		SLM:                slm,
+		FusionPatterns:     fusionPatterns,
+		FormattingRegex:    formattingPatterns,
+		LocalPatternsRegex: localPatterns,
+		Budget:             &stubBudget{remaining: 0.01, wouldExceed: true},
+		FrontierCostPer1K:  0.005,
 	}
 	req := PlanRequest{
 		Prompt:          "explain quantum computing in detail", // no DSL match
@@ -1007,12 +1007,12 @@ func TestPlanner_BudgetDownTier(t *testing.T) {
 func TestPlanner_BudgetHealthyNoDownTier(t *testing.T) {
 	slm := &stubSLM{route: RouteFrontier}
 	p := &Planner{
-		SLM:                 slm,
-		FusionPatterns:      fusionPatterns,
-		FormattingRegex:     formattingPatterns,
-		LocalPatternsRegex:  localPatterns,
-		Budget:              &stubBudget{remaining: 50.0, wouldExceed: false},
-		FrontierCostPer1K:   0.005,
+		SLM:                slm,
+		FusionPatterns:     fusionPatterns,
+		FormattingRegex:    formattingPatterns,
+		LocalPatternsRegex: localPatterns,
+		Budget:             &stubBudget{remaining: 50.0, wouldExceed: false},
+		FrontierCostPer1K:  0.005,
 	}
 	req := PlanRequest{
 		Prompt:          "explain quantum computing in detail",
@@ -1037,12 +1037,12 @@ func TestPlanner_BudgetHealthyNoDownTier(t *testing.T) {
 func TestPlanner_GuardrailPrecedenceOverBudget(t *testing.T) {
 	slm := &stubSLM{route: RouteLocal}
 	p := &Planner{
-		SLM:                 slm,
-		FusionPatterns:      fusionPatterns,
-		FormattingRegex:     formattingPatterns,
-		LocalPatternsRegex:  localPatterns,
-		Budget:              &stubBudget{remaining: 0.0, wouldExceed: true},
-		FrontierCostPer1K:   0.005,
+		SLM:                slm,
+		FusionPatterns:     fusionPatterns,
+		FormattingRegex:    formattingPatterns,
+		LocalPatternsRegex: localPatterns,
+		Budget:             &stubBudget{remaining: 0.0, wouldExceed: true},
+		FrontierCostPer1K:  0.005,
 	}
 	req := PlanRequest{
 		// 50000 'a's = 6250 tokens > 6000 guardrail budget.
@@ -1067,12 +1067,12 @@ func TestPlanner_GuardrailPrecedenceOverBudget(t *testing.T) {
 func TestPlanner_NilBudgetCheckerBackwardCompat(t *testing.T) {
 	slm := &stubSLM{route: RouteFrontier}
 	p := &Planner{
-		SLM:                 slm,
-		FusionPatterns:      fusionPatterns,
-		FormattingRegex:     formattingPatterns,
-		LocalPatternsRegex:  localPatterns,
-		Budget:              nil, // disabled
-		FrontierCostPer1K:   0.005,
+		SLM:                slm,
+		FusionPatterns:     fusionPatterns,
+		FormattingRegex:    formattingPatterns,
+		LocalPatternsRegex: localPatterns,
+		Budget:             nil, // disabled
+		FrontierCostPer1K:  0.005,
 	}
 	req := PlanRequest{
 		Prompt:          "explain quantum computing in detail",
