@@ -249,64 +249,64 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_SERVER_READ_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_SERVER_READ_TIMEOUT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_SERVER_READ_TIMEOUT: %w. See .env.example.", err)
 		}
 		if d < 0 {
-			return cfg, fmt.Errorf("config: NEXUS_SERVER_READ_TIMEOUT must not be negative, got %s", d)
+			return cfg, configError("NEXUS_SERVER_READ_TIMEOUT", "must not be negative", v, DefaultServerReadTimeout.String())
 		}
 		cfg.ReadTimeout = d
 	}
 	if v := os.Getenv("NEXUS_SERVER_WRITE_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_SERVER_WRITE_TIMEOUT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_SERVER_WRITE_TIMEOUT: %w. See .env.example.", err)
 		}
 		if d < 0 {
-			return cfg, fmt.Errorf("config: NEXUS_SERVER_WRITE_TIMEOUT must not be negative, got %s", d)
+			return cfg, configError("NEXUS_SERVER_WRITE_TIMEOUT", "must not be negative", v, DefaultServerWriteTimeout.String())
 		}
 		cfg.WriteTimeout = d
 	}
 	if v := os.Getenv("NEXUS_SERVER_IDLE_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_SERVER_IDLE_TIMEOUT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_SERVER_IDLE_TIMEOUT: %w. See .env.example.", err)
 		}
 		if d < 0 {
-			return cfg, fmt.Errorf("config: NEXUS_SERVER_IDLE_TIMEOUT must not be negative, got %s", d)
+			return cfg, configError("NEXUS_SERVER_IDLE_TIMEOUT", "must not be negative", v, DefaultServerIdleTimeout.String())
 		}
 		cfg.IdleTimeout = d
 	}
 	if v := os.Getenv("NEXUS_SERVER_MAX_HEADER_BYTES"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_SERVER_MAX_HEADER_BYTES: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_SERVER_MAX_HEADER_BYTES: %w. See .env.example.", err)
 		}
 		if n < 0 {
-			return cfg, fmt.Errorf("config: NEXUS_SERVER_MAX_HEADER_BYTES must not be negative, got %d", n)
+			return cfg, configError("NEXUS_SERVER_MAX_HEADER_BYTES", "must not be negative", v, strconv.Itoa(DefaultServerMaxHeaderBytes))
 		}
 		cfg.MaxHeaderBytes = n
 	}
 	if v := os.Getenv("NEXUS_MAX_BODY_BYTES"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_MAX_BODY_BYTES: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_MAX_BODY_BYTES: %w. See .env.example.", err)
 		}
 		cfg.MaxBodyBytes = n
 	}
 	if v := os.Getenv("NEXUS_MAX_RESPONSE_BYTES"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_MAX_RESPONSE_BYTES: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_MAX_RESPONSE_BYTES: %w. See .env.example.", err)
 		}
 		cfg.MaxResponseBytes = n
 	}
 	if v := os.Getenv("NEXUS_SHUTDOWN_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_SHUTDOWN_TIMEOUT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_SHUTDOWN_TIMEOUT: %w. See .env.example.", err)
 		}
 		if d < 0 {
-			return cfg, fmt.Errorf("config: NEXUS_SHUTDOWN_TIMEOUT must not be negative, got %s", d)
+			return cfg, configError("NEXUS_SHUTDOWN_TIMEOUT", "must not be negative", v, DefaultShutdownTimeout.String())
 		}
 		if d == 0 {
 			d = DefaultShutdownTimeout
@@ -316,10 +316,10 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_TRACING_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT: %w. See .env.example.", err)
 		}
 		if d < 0 {
-			return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT must not be negative, got %s", d)
+			return cfg, configError("NEXUS_TRACING_TIMEOUT", "must not be negative", v, DefaultTracingTimeout.String())
 		}
 		if d == 0 {
 			d = DefaultTracingTimeout
@@ -349,7 +349,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_DEBUG_BODY_BYTES"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_DEBUG_BODY_BYTES: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_DEBUG_BODY_BYTES: %w. See .env.example.", err)
 		}
 		cfg.DebugBodyBytes = n
 	}
@@ -381,7 +381,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_FRONTIER_COST_PER_1K"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_FRONTIER_COST_PER_1K: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_FRONTIER_COST_PER_1K: %w. See .env.example.", err)
 		}
 		if f < 0 {
 			f = 0
@@ -402,7 +402,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_ZAI_COST_PER_1K"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_ZAI_COST_PER_1K: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_ZAI_COST_PER_1K: %w. See .env.example.", err)
 		}
 		if f < 0 {
 			f = 0
@@ -428,7 +428,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_COST_BASELINE_RATE_PER_1K"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_COST_BASELINE_RATE_PER_1K: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_COST_BASELINE_RATE_PER_1K: %w. See .env.example.", err)
 		}
 		if f < 0 {
 			f = 0
@@ -440,7 +440,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_BUDGET_DAILY_LIMIT"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_BUDGET_DAILY_LIMIT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_BUDGET_DAILY_LIMIT: %w. See .env.example.", err)
 		}
 		if f < 0 {
 			f = 0
@@ -453,7 +453,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_BUDGET_ALERT_THRESHOLD"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_BUDGET_ALERT_THRESHOLD: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_BUDGET_ALERT_THRESHOLD: %w. See .env.example.", err)
 		}
 		cfg.BudgetAlertThreshold = clampFloat(f, 0, 1)
 	}
@@ -465,7 +465,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_SELECTOR_WINDOW"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_SELECTOR_WINDOW: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_SELECTOR_WINDOW: %w. See .env.example.", err)
 		}
 		if d < 0 {
 			d = 0
@@ -475,7 +475,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_SELECTOR_MIN_SAMPLES"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_SELECTOR_MIN_SAMPLES: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_SELECTOR_MIN_SAMPLES: %w. See .env.example.", err)
 		}
 		if n < 0 {
 			n = 0
@@ -485,7 +485,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_SELECTOR_REFRESH"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_SELECTOR_REFRESH: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_SELECTOR_REFRESH: %w. See .env.example.", err)
 		}
 		if d < 0 {
 			d = 0
@@ -495,10 +495,10 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_PROVIDER_TAIL_WEIGHT"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_PROVIDER_TAIL_WEIGHT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_PROVIDER_TAIL_WEIGHT: %w. See .env.example.", err)
 		}
 		if f < 0 || f > 1 {
-			return cfg, fmt.Errorf("config: NEXUS_PROVIDER_TAIL_WEIGHT must be in [0,1], got %v", f)
+			return cfg, configError("NEXUS_PROVIDER_TAIL_WEIGHT", "must be a number in [0,1]", v, "0")
 		}
 		cfg.ProviderTailWeight = f
 	}
@@ -510,7 +510,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_RAG_THRESHOLD"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_RAG_THRESHOLD: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_RAG_THRESHOLD: %w. See .env.example.", err)
 		}
 		cfg.RAGThreshold = f
 	}
@@ -529,7 +529,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_RAG_POLL_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_RAG_POLL_INTERVAL: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_RAG_POLL_INTERVAL: %w. See .env.example.", err)
 		}
 		if d < 0 {
 			d = 0
@@ -539,28 +539,28 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_RAG_EMBED_CACHE_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_RAG_EMBED_CACHE_SIZE: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_RAG_EMBED_CACHE_SIZE: %w. See .env.example.", err)
 		}
 		cfg.RAGEmbedCacheSize = n
 	}
 	if v := os.Getenv("NEXUS_RAG_EMBED_CACHE_TTL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_RAG_EMBED_CACHE_TTL: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_RAG_EMBED_CACHE_TTL: %w. See .env.example.", err)
 		}
 		cfg.RAGEmbedCacheTTL = d
 	}
 	if v := os.Getenv("NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT: %w. See .env.example.", err)
 		}
 		cfg.RAGEmbedCacheWaitTimeout = d
 	}
 	if v := os.Getenv("NEXUS_RAG_BATCH_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_RAG_BATCH_SIZE: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_RAG_BATCH_SIZE: %w. See .env.example.", err)
 		}
 		if n < 0 {
 			n = 0
@@ -572,21 +572,21 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_TOKEN_GUARDRAIL"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_TOKEN_GUARDRAIL: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_TOKEN_GUARDRAIL: %w. See .env.example.", err)
 		}
 		cfg.TokenGuardrail = n
 	}
 	if v := os.Getenv("NEXUS_SLM_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_SLM_TIMEOUT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_SLM_TIMEOUT: %w. See .env.example.", err)
 		}
 		cfg.SLMTimeout = d
 	}
 	if v := os.Getenv("NEXUS_SLM_CACHE_MAX_ENTRIES"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_SLM_CACHE_MAX_ENTRIES: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_SLM_CACHE_MAX_ENTRIES: %w. See .env.example.", err)
 		}
 		if n < 0 {
 			n = 0
@@ -596,21 +596,21 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_SLM_CACHE_TTL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_SLM_CACHE_TTL: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_SLM_CACHE_TTL: %w. See .env.example.", err)
 		}
 		cfg.SLMCacheTTL = d
 	}
 	if v := os.Getenv("NEXUS_SLMCACHE_SIMILARITY_THRESHOLD"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_SLMCACHE_SIMILARITY_THRESHOLD: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_SLMCACHE_SIMILARITY_THRESHOLD: %w. See .env.example.", err)
 		}
 		cfg.SLMCacheSemanticThreshold = clampFloat(f, 0, 1)
 	}
 	if v := os.Getenv("NEXUS_SLMCACHE_MAX_STALE"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_SLMCACHE_MAX_STALE: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_SLMCACHE_MAX_STALE: %w. See .env.example.", err)
 		}
 		if n < 0 {
 			n = 0
@@ -620,7 +620,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_SLMCACHE_STALE_CLEANUP_THRESHOLD"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_SLMCACHE_STALE_CLEANUP_THRESHOLD: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_SLMCACHE_STALE_CLEANUP_THRESHOLD: %w. See .env.example.", err)
 		}
 		if n < 0 {
 			n = 0
@@ -630,7 +630,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT: %w. See .env.example.", err)
 		}
 		if n < 0 {
 			n = 0
@@ -640,28 +640,28 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_FUSION_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_FUSION_TIMEOUT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_FUSION_TIMEOUT: %w. See .env.example.", err)
 		}
 		cfg.FusionTimeout = d
 	}
 	if v := os.Getenv("NEXUS_CASCADE_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_CASCADE_TIMEOUT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_CASCADE_TIMEOUT: %w. See .env.example.", err)
 		}
 		cfg.CascadeTimeout = d
 	}
 	if v := os.Getenv("NEXUS_ARBITER_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_ARBITER_TIMEOUT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_ARBITER_TIMEOUT: %w. See .env.example.", err)
 		}
 		cfg.ArbiterTimeout = d
 	}
 	if v := os.Getenv("NEXUS_CASCADE_MAX_RESPONSE_BYTES"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_CASCADE_MAX_RESPONSE_BYTES: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_CASCADE_MAX_RESPONSE_BYTES: %w. See .env.example.", err)
 		}
 		cfg.CascadeMaxResponseBytes = n
 	}
@@ -673,24 +673,24 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_FUSION_AGREEMENT_THRESHOLD"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_FUSION_AGREEMENT_THRESHOLD: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_FUSION_AGREEMENT_THRESHOLD: %w. See .env.example.", err)
 		}
 		if f < 0 || f > 1 {
-			return cfg, fmt.Errorf("config: NEXUS_FUSION_AGREEMENT_THRESHOLD must be in [0,1], got %v", f)
+			return cfg, configError("NEXUS_FUSION_AGREEMENT_THRESHOLD", "must be a number in [0,1]", v, "0.85")
 		}
 		cfg.FusionAgreementThreshold = f
 	}
 	if v := os.Getenv("NEXUS_ARBITER_CACHE_TTL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_ARBITER_CACHE_TTL: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_ARBITER_CACHE_TTL: %w. See .env.example.", err)
 		}
 		cfg.ArbiterCacheTTL = d
 	}
 	if v := os.Getenv("NEXUS_ARBITER_CACHE_MAX_ENTRIES"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_ARBITER_CACHE_MAX_ENTRIES: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_ARBITER_CACHE_MAX_ENTRIES: %w. See .env.example.", err)
 		}
 		if n < 0 {
 			n = 0
@@ -702,21 +702,21 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_HEALTH_POLL_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_HEALTH_POLL_INTERVAL: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_HEALTH_POLL_INTERVAL: %w. See .env.example.", err)
 		}
 		cfg.HealthPollInterval = d
 	}
 	if v := os.Getenv("NEXUS_HEALTH_BREAKER_THRESHOLD"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_HEALTH_BREAKER_THRESHOLD: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_HEALTH_BREAKER_THRESHOLD: %w. See .env.example.", err)
 		}
 		cfg.HealthBreakerThreshold = n
 	}
 	if v := os.Getenv("NEXUS_HEALTH_PROBE_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_HEALTH_PROBE_TIMEOUT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_HEALTH_PROBE_TIMEOUT: %w. See .env.example.", err)
 		}
 		cfg.HealthProbeTimeout = d
 	}
@@ -725,7 +725,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_PROBE_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_PROBE_INTERVAL: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_PROBE_INTERVAL: %w. See .env.example.", err)
 		}
 		cfg.ProbePollInterval = d
 		cfg.ProbeEnabled = cfg.ProbePollInterval > 0
@@ -733,14 +733,14 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_PROBE_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_PROBE_TIMEOUT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_PROBE_TIMEOUT: %w. See .env.example.", err)
 		}
 		cfg.ProbeTimeout = d
 	}
 	if v := os.Getenv("NEXUS_PROBE_BYTES_PER_TOKEN"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_PROBE_BYTES_PER_TOKEN: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_PROBE_BYTES_PER_TOKEN: %w. See .env.example.", err)
 		}
 		if n < 0 {
 			n = 0
@@ -750,7 +750,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_PROBE_THERMAL_THRESHOLD"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_PROBE_THERMAL_THRESHOLD: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_PROBE_THERMAL_THRESHOLD: %w. See .env.example.", err)
 		}
 		if n < 0 {
 			n = 0
@@ -762,7 +762,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_LOCAL_MAX_CONCURRENT"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_LOCAL_MAX_CONCURRENT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_LOCAL_MAX_CONCURRENT: %w. See .env.example.", err)
 		}
 		if n < 0 {
 			n = 0
@@ -772,7 +772,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_LOCAL_VRAM_BYTES_PER_SLOT"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_LOCAL_VRAM_BYTES_PER_SLOT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_LOCAL_VRAM_BYTES_PER_SLOT: %w. See .env.example.", err)
 		}
 		if n < 0 {
 			n = int(DefaultLocalVRAMBytesPerSlot)
@@ -782,7 +782,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_LOCAL_COOLDOWN"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_LOCAL_COOLDOWN: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_LOCAL_COOLDOWN: %w. See .env.example.", err)
 		}
 		if d < 0 {
 			d = 0
@@ -803,35 +803,35 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_JUDGE_SAMPLE_RATE"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_JUDGE_SAMPLE_RATE: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_JUDGE_SAMPLE_RATE: %w. See .env.example.", err)
 		}
 		cfg.JudgeSampleRate = f
 	}
 	if v := os.Getenv("NEXUS_JUDGE_CONCURRENCY"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_JUDGE_CONCURRENCY: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_JUDGE_CONCURRENCY: %w. See .env.example.", err)
 		}
 		cfg.JudgeConcurrency = n
 	}
 	if v := os.Getenv("NEXUS_JUDGE_QUEUE"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_JUDGE_QUEUE: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_JUDGE_QUEUE: %w. See .env.example.", err)
 		}
 		cfg.JudgeQueueDepth = n
 	}
 	if v := os.Getenv("NEXUS_JUDGE_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_JUDGE_TIMEOUT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_JUDGE_TIMEOUT: %w. See .env.example.", err)
 		}
 		cfg.JudgeTimeout = d
 	}
 	if v := os.Getenv("NEXUS_JUDGE_COST_PER_1K"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_JUDGE_COST_PER_1K: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_JUDGE_COST_PER_1K: %w. See .env.example.", err)
 		}
 		cfg.JudgeCostPer1KUSD = f
 	}
@@ -847,28 +847,28 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_ROUTING_CONFIDENCE_FLOOR"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_ROUTING_CONFIDENCE_FLOOR: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_ROUTING_CONFIDENCE_FLOOR: %w. See .env.example.", err)
 		}
 		cfg.RoutingConfidenceFloor = f
 	}
 	if v := os.Getenv("NEXUS_ROUTING_CONFIDENCE_CEILING"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_ROUTING_CONFIDENCE_CEILING: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_ROUTING_CONFIDENCE_CEILING: %w. See .env.example.", err)
 		}
 		cfg.RoutingConfidenceCeiling = f
 	}
 	if v := os.Getenv("NEXUS_ROUTING_CONFIDENCE_MIN_SAMPLES"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_ROUTING_CONFIDENCE_MIN_SAMPLES: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_ROUTING_CONFIDENCE_MIN_SAMPLES: %w. See .env.example.", err)
 		}
 		cfg.RoutingConfidenceMinSamples = n
 	}
 	if v := os.Getenv("NEXUS_ROUTING_CONFIDENCE_WINDOW"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_ROUTING_CONFIDENCE_WINDOW: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_ROUTING_CONFIDENCE_WINDOW: %w. See .env.example.", err)
 		}
 		cfg.RoutingConfidenceWindow = d
 	}
@@ -877,7 +877,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_QUALITY_CONCURRENCY"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_QUALITY_CONCURRENCY: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_QUALITY_CONCURRENCY: %w. See .env.example.", err)
 		}
 		cfg.QualityConcurrency = n
 		cfg.QualityEnabled = cfg.QualityConcurrency > 0
@@ -885,21 +885,21 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_QUALITY_QUEUE"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_QUALITY_QUEUE: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_QUALITY_QUEUE: %w. See .env.example.", err)
 		}
 		cfg.QualityQueueDepth = n
 	}
 	if v := os.Getenv("NEXUS_QUALITY_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_QUALITY_TIMEOUT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_QUALITY_TIMEOUT: %w. See .env.example.", err)
 		}
 		cfg.QualityTimeout = d
 	}
 	if v := os.Getenv("NEXUS_QUALITY_STDERR_CAP"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_QUALITY_STDERR_CAP: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_QUALITY_STDERR_CAP: %w. See .env.example.", err)
 		}
 		cfg.QualityStderrCap = n
 	}
@@ -911,7 +911,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_QUALITY_DROPPED_RING_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_QUALITY_DROPPED_RING_SIZE: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_QUALITY_DROPPED_RING_SIZE: %w. See .env.example.", err)
 		}
 		cfg.QualityDroppedRingSize = n
 	}
@@ -998,7 +998,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_MODELS_CACHE_TTL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_MODELS_CACHE_TTL: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_MODELS_CACHE_TTL: %w. See .env.example.", err)
 		}
 		cfg.ModelsCacheTTL = d
 	}
@@ -1017,7 +1017,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_RATE_LIMIT_RPM"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_RATE_LIMIT_RPM: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_RATE_LIMIT_RPM: %w. See .env.example.", err)
 		}
 		if n < 0 {
 			n = 0
@@ -1027,7 +1027,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_RATE_LIMIT_BURST"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_RATE_LIMIT_BURST: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_RATE_LIMIT_BURST: %w. See .env.example.", err)
 		}
 		if n < 0 {
 			n = 0
@@ -1042,7 +1042,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_AUTH_RATE_LIMIT_RPM"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_AUTH_RATE_LIMIT_RPM: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_AUTH_RATE_LIMIT_RPM: %w. See .env.example.", err)
 		}
 		if n < 0 {
 			n = 0
@@ -1052,7 +1052,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_AUTH_RATE_LIMIT_BURST"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_AUTH_RATE_LIMIT_BURST: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_AUTH_RATE_LIMIT_BURST: %w. See .env.example.", err)
 		}
 		if n < 0 {
 			n = 0
@@ -1062,7 +1062,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_AUTH_RATE_LIMIT_WINDOW"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_AUTH_RATE_LIMIT_WINDOW: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_AUTH_RATE_LIMIT_WINDOW: %w. See .env.example.", err)
 		}
 		if d < 0 {
 			d = 0
@@ -1077,7 +1077,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_TRACING_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT: %w. See .env.example.", err)
 		}
 		if d < 0 {
 			d = 10 * time.Second
@@ -1087,7 +1087,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_TRACING_QUEUE_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_TRACING_QUEUE_SIZE: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_QUEUE_SIZE: %w. See .env.example.", err)
 		}
 		if n < 0 {
 			n = 256
@@ -1097,7 +1097,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_TRACING_BATCH_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_TRACING_BATCH_SIZE: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_BATCH_SIZE: %w. See .env.example.", err)
 		}
 		if n < 1 {
 			n = 64
@@ -1107,7 +1107,7 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_TRACING_SAMPLE_RATE"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return cfg, fmt.Errorf("config: NEXUS_TRACING_SAMPLE_RATE: %w", err)
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_SAMPLE_RATE: %w. See .env.example.", err)
 		}
 		if f < 0 {
 			f = 0
@@ -1410,46 +1410,47 @@ func clampFloat(v, min, max float64) float64 {
 func (yc YAMLConfig) validate() error {
 	if yc.ReadTimeout != "" {
 		if d, err := time.ParseDuration(yc.ReadTimeout); err == nil && d < 0 {
-			return fmt.Errorf("config: server_read_timeout must not be negative, got %s", d)
+			return configError("server_read_timeout", "must not be negative", yc.ReadTimeout, DefaultServerReadTimeout.String())
 		}
 	}
 	if yc.WriteTimeout != "" {
 		if d, err := time.ParseDuration(yc.WriteTimeout); err == nil && d < 0 {
-			return fmt.Errorf("config: server_write_timeout must not be negative, got %s", d)
+			return configError("server_write_timeout", "must not be negative", yc.WriteTimeout, DefaultServerWriteTimeout.String())
 		}
 	}
 	if yc.IdleTimeout != "" {
 		if d, err := time.ParseDuration(yc.IdleTimeout); err == nil && d < 0 {
-			return fmt.Errorf("config: server_idle_timeout must not be negative, got %s", d)
+			return configError("server_idle_timeout", "must not be negative", yc.IdleTimeout, DefaultServerIdleTimeout.String())
 		}
 	}
 	if yc.MaxHeaderBytes < 0 {
-		return fmt.Errorf("config: server_max_header_bytes must not be negative, got %d", yc.MaxHeaderBytes)
+		return configError("server_max_header_bytes", "must not be negative", strconv.Itoa(yc.MaxHeaderBytes), strconv.Itoa(DefaultServerMaxHeaderBytes))
 	}
 	if yc.ShutdownTimeout != "" {
 		if d, err := time.ParseDuration(yc.ShutdownTimeout); err == nil && d < 0 {
-			return fmt.Errorf("config: shutdown_timeout must not be negative, got %s", d)
+			return configError("shutdown_timeout", "must not be negative", yc.ShutdownTimeout, DefaultShutdownTimeout.String())
 		}
 	}
 
-	// Fractional fields (0..1 range)
+	// Fractional fields (0..1 range). Default values mirror the env-var
+	// defaults documented in .env.example.
 	if yc.BudgetAlertThreshold < 0 || yc.BudgetAlertThreshold > 1 {
-		return fmt.Errorf("config: budget_alert_threshold must be in range [0,1], got %f", yc.BudgetAlertThreshold)
+		return configError("budget_alert_threshold", "must be in [0,1]", strconv.FormatFloat(yc.BudgetAlertThreshold, 'f', -1, 64), "0.8")
 	}
 	if yc.FusionAgreementThreshold < 0 || yc.FusionAgreementThreshold > 1 {
-		return fmt.Errorf("config: fusion_agreement_threshold must be in range [0,1], got %f", yc.FusionAgreementThreshold)
+		return configError("fusion_agreement_threshold", "must be in [0,1]", strconv.FormatFloat(yc.FusionAgreementThreshold, 'f', -1, 64), "0.85")
 	}
 	if yc.ProviderTailWeight < 0 || yc.ProviderTailWeight > 1 {
-		return fmt.Errorf("config: provider_tail_weight must be in range [0,1], got %f", yc.ProviderTailWeight)
+		return configError("provider_tail_weight", "must be in [0,1]", strconv.FormatFloat(yc.ProviderTailWeight, 'f', -1, 64), "0")
 	}
 	if yc.TracingSampleRate < 0 || yc.TracingSampleRate > 1 {
-		return fmt.Errorf("config: tracing_sample_rate must be in range [0,1], got %f", yc.TracingSampleRate)
+		return configError("tracing_sample_rate", "must be in [0,1]", strconv.FormatFloat(yc.TracingSampleRate, 'f', -1, 64), "1")
 	}
 	if yc.RoutingConfidenceFloor < 0 || yc.RoutingConfidenceFloor > 1 {
-		return fmt.Errorf("config: routing_confidence_floor must be in range [0,1], got %f", yc.RoutingConfidenceFloor)
+		return configError("routing_confidence_floor", "must be in [0,1]", strconv.FormatFloat(yc.RoutingConfidenceFloor, 'f', -1, 64), "0.4")
 	}
 	if yc.RoutingConfidenceCeiling < 0 || yc.RoutingConfidenceCeiling > 1 {
-		return fmt.Errorf("config: routing_confidence_ceiling must be in range [0,1], got %f", yc.RoutingConfidenceCeiling)
+		return configError("routing_confidence_ceiling", "must be in [0,1]", strconv.FormatFloat(yc.RoutingConfidenceCeiling, 'f', -1, 64), "0.85")
 	}
 
 	return nil
@@ -1474,11 +1475,11 @@ func validateRawBoolFields(data []byte) error {
 		case string:
 			// Try to parse as bool; reject if unrecognized
 			if _, err := parseYAMLBool(v); err != nil {
-				return fmt.Errorf("config: toon_unfenced %s", err.Error())
+				return fmt.Errorf("config: toon_unfenced %s. See .env.example.", err.Error())
 			}
 		default:
 			// Also catch int/float etc that yaml.Unmarshal accepted
-			return fmt.Errorf("config: toon_unfenced value %v is not a boolean", v)
+			return fmt.Errorf("config: toon_unfenced value %v is not a boolean; want true or false. See .env.example.", v)
 		}
 	}
 

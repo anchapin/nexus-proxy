@@ -1004,7 +1004,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if tailWeight < 0 || tailWeight > 1 {
-		return cfg, fmt.Errorf("config: NEXUS_PROVIDER_TAIL_WEIGHT must be in [0,1], got %v", tailWeight)
+		return cfg, configError("NEXUS_PROVIDER_TAIL_WEIGHT", "must be a number in [0,1]", os.Getenv("NEXUS_PROVIDER_TAIL_WEIGHT"), strconv.FormatFloat(0.0, 'f', -1, 64))
 	}
 	cfg.ProviderTailWeight = tailWeight
 
@@ -1303,7 +1303,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if readTimeout < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_SERVER_READ_TIMEOUT must not be negative, got %s", readTimeout)
+		return cfg, configError("NEXUS_SERVER_READ_TIMEOUT", "must not be negative", os.Getenv("NEXUS_SERVER_READ_TIMEOUT"), DefaultServerReadTimeout.String())
 	}
 	cfg.ReadTimeout = readTimeout
 
@@ -1312,7 +1312,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if writeTimeout < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_SERVER_WRITE_TIMEOUT must not be negative, got %s", writeTimeout)
+		return cfg, configError("NEXUS_SERVER_WRITE_TIMEOUT", "must not be negative", os.Getenv("NEXUS_SERVER_WRITE_TIMEOUT"), DefaultServerWriteTimeout.String())
 	}
 	cfg.WriteTimeout = writeTimeout
 
@@ -1321,7 +1321,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if idleTimeout < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_SERVER_IDLE_TIMEOUT must not be negative, got %s", idleTimeout)
+		return cfg, configError("NEXUS_SERVER_IDLE_TIMEOUT", "must not be negative", os.Getenv("NEXUS_SERVER_IDLE_TIMEOUT"), DefaultServerIdleTimeout.String())
 	}
 	cfg.IdleTimeout = idleTimeout
 
@@ -1330,7 +1330,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if maxHeader < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_SERVER_MAX_HEADER_BYTES must not be negative, got %d", maxHeader)
+		return cfg, configError("NEXUS_SERVER_MAX_HEADER_BYTES", "must not be negative", os.Getenv("NEXUS_SERVER_MAX_HEADER_BYTES"), strconv.Itoa(DefaultServerMaxHeaderBytes))
 	}
 	cfg.MaxHeaderBytes = maxHeader
 
@@ -1358,7 +1358,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if shutdownTimeout < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_SHUTDOWN_TIMEOUT must not be negative, got %s", shutdownTimeout)
+		return cfg, configError("NEXUS_SHUTDOWN_TIMEOUT", "must not be negative", os.Getenv("NEXUS_SHUTDOWN_TIMEOUT"), DefaultShutdownTimeout.String())
 	}
 	if shutdownTimeout == 0 {
 		shutdownTimeout = DefaultShutdownTimeout
@@ -1656,7 +1656,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if tracingTimeout < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT must not be negative, got %s", tracingTimeout)
+		return cfg, configError("NEXUS_TRACING_TIMEOUT", "must not be negative", os.Getenv("NEXUS_TRACING_TIMEOUT"), DefaultTracingTimeout.String())
 	}
 	cfg.TracingTimeout = tracingTimeout
 
@@ -1700,7 +1700,7 @@ func (c Config) Validate() error {
 	case "strict", "degraded":
 		// Recognised values.
 	default:
-		return fmt.Errorf("config: NEXUS_READINESS_MODE value %q is not recognised; want \"strict\" or \"degraded\"", c.ReadinessMode)
+		return configError("NEXUS_READINESS_MODE", `must be "strict" or "degraded"`, c.ReadinessMode, "degraded")
 	}
 	return nil
 }
@@ -1985,7 +1985,7 @@ func parseTrustedProxies(raw string) ([]*net.IPNet, error) {
 			}
 			continue
 		}
-		return nil, fmt.Errorf("config: invalid NEXUS_TRUSTED_PROXIES entry %q (expected CIDR or IP)", p)
+		return nil, fmt.Errorf("config: invalid NEXUS_TRUSTED_PROXIES entry %q (expected CIDR or IP). See .env.example.", p)
 	}
 	return out, nil
 }
@@ -2217,6 +2217,24 @@ func getEnv(key, def string) string {
 	return def
 }
 
+// configError renders an actionable config-validation error (issue #1181).
+// The message bundles the offending env var, a human-readable constraint,
+// the raw value the operator supplied, the safe default, and a pointer to
+// .env.example so the fix is self-evident without reading the source:
+//
+//	config: NEXUS_SERVER_READ_TIMEOUT must not be negative; got "-5s".
+//	        Unset the var to use the default (30s). See .env.example.
+//
+// The result is a plain error (not a custom type) so the existing error
+// contract is preserved — callers assert on err != nil or substrings, and
+// wrapping the underlying parse error (%w) keeps errors.Is working.
+func configError(key, constraint, gotValue, defaultStr string) error {
+	return fmt.Errorf(
+		"config: %s %s; got %q. Unset the var to use the default (%s). See .env.example.",
+		key, constraint, gotValue, defaultStr,
+	)
+}
+
 // parseInjectionScanRoles canonicalises the comma-separated role list
 // from NEXUS_INJECTION_SCAN_ROLES (issue #481). It lower-cases, trims,
 // deduplicates, and keeps only recognised roles ("system", "user"). An
@@ -2268,7 +2286,7 @@ func getEnvInt(key string, def int) (int, error) {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return 0, fmt.Errorf("config: %s must be an integer: %w", key, err)
+		return 0, configError(key, "must be an integer", v, strconv.Itoa(def))
 	}
 	return n, nil
 }
@@ -2296,7 +2314,7 @@ func getEnvFloat(key string, def float64) (float64, error) {
 	}
 	f, err := strconv.ParseFloat(v, 64)
 	if err != nil {
-		return 0, fmt.Errorf("config: %s must be a number: %w", key, err)
+		return 0, configError(key, "must be a number", v, strconv.FormatFloat(def, 'f', -1, 64))
 	}
 	return f, nil
 }
@@ -2308,7 +2326,7 @@ func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
-		return 0, fmt.Errorf("config: %s must be a duration (e.g. 8s, 2m): %w", key, err)
+		return 0, configError(key, `must be a Go duration string (e.g. "8s", "2m")`, v, def.String())
 	}
 	return d, nil
 }
@@ -2335,7 +2353,7 @@ func getEnvRegexps(key string, defaultPattern string) ([]*regexp.Regexp, error) 
 		}
 		re, err := regexp.Compile(p)
 		if err != nil {
-			return nil, fmt.Errorf("config: %s pattern %q is not a valid regex: %w", key, p, err)
+			return nil, fmt.Errorf("config: %s pattern %q is not a valid regex: %w. Unset the var to restore the built-in default. See .env.example.", key, p, err)
 		}
 		result = append(result, re)
 	}
@@ -2399,7 +2417,7 @@ func parseLogLevel(raw string) (slog.Level, error) {
 	case "", "info":
 		return slog.LevelInfo, nil
 	default:
-		return slog.LevelInfo, fmt.Errorf("config: invalid NEXUS_LOG_LEVEL %q", raw)
+		return slog.LevelInfo, fmt.Errorf("config: invalid NEXUS_LOG_LEVEL %q; want debug, info, warn, or error. See .env.example.", raw)
 	}
 }
 
