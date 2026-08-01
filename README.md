@@ -85,6 +85,21 @@ complexity.
 
 ### Configure
 
+The fastest path is the interactive wizard (issue #1156), which detects
+Ollama, validates your frontier key, and writes a ready-to-serve config:
+
+```bash
+./bin/nexus init
+```
+
+For unattended installs (CI, provisioning scripts), run non-interactively:
+
+```bash
+NEXUS_INIT_PROFILE=local-first ./bin/nexus init --non-interactive
+```
+
+Alternatively, copy and edit the env file by hand:
+
 ```bash
 cp .env.example .env
 # Edit .env and set NEXUS_FRONTIER_API_KEY
@@ -511,6 +526,7 @@ invocation (no args) starts the proxy on `:8000`.
 | Command | Purpose |
 | ------- | ------- |
 | `nexus` | Start the proxy (binds `:8000` by default; override with `NEXUS_ADDR`). |
+| `nexus init` | Launch the interactive config wizard (issue #1156). Detects Ollama, validates the frontier key, and writes `.env` or `config.yaml`. `--non-interactive` writes from `NEXUS_INIT_PROFILE` without prompting. |
 | `nexus check` | Run the boot-time diagnostic suite and exit. Use `--json` for machine-readable output. See [Verify](#verify-before-serving-traffic) above. |
 | `nexus doctor` | Alias for `nexus check`. |
 | `nexus config validate <file>` | Parse and validate a YAML config file, then print the resolved keys. Exits `0` on success, `1` on parse / indentation errors. |

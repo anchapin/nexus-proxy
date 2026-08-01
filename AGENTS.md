@@ -42,6 +42,11 @@ are also excluded in non-critical paths.
 
 **Subcommands** (`cmd/nexus/dispatch.go` dispatches on `os.Args[1]`; no args =
 start the proxy):
+- `nexus init` — interactive config wizard (issue #1156). Detects Ollama,
+  validates the frontier key, picks a routing profile preset, and writes
+  `.env` (or `config.yaml` when `NEXUS_CONFIG_FILE` is set).
+  `--non-interactive` writes from `NEXUS_INIT_PROFILE` without prompting.
+  Implementation: `cmd/nexus/init.go`.
 - `nexus check` (alias `nexus doctor`) — boot-time diagnostic suite. Exits
   **0 when every check passes** (warn/skip are fine), **1 when at least one
   fails**. `--json` for machine-readable output. Guarded by
