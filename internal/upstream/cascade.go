@@ -42,17 +42,14 @@ type Cascade struct {
 	Timeout          time.Duration // per-attempt fixed fallback; <=0 falls back to cascadeDefaultTimeout
 	MaxResponseBytes int           // per-response cap; <=0 falls back to defaultMaxResponseBytes (64 MiB)
 
-	// Adaptive per-attempt timeout (issue #1175). When TimeoutPer1kTokens
-	// > 0 the effective per-attempt timeout scales with the estimated
-	// prompt token count:
-	//
-	//	effective = clamp(floor + per1k * estimatedPromptTokens/1000, floor, ceiling)
-	//
-	// When TimeoutPer1kTokens <= 0 the fixed Timeout field is used
-	// (backward compatible — identical to pre-issue-#1175 behaviour).
 	TimeoutFloor       time.Duration
 	TimeoutCeiling     time.Duration
 	TimeoutPer1kTokens time.Duration
+
+	// Coalescer deduplicates identical concurrent non-streaming
+	// fetchCascadeStep calls (issue #1155). When nil, coalescing is
+	// disabled and every request makes its own upstream call.
+	Coalescer *Coalescer
 }
 
 // CascadeResult is the per-request outcome suitable for telemetry.
@@ -432,6 +429,24 @@ func (c *Cascade) fetchCascadeStep(ctx context.Context, client Client, step Casc
 	if mErr != nil {
 		return AssistantMessage{}, "", nil, newCascadeErr(false, "", "marshal: %v", mErr)
 	}
+
+	// Coalesce identical concurrent requests when enabled (issue #1155).
+	// Only the non-streaming path is coalesced; streaming bypasses the
+	// cascade entirely.
+	if c.Coalescer != nil {
+		key := FlightKey(FlightKeyMethod, step.Model, jsonPayload)
+		return c.Coalescer.Do(key, func() (AssistantMessage, string, []byte, error) {
+			return c.doFetchCascadeStep(ctx, client, step, jsonPayload)
+		})
+	}
+
+	return c.doFetchCascadeStep(ctx, client, step, jsonPayload)
+}
+
+// doFetchCascadeStep performs the actual HTTP call for a cascade step.
+// It is split from fetchCascadeStep so the coalescer can wrap it via
+// singleflight (issue #1155).
+func (c *Cascade) doFetchCascadeStep(ctx context.Context, client Client, step CascadeStep, jsonPayload []byte) (AssistantMessage, string, []byte, error) {
 	req, rErr := http.NewRequestWithContext(ctx, http.MethodPost, step.URL, bytes.NewReader(jsonPayload))
 	if rErr != nil {
 		return AssistantMessage{}, "", nil, newCascadeErr(false, "", "build request: %v", rErr)
