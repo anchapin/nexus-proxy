@@ -221,6 +221,14 @@ type Config struct {
 	ArbiterCacheTTL        time.Duration // NEXUS_ARBITER_CACHE_TTL; default 5m (0 disables)
 	ArbiterCacheMaxEntries int           // NEXUS_ARBITER_CACHE_MAX_ENTRIES; default 512
 
+	// Arbiter cache boot-time pre-warming (issue #1176). When
+	// CacheWarmOnBoot is true, the boot sequence queries the SQLite
+	// metrics store for recent arbiter syntheses still within the cache
+	// TTL and loads them into the arbiter cache, cutting cold-start
+	// latency. CacheWarmLimit caps the number of entries queried.
+	CacheWarmOnBoot bool // NEXUS_CACHE_WARM_ON_BOOT; default false (opt-in)
+	CacheWarmLimit  int  // NEXUS_CACHE_WARM_LIMIT; default 256
+
 	// Judge-guided adaptive routing (issue #47). Historical judge
 	// scores are aggregated by task category in a SQLite table and fed
 	// back to the SLM router as a confidence signal. All of this is
@@ -1081,6 +1089,21 @@ func Load() (Config, error) {
 		arbiterCacheMax = 0
 	}
 	cfg.ArbiterCacheMaxEntries = arbiterCacheMax
+
+	// Arbiter cache boot-time pre-warming (issue #1176). Opt-in: the
+	// default is false so boot is byte-for-byte identical to pre-#1176
+	// behaviour. When true the boot sequence queries the SQLite metrics
+	// store for recent arbiter syntheses within the cache TTL window.
+	cfg.CacheWarmOnBoot = getEnvBool("NEXUS_CACHE_WARM_ON_BOOT", false)
+
+	cacheWarmLimit, err := getEnvInt("NEXUS_CACHE_WARM_LIMIT", 256)
+	if err != nil {
+		return cfg, err
+	}
+	if cacheWarmLimit < 0 {
+		cacheWarmLimit = 0
+	}
+	cfg.CacheWarmLimit = cacheWarmLimit
 
 	// Judge-guided adaptive routing (issue #47). Defaults keep the
 	// feature dormant unless the judge is enabled and a DB path is

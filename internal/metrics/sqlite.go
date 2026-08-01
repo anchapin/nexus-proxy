@@ -64,7 +64,9 @@ CREATE TABLE IF NOT EXISTS requests (
     route_source TEXT NOT NULL DEFAULT '',
     route_reason TEXT NOT NULL DEFAULT '',
     slm_confidence REAL NOT NULL DEFAULT 0,
-    slm_task_type TEXT NOT NULL DEFAULT ''
+    slm_task_type TEXT NOT NULL DEFAULT '',
+    arbiter_cache_key TEXT NOT NULL DEFAULT '',
+    arbiter_synthesis TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
 CREATE INDEX IF NOT EXISTS idx_requests_request_id ON requests(request_id);
@@ -91,6 +93,9 @@ var additiveMigrations = []string{
 	`ALTER TABLE requests ADD COLUMN fusion_arbiter_cost_usd REAL NOT NULL DEFAULT 0`,
 	// Issue #227: rag cache hit tracking
 	`ALTER TABLE requests ADD COLUMN rag_cache_hit INTEGER NOT NULL DEFAULT 0`,
+	// Issue #1176: arbiter cache key + synthesis for boot-time pre-warming
+	`ALTER TABLE requests ADD COLUMN arbiter_cache_key TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE requests ADD COLUMN arbiter_synthesis TEXT NOT NULL DEFAULT ''`,
 }
 
 // runAdditiveMigrations executes the additive ALTER TABLE migrations.
@@ -139,8 +144,9 @@ const insertSQL = `INSERT INTO requests
      baseline_cost_usd, savings_usd,
      ttft_ms, total_latency_ms, tps, streaming,
      fusion_arbiter_skipped, fusion_jaccard_similarity, fusion_arbiter_cost_usd, error,
-     route_source, route_reason, slm_confidence, slm_task_type)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     route_source, route_reason, slm_confidence, slm_task_type,
+     arbiter_cache_key, arbiter_synthesis)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // SQLiteStore is the production Store implementation (issue #4).
 // Writes are funnelled through a buffered channel and a single
@@ -421,6 +427,7 @@ func (s *SQLiteStore) writeOne(req Request) {
 		req.TTFTMs, req.TotalLatencyMs, req.TPS, streaming,
 		fusionArbiterSkipped, req.FusionJaccardSimilarity, req.FusionArbiterCostUSD, req.Error,
 		req.RouteSource, req.RouteReason, req.SLMConfidence, req.SLMTaskType,
+		req.ArbiterCacheKeyHex, req.ArbiterSynthesis,
 	)
 	if err != nil {
 		s.logger("ERROR: insert request_id=%s: %v", req.RequestID, err)
@@ -571,6 +578,85 @@ WHERE timestamp >= ? AND timestamp < ?`
 		return Summary{}, fmt.Errorf("metrics: daily summary: %w", err)
 	}
 	return sum, nil
+}
+
+// ArbiterSynthesisRow is one historical arbiter synthesis entry returned
+// by RecentArbiterSyntheses (issue #1176). CacheKeyHex is the hex-encoded
+// SHA-256 hash of the two panel-member contents; the caller decodes it
+// back to [32]byte for ArbiterCache.Warm.
+type ArbiterSynthesisRow struct {
+	CacheKeyHex string
+	Synthesis   string
+	Timestamp   time.Time
+}
+
+// recentArbiterSynthesesSQL selects the most recent synthesis per unique
+// cache key within the TTL window. GROUP BY deduplicates repeated
+// disagreements on identical panel content so the warmer does not process
+// redundant rows. The composite index on (route, timestamp) plus the
+// arbiter_cache_key != ” filter keeps the scan narrow.
+const recentArbiterSynthesesSQL = `
+SELECT arbiter_cache_key, arbiter_synthesis, MAX(timestamp) AS ts
+FROM requests
+WHERE arbiter_cache_key != '' AND arbiter_synthesis != '' AND timestamp >= ?
+GROUP BY arbiter_cache_key
+ORDER BY ts DESC
+LIMIT ?`
+
+// recentArbiterSynthesesTimeout bounds the boot-time query so a large
+// metrics DB cannot stall startup.
+const recentArbiterSynthesesTimeout = 10 * time.Second
+
+// ArbiterSynthesisReader is the capability interface implemented by
+// SQLiteStore for querying historical arbiter syntheses (issue #1176).
+// Callers type-assert to check whether the Store supports pre-warming.
+type ArbiterSynthesisReader interface {
+	RecentArbiterSyntheses(ctx context.Context, limit int, since time.Time) ([]ArbiterSynthesisRow, error)
+}
+
+// RecentArbiterSyntheses returns the most recent arbiter synthesis per
+// unique cache key written since the given timestamp (issue #1176).
+// limit caps the number of rows returned. The caller (boot-time warmer)
+// passes since = now - ArbiterCacheTTL so only entries still within
+// the TTL window are loaded.
+func (s *SQLiteStore) RecentArbiterSyntheses(ctx context.Context, limit int, since time.Time) ([]ArbiterSynthesisRow, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	queryCtx, cancel := context.WithTimeout(ctx, recentArbiterSynthesesTimeout)
+	defer cancel()
+
+	rows, err := s.db.QueryContext(queryCtx, recentArbiterSynthesesSQL, since.UTC(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("metrics: recent arbiter syntheses: %w", err)
+	}
+	defer rows.Close()
+
+	var result []ArbiterSynthesisRow
+	for rows.Next() {
+		var r ArbiterSynthesisRow
+		var tsStr string
+		if err := rows.Scan(&r.CacheKeyHex, &r.Synthesis, &tsStr); err != nil {
+			return nil, fmt.Errorf("metrics: scan arbiter synthesis: %w", err)
+		}
+		// SQLite stores DATETIME as a string; parse it back to time.Time.
+		if t, err := time.Parse("2006-01-02 15:04:05.999999999-07:00", tsStr); err == nil {
+			r.Timestamp = t
+		} else if t, err := time.Parse(time.RFC3339Nano, tsStr); err == nil {
+			r.Timestamp = t
+		} else if t, err := time.Parse(time.RFC3339, tsStr); err == nil {
+			r.Timestamp = t
+		} else {
+			// Fall back to raw parse; if it fails, use zero time so the
+			// warmer will treat it as stale and skip it.
+			r.Timestamp, _ = time.Parse(time.DateTime, tsStr)
+		}
+		result = append(result, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("metrics: arbiter synthesis rows: %w", err)
+	}
+	return result, nil
 }
 
 // providerStatsAggregateSQL computes count, average cost, and error

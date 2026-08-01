@@ -109,6 +109,8 @@ type YAMLConfig struct {
 	FusionAgreementThreshold  float64 `yaml:"fusion_agreement_threshold"`
 	ArbiterCacheTTL           string  `yaml:"arbiter_cache_ttl"`
 	ArbiterCacheMaxEntries    int     `yaml:"arbiter_cache_max_entries"`
+	CacheWarmOnBoot           bool    `yaml:"cache_warm_on_boot"`
+	CacheWarmLimit            int     `yaml:"cache_warm_limit"`
 
 	// Health
 	HealthPollInterval     string `yaml:"health_poll_interval"`
@@ -698,6 +700,25 @@ func LoadYAML(path string) (Config, error) {
 		cfg.ArbiterCacheMaxEntries = n
 	}
 
+	// Arbiter cache boot-time pre-warming (issue #1176)
+	if v := os.Getenv("NEXUS_CACHE_WARM_ON_BOOT"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_CACHE_WARM_ON_BOOT: %w", err)
+		}
+		cfg.CacheWarmOnBoot = b
+	}
+	if v := os.Getenv("NEXUS_CACHE_WARM_LIMIT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_CACHE_WARM_LIMIT: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.CacheWarmLimit = n
+	}
+
 	// Health
 	if v := os.Getenv("NEXUS_HEALTH_POLL_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -1194,6 +1215,8 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		FusionAgreementThreshold:  yc.floatDefault(yc.FusionAgreementThreshold, 0.85),
 		ArbiterCacheTTL:           yc.durationDefault(yc.ArbiterCacheTTL, 5*time.Minute),
 		ArbiterCacheMaxEntries:    yc.intDefault(yc.ArbiterCacheMaxEntries, 512),
+		CacheWarmOnBoot:           yc.CacheWarmOnBoot, // default false (opt-in, issue #1176)
+		CacheWarmLimit:            yc.intDefault(yc.CacheWarmLimit, 256),
 
 		JudgeURL:          yc.stringDefault(yc.JudgeURL, "https://api.z.ai/v1/chat/completions"),
 		JudgeModel:        yc.stringDefault(yc.JudgeModel, ""), // Falls back to FrontierModel later

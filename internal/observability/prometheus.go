@@ -241,6 +241,11 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Build metadata for the running nexus-proxy binary (issue #529). Always 1.",
 		typ:  "gauge",
 	},
+	// Arbiter cache pre-warming gauge (issue #1176). Set once at boot.
+	"nexus_cache_warmed_entries": {
+		help: "Number of entries loaded into the arbiter cache from historical SQLite metrics during boot-time pre-warming (issue #1176). 0 when pre-warming is disabled or no data was found.",
+		typ:  "gauge",
+	},
 	// Per-route latency percentile gauges (issue #774). Computed from a
 	// sliding window ring buffer per route (local/frontier/fusion).
 	// Values are in seconds (ms → s conversion at render time).
