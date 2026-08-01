@@ -197,6 +197,7 @@ type YAMLConfig struct {
 	TracingQueueSize  int     `yaml:"tracing_queue_size"`
 	TracingBatchSize  int     `yaml:"tracing_batch_size"`
 	TracingSampleRate float64 `yaml:"tracing_sample_rate"`
+	LogTraceID        bool    `yaml:"log_trace_id"`
 }
 
 // LoadYAML reads configuration from a YAML file at path, then overlays
@@ -1117,6 +1118,9 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.TracingSampleRate = f
 	}
+	if v := os.Getenv("NEXUS_LOG_TRACE_ID"); v != "" {
+		cfg.LogTraceID = parseBoolEnvStr(v, true)
+	}
 
 	ValidateShutdownTimeout(cfg)
 	return cfg, nil
@@ -1282,6 +1286,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		TracingQueueSize:  yc.intDefault(yc.TracingQueueSize, 256),
 		TracingBatchSize:  yc.intDefault(yc.TracingBatchSize, 64),
 		TracingSampleRate: yc.floatDefault(yc.TracingSampleRate, 1.0),
+		LogTraceID:        yc.boolFieldDefault(yc.LogTraceID, true),
 	}
 
 	// Warn if yaml had unrecognized injection scan roles (issue #845)

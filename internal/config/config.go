@@ -532,6 +532,12 @@ type Config struct {
 	TracingQueueSize  int
 	TracingBatchSize  int
 	TracingSampleRate float64
+
+	// LogTraceID (issue #1169). When true and tracing is enabled, the
+	// slog default logger is wrapped so every log record inside a
+	// traced request's context carries trace_id and span_id attributes.
+	// Default true so operators get log-to-trace correlation by default.
+	LogTraceID bool
 }
 
 // DefaultMetricsDBPath returns the canonical metrics DB location:
@@ -1683,6 +1689,10 @@ func Load() (Config, error) {
 		tracingSampleRate = 1
 	}
 	cfg.TracingSampleRate = tracingSampleRate
+
+	// Log trace ID injection (issue #1169). Default true so operators
+	// get log-to-trace correlation by default when tracing is enabled.
+	cfg.LogTraceID = getEnvBool("NEXUS_LOG_TRACE_ID", true)
 
 	if err := cfg.Validate(); err != nil {
 		return cfg, err

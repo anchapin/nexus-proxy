@@ -28,6 +28,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
 const (
@@ -77,6 +78,12 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 	logger := cfg.NewLogger()
+	// Wrap the slog handler so trace_id / span_id are injected into
+	// every log record inside a traced request's context (issue #1169).
+	// Only wraps when tracing is enabled — when disabled, zero overhead.
+	if cfg.TracingEndpoint != "" && cfg.LogTraceID {
+		logger = slog.New(tracing.NewLogHandler(logger.Handler()))
+	}
 	slog.SetDefault(logger)
 
 	srv, parts, cleanup, err := buildServer(cfg, startTime)
