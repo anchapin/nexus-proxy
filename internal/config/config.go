@@ -183,6 +183,14 @@ type Config struct {
 	CascadeTimeoutPer1kTokens     time.Duration // additive per-1k prompt tokens; <=0 disables adaptive (1500ms, issue #1175)
 	ArbiterTimeout                time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
+	// Frontier per-provider failover (issue #1157). When true and more
+	// than one frontier provider is registered, the route=frontier
+	// dispatch wraps in a frontier-only cascade: on a retryable failure
+	// (5xx, timeout, connection reset) the next provider is tried before
+	// returning an error to the client.
+	FrontierFailover            bool // NEXUS_FRONTIER_FAILOVER (default true when >1 provider)
+	FrontierFailoverMaxAttempts int  // NEXUS_FRONTIER_FAILOVER_MAX_ATTEMPTS (default 3)
+
 	// DSL fast-pass patterns (issue #305). DSLFormattingPatterns
 	// matches simple formatting keywords (css, format, docstring, ...).
 	// DSLFusionPatterns matches architecture keywords that warrant
@@ -1160,6 +1168,18 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.CascadeTimeoutPer1kTokens = cascadePer1k
+
+	// Frontier per-provider failover (issue #1157). Default true so
+	// operators with >1 provider get automatic failover without opt-in.
+	cfg.FrontierFailover = getEnvBool("NEXUS_FRONTIER_FAILOVER", true)
+	failoverMaxAttempts, err := getEnvInt("NEXUS_FRONTIER_FAILOVER_MAX_ATTEMPTS", 3)
+	if err != nil {
+		return cfg, err
+	}
+	if failoverMaxAttempts < 1 {
+		failoverMaxAttempts = 1
+	}
+	cfg.FrontierFailoverMaxAttempts = failoverMaxAttempts
 
 	// Fusion arbiter synthesis (issue #12). Shorter than FusionTimeout
 	// because the arbiter is doing synthesis, not generation — a slow

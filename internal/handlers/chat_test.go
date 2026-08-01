@@ -2689,3 +2689,167 @@ func TestChatTopKDefaultBackwardCompat(t *testing.T) {
 		t.Errorf("expected exactly 1 context block for K=1, got %d", blockCount)
 	}
 }
+
+// frontierFailoverDeps builds a Deps with two frontier providers registered
+// in the ProviderRegistry so the route=frontier failover path (issue #1157)
+// is exercised. The large prompt exceeds the token guardrail so routing
+// always picks RouteFrontier.
+func frontierFailoverDeps(t *testing.T) (Deps, *upstream.RecordingTransport) {
+	t.Helper()
+	cfg := config.Config{
+		Addr:                        ":0",
+		OllamaURL:                   "http://ollama.local",
+		RouterModel:                 "qwen3-coder:4b",
+		LocalModel:                  "qwen3-coder:8b",
+		EmbeddingModel:              "nomic-embed-text",
+		FrontierURL:                 "http://frontier.local",
+		FrontierModel:               "gpt-4o",
+		FrontierKey:                 "sk-test",
+		RAGThreshold:                0.55,
+		TokenGuardrail:              6000,
+		MetaPrompt:                  " BOOST",
+		TOONNotice:                  "[PROXY SYSTEM NOTE]: TOON compression applied",
+		FrontierFailover:            true,
+		FrontierFailoverMaxAttempts: 3,
+	}
+	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.TOONUnfenced, cfg.PromptInjectionIsolated())
+	store := rag.NewStore(stubEmbedder{vec: []float64{0, 0, 0}}, 0.55)
+	store.Add("no-match.go", "x", []float64{0, 1, 0})
+	rt := upstream.NewRecordingTransport()
+	client := &http.Client{Transport: rt}
+	reg := providers.NewProviderRegistry()
+	reg.Register(providers.ProviderConfig{
+		NameVal:    "openai",
+		BaseURLVal: "http://openai.test",
+		ModelVal:   "gpt-4o",
+		APIKeyVal:  "sk-openai",
+	})
+	reg.Register(providers.ProviderConfig{
+		NameVal:    "anthropic",
+		BaseURLVal: "http://anthropic.test",
+		ModelVal:   "claude-3.5-sonnet",
+		APIKeyVal:  "sk-anthropic",
+	})
+	deps := Deps{
+		Config:    cfg,
+		Client:    client,
+		RAG:       store,
+		SLM:       router.NewSLMClient(cfg.OllamaURL, cfg.RouterModel, 1, client),
+		Recorder:  telemetry.Noop{},
+		Providers: reg,
+	}
+	return deps, rt
+}
+
+// largeFrontierBody returns a request body whose prompt exceeds the 6000
+// token guardrail, forcing RouteFrontier.
+func largeFrontierBody() string {
+	return `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 48500) + `"}]}`
+}
+
+// TestFrontierFailoverStreaming503ThenSuccess verifies that when the first
+// provider returns 503, the cascade advances to the second provider and
+// succeeds (issue #1157).
+func TestFrontierFailoverStreaming503ThenSuccess(t *testing.T) {
+	deps, rt := frontierFailoverDeps(t)
+	rt.On("POST", "http://openai.test/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	rt.On("POST", "http://anthropic.test/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"claude-3.5-sonnet","choices":[{"index":0,"message":{"role":"assistant","content":"anthropic fallback"},"finish_reason":"stop"}]}`)
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(largeFrontierBody()))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rw.Code, rw.Body.String())
+	}
+	if got := rw.Header().Get("X-Nexus-Cascade-Served-By"); got != "anthropic" {
+		t.Errorf("X-Nexus-Cascade-Served-By = %q, want %q", got, "anthropic")
+	}
+	if !strings.Contains(rw.Body.String(), "anthropic fallback") {
+		t.Errorf("body missing fallback content: %q", rw.Body.String())
+	}
+	if len(rt.Calls()) != 2 {
+		t.Errorf("expected 2 upstream calls, got %d", len(rt.Calls()))
+	}
+}
+
+// TestFrontierFailoverNonStreaming503ThenSuccess verifies the non-streaming
+// path returns a JSON object when failover succeeds (issue #1157).
+func TestFrontierFailoverNonStreaming503ThenSuccess(t *testing.T) {
+	deps, rt := frontierFailoverDeps(t)
+	rt.On("POST", "http://openai.test/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	rt.On("POST", "http://anthropic.test/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"anthropic json"},"finish_reason":"stop"}]}`)
+	})
+	body := `{"stream":false,"messages":[{"role":"user","content":"` + strings.Repeat("a", 48500) + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rw.Code, rw.Body.String())
+	}
+	if got := rw.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	if got := rw.Header().Get("X-Nexus-Cascade-Served-By"); got != "anthropic" {
+		t.Errorf("X-Nexus-Cascade-Served-By = %q, want %q", got, "anthropic")
+	}
+	if !strings.Contains(rw.Body.String(), `"object":"chat.completion"`) {
+		t.Errorf("body missing JSON shape: %q", rw.Body.String())
+	}
+	if strings.HasPrefix(strings.TrimSpace(rw.Body.String()), "data:") {
+		t.Errorf("body looks like SSE, want plain JSON: %q", rw.Body.String())
+	}
+}
+
+// TestFrontierFailoverAllProvidersFail verifies the handler returns 502
+// when every provider in the frontier cascade fails (issue #1157).
+func TestFrontierFailoverAllProvidersFail(t *testing.T) {
+	deps, rt := frontierFailoverDeps(t)
+	rt.OnAny(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(largeFrontierBody()))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%q", rw.Code, rw.Body.String())
+	}
+}
+
+// TestFrontierFailoverDisabledRestoresSingleEndpoint verifies that when
+// NEXUS_FRONTIER_FAILOVER is false, the route=frontier dispatch posts to a
+// single endpoint and does not cascade (issue #1157 acceptance criteria).
+func TestFrontierFailoverDisabledRestoresSingleEndpoint(t *testing.T) {
+	deps, rt := frontierFailoverDeps(t)
+	deps.Config.FrontierFailover = false
+	// The legacy path uses d.Config.FrontierURL, not the provider URLs.
+	rt.On("POST", "http://frontier.local", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("frontier stream"))
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(largeFrontierBody()))
+	rw := httptest.NewRecorder()
+	Chat(deps).ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rw.Code, rw.Body.String())
+	}
+	// Exactly one call to the legacy frontier URL.
+	if len(rt.Calls()) != 1 {
+		t.Fatalf("expected 1 call (single endpoint), got %d", len(rt.Calls()))
+	}
+	if rt.Calls()[0].URL != "http://frontier.local" {
+		t.Errorf("call URL = %q, want http://frontier.local", rt.Calls()[0].URL)
+	}
+	// No cascade header when failover is disabled.
+	if got := rw.Header().Get("X-Nexus-Cascade-Served-By"); got != "" {
+		t.Errorf("X-Nexus-Cascade-Served-By = %q, want empty", got)
+	}
+}

@@ -133,7 +133,7 @@ func BenchmarkFetchCascadeStepPooled(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				msg, _, err := cas.fetchCascadeStep(context.Background(), http.DefaultClient, cas.Steps[0], map[string]interface{}{})
+				msg, _, _, err := cas.fetchCascadeStep(context.Background(), http.DefaultClient, cas.Steps[0], map[string]interface{}{})
 				if err != nil {
 					b.Fatal(err)
 				}

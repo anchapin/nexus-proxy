@@ -124,6 +124,10 @@ type YAMLConfig struct {
 	MaxResponseBytes              int     `yaml:"max_response_bytes"`
 	PoolBufferMaxBytes            int     `yaml:"pool_buffer_max_bytes"`
 
+	// Frontier per-provider failover (issue #1157).
+	FrontierFailover            bool `yaml:"frontier_failover"`
+	FrontierFailoverMaxAttempts int  `yaml:"frontier_failover_max_attempts"`
+
 	// Fusion
 	FusionProgressiveDelivery bool    `yaml:"fusion_progressive_delivery"`
 	FusionAgreementThreshold  float64 `yaml:"fusion_agreement_threshold"`
@@ -816,6 +820,21 @@ func LoadYAML(path string) (Config, error) {
 			return cfg, fmt.Errorf("config: NEXUS_ARBITER_TIMEOUT: %w; see .env.example", err)
 		}
 		cfg.ArbiterTimeout = d
+	}
+	// Frontier per-provider failover (issue #1157). Env overrides YAML.
+	if v := os.Getenv("NEXUS_FRONTIER_FAILOVER"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_FRONTIER_FAILOVER: %w", err)
+		}
+		cfg.FrontierFailover = b
+	}
+	if v := os.Getenv("NEXUS_FRONTIER_FAILOVER_MAX_ATTEMPTS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_FRONTIER_FAILOVER_MAX_ATTEMPTS: %w", err)
+		}
+		cfg.FrontierFailoverMaxAttempts = n
 	}
 	if v := os.Getenv("NEXUS_CASCADE_MAX_RESPONSE_BYTES"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -1519,6 +1538,8 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		CascadeMaxResponseBytes:       yc.intDefault(yc.CascadeMaxResponseBytes, DefaultMaxResponseBytes),
 		MaxResponseBytes:              yc.intDefault(yc.MaxResponseBytes, DefaultMaxResponseBytes),
 		PoolBufferMaxBytes:            yc.intDefault(yc.PoolBufferMaxBytes, DefaultPoolBufferMaxBytes),
+		FrontierFailover:              yc.boolFieldDefault(yc.FrontierFailover, true),
+		FrontierFailoverMaxAttempts:   yc.intDefault(yc.FrontierFailoverMaxAttempts, 3),
 
 		FusionProgressiveDelivery: yc.boolFieldDefault(yc.FusionProgressiveDelivery, true),
 		FusionAgreementThreshold:  yc.floatDefault(yc.FusionAgreementThreshold, 0.85),
