@@ -241,6 +241,11 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Build metadata for the running nexus-proxy binary (issue #529). Always 1.",
 		typ:  "gauge",
 	},
+	// Arbiter cache pre-warming gauge (issue #1176). Set once at boot.
+	"nexus_cache_warmed_entries": {
+		help: "Number of entries loaded into the arbiter cache from historical SQLite metrics during boot-time pre-warming (issue #1176). 0 when pre-warming is disabled or no data was found.",
+		typ:  "gauge",
+	},
 	// Per-route latency percentile gauges (issue #774). Computed from a
 	// sliding window ring buffer per route (local/frontier/fusion).
 	// Values are in seconds (ms → s conversion at render time).
@@ -487,6 +492,23 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	writeCounter(w, "nexus_confidence_errors_total",
 		"Total LocalConfidence errors in the planner where the SQLite confidence store returned an error (DB locked, query failed, etc.).",
 		c.ConfidenceErrors())
+
+	// RAG-vs-judge quality correlation (issue #1167). Sum and count of
+	// judge scores partitioned by whether RAG context was injected.
+	// Operators compute avg = sum/count per label to measure retrieval
+	// effectiveness.
+	writeMeta(w, "nexus_rag_judge_score_sum",
+		"Cumulative judge quality score sum partitioned by RAG injection (issue #1167). Compute avg via nexus_rag_judge_score_sum / nexus_rag_judge_score_count.", "counter")
+	//nolint:errcheck // ResponseWriter error cannot be handled after headers committed.
+	fmt.Fprintf(w, "nexus_rag_judge_score_sum{injected=\"true\"} %s\n", formatFloat(c.RAGJudgeScoreSum(true)))
+	//nolint:errcheck // ResponseWriter error cannot be handled after headers committed.
+	fmt.Fprintf(w, "nexus_rag_judge_score_sum{injected=\"false\"} %s\n", formatFloat(c.RAGJudgeScoreSum(false)))
+	writeCounterLabeled(w, "nexus_rag_judge_score_count",
+		"Count of judge quality scores partitioned by RAG injection (issue #1167).",
+		"injected", []labelSample{
+			{value: "true", n: c.RAGJudgeScoreCount(true)},
+			{value: "false", n: c.RAGJudgeScoreCount(false)},
+		})
 
 	// --- Histograms -----------------------------------------------------
 

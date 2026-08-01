@@ -1273,3 +1273,31 @@ func TestObserveWithExemplar(t *testing.T) {
 		t.Errorf("len(upperBounds) = %d, want 2", len(upperBounds))
 	}
 }
+
+// TestRenderPrometheusRAGJudgeScore confirms the RAG-vs-judge quality
+// correlation metrics (issue #1167) are rendered with the correct
+// labels and values.
+func TestRenderPrometheusRAGJudgeScore(t *testing.T) {
+	c := NewCollector()
+	c.ObserveJudgeScore(true, 5)
+	c.ObserveJudgeScore(true, 4)
+	c.ObserveJudgeScore(false, 2)
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c)
+	out := sb.String()
+
+	wantLines := []string{
+		"# TYPE nexus_rag_judge_score_sum counter",
+		`nexus_rag_judge_score_sum{injected="true"} 9`,
+		`nexus_rag_judge_score_sum{injected="false"} 2`,
+		"# TYPE nexus_rag_judge_score_count counter",
+		`nexus_rag_judge_score_count{injected="true"} 2`,
+		`nexus_rag_judge_score_count{injected="false"} 1`,
+	}
+	for _, want := range wantLines {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+}
