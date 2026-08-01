@@ -1281,3 +1281,78 @@ func TestLatencyPercentileBufferPreciseDistribution(t *testing.T) {
 		t.Errorf("p99 = %v, outside 5%% tolerance of 990.5", p99)
 	}
 }
+
+// TestObserveJudgeScorePartitionedByRAG confirms that the RAG-vs-quality
+// correlation counters accumulate correctly partitioned by the injected
+// label (issue #1167).
+func TestObserveJudgeScorePartitionedByRAG(t *testing.T) {
+	c := NewCollector()
+	// Injected: scores 5, 4, 3 → sum=12, count=3
+	c.ObserveJudgeScore(true, 5)
+	c.ObserveJudgeScore(true, 4)
+	c.ObserveJudgeScore(true, 3)
+	// Non-injected: scores 2, 1 → sum=3, count=2
+	c.ObserveJudgeScore(false, 2)
+	c.ObserveJudgeScore(false, 1)
+
+	if got := c.RAGJudgeScoreSum(true); got != 12 {
+		t.Errorf("RAGJudgeScoreSum(true) = %v, want 12", got)
+	}
+	if got := c.RAGJudgeScoreCount(true); got != 3 {
+		t.Errorf("RAGJudgeScoreCount(true) = %d, want 3", got)
+	}
+	if got := c.RAGJudgeScoreSum(false); got != 3 {
+		t.Errorf("RAGJudgeScoreSum(false) = %v, want 3", got)
+	}
+	if got := c.RAGJudgeScoreCount(false); got != 2 {
+		t.Errorf("RAGJudgeScoreCount(false) = %d, want 2", got)
+	}
+}
+
+// TestObserveJudgeScoreIgnoresInvalid confirms that scores outside 1..5
+// (parse failures, score==0) are silently skipped so the correlation
+// metrics reflect actual model quality (issue #1167).
+func TestObserveJudgeScoreIgnoresInvalid(t *testing.T) {
+	c := NewCollector()
+	c.ObserveJudgeScore(true, 0)  // parse failure
+	c.ObserveJudgeScore(false, 6) // out of range
+	c.ObserveJudgeScore(true, -1) // negative
+
+	if got := c.RAGJudgeScoreCount(true); got != 0 {
+		t.Errorf("RAGJudgeScoreCount(true) = %d, want 0", got)
+	}
+	if got := c.RAGJudgeScoreCount(false); got != 0 {
+		t.Errorf("RAGJudgeScoreCount(false) = %d, want 0", got)
+	}
+}
+
+// TestObserveJudgeScoreNilSafe confirms a nil collector is a no-op.
+func TestObserveJudgeScoreNilSafe(t *testing.T) {
+	var c *Collector
+	c.ObserveJudgeScore(true, 5) // must not panic
+}
+
+// TestObserveJudgeScoreConcurrent confirms the correlation counters are
+// safe under concurrent access (issue #1167).
+func TestObserveJudgeScoreConcurrent(t *testing.T) {
+	c := NewCollector()
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			c.ObserveJudgeScore(true, 5)
+		}()
+		go func() {
+			defer wg.Done()
+			c.ObserveJudgeScore(false, 3)
+		}()
+	}
+	wg.Wait()
+	if got := c.RAGJudgeScoreCount(true); got != 100 {
+		t.Errorf("RAGJudgeScoreCount(true) = %d, want 100", got)
+	}
+	if got := c.RAGJudgeScoreCount(false); got != 100 {
+		t.Errorf("RAGJudgeScoreCount(false) = %d, want 100", got)
+	}
+}

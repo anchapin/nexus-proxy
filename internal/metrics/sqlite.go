@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS requests (
     rag_injected INTEGER NOT NULL DEFAULT 0,
     rag_filename TEXT NOT NULL DEFAULT '',
     estimated_cost_usd REAL NOT NULL DEFAULT 0,
+    input_cost_usd REAL NOT NULL DEFAULT 0,
+    output_cost_usd REAL NOT NULL DEFAULT 0,
     baseline_cost_usd REAL NOT NULL DEFAULT 0,
     savings_usd REAL NOT NULL DEFAULT 0,
     ttft_ms INTEGER NOT NULL DEFAULT 0,
@@ -91,6 +93,9 @@ var additiveMigrations = []string{
 	`ALTER TABLE requests ADD COLUMN toon_compression_method TEXT NOT NULL DEFAULT ''`,
 	// Issue #239: arbiter cost tracking
 	`ALTER TABLE requests ADD COLUMN fusion_arbiter_cost_usd REAL NOT NULL DEFAULT 0`,
+	// Issue #1183: per-provider cost split (input/output token streams)
+	`ALTER TABLE requests ADD COLUMN input_cost_usd REAL NOT NULL DEFAULT 0`,
+	`ALTER TABLE requests ADD COLUMN output_cost_usd REAL NOT NULL DEFAULT 0`,
 	// Issue #227: rag cache hit tracking
 	`ALTER TABLE requests ADD COLUMN rag_cache_hit INTEGER NOT NULL DEFAULT 0`,
 	// Issue #1176: arbiter cache key + synthesis for boot-time pre-warming
@@ -141,12 +146,13 @@ const insertSQL = `INSERT INTO requests
     (timestamp, request_id, route, model,
      input_tokens, output_tokens, toon_savings_tokens, toon_compression_method,
      rag_injected, rag_filename, rag_cache_hit, estimated_cost_usd,
+     input_cost_usd, output_cost_usd,
      baseline_cost_usd, savings_usd,
      ttft_ms, total_latency_ms, tps, streaming,
      fusion_arbiter_skipped, fusion_jaccard_similarity, fusion_arbiter_cost_usd, error,
-     route_source, route_reason, slm_confidence, slm_task_type,
-     arbiter_cache_key, arbiter_synthesis)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      route_source, route_reason, slm_confidence, slm_task_type,
+      arbiter_cache_key, arbiter_synthesis)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // SQLiteStore is the production Store implementation (issue #4).
 // Writes are funnelled through a buffered channel and a single
@@ -423,6 +429,7 @@ func (s *SQLiteStore) writeOne(req Request) {
 		ts.UTC(), req.RequestID, route, model,
 		req.InputTokens, req.OutputTokens, req.TOONSavingsTokens, req.TOONCompressionMethod,
 		ragInjected, req.RAGFilename, req.RAGCacheHit, req.EstimatedCostUSD,
+		req.InputCostUSD, req.OutputCostUSD,
 		req.BaselineCostUSD, req.SavingsUSD,
 		req.TTFTMs, req.TotalLatencyMs, req.TPS, streaming,
 		fusionArbiterSkipped, req.FusionJaccardSimilarity, req.FusionArbiterCostUSD, req.Error,
@@ -534,11 +541,32 @@ func (s *SQLiteStore) pruneOnce(retentionDays int) {
 func (s *SQLiteStore) DailySummary(date time.Time) (Summary, error) {
 	day := date.UTC().Truncate(24 * time.Hour)
 	next := day.Add(24 * time.Hour)
+	return s.scanRange(day, next, day)
+}
 
-	// One aggregate per metric — the statement is built once
-	// per call because the date range is parametric. Indexes on
-	// idx_requests_timestamp keep the range scan cheap.
-	const summarySQL = `
+// RangeSummary returns a single Summary aggregating every request whose
+// timestamp falls in the half-open interval [start, end). It collapses a
+// weekly / monthly / quarterly window into one row in a single SQL
+// round-trip, replacing N per-day DailySummary calls for long-horizon
+// dashboard views (issue #1170). The Date field of the returned Summary
+// is the truncated start. An empty range (start not before end) returns
+// an error so a caller never silently sees a zero-row aggregate that
+// masquerades as "no traffic". Safe to call concurrently with writes.
+func (s *SQLiteStore) RangeSummary(start, end time.Time) (Summary, error) {
+	s0 := start.UTC().Truncate(24 * time.Hour)
+	e0 := end.UTC().Truncate(24 * time.Hour)
+	if !s0.Before(e0) {
+		return Summary{}, fmt.Errorf("metrics: range summary: empty range [%s, %s)", s0.Format("2006-01-02"), e0.Format("2006-01-02"))
+	}
+	return s.scanRange(s0, e0, s0)
+}
+
+// rangeAggregateSQL is the shared aggregation statement used by both
+// DailySummary and RangeSummary. It collapses all rows whose timestamp
+// falls in the half-open interval [from, to) into a single Summary.
+// The idx_requests_timestamp index keeps the range scan cheap even over
+// months of data.
+const rangeAggregateSQL = `
 SELECT
     COUNT(*),
     COALESCE(SUM(CASE WHEN route = 'local'    THEN 1 ELSE 0 END), 0),
@@ -548,6 +576,8 @@ SELECT
     COALESCE(SUM(toon_savings_tokens), 0),
     COALESCE(SUM(CASE WHEN rag_injected = 1 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(estimated_cost_usd), 0),
+    COALESCE(SUM(input_cost_usd), 0),
+    COALESCE(SUM(output_cost_usd), 0),
     COALESCE(SUM(baseline_cost_usd), 0),
     COALESCE(SUM(savings_usd), 0),
     COALESCE(SUM(total_latency_ms), 0),
@@ -555,12 +585,16 @@ SELECT
 FROM requests
 WHERE timestamp >= ? AND timestamp < ?`
 
+// scanRange executes rangeAggregateSQL over the half-open [from, to)
+// window and returns the single aggregated Summary, stamping its Date
+// field with dateLabel. Callers pre-truncate the bounds to UTC days.
+func (s *SQLiteStore) scanRange(from, to, dateLabel time.Time) (Summary, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), recordRequestErrorTimeout)
 	defer cancel()
 
-	row := s.db.QueryRowContext(ctx, summarySQL, day, next)
+	row := s.db.QueryRowContext(ctx, rangeAggregateSQL, from, to)
 	var sum Summary
-	sum.Date = day
+	sum.Date = dateLabel
 	if err := row.Scan(
 		&sum.RequestCount,
 		&sum.LocalCount,
@@ -570,12 +604,14 @@ WHERE timestamp >= ? AND timestamp < ?`
 		&sum.TOONSavingsTokens,
 		&sum.RAGInjectedCount,
 		&sum.EstimatedCostTotal,
+		&sum.InputCostTotal,
+		&sum.OutputCostTotal,
 		&sum.BaselineCostTotal,
 		&sum.SavingsTotal,
 		&sum.TotalLatencyMsSum,
 		&sum.ErrorCount,
 	); err != nil {
-		return Summary{}, fmt.Errorf("metrics: daily summary: %w", err)
+		return Summary{}, fmt.Errorf("metrics: range summary: %w", err)
 	}
 	return sum, nil
 }

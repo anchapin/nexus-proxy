@@ -25,6 +25,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/handlers"
 	"github.com/anchapin/nexus-proxy/internal/health"
+	"github.com/anchapin/nexus-proxy/internal/ioutils"
 	"github.com/anchapin/nexus-proxy/internal/judge"
 	"github.com/anchapin/nexus-proxy/internal/metrics"
 	"github.com/anchapin/nexus-proxy/internal/middleware"
@@ -58,6 +59,12 @@ type serverParts struct {
 // boot error. The cleanup function closes resources in reverse order.
 func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverParts, func(), error) {
 	parts := &serverParts{}
+
+	// Configure the response-body buffer pool retention cap (issue #1177).
+	// This is a global setting because sync.Pool is package-level in
+	// ioutils. Values <= 0 disable pooling — GetBuffer still allocates
+	// but PutBuffer discards instead of returning to the pool.
+	ioutils.SetPoolBufferMaxBytes(cfg.PoolBufferMaxBytes)
 
 	// Root context for background goroutines (probe manager, health
 	// poller). Cancelled during cleanup so those goroutines exit before
@@ -168,6 +175,9 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		)
 	}
 	probeMgr := probe.NewManager(probeImpl, cfg.ProbePollInterval, cfg.ProbeTimeout)
+	if cfg.ProbeNVIDIAInterval > 0 {
+		probeMgr.EnableNVIDIARefresh(cfg.ProbeNVIDIAInterval)
+	}
 	go probeMgr.Run(bgCtx)
 	addCleanup(func() {
 		if err := probeMgr.Close(); err != nil {
@@ -341,6 +351,14 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		}
 
 		judgeEval = judge.NewEvaluator(evalCfg, httpClient, storage)
+		// Wire the score callback so RAG-vs-quality correlation metrics
+		// are updated on the worker goroutine after each judge attempt
+		// (issue #1167). Only valid scores (1..5) feed the correlation
+		// counters; parse failures (Score==0 / Err set) are skipped by
+		// ObserveJudgeScore.
+		judgeEval.SetScoreCallback(func(s judge.JudgeScore) {
+			circuitCollector.ObserveJudgeScore(s.RAGInjected, s.Score)
+		})
 		judgeObs = handlers.JudgeObserverFunc(func(c handlers.LocalCompletion) bool {
 			if !judgeEval.Sample() {
 				return false
@@ -349,13 +367,15 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 				bridge.note(c.RequestID, router.Categorize(c.Instruction))
 			}
 			if !judgeEval.Enqueue(judge.Sample{
-				RequestID:   c.RequestID,
-				Instruction: c.Instruction,
-				Output:      c.Output,
-				LocalModel:  c.LocalModel,
-				Route:       c.Route,
-				TraceParent: c.TraceParent,
-				TraceState:  c.TraceState,
+				RequestID:     c.RequestID,
+				Instruction:   c.Instruction,
+				Output:        c.Output,
+				LocalModel:    c.LocalModel,
+				Route:         c.Route,
+				TraceParent:   c.TraceParent,
+				TraceState:    c.TraceState,
+				RAGInjected:   c.RAGInjected,
+				RAGSimilarity: c.RAGSimilarity,
 			}) {
 				if bridge != nil {
 					bridge.forget(c.RequestID)
@@ -1117,6 +1137,39 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		)
 	} else {
 		slog.Info("models endpoint disabled (NEXUS_MODELS_ENDPOINT=false)")
+	}
+
+	// Built-in web dashboard (issue #1182). Opt-in via
+	// NEXUS_DASHBOARD_ENDPOINT; serves a self-contained HTML page from
+	// the SQLite metrics store. The route lives on the same mux that
+	// SecurityHeaders wraps, so it inherits response hardening. It is
+	// rate-limited (when a limiter is configured) exactly like the
+	// chat path, and auth-gated like /status (NEXUS_DASHBOARD_PUBLIC).
+	if cfg.DashboardEndpointEnabled {
+		endpoint := cfg.DashboardEndpoint
+		if endpoint == "" {
+			endpoint = "/dashboard"
+		}
+		// dashStore stays a nil interface when metrics is disabled;
+		// the handler degrades to a static "metrics disabled" page.
+		var dashStore handlers.DashboardStore
+		if metricsStore != nil {
+			dashStore = metricsStore
+		}
+		dashH := http.Handler(handlers.Dashboard(handlers.DashboardDeps{
+			Store:     dashStore,
+			CostPer1K: cfg.FrontierCostPer1K,
+		}))
+		if rateLimiter != nil {
+			dashH = rateLimiter.Wrap(dashH)
+		}
+		mux.Handle(endpoint, dashH)
+		slog.Info("dashboard endpoint enabled",
+			slog.String("path", endpoint),
+			slog.Bool("public", cfg.DashboardPublic),
+		)
+	} else {
+		slog.Info("dashboard endpoint disabled (NEXUS_DASHBOARD_ENDPOINT=false)")
 	}
 
 	slog.Info("starting nexus proxy",

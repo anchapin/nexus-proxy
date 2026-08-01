@@ -1146,3 +1146,167 @@ func TestGPUInfoFields(t *testing.T) {
 		t.Errorf("MemoryTotal = %d, want 24 GiB", info.MemoryTotal)
 	}
 }
+
+// --- Periodic NVIDIA VRAM refresh (issue #1178) -------------------------
+
+// TestMergeNVIDIAUpdatesBudget verifies that mergeNVIDIA republishes the
+// budget with the NVIDIA free-VRAM sum and per-GPU slice, and that the
+// limiter-relevant field (FreeVRAMBytes) reflects the refresh. It calls
+// mergeNVIDIA directly to keep the assertion deterministic.
+func TestMergeNVIDIAUpdatesBudget(t *testing.T) {
+	mgr := NewManager(&stubProbe{}, time.Hour, time.Second)
+	// Seed a boot budget that simulates an NVIDIA-only host: the AMD
+	// sysfs path found nothing (SourceStatic, no free VRAM) so the
+	// NVIDIA refresh is the only source of free VRAM.
+	boot := Budget{Tokens: 0, FreeVRAMBytes: 0, BytesPerToken: DefaultBytesPerToken, Source: SourceStatic}
+	mgr.latest.Store(&boot)
+
+	gpus := []GPUInfo{
+		{Index: 0, Name: "RTX 3090", MemoryFree: 6 << 30, MemoryTotal: 24 << 30},
+		{Index: 1, Name: "RTX 3090", MemoryFree: 4 << 30, MemoryTotal: 24 << 30},
+	}
+	mgr.nvidiaRefresh = func() ([]GPUInfo, error) { return gpus, nil }
+
+	mgr.mergeNVIDIA()
+
+	got := mgr.Get()
+	wantFree := int64(10) << 30 // 6 GiB + 4 GiB
+	if got.FreeVRAMBytes != wantFree {
+		t.Errorf("FreeVRAMBytes = %d, want %d", got.FreeVRAMBytes, wantFree)
+	}
+	if len(got.PerGPU) != 2 {
+		t.Fatalf("PerGPU len = %d, want 2", len(got.PerGPU))
+	}
+	if got.Source != SourceNVIDIA {
+		t.Errorf("Source = %q, want %q", got.Source, SourceNVIDIA)
+	}
+	// Tokens must be re-derived from the refreshed VRAM.
+	wantTokens := vramBytesToTokens(wantFree, DefaultBytesPerToken)
+	if got.Tokens != wantTokens {
+		t.Errorf("Tokens = %d, want %d (refreshed VRAM derived)", got.Tokens, wantTokens)
+	}
+}
+
+// TestMergeNVIDIANoopWhenNoGPU asserts that a missing nvidia-smi (or an
+// empty GPU list) leaves the previously published budget untouched, so
+// AMD-only and headless hosts are unaffected.
+func TestMergeNVIDIANoopWhenNoGPU(t *testing.T) {
+	mgr := NewManager(&stubProbe{}, time.Hour, time.Second)
+	boot := Budget{Tokens: 4096, FreeVRAMBytes: 1 << 30, BytesPerToken: DefaultBytesPerToken, Source: SourceSysfs}
+	mgr.latest.Store(&boot)
+
+	mgr.nvidiaRefresh = func() ([]GPUInfo, error) { return nil, nil }
+	mgr.mergeNVIDIA()
+
+	got := mgr.Get()
+	if got.FreeVRAMBytes != 1<<30 {
+		t.Errorf("FreeVRAMBytes = %d, want unchanged 1 GiB", got.FreeVRAMBytes)
+	}
+	if got.Source != SourceSysfs {
+		t.Errorf("Source = %q, want unchanged %q", got.Source, SourceSysfs)
+	}
+	if got.PerGPU != nil {
+		t.Errorf("PerGPU = %v, want nil", got.PerGPU)
+	}
+}
+
+// TestMergeNVIDIAPreservesModelContext verifies that when the boot budget
+// already carries a model context, mergeNVIDIA keeps Tokens = min(model
+// context, refreshed VRAM tokens) instead of clobbering it.
+func TestMergeNVIDIAPreservesModelContext(t *testing.T) {
+	mgr := NewManager(&stubProbe{}, time.Hour, time.Second)
+	modelCtx := 8192
+	boot := Budget{Tokens: modelCtx, ModelContext: modelCtx, BytesPerToken: DefaultBytesPerToken, Source: SourceOllamaPS}
+	mgr.latest.Store(&boot)
+
+	// 1 GiB free -> 4096 tokens, which is below the 8192 model
+	// context, so Tokens should follow the VRAM-derived figure.
+	gpus := []GPUInfo{{Index: 0, Name: "RTX", MemoryFree: 1 << 30, MemoryTotal: 24 << 30}}
+	mgr.nvidiaRefresh = func() ([]GPUInfo, error) { return gpus, nil }
+
+	mgr.mergeNVIDIA()
+
+	got := mgr.Get()
+	if got.ModelContext != modelCtx {
+		t.Errorf("ModelContext = %d, want preserved %d", got.ModelContext, modelCtx)
+	}
+	wantTokens := vramBytesToTokens(1<<30, DefaultBytesPerToken) // 4096
+	if got.Tokens != wantTokens {
+		t.Errorf("Tokens = %d, want min(modelCtx, vram) = %d", got.Tokens, wantTokens)
+	}
+}
+
+// TestNVIDIARefreshLoopRepublishesBudget drives the full goroutine path:
+// with EnableNVIDIARefresh armed and a fast ticker, the published budget
+// updates at least once after the interval elapses on a stubbed host.
+func TestNVIDIARefreshLoopRepublishesBudget(t *testing.T) {
+	mgr := NewManager(&stubProbe{}, time.Hour, time.Second) // AMD poll effectively never fires
+	mgr.EnableNVIDIARefresh(5 * time.Millisecond)
+
+	var calls int64
+	gpus := []GPUInfo{{Index: 0, Name: "RTX 4090", MemoryFree: 5 << 30, MemoryTotal: 24 << 30}}
+	mgr.nvidiaRefresh = func() ([]GPUInfo, error) {
+		atomic.AddInt64(&calls, 1)
+		return gpus, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Run is invoked synchronously: it returns immediately after
+	// spawning the background loop/nvidiaLoop goroutines, matching the
+	// existing test pattern so wg.Add (inside Run) and wg.Wait (inside
+	// Close) share a happens-before edge on this goroutine.
+	mgr.Run(ctx)
+	defer mgr.Close()
+
+	wantFree := int64(5) << 30
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("nvidia refresh never republished budget; calls=%d", atomic.LoadInt64(&calls))
+		default:
+		}
+		if b := mgr.Get(); b.FreeVRAMBytes == wantFree && len(b.PerGPU) == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if atomic.LoadInt64(&calls) == 0 {
+		t.Fatal("nvidiaRefresh was never invoked")
+	}
+}
+
+// TestNVIDIARefreshDisabledByDefault asserts that when
+// EnableNVIDIARefresh is not called, no periodic nvidia-smi invocation
+// happens — the boot-only behaviour is preserved (acceptance criterion 2).
+func TestNVIDIARefreshDisabledByDefault(t *testing.T) {
+	mgr := NewManager(&stubProbe{}, time.Hour, time.Second)
+	// EnableNVIDIARefresh was never called, so the interval stays at
+	// its zero default and Run must not start an nvidia loop. Assert
+	// before Run so the read is race-free.
+	if mgr.nvidiaInterval != 0 {
+		t.Fatalf("nvidiaInterval = %v, want 0 when refresh not enabled", mgr.nvidiaInterval)
+	}
+
+	var calls int64
+	// Even though we set the stub, EnableNVIDIARefresh was never
+	// called so no goroutine should ever invoke it.
+	mgr.nvidiaRefresh = func() ([]GPUInfo, error) {
+		atomic.AddInt64(&calls, 1)
+		return []GPUInfo{{Index: 0, MemoryFree: 1 << 30}}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mgr.Run(ctx)
+	defer mgr.Close()
+
+	// Give any would-be loop ample time to (incorrectly) fire.
+	time.Sleep(50 * time.Millisecond)
+	// All observations are atomic; the background AMD-poll goroutine
+	// (1h interval) does not touch `calls`.
+	if n := atomic.LoadInt64(&calls); n != 0 {
+		t.Errorf("nvidiaRefresh called %d times when refresh disabled, want 0", n)
+	}
+}

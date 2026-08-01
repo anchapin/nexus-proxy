@@ -91,6 +91,7 @@ probe_interval: "90s"
 probe_timeout: "3s"
 probe_bytes_per_token: 131072
 probe_thermal_threshold: 75
+probe_nvidia_interval: "5m"
 local_max_concurrent: 4
 local_vram_bytes_per_slot: 1073741824
 local_cooldown: "20s"
@@ -169,6 +170,9 @@ auth_rate_limit_window: "3m"
 	}
 	if cfg.ProbeThermalThreshold != 75 {
 		t.Errorf("ProbeThermalThreshold = %d, want 75", cfg.ProbeThermalThreshold)
+	}
+	if cfg.ProbeNVIDIAInterval != 5*time.Minute {
+		t.Errorf("ProbeNVIDIAInterval = %v, want 5m", cfg.ProbeNVIDIAInterval)
 	}
 	if cfg.LocalMaxConcurrent != 4 {
 		t.Errorf("LocalMaxConcurrent = %d", cfg.LocalMaxConcurrent)
@@ -289,25 +293,36 @@ shutdown_timeout: "-5s"
 	}
 	_, err := LoadYAML(path)
 	if err == nil {
-		t.Error("expected error for negative shutdown timeout")
+		t.Fatal("expected error for negative shutdown timeout")
+	}
+	// issue #1181: the error must name the safe default and point to .env.example.
+	msg := err.Error()
+	if !strings.Contains(msg, "30s") {
+		t.Errorf("error %q does not name the default 30s", msg)
+	}
+	if !strings.Contains(msg, ".env.example") {
+		t.Errorf("error %q does not point to .env.example", msg)
 	}
 }
 
-// issue #986: fractional fields must be validated in 0..1 range
+// issue #986: fractional fields must be validated in 0..1 range.
+// issue #1181: error messages now carry actionable hints (default +
+// .env.example pointer); the substring checks below target the
+// stable "must be in [0,1]" constraint phrase.
 func TestLoadYAMLFractionalFieldRangeValidation(t *testing.T) {
 	fractionalFields := []struct {
 		yamlKey string
 		yamlVal string
 		wantErr string
 	}{
-		{"budget_alert_threshold", "5.0", "budget_alert_threshold must be in range [0,1]"},
-		{"budget_alert_threshold", "-0.5", "budget_alert_threshold must be in range [0,1]"},
-		{"fusion_agreement_threshold", "2.0", "fusion_agreement_threshold must be in range [0,1]"},
-		{"fusion_agreement_threshold", "-0.1", "fusion_agreement_threshold must be in range [0,1]"},
-		{"provider_tail_weight", "1.5", "provider_tail_weight must be in range [0,1]"},
-		{"provider_tail_weight", "-0.1", "provider_tail_weight must be in range [0,1]"},
-		{"tracing_sample_rate", "3.0", "tracing_sample_rate must be in range [0,1]"},
-		{"tracing_sample_rate", "-0.1", "tracing_sample_rate must be in range [0,1]"},
+		{"budget_alert_threshold", "5.0", "budget_alert_threshold must be in [0,1]"},
+		{"budget_alert_threshold", "-0.5", "budget_alert_threshold must be in [0,1]"},
+		{"fusion_agreement_threshold", "2.0", "fusion_agreement_threshold must be in [0,1]"},
+		{"fusion_agreement_threshold", "-0.1", "fusion_agreement_threshold must be in [0,1]"},
+		{"provider_tail_weight", "1.5", "provider_tail_weight must be in [0,1]"},
+		{"provider_tail_weight", "-0.1", "provider_tail_weight must be in [0,1]"},
+		{"tracing_sample_rate", "3.0", "tracing_sample_rate must be in [0,1]"},
+		{"tracing_sample_rate", "-0.1", "tracing_sample_rate must be in [0,1]"},
 	}
 
 	for _, tc := range fractionalFields {
@@ -324,6 +339,10 @@ func TestLoadYAMLFractionalFieldRangeValidation(t *testing.T) {
 			}
 			if err != nil && !strings.Contains(err.Error(), tc.wantErr) {
 				t.Errorf("LoadYAML error = %q, want containing %q", err.Error(), tc.wantErr)
+			}
+			// issue #1181: every range error must carry a remediation hint.
+			if err != nil && !strings.Contains(err.Error(), ".env.example") {
+				t.Errorf("LoadYAML error = %q, want .env.example hint", err.Error())
 			}
 		})
 	}
@@ -809,10 +828,10 @@ func TestLoadYAMLRoutingConfidenceOutOfRange(t *testing.T) {
 		yamlVal string
 		wantErr string
 	}{
-		{"routing_confidence_floor", "1.5", "routing_confidence_floor must be in range [0,1]"},
-		{"routing_confidence_floor", "-0.2", "routing_confidence_floor must be in range [0,1]"},
-		{"routing_confidence_ceiling", "1.5", "routing_confidence_ceiling must be in range [0,1]"},
-		{"routing_confidence_ceiling", "-0.2", "routing_confidence_ceiling must be in range [0,1]"},
+		{"routing_confidence_floor", "1.5", "routing_confidence_floor must be in [0,1]"},
+		{"routing_confidence_floor", "-0.2", "routing_confidence_floor must be in [0,1]"},
+		{"routing_confidence_ceiling", "1.5", "routing_confidence_ceiling must be in [0,1]"},
+		{"routing_confidence_ceiling", "-0.2", "routing_confidence_ceiling must be in [0,1]"},
 	}
 
 	for _, tc := range routingConfidenceFields {
@@ -915,8 +934,8 @@ toon_unfenced: maybe
 	if err == nil {
 		t.Fatal("LoadYAML: expected error for toon_unfenced: maybe, got nil")
 	}
-	if got := err.Error(); got != `config: toon_unfenced value "maybe" is not recognised; want true or false` {
-		t.Errorf("error = %q, want %q", got, `config: toon_unfenced value "maybe" is not recognised; want true or false`)
+	if got := err.Error(); got != `config: toon_unfenced value "maybe" is not recognised; want true or false; see .env.example` {
+		t.Errorf("error = %q, want %q", got, `config: toon_unfenced value "maybe" is not recognised; want true or false; see .env.example`)
 	}
 }
 
@@ -1110,4 +1129,73 @@ func TestParseBoolEnvStr(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLoadYAMLProviderTypeValidation (issue #1185) ensures the YAML
+// `providers:` list validates each entry's `type` against the allowed
+// set, so `nexus config validate` rejects a typo before boot.
+func TestLoadYAMLProviderTypeValidation(t *testing.T) {
+	t.Run("valid types accepted", func(t *testing.T) {
+		tmp := t.TempDir()
+		path := filepath.Join(tmp, "config.yaml")
+		yamlContent := `
+providers:
+  - name: openai
+    url: https://api.openai.com/v1/chat/completions
+    model: gpt-4o
+    type: openai
+  - name: claude
+    url: https://api.anthropic.com
+    model: claude-opus-4
+    type: anthropic
+`
+		if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if _, err := LoadYAML(path); err != nil {
+			t.Errorf("LoadYAML valid types: unexpected error: %v", err)
+		}
+	})
+
+	t.Run("unknown type rejected", func(t *testing.T) {
+		tmp := t.TempDir()
+		path := filepath.Join(tmp, "config.yaml")
+		yamlContent := `
+providers:
+  - name: bad
+    url: https://example.com
+    model: x
+    type: cohere
+`
+		if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		_, err := LoadYAML(path)
+		if err == nil {
+			t.Fatal("LoadYAML: expected error for unknown provider type")
+		}
+		if !strings.Contains(err.Error(), "type") {
+			t.Errorf("error should mention type: %v", err)
+		}
+		if !strings.Contains(err.Error(), "cohere") {
+			t.Errorf("error should name the bad value: %v", err)
+		}
+	})
+
+	t.Run("empty type accepted (defaults to openai)", func(t *testing.T) {
+		tmp := t.TempDir()
+		path := filepath.Join(tmp, "config.yaml")
+		yamlContent := `
+providers:
+  - name: oai
+    url: https://api.openai.com/v1/chat/completions
+    model: gpt-4o
+`
+		if err := os.WriteFile(path, []byte(yamlContent), 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if _, err := LoadYAML(path); err != nil {
+			t.Errorf("LoadYAML empty type: unexpected error: %v", err)
+		}
+	})
 }

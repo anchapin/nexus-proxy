@@ -6,6 +6,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -85,6 +86,17 @@ type Config struct {
 	ZAIURL   string // "https://api.z.ai/v1/chat/completions"
 	ZAIModel string // "glm-4.6"
 	ZAIKey   string // empty == skipped from cascade
+
+	// Model aliasing (issue #1184). Maps client-requested model names
+	// to "providerName/upstreamModel" so an operator can transparently
+	// remap e.g. "gpt-4" to "anthropic/claude-3-5-sonnet". When a
+	// request's model matches an alias the handler rewrites the body
+	// and routes directly to the target provider. Empty map = disabled
+	// (backward compatible). ModelAliasesStrict, when true, returns
+	// HTTP 400 for a model that matches no alias and no exact provider
+	// model; false (default) passes unknown models through unchanged.
+	ModelAliases       map[string]string // NEXUS_MODEL_ALIASES JSON
+	ModelAliasesStrict bool              // NEXUS_MODEL_ALIASES_STRICT
 
 	// Inbound auth (issue #109). When ProxyAPIKey is non-empty, every
 	// non-exempt endpoint requires a matching Bearer token in the
@@ -197,6 +209,16 @@ type Config struct {
 	CostBaselineModel     string  // NEXUS_FRONTIER_MODEL (default) or a custom model
 	CostBaselineRatePer1K float64 // USD per 1k tokens for baseline valuation
 
+	// CostUseOutputTokens (issue #1183) switches the per-request cost
+	// estimate from the legacy flat input-only rate to a per-provider
+	// input+output token split. When false (default) the estimate is
+	// byte-for-byte identical to the pre-issue-#1183 behaviour, so a
+	// stock deployment's savings numbers are unaffected. When true the
+	// handler looks up the serving provider's InputCostPer1K /
+	// OutputCostPer1K via the registry and counts output tokens with
+	// the tiktoken tokenizer instead of the bytes/4 heuristic.
+	CostUseOutputTokens bool // true => per-provider input/output cost split (issue #1183)
+
 	// Fusion progressive delivery (issue #48). When enabled and the
 	// harness requests a streaming response, the chat handler
 	// dispatches route=fusion to upstream.PanelStreaming instead of
@@ -276,6 +298,14 @@ type Config struct {
 	// which the probe treats free VRAM as 0 and forces the static
 	// guardrail (issue #597). 0 disables the thermal check.
 	ProbeThermalThreshold int // GPU temp (°C) threshold; default 90, 0 disables
+	// ProbeNVIDIAInterval is the cadence of the periodic NVIDIA
+	// free-VRAM refresh (issue #1178). On NVIDIA-only hosts the AMD
+	// sysfs path returns nothing, so without this refresh the
+	// budget's FreeVRAMBytes — read on every Acquire by the
+	// concurrency limiter — would stay frozen at boot for the whole
+	// process lifetime. Zero (default) keeps the boot-only behaviour
+	// (nvidia-smi is invoked once at boot and by `nexus check`).
+	ProbeNVIDIAInterval time.Duration // periodic nvidia-smi refresh; 0 disables
 
 	// Local-route concurrency ceiling (issue #81). The limiter bounds
 	// in-flight local-route requests so a small GPU does not OOM under
@@ -471,6 +501,18 @@ type Config struct {
 	ModelsEndpointEnabled bool
 	ModelsCacheTTL        time.Duration
 
+	// Built-in web dashboard (issue #1182). When DashboardEndpointEnabled
+	// is true the proxy serves GET <DashboardEndpoint> — a self-contained
+	// HTML page (inline CSS/JS, no external assets) rendering savings and
+	// routing metrics from the SQLite metrics store. Disabled by default
+	// so a stock deployment exposes no extra surface. DashboardPublic
+	// mirrors StatusPublic: when true the route bypasses inbound auth
+	// (handy for an operator-only LAN). When false (default) the route is
+	// gated by NEXUS_PROXY_API_KEY exactly like /status.
+	DashboardEndpointEnabled bool
+	DashboardEndpoint        string
+	DashboardPublic          bool
+
 	// Trusted-proxy enforcement + rate limiting (issue #75).
 	//
 	// TrustedProxies is the parsed CIDR allowlist sourced from
@@ -507,6 +549,12 @@ type Config struct {
 	// bounds separately (issue #742). Zero or negative falls back to
 	// DefaultMaxResponseBytes.
 	CascadeMaxResponseBytes int
+
+	// PoolBufferMaxBytes is the maximum capacity a pooled *bytes.Buffer
+	// may retain to be returned to the sync.Pool (issue #1177). Buffers
+	// that grew beyond this are discarded so a single huge response never
+	// pins pool memory. Default 1 MiB. Zero or negative disables pooling.
+	PoolBufferMaxBytes int
 
 	// Auth brute-force protection (issue #296). Tracks per-client-IP
 	// auth failures and blocks the client after AuthRateLimitBurst
@@ -1012,7 +1060,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if tailWeight < 0 || tailWeight > 1 {
-		return cfg, fmt.Errorf("config: NEXUS_PROVIDER_TAIL_WEIGHT must be in [0,1], got %v", tailWeight)
+		return cfg, configError("NEXUS_PROVIDER_TAIL_WEIGHT", "must be a number in [0,1]", os.Getenv("NEXUS_PROVIDER_TAIL_WEIGHT"), strconv.FormatFloat(0.0, 'f', -1, 64))
 	}
 	cfg.ProviderTailWeight = tailWeight
 
@@ -1054,6 +1102,12 @@ func Load() (Config, error) {
 		baselineRate = 0
 	}
 	cfg.CostBaselineRatePer1K = baselineRate
+
+	// Per-provider cost model with input/output token split (issue #1183).
+	// Defaults to false so the per-request estimate stays byte-for-byte
+	// identical to the legacy flat input-only rate. Operators opt in to
+	// the richer per-provider model that counts output tokens separately.
+	cfg.CostUseOutputTokens = getEnvBool("NEXUS_COST_USE_OUTPUT_TOKENS", false)
 
 	// Fusion progressive delivery (issue #48). Defaults to ON so a
 	// stock `.env.example` boots into the new behaviour; operators
@@ -1267,6 +1321,20 @@ func Load() (Config, error) {
 	}
 	cfg.ProbeThermalThreshold = probeThermal
 
+	// Periodic NVIDIA free-VRAM refresh (issue #1178). The default
+	// of 0 keeps the boot-only nvidia-smi behaviour; a positive
+	// duration arms a background goroutine in the probe Manager that
+	// republishes the budget so the VRAM-aware limiter adapts to
+	// model-swap and co-tenant VRAM-grab events on NVIDIA-only hosts.
+	probeNVIDIAInterval, err := getEnvDuration("NEXUS_PROBE_NVIDIA_INTERVAL", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if probeNVIDIAInterval < 0 {
+		probeNVIDIAInterval = 0
+	}
+	cfg.ProbeNVIDIAInterval = probeNVIDIAInterval
+
 	// Local-route concurrency ceiling (issue #81). The limiter is
 	// dormant unless the operator sets NEXUS_LOCAL_MAX_CONCURRENT
 	// above zero, so a stock deployment is byte-for-byte identical to
@@ -1326,7 +1394,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if readTimeout < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_SERVER_READ_TIMEOUT must not be negative, got %s", readTimeout)
+		return cfg, configError("NEXUS_SERVER_READ_TIMEOUT", "must not be negative", os.Getenv("NEXUS_SERVER_READ_TIMEOUT"), DefaultServerReadTimeout.String())
 	}
 	cfg.ReadTimeout = readTimeout
 
@@ -1335,7 +1403,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if writeTimeout < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_SERVER_WRITE_TIMEOUT must not be negative, got %s", writeTimeout)
+		return cfg, configError("NEXUS_SERVER_WRITE_TIMEOUT", "must not be negative", os.Getenv("NEXUS_SERVER_WRITE_TIMEOUT"), DefaultServerWriteTimeout.String())
 	}
 	cfg.WriteTimeout = writeTimeout
 
@@ -1344,7 +1412,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if idleTimeout < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_SERVER_IDLE_TIMEOUT must not be negative, got %s", idleTimeout)
+		return cfg, configError("NEXUS_SERVER_IDLE_TIMEOUT", "must not be negative", os.Getenv("NEXUS_SERVER_IDLE_TIMEOUT"), DefaultServerIdleTimeout.String())
 	}
 	cfg.IdleTimeout = idleTimeout
 
@@ -1353,7 +1421,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if maxHeader < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_SERVER_MAX_HEADER_BYTES must not be negative, got %d", maxHeader)
+		return cfg, configError("NEXUS_SERVER_MAX_HEADER_BYTES", "must not be negative", os.Getenv("NEXUS_SERVER_MAX_HEADER_BYTES"), strconv.Itoa(DefaultServerMaxHeaderBytes))
 	}
 	cfg.MaxHeaderBytes = maxHeader
 
@@ -1381,7 +1449,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if shutdownTimeout < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_SHUTDOWN_TIMEOUT must not be negative, got %s", shutdownTimeout)
+		return cfg, configError("NEXUS_SHUTDOWN_TIMEOUT", "must not be negative", os.Getenv("NEXUS_SHUTDOWN_TIMEOUT"), DefaultShutdownTimeout.String())
 	}
 	if shutdownTimeout == 0 {
 		shutdownTimeout = DefaultShutdownTimeout
@@ -1468,11 +1536,9 @@ func Load() (Config, error) {
 	}
 	cfg.QualityStderrCap = stderrCap
 
-	// Backward-compat alias (issue #924)
-	if v := os.Getenv("NEXUS_QUALITY_DROPED_RING_SIZE"); v != "" {
-		slog.Warn("NEXUS_QUALITY_DROPED_RING_SIZE is deprecated; use NEXUS_QUALITY_DROPPED_RING_SIZE",
-			slog.String("component", "config"))
-	}
+	// Deprecated-key warnings are emitted centrally via the registry
+	// (issue #1180). The #924 alias (NEXUS_QUALITY_DROPED_RING_SIZE)
+	// is tracked there; value parsing still reads the current name.
 	droppedRingSize, err := getEnvInt("NEXUS_QUALITY_DROPPED_RING_SIZE", 256)
 	if err != nil {
 		return cfg, err
@@ -1514,6 +1580,31 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.ModelsCacheTTL = modelsCacheTTL
+
+	// Model aliasing (issue #1184). NEXUS_MODEL_ALIASES is a JSON map
+	// of client-requested model names to "providerName/upstreamModel".
+	// Empty/unset = disabled (backward compatible). Invalid JSON fails
+	// boot so an operator typo does not silently pass models through.
+	if raw := os.Getenv("NEXUS_MODEL_ALIASES"); raw != "" {
+		var aliases map[string]string
+		if err := json.Unmarshal([]byte(raw), &aliases); err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_MODEL_ALIASES: %w", err)
+		}
+		cfg.ModelAliases = aliases
+	}
+	cfg.ModelAliasesStrict = parseBoolEnv("NEXUS_MODEL_ALIASES_STRICT", false)
+
+	// Built-in web dashboard (issue #1182). Disabled by default so a
+	// stock deployment exposes no extra HTTP surface; opt in with
+	// NEXUS_DASHBOARD_ENDPOINT=true. The endpoint path defaults to
+	// /dashboard. NEXUS_DASHBOARD_PUBLIC mirrors NEXUS_STATUS_PUBLIC:
+	// when true the route bypasses the inbound auth gate.
+	cfg.DashboardEndpointEnabled = parseBoolEnv("NEXUS_DASHBOARD_ENDPOINT", false)
+	cfg.DashboardEndpoint = getEnvAllowEmpty("NEXUS_DASHBOARD_PATH", "/dashboard")
+	if cfg.DashboardEndpoint == "" {
+		cfg.DashboardEndpoint = "/dashboard"
+	}
+	cfg.DashboardPublic = parseBoolEnv("NEXUS_DASHBOARD_PUBLIC", false)
 
 	// Prompt-injection hardening (issue #76). Defaults to warn so a
 	// stock deployment logs injection attempts out of the box.
@@ -1632,6 +1723,14 @@ func Load() (Config, error) {
 	}
 	cfg.CascadeMaxResponseBytes = cascadeMaxRespBytes
 
+	// PoolBufferMaxBytes caps retained pooled buffer capacity (issue
+	// #1177). Default 1 MiB; zero or negative disables pooling entirely.
+	poolBufMax, err := getEnvInt("NEXUS_POOL_BUFFER_MAX_BYTES", DefaultPoolBufferMaxBytes)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.PoolBufferMaxBytes = poolBufMax
+
 	// Auth brute-force protection (issue #296). Defaults: RPM 5, burst 3,
 	// window 5 min. When RPM <= 0 the limiter is disabled so a stock
 	// deployment with no NEXUS_AUTH_RATE_LIMIT_RPM is byte-for-byte
@@ -1679,7 +1778,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	if tracingTimeout < 0 {
-		return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT must not be negative, got %s", tracingTimeout)
+		return cfg, configError("NEXUS_TRACING_TIMEOUT", "must not be negative", os.Getenv("NEXUS_TRACING_TIMEOUT"), DefaultTracingTimeout.String())
 	}
 	cfg.TracingTimeout = tracingTimeout
 
@@ -1711,6 +1810,11 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	ValidateShutdownTimeout(cfg)
+
+	// Emit structured warnings for any deprecated env vars that are set
+	// (issue #1180). Advisory only — does not alter parsed values.
+	WarnDeprecatedEnv()
+
 	return cfg, nil
 }
 
@@ -1723,7 +1827,7 @@ func (c Config) Validate() error {
 	case "strict", "degraded":
 		// Recognised values.
 	default:
-		return fmt.Errorf("config: NEXUS_READINESS_MODE value %q is not recognised; want \"strict\" or \"degraded\"", c.ReadinessMode)
+		return configError("NEXUS_READINESS_MODE", `must be "strict" or "degraded"`, c.ReadinessMode, "degraded")
 	}
 	return nil
 }
@@ -1837,6 +1941,12 @@ const DefaultMaxBodyBytes = 1 << 20 // 1 MiB
 // (issue #365). 64 MiB accommodates large frontier completions while
 // preventing memory exhaustion from a malicious upstream.
 const DefaultMaxResponseBytes = 64 << 20 // 64 MiB
+
+// DefaultPoolBufferMaxBytes is the default retention cap for pooled
+// response-body buffers (issue #1177). 1 MiB is generous for typical
+// multi-KiB completions while preventing a single huge response from
+// pinning pool memory. Zero or negative disables pooling entirely.
+const DefaultPoolBufferMaxBytes = 1 << 20 // 1 MiB
 
 // EffectiveMaxBodyBytes returns the request-body cap the chat handler should
 // enforce. Zero or negative values fall back to DefaultMaxBodyBytes so a
@@ -2008,7 +2118,7 @@ func parseTrustedProxies(raw string) ([]*net.IPNet, error) {
 			}
 			continue
 		}
-		return nil, fmt.Errorf("config: invalid NEXUS_TRUSTED_PROXIES entry %q (expected CIDR or IP)", p)
+		return nil, fmt.Errorf("config: invalid NEXUS_TRUSTED_PROXIES entry %q (expected CIDR or IP); see .env.example", p)
 	}
 	return out, nil
 }
@@ -2240,6 +2350,24 @@ func getEnv(key, def string) string {
 	return def
 }
 
+// configError renders an actionable config-validation error (issue #1181).
+// The message bundles the offending env var, a human-readable constraint,
+// the raw value the operator supplied, the safe default, and a pointer to
+// .env.example so the fix is self-evident without reading the source:
+//
+//	config: NEXUS_SERVER_READ_TIMEOUT must not be negative; got "-5s".
+//	        Unset the var to use the default (30s); see .env.example
+//
+// The result is a plain error (not a custom type) so the existing error
+// contract is preserved — callers assert on err != nil or substrings, and
+// wrapping the underlying parse error (%w) keeps errors.Is working.
+func configError(key, constraint, gotValue, defaultStr string) error {
+	return fmt.Errorf(
+		"config: %s %s; got %q. Unset the var to use the default (%s); see .env.example",
+		key, constraint, gotValue, defaultStr,
+	)
+}
+
 // parseInjectionScanRoles canonicalises the comma-separated role list
 // from NEXUS_INJECTION_SCAN_ROLES (issue #481). It lower-cases, trims,
 // deduplicates, and keeps only recognised roles ("system", "user"). An
@@ -2291,7 +2419,7 @@ func getEnvInt(key string, def int) (int, error) {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return 0, fmt.Errorf("config: %s must be an integer: %w", key, err)
+		return 0, configError(key, "must be an integer", v, strconv.Itoa(def))
 	}
 	return n, nil
 }
@@ -2319,7 +2447,7 @@ func getEnvFloat(key string, def float64) (float64, error) {
 	}
 	f, err := strconv.ParseFloat(v, 64)
 	if err != nil {
-		return 0, fmt.Errorf("config: %s must be a number: %w", key, err)
+		return 0, configError(key, "must be a number", v, strconv.FormatFloat(def, 'f', -1, 64))
 	}
 	return f, nil
 }
@@ -2331,7 +2459,7 @@ func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
-		return 0, fmt.Errorf("config: %s must be a duration (e.g. 8s, 2m): %w", key, err)
+		return 0, configError(key, `must be a Go duration string (e.g. "8s", "2m")`, v, def.String())
 	}
 	return d, nil
 }
@@ -2358,7 +2486,7 @@ func getEnvRegexps(key string, defaultPattern string) ([]*regexp.Regexp, error) 
 		}
 		re, err := regexp.Compile(p)
 		if err != nil {
-			return nil, fmt.Errorf("config: %s pattern %q is not a valid regex: %w", key, p, err)
+			return nil, fmt.Errorf("config: %s pattern %q is not a valid regex: %w. Unset the var to restore the built-in default; see .env.example", key, p, err)
 		}
 		result = append(result, re)
 	}
@@ -2422,7 +2550,7 @@ func parseLogLevel(raw string) (slog.Level, error) {
 	case "", "info":
 		return slog.LevelInfo, nil
 	default:
-		return slog.LevelInfo, fmt.Errorf("config: invalid NEXUS_LOG_LEVEL %q", raw)
+		return slog.LevelInfo, fmt.Errorf("config: invalid NEXUS_LOG_LEVEL %q; want debug, info, warn, or error; see .env.example", raw)
 	}
 }
 

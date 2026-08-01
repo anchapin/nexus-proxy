@@ -948,3 +948,154 @@ func TestNewSeededRandDistinct(t *testing.T) {
 		}
 	}
 }
+
+// TestScoreCarriesRAGState confirms that the RAGInjected and
+// RAGSimilarity fields on Sample propagate to the persisted JudgeScore
+// (issue #1167).
+func TestScoreCarriesRAGState(t *testing.T) {
+	fn := rtFunc(func(_ *http.Request) (*http.Response, error) {
+		resp := `{"choices":[{"message":{"content":"5"}}]}`
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(resp)),
+		}, nil
+	})
+	e, store := newTestEvaluator(t, Config{}, fn)
+	defer e.Close()
+
+	s := Sample{
+		RequestID:     "rag-req",
+		Instruction:   "refactor this",
+		Output:        "done",
+		LocalModel:    "qwen3-coder:8b",
+		Route:         "local",
+		RAGInjected:   true,
+		RAGSimilarity: 0.92,
+	}
+	if !e.Enqueue(s) {
+		t.Fatal("Enqueue should accept")
+	}
+	scores := waitForScores(t, store, 1, 2*time.Second)
+	if len(scores) != 1 {
+		t.Fatalf("got %d scores, want 1", len(scores))
+	}
+	got := scores[0]
+	if !got.RAGInjected {
+		t.Error("JudgeScore.RAGInjected = false, want true")
+	}
+	if got.RAGSimilarity != 0.92 {
+		t.Errorf("JudgeScore.RAGSimilarity = %v, want 0.92", got.RAGSimilarity)
+	}
+}
+
+// TestScoreRAGStateDefaultsFalse confirms non-RAG samples carry
+// RAGInjected=false and RAGSimilarity=0 (issue #1167).
+func TestScoreRAGStateDefaultsFalse(t *testing.T) {
+	fn := rtFunc(func(_ *http.Request) (*http.Response, error) {
+		resp := `{"choices":[{"message":{"content":"3"}}]}`
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(resp)),
+		}, nil
+	})
+	e, store := newTestEvaluator(t, Config{}, fn)
+	defer e.Close()
+
+	s := Sample{
+		RequestID:   "plain-req",
+		Instruction: "hello",
+		Output:      "world",
+	}
+	if !e.Enqueue(s) {
+		t.Fatal("Enqueue should accept")
+	}
+	scores := waitForScores(t, store, 1, 2*time.Second)
+	if len(scores) != 1 {
+		t.Fatalf("got %d scores, want 1", len(scores))
+	}
+	got := scores[0]
+	if got.RAGInjected {
+		t.Error("JudgeScore.RAGInjected = true, want false")
+	}
+	if got.RAGSimilarity != 0 {
+		t.Errorf("JudgeScore.RAGSimilarity = %v, want 0", got.RAGSimilarity)
+	}
+}
+
+// TestScoreCallbackFires confirms that the onScore callback registered
+// via SetScoreCallback is invoked with the resulting JudgeScore after
+// each evaluation, including RAG state (issue #1167).
+func TestScoreCallbackFires(t *testing.T) {
+	fn := rtFunc(func(_ *http.Request) (*http.Response, error) {
+		resp := `{"choices":[{"message":{"content":"4"}}]}`
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(resp)),
+		}, nil
+	})
+	e, store := newTestEvaluator(t, Config{}, fn)
+	defer e.Close()
+
+	var (
+		cbMu     sync.Mutex
+		cbScores []JudgeScore
+	)
+	e.SetScoreCallback(func(s JudgeScore) {
+		cbMu.Lock()
+		cbScores = append(cbScores, s)
+		cbMu.Unlock()
+	})
+
+	s := Sample{
+		RequestID:     "cb-req",
+		Instruction:   "test",
+		Output:        "output",
+		RAGInjected:   true,
+		RAGSimilarity: 0.88,
+	}
+	if !e.Enqueue(s) {
+		t.Fatal("Enqueue should accept")
+	}
+	// Wait for storage to confirm the worker ran.
+	_ = waitForScores(t, store, 1, 2*time.Second)
+
+	cbMu.Lock()
+	defer cbMu.Unlock()
+	if len(cbScores) != 1 {
+		t.Fatalf("callback fired %d times, want 1", len(cbScores))
+	}
+	got := cbScores[0]
+	if got.Score != 4 {
+		t.Errorf("callback score = %d, want 4", got.Score)
+	}
+	if !got.RAGInjected {
+		t.Error("callback JudgeScore.RAGInjected = false, want true")
+	}
+}
+
+// TestScoreCallbackNilSafe confirms a nil callback (the default) does
+// not panic (issue #1167).
+func TestScoreCallbackNilSafe(t *testing.T) {
+	fn := rtFunc(func(_ *http.Request) (*http.Response, error) {
+		resp := `{"choices":[{"message":{"content":"2"}}]}`
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(resp)),
+		}, nil
+	})
+	e, store := newTestEvaluator(t, Config{}, fn)
+	defer e.Close()
+	// Do NOT call SetScoreCallback — onScore stays nil.
+
+	if !e.Enqueue(Sample{RequestID: "nil-cb", Instruction: "x", Output: "y"}) {
+		t.Fatal("Enqueue should accept")
+	}
+	scores := waitForScores(t, store, 1, 2*time.Second)
+	if len(scores) != 1 {
+		t.Fatalf("got %d scores, want 1 (callback should not interfere)", len(scores))
+	}
+}

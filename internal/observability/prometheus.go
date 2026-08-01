@@ -493,6 +493,23 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 		"Total LocalConfidence errors in the planner where the SQLite confidence store returned an error (DB locked, query failed, etc.).",
 		c.ConfidenceErrors())
 
+	// RAG-vs-judge quality correlation (issue #1167). Sum and count of
+	// judge scores partitioned by whether RAG context was injected.
+	// Operators compute avg = sum/count per label to measure retrieval
+	// effectiveness.
+	writeMeta(w, "nexus_rag_judge_score_sum",
+		"Cumulative judge quality score sum partitioned by RAG injection (issue #1167). Compute avg via nexus_rag_judge_score_sum / nexus_rag_judge_score_count.", "counter")
+	//nolint:errcheck // ResponseWriter error cannot be handled after headers committed.
+	fmt.Fprintf(w, "nexus_rag_judge_score_sum{injected=\"true\"} %s\n", formatFloat(c.RAGJudgeScoreSum(true)))
+	//nolint:errcheck // ResponseWriter error cannot be handled after headers committed.
+	fmt.Fprintf(w, "nexus_rag_judge_score_sum{injected=\"false\"} %s\n", formatFloat(c.RAGJudgeScoreSum(false)))
+	writeCounterLabeled(w, "nexus_rag_judge_score_count",
+		"Count of judge quality scores partitioned by RAG injection (issue #1167).",
+		"injected", []labelSample{
+			{value: "true", n: c.RAGJudgeScoreCount(true)},
+			{value: "false", n: c.RAGJudgeScoreCount(false)},
+		})
+
 	// --- Histograms -----------------------------------------------------
 
 	writeHistogramLabeled(w, "nexus_request_duration_ms",
