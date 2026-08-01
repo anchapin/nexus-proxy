@@ -228,6 +228,15 @@ type YAMLConfig struct {
 	// SSRF egress guard (issue #1174)
 	EgressGuardEnabled bool   `yaml:"egress_block_private"`
 	EgressAllowCIDRs   string `yaml:"egress_allow"`
+
+	// Secret management (issue #1173)
+	SecretBackend string `yaml:"secret_backend"`
+	VaultAddr     string `yaml:"vault_addr"`
+	VaultToken    string `yaml:"vault_token"`
+	VaultRole     string `yaml:"vault_role"`
+	VaultPath     string `yaml:"vault_path"`
+	AWSSMPrefix   string `yaml:"awssm_prefix"`
+	SecretRefresh string `yaml:"secret_refresh"`
 }
 
 // LoadYAML reads configuration from a YAML file at path, then overlays
@@ -1242,6 +1251,33 @@ func LoadYAML(path string) (Config, error) {
 		cfg.EgressAllowCIDRs = v
 	}
 
+	// Secret-manager backend (issue #1173). Env overrides YAML.
+	if v := os.Getenv("NEXUS_SECRET_BACKEND"); v != "" {
+		cfg.SecretBackend = v
+	}
+	if v := os.Getenv("NEXUS_VAULT_ADDR"); v != "" {
+		cfg.VaultAddr = v
+	}
+	if v := os.Getenv("NEXUS_VAULT_TOKEN"); v != "" {
+		cfg.VaultToken = v
+	}
+	if v := os.Getenv("NEXUS_VAULT_ROLE"); v != "" {
+		cfg.VaultRole = v
+	}
+	if v := os.Getenv("NEXUS_VAULT_PATH"); v != "" {
+		cfg.VaultPath = v
+	}
+	if v := os.Getenv("NEXUS_AWSSM_PREFIX"); v != "" {
+		cfg.AWSSMPrefix = v
+	}
+	if v := os.Getenv("NEXUS_SECRET_REFRESH"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_SECRET_REFRESH: %w", err)
+		}
+		cfg.SecretRefresh = d
+	}
+
 	ValidateShutdownTimeout(cfg)
 
 	// Emit structured warnings for deprecated env vars and YAML keys
@@ -1432,6 +1468,14 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		// deployment is protected out of the box.
 		EgressGuardEnabled: true,
 		EgressAllowCIDRs:   yc.EgressAllowCIDRs,
+
+		SecretBackend: yc.stringDefault(yc.SecretBackend, "env"),
+		VaultAddr:     yc.VaultAddr,
+		VaultToken:    yc.VaultToken,
+		VaultRole:     yc.VaultRole,
+		VaultPath:     yc.stringDefault(yc.VaultPath, "secret"),
+		AWSSMPrefix:   yc.AWSSMPrefix,
+		SecretRefresh: yc.durationDefault(yc.SecretRefresh, 0),
 	}
 
 	// Warn if yaml had unrecognized injection scan roles (issue #845)

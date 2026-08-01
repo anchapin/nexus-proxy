@@ -27,6 +27,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/probe"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
+	"github.com/anchapin/nexus-proxy/internal/secrets"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
 )
 
@@ -75,6 +76,54 @@ func main() {
 		// log.Fatalf path. This is one of two unrecoverable boot
 		// errors (issue #3).
 		log.Fatalf("config: %v", err)
+	}
+
+	// External secret-manager resolution (issue #1173). When a non-env
+	// backend is configured, resolve API keys from Vault / AWS SM before
+	// proceeding. Fail-closed: unreachable backend aborts boot.
+	if cfg.SecretBackend != "" && cfg.SecretBackend != "env" {
+		resolver, err := secrets.NewResolver(secrets.BackendConfig{
+			Backend:     cfg.SecretBackend,
+			VaultAddr:   cfg.VaultAddr,
+			VaultToken:  cfg.VaultToken,
+			VaultRole:   cfg.VaultRole,
+			VaultPath:   cfg.VaultPath,
+			AWSSMPrefix: cfg.AWSSMPrefix,
+		})
+		if err != nil {
+			log.Fatalf("secrets: %v", err)
+		}
+		store := secrets.NewSecretStore(resolver)
+		if err := store.Populate(); err != nil {
+			log.Fatalf("secrets: %v", err)
+		}
+		// Override env-sourced credentials with resolver values. A resolver
+		// value of "" (not found in external store, not in env) is left as-is.
+		if v := store.Get("NEXUS_FRONTIER_API_KEY"); v != "" {
+			cfg.FrontierKey = v
+		}
+		if v := store.Get("NEXUS_ZAI_API_KEY"); v != "" {
+			cfg.ZAIKey = v
+		}
+		if v := store.Get("NEXUS_PROXY_API_KEY"); v != "" {
+			cfg.ProxyAPIKey = v
+		}
+		if v := store.Get("NEXUS_JUDGE_API_KEY"); v != "" {
+			cfg.JudgeAPIKey = v
+		}
+		if v := store.Get("NEXUS_COHERE_API_KEY"); v != "" {
+			cfg.CohereAPIKey = v
+		}
+		// Start periodic refresh if configured (issue #1173 acceptance criterion).
+		if cfg.SecretRefresh > 0 {
+			slog.Info("secret refresh enabled",
+				slog.String("component", "secrets"),
+				slog.Duration("interval", cfg.SecretRefresh),
+			)
+			cancel := store.StartRefresh(cfg.SecretRefresh)
+			defer cancel()
+		}
+		defer store.Close()
 	}
 	logger := cfg.NewLogger()
 	slog.SetDefault(logger)
