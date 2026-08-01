@@ -14,7 +14,7 @@ LINT        ?= golangci-lint
 VERSION     ?= dev
 LDFLAGS     := -s -w -X main.version=$(VERSION)
 
-.PHONY: help build run test test-race bench bench-short bench-baseline vet fmt lint tidy ci clean docker-build install-hooks release release-snapshot
+.PHONY: help build run test test-race bench bench-short bench-baseline vet fmt lint tidy ci clean docker-build install-hooks release release-snapshot check-rules
 
 help:
 	@echo "Targets:"
@@ -35,6 +35,7 @@ help:
 	@echo "  install-hooks - install git pre-commit hook (gofmt check)"
 	@echo "  release     - run goreleaser release (requires tag + secrets)"
 	@echo "  release-snapshot - dry-run goreleaser locally (no upload)"
+	@echo "  check-rules - validate Prometheus rule files with promtool (issue #1151)"
 
 build:
 	@mkdir -p bin
@@ -122,3 +123,20 @@ release:
 
 release-snapshot:
 	$(GORELEASER) release --snapshot --clean
+
+# check-rules validates the shipped Prometheus alerting and recording
+# rule files with promtool (issue #1151). promtool is the canonical
+# validator; if it is not on PATH the target prints install instructions
+# and exits non-zero so CI fails loudly rather than silently skipping.
+PROMTOOL ?= $(shell command -v promtool 2>/dev/null)
+RULE_FILES := deploy/prometheus/recording-rules.yaml deploy/prometheus/alerts.yaml
+
+check-rules:
+ifeq ($(PROMTOOL),)
+	@echo "promtool not found on PATH." >&2
+	@echo "Install it from https://prometheus.io/docs/prometheus/latest/installation/ or:" >&2
+	@echo "  cd /tmp && curl -sL https://github.com/prometheus/prometheus/releases/latest/download/prometheus-\$$(uname -s | tr A-Z a-z)-amd64.tar.gz | tar xz" >&2
+	@exit 1
+else
+	$(PROMTOOL) check rules $(RULE_FILES)
+endif

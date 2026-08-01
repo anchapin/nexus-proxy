@@ -1,0 +1,98 @@
+# Prometheus recording rules for nexus-proxy.
+#
+# These rules precompute the most common high-cardinality or frequently
+# charted expressions so dashboards and alerting rules can reference a
+# single named series instead of re-evaluating a complex PromQL query on
+# every scrape / evaluation cycle. Load this file (and alerts.yaml) into
+# Prometheus via the `rule_files` list in prometheus.yml:
+#
+#   rule_files:
+#     - /etc/prometheus/nexus-recording-rules.yaml
+#     - /etc/prometheus/nexus-alerts.yaml
+#
+# See docs/alerting.md for the full load path, validation instructions
+# (`make check-rules`), and per-rule rationale.
+#
+# Rule group interval: nexus-proxy scrapes are typically 15-30s. A 30s
+# evaluation interval keeps recording rules fresh without burning CPU on
+# a busy Prometheus.
+groups:
+  - name: nexus-recording.rules
+    interval: 30s
+    rules:
+      # ----------------------------------------------------------------------
+      # nexus:error_rate5m
+      # ----------------------------------------------------------------------
+      # rationale: A request is considered "errored" on the local route when
+      # the cascade has to fall back to frontier — that is the proxy's own
+      # authoritative signal that the local arm failed (timeout, transport
+      # error, malformed response, etc.). Rejections (4xx) are intentionally
+      # excluded because they represent client-side mistakes, not proxy
+      # failures. The denominator is the local route decision counter, which
+      # is the population at risk for a cascade fallback. The ratio is
+      # recorded per route so the alerting rule and dashboards can break the
+      # error rate down by local/frontier/fusion rather than averaging away
+      # a local-only regression.
+      - record: nexus:error_rate5m
+        expr: |
+          sum by (route) (rate(nexus_cascade_fallback_total[5m]))
+            / clamp_min(sum by (route) (rate(nexus_route_decisions_total[5m])), 1)
+
+      # ----------------------------------------------------------------------
+      # nexus:request_latency_p99_5m
+      # ----------------------------------------------------------------------
+      # rationale: nexus_upstream_request_latency_p99_seconds is a gauge
+      # recomputed from a sliding-window ring buffer on every scrape, so a
+      # single scrape can be noisy. Averaging over a 5m window smooths the
+      # one-off spikes (GC pause, slow batch) without hiding a sustained
+      # regression, giving the SLO alert a stable input. Recorded per route
+      # so the same series feeds both the dashboard panel and the
+      # NexusSLOp99Breach alert. Values are in seconds (Prometheus latency
+      # convention).
+      - record: nexus:request_latency_p99_5m
+        expr: avg_over_time(nexus_upstream_request_latency_p99_seconds[5m])
+
+      # ----------------------------------------------------------------------
+      # nexus:budget_utilization_ratio
+      # ----------------------------------------------------------------------
+      # rationale: The proxy exposes the rolling 24h spend as
+      # nexus_budget_spend_usd but does NOT expose the configured daily cap
+      # as its own metric (the cap is a static config value, not a runtime
+      # signal). This rule divides spend by a cap constant. Operators MUST
+      # edit NEXUS_BUDGET_DAILY_CAP_USD below to match their configured
+      # NEXUS_BUDGET_ALERT_THRESHOLD before relying on the
+      # NexusBudgetApproaching alert or this series. The default of 10.0 is
+      # a placeholder chosen to be obviously wrong for most deployments so a
+      # forgotten edit surfaces as a noisy-but-harmless alert rather than a
+      # silent gap. clamp_min on the denominator guards against a divide-by
+      # -zero if spend is somehow 0/absent.
+      - record: nexus:budget_utilization_ratio
+        expr: nexus_budget_spend_usd / 10.0
+        # ^ NEXUS_BUDGET_DAILY_CAP_USD — edit to match your deployment.
+
+      # ----------------------------------------------------------------------
+      # nexus:local_cooldown_fraction_30m
+      # ----------------------------------------------------------------------
+      # rationale: nexus_local_cooldown_active is a 0/1 gauge. Averaging it
+      # over 30m yields the fraction of that window the cooldown was armed —
+      # 0.5 means half the last half-hour was spent bypassing the local arm.
+      # This is a richer signal than the raw gauge for diagnosing flapping
+      # Ollama instances (many short cooldowns vs. one stuck cooldown) and
+      # feeds a secondary dashboard panel. The cooldown gauge is absent from
+      # /metrics when NEXUS_LOCAL_COOLDOWN<=0 (disabled); in that case this
+      # rule produces no series, which is the correct "no data" outcome.
+      - record: nexus:local_cooldown_fraction_30m
+        expr: avg_over_time(nexus_local_cooldown_active[30m])
+
+      # ----------------------------------------------------------------------
+      # nexus:cascade_fallback_rate5m
+      # ----------------------------------------------------------------------
+      # rationale: Cascade fallbacks are the leading indicator of local-arm
+      # trouble. Recording the per-reason rate (not just the total) lets
+      # dashboards show a stacked breakdown of timeout vs. transport_error
+      # vs. http_error without each panel re-running the rate() — useful
+      # during incident triage when Prometheus is already under load. Pairs
+      # with the NexusHighErrorRate alert, which keys off the route
+      # aggregation rather than the per-reason breakdown.
+      - record: nexus:cascade_fallback_rate5m
+        expr: sum by (reason) (rate(nexus_cascade_fallback_total[5m]))
