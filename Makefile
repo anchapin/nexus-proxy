@@ -14,7 +14,7 @@ LINT        ?= golangci-lint
 VERSION     ?= dev
 LDFLAGS     := -s -w -X main.version=$(VERSION)
 
-.PHONY: help build run test test-race bench bench-short vet fmt lint tidy ci clean docker-build install-hooks
+.PHONY: help build run test test-race bench bench-short bench-baseline vet fmt lint tidy ci clean docker-build install-hooks
 
 help:
 	@echo "Targets:"
@@ -24,6 +24,7 @@ help:
 	@echo "  test-race   - run unit tests with -race"
 	@echo "  bench       - run all benchmarks with -benchmem -count=5"
 	@echo "  bench-short - run benchmarks with -benchtime=100ms for CI"
+	@echo "  bench-baseline - regenerate bench/paseline.txt for benchstat (issue #1186)"
 	@echo "  vet         - go vet"
 	@echo "  fmt         - gofmt -w (writes in place)"
 	@echo "  lint        - golangci-lint run"
@@ -61,6 +62,13 @@ bench:
 
 bench-short:
 	$(GO) test -run='^$$' -bench=. -benchmem -benchtime=100ms $(BENCH_PACKAGES)
+
+# bench-baseline regenerates the stored baseline used by CI benchstat
+# regression detection (issue #1186). Run on develop after hot-path
+# changes, then commit bench/baseline.txt. Uses -count=10 for tighter
+# statistical confidence and -benchtime=100ms to keep runtime manageable.
+bench-baseline:
+	$(GO) test -run='^$$' -bench=. -benchmem -count=10 -benchtime=100ms $(BENCH_PACKAGES) > bench/baseline.txt
 
 vet:
 	$(GO) vet $(PKG)

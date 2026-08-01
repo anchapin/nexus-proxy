@@ -17,6 +17,7 @@ make test           # unit tests
 make test-race      # race detector — required to merge
 make lint           # golangci-lint v2.12.2
 make fmt            # gofmt -w (in place)
+make bench-baseline # regenerate bench/baseline.txt for benchstat (issue #1186)
 make ci             # vet + build + test + test-race + lint + bench-short
 ```
 
@@ -25,10 +26,12 @@ make ci             # vet + build + test + test-race + lint + bench-short
 **Coverage floor is 70%** — CI fails if total drops below `COVERAGE_THRESHOLD`.
 Per-package numbers print for visibility; only the total gates.
 
-**CI runs four jobs** (`.github/workflows/ci.yml`): `test` (vet → build →
+**CI runs five jobs** (`.github/workflows/ci.yml`): `test` (vet → build →
 `go test -race -coverprofile=coverage.txt -covermode=atomic ./...` + coverage
 gate), `bench` (non-blocking `bench-short`, `continue-on-error: true`),
-`lint` (`golangci-lint-action@v9`, golangci-lint **v2.12.2**), and `docker`
+`bench-regression` (benchstat comparison against `bench/baseline.txt`, posts
+PR comment, `continue-on-error: true` — issue #1186), `lint`
+(`golangci-lint-action@v9`, golangci-lint **v2.12.2**), and `docker`
 (smoke `make docker-build` — catches Dockerfile↔go.mod Go-version drift,
 issue #541). `make ci` is a local convenience wrapper; CI does not invoke it.
 
