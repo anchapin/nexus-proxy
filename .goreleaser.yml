@@ -1,0 +1,118 @@
+# GoReleaser configuration (issue #1179).
+#
+# Produces cross-compiled archives + checksums and auto-publishes a
+# Homebrew formula to anchapin/homebrew-nexus on every tagged release,
+# enabling `brew install anchapin/nexus/nexus` for macOS users.
+#
+# The existing release.yml pipeline (cross-compile, SBOM, SLSA, cosign)
+# remains the primary build path.  GoReleaser runs as a dedicated
+# `homebrew-tap` job that builds the darwin/arm64 + darwin/amd64 +
+# linux archives and pushes the generated formula to the tap repo.
+#
+# Validate locally:
+#   goreleaser check
+#   goreleaser release --snapshot --clean
+
+version: 2
+
+project_name: nexus
+
+# ── Pre-build hooks ──────────────────────────────────────────────
+# Run the test suite before packaging so a failing test blocks every
+# downstream artifact (mirrors the release.yml prereq gate).
+before:
+  hooks:
+    - go mod tidy
+
+# ── Build matrix ─────────────────────────────────────────────────
+# CGO-free (pure-Go deps) so cross-compilation is trivial.
+# Version is injected via -ldflags, matching the Makefile convention.
+builds:
+  - id: nexus
+    main: ./cmd/nexus
+    binary: nexus
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.ShortCommit}} -X main.date={{.Date}}
+
+# ── Archives ─────────────────────────────────────────────────────
+archives:
+  - id: nexus
+    ids: [nexus]
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "arm64" }}arm64
+      {{- end }}
+
+# ── Checksums ────────────────────────────────────────────────────
+# sha256 is automatically wired into the generated Homebrew formula.
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# ── Changelog ────────────────────────────────────────────────────
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"
+
+# ── Homebrew tap ─────────────────────────────────────────────────
+# On each release GoReleaser generates Formula/nexus.rb with the
+# correct url + sha256 and pushes it to the tap repository.
+# macOS users then install with:
+#   brew tap anchapin/nexus
+#   brew install nexus
+# or equivalently:
+#   brew install anchapin/nexus/nexus
+brews:
+  - name: nexus
+    ids: [nexus]
+    repository:
+      owner: anchapin
+      name: homebrew-nexus
+      branch: main
+      # Use a separate PAT so the formula push does not trigger
+      # downstream GitHub Actions runs on the tap repo.
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    commit_author:
+      name: github-actions[bot]
+      email: 41898282+github-actions[bot]@users.noreply.github.com
+    commit_msg_template: "Brew formula update for {{ .ProjectName }} {{ .Tag }}"
+    homepage: https://github.com/anchapin/nexus-proxy
+    description: "Hardware-aware AI routing gateway — intercepts OpenAI-compatible requests and routes to local Ollama or frontier APIs."
+    license: MIT
+    skip_upload: "{{ .Env.SKIP_BREW_UPLOAD }}"
+    url_template: "https://github.com/anchapin/nexus-proxy/releases/download/{{ .Tag }}/{{ .ArtifactName }}"
+    # Minimal install — single static binary.
+    install: |
+      bin.install "nexus"
+    test: |
+      system "#{bin}/nexus", "--version"
+    # Caveats shown after install.
+    caveats: |
+      nexus is now installed! To start the proxy:
+
+        nexus
+
+      Or run the boot-time diagnostic suite:
+
+        nexus check
+
+      Documentation: https://github.com/anchapin/nexus-proxy#readme
