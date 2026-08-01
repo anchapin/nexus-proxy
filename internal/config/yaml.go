@@ -197,6 +197,9 @@ type YAMLConfig struct {
 	TracingQueueSize  int     `yaml:"tracing_queue_size"`
 	TracingBatchSize  int     `yaml:"tracing_batch_size"`
 	TracingSampleRate float64 `yaml:"tracing_sample_rate"`
+
+	// Metrics exemplars (issue #1171)
+	MetricsExemplars *bool `yaml:"metrics_exemplars"`
 }
 
 // LoadYAML reads configuration from a YAML file at path, then overlays
@@ -1118,6 +1121,16 @@ func LoadYAML(path string) (Config, error) {
 		cfg.TracingSampleRate = f
 	}
 
+	// Metrics exemplars (issue #1171). Env overrides YAML; default is
+	// true when tracing endpoint is set, false otherwise.
+	if v := os.Getenv("NEXUS_METRICS_EXEMPLARS"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_METRICS_EXEMPLARS: %w", err)
+		}
+		cfg.MetricsExemplars = b
+	}
+
 	ValidateShutdownTimeout(cfg)
 	return cfg, nil
 }
@@ -1282,6 +1295,16 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		TracingQueueSize:  yc.intDefault(yc.TracingQueueSize, 256),
 		TracingBatchSize:  yc.intDefault(yc.TracingBatchSize, 64),
 		TracingSampleRate: yc.floatDefault(yc.TracingSampleRate, 1.0),
+	}
+
+	// Metrics exemplars (issue #1171). YAML pointer (nil = use env default);
+	// when set in YAML, use that value. When nil, fall through to Load()
+	// logic (true if tracing endpoint is set).
+	tracingEndpoint := cfg.TracingEndpoint
+	if yc.MetricsExemplars != nil {
+		cfg.MetricsExemplars = *yc.MetricsExemplars
+	} else {
+		cfg.MetricsExemplars = tracingEndpoint != ""
 	}
 
 	// Warn if yaml had unrecognized injection scan roles (issue #845)

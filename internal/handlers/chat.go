@@ -70,6 +70,11 @@ type LatencyEvent struct {
 	LatencySeconds float64
 	TTFTSeconds    float64
 	IsError        bool
+
+	// Trace context for exemplar attachment (issue #1171). Populated
+	// from the root span; empty when tracing is not active.
+	TraceID string
+	SpanID  string
 }
 
 // LatencyObserver is called after each request completes with timing
@@ -103,6 +108,10 @@ type PipelineStageEvent struct {
 	// SLM confidence for histogram recording (issue #425).
 	SLMConfidence float64
 	SLMTaskType   string
+
+	// Trace context for exemplar attachment (issue #1171).
+	TraceID string
+	SpanID  string
 }
 
 // PipelineStageObserver is called after each request completes with
@@ -2005,6 +2014,13 @@ func Chat(d Deps) http.Handler {
 		// LatencyObserver (issue #165): fired after the upstream response
 		// completes so callers can record end-to-end latency histograms.
 		// ttftMs is already computed above; convert to float64 seconds.
+		// Trace context (issue #1171): extract from root span so the
+		// collector can attach exemplars to histogram buckets.
+		var traceID, spanID string
+		if rs, ok := tracing.RootSpanFromContext(r.Context()); ok {
+			traceID = rs.TraceID
+			spanID = rs.SpanID
+		}
 		if d.LatencyObserver != nil {
 			var ttftSecs float64
 			if ttftMs > 0 {
@@ -2019,6 +2035,8 @@ func Chat(d Deps) http.Handler {
 				LatencySeconds: totalMs / 1000.0,
 				TTFTSeconds:    ttftSecs,
 				IsError:        isErr,
+				TraceID:        traceID,
+				SpanID:         spanID,
 			})
 		}
 
@@ -2035,6 +2053,8 @@ func Chat(d Deps) http.Handler {
 				UpstreamFirstByteMs: ttftMs,
 				SLMConfidence:       decision.Confidence,
 				SLMTaskType:         decision.TaskType,
+				TraceID:             traceID,
+				SpanID:              spanID,
 			})
 		}
 
