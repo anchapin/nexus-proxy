@@ -155,15 +155,16 @@ type YAMLConfig struct {
 	LocalCooldown         string `yaml:"local_cooldown"`
 
 	// Judge
-	JudgeURL          string  `yaml:"judge_url"`
-	JudgeModel        string  `yaml:"judge_model"`
-	JudgeAPIKey       string  `yaml:"judge_api_key"`
-	JudgeSampleRate   float64 `yaml:"judge_sample_rate"`
-	JudgeConcurrency  int     `yaml:"judge_concurrency"`
-	JudgeQueueDepth   int     `yaml:"judge_queue"`
-	JudgeTimeout      string  `yaml:"judge_timeout"`
-	JudgeCostPer1KUSD float64 `yaml:"judge_cost_per_1k"`
-	JudgeDBPath       string  `yaml:"judge_db_path"`
+	JudgeURL                string  `yaml:"judge_url"`
+	JudgeModel              string  `yaml:"judge_model"`
+	JudgeAPIKey             string  `yaml:"judge_api_key"`
+	JudgeSampleRate         float64 `yaml:"judge_sample_rate"`
+	JudgeFrontierSampleRate float64 `yaml:"judge_frontier_sample_rate"`
+	JudgeConcurrency        int     `yaml:"judge_concurrency"`
+	JudgeQueueDepth         int     `yaml:"judge_queue"`
+	JudgeTimeout            string  `yaml:"judge_timeout"`
+	JudgeCostPer1KUSD       float64 `yaml:"judge_cost_per_1k"`
+	JudgeDBPath             string  `yaml:"judge_db_path"`
 
 	// Routing confidence
 	RoutingConfidenceDB         string  `yaml:"routing_confidence_db"`
@@ -996,6 +997,13 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.JudgeSampleRate = f
 	}
+	if v := os.Getenv("NEXUS_JUDGE_FRONTIER_SAMPLE_RATE"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_JUDGE_FRONTIER_SAMPLE_RATE: %w", err)
+		}
+		cfg.JudgeFrontierSampleRate = f
+	}
 	if v := os.Getenv("NEXUS_JUDGE_CONCURRENCY"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
@@ -1495,15 +1503,16 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		DSLPromotionConfidence: clampFloat(yc.floatDefault(yc.DSLPromotionConfidence, 0.90), 0, 1),
 		DSLPromotionInterval:   yc.durationDefault(yc.DSLPromotionInterval, time.Hour),
 
-		JudgeURL:          yc.stringDefault(yc.JudgeURL, "https://api.z.ai/v1/chat/completions"),
-		JudgeModel:        yc.stringDefault(yc.JudgeModel, ""), // Falls back to FrontierModel later
-		JudgeAPIKey:       yc.JudgeAPIKey,
-		JudgeSampleRate:   yc.floatDefault(yc.JudgeSampleRate, 0.1),
-		JudgeConcurrency:  yc.intDefault(yc.JudgeConcurrency, 2),
-		JudgeQueueDepth:   yc.intDefault(yc.JudgeQueueDepth, 64),
-		JudgeTimeout:      yc.durationDefault(yc.JudgeTimeout, 30*time.Second),
-		JudgeCostPer1KUSD: yc.floatDefault(yc.JudgeCostPer1KUSD, 0.002),
-		JudgeDBPath:       yc.stringDefault(yc.JudgeDBPath, DefaultJudgeDBPath()),
+		JudgeURL:                yc.stringDefault(yc.JudgeURL, "https://api.z.ai/v1/chat/completions"),
+		JudgeModel:              yc.stringDefault(yc.JudgeModel, ""), // Falls back to FrontierModel later
+		JudgeAPIKey:             yc.JudgeAPIKey,
+		JudgeSampleRate:         yc.floatDefault(yc.JudgeSampleRate, 0.1),
+		JudgeFrontierSampleRate: yc.floatDefault(yc.JudgeFrontierSampleRate, 0.02),
+		JudgeConcurrency:        yc.intDefault(yc.JudgeConcurrency, 2),
+		JudgeQueueDepth:         yc.intDefault(yc.JudgeQueueDepth, 64),
+		JudgeTimeout:            yc.durationDefault(yc.JudgeTimeout, 30*time.Second),
+		JudgeCostPer1KUSD:       yc.floatDefault(yc.JudgeCostPer1KUSD, 0.002),
+		JudgeDBPath:             yc.stringDefault(yc.JudgeDBPath, DefaultJudgeDBPath()),
 
 		RoutingConfidenceDB:         yc.stringDefault(yc.RoutingConfidenceDB, DefaultRoutingConfidenceDBPath()),
 		RoutingConfidenceFloor:      clampFloat(yc.floatDefault(yc.RoutingConfidenceFloor, 0.4), 0, 1),

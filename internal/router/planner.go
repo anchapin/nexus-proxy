@@ -457,7 +457,9 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	if p.SLMCache != nil {
 		if cached, hit, hitKind := p.SLMCache.Get(req.Context, req.Prompt); hit {
 			if p.Confidence != nil {
-				if conf, err := p.Confidence.LocalConfidence(category); err != nil {
+				// Use comparative confidence when available (issue #1162)
+				// so the hard-override below sees the local fraction.
+				if conf, _, err := p.Confidence.ComparativeConfidence(category); err != nil {
 					slog.Warn("planner: confidence lookup",
 						slog.String("category", category),
 						slog.Any("err", err),
@@ -500,18 +502,37 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	}
 
 	if p.Confidence != nil {
-		if conf, err := p.Confidence.LocalConfidence(category); err != nil {
-			slog.Warn("planner: confidence lookup",
-				slog.String("category", category),
-				slog.Any("err", err),
-			)
-			if p.ConfidenceErrorHook != nil {
-				p.ConfidenceErrorHook(category, err)
+		// Try comparative confidence first (issue #1162). When the store
+		// and SLM both support it, pass both local and frontier signals.
+		// This lets the SLM suggest fusion when both models struggle.
+		if cmpSLM, ok := p.SLM.(ComparativeSLMDecider); ok {
+			lConf, fConf, cerr := p.Confidence.ComparativeConfidence(category)
+			if cerr != nil {
+				slog.Warn("planner: comparative confidence lookup",
+					slog.String("category", category),
+					slog.Any("err", cerr),
+				)
+				if p.ConfidenceErrorHook != nil {
+					p.ConfidenceErrorHook(category, cerr)
+				}
+			} else {
+				confidence = lConf
 			}
+			dec, err = cmpSLM.DecideWithComparativeConfidence(req.Context, req.Prompt, lConf, fConf)
 		} else {
-			confidence = conf
+			if conf, cerr := p.Confidence.LocalConfidence(category); cerr != nil {
+				slog.Warn("planner: confidence lookup",
+					slog.String("category", category),
+					slog.Any("err", cerr),
+				)
+				if p.ConfidenceErrorHook != nil {
+					p.ConfidenceErrorHook(category, cerr)
+				}
+			} else {
+				confidence = conf
+			}
+			dec, err = p.SLM.DecideWithConfidence(req.Context, req.Prompt, confidence)
 		}
-		dec, err = p.SLM.DecideWithConfidence(req.Context, req.Prompt, confidence)
 	} else {
 		dec, err = p.SLM.Decide(req.Context, req.Prompt)
 	}

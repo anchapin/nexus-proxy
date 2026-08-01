@@ -535,6 +535,54 @@ func TestSampleRateDistribution(t *testing.T) {
 	}
 }
 
+// TestSampleFrontierRateDisabled verifies that SampleFrontier returns false
+// when FrontierSampleRate is 0 (issue #1162).
+func TestSampleFrontierRateDisabled(t *testing.T) {
+	e := NewEvaluator(Config{SampleRate: 0.1}, nil, nil)
+	defer e.Close()
+	for i := 0; i < 100; i++ {
+		if e.SampleFrontier() {
+			t.Fatal("SampleFrontier() should always be false when FrontierSampleRate is 0")
+		}
+	}
+}
+
+// TestSampleFrontierRateDistribution verifies the frontier sample rate
+// produces the expected fraction of hits (issue #1162).
+func TestSampleFrontierRateDistribution(t *testing.T) {
+	const (
+		rate  = 0.02
+		tries = 10000
+	)
+	e := NewEvaluator(Config{SampleRate: 0.1, FrontierSampleRate: rate}, nil, nil)
+	defer e.Close()
+	hits := 0
+	for i := 0; i < tries; i++ {
+		if e.SampleFrontier() {
+			hits++
+		}
+	}
+	frac := float64(hits) / float64(tries)
+	if frac < rate-0.01 || frac > rate+0.01 {
+		t.Errorf("frontier sample fraction %.4f, want ~%.4f", frac, rate)
+	}
+	if got := e.FrontierSampled(); got != uint64(hits) {
+		t.Errorf("FrontierSampled = %d, want %d", got, hits)
+	}
+}
+
+// TestSampleFrontierNilSafe verifies that SampleFrontier on a nil evaluator
+// does not panic.
+func TestSampleFrontierNilSafe(t *testing.T) {
+	var e *Evaluator
+	if e.SampleFrontier() {
+		t.Error("nil evaluator SampleFrontier should return false")
+	}
+	if e.FrontierSampled() != 0 {
+		t.Error("nil evaluator FrontierSampled should return 0")
+	}
+}
+
 // TestEvaluateEntryPoint exercises the standalone Evaluate path so a
 // future CLI tool (or test harness) can drive one judge call without
 // spinning up the worker pool.

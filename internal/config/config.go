@@ -383,16 +383,17 @@ type Config struct {
 	// Judge (async LLM-as-a-judge evaluator). All zero/empty values
 	// disable the judge; the chat handler is unaffected when the
 	// evaluator is wired to a no-op observer (see cmd/nexus/main.go).
-	JudgeEnabled      bool          // true iff at least one judge parameter is non-zero
-	JudgeURL          string        // frontier endpoint for judge calls
-	JudgeModel        string        // judge model name (e.g. "gpt-4o")
-	JudgeAPIKey       string        // bearer token; may equal FrontierKey
-	JudgeSampleRate   float64       // 0..1; <=0 disables sampling
-	JudgeConcurrency  int           // max parallel judge calls (default 2)
-	JudgeQueueDepth   int           // buffered channel size (default 64)
-	JudgeTimeout      time.Duration // per-call judge timeout (default 30s)
-	JudgeCostPer1KUSD float64       // rough USD/1k-token rate for cost estimates
-	JudgeDBPath       string        // on-disk SQLite database for judge scores; empty disables Detected
+	JudgeEnabled            bool          // true iff at least one judge parameter is non-zero
+	JudgeURL                string        // frontier endpoint for judge calls
+	JudgeModel              string        // judge model name (e.g. "gpt-4o")
+	JudgeAPIKey             string        // bearer token; may equal FrontierKey
+	JudgeSampleRate         float64       // 0..1; <=0 disables sampling
+	JudgeFrontierSampleRate float64       // 0..1; fraction of frontier completions to judge (default 0.02)
+	JudgeConcurrency        int           // max parallel judge calls (default 2)
+	JudgeQueueDepth         int           // buffered channel size (default 64)
+	JudgeTimeout            time.Duration // per-call judge timeout (default 30s)
+	JudgeCostPer1KUSD       float64       // rough USD/1k-token rate for cost estimates
+	JudgeDBPath             string        // on-disk SQLite database for judge scores; empty disables Detected
 	// edits enqueue a background `cargo check` / `npx tsc` and the
 	// verdict (1 = clean, 0 = fail/timeout) is reported via a
 	// callback to cmd/nexus/main.go. QualityEnabled is true iff
@@ -1661,6 +1662,12 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.JudgeSampleRate = sampleRate
+
+	frontierSampleRate, err := getEnvFloat("NEXUS_JUDGE_FRONTIER_SAMPLE_RATE", 0.02)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.JudgeFrontierSampleRate = frontierSampleRate
 
 	concurrency, err := getEnvInt("NEXUS_JUDGE_CONCURRENCY", 2)
 	if err != nil {

@@ -295,15 +295,16 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 	stageCollector := observability.NewCollector()
 	if cfg.JudgeEnabled && cfg.JudgeAPIKey != "" {
 		evalCfg := judge.Config{
-			URL:         cfg.JudgeURL,
-			Model:       cfg.JudgeModel,
-			APIKey:      cfg.JudgeAPIKey,
-			SampleRate:  cfg.JudgeSampleRate,
-			Concurrency: cfg.JudgeConcurrency,
-			QueueDepth:  cfg.JudgeQueueDepth,
-			Timeout:     cfg.JudgeTimeout,
-			CostPer1K:   cfg.JudgeCostPer1KUSD,
-			BudgetGuard: budgetGuard,
+			URL:                cfg.JudgeURL,
+			Model:              cfg.JudgeModel,
+			APIKey:             cfg.JudgeAPIKey,
+			SampleRate:         cfg.JudgeSampleRate,
+			FrontierSampleRate: cfg.JudgeFrontierSampleRate,
+			Concurrency:        cfg.JudgeConcurrency,
+			QueueDepth:         cfg.JudgeQueueDepth,
+			Timeout:            cfg.JudgeTimeout,
+			CostPer1K:          cfg.JudgeCostPer1KUSD,
+			BudgetGuard:        budgetGuard,
 		}
 		var storage judge.Storage
 		if cfg.JudgeDBEnabled() {
@@ -360,8 +361,17 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 			circuitCollector.ObserveJudgeScore(s.RAGInjected, s.Score)
 		})
 		judgeObs = handlers.JudgeObserverFunc(func(c handlers.LocalCompletion) bool {
-			if !judgeEval.Sample() {
-				return false
+			// Issue #1162: use the frontier sample rate for frontier
+			// completions so the judge builds a frontier quality
+			// baseline. Local/fusion completions use the standard rate.
+			if c.Route == string(router.RouteFrontier) {
+				if !judgeEval.SampleFrontier() {
+					return false
+				}
+			} else {
+				if !judgeEval.Sample() {
+					return false
+				}
 			}
 			if bridge != nil {
 				bridge.note(c.RequestID, router.Categorize(c.Instruction))
@@ -559,6 +569,15 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 			}
 			return []observability.GaugeSample{{
 				Name: "nexus_judge_dropped_total", Value: float64(v),
+			}}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			var v uint64
+			if judgeEval != nil {
+				v = judgeEval.FrontierSampled()
+			}
+			return []observability.GaugeSample{{
+				Name: "nexus_judge_frontier_sampled_total", Value: float64(v),
 			}}
 		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {

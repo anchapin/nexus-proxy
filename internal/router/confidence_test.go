@@ -344,3 +344,80 @@ func TestConfidenceTimeBasedCleanup(t *testing.T) {
 		t.Errorf("RowsTotal after time-based cleanup = %d, want 1 (stale rows deleted)", got)
 	}
 }
+
+// TestComparativeConfidenceBothRoutes tests issue #1162: when both local
+// and frontier outcomes are recorded, ComparativeConfidence returns both
+// fractions correctly.
+func TestComparativeConfidenceBothRoutes(t *testing.T) {
+	cs := newTestConfidenceStore(t, 5, time.Hour)
+	// Local: 6 outcomes, all scoring 1..2 (poor).
+	for i := 0; i < 6; i++ {
+		cs.RecordOutcome(CategoryDebugging, RouteLocal, 1+i%2)
+	}
+	// Frontier: 6 outcomes, all scoring 4..5 (good).
+	for i := 0; i < 6; i++ {
+		cs.RecordOutcome(CategoryDebugging, RouteFrontier, 4+i%2)
+	}
+	localConf, frontierConf, err := cs.ComparativeConfidence(CategoryDebugging)
+	if err != nil {
+		t.Fatalf("ComparativeConfidence: %v", err)
+	}
+	if localConf >= DefaultConfidenceFloor {
+		t.Errorf("localConf = %v, want < %v", localConf, DefaultConfidenceFloor)
+	}
+	if frontierConf <= DefaultConfidenceCeiling {
+		t.Errorf("frontierConf = %v, want > %v", frontierConf, DefaultConfidenceCeiling)
+	}
+}
+
+// TestComparativeConfidenceInsufficientFrontier tests that
+// ComparativeConfidence returns NeutralConfidence for frontier when there
+// are not enough frontier samples.
+func TestComparativeConfidenceInsufficientFrontier(t *testing.T) {
+	cs := newTestConfidenceStore(t, 5, time.Hour)
+	// Local: 6 outcomes, all good.
+	for i := 0; i < 6; i++ {
+		cs.RecordOutcome(CategoryCSS, RouteLocal, 4+i%2)
+	}
+	// Frontier: only 2 outcomes (below min-samples gate of 5).
+	for i := 0; i < 2; i++ {
+		cs.RecordOutcome(CategoryCSS, RouteFrontier, 5)
+	}
+	localConf, frontierConf, err := cs.ComparativeConfidence(CategoryCSS)
+	if err != nil {
+		t.Fatalf("ComparativeConfidence: %v", err)
+	}
+	if localConf <= DefaultConfidenceCeiling {
+		t.Errorf("localConf = %v, want > %v", localConf, DefaultConfidenceCeiling)
+	}
+	if frontierConf != NeutralConfidence {
+		t.Errorf("frontierConf = %v, want %v (insufficient samples)", frontierConf, NeutralConfidence)
+	}
+}
+
+// TestComparativeConfidenceInsufficientBoth tests that
+// ComparativeConfidence returns NeutralConfidence for both when there is
+// no data at all.
+func TestComparativeConfidenceInsufficientBoth(t *testing.T) {
+	cs := newTestConfidenceStore(t, 5, time.Hour)
+	localConf, frontierConf, err := cs.ComparativeConfidence(CategoryOther)
+	if err != nil {
+		t.Fatalf("ComparativeConfidence: %v", err)
+	}
+	if localConf != NeutralConfidence {
+		t.Errorf("localConf = %v, want %v", localConf, NeutralConfidence)
+	}
+	if frontierConf != NeutralConfidence {
+		t.Errorf("frontierConf = %v, want %v", frontierConf, NeutralConfidence)
+	}
+}
+
+// TestComparativeConfidenceEmptyCategory tests that an empty category
+// returns an error.
+func TestComparativeConfidenceEmptyCategory(t *testing.T) {
+	cs := newTestConfidenceStore(t, 5, time.Hour)
+	_, _, err := cs.ComparativeConfidence("")
+	if err == nil {
+		t.Error("ComparativeConfidence(empty) should return an error")
+	}
+}

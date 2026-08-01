@@ -823,9 +823,9 @@ func TestChatLocalRouteObserverNilSkipsCapture(t *testing.T) {
 	}
 }
 
-func TestChatNonLocalRouteDoesNotInvokeObserver(t *testing.T) {
-	// Fusion / Frontier routes must NOT fire the observer: the
-	// judge is explicitly scoped to local outputs.
+func TestChatNonLocalRouteObserver(t *testing.T) {
+	// Fusion routes must NOT fire the observer: the judge is explicitly
+	// scoped to local and frontier outputs.
 	deps, rt := baseDeps(t)
 	obs := &recordingObserver{}
 	deps.JudgeObserver = obs
@@ -840,14 +840,16 @@ func TestChatNonLocalRouteDoesNotInvokeObserver(t *testing.T) {
 		t.Errorf("observer saw %d events on fusion, want 0", got)
 	}
 
+	// Frontier routes DO fire the observer (issue #1162) so the judge
+	// can sample frontier completions and build a quality baseline.
 	obs = &recordingObserver{}
 	deps.JudgeObserver = obs
 	body = `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 48500) + `"}]}` // guardrail -> frontier
 	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw = httptest.NewRecorder()
 	Chat(deps).ServeHTTP(rw, req)
-	if got := len(obs.Snapshot()); got != 0 {
-		t.Errorf("observer saw %d events on frontier, want 0", got)
+	if got := len(obs.Snapshot()); got != 1 {
+		t.Errorf("observer saw %d events on frontier, want 1 (issue #1162)", got)
 	}
 }
 

@@ -87,6 +87,13 @@ type ConfidenceStore interface {
 	// so upstream callers that fail to categorize a prompt are surfaced
 	// rather than silently coercing to CategoryOther (issue #802).
 	LocalConfidence(category string) (float64, error)
+
+	// ComparativeConfidence returns both the local and frontier
+	// confidence fractions for a category (issue #1162). Either value is
+	// NeutralConfidence (0.5) when there is insufficient data for that
+	// route, so callers can distinguish "no data" from "low quality".
+	// An empty category returns an error.
+	ComparativeConfidence(category string) (localConf, frontierConf float64, err error)
 }
 
 // categoryKeywords maps each category to the word-boundary-matched
