@@ -472,10 +472,11 @@ func budgetObserver(mgr *probe.Manager) handlers.BudgetObserver {
 // healthzHandler returns the /healthz handler. Status code is
 // always 200 when the binary is alive; the JSON body carries the
 // per-request VRAM budget, the source label, the fallback value
-// the operator configured, and whether the local Ollama poller
+// the operator configured, whether the local Ollama poller
 // considers Ollama healthy (nil hpoller -> true, matches the
-// health.Health nil-safe contract).
-func healthzHandler(hpoller *health.Health, mgr *probe.Manager, cfg config.Config) http.HandlerFunc {
+// health.Health nil-safe contract), and the per-frontier-provider
+// circuit state (issue #1158).
+func healthzHandler(hpoller *health.Health, fhpoller *health.FrontierHealth, mgr *probe.Manager, cfg config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -494,22 +495,42 @@ func healthzHandler(hpoller *health.Health, mgr *probe.Manager, cfg config.Confi
 			displayTokens = cfg.TokenGuardrail
 			source = string(probe.SourceStatic)
 		}
+
+		// Per-frontier-provider circuit state (issue #1158). When
+		// the poller is nil the map is empty so the field is omitted
+		// from the JSON (omitempty).
+		type providerHealth struct {
+			Name         string `json:"name"`
+			Healthy      bool   `json:"healthy"`
+			FailureCount int32  `json:"failure_count"`
+		}
+		var frontierProviders []providerHealth
+		for _, st := range fhpoller.States() {
+			frontierProviders = append(frontierProviders, providerHealth{
+				Name:         st.Name,
+				Healthy:      st.Healthy,
+				FailureCount: st.FailureCount,
+			})
+		}
+
 		resp := struct {
-			Status         string `json:"status"`
-			OllamaHealthy  bool   `json:"ollama_healthy"`
-			BudgetTokens   int    `json:"budget_tokens"`
-			BudgetSource   string `json:"budget_source"`
-			FreeVRAMBytes  int64  `json:"free_vram_bytes,omitempty"`
-			ModelContext   int    `json:"model_context,omitempty"`
-			StaticFallback int    `json:"static_fallback_tokens"`
+			Status            string           `json:"status"`
+			OllamaHealthy     bool             `json:"ollama_healthy"`
+			BudgetTokens      int              `json:"budget_tokens"`
+			BudgetSource      string           `json:"budget_source"`
+			FreeVRAMBytes     int64            `json:"free_vram_bytes,omitempty"`
+			ModelContext      int              `json:"model_context,omitempty"`
+			StaticFallback    int              `json:"static_fallback_tokens"`
+			FrontierProviders []providerHealth `json:"frontier_providers,omitempty"`
 		}{
-			Status:         "ok",
-			OllamaHealthy:  hpoller == nil || hpoller.IsLocalHealthy(),
-			BudgetTokens:   displayTokens,
-			BudgetSource:   source,
-			FreeVRAMBytes:  budget.FreeVRAMBytes,
-			ModelContext:   budget.ModelContext,
-			StaticFallback: cfg.TokenGuardrail,
+			Status:            "ok",
+			OllamaHealthy:     hpoller == nil || hpoller.IsLocalHealthy(),
+			BudgetTokens:      displayTokens,
+			BudgetSource:      source,
+			FreeVRAMBytes:     budget.FreeVRAMBytes,
+			ModelContext:      budget.ModelContext,
+			StaticFallback:    cfg.TokenGuardrail,
+			FrontierProviders: frontierProviders,
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}

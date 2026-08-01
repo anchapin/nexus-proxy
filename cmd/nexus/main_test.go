@@ -269,7 +269,7 @@ func TestHealthzHandler(t *testing.T) {
 		TokenGuardrail: 6000,
 	}
 
-	handler := healthzHandler(nil, nil, cfg)
+	handler := healthzHandler(nil, nil, nil, cfg)
 	req := httptest.NewRequest("GET", "/healthz", nil)
 	rr := httptest.NewRecorder()
 

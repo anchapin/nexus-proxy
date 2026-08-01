@@ -70,7 +70,7 @@ internal/
   config/               # Load() (env parsing) + LoadYAML() (file + env override)
   diag/                  # boot-time diagnostics (nexus check / nexus doctor)
   handlers/             # chat.go + health.go + recover/security/sanitize
-  health/               # Ollama circuit breaker (separate from internal/circuit)
+  health/               # Ollama circuit breaker + frontier health poller (issue #1158)
   ioutils/              # shared io helpers (decompression, etc.)
   judge/                # async LLM-as-a-judge (sampled local completions)
   metrics/              # SQLite metrics store → savings dashboard
@@ -214,6 +214,26 @@ breaker after `NEXUS_HEALTH_BREAKER_THRESHOLD` (default 3) failed probes:
 - Circuit recloses on next successful probe
 
 Set `NEXUS_HEALTH_POLL_INTERVAL=0` to disable the poller.
+
+## Frontier provider health probing (issue #1158)
+
+A background poller (`internal/health/frontier.go`) mirrors the Ollama
+health poller for frontier API providers. It periodically sends a
+lightweight probe (`GET <BaseURL>/models`) to each registered provider,
+tracks consecutive failures, and maintains a per-provider circuit
+breaker.
+
+- `NEXUS_FRONTIER_HEALTH_POLL_INTERVAL` (default 60s): poll cadence; 0 disables
+- `NEXUS_FRONTIER_HEALTH_BREAKER_THRESHOLD` (default 3): consecutive failures
+  before a provider's circuit opens
+- `NEXUS_FRONTIER_HEALTH_TIMEOUT` (default 5s): per-probe HTTP timeout
+- The `ProviderSelector` consults the per-provider circuit state via the
+  `providers.HealthChecker` interface to skip providers whose circuit is open
+- Circuit recloses on the next successful probe (same semantics as Ollama breaker)
+- `/healthz` surfaces per-frontier-provider circuit state in the JSON body
+- `/status` includes a `frontier_health` section with per-provider details
+- Prometheus counters: `nexus_frontier_probe_total{provider,result}`,
+  `nexus_frontier_circuit_open_total{provider}`
 
 ## Trusted-proxy client-IP resolution (issue #75)
 
