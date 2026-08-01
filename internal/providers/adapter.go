@@ -347,7 +347,7 @@ func (n *anthropicSSENormalizer) start() {
 // first conversion error (errors are terminal — the agent receives a
 // clean EOF).
 func (n *anthropicSSENormalizer) convert() {
-	defer n.pw.Close()
+	defer func() { _ = n.pw.Close() }()
 	finishReason := "stop"
 	emitted := false
 	for {
