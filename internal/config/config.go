@@ -592,6 +592,12 @@ type Config struct {
 	TracingBatchSize  int
 	TracingSampleRate float64
 
+	// LogTraceID (issue #1169). When true and tracing is enabled, the
+	// slog default logger is wrapped so every log record inside a
+	// traced request's context carries trace_id and span_id attributes.
+	// Default true so operators get log-to-trace correlation by default.
+	LogTraceID bool
+
 	// MetricsExemplars controls whether histogram buckets carry OTLP
 	// trace exemplars in the Prometheus exposition (issue #1171).
 	// When true, non-+Inf bucket lines carry a
@@ -1898,6 +1904,10 @@ func Load() (Config, error) {
 		tracingSampleRate = 1
 	}
 	cfg.TracingSampleRate = tracingSampleRate
+
+	// Log trace ID injection (issue #1169). Default true so operators
+	// get log-to-trace correlation by default when tracing is enabled.
+	cfg.LogTraceID = getEnvBool("NEXUS_LOG_TRACE_ID", true)
 
 	// Metrics exemplars (issue #1171). Defaults to true when tracing
 	// is active (TracingEndpoint set) so operators get exemplars
