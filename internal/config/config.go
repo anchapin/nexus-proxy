@@ -174,7 +174,9 @@ type Config struct {
 	SLMCacheStaleCleanupThreshold int           // Get-triggered eviction threshold; 0 = disabled (issue #1037)
 	SLMCacheSemanticScanLimit     int           // max entries scanned in getSemantic; 0 = unlimited (issue #933)
 	SLMConfidenceThreshold        float64       // hard escalation threshold: local/fusion decisions below this force frontier (default 0.3, issue #301)
-	FusionTimeout                 time.Duration // per-panel-member fetch timeout (120s)
+	FusionTimeout                 time.Duration // per-panel-member fetch timeout (120s), shared fallback
+	FusionLocalTimeout            time.Duration // per-panel-member timeout for the local Ollama member (90s, issue #1164)
+	FusionFrontierTimeout         time.Duration // per-panel-member timeout for the frontier API member (30s, issue #1164)
 	CascadeTimeout                time.Duration // per-attempt timeout for cascade fallback (30s)
 	CascadeTimeoutFloor           time.Duration // adaptive floor: minimum per-attempt timeout (5s, issue #1175)
 	CascadeTimeoutCeiling         time.Duration // adaptive ceiling: maximum per-attempt timeout (120s, issue #1175)
@@ -1102,6 +1104,21 @@ func Load() (Config, error) {
 	}
 	cfg.FusionTimeout = fusionTimeout
 
+	// Issue #1164: independent per-member timeouts for fusion panels.
+	// When either is unset/zero the code falls back to FusionTimeout so
+	// existing deployments see byte-for-byte identical behaviour.
+	fusionLocalTimeout, err := getEnvDuration("NEXUS_FUSION_LOCAL_TIMEOUT", 90*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.FusionLocalTimeout = fusionLocalTimeout
+
+	fusionFrontierTimeout, err := getEnvDuration("NEXUS_FUSION_FRONTIER_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.FusionFrontierTimeout = fusionFrontierTimeout
+
 	cascadeTimeout, err := getEnvDuration("NEXUS_CASCADE_TIMEOUT", 30*time.Second)
 	if err != nil {
 		return cfg, err
@@ -2012,6 +2029,7 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	ValidateShutdownTimeout(cfg)
+	ValidateFusionTimeouts(cfg)
 
 	// Emit structured warnings for any deprecated env vars that are set
 	// (issue #1180). Advisory only — does not alter parsed values.
@@ -2061,6 +2079,21 @@ func ValidateShutdownTimeout(cfg Config) {
 			slog.Duration("shutdown_timeout", cfg.ShutdownTimeout),
 			slog.Duration("read_timeout", cfg.ReadTimeout),
 			slog.String("hint", "set NEXUS_SHUTDOWN_TIMEOUT >= NEXUS_SERVER_READ_TIMEOUT"),
+		)
+	}
+}
+
+// ValidateFusionTimeouts emits a boot warning when the local panel-member
+// timeout is shorter than the frontier timeout (issue #1164). Local Ollama
+// models typically need more time than a frontier API, so a configuration
+// where local expires first is almost certainly a mistake.
+func ValidateFusionTimeouts(cfg Config) {
+	if cfg.FusionLocalTimeout > 0 && cfg.FusionFrontierTimeout > 0 &&
+		cfg.FusionLocalTimeout < cfg.FusionFrontierTimeout {
+		slog.Warn("fusion local timeout shorter than frontier timeout",
+			slog.Duration("local_timeout", cfg.FusionLocalTimeout),
+			slog.Duration("frontier_timeout", cfg.FusionFrontierTimeout),
+			slog.String("hint", "set NEXUS_FUSION_LOCAL_TIMEOUT >= NEXUS_FUSION_FRONTIER_TIMEOUT"),
 		)
 	}
 }

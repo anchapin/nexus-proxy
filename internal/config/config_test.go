@@ -877,6 +877,64 @@ func TestLoadShutdownTimeoutInvalidValue(t *testing.T) {
 	}
 }
 
+// --- Fusion per-member timeouts (issue #1164) ---
+
+func TestLoadFusionLocalTimeoutDefault(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.FusionLocalTimeout != 90*time.Second {
+		t.Errorf("FusionLocalTimeout = %v, want 90s", cfg.FusionLocalTimeout)
+	}
+}
+
+func TestLoadFusionFrontierTimeoutDefault(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.FusionFrontierTimeout != 30*time.Second {
+		t.Errorf("FusionFrontierTimeout = %v, want 30s", cfg.FusionFrontierTimeout)
+	}
+}
+
+func TestLoadFusionLocalTimeoutHonoursOverride(t *testing.T) {
+	t.Setenv("NEXUS_FUSION_LOCAL_TIMEOUT", "45s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.FusionLocalTimeout != 45*time.Second {
+		t.Errorf("FusionLocalTimeout = %v, want 45s", cfg.FusionLocalTimeout)
+	}
+}
+
+func TestLoadFusionFrontierTimeoutHonoursOverride(t *testing.T) {
+	t.Setenv("NEXUS_FUSION_FRONTIER_TIMEOUT", "15s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.FusionFrontierTimeout != 15*time.Second {
+		t.Errorf("FusionFrontierTimeout = %v, want 15s", cfg.FusionFrontierTimeout)
+	}
+}
+
+func TestLoadFusionLocalTimeoutInvalidValue(t *testing.T) {
+	t.Setenv("NEXUS_FUSION_LOCAL_TIMEOUT", "soon")
+	if _, err := Load(); err == nil {
+		t.Errorf("expected error for NEXUS_FUSION_LOCAL_TIMEOUT=soon")
+	}
+}
+
+func TestLoadFusionFrontierTimeoutInvalidValue(t *testing.T) {
+	t.Setenv("NEXUS_FUSION_FRONTIER_TIMEOUT", "soon")
+	if _, err := Load(); err == nil {
+		t.Errorf("expected error for NEXUS_FUSION_FRONTIER_TIMEOUT=soon")
+	}
+}
+
 // --- Tracing timeout (issue #1058) ---
 
 func TestLoadTracingTimeoutNegativeRejected(t *testing.T) {

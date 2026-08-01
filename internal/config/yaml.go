@@ -113,6 +113,8 @@ type YAMLConfig struct {
 	SLMCacheStaleCleanupThreshold int     `yaml:"slm_cache_stale_cleanup_threshold"` // issue #1037
 	SLMCacheSemanticScanLimit     int     `yaml:"slm_cache_semantic_scan_limit"`     // issue #933
 	FusionTimeout                 string  `yaml:"fusion_timeout"`
+	FusionLocalTimeout            string  `yaml:"fusion_local_timeout"`    // issue #1164
+	FusionFrontierTimeout         string  `yaml:"fusion_frontier_timeout"` // issue #1164
 	CascadeTimeout                string  `yaml:"cascade_timeout"`
 	CascadeTimeoutFloor           string  `yaml:"cascade_timeout_floor"`         // issue #1175
 	CascadeTimeoutCeiling         string  `yaml:"cascade_timeout_ceiling"`       // issue #1175
@@ -760,6 +762,20 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.FusionTimeout = d
 	}
+	if v := os.Getenv("NEXUS_FUSION_LOCAL_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_FUSION_LOCAL_TIMEOUT: %w", err)
+		}
+		cfg.FusionLocalTimeout = d
+	}
+	if v := os.Getenv("NEXUS_FUSION_FRONTIER_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_FUSION_FRONTIER_TIMEOUT: %w", err)
+		}
+		cfg.FusionFrontierTimeout = d
+	}
 	if v := os.Getenv("NEXUS_CASCADE_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -1381,6 +1397,7 @@ func LoadYAML(path string) (Config, error) {
 	}
 
 	ValidateShutdownTimeout(cfg)
+	ValidateFusionTimeouts(cfg)
 
 	// Emit structured warnings for deprecated env vars and YAML keys
 	// (issue #1180). Advisory only — does not alter parsed values.
@@ -1456,6 +1473,8 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		SLMCacheStaleCleanupThreshold: yc.intDefault(yc.SLMCacheStaleCleanupThreshold, 0), // issue #1037
 		SLMCacheSemanticScanLimit:     yc.intDefault(yc.SLMCacheSemanticScanLimit, 0),     // issue #933
 		FusionTimeout:                 yc.durationDefault(yc.FusionTimeout, 120*time.Second),
+		FusionLocalTimeout:            yc.durationDefault(yc.FusionLocalTimeout, 90*time.Second),    // issue #1164
+		FusionFrontierTimeout:         yc.durationDefault(yc.FusionFrontierTimeout, 30*time.Second), // issue #1164
 		CascadeTimeout:                yc.durationDefault(yc.CascadeTimeout, 30*time.Second),
 		CascadeTimeoutFloor:           yc.durationDefault(yc.CascadeTimeoutFloor, 5*time.Second),               // issue #1175
 		CascadeTimeoutCeiling:         yc.durationDefault(yc.CascadeTimeoutCeiling, 120*time.Second),           // issue #1175

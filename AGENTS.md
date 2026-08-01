@@ -171,6 +171,12 @@ panels race local + frontier, stream the faster as speculative SSE, and
 only invoke the arbiter when Jaccard similarity < `NEXUS_FUSION_AGREEMENT_THRESHOLD`
 (default 0.85).
 
+**Fusion per-member timeouts** (issue #1164): `NEXUS_FUSION_LOCAL_TIMEOUT`
+(default 90s) and `NEXUS_FUSION_FRONTIER_TIMEOUT` (default 30s) give each
+panel member an independent deadline. When either is unset/zero the code
+falls back to `NEXUS_FUSION_TIMEOUT` (default 120s). A boot warning fires
+when `LOCAL_TIMEOUT < FRONTIER_TIMEOUT`.
+
 **Arbiter synthesis cache** (`NEXUS_ARBITER_CACHE_TTL`, default 5m): when > 0, arbiter
 responses are cached keyed by a hash of both panel members' content. Set to 0
 to disable — every disagreement triggers a fresh frontier call.
