@@ -44,6 +44,17 @@ type LocalCompletion struct {
 	Output      string
 	LocalModel  string
 	Route       string // routing path that produced this output: "local", "fusion", or "frontier"
+
+	// RAGInjected reports whether a RAG few-shot snippet was injected
+	// into the prompt for this request (issue #1167). Carried through
+	// to the judge so quality scores can be partitioned by
+	// injected=true|false.
+	RAGInjected bool
+
+	// RAGSimilarity is the cosine-similarity score of the best RAG
+	// match (0 when RAG was not injected). Persisted alongside the
+	// judge score for offline retrieval-effectiveness analysis.
+	RAGSimilarity float64
 }
 
 // JudgeObserver is the hook the chat handler invokes when a
@@ -1738,11 +1749,13 @@ func Chat(d Deps) http.Handler {
 					if res.Succeeded && capw != nil {
 						if d.JudgeObserver != nil {
 							d.JudgeObserver.Submit(LocalCompletion{
-								RequestID:   reqID,
-								Instruction: latestPrompt,
-								Output:      capw.Buffer(),
-								LocalModel:  d.Config.LocalModel,
-								Route:       string(route),
+								RequestID:     reqID,
+								Instruction:   latestPrompt,
+								Output:        capw.Buffer(),
+								LocalModel:    d.Config.LocalModel,
+								Route:         string(route),
+								RAGInjected:   ragInjected,
+								RAGSimilarity: ragScore,
 							})
 						}
 						if d.QualityObserver != nil {
@@ -1814,11 +1827,13 @@ func Chat(d Deps) http.Handler {
 					if capw != nil {
 						if d.JudgeObserver != nil {
 							d.JudgeObserver.Submit(LocalCompletion{
-								RequestID:   reqID,
-								Instruction: latestPrompt,
-								Output:      capw.Buffer(),
-								LocalModel:  d.Config.LocalModel,
-								Route:       string(route),
+								RequestID:     reqID,
+								Instruction:   latestPrompt,
+								Output:        capw.Buffer(),
+								LocalModel:    d.Config.LocalModel,
+								Route:         string(route),
+								RAGInjected:   ragInjected,
+								RAGSimilarity: ragScore,
 							})
 						}
 						if d.QualityObserver != nil {

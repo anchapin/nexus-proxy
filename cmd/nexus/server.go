@@ -340,6 +340,14 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		}
 
 		judgeEval = judge.NewEvaluator(evalCfg, httpClient, storage)
+		// Wire the score callback so RAG-vs-quality correlation metrics
+		// are updated on the worker goroutine after each judge attempt
+		// (issue #1167). Only valid scores (1..5) feed the correlation
+		// counters; parse failures (Score==0 / Err set) are skipped by
+		// ObserveJudgeScore.
+		judgeEval.SetScoreCallback(func(s judge.JudgeScore) {
+			circuitCollector.ObserveJudgeScore(s.RAGInjected, s.Score)
+		})
 		judgeObs = handlers.JudgeObserverFunc(func(c handlers.LocalCompletion) bool {
 			if !judgeEval.Sample() {
 				return false
@@ -348,13 +356,15 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 				bridge.note(c.RequestID, router.Categorize(c.Instruction))
 			}
 			if !judgeEval.Enqueue(judge.Sample{
-				RequestID:   c.RequestID,
-				Instruction: c.Instruction,
-				Output:      c.Output,
-				LocalModel:  c.LocalModel,
-				Route:       c.Route,
-				TraceParent: c.TraceParent,
-				TraceState:  c.TraceState,
+				RequestID:     c.RequestID,
+				Instruction:   c.Instruction,
+				Output:        c.Output,
+				LocalModel:    c.LocalModel,
+				Route:         c.Route,
+				TraceParent:   c.TraceParent,
+				TraceState:    c.TraceState,
+				RAGInjected:   c.RAGInjected,
+				RAGSimilarity: c.RAGSimilarity,
 			}) {
 				if bridge != nil {
 					bridge.forget(c.RequestID)
