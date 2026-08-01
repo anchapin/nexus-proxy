@@ -633,6 +633,13 @@ type Deps struct {
 	// construction time via NewSLMCache.
 	SLMCache *router.SLMCache
 
+	// Promoter is the optional auto-promoted DSL pattern matcher
+	// (issue #1165). When non-nil the planner checks promoted patterns
+	// before the manual DSL fast-pass. The promoter also records SLM
+	// routing decisions for future pattern analysis. When nil the
+	// planner behaves identically to the pre-issue-1165 path.
+	Promoter *router.PatternPromoter
+
 	// LocalPatternsRegex is the DSL fast-pass regex(es) for common coding
 	// task keywords (issue #298). When non-nil the handler uses these
 	// patterns for DSL routing instead of Config.DSLLocalPatterns. This
@@ -1474,6 +1481,7 @@ func Chat(d Deps) http.Handler {
 			ConfidenceErrorHook:  d.ConfidenceErrorHook,
 			Budget:               d.BudgetChecker,
 			FrontierCostPer1K:    d.Config.FrontierCostPer1K,
+			Promoter:             d.Promoter,
 		}
 		if d.Config.SLMConfidenceThreshold > 0 && d.Confidence == nil {
 			slog.Warn("planner: ConfidenceThreshold set but no ConfidenceStore — threshold disabled")
@@ -1493,6 +1501,14 @@ func Chat(d Deps) http.Handler {
 		// planner decided.
 		if aliasResolved {
 			route = router.RouteFrontier
+		}
+
+		// Record SLM routing decisions for pattern promotion analysis
+		// (issue #1165). Only SourceSLM decisions are recorded —
+		// guardrail, DSL, and promoted decisions bypass the SLM and
+		// are not useful for promotion.
+		if d.Promoter != nil && decision.Source == router.SourceSLM {
+			d.Promoter.RecordDecision(latestPrompt, route)
 		}
 
 		// Surface route-decision metadata on the response and via the
@@ -1516,11 +1532,11 @@ func Chat(d Deps) http.Handler {
 			CacheHit:     decision.CacheHit,
 			CacheHitKind: string(decision.CacheHitKind),
 			// DSLMiss is true when the DSL fast-pass had no opinion and the
-			// request fell through to SLM (issue #875). Guardrail and DSL
-			// are the only sources that mean "DSL was evaluated"; everything
-			// else (SLM, SLM-error, escalation, SLM-escalation) means DSL
-			// was bypassed and the request went to SLM.
-			DSLMiss: decision.Source != router.SourceGuardrail && decision.Source != router.SourceDSL,
+			// request fell through to SLM (issue #875). Guardrail, DSL, and
+			// DSL-promoted are the only sources that mean "DSL was evaluated";
+			// everything else (SLM, SLM-error, escalation, SLM-escalation)
+			// means DSL was bypassed and the request went to SLM.
+			DSLMiss: decision.Source != router.SourceGuardrail && decision.Source != router.SourceDSL && decision.Source != router.SourceDSLPromoted,
 		}
 		w.Header().Set("X-Nexus-Route", SanitizeHeaderValue(routeEvent.Route))
 		w.Header().Set("X-Nexus-Route-Source", SanitizeHeaderValue(routeEvent.Source))
@@ -1556,6 +1572,12 @@ func Chat(d Deps) http.Handler {
 		case router.SourceDSL:
 			slog.Info("dsl match",
 				slog.String("route", string(decision.Route)),
+				slog.String("request_id", reqID),
+			)
+		case router.SourceDSLPromoted:
+			slog.Info("dsl promoted match",
+				slog.String("route", string(decision.Route)),
+				slog.String("reason", decision.Reason),
 				slog.String("request_id", reqID),
 			)
 		default:
