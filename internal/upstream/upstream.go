@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -586,28 +587,11 @@ func (p PanelResult) ErrStr() string {
 }
 
 // Panel runs local and frontier fetches concurrently and waits for both.
-// Each member gets its own timeout (perFetchTimeout) so a slow frontier
-// can't pin the local one.
-//
-// When skipLocal is true the local Ollama fetch is omitted (issue #8
-// graceful-degradation path). The local slot in the arbiter prompt is
-// populated with a synthetic PanelResult whose Err is set to a sentinel
-// error, which formatCandidate renders as
-// "[local failed: ollama unavailable (degraded)]". The arbiter's
-// "synthesize the strongest answer" instruction already copes with one
-// candidate being unavailable, so the synthesis stream still produces a
-// useful reply using only the frontier member.
-//
-// arbiterURL/arbiterKey/arbiterModel identify the synthesis model. The
-// arbiter receives a single user message containing both candidates and
-// streams the synthesized reply via Stream. The arbiter call is bounded
-// by arbiterTimeout (issue #12, NEXUS_ARBITER_TIMEOUT, default 60s) via
-// StreamWithContext so a slow synthesis endpoint cannot block the
-// handler indefinitely — without this the arbiter inherits the shared
-// http.DefaultClient which has no timeout.
-// Panel runs local and frontier fetches concurrently and waits for both.
-// Each member gets its own timeout (perFetchTimeout) so a slow frontier
-// can't pin the local one.
+// Each member gets its own timeout so a slow frontier can't pin the local
+// one (issue #1164). localFetchTimeout bounds the local Ollama goroutine
+// and frontierFetchTimeout bounds the frontier goroutine. When either is
+// zero the caller should pass FusionTimeout as the fallback (backward
+// compatibility with the pre-#1164 shared timeout).
 //
 // When skipLocal is true the local Ollama fetch is omitted (issue #8
 // graceful-degradation path). The local slot in the arbiter prompt is
@@ -650,7 +634,8 @@ func Panel(
 	arbiterURL, arbiterKey, arbiterModel string,
 	body map[string]interface{},
 	latestPrompt string,
-	perFetchTimeout time.Duration,
+	localFetchTimeout time.Duration,
+	frontierFetchTimeout time.Duration,
 	arbiterTimeout time.Duration,
 	skipLocal bool,
 	requestID string,
@@ -678,7 +663,7 @@ func Panel(
 					results <- PanelResult{Source: "local", Err: fmt.Errorf("panic: %v", r)}
 				}
 			}()
-			ctx, cancel := context.WithTimeout(ctx, perFetchTimeout)
+			ctx, cancel := context.WithTimeout(ctx, localFetchTimeout)
 			defer cancel()
 			msg, err := FetchPanel(ctx, client,
 				localBaseURL+"/v1/chat/completions", "", localModel, body)
@@ -696,7 +681,7 @@ func Panel(
 				results <- PanelResult{Source: "frontier", Err: fmt.Errorf("panic: %v", r)}
 			}
 		}()
-		ctx, cancel := context.WithTimeout(ctx, perFetchTimeout)
+		ctx, cancel := context.WithTimeout(ctx, frontierFetchTimeout)
 		defer cancel()
 		msg, err := FetchPanel(ctx, client,
 			frontierURL, frontierKey, frontierModel, body)
@@ -834,6 +819,11 @@ func Panel(
 	// Cache the synthesis for future identical panel members (issue #232).
 	if arbiterCache != nil && arbiterCacheTTL > 0 && synthesis != "" {
 		arbiterCache.Set(r1.Content, r2.Content, synthesis, arbiterCacheTTL)
+		// Expose the cache key + synthesis so the handler can persist
+		// them for boot-time pre-warming (issue #1176).
+		key := CacheKey(r1.Content, r2.Content)
+		outcome.ArbiterCacheKeyHex = hex.EncodeToString(key[:])
+		outcome.ArbiterSynthesis = synthesis
 	}
 
 	if isFusion {
@@ -894,6 +884,16 @@ type PanelOutcome struct {
 	// or "cache_hit" when the synthesis was served from the arbiter cache.
 	// Empty when ArbiterSkipped is false.
 	SkipReason string
+	// ArbiterCacheKeyHex is the hex-encoded cache key for the synthesis,
+	// populated only when a new synthesis was fetched and cached (issue
+	// #1176). Empty on cache hits, skips, and non-fusion paths. The handler
+	// forwards it to the metrics store so a subsequent boot can pre-warm
+	// the cache without re-computing the key.
+	ArbiterCacheKeyHex string
+	// ArbiterSynthesis is the synthesis text that was cached, populated
+	// alongside ArbiterCacheKeyHex (issue #1176). Empty unless a fresh
+	// synthesis was computed and stored in the cache.
+	ArbiterSynthesis string
 }
 
 // PanelStreaming runs the fusion panel with progressive delivery
@@ -943,7 +943,8 @@ func PanelStreaming(
 	arbiterURL, arbiterKey, arbiterModel string,
 	body map[string]interface{},
 	latestPrompt string,
-	perFetchTimeout time.Duration,
+	localFetchTimeout time.Duration,
+	frontierFetchTimeout time.Duration,
 	arbiterTimeout time.Duration,
 	skipLocal bool,
 	agreementThreshold float64,
@@ -962,7 +963,7 @@ func PanelStreaming(
 		panelOutcome, cacheHit, err := Panel(ctx, w, client,
 			localBaseURL, localModel, frontierURL, frontierKey, frontierModel,
 			arbiterURL, arbiterKey, arbiterModel,
-			body, latestPrompt, perFetchTimeout, arbiterTimeout,
+			body, latestPrompt, localFetchTimeout, frontierFetchTimeout, arbiterTimeout,
 			skipLocal, requestID, arbiterCache, arbiterCacheTTL,
 			true) // isFusion: set X-Nexus-Fusion-Progressive header (issue #984)
 		if err != nil {
@@ -971,6 +972,8 @@ func PanelStreaming(
 		outcome.ArbiterCacheHit = cacheHit
 		outcome.ArbiterSkipped = panelOutcome.ArbiterSkipped
 		outcome.SkipReason = panelOutcome.SkipReason
+		outcome.ArbiterCacheKeyHex = panelOutcome.ArbiterCacheKeyHex
+		outcome.ArbiterSynthesis = panelOutcome.ArbiterSynthesis
 		return outcome, nil
 	}
 
@@ -1001,7 +1004,7 @@ func PanelStreaming(
 					results <- PanelResult{Source: "local", Err: fmt.Errorf("panic: %v", r)}
 				}
 			}()
-			ctxLocal, cancel := context.WithTimeout(gCtx, perFetchTimeout)
+			ctxLocal, cancel := context.WithTimeout(gCtx, localFetchTimeout)
 			cancelLocal = cancel
 			defer cancel()
 			msg, err := FetchPanel(ctxLocal, client,
@@ -1017,7 +1020,7 @@ func PanelStreaming(
 				results <- PanelResult{Source: "frontier", Err: fmt.Errorf("panic: %v", r)}
 			}
 		}()
-		ctxFrontier, cancel := context.WithTimeout(gCtx, perFetchTimeout)
+		ctxFrontier, cancel := context.WithTimeout(gCtx, frontierFetchTimeout)
 		cancelFrontier = cancel
 		defer cancel()
 		msg, err := FetchPanel(ctxFrontier, client,

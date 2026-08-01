@@ -152,6 +152,14 @@ func buildModelsList(ctx context.Context, deps ModelsDeps, cache *tagsCache) []M
 	add(deps.Config.FrontierModel, "frontier", now)
 	add(deps.Config.ZAIModel, "zai", now)
 
+	// Model aliases (issue #1184): surface configured alias names so
+	// OpenAI-compatible clients can discover and request them. The
+	// alias key is the client-facing model name; the owned_by label
+	// is "alias" so operators can distinguish them from real models.
+	for aliasName := range deps.Config.ModelAliases {
+		add(aliasName, "alias", now)
+	}
+
 	// Optional Ollama /api/tags supplement (cached per ModelsCacheTTL).
 	if deps.Config.ModelsCacheEnabled() {
 		for _, m := range cache.get(ctx, deps) {

@@ -203,6 +203,8 @@ func e2eBaseEnv(t *testing.T, ollamaURL, frontierURL string) {
 	t.Setenv("NEXUS_METRICS_DB", filepath.Join(t.TempDir(), "metrics.db"))
 	t.Setenv("NEXUS_TELEMETRY_PATH", "")
 	t.Setenv("NEXUS_EXAMPLES_DIR", t.TempDir())
+	// Allow loopback connections to mock upstreams (issue #1174 SSRF guard).
+	t.Setenv("NEXUS_EGRESS_ALLOW", "127.0.0.0/8")
 }
 
 // e2eTestServer builds a full production handler stack from buildServer

@@ -108,6 +108,114 @@ jobs:
           path: bench.txt
           retention-days: 7
 
+  # ── Benchmark regression detection (issue #1186) ────────────────
+  # Runs benchmarks on the PR, compares against the stored baseline
+  # (bench/baseline.txt) with benchstat, and posts the comparison
+  # table as a PR comment. Non-blocking (continue-on-error) initially.
+  # The threshold for flagging a regression is NEXUS_BENCH_REGRESSION_THRESHOLD
+  # (default 15% on ns/op). Baseline is regenerated on develop merges.
+  bench-regression:
+    name: bench (regression check)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      NEXUS_BENCH_REGRESSION_THRESHOLD: "15"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Install benchstat
+        run: go install golang.org/x/perf/cmd/benchstat@latest
+
+      # Run benchmarks with -count=5 for statistical confidence.
+      # -benchtime=100ms keeps the suite under ~30s on CI runners.
+      - name: Run benchmarks
+        run: go test -run='^$' -bench=. -benchmem -count=5 -benchtime=100ms ./... > pr.txt 2>&1 || true
+
+      # Compare PR results against the stored baseline.
+      # benchstat prints a table; we capture it for the PR comment
+      # and check for regressions exceeding the threshold.
+      - name: benchstat comparison
+        id: benchstat
+        run: |
+          set -uo pipefail
+          # Generate the comparison table.
+          benchstat bench/baseline.txt pr.txt > benchstat-output.txt 2>&1 || true
+          cat benchstat-output.txt
+
+          # Check for regressions exceeding threshold on ns/op.
+          # benchstat marks significant changes with "p < 0.05" and
+          # shows the delta as a percentage. We look for lines where
+          # the ns/op column shows a regression > threshold%.
+          REGRESSIONS=$(awk -v threshold="${NEXUS_BENCH_REGRESSION_THRESHOLD}" '
+            /^[A-Za-z]/ { name=$1 }
+            /ns\/op/ && /\+[0-9]/ {
+              # Extract percentage from columns containing +N.N%
+              for (i=1; i<=NF; i++) {
+                if ($i ~ /^\+[0-9]/) {
+                  pct = $i; gsub(/[^0-9.]/, "", pct)
+                  if (pct+0 > threshold+0) {
+                    print name " regressed " pct "% on ns/op"
+                  }
+                }
+              }
+            }
+          ' benchstat-output.txt || true)
+
+          if [ -n "$REGRESSIONS" ]; then
+            echo "::warning::Benchmark regressions detected exceeding ${NEXUS_BENCH_REGRESSION_THRESHOLD}%:"
+            echo "$REGRESSIONS"
+            echo "regressed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No benchmark regressions exceeding ${NEXUS_BENCH_REGRESSION_THRESHOLD}%."
+            echo "regressed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload benchstat output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchstat
+          path: |
+            benchstat-output.txt
+            pr.txt
+          retention-days: 14
+
+      # Post the comparison table as a PR comment (updates existing on re-run).
+      - name: Post benchstat comment
+        if: always() && github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: benchstat
+          message: |
+            ## Benchmark comparison (benchstat)
+
+            <details><summary>Comparison against <code>bench/baseline.txt</code></summary>
+
+            ```
+            ${{ steps.benchstat.outputs.regressed == 'true' && '⚠️ Regressions detected' || '✅ No significant regressions' }}
+
+            ```
+
+            ```benchstat
+            $(cat benchstat-output.txt)
+            ```
+
+            </details>
+
+            _Regression threshold: ${{ env.NEXUS_BENCH_REGRESSION_THRESHOLD }}% on ns/op · [How to interpret](../blob/develop/docs/BENCHMARKS.md#10-benchstat-regression-detection)_
+
   lint:
     name: golangci-lint
     runs-on: ubuntu-latest
@@ -128,6 +236,35 @@ jobs:
         with:
           version: v2.12.2
           args: --timeout=5m
+
+  # ── Go native fuzz tests (issue #1161) ──────────────────────────
+  # Runs each fuzz target for a bounded duration on develop pushes.
+  # Non-blocking initially — fuzz failures surface as warnings, not
+  # red builds.
+  fuzz:
+    name: fuzz (smoke)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Fuzz TOON compression
+        run: go test -run='^$' -fuzz=FuzzSerializeToTOON -fuzztime=30s ./internal/middleware/
+
+      - name: Fuzz DSL regex matching
+        run: go test -run='^$' -fuzz=FuzzDSLRegex -fuzztime=30s ./internal/router/
+
+      - name: Fuzz RAG similarity scoring
+        run: go test -run='^$' -fuzz=FuzzSimilarity -fuzztime=30s ./internal/rag/
 
   # ── Docker image smoke build (issue #541) ───────────────────────
   # Builds the container image on every PR so a Dockerfile / go.mod Go

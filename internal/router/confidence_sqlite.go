@@ -46,6 +46,21 @@ SELECT
 FROM routing_outcomes
 WHERE category = ? AND route = ? AND timestamp > ?`
 
+// comparativeConfidenceQuerySQL aggregates both local and frontier
+// confidence in a single pass (issue #1162). It returns four columns:
+// local sample count, local success fraction, frontier sample count,
+// frontier success fraction. The minSamples gate is applied per-route by
+// the caller so a category with frontier data but no local data still
+// reports NeutralConfidence for the missing route.
+const comparativeConfidenceQuerySQL = `
+SELECT
+    COALESCE(SUM(CASE WHEN route = ? THEN 1 ELSE 0 END), 0),
+    COALESCE(AVG(CASE WHEN route = ? AND score >= ? THEN 1.0 WHEN route = ? THEN 0.0 END), 0),
+    COALESCE(SUM(CASE WHEN route = ? THEN 1 ELSE 0 END), 0),
+    COALESCE(AVG(CASE WHEN route = ? AND score >= ? THEN 1.0 WHEN route = ? THEN 0.0 END), 0)
+FROM routing_outcomes
+WHERE category = ? AND timestamp > ?`
+
 // confidenceOpTimeout bounds a single DB op. Aggregates over the small
 // indexed table finish in microseconds; the timeout only guards a
 // pathological disk stall so RecordOutcome / LocalConfidence never pin a
@@ -264,6 +279,50 @@ func (s *SQLiteConfidenceStore) LocalConfidence(category string) (float64, error
 		return NeutralConfidence, nil
 	}
 	return frac, nil
+}
+
+// ComparativeConfidence implements ConfidenceStore (issue #1162). Returns
+// both the local and frontier confidence fractions for a category. Either
+// value is NeutralConfidence when fewer than minSamples recent outcomes
+// exist for that route. An empty category returns an error.
+func (s *SQLiteConfidenceStore) ComparativeConfidence(category string) (float64, float64, error) {
+	if category == "" {
+		return NeutralConfidence, NeutralConfidence, errors.New("confidence: category is empty")
+	}
+	if s == nil || s.db == nil {
+		return NeutralConfidence, NeutralConfidence, nil
+	}
+	cutoff := time.Now().UTC().Add(-s.window)
+
+	ctx, cancel := context.WithTimeout(context.Background(), confidenceOpTimeout)
+	defer cancel()
+
+	var (
+		localCount    int
+		localConf     float64
+		frontierCount int
+		frontierConf  float64
+	)
+	localRoute := string(RouteLocal)
+	frontierRoute := string(RouteFrontier)
+	row := s.db.QueryRowContext(ctx, comparativeConfidenceQuerySQL,
+		localRoute, localRoute, s.successScore, localRoute,
+		frontierRoute, frontierRoute, s.successScore, frontierRoute,
+		category, cutoff)
+	if err := row.Scan(&localCount, &localConf, &frontierCount, &frontierConf); err != nil {
+		slog.Warn("confidence: comparative query",
+			slog.String("category", category),
+			slog.Any("err", err),
+		)
+		return NeutralConfidence, NeutralConfidence, nil
+	}
+	if localCount < s.minSamples {
+		localConf = NeutralConfidence
+	}
+	if frontierCount < s.minSamples {
+		frontierConf = NeutralConfidence
+	}
+	return localConf, frontierConf, nil
 }
 
 // CategoryStats holds the raw aggregate for one task category in the
