@@ -669,21 +669,18 @@ func TestNewVRAMLimiterContextCancelReleasesBlocked(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	errCh := make(chan error, 1)
+
+	// Set onWait BEFORE starting the waiter goroutine so the callback is
+	// guaranteed to be set when the goroutine checks it inside AcquireGPU.
+	// This eliminates the race where the goroutine passes the onWait check
+	// point before the main goroutine stores the callback (issue #925 flake).
+	ready := make(chan struct{})
+	l.onWait.Store(func() { close(ready) })
+
 	go func() {
 		_, gerr := l.AcquireGPU(ctx)
 		errCh <- gerr
 	}()
-
-	// The waiter signals on l.onWait (called just before cond.Wait()) so
-	// we know it has entered cond.Wait() before we call cancel(). This
-	// eliminates the scheduler-dependent sleep that caused flakiness.
-	// Issue #925: Use a barrier channel that the waiter closes to signal
-	// it has entered cond.Wait(). We also yield to the scheduler to ensure
-	// the waiter goroutine is actually blocked before we set onWait.
-	ready := make(chan struct{})
-	l.onWait.Store(func() { close(ready) })
-	runtime.Gosched()
-	runtime.Gosched() // Double yield to account for heavily-loaded CI
 
 	select {
 	case <-ready:

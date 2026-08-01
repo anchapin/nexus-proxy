@@ -930,8 +930,8 @@ toon_unfenced: maybe
 	if err == nil {
 		t.Fatal("LoadYAML: expected error for toon_unfenced: maybe, got nil")
 	}
-	if got := err.Error(); got != `config: toon_unfenced value "maybe" is not recognised; want true or false. See .env.example.` {
-		t.Errorf("error = %q, want %q", got, `config: toon_unfenced value "maybe" is not recognised; want true or false. See .env.example.`)
+	if got := err.Error(); got != `config: toon_unfenced value "maybe" is not recognised; want true or false; see .env.example` {
+		t.Errorf("error = %q, want %q", got, `config: toon_unfenced value "maybe" is not recognised; want true or false; see .env.example`)
 	}
 }
 

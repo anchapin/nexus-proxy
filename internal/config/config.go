@@ -1985,7 +1985,7 @@ func parseTrustedProxies(raw string) ([]*net.IPNet, error) {
 			}
 			continue
 		}
-		return nil, fmt.Errorf("config: invalid NEXUS_TRUSTED_PROXIES entry %q (expected CIDR or IP). See .env.example.", p)
+		return nil, fmt.Errorf("config: invalid NEXUS_TRUSTED_PROXIES entry %q (expected CIDR or IP); see .env.example", p)
 	}
 	return out, nil
 }
@@ -2223,14 +2223,14 @@ func getEnv(key, def string) string {
 // .env.example so the fix is self-evident without reading the source:
 //
 //	config: NEXUS_SERVER_READ_TIMEOUT must not be negative; got "-5s".
-//	        Unset the var to use the default (30s). See .env.example.
+//	        Unset the var to use the default (30s); see .env.example
 //
 // The result is a plain error (not a custom type) so the existing error
 // contract is preserved — callers assert on err != nil or substrings, and
 // wrapping the underlying parse error (%w) keeps errors.Is working.
 func configError(key, constraint, gotValue, defaultStr string) error {
 	return fmt.Errorf(
-		"config: %s %s; got %q. Unset the var to use the default (%s). See .env.example.",
+		"config: %s %s; got %q. Unset the var to use the default (%s); see .env.example",
 		key, constraint, gotValue, defaultStr,
 	)
 }
@@ -2353,7 +2353,7 @@ func getEnvRegexps(key string, defaultPattern string) ([]*regexp.Regexp, error) 
 		}
 		re, err := regexp.Compile(p)
 		if err != nil {
-			return nil, fmt.Errorf("config: %s pattern %q is not a valid regex: %w. Unset the var to restore the built-in default. See .env.example.", key, p, err)
+			return nil, fmt.Errorf("config: %s pattern %q is not a valid regex: %w. Unset the var to restore the built-in default; see .env.example", key, p, err)
 		}
 		result = append(result, re)
 	}
@@ -2417,7 +2417,7 @@ func parseLogLevel(raw string) (slog.Level, error) {
 	case "", "info":
 		return slog.LevelInfo, nil
 	default:
-		return slog.LevelInfo, fmt.Errorf("config: invalid NEXUS_LOG_LEVEL %q; want debug, info, warn, or error. See .env.example.", raw)
+		return slog.LevelInfo, fmt.Errorf("config: invalid NEXUS_LOG_LEVEL %q; want debug, info, warn, or error; see .env.example", raw)
 	}
 }
 
