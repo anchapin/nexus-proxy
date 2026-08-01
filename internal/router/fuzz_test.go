@@ -36,8 +36,8 @@ func FuzzDSLRegex(f *testing.F) {
 	f.Add("")
 	f.Add(strings.Repeat("a", 10000))        // long input
 	f.Add("css" + strings.Repeat(" ", 5000)) // keyword + huge padding
-	f.Add("请解释这个函数的用法")                // Chinese (unicode match)
-	f.Add("🎉🎊🎈💯🔥")                        // emoji spam (no match)
+	f.Add("请解释这个函数的用法")                      // Chinese (unicode match)
+	f.Add("🎉🎊🎈💯🔥")                           // emoji spam (no match)
 	// Null bytes and control characters.
 	f.Add("css\x00format\x01lint")
 	// Alternating keyword / non-keyword.
