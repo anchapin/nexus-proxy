@@ -225,6 +225,9 @@ type YAMLConfig struct {
 	TracingBatchSize  int     `yaml:"tracing_batch_size"`
 	TracingSampleRate float64 `yaml:"tracing_sample_rate"`
 
+	// Metrics exemplars (issue #1171)
+	MetricsExemplars *bool `yaml:"metrics_exemplars"`
+
 	// Response-content redaction (issue #1172).
 	RedactEnabled     bool   `yaml:"redact_enabled"`
 	RedactProfile     string `yaml:"redact_profile"`
@@ -1249,6 +1252,16 @@ func LoadYAML(path string) (Config, error) {
 		cfg.TracingSampleRate = f
 	}
 
+	// Metrics exemplars (issue #1171). Env overrides YAML; default is
+	// true when tracing endpoint is set, false otherwise.
+	if v := os.Getenv("NEXUS_METRICS_EXEMPLARS"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_METRICS_EXEMPLARS: %w", err)
+		}
+		cfg.MetricsExemplars = b
+	}
+
 	// Response-content redaction env overrides (issue #1172).
 	if v := os.Getenv("NEXUS_REDACT_ENABLED"); v != "" {
 		cfg.RedactEnabled = strings.EqualFold(v, "true")
@@ -1505,6 +1518,16 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		VaultPath:     yc.stringDefault(yc.VaultPath, "secret"),
 		AWSSMPrefix:   yc.AWSSMPrefix,
 		SecretRefresh: yc.durationDefault(yc.SecretRefresh, 0),
+	}
+
+	// Metrics exemplars (issue #1171). YAML pointer (nil = use env default);
+	// when set in YAML, use that value. When nil, fall through to Load()
+	// logic (true if tracing endpoint is set).
+	tracingEndpoint := cfg.TracingEndpoint
+	if yc.MetricsExemplars != nil {
+		cfg.MetricsExemplars = *yc.MetricsExemplars
+	} else {
+		cfg.MetricsExemplars = tracingEndpoint != ""
 	}
 
 	// Warn if yaml had unrecognized injection scan roles (issue #845)

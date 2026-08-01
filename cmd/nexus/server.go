@@ -889,6 +889,10 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		}),
 	)
 
+	// Enable exemplars on both collectors based on config (issue #1171).
+	circuitCollector.SetExemplarsEnabled(cfg.MetricsExemplars)
+	stageCollector.SetExemplarsEnabled(cfg.MetricsExemplars)
+
 	routeCounters.SetCollector(circuitCollector)
 
 	circuitBreakerObs := circuitBreakerAdapter{
@@ -952,7 +956,21 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 					UpstreamFirstByteMs: e.UpstreamFirstByteMs,
 					SLMConfidence:       e.SLMConfidence,
 					SLMTaskType:         e.SLMTaskType,
+					TraceID:             e.TraceID,
+					SpanID:              e.SpanID,
 				})
+			},
+		),
+		LatencyObserver: handlers.LatencyObserverFunc(
+			func(e handlers.LatencyEvent) {
+				circuitCollector.Submit(observability.ObservabilityEvent{
+					Route:          e.Route,
+					TotalLatencyMs: int64(e.LatencySeconds * 1000),
+					TTFTMs:         int64(e.TTFTSeconds * 1000),
+					TraceID:        e.TraceID,
+					SpanID:         e.SpanID,
+				})
+				circuitCollector.ObserveLatency(e.Route, int64(e.LatencySeconds*1000))
 			},
 		),
 		LocalPatternsRegex: cfg.DSLLocalPatterns,

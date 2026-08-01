@@ -592,6 +592,14 @@ type Config struct {
 	TracingBatchSize  int
 	TracingSampleRate float64
 
+	// MetricsExemplars controls whether histogram buckets carry OTLP
+	// trace exemplars in the Prometheus exposition (issue #1171).
+	// When true, non-+Inf bucket lines carry a
+	// `# {trace_id="...",span_id="..."} <value>` suffix so Grafana
+	// can link latency outliers to the trace that produced them.
+	// Defaults to true when NEXUS_TRACING_ENDPOINT is set.
+	MetricsExemplars bool
+
 	// Response-content redaction (issue #1172). When RedactEnabled is
 	// true and RedactProfile is one of {secrets, pii, custom}, the chat
 	// handler wraps the response writer with a ResponseRedactor that
@@ -1890,6 +1898,11 @@ func Load() (Config, error) {
 		tracingSampleRate = 1
 	}
 	cfg.TracingSampleRate = tracingSampleRate
+
+	// Metrics exemplars (issue #1171). Defaults to true when tracing
+	// is active (TracingEndpoint set) so operators get exemplars
+	// automatically; explicitly false when tracing is off.
+	cfg.MetricsExemplars = getEnvBool("NEXUS_METRICS_EXEMPLARS", cfg.TracingEndpoint != "")
 
 	// Response-content redaction (issue #1172).
 	cfg.RedactEnabled = getEnvBool("NEXUS_REDACT_ENABLED", false)
