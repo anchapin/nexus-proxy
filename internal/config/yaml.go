@@ -197,6 +197,12 @@ type YAMLConfig struct {
 	TracingQueueSize  int     `yaml:"tracing_queue_size"`
 	TracingBatchSize  int     `yaml:"tracing_batch_size"`
 	TracingSampleRate float64 `yaml:"tracing_sample_rate"`
+
+	// Response-content redaction (issue #1172).
+	RedactEnabled     bool   `yaml:"redact_enabled"`
+	RedactProfile     string `yaml:"redact_profile"`
+	RedactPatternsRaw string `yaml:"redact_patterns"`
+	RedactBufferBytes int    `yaml:"redact_buffer_bytes"`
 }
 
 // LoadYAML reads configuration from a YAML file at path, then overlays
@@ -1118,6 +1124,24 @@ func LoadYAML(path string) (Config, error) {
 		cfg.TracingSampleRate = f
 	}
 
+	// Response-content redaction env overrides (issue #1172).
+	if v := os.Getenv("NEXUS_REDACT_ENABLED"); v != "" {
+		cfg.RedactEnabled = strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("NEXUS_REDACT_PROFILE"); v != "" {
+		cfg.RedactProfile = v
+	}
+	if v := os.Getenv("NEXUS_REDACT_PATTERNS"); v != "" {
+		cfg.RedactPatternsRaw = v
+	}
+	if v := os.Getenv("NEXUS_REDACT_BUFFER_BYTES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_REDACT_BUFFER_BYTES: %w", err)
+		}
+		cfg.RedactBufferBytes = n
+	}
+
 	ValidateShutdownTimeout(cfg)
 	return cfg, nil
 }
@@ -1282,6 +1306,11 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		TracingQueueSize:  yc.intDefault(yc.TracingQueueSize, 256),
 		TracingBatchSize:  yc.intDefault(yc.TracingBatchSize, 64),
 		TracingSampleRate: yc.floatDefault(yc.TracingSampleRate, 1.0),
+
+		RedactEnabled:     yc.RedactEnabled,
+		RedactProfile:     yc.stringDefault(yc.RedactProfile, RedactProfileDefault),
+		RedactPatternsRaw: yc.RedactPatternsRaw,
+		RedactBufferBytes: yc.intDefault(yc.RedactBufferBytes, DefaultRedactBufferBytes),
 	}
 
 	// Warn if yaml had unrecognized injection scan roles (issue #845)

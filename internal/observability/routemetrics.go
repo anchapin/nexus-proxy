@@ -235,6 +235,11 @@ type RouteCounters struct {
 	dslHits   map[string]*uint64
 	dslMisses *uint64
 
+	// Response-content redaction counter (issue #1172). Labelled by
+	// profile ("secrets", "pii", "custom"). Incremented by the
+	// substitution count for each request that produced >=1 redaction.
+	redacted map[string]*uint64
+
 	// collector is an optional Collector whose CircuitBreakerGauges()
 	// are merged into the /metrics output when non-nil.
 	collector *Collector
@@ -279,6 +284,7 @@ func NewRouteCounters() *RouteCounters {
 		promptInjectionHits:      make(map[string]*uint64),
 		dslHits:                  make(map[string]*uint64),
 		dslMisses:                &dslMisses,
+		redacted:                 make(map[string]*uint64),
 	}
 }
 
@@ -693,6 +699,29 @@ func (rc *RouteCounters) ObservePromptInjectionHit(mode string) {
 	atomic.AddUint64(rc.promptInjectionSlot(mode), 1)
 }
 
+// ObserveRedaction records the number of pattern substitutions made
+// during a single request (issue #1172). profile labels the active
+// redaction profile ("secrets", "pii", "custom"). Safe for concurrent
+// use; nil receivers are a no-op.
+func (rc *RouteCounters) ObserveRedaction(profile string, substitutions int64) {
+	if rc == nil || profile == "" || substitutions <= 0 {
+		return
+	}
+	atomic.AddUint64(rc.redactedSlot(profile), uint64(substitutions))
+}
+
+func (rc *RouteCounters) redactedSlot(profile string) *uint64 {
+	rc.mu.Lock()
+	p, ok := rc.redacted[profile]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		rc.redacted[profile] = p
+	}
+	rc.mu.Unlock()
+	return p
+}
+
 // promptInjectionSlot returns the *uint64 for the mode label, creating
 // it if absent. Same lock-then-atomic pattern as reasonSlot: the mutex
 // guards the map mutation only, the increment happens lock-free.
@@ -1086,6 +1115,14 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	// DSL fast-pass counters (issue #875): nexus_router_dsl_hits_total{reason}
 	// and nexus_router_dsl_misses_total.
 	if n, err := writeDSLHitSeries(w, rc.dslHits, rc.dslMisses); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
+	// Response-content redaction counter (issue #1172).
+	if n, err := writeLabelledSeries(w, "nexus_redacted_total",
+		"Total response-content redactions (pattern substitutions) by profile (issue #1172).",
+		"profile", rc.redacted); err != nil {
 		return total, err
 	} else {
 		total += n
