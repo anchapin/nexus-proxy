@@ -359,6 +359,21 @@ latency + cost. Tunable via `NEXUS_SELECTOR_WINDOW` (look-back window),
 (P95 blend factor, range 0–1). When multiple providers are registered via
 `NEXUS_PROVIDERS`, the legacy `NEXUS_FRONTIER_*` vars are ignored.
 
+**Provider configuration surfaces** (issue #1159) — two mutually exclusive
+ways to populate the frontier `ProviderRegistry`, wired in
+`cmd/nexus/server.go` via `providers.LoadProviderRegistry()`:
+1. `NEXUS_PROVIDERS` + per-provider `NEXUS_PROVIDER_<NAME>_*` env vars
+   (richer: priority ordering, input/output cost split, max tokens). Takes
+   precedence when set. Parsing lives in `providers.LoadFromEnv`/`ToConfig`.
+2. `NEXUS_FRONTIER_PROVIDERS` (JSON array) — the `ParseProvidersFromEnv`
+   path. Used as the fallback when `NEXUS_PROVIDERS` is unset.
+
+Setting **both** fails boot with a clear "mutually exclusive" error. When
+neither is set, the config layer's legacy `NEXUS_FRONTIER_*` / `NEXUS_ZAI_*`
+vars apply (the `Config.FrontierProviders()` accessor). A declared
+`NEXUS_PROVIDERS` entry missing a required `NEXUS_PROVIDER_<NAME>_URL` /
+`_MODEL` fails boot with a field-named error.
+
 ## Provider adapter interface (issue #1185)
 
 `internal/providers/adapter.go` defines a `ProviderAdapter` that translates
