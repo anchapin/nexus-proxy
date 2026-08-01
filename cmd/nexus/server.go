@@ -1104,6 +1104,39 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		slog.Info("models endpoint disabled (NEXUS_MODELS_ENDPOINT=false)")
 	}
 
+	// Built-in web dashboard (issue #1182). Opt-in via
+	// NEXUS_DASHBOARD_ENDPOINT; serves a self-contained HTML page from
+	// the SQLite metrics store. The route lives on the same mux that
+	// SecurityHeaders wraps, so it inherits response hardening. It is
+	// rate-limited (when a limiter is configured) exactly like the
+	// chat path, and auth-gated like /status (NEXUS_DASHBOARD_PUBLIC).
+	if cfg.DashboardEndpointEnabled {
+		endpoint := cfg.DashboardEndpoint
+		if endpoint == "" {
+			endpoint = "/dashboard"
+		}
+		// dashStore stays a nil interface when metrics is disabled;
+		// the handler degrades to a static "metrics disabled" page.
+		var dashStore handlers.DashboardStore
+		if metricsStore != nil {
+			dashStore = metricsStore
+		}
+		dashH := http.Handler(handlers.Dashboard(handlers.DashboardDeps{
+			Store:     dashStore,
+			CostPer1K: cfg.FrontierCostPer1K,
+		}))
+		if rateLimiter != nil {
+			dashH = rateLimiter.Wrap(dashH)
+		}
+		mux.Handle(endpoint, dashH)
+		slog.Info("dashboard endpoint enabled",
+			slog.String("path", endpoint),
+			slog.Bool("public", cfg.DashboardPublic),
+		)
+	} else {
+		slog.Info("dashboard endpoint disabled (NEXUS_DASHBOARD_ENDPOINT=false)")
+	}
+
 	slog.Info("starting nexus proxy",
 		slog.String("addr", cfg.Addr),
 		slog.String("local_model", cfg.LocalModel),

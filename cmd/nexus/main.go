@@ -457,14 +457,22 @@ func healthzHandler(hpoller *health.Health, mgr *probe.Manager, cfg config.Confi
 // credentials. /status is exempt only when NEXUS_STATUS_PUBLIC=true
 // (default false) — the diagnostics surface (frontier configured,
 // judge enabled, VRAM state) is reconnaissance-grade and should be
-// gated by default.
+// gated by default. The web dashboard path (issue #1182, default
+// /dashboard) is exempt only when NEXUS_DASHBOARD_PUBLIC=true, mirroring
+// the /status posture.
 func publicPathExempt(cfg config.Config) func(*http.Request) bool {
+	dashPath := cfg.DashboardEndpoint
+	if dashPath == "" {
+		dashPath = "/dashboard"
+	}
 	return func(r *http.Request) bool {
 		switch r.URL.Path {
 		case "/healthz", "/metrics", "/readyz":
 			return true
 		case "/status":
 			return cfg.StatusPublic
+		case dashPath:
+			return cfg.DashboardPublic
 		default:
 			return false
 		}

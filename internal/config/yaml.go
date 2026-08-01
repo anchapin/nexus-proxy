@@ -195,6 +195,11 @@ type YAMLConfig struct {
 	ModelAliases       map[string]string `yaml:"model_aliases"`
 	ModelAliasesStrict bool              `yaml:"model_aliases_strict"`
 
+	// Built-in web dashboard (issue #1182)
+	DashboardEndpointEnabled bool   `yaml:"dashboard_endpoint_enabled"`
+	DashboardEndpoint        string `yaml:"dashboard_endpoint"`
+	DashboardPublic          bool   `yaml:"dashboard_public"`
+
 	// Trusted proxies
 	TrustedProxies    string `yaml:"trusted_proxies"`
 	RateLimitRPM      int    `yaml:"rate_limit_rpm"`
@@ -1035,6 +1040,19 @@ func LoadYAML(path string) (Config, error) {
 		cfg.ModelAliasesStrict = parseBoolEnvStr(v, false)
 	}
 
+	// Built-in web dashboard (issue #1182). Env overrides YAML; an
+	// explicit empty NEXUS_DASHBOARD_PATH still falls back to the
+	// /dashboard default so a blank value cannot unregister the route.
+	if v := os.Getenv("NEXUS_DASHBOARD_ENDPOINT"); v != "" {
+		cfg.DashboardEndpointEnabled = parseBoolEnvStr(v, false)
+	}
+	if v := os.Getenv("NEXUS_DASHBOARD_PATH"); v != "" {
+		cfg.DashboardEndpoint = v
+	}
+	if v := os.Getenv("NEXUS_DASHBOARD_PUBLIC"); v != "" {
+		cfg.DashboardPublic = parseBoolEnvStr(v, false)
+	}
+
 	// Trusted proxies
 	if v := os.Getenv("NEXUS_TRUSTED_PROXIES"); v != "" {
 		cfg.TrustedProxiesRaw = v
@@ -1302,6 +1320,10 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 
 		ModelAliases:       yc.ModelAliases,
 		ModelAliasesStrict: yc.ModelAliasesStrict,
+
+		DashboardEndpointEnabled: yc.boolFieldDefault(yc.DashboardEndpointEnabled, false),
+		DashboardEndpoint:        yc.stringDefault(yc.DashboardEndpoint, "/dashboard"),
+		DashboardPublic:          yc.DashboardPublic,
 
 		RAGPollInterval: yc.durationDefault(yc.RAGPollInterval, 30*time.Second),
 

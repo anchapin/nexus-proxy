@@ -685,6 +685,27 @@ Sum `savings_usd` over any time window to obtain the total cost
 avoided. The `nexus-dashboard` command (`cmd/nexus-dashboard/main.go`)
 produces a daily rollup using this data.
 
+### Web dashboard
+
+For a single-operator local setup that does not want to stand up a full
+Prometheus + Grafana stack, the proxy can serve a lightweight built-in
+web dashboard directly from the SQLite metrics store:
+
+| Variable                    | Default      | Purpose                                            |
+| --------------------------- | ------------ | -------------------------------------------------- |
+| `NEXUS_DASHBOARD_ENDPOINT`  | `false`      | Opt in to the built-in `GET /dashboard` HTML page. |
+| `NEXUS_DASHBOARD_PATH`      | `/dashboard` | Path that serves the dashboard.                    |
+| `NEXUS_DASHBOARD_PUBLIC`    | `false`      | Bypass the inbound auth gate (mirrors `NEXUS_STATUS_PUBLIC`). |
+
+The page is a single self-contained HTML document (inline CSS/JS, **no
+external assets**) rendering requests-by-route, tokens, TOON savings,
+routing savings, and per-day status for a selectable window
+(`?range=24h|7d|30d`). It is read-only and safe to serve while the proxy
+is live. Disabled by default so a stock deployment exposes no extra HTTP
+surface; when enabled it sits behind the same auth wall as `/status`
+unless `NEXUS_DASHBOARD_PUBLIC=true`. Append `?format=json` for a
+scriptable JSON view of the same aggregates.
+
 ## Status
 
 This is the Phase 1 refactor (see `Nexus Proxy PRD and Architecture.md`).
