@@ -85,6 +85,9 @@ token_guardrail: 8000
 slm_timeout: "12s"
 fusion_timeout: "180s"
 cascade_timeout: "45s"
+cascade_timeout_floor: "10s"
+cascade_timeout_ceiling: "180s"
+cascade_timeout_per_1k_tokens: "3s"
 arbiter_timeout: "90s"
 rag_threshold: 0.75
 probe_interval: "90s"
@@ -152,6 +155,15 @@ auth_rate_limit_window: "3m"
 	}
 	if cfg.CascadeTimeout != 45*time.Second {
 		t.Errorf("CascadeTimeout = %v", cfg.CascadeTimeout)
+	}
+	if cfg.CascadeTimeoutFloor != 10*time.Second {
+		t.Errorf("CascadeTimeoutFloor = %v, want 10s", cfg.CascadeTimeoutFloor)
+	}
+	if cfg.CascadeTimeoutCeiling != 180*time.Second {
+		t.Errorf("CascadeTimeoutCeiling = %v, want 180s", cfg.CascadeTimeoutCeiling)
+	}
+	if cfg.CascadeTimeoutPer1kTokens != 3*time.Second {
+		t.Errorf("CascadeTimeoutPer1kTokens = %v, want 3s", cfg.CascadeTimeoutPer1kTokens)
 	}
 	if cfg.ArbiterTimeout != 90*time.Second {
 		t.Errorf("ArbiterTimeout = %v", cfg.ArbiterTimeout)

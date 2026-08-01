@@ -160,6 +160,9 @@ type Config struct {
 	SLMConfidenceThreshold        float64       // hard escalation threshold: local/fusion decisions below this force frontier (default 0.3, issue #301)
 	FusionTimeout                 time.Duration // per-panel-member fetch timeout (120s)
 	CascadeTimeout                time.Duration // per-attempt timeout for cascade fallback (30s)
+	CascadeTimeoutFloor           time.Duration // adaptive floor: minimum per-attempt timeout (5s, issue #1175)
+	CascadeTimeoutCeiling         time.Duration // adaptive ceiling: maximum per-attempt timeout (120s, issue #1175)
+	CascadeTimeoutPer1kTokens     time.Duration // additive per-1k prompt tokens; <=0 disables adaptive (1500ms, issue #1175)
 	ArbiterTimeout                time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
 	// DSL fast-pass patterns (issue #305). DSLFormattingPatterns
@@ -976,6 +979,29 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.CascadeTimeout = cascadeTimeout
+
+	// Adaptive cascade per-attempt timeout (issue #1175). Scales the
+	// timeout by prompt token count instead of a single fixed value:
+	// clamp(floor + per1k * tokens/1000, floor, ceiling). When
+	// PER_1K_TOKENS <= 0 the fixed NEXUS_CASCADE_TIMEOUT is used
+	// (backward compatible).
+	cascadeFloor, err := getEnvDuration("NEXUS_CASCADE_TIMEOUT_FLOOR", 5*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.CascadeTimeoutFloor = cascadeFloor
+
+	cascadeCeiling, err := getEnvDuration("NEXUS_CASCADE_TIMEOUT_CEILING", 120*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.CascadeTimeoutCeiling = cascadeCeiling
+
+	cascadePer1k, err := getEnvDuration("NEXUS_CASCADE_TIMEOUT_PER_1K_TOKENS", 1500*time.Millisecond)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.CascadeTimeoutPer1kTokens = cascadePer1k
 
 	// Fusion arbiter synthesis (issue #12). Shorter than FusionTimeout
 	// because the arbiter is doing synthesis, not generation — a slow

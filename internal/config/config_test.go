@@ -65,6 +65,15 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.CascadeTimeout != 30*time.Second {
 		t.Errorf("CascadeTimeout = %v, want 30s", cfg.CascadeTimeout)
 	}
+	if cfg.CascadeTimeoutFloor != 5*time.Second {
+		t.Errorf("CascadeTimeoutFloor = %v, want 5s", cfg.CascadeTimeoutFloor)
+	}
+	if cfg.CascadeTimeoutCeiling != 120*time.Second {
+		t.Errorf("CascadeTimeoutCeiling = %v, want 120s", cfg.CascadeTimeoutCeiling)
+	}
+	if cfg.CascadeTimeoutPer1kTokens != 1500*time.Millisecond {
+		t.Errorf("CascadeTimeoutPer1kTokens = %v, want 1500ms", cfg.CascadeTimeoutPer1kTokens)
+	}
 	if cfg.ZAIURL != "https://api.z.ai/v1/chat/completions" {
 		t.Errorf("ZAIURL = %q", cfg.ZAIURL)
 	}
@@ -138,6 +147,9 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("NEXUS_RAG_THRESHOLD", "0.7")
 	t.Setenv("NEXUS_SLM_TIMEOUT", "3s")
 	t.Setenv("NEXUS_CASCADE_TIMEOUT", "15s")
+	t.Setenv("NEXUS_CASCADE_TIMEOUT_FLOOR", "8s")
+	t.Setenv("NEXUS_CASCADE_TIMEOUT_CEILING", "200s")
+	t.Setenv("NEXUS_CASCADE_TIMEOUT_PER_1K_TOKENS", "2s")
 	t.Setenv("NEXUS_ZAI_API_KEY", "zai-test")
 	t.Setenv("NEXUS_ZAI_MODEL", "glm-4.5")
 	t.Setenv("NEXUS_TELEMETRY_PATH", "")
@@ -169,6 +181,15 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if cfg.CascadeTimeout != 15*time.Second {
 		t.Errorf("CascadeTimeout = %v, want 15s", cfg.CascadeTimeout)
+	}
+	if cfg.CascadeTimeoutFloor != 8*time.Second {
+		t.Errorf("CascadeTimeoutFloor = %v, want 8s", cfg.CascadeTimeoutFloor)
+	}
+	if cfg.CascadeTimeoutCeiling != 200*time.Second {
+		t.Errorf("CascadeTimeoutCeiling = %v, want 200s", cfg.CascadeTimeoutCeiling)
+	}
+	if cfg.CascadeTimeoutPer1kTokens != 2*time.Second {
+		t.Errorf("CascadeTimeoutPer1kTokens = %v, want 2s", cfg.CascadeTimeoutPer1kTokens)
 	}
 	if cfg.ZAIKey != "zai-test" {
 		t.Errorf("ZAIKey = %q", cfg.ZAIKey)

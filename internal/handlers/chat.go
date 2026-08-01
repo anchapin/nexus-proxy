@@ -1731,21 +1731,31 @@ func Chat(d Deps) http.Handler {
 						APIKey: p.APIKey(),
 					})
 				}
-				cas = &upstream.Cascade{Steps: steps, Timeout: d.Config.CascadeTimeout, MaxResponseBytes: d.Config.EffectiveCascadeMaxResponseBytes()}
+				cas = &upstream.Cascade{
+					Steps:              steps,
+					Timeout:            d.Config.CascadeTimeout,
+					TimeoutFloor:       d.Config.CascadeTimeoutFloor,
+					TimeoutCeiling:     d.Config.CascadeTimeoutCeiling,
+					TimeoutPer1kTokens: d.Config.CascadeTimeoutPer1kTokens,
+					MaxResponseBytes:   d.Config.EffectiveCascadeMaxResponseBytes(),
+				}
 			} else {
 				// Legacy path: build cascade from config (frontier + z.ai).
 				cas = upstream.BuildLocalCascade(upstream.CascadeConfig{
-					LocalURL:         d.Config.OllamaURL,
-					LocalModel:       d.Config.LocalModel,
-					FrontierURL:      d.Config.FrontierURL,
-					FrontierModel:    d.Config.FrontierModel,
-					FrontierKey:      d.Config.FrontierKey,
-					ZAIURL:           d.Config.ZAIURL,
-					ZAIModel:         d.Config.ZAIModel,
-					ZAIKey:           d.Config.ZAIKey,
-					Timeout:          d.Config.CascadeTimeout,
-					MaxResponseBytes: d.Config.EffectiveCascadeMaxResponseBytes(),
-					SkipLocal:        skipLocal,
+					LocalURL:           d.Config.OllamaURL,
+					LocalModel:         d.Config.LocalModel,
+					FrontierURL:        d.Config.FrontierURL,
+					FrontierModel:      d.Config.FrontierModel,
+					FrontierKey:        d.Config.FrontierKey,
+					ZAIURL:             d.Config.ZAIURL,
+					ZAIModel:           d.Config.ZAIModel,
+					ZAIKey:             d.Config.ZAIKey,
+					Timeout:            d.Config.CascadeTimeout,
+					TimeoutFloor:       d.Config.CascadeTimeoutFloor,
+					TimeoutCeiling:     d.Config.CascadeTimeoutCeiling,
+					TimeoutPer1kTokens: d.Config.CascadeTimeoutPer1kTokens,
+					MaxResponseBytes:   d.Config.EffectiveCascadeMaxResponseBytes(),
+					SkipLocal:          skipLocal,
 				})
 			}
 

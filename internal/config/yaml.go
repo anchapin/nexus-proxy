@@ -111,6 +111,9 @@ type YAMLConfig struct {
 	SLMCacheSemanticScanLimit     int     `yaml:"slm_cache_semantic_scan_limit"`     // issue #933
 	FusionTimeout                 string  `yaml:"fusion_timeout"`
 	CascadeTimeout                string  `yaml:"cascade_timeout"`
+	CascadeTimeoutFloor           string  `yaml:"cascade_timeout_floor"`         // issue #1175
+	CascadeTimeoutCeiling         string  `yaml:"cascade_timeout_ceiling"`       // issue #1175
+	CascadeTimeoutPer1kTokens     string  `yaml:"cascade_timeout_per_1k_tokens"` // issue #1175
 	ArbiterTimeout                string  `yaml:"arbiter_timeout"`
 	CascadeMaxResponseBytes       int     `yaml:"cascade_max_response_bytes"`
 	MaxResponseBytes              int     `yaml:"max_response_bytes"`
@@ -679,6 +682,27 @@ func LoadYAML(path string) (Config, error) {
 			return cfg, fmt.Errorf("config: NEXUS_CASCADE_TIMEOUT: %w; see .env.example", err)
 		}
 		cfg.CascadeTimeout = d
+	}
+	if v := os.Getenv("NEXUS_CASCADE_TIMEOUT_FLOOR"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_CASCADE_TIMEOUT_FLOOR: %w", err)
+		}
+		cfg.CascadeTimeoutFloor = d
+	}
+	if v := os.Getenv("NEXUS_CASCADE_TIMEOUT_CEILING"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_CASCADE_TIMEOUT_CEILING: %w", err)
+		}
+		cfg.CascadeTimeoutCeiling = d
+	}
+	if v := os.Getenv("NEXUS_CASCADE_TIMEOUT_PER_1K_TOKENS"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_CASCADE_TIMEOUT_PER_1K_TOKENS: %w", err)
+		}
+		cfg.CascadeTimeoutPer1kTokens = d
 	}
 	if v := os.Getenv("NEXUS_ARBITER_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -1280,6 +1304,9 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		SLMCacheSemanticScanLimit:     yc.intDefault(yc.SLMCacheSemanticScanLimit, 0),     // issue #933
 		FusionTimeout:                 yc.durationDefault(yc.FusionTimeout, 120*time.Second),
 		CascadeTimeout:                yc.durationDefault(yc.CascadeTimeout, 30*time.Second),
+		CascadeTimeoutFloor:           yc.durationDefault(yc.CascadeTimeoutFloor, 5*time.Second),               // issue #1175
+		CascadeTimeoutCeiling:         yc.durationDefault(yc.CascadeTimeoutCeiling, 120*time.Second),           // issue #1175
+		CascadeTimeoutPer1kTokens:     yc.durationDefault(yc.CascadeTimeoutPer1kTokens, 1500*time.Millisecond), // issue #1175
 		ArbiterTimeout:                yc.durationDefault(yc.ArbiterTimeout, 60*time.Second),
 		CascadeMaxResponseBytes:       yc.intDefault(yc.CascadeMaxResponseBytes, DefaultMaxResponseBytes),
 		MaxResponseBytes:              yc.intDefault(yc.MaxResponseBytes, DefaultMaxResponseBytes),
