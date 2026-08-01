@@ -519,6 +519,14 @@ type Config struct {
 	// is caught immediately instead of producing an indeterminate state.
 	ReadinessMode string
 
+	// Init wizard profile (issue #1156). Selects the routing-knob
+	// preset used by `nexus init --non-interactive`. Recognised values
+	// are "local-first", "frontier-default", "fusion-balanced". Empty
+	// falls back to "fusion-balanced" at the wizard layer; the proxy
+	// server itself never reads this value, so it is not validated
+	// during boot — it only steers the generated config file.
+	InitProfile string
+
 	// Tracing (issue #787). OTLP/JSON exporter wired via NewExporter +
 	// RegisterExporter in main.go so spans are actually submitted to the
 	// configured collector. All zero/empty values disable tracing.
@@ -1646,6 +1654,10 @@ func Load() (Config, error) {
 	// the default). Unrecognised values fail boot rather than silently
 	// falling back.
 	cfg.ReadinessMode = getEnv("NEXUS_READINESS_MODE", "degraded")
+
+	// Init wizard profile (issue #1156). Only consumed by `nexus init`;
+	// the server never reads it, so there is no boot-time validation.
+	cfg.InitProfile = getEnv("NEXUS_INIT_PROFILE", "")
 
 	// Tracing (issue #787). Endpoint empty disables tracing entirely
 	// (NewExporter returns nil, RegisterExporter is never called).
