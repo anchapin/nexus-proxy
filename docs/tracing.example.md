@@ -342,7 +342,44 @@ NEXUS_TRACING_MAX_RETRIES=0
 
 ---
 
-## 6. Troubleshooting
+## 6. Log Correlation (issue #1169)
+
+When tracing is enabled, the proxy automatically injects `trace_id` and
+`span_id` attributes into every `slog` log record whose context carries an
+active trace. This lets an operator pivot directly from a log line to the
+corresponding trace in Jaeger or Tempo.
+
+### Configuration
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `NEXUS_LOG_TRACE_ID` | `true` | Inject `trace_id` / `span_id` into slog records when tracing is enabled. Set to `false` to disable. |
+
+The wrapper is only applied when `NEXUS_TRACING_ENDPOINT` is set. When
+tracing is disabled, there is zero overhead — the handler is not wrapped.
+
+### Example log output
+
+```json
+{"time":"2026-01-01T12:00:00Z","level":"INFO","msg":"routing decision","route":"local","trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331"}
+```
+
+Copy the `trace_id` value into Jaeger/Tempo's search bar to jump to the
+full distributed trace.
+
+### Behaviour notes
+
+- **No active trace (background goroutines):** `trace_id` and `span_id`
+  are omitted — the log line is byte-identical to the non-wrapped handler.
+- **Tracing disabled:** the handler is not wrapped at all; log output is
+  unchanged.
+- Log records emitted via `slog.Info(...)` (without a context) will not
+  carry trace IDs. Use `slog.InfoContext(ctx, ...)` in traced code paths
+  to get automatic injection.
+
+---
+
+## 7. Troubleshooting
 
 ### Spans are not appearing in the UI
 
@@ -389,7 +426,7 @@ Ensure `traceparent` propagation is working:
 
 ---
 
-## 6. Full Example: Docker Compose
+## 8. Full Example: Docker Compose
 
 A minimal end-to-end stack with Jaeger:
 

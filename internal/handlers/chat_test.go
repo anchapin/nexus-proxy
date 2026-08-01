@@ -823,9 +823,9 @@ func TestChatLocalRouteObserverNilSkipsCapture(t *testing.T) {
 	}
 }
 
-func TestChatNonLocalRouteDoesNotInvokeObserver(t *testing.T) {
-	// Fusion / Frontier routes must NOT fire the observer: the
-	// judge is explicitly scoped to local outputs.
+func TestChatNonLocalRouteObserver(t *testing.T) {
+	// Fusion routes must NOT fire the observer: the judge is explicitly
+	// scoped to local and frontier outputs.
 	deps, rt := baseDeps(t)
 	obs := &recordingObserver{}
 	deps.JudgeObserver = obs
@@ -840,14 +840,16 @@ func TestChatNonLocalRouteDoesNotInvokeObserver(t *testing.T) {
 		t.Errorf("observer saw %d events on fusion, want 0", got)
 	}
 
+	// Frontier routes DO fire the observer (issue #1162) so the judge
+	// can sample frontier completions and build a quality baseline.
 	obs = &recordingObserver{}
 	deps.JudgeObserver = obs
 	body = `{"messages":[{"role":"user","content":"` + strings.Repeat("a", 48500) + `"}]}` // guardrail -> frontier
 	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rw = httptest.NewRecorder()
 	Chat(deps).ServeHTTP(rw, req)
-	if got := len(obs.Snapshot()); got != 0 {
-		t.Errorf("observer saw %d events on frontier, want 0", got)
+	if got := len(obs.Snapshot()); got != 1 {
+		t.Errorf("observer saw %d events on frontier, want 1 (issue #1162)", got)
 	}
 }
 
@@ -2430,5 +2432,260 @@ func TestChatRootSpanErrorAttribute(t *testing.T) {
 
 	if got := tracingtest.AttrString(s, "error"); got == "" {
 		t.Error("error = empty, want non-empty for upstream failure")
+	}
+}
+
+// TestFrontierCostEstimateLegacy (issue #1183) verifies the default
+// (NEXUS_COST_USE_OUTPUT_TOKENS unset) reproduces the pre-issue-#1183
+// single-rate estimate byte-for-byte: output tokens are ignored and
+// InputCostUSD equals the total.
+func TestFrontierCostEstimateLegacy(t *testing.T) {
+	res := frontierCostEstimate(
+		string(router.RouteFrontier), "gpt-4o",
+		1000, 2000, // output ignored in legacy mode
+		0.005, false, nil,
+	)
+	want := 1000 * 0.005 / 1000.0
+	if res.InputCost != want {
+		t.Errorf("InputCost = %v, want %v", res.InputCost, want)
+	}
+	if res.OutputCost != 0 {
+		t.Errorf("OutputCost = %v, want 0 in legacy mode", res.OutputCost)
+	}
+}
+
+// TestFrontierCostEstimateNonFrontier (issue #1183) verifies local and
+// fusion routes record zero cost regardless of the split flag.
+func TestFrontierCostEstimateNonFrontier(t *testing.T) {
+	for _, route := range []router.Route{router.RouteLocal, router.RouteFusion} {
+		res := frontierCostEstimate(string(route), "m", 1000, 2000, 0.005, true, nil)
+		if res.Total != 0 || res.InputCost != 0 || res.OutputCost != 0 {
+			t.Errorf("route=%v: got %+v, want all zero", route, res)
+		}
+	}
+}
+
+// TestFrontierCostEstimateSplit (issue #1183) verifies the per-provider
+// input/output split. A provider with inputCostPer1K=0.005,
+// outputCostPer1K=0.015 serving 1000 input + 2000 output tokens must
+// record input=0.005 and output=0.03.
+func TestFrontierCostEstimateSplit(t *testing.T) {
+	reg := providers.NewProviderRegistry()
+	reg.Register(providers.ProviderConfig{
+		NameVal:            "openai",
+		ModelVal:           "gpt-4o",
+		InputCostPer1KVal:  0.005,
+		OutputCostPer1KVal: 0.015,
+	})
+
+	res := frontierCostEstimate(
+		string(router.RouteFrontier), "gpt-4o",
+		1000, 2000,
+		0.999, // flat rate ignored when provider found
+		true, reg,
+	)
+	wantIn := 1000 * 0.005 / 1000.0
+	wantOut := 2000 * 0.015 / 1000.0
+	if res.InputCost != wantIn {
+		t.Errorf("InputCost = %v, want %v", res.InputCost, wantIn)
+	}
+	if res.OutputCost != wantOut {
+		t.Errorf("OutputCost = %v, want %v", res.OutputCost, wantOut)
+	}
+	if res.Total != wantIn+wantOut {
+		t.Errorf("Total = %v, want %v", res.Total, wantIn+wantOut)
+	}
+}
+
+// TestFrontierCostEstimateSplitNoProvider (issue #1183) verifies that
+// when the split model is enabled but no provider matches the model,
+// the estimator falls back to the flat config rate for input and a
+// zero output rate (graceful degradation).
+func TestFrontierCostEstimateSplitNoProvider(t *testing.T) {
+	res := frontierCostEstimate(
+		string(router.RouteFrontier), "unknown-model",
+		1000, 2000,
+		0.005, true, nil, // no registry
+	)
+	wantIn := 1000 * 0.005 / 1000.0
+	if res.InputCost != wantIn {
+		t.Errorf("InputCost = %v, want %v (flat fallback)", res.InputCost, wantIn)
+	}
+	if res.OutputCost != 0 {
+		t.Errorf("OutputCost = %v, want 0 (no output rate without provider)", res.OutputCost)
+	}
+}
+
+// --- Top-K RAG injection tests (issue #1166) ---
+
+// TestChatTopKInjectsMultipleExamples verifies that when RAGTopK > 1,
+// multiple matching examples are injected into the upstream request.
+func TestChatTopKInjectsMultipleExamples(t *testing.T) {
+	deps, rt := baseDeps(t)
+
+	deps.Config.RAGTopK = 3
+	deps.Config.RAGMaxInjectionTokens = 100000
+
+	store := rag.NewStore(stubEmbedder{vec: []float64{1, 0, 0}}, 0.5)
+	store.Add("first.go", "package first", []float64{0.95, 0.05, 0})
+	store.Add("second.go", "package second", []float64{0.9, 0.1, 0})
+	store.Add("third.go", "package third", []float64{0.85, 0.15, 0})
+	deps.RAG = store
+
+	deps.Config.DSLFormattingPatterns = []*regexp.Regexp{regexp.MustCompile("test")}
+	middleware.Init(deps.Config.MetaPrompt, deps.Config.TOONNotice, deps.Config.TOONUnfenced, deps.Config.PromptInjectionIsolated())
+
+	var capturedBody map[string]interface{}
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	})
+
+	body := `{"messages":[{"role":"user","content":"test prompt"}]}`
+	Chat(deps).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+
+	if capturedBody == nil {
+		t.Fatal("no request captured")
+	}
+	messages, _ := capturedBody["messages"].([]interface{})
+	if len(messages) == 0 {
+		t.Fatal("no messages in request")
+	}
+	var systemContent string
+	for _, m := range messages {
+		msg, _ := m.(map[string]interface{})
+		if msg["role"] == "user" {
+			if content, ok := msg["content"].(string); ok {
+				if strings.Contains(content, "[PROXY RETRIEVAL CONTEXT]") {
+					systemContent = content
+					break
+				}
+			}
+		}
+	}
+	if systemContent == "" {
+		t.Fatal("no user message with RAG context found")
+	}
+	blockCount := strings.Count(systemContent, "[PROXY RETRIEVAL CONTEXT]")
+	if blockCount < 2 {
+		t.Errorf("expected at least 2 context blocks, got %d (content=%q)", blockCount, systemContent)
+	}
+	for _, name := range []string{"first.go", "second.go", "third.go"} {
+		if !strings.Contains(systemContent, name) {
+			t.Errorf("system message missing %s", name)
+		}
+	}
+}
+
+// TestChatTopKTokenBudgetCapsInjection verifies that when the token budget
+// is exceeded, fewer examples are injected.
+func TestChatTopKTokenBudgetCapsInjection(t *testing.T) {
+	deps, rt := baseDeps(t)
+
+	deps.Config.RAGTopK = 3
+	deps.Config.RAGMaxInjectionTokens = 10
+
+	store := rag.NewStore(stubEmbedder{vec: []float64{1, 0, 0}}, 0.5)
+	store.Add("first.go", strings.Repeat("a", 30), []float64{0.95, 0.05, 0})
+	store.Add("second.go", strings.Repeat("b", 50), []float64{0.9, 0.1, 0})
+	store.Add("third.go", strings.Repeat("c", 50), []float64{0.85, 0.15, 0})
+	deps.RAG = store
+
+	deps.Config.DSLFormattingPatterns = []*regexp.Regexp{regexp.MustCompile("test")}
+	middleware.Init(deps.Config.MetaPrompt, deps.Config.TOONNotice, deps.Config.TOONUnfenced, deps.Config.PromptInjectionIsolated())
+
+	var capturedBody map[string]interface{}
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	})
+
+	body := `{"messages":[{"role":"user","content":"test prompt"}]}`
+	Chat(deps).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+
+	if capturedBody == nil {
+		t.Fatal("no request captured")
+	}
+	messages, _ := capturedBody["messages"].([]interface{})
+	var systemContent string
+	for _, m := range messages {
+		msg, _ := m.(map[string]interface{})
+		if msg["role"] == "user" {
+			if content, ok := msg["content"].(string); ok {
+				if strings.Contains(content, "[PROXY RETRIEVAL CONTEXT]") {
+					systemContent = content
+					break
+				}
+			}
+		}
+	}
+	if systemContent == "" {
+		t.Fatal("no user message with RAG context found")
+	}
+	blockCount := strings.Count(systemContent, "[PROXY RETRIEVAL CONTEXT]")
+	if blockCount != 1 {
+		t.Errorf("expected exactly 1 context block (budget capped), got %d", blockCount)
+	}
+	if !strings.Contains(systemContent, "first.go") {
+		t.Errorf("expected first.go in system message")
+	}
+}
+
+// TestChatTopKDefaultBackwardCompat verifies that with the default
+// RAGTopK=1, the existing single-example path is used byte-for-byte.
+func TestChatTopKDefaultBackwardCompat(t *testing.T) {
+	deps, rt := baseDeps(t)
+
+	if deps.Config.RAGTopK == 0 {
+		deps.Config.RAGTopK = 1
+	}
+
+	store := rag.NewStore(stubEmbedder{vec: []float64{1, 0, 0}}, 0.5)
+	store.Add("only.go", "package only", []float64{0.95, 0.05, 0})
+	deps.RAG = store
+
+	deps.Config.DSLFormattingPatterns = []*regexp.Regexp{regexp.MustCompile("test")}
+	middleware.Init(deps.Config.MetaPrompt, deps.Config.TOONNotice, deps.Config.TOONUnfenced, deps.Config.PromptInjectionIsolated())
+
+	var capturedBody map[string]interface{}
+	rt.On("POST", "http://ollama.local/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"qwen3-coder:8b","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	})
+
+	body := `{"messages":[{"role":"user","content":"test prompt"}]}`
+	Chat(deps).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+
+	if capturedBody == nil {
+		t.Fatal("no request captured")
+	}
+	messages, _ := capturedBody["messages"].([]interface{})
+	var systemContent string
+	for _, m := range messages {
+		msg, _ := m.(map[string]interface{})
+		if msg["role"] == "user" {
+			if content, ok := msg["content"].(string); ok {
+				if strings.Contains(content, "[PROXY RETRIEVAL CONTEXT]") {
+					systemContent = content
+					break
+				}
+			}
+		}
+	}
+	if systemContent == "" {
+		t.Fatal("no user message with RAG context found")
+	}
+	blockCount := strings.Count(systemContent, "[PROXY RETRIEVAL CONTEXT]")
+	if blockCount != 1 {
+		t.Errorf("expected exactly 1 context block for K=1, got %d", blockCount)
 	}
 }

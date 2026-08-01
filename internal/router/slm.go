@@ -82,6 +82,14 @@ const positiveBiasNote = `
 
 ADAPTIVE ROUTING CONTEXT: Historical quality evaluations show the LOCAL model handles tasks similar to this one WELL. Prefer {"route": "local"} when the task is not clearly complex.`
 
+// fusionBiasNote is appended when both local AND frontier confidence are
+// below the floor (issue #1162): both models struggle with this category,
+// so fusion (local + frontier synthesis) may produce a better result than
+// either alone.
+const fusionBiasNote = `
+
+ADAPTIVE ROUTING CONTEXT: Historical quality evaluations show BOTH the local and frontier models perform POORLY on tasks similar to this one. Consider {"route": "fusion"} to leverage combined analysis.`
+
 // Decide returns the routing decision for prompt. It is the neutral-path
 // entry point: equivalent to DecideWithConfidence with NeutralConfidence,
 // so the SLM request is byte-for-byte identical to the pre-issue-47
@@ -100,6 +108,50 @@ func (c *SLMClient) Decide(ctx context.Context, prompt string) (Route, error) {
 // inside the neutral band the request is unchanged from Decide.
 func (c *SLMClient) DecideWithConfidence(ctx context.Context, prompt string, confidence float64) (Route, error) {
 	return c.decide(ctx, prompt, c.systemPromptFor(confidence))
+}
+
+// ComparativeSLMDecider is the optional interface an SLM client can
+// implement to accept both local and frontier confidence signals
+// (issue #1162). When the planner has comparative data it type-asserts
+// to this interface; otherwise it falls back to DecideWithConfidence.
+type ComparativeSLMDecider interface {
+	DecideWithComparativeConfidence(ctx context.Context, prompt string, localConf, frontierConf float64) (Route, error)
+}
+
+// DecideWithComparativeConfidence is Decide augmented with both local and
+// frontier confidence signals (issue #1162). When local confidence is below
+// the floor AND frontier confidence is also below the floor, the system
+// prompt gains a fusion bias (both models struggle). When only local is
+// below the floor, the existing frontier bias applies. When local is above
+// the ceiling, the existing local bias applies.
+func (c *SLMClient) DecideWithComparativeConfidence(ctx context.Context, prompt string, localConf, frontierConf float64) (Route, error) {
+	return c.decide(ctx, prompt, c.systemPromptForComparative(localConf, frontierConf))
+}
+
+// systemPromptForComparative returns the SLM system prompt considering both
+// local and frontier confidence. It is separated out so tests can assert
+// the exact augmentation without an HTTP round-trip.
+func (c *SLMClient) systemPromptForComparative(localConf, frontierConf float64) string {
+	floor := c.ConfidenceFloor
+	if floor <= 0 {
+		floor = DefaultConfidenceFloor
+	}
+	ceiling := c.ConfidenceCeiling
+	if ceiling <= 0 {
+		ceiling = DefaultConfidenceCeiling
+	}
+	// When both models struggle, suggest fusion (issue #1162).
+	if localConf < floor && frontierConf < floor {
+		return slmSystemPrompt + fusionBiasNote
+	}
+	switch {
+	case localConf < floor:
+		return slmSystemPrompt + negativeBiasNote
+	case localConf > ceiling:
+		return slmSystemPrompt + positiveBiasNote
+	default:
+		return slmSystemPrompt
+	}
 }
 
 // systemPromptFor returns the SLM system prompt for the given confidence,

@@ -27,6 +27,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/tokenizer"
 	"github.com/anchapin/nexus-proxy/internal/tracing"
 	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
@@ -44,6 +45,17 @@ type LocalCompletion struct {
 	Output      string
 	LocalModel  string
 	Route       string // routing path that produced this output: "local", "fusion", or "frontier"
+
+	// RAGInjected reports whether a RAG few-shot snippet was injected
+	// into the prompt for this request (issue #1167). Carried through
+	// to the judge so quality scores can be partitioned by
+	// injected=true|false.
+	RAGInjected bool
+
+	// RAGSimilarity is the cosine-similarity score of the best RAG
+	// match (0 when RAG was not injected). Persisted alongside the
+	// judge score for offline retrieval-effectiveness analysis.
+	RAGSimilarity float64
 }
 
 // JudgeObserver is the hook the chat handler invokes when a
@@ -70,6 +82,11 @@ type LatencyEvent struct {
 	LatencySeconds float64
 	TTFTSeconds    float64
 	IsError        bool
+
+	// Trace context for exemplar attachment (issue #1171). Populated
+	// from the root span; empty when tracing is not active.
+	TraceID string
+	SpanID  string
 }
 
 // LatencyObserver is called after each request completes with timing
@@ -103,6 +120,10 @@ type PipelineStageEvent struct {
 	// SLM confidence for histogram recording (issue #425).
 	SLMConfidence float64
 	SLMTaskType   string
+
+	// Trace context for exemplar attachment (issue #1171).
+	TraceID string
+	SpanID  string
 }
 
 // PipelineStageObserver is called after each request completes with
@@ -447,6 +468,13 @@ type MetricsEvent struct {
 	RAGCacheHit      bool // true when the RAG embedding was served from the embed cache (issue #227)
 	EstimatedCostUSD float64
 
+	// InputCostUSD / OutputCostUSD break the EstimatedCostUSD total into
+	// the input-token and output-token components (issue #1183). When
+	// NEXUS_COST_USE_OUTPUT_TOKENS is false the output component is zero
+	// and InputCostUSD equals EstimatedCostUSD (legacy flat-rate path).
+	InputCostUSD  float64
+	OutputCostUSD float64
+
 	// BaselineCostUSD is what the request would have cost at the
 	// configured frontier baseline rate (issue #73). SavingsUSD is
 	// max(BaselineCostUSD - EstimatedCostUSD, 0).
@@ -470,6 +498,13 @@ type MetricsEvent struct {
 	RouteReason   string
 	SLMConfidence float64
 	SLMTaskType   string
+
+	// ArbiterCacheKeyHex + ArbiterSynthesis (issue #1176): populated only
+	// when a fresh arbiter synthesis was computed and cached (route=fusion,
+	// cache miss, non-streaming). Forwarded to the metrics store so a
+	// subsequent boot can pre-warm the cache.
+	ArbiterCacheKeyHex string
+	ArbiterSynthesis   string
 }
 
 // MetricsObserver is the hook the chat handler invokes once per
@@ -598,6 +633,13 @@ type Deps struct {
 	// construction time via NewSLMCache.
 	SLMCache *router.SLMCache
 
+	// Promoter is the optional auto-promoted DSL pattern matcher
+	// (issue #1165). When non-nil the planner checks promoted patterns
+	// before the manual DSL fast-pass. The promoter also records SLM
+	// routing decisions for future pattern analysis. When nil the
+	// planner behaves identically to the pre-issue-1165 path.
+	Promoter *router.PatternPromoter
+
 	// LocalPatternsRegex is the DSL fast-pass regex(es) for common coding
 	// task keywords (issue #298). When non-nil the handler uses these
 	// patterns for DSL routing instead of Config.DSLLocalPatterns. This
@@ -674,6 +716,20 @@ type Deps struct {
 	SpendGuard interface {
 		Check(ctx context.Context, cost float64) bool
 		Record(ctx context.Context, cost float64, source string)
+	}
+
+	// BudgetChecker is the pre-routing budget quick-check (issue #1163).
+	// When non-nil the planner checks whether the estimated frontier
+	// cost would exceed the remaining 24h budget BEFORE the DSL stage,
+	// down-tiering to RouteLocal to avoid wasting the SLM call on a
+	// request that would be rejected with 429 at dispatch time. The
+	// dispatch-time SpendGuard.Check remains as a final safety net.
+	// Nil means the pre-routing budget check is disabled (backward
+	// compatible). Typically wired to the same *budget.Guard as
+	// SpendGuard.
+	BudgetChecker interface {
+		Remaining() float64
+		WouldExceed(estimatedCost float64) bool
 	}
 
 	// LocalLimiter bounds concurrent local-route requests (issue
@@ -806,6 +862,14 @@ type Deps struct {
 	// circuit breaker metrics are not recorded. The hot path is
 	// unaffected when nil.
 	CircuitBreakerObserver CircuitBreakerObserver
+
+	// RedactionObserver is invoked after the upstream dispatch
+	// completes with the total number of patterns replaced during
+	// this request (issue #1172). When substitutions > 0 the
+	// observer increments nexus_redacted_total. Nil means "no
+	// observer"; the hot path is unaffected and redaction is
+	// disabled regardless of Config settings.
+	RedactionObserver func(profile string, substitutions int64)
 
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
@@ -1028,6 +1092,43 @@ func Chat(d Deps) http.Handler {
 			}
 		}
 
+		// Model aliasing (issue #1184). Resolve the client-requested
+		// model against the configured alias map before routing. When a
+		// match is found the request body's model is rewritten to the
+		// upstream model and the route is forced to frontier using the
+		// target provider's endpoint. In strict mode an unknown model
+		// (no alias and no exact provider match) is rejected with 400.
+		var aliasTarget providers.AliasTarget
+		aliasResolved := false
+		if requestedModel, ok := body["model"].(string); ok && requestedModel != "" {
+			if target, found := providers.ResolveAlias(d.Config.ModelAliases, d.Providers, requestedModel); found {
+				aliasTarget = target
+				aliasResolved = true
+				body["model"] = target.Model
+				trace.Request.ModelRequested = requestedModel // preserve original for trace
+				slog.Info("model alias resolved",
+					slog.String("alias", requestedModel),
+					slog.String("provider", target.ProviderName),
+					slog.String("model", target.Model),
+					slog.String("request_id", reqID),
+				)
+			} else if d.Config.ModelAliasesStrict {
+				// Strict mode: reject when the model matches no alias
+				// and no exact provider model. This prevents silently
+				// forwarding unknown models to the default frontier.
+				if !providers.HasProviderModel(d.Providers, requestedModel) {
+					slog.Info("strict mode rejecting unknown model",
+						slog.String("model", requestedModel),
+						slog.String("request_id", reqID),
+					)
+					recordRejection(RejectionBadRequest)
+					writeJSONError(w, http.StatusBadRequest, ErrTypeInvalidRequest,
+						fmt.Sprintf("Model '%s' is not a known alias or configured provider model", requestedModel))
+					return
+				}
+			}
+		}
+
 		messages := rawMessages
 
 		// Apply prompt engineering.
@@ -1057,111 +1158,240 @@ func Chat(d Deps) http.Handler {
 			cacheHitCountBefore = statsProvider.EmbedHitCount()
 		}
 
-		ragEx, ragScore, ragIndexPath, ragErr := d.RAG.Retrieve(r.Context(), latestPrompt)
-		switch {
-		case ragErr != nil:
-			slog.Info("rag miss",
-				slog.String("reason", "embed_error"),
-				slog.String("request_id", reqID),
-			)
-			if d.RAGObserver != nil {
-				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "embed_error"})
-			}
-			// Record circuit failure for rag only when the circuit is open
-			// (transient embed errors are not circuit breaker events).
-			if d.CircuitBreakerObserver != nil {
-				if s, ok := d.RAG.(interface{ IsBreakerOpen() bool }); ok && s.IsBreakerOpen() {
-					d.CircuitBreakerObserver.RecordCircuitFailure("rag")
-					// Also record the embedder-specific failure counter (issue #423, #886).
-					if kind := rag.CircuitKind(ragErr); kind != "" {
-						d.CircuitBreakerObserver.IncEmbedderFailure(kind)
-						d.CircuitBreakerObserver.IncRAGCircuitTrip(kind)
+		// Top-K retrieval path (issue #1166). When RAGTopK > 1 and the
+		// store supports RetrieveTopK, fetch K examples, apply token
+		// budget capping, and inject them as concatenated context blocks.
+		// When RAGTopK <= 1 or the type assertion fails, fall through to
+		// the existing single-example path (byte-for-byte backward compat).
+		topKHandled := false
+		if d.Config.RAGTopK > 1 {
+			if topKStore, ok := d.RAG.(rag.TopKRetriever); ok {
+				topKHandled = true
+				topKExamples, topKScores, topKIdxPath, topKErr := topKStore.RetrieveTopK(r.Context(), latestPrompt, d.Config.RAGTopK)
+				switch {
+				case topKErr != nil:
+					slog.Info("rag miss",
+						slog.String("reason", "embed_error"),
+						slog.String("request_id", reqID),
+					)
+					if d.RAGObserver != nil {
+						d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "embed_error"})
+					}
+					if d.CircuitBreakerObserver != nil {
+						if s, ok := d.RAG.(interface{ IsBreakerOpen() bool }); ok && s.IsBreakerOpen() {
+							d.CircuitBreakerObserver.RecordCircuitFailure("rag")
+							if kind := rag.CircuitKind(topKErr); kind != "" {
+								d.CircuitBreakerObserver.IncEmbedderFailure(kind)
+								d.CircuitBreakerObserver.IncRAGCircuitTrip(kind)
+							}
+						}
+					}
+				case len(topKExamples) > 0:
+					// Apply token budget cap: accumulate from highest-ranked
+					// to lowest, dropping examples that would exceed the cap.
+					remaining := d.Config.RAGMaxInjectionTokens
+					var kept []*rag.FewShotExample
+					for i := range topKExamples {
+						tokens := tokenizer.CountTokens(topKExamples[i].Content)
+						if tokens > remaining && len(kept) > 0 {
+							break
+						}
+						remaining -= tokens
+						kept = append(kept, &topKExamples[i])
+					}
+					if len(kept) > 0 {
+						contextBlock := rag.FormatInjectionMulti(kept)
+						messages, ragInjected = middleware.InjectRAGWithLimit(
+							messages, contextBlock, d.Config.EffectiveMaxBodyBytes(),
+						)
+						if ragInjected {
+							ragFilename = topKExamples[0].Filename
+							ragScore = topKScores[0]
+							ragIndexPath = topKIdxPath
+							slog.Info("rag hit (top-k)",
+								slog.String("filename", ragFilename),
+								slog.Int("examples_injected", len(kept)),
+								slog.Float64("score", ragScore),
+								slog.String("index_path", string(ragIndexPath)),
+								slog.String("request_id", reqID),
+							)
+							if d.RAGObserver != nil {
+								d.RAGObserver.ObserveRAG(RAGEvent{
+									Hit:                true,
+									Filename:           ragFilename,
+									Score:              ragScore,
+									IndexPath:          string(ragIndexPath),
+									EffectiveThreshold: d.RAG.ThresholdFor(topKExamples[0].Dir),
+								})
+							}
+						} else {
+							slog.Warn("rag injection skipped: context block exceeds size guard",
+								slog.Int("examples", len(kept)),
+								slog.Int("context_block_bytes", len(contextBlock)),
+								slog.Int("max_body_bytes", d.Config.EffectiveMaxBodyBytes()),
+								slog.String("request_id", reqID),
+							)
+							if rec, ok := d.RAG.(rag.InjectionSkipRecorder); ok {
+								rec.IncInjectionSkippedSizeLimit()
+							}
+							if d.RAGObserver != nil {
+								d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "size_limit"})
+							}
+						}
+						if d.CircuitBreakerObserver != nil {
+							d.CircuitBreakerObserver.RecordCircuitRecovery("rag")
+						}
+						if s, ok := d.RAG.(interface{ RecordBreakerSuccess() }); ok {
+							s.RecordBreakerSuccess()
+						}
+						if d.CircuitBreakerObserver != nil {
+							if rec, ok := d.RAG.(interface{ LastSuccessfulKind() string }); ok {
+								if kind := rec.LastSuccessfulKind(); kind != "" {
+									d.CircuitBreakerObserver.IncRAGCircuitRecover(kind)
+								}
+							}
+						}
+					} else {
+						slog.Info("rag miss",
+							slog.String("reason", "token_budget_exhausted"),
+							slog.String("request_id", reqID),
+						)
+						if d.RAGObserver != nil {
+							d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "token_budget"})
+						}
+					}
+				case d.RAG.Size() == 0:
+					slog.Info("rag miss",
+						slog.String("reason", "empty_store"),
+						slog.String("request_id", reqID),
+					)
+					if d.RAGObserver != nil {
+						d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "empty_store"})
+					}
+				default:
+					slog.Info("rag miss",
+						slog.String("reason", "threshold"),
+						slog.String("index_path", string(topKIdxPath)),
+						slog.String("request_id", reqID),
+					)
+					if d.RAGObserver != nil {
+						d.RAGObserver.ObserveRAG(RAGEvent{
+							Hit:                false,
+							MissReason:         "threshold",
+							IndexPath:          string(topKIdxPath),
+							EffectiveThreshold: d.RAG.Threshold(),
+						})
 					}
 				}
 			}
-		case ragEx != nil:
-			// Size guard (issue #594): a retrieved few-shot example can
-			// be large enough to overflow the model's context window.
-			// InjectRAGWithLimit skips the context block when appending it
-			// would push the latest user message past NEXUS_MAX_BODY_BYTES.
-			contextBlock := rag.FormatInjection(ragEx)
-			messages, ragInjected = middleware.InjectRAGWithLimit(
-				messages, contextBlock, d.Config.EffectiveMaxBodyBytes(),
-			)
-			if ragInjected {
-				slog.Info("rag hit",
-					slog.String("filename", ragEx.Filename),
+		}
+		if !topKHandled {
+			ragEx, ragScore, ragIndexPath, ragErr := d.RAG.Retrieve(r.Context(), latestPrompt)
+			switch {
+			case ragErr != nil:
+				slog.Info("rag miss",
+					slog.String("reason", "embed_error"),
+					slog.String("request_id", reqID),
+				)
+				if d.RAGObserver != nil {
+					d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "embed_error"})
+				}
+				// Record circuit failure for rag only when the circuit is open
+				// (transient embed errors are not circuit breaker events).
+				if d.CircuitBreakerObserver != nil {
+					if s, ok := d.RAG.(interface{ IsBreakerOpen() bool }); ok && s.IsBreakerOpen() {
+						d.CircuitBreakerObserver.RecordCircuitFailure("rag")
+						// Also record the embedder-specific failure counter (issue #423, #886).
+						if kind := rag.CircuitKind(ragErr); kind != "" {
+							d.CircuitBreakerObserver.IncEmbedderFailure(kind)
+							d.CircuitBreakerObserver.IncRAGCircuitTrip(kind)
+						}
+					}
+				}
+			case ragEx != nil:
+				// Size guard (issue #594): a retrieved few-shot example can
+				// be large enough to overflow the model's context window.
+				// InjectRAGWithLimit skips the context block when appending it
+				// would push the latest user message past NEXUS_MAX_BODY_BYTES.
+				contextBlock := rag.FormatInjection(ragEx)
+				messages, ragInjected = middleware.InjectRAGWithLimit(
+					messages, contextBlock, d.Config.EffectiveMaxBodyBytes(),
+				)
+				if ragInjected {
+					slog.Info("rag hit",
+						slog.String("filename", ragEx.Filename),
+						slog.Float64("score", ragScore),
+						slog.String("index_path", string(ragIndexPath)),
+						slog.String("request_id", reqID),
+					)
+					ragFilename = ragEx.Filename
+					if d.RAGObserver != nil {
+						d.RAGObserver.ObserveRAG(RAGEvent{
+							Hit:                true,
+							Filename:           ragEx.Filename,
+							Score:              ragScore,
+							IndexPath:          string(ragIndexPath),
+							EffectiveThreshold: d.RAG.ThresholdFor(ragEx.Dir),
+						})
+					}
+				} else {
+					slog.Warn("rag injection skipped: context block exceeds size guard",
+						slog.String("filename", ragEx.Filename),
+						slog.Int("context_block_bytes", len(contextBlock)),
+						slog.Int("max_body_bytes", d.Config.EffectiveMaxBodyBytes()),
+						slog.String("request_id", reqID),
+					)
+					if rec, ok := d.RAG.(rag.InjectionSkipRecorder); ok {
+						rec.IncInjectionSkippedSizeLimit()
+					}
+					if d.RAGObserver != nil {
+						d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "size_limit"})
+					}
+				}
+				// Retrieval itself succeeded regardless of whether the
+				// context block was injected, so reset the RAG embedder's
+				// circuit-breaker state (issue #304).
+				if d.CircuitBreakerObserver != nil {
+					d.CircuitBreakerObserver.RecordCircuitRecovery("rag")
+				}
+				if s, ok := d.RAG.(interface{ RecordBreakerSuccess() }); ok {
+					s.RecordBreakerSuccess()
+				}
+				// Track per-embedder recovery for observability (issue #886).
+				if d.CircuitBreakerObserver != nil {
+					if rec, ok := d.RAG.(interface{ LastSuccessfulKind() string }); ok {
+						if kind := rec.LastSuccessfulKind(); kind != "" {
+							d.CircuitBreakerObserver.IncRAGCircuitRecover(kind)
+						}
+					}
+				}
+			case d.RAG.Size() == 0:
+				slog.Info("rag miss",
+					slog.String("reason", "empty_store"),
+					slog.String("request_id", reqID),
+				)
+				if d.RAGObserver != nil {
+					d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "empty_store"})
+				}
+			default:
+				slog.Info("rag miss",
+					slog.String("reason", "threshold"),
 					slog.Float64("score", ragScore),
 					slog.String("index_path", string(ragIndexPath)),
 					slog.String("request_id", reqID),
 				)
-				ragFilename = ragEx.Filename
 				if d.RAGObserver != nil {
+					// For threshold misses, we don't have access to the best candidate's
+					// directory, so we use the global threshold as an approximation.
+					// This still provides useful visibility into threshold behavior.
 					d.RAGObserver.ObserveRAG(RAGEvent{
-						Hit:                true,
-						Filename:           ragEx.Filename,
+						Hit:                false,
+						MissReason:         "threshold",
 						Score:              ragScore,
 						IndexPath:          string(ragIndexPath),
-						EffectiveThreshold: d.RAG.ThresholdFor(ragEx.Dir),
+						EffectiveThreshold: d.RAG.Threshold(),
 					})
 				}
-			} else {
-				slog.Warn("rag injection skipped: context block exceeds size guard",
-					slog.String("filename", ragEx.Filename),
-					slog.Int("context_block_bytes", len(contextBlock)),
-					slog.Int("max_body_bytes", d.Config.EffectiveMaxBodyBytes()),
-					slog.String("request_id", reqID),
-				)
-				if rec, ok := d.RAG.(rag.InjectionSkipRecorder); ok {
-					rec.IncInjectionSkippedSizeLimit()
-				}
-				if d.RAGObserver != nil {
-					d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "size_limit"})
-				}
-			}
-			// Retrieval itself succeeded regardless of whether the
-			// context block was injected, so reset the RAG embedder's
-			// circuit-breaker state (issue #304).
-			if d.CircuitBreakerObserver != nil {
-				d.CircuitBreakerObserver.RecordCircuitRecovery("rag")
-			}
-			if s, ok := d.RAG.(interface{ RecordBreakerSuccess() }); ok {
-				s.RecordBreakerSuccess()
-			}
-			// Track per-embedder recovery for observability (issue #886).
-			if d.CircuitBreakerObserver != nil {
-				if rec, ok := d.RAG.(interface{ LastSuccessfulKind() string }); ok {
-					if kind := rec.LastSuccessfulKind(); kind != "" {
-						d.CircuitBreakerObserver.IncRAGCircuitRecover(kind)
-					}
-				}
-			}
-		case d.RAG.Size() == 0:
-			slog.Info("rag miss",
-				slog.String("reason", "empty_store"),
-				slog.String("request_id", reqID),
-			)
-			if d.RAGObserver != nil {
-				d.RAGObserver.ObserveRAG(RAGEvent{Hit: false, MissReason: "empty_store"})
-			}
-		default:
-			slog.Info("rag miss",
-				slog.String("reason", "threshold"),
-				slog.Float64("score", ragScore),
-				slog.String("index_path", string(ragIndexPath)),
-				slog.String("request_id", reqID),
-			)
-			if d.RAGObserver != nil {
-				// For threshold misses, we don't have access to the best candidate's
-				// directory, so we use the global threshold as an approximation.
-				// This still provides useful visibility into threshold behavior.
-				d.RAGObserver.ObserveRAG(RAGEvent{
-					Hit:                false,
-					MissReason:         "threshold",
-					Score:              ragScore,
-					IndexPath:          string(ragIndexPath),
-					EffectiveThreshold: d.RAG.Threshold(),
-				})
 			}
 		}
 		// Determine embedding cache hit by diffing the hit counter before/after
@@ -1249,6 +1479,9 @@ func Chat(d Deps) http.Handler {
 			SLMCache:             d.SLMCache,
 			ConfidenceThreshold:  d.Config.SLMConfidenceThreshold,
 			ConfidenceErrorHook:  d.ConfidenceErrorHook,
+			Budget:               d.BudgetChecker,
+			FrontierCostPer1K:    d.Config.FrontierCostPer1K,
+			Promoter:             d.Promoter,
 		}
 		if d.Config.SLMConfidenceThreshold > 0 && d.Confidence == nil {
 			slog.Warn("planner: ConfidenceThreshold set but no ConfidenceStore — threshold disabled")
@@ -1261,6 +1494,22 @@ func Chat(d Deps) http.Handler {
 		})
 		slmRoutingMs = time.Since(started).Milliseconds() - promptEngineeringMs - ragRetrievalMs - toonCompressionMs
 		route := decision.Route
+
+		// Model aliasing (issue #1184): when an alias was resolved
+		// earlier, force the route to frontier so the request is
+		// dispatched to the target provider regardless of what the
+		// planner decided.
+		if aliasResolved {
+			route = router.RouteFrontier
+		}
+
+		// Record SLM routing decisions for pattern promotion analysis
+		// (issue #1165). Only SourceSLM decisions are recorded —
+		// guardrail, DSL, and promoted decisions bypass the SLM and
+		// are not useful for promotion.
+		if d.Promoter != nil && decision.Source == router.SourceSLM {
+			d.Promoter.RecordDecision(latestPrompt, route)
+		}
 
 		// Surface route-decision metadata on the response and via the
 		// observer hook (issue #74). The four X-Nexus-Route-* headers
@@ -1283,11 +1532,11 @@ func Chat(d Deps) http.Handler {
 			CacheHit:     decision.CacheHit,
 			CacheHitKind: string(decision.CacheHitKind),
 			// DSLMiss is true when the DSL fast-pass had no opinion and the
-			// request fell through to SLM (issue #875). Guardrail and DSL
-			// are the only sources that mean "DSL was evaluated"; everything
-			// else (SLM, SLM-error, escalation, SLM-escalation) means DSL
-			// was bypassed and the request went to SLM.
-			DSLMiss: decision.Source != router.SourceGuardrail && decision.Source != router.SourceDSL,
+			// request fell through to SLM (issue #875). Guardrail, DSL, and
+			// DSL-promoted are the only sources that mean "DSL was evaluated";
+			// everything else (SLM, SLM-error, escalation, SLM-escalation)
+			// means DSL was bypassed and the request went to SLM.
+			DSLMiss: decision.Source != router.SourceGuardrail && decision.Source != router.SourceDSL && decision.Source != router.SourceDSLPromoted,
 		}
 		w.Header().Set("X-Nexus-Route", SanitizeHeaderValue(routeEvent.Route))
 		w.Header().Set("X-Nexus-Route-Source", SanitizeHeaderValue(routeEvent.Source))
@@ -1323,6 +1572,12 @@ func Chat(d Deps) http.Handler {
 		case router.SourceDSL:
 			slog.Info("dsl match",
 				slog.String("route", string(decision.Route)),
+				slog.String("request_id", reqID),
+			)
+		case router.SourceDSLPromoted:
+			slog.Info("dsl promoted match",
+				slog.String("route", string(decision.Route)),
+				slog.String("reason", decision.Reason),
 				slog.String("request_id", reqID),
 			)
 		default:
@@ -1438,6 +1693,10 @@ func Chat(d Deps) http.Handler {
 		var upErr error
 		var fusionArbiterSkipped bool
 		var fusionJaccardSimilarity float64
+		// fusionArbiterCacheKeyHex / fusionArbiterSynthesis capture the
+		// cache key + synthesis for metrics persistence (issue #1176).
+		// Only set when a fresh synthesis was cached (non-streaming Panel).
+		var fusionArbiterCacheKeyHex, fusionArbiterSynthesis string
 		// toolCallCount is populated from the cascade result on the
 		// local streaming route (issue #72) and forwarded to telemetry
 		// + metrics so the dashboard can report how many tool calls
@@ -1464,6 +1723,37 @@ func Chat(d Deps) http.Handler {
 		// and decide whether to enable captureWriter globally in a
 		// follow-up.
 		var capw *captureWriter
+
+		// Writer chain (outermost first):
+		//   upstream.Write -> ResponseRedactor (issue #1172, when enabled) ->
+		//   captureWriter (judge + quality tee OR debug) ->
+		//   ObservingWriter (telemetry byte count + TTFT + status) ->
+		//   underlying ResponseWriter.
+		//
+		// ResponseRedactor sits between captureWriter and obs so that
+		// captured content (judge samples, debug traces) is also
+		// redacted. When redaction is disabled, redactW aliases obs
+		// and the chain is byte-for-byte identical to the pre-#1172
+		// path.
+		redactW := http.ResponseWriter(obs)
+		var redactor *ResponseRedactor
+		if RedactionEnabled(d.Config.RedactEnabled, d.Config.RedactProfile) && d.RedactionObserver != nil {
+			customRegexes := compileCustomPatternsOrNil(d.Config.RedactPatternsRaw)
+			patterns := PatternsForProfile(d.Config.RedactProfile, customRegexes)
+			bufBytes := d.Config.RedactBufferBytes
+			if bufBytes <= 0 {
+				bufBytes = config.DefaultRedactBufferBytes
+			}
+			redactor = NewResponseRedactor(obs, patterns, 0)
+			redactor.maxBuffer = bufBytes
+			redactW = redactor
+		}
+		rw := redactW
+		if d.JudgeObserver != nil || d.QualityObserver != nil || d.Config.Debug {
+			capw = newCaptureWriter(redactW, d.maxObservedBytes)
+			rw = capw
+		}
+
 		switch route {
 		case router.RouteFusion:
 			slog.Info("starting fusion panel", slog.String("request_id", reqID))
@@ -1502,11 +1792,13 @@ func Chat(d Deps) http.Handler {
 				var outcome upstream.PanelOutcome
 				outcome, upErr = upstream.PanelStreaming(
 					r.Context(),
-					obs, d.Client,
+					redactW, d.Client,
 					d.Config.OllamaURL, d.Config.LocalModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
-					body, latestPrompt, d.Config.FusionTimeout,
+					body, latestPrompt,
+					effectiveFusionTimeout(d.Config.FusionLocalTimeout, d.Config.FusionTimeout),
+					effectiveFusionTimeout(d.Config.FusionFrontierTimeout, d.Config.FusionTimeout),
 					d.Config.ArbiterTimeout,
 					skipLocal,
 					d.Config.FusionAgreementThreshold,
@@ -1516,6 +1808,8 @@ func Chat(d Deps) http.Handler {
 				)
 				fusionArbiterSkipped = outcome.ArbiterSkipped
 				fusionJaccardSimilarity = outcome.Similarity
+				fusionArbiterCacheKeyHex = outcome.ArbiterCacheKeyHex
+				fusionArbiterSynthesis = outcome.ArbiterSynthesis
 				if d.ArbiterCacheObserver != nil {
 					d.ArbiterCacheObserver(outcome.ArbiterCacheHit)
 				}
@@ -1538,11 +1832,13 @@ func Chat(d Deps) http.Handler {
 				var cacheHit bool
 				outcome, cacheHit, upErr = upstream.Panel(
 					r.Context(),
-					obs, d.Client,
+					redactW, d.Client,
 					d.Config.OllamaURL, d.Config.LocalModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
-					body, latestPrompt, d.Config.FusionTimeout,
+					body, latestPrompt,
+					effectiveFusionTimeout(d.Config.FusionLocalTimeout, d.Config.FusionTimeout),
+					effectiveFusionTimeout(d.Config.FusionFrontierTimeout, d.Config.FusionTimeout),
 					d.Config.ArbiterTimeout,
 					skipLocal,
 					reqID,
@@ -1553,6 +1849,8 @@ func Chat(d Deps) http.Handler {
 				if d.ArbiterCacheObserver != nil {
 					d.ArbiterCacheObserver(cacheHit)
 				}
+				fusionArbiterCacheKeyHex = outcome.ArbiterCacheKeyHex
+				fusionArbiterSynthesis = outcome.ArbiterSynthesis
 				if d.FusionOutcomeObserver != nil {
 					d.FusionOutcomeObserver.ObserveFusionOutcome(FusionOutcomeEvent{
 						RequestID:      reqID,
@@ -1653,37 +1951,34 @@ func Chat(d Deps) http.Handler {
 						APIKey: p.APIKey(),
 					})
 				}
-				cas = &upstream.Cascade{Steps: steps, Timeout: d.Config.CascadeTimeout, MaxResponseBytes: d.Config.EffectiveCascadeMaxResponseBytes()}
+				cas = &upstream.Cascade{
+					Steps:              steps,
+					Timeout:            d.Config.CascadeTimeout,
+					TimeoutFloor:       d.Config.CascadeTimeoutFloor,
+					TimeoutCeiling:     d.Config.CascadeTimeoutCeiling,
+					TimeoutPer1kTokens: d.Config.CascadeTimeoutPer1kTokens,
+					MaxResponseBytes:   d.Config.EffectiveCascadeMaxResponseBytes(),
+				}
 			} else {
 				// Legacy path: build cascade from config (frontier + z.ai).
 				cas = upstream.BuildLocalCascade(upstream.CascadeConfig{
-					LocalURL:         d.Config.OllamaURL,
-					LocalModel:       d.Config.LocalModel,
-					FrontierURL:      d.Config.FrontierURL,
-					FrontierModel:    d.Config.FrontierModel,
-					FrontierKey:      d.Config.FrontierKey,
-					ZAIURL:           d.Config.ZAIURL,
-					ZAIModel:         d.Config.ZAIModel,
-					ZAIKey:           d.Config.ZAIKey,
-					Timeout:          d.Config.CascadeTimeout,
-					MaxResponseBytes: d.Config.EffectiveCascadeMaxResponseBytes(),
-					SkipLocal:        skipLocal,
+					LocalURL:           d.Config.OllamaURL,
+					LocalModel:         d.Config.LocalModel,
+					FrontierURL:        d.Config.FrontierURL,
+					FrontierModel:      d.Config.FrontierModel,
+					FrontierKey:        d.Config.FrontierKey,
+					ZAIURL:             d.Config.ZAIURL,
+					ZAIModel:           d.Config.ZAIModel,
+					ZAIKey:             d.Config.ZAIKey,
+					Timeout:            d.Config.CascadeTimeout,
+					TimeoutFloor:       d.Config.CascadeTimeoutFloor,
+					TimeoutCeiling:     d.Config.CascadeTimeoutCeiling,
+					TimeoutPer1kTokens: d.Config.CascadeTimeoutPer1kTokens,
+					MaxResponseBytes:   d.Config.EffectiveCascadeMaxResponseBytes(),
+					SkipLocal:          skipLocal,
 				})
 			}
 
-			// Writer chain (outermost first):
-			//   upstream.Write -> captureWriter (judge + quality tee OR debug) ->
-			//   ObservingWriter (telemetry byte count + TTFT + status) ->
-			//   underlying ResponseWriter.
-			// captureWriter is installed when at least one observer
-			// is set OR debug tracing is on (issue #33); otherwise
-			// the dispatch writes directly through obs with zero
-			// overhead.
-			rw := http.ResponseWriter(obs)
-			if d.JudgeObserver != nil || d.QualityObserver != nil || d.Config.Debug {
-				capw = newCaptureWriter(obs, d.maxObservedBytes)
-				rw = capw
-			}
 			if streaming {
 				// Cascade (issue #14): try local Ollama first, fall
 				// back to configured frontier endpoints (frontier,
@@ -1738,11 +2033,13 @@ func Chat(d Deps) http.Handler {
 					if res.Succeeded && capw != nil {
 						if d.JudgeObserver != nil {
 							d.JudgeObserver.Submit(LocalCompletion{
-								RequestID:   reqID,
-								Instruction: latestPrompt,
-								Output:      capw.Buffer(),
-								LocalModel:  d.Config.LocalModel,
-								Route:       string(route),
+								RequestID:     reqID,
+								Instruction:   latestPrompt,
+								Output:        capw.Buffer(),
+								LocalModel:    d.Config.LocalModel,
+								Route:         string(route),
+								RAGInjected:   ragInjected,
+								RAGSimilarity: ragScore,
 							})
 						}
 						if d.QualityObserver != nil {
@@ -1814,11 +2111,13 @@ func Chat(d Deps) http.Handler {
 					if capw != nil {
 						if d.JudgeObserver != nil {
 							d.JudgeObserver.Submit(LocalCompletion{
-								RequestID:   reqID,
-								Instruction: latestPrompt,
-								Output:      capw.Buffer(),
-								LocalModel:  d.Config.LocalModel,
-								Route:       string(route),
+								RequestID:     reqID,
+								Instruction:   latestPrompt,
+								Output:        capw.Buffer(),
+								LocalModel:    d.Config.LocalModel,
+								Route:         string(route),
+								RAGInjected:   ragInjected,
+								RAGSimilarity: ragScore,
 							})
 						}
 						if d.QualityObserver != nil {
@@ -1844,7 +2143,18 @@ func Chat(d Deps) http.Handler {
 			}
 
 		default:
-			model = d.Config.FrontierModel
+			// Model aliasing (issue #1184): when an alias was resolved,
+			// dispatch to the target provider's endpoint and model
+			// instead of the default frontier config.
+			frontierURL := d.Config.FrontierURL
+			frontierKey := d.Config.FrontierKey
+			if aliasResolved {
+				model = aliasTarget.Model
+				frontierURL = strings.TrimRight(aliasTarget.BaseURL, "/") + "/v1/chat/completions"
+				frontierKey = aliasTarget.APIKey
+			} else {
+				model = d.Config.FrontierModel
+			}
 			// Budget guard: check before frontier dispatch (issue #220).
 			if d.SpendGuard != nil && frontierCost > 0 && d.SpendGuard.Check(r.Context(), frontierCost) {
 				slog.Warn("budget exhausted, rejecting frontier request",
@@ -1861,11 +2171,11 @@ func Chat(d Deps) http.Handler {
 			// BufferedFetch collects the full body and returns a
 			// single chatCompletionResponse JSON object.
 			if streaming {
-				upErr = upstream.Stream(obs, d.Client,
-					d.Config.FrontierURL, d.Config.FrontierKey, body)
+				upErr = upstream.Stream(redactW, d.Client,
+					frontierURL, frontierKey, body)
 			} else {
-				upErr = upstream.BufferedFetch(obs, d.Client,
-					d.Config.FrontierURL, d.Config.FrontierKey, body)
+				upErr = upstream.BufferedFetch(redactW, d.Client,
+					frontierURL, frontierKey, body)
 			}
 			if upErr != nil {
 				if errors.Is(upErr, upstream.ErrUpstreamTruncated) {
@@ -1890,9 +2200,26 @@ func Chat(d Deps) http.Handler {
 					writeJSONError(w, http.StatusBadGateway, ErrTypeUpstreamError,
 						"Frontier upstream call failed")
 				}
-			} else if d.SpendGuard != nil && frontierCost > 0 {
-				// Budget guard: record after successful frontier call (issue #220).
-				d.SpendGuard.Record(r.Context(), frontierCost, "frontier")
+			} else {
+				if d.SpendGuard != nil && frontierCost > 0 {
+					// Budget guard: record after successful frontier call (issue #220).
+					d.SpendGuard.Record(r.Context(), frontierCost, "frontier")
+				}
+				// Issue #1162: submit frontier completion to the judge
+				// observer so it can be sampled and scored against the
+				// frontier baseline.
+				if d.JudgeObserver != nil && capw != nil {
+					d.JudgeObserver.Submit(LocalCompletion{
+						RequestID:   reqID,
+						Instruction: latestPrompt,
+						Output:      capw.Buffer(),
+						LocalModel:  d.Config.FrontierModel,
+						Route:       string(route),
+					})
+				}
+				if d.QualityObserver != nil && capw != nil {
+					emitDetectedEdits(capw.Buffer(), reqID, "", "", d.QualityObserver)
+				}
 			}
 			// Debug trace (issue #33): route=frontier is a single
 			// endpoint with no cascade — populate the trace with
@@ -1900,7 +2227,7 @@ func Chat(d Deps) http.Handler {
 			trace.Upstream.Route = string(route)
 			trace.Upstream.Streaming = streaming
 			trace.Upstream.Model = model
-			trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
+			trace.Upstream.TargetHost = HostOfURL(frontierURL)
 			if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
 				rootSpan.SetAttr("ai.model", model)
 				rootSpan.SetAttr("upstream_target", trace.Upstream.TargetHost)
@@ -1920,6 +2247,12 @@ func Chat(d Deps) http.Handler {
 		// truncation used to flip to 0 on fast hardware and
 		// exposed a write race against the recorder's reader.
 		totalMs := float64(time.Since(started).Microseconds()) / 1000.0
+		// Response-content redaction metric (issue #1172). Report the
+		// total substitution count for this request so the observer
+		// can increment nexus_redacted_total.
+		if redactor != nil && d.RedactionObserver != nil {
+			d.RedactionObserver(d.Config.RedactProfile, redactor.Substitutions())
+		}
 		var ttftMs int64
 		if streaming && firstWriteAt.Load() > 0 {
 			ttftMs = time.Unix(0, firstWriteAt.Load()).Sub(started).Milliseconds()
@@ -1933,7 +2266,11 @@ func Chat(d Deps) http.Handler {
 			postCompressionChars := totalMessageChars(messages)
 			savings := totalTokenSavings(preCompressionChars, postCompressionChars)
 			inputTokens := telemetry.EstimateTokens(latestPrompt)
-			cost := frontierCostEstimate(string(route), model, inputTokens, d.Config.FrontierCostPer1K)
+			res := frontierCostEstimate(
+				string(route), model, inputTokens, outputTokens,
+				d.Config.FrontierCostPer1K, d.Config.CostUseOutputTokens, d.Providers,
+			)
+			cost := res.Total
 			baselineCost := baselineCostEstimate(inputTokens+outputTokens, d.Config.CostBaselineRatePer1K)
 			savingsCost := baselineCost - cost
 			if savingsCost < 0 {
@@ -1944,11 +2281,16 @@ func Chat(d Deps) http.Handler {
 			// FrontierCostPer1K. The arbiter prompt is approximately
 			// the latestPrompt plus the two panel responses; we use
 			// inputTokens as a conservative proxy since the streamed
-			// responses are not retained after serving.
+			// responses are not retained after serving. Output tokens
+			// are not counted for the arbiter (its output is folded
+			// into the main response stream) so we pass 0.
 			var fusionArbiterCostUSD float64
 			if route == router.RouteFusion && !fusionArbiterSkipped {
-				fusionArbiterCostUSD = frontierCostEstimate(
-					string(router.RouteFrontier), model, inputTokens, d.Config.FrontierCostPer1K)
+				arb := frontierCostEstimate(
+					string(router.RouteFrontier), model, inputTokens, 0,
+					d.Config.FrontierCostPer1K, d.Config.CostUseOutputTokens, d.Providers,
+				)
+				fusionArbiterCostUSD = arb.Total
 			}
 			tps := telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 			d.MetricsObserver.Submit(MetricsEvent{
@@ -1963,6 +2305,8 @@ func Chat(d Deps) http.Handler {
 				RAGFilename:             ragFilename,
 				RAGCacheHit:             false, // issue #227: EmbedCache tracking not active with CachedEmbedder (issue #115)
 				EstimatedCostUSD:        cost,
+				InputCostUSD:            res.InputCost,
+				OutputCostUSD:           res.OutputCost,
 				BaselineCostUSD:         baselineCost,
 				SavingsUSD:              savingsCost,
 				OutputTokens:            outputTokens,
@@ -1979,6 +2323,8 @@ func Chat(d Deps) http.Handler {
 				RouteReason:             decision.Reason,
 				SLMConfidence:           decision.Confidence,
 				SLMTaskType:             decision.TaskType,
+				ArbiterCacheKeyHex:      fusionArbiterCacheKeyHex,
+				ArbiterSynthesis:        fusionArbiterSynthesis,
 			})
 		}
 		// Both observers receive the record when both are wired (issue #164).
@@ -2005,6 +2351,13 @@ func Chat(d Deps) http.Handler {
 		// LatencyObserver (issue #165): fired after the upstream response
 		// completes so callers can record end-to-end latency histograms.
 		// ttftMs is already computed above; convert to float64 seconds.
+		// Trace context (issue #1171): extract from root span so the
+		// collector can attach exemplars to histogram buckets.
+		var traceID, spanID string
+		if rs, ok := tracing.RootSpanFromContext(r.Context()); ok {
+			traceID = rs.TraceID
+			spanID = rs.SpanID
+		}
 		if d.LatencyObserver != nil {
 			var ttftSecs float64
 			if ttftMs > 0 {
@@ -2019,6 +2372,8 @@ func Chat(d Deps) http.Handler {
 				LatencySeconds: totalMs / 1000.0,
 				TTFTSeconds:    ttftSecs,
 				IsError:        isErr,
+				TraceID:        traceID,
+				SpanID:         spanID,
 			})
 		}
 
@@ -2035,6 +2390,8 @@ func Chat(d Deps) http.Handler {
 				UpstreamFirstByteMs: ttftMs,
 				SLMConfidence:       decision.Confidence,
 				SLMTaskType:         decision.TaskType,
+				TraceID:             traceID,
+				SpanID:              spanID,
 			})
 		}
 
@@ -2173,6 +2530,16 @@ type captureWriter struct {
 	cap      int
 	buf      strings.Builder
 	overflow bool
+}
+
+// effectiveFusionTimeout returns the per-member timeout, falling back to
+// the shared FusionTimeout when the member-specific value is zero/unset
+// (issue #1164 backward compatibility).
+func effectiveFusionTimeout(specific, fallback time.Duration) time.Duration {
+	if specific > 0 {
+		return specific
+	}
+	return fallback
 }
 
 // newCaptureWriter wires a captureWriter around w with the given
@@ -2463,21 +2830,79 @@ func totalTokenSavings(preChars, postChars int) int {
 	return (preChars - postChars) / 4
 }
 
-// frontierCostEstimate multiplies input tokens by the configured
-// cost-per-1k. Returns zero for non-frontier routes so local +
-// fusion-trail rows count as zero cost in the dashboard.
+// costEstimateResult holds the per-request cost split computed by
+// frontierCostEstimate (issue #1183). Total = InputCost + OutputCost.
+type costEstimateResult struct {
+	Total      float64
+	InputCost  float64
+	OutputCost float64
+}
+
+// frontierCostEstimate multiplies tokens by the configured cost-per-1k
+// and returns the per-direction split (issue #1183). Returns zero for
+// non-frontier routes so local + fusion-trail rows count as zero cost
+// in the dashboard.
+//
+// Legacy path (useOutputTokens == false): computes
+// inputTokens * costPer1KUSD / 1000 byte-for-byte identical to the
+// pre-issue-#1183 estimate; OutputCost is zero and InputCost == Total.
+//
+// Split path (useOutputTokens == true): looks up the serving provider
+// by model in the registry. When found, uses the provider's
+// InputCostPer1K / OutputCostPer1K rates; when no provider matches (or
+// the registry is nil) it falls back to costPer1KUSD as the input rate
+// and a zero output rate. Output tokens are counted via the tiktoken
+// tokenizer (passed in by the caller, which already computed them) so
+// the output stream is costed accurately instead of bytes/4.
 //
 //gitleaks:ignore
-func frontierCostEstimate(route, model string, inputTokens int, costPer1KUSD float64) float64 {
-	// model is reserved for future per-model pricing tables.
-	_ = model
+func frontierCostEstimate(
+	route, model string,
+	inputTokens, outputTokens int,
+	costPer1KUSD float64,
+	useOutputTokens bool,
+	registry *providers.ProviderRegistry,
+) costEstimateResult {
 	if route != string(router.RouteFrontier) {
-		return 0
+		return costEstimateResult{}
 	}
-	if costPer1KUSD <= 0 || inputTokens <= 0 {
-		return 0
+	if costPer1KUSD <= 0 && inputTokens <= 0 {
+		return costEstimateResult{}
 	}
-	return float64(inputTokens) * costPer1KUSD / 1000.0
+
+	// Legacy single-rate estimate (default). Reproduces the
+	// pre-issue-#1183 behaviour exactly so savings numbers are stable
+	// when the operator has not opted into the split model.
+	if !useOutputTokens {
+		if costPer1KUSD <= 0 || inputTokens <= 0 {
+			return costEstimateResult{}
+		}
+		total := float64(inputTokens) * costPer1KUSD / 1000.0
+		return costEstimateResult{Total: total, InputCost: total}
+	}
+
+	// Per-provider split (issue #1183). Resolve input/output rates from
+	// the registry; fall back to the flat config rate for input and a
+	// zero output rate when no provider matches.
+	inputRate := costPer1KUSD
+	outputRate := 0.0
+	if registry != nil {
+		if p := registry.ByModel(model); p != nil {
+			if r := p.InputCostPer1KUSD(); r > 0 {
+				inputRate = r
+			}
+			outputRate = p.OutputCostPer1KUSD()
+		}
+	}
+
+	var in, out float64
+	if inputRate > 0 && inputTokens > 0 {
+		in = float64(inputTokens) * inputRate / 1000.0
+	}
+	if outputRate > 0 && outputTokens > 0 {
+		out = float64(outputTokens) * outputRate / 1000.0
+	}
+	return costEstimateResult{Total: in + out, InputCost: in, OutputCost: out}
 }
 
 // formatConfidence renders a [0,1] confidence as the X-Nexus-Route-

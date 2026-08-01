@@ -669,21 +669,18 @@ func TestNewVRAMLimiterContextCancelReleasesBlocked(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	errCh := make(chan error, 1)
+
+	// Set onWait BEFORE starting the waiter goroutine so the callback is
+	// guaranteed to be set when the goroutine checks it inside AcquireGPU.
+	// This eliminates the race where the goroutine passes the onWait check
+	// point before the main goroutine stores the callback (issue #925 flake).
+	ready := make(chan struct{})
+	l.onWait.Store(func() { close(ready) })
+
 	go func() {
 		_, gerr := l.AcquireGPU(ctx)
 		errCh <- gerr
 	}()
-
-	// The waiter signals on l.onWait (called just before cond.Wait()) so
-	// we know it has entered cond.Wait() before we call cancel(). This
-	// eliminates the scheduler-dependent sleep that caused flakiness.
-	// Issue #925: Use a barrier channel that the waiter closes to signal
-	// it has entered cond.Wait(). We also yield to the scheduler to ensure
-	// the waiter goroutine is actually blocked before we set onWait.
-	ready := make(chan struct{})
-	l.onWait.Store(func() { close(ready) })
-	runtime.Gosched()
-	runtime.Gosched() // Double yield to account for heavily-loaded CI
 
 	select {
 	case <-ready:
@@ -795,5 +792,52 @@ func TestNewVRAMLimiterNilFreeVRAMFallsBackToCeiling(t *testing.T) {
 	total := inflights[0] + inflights[1]
 	if total != 4 {
 		t.Errorf("total in-flight = %d, want 4 (ceil(4/2)=2 per GPU * 2 GPUs)", total)
+	}
+}
+
+// --- VRAM refresh regression (issue #1178) --------------------------------
+
+// TestLimiterEffectiveShrinksAfterVRAMRefresh is the regression test
+// mandated by issue #1178: the limiter must return a SMALLER Effective()
+// after a VRAM refresh reports reduced free VRAM. The limiter reads the
+// probe snapshot via its FreeVRAM closure on every Effective/Acquire, so
+// when the periodic NVIDIA refresh republishes a smaller FreeVRAMBytes
+// the limiter must react on the very next request without a restart.
+func TestLimiterEffectiveShrinksAfterVRAMRefresh(t *testing.T) {
+	ceiling := 8
+	bytesPerSlot := int64(1 << 30)        // 1 GiB
+	v, freeVRAM := vramFn(int64(8) << 30) // 8 GiB free initially
+	l := New(ceiling, bytesPerSlot, freeVRAM)
+
+	// 8 GiB / 1 GiB = 8 slots, capped to ceiling 8.
+	if eff := l.Effective(); eff != 8 {
+		t.Fatalf("initial Effective = %d, want 8 (8 GiB/1 GiB capped at ceiling)", eff)
+	}
+
+	// Simulate a VRAM refresh that reports reduced free VRAM
+	// (model swap / co-tenant grab / thermal throttle). 2 GiB free
+	// -> 2 slots, well below the ceiling.
+	v.Store(int64(2) << 30)
+	if eff := l.Effective(); eff != 2 {
+		t.Errorf("post-refresh Effective = %d, want 2 (2 GiB/1 GiB)", eff)
+	}
+}
+
+// TestLimiterEffectiveGrowsAfterVRAMRefresh confirms the symmetric case:
+// when a refresh reports MORE free VRAM the limiter widens Effective()
+// again, so freed-up VRAM is immediately usable (no stale clamp).
+func TestLimiterEffectiveGrowsAfterVRAMRefresh(t *testing.T) {
+	ceiling := 8
+	bytesPerSlot := int64(1 << 30)
+	v, freeVRAM := vramFn(int64(2) << 30) // 2 GiB free -> 2 slots
+	l := New(ceiling, bytesPerSlot, freeVRAM)
+
+	if eff := l.Effective(); eff != 2 {
+		t.Fatalf("initial Effective = %d, want 2", eff)
+	}
+
+	v.Store(int64(8) << 30)
+	if eff := l.Effective(); eff != 8 {
+		t.Errorf("post-refresh Effective = %d, want 8 (grew back to ceiling)", eff)
 	}
 }

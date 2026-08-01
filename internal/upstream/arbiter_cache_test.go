@@ -527,3 +527,111 @@ func TestArbiterCacheDeleteRemovesFromLRU(t *testing.T) {
 		t.Error("cache.Get miss for 'g', 'h', want hit")
 	}
 }
+
+// TestCacheKeyExported verifies the exported CacheKey wrapper matches the
+// internal cacheKey so callers (metrics recorder) compute the same hash
+// the cache uses (issue #1176).
+func TestCacheKeyExported(t *testing.T) {
+	r1, r2 := "alpha", "beta"
+	internal := cacheKey(r1, r2)
+	exported := CacheKey(r1, r2)
+	if internal != exported {
+		t.Fatal("CacheKey does not match cacheKey")
+	}
+	// Order independence
+	exportedRev := CacheKey(r2, r1)
+	if exported != exportedRev {
+		t.Fatal("CacheKey is not order-independent")
+	}
+}
+
+// TestArbiterCacheWarmPopulatesAndServes verifies that Warm inserts entries
+// that can be served by a subsequent Get (issue #1176).
+func TestArbiterCacheWarmPopulatesAndServes(t *testing.T) {
+	ttl := 5 * time.Minute
+	cache := NewArbiterCache(ttl, 0)
+
+	key := CacheKey("hello", "world")
+	entries := []ArbiterCacheWarmEntry{
+		{Key: key, Synthesis: "synthesized answer", WrittenAt: time.Now()},
+	}
+
+	loaded, skipped := cache.Warm(entries)
+	if loaded != 1 {
+		t.Fatalf("Warm loaded = %d, want 1", loaded)
+	}
+	if skipped != 0 {
+		t.Fatalf("Warm skippedStale = %d, want 0", skipped)
+	}
+
+	got, ok := cache.Get("hello", "world")
+	if !ok {
+		t.Fatal("cache.Get miss after Warm, want hit")
+	}
+	if got != "synthesized answer" {
+		t.Errorf("cache.Get returned %q, want %q", got, "synthesized answer")
+	}
+}
+
+// TestArbiterCacheWarmSkipsStale verifies that entries older than the
+// cache TTL are skipped during Warm (issue #1176).
+func TestArbiterCacheWarmSkipsStale(t *testing.T) {
+	ttl := 5 * time.Minute
+	cache := NewArbiterCache(ttl, 0)
+
+	key := CacheKey("old", "pair")
+	entries := []ArbiterCacheWarmEntry{
+		// Written 10 minutes ago, TTL is 5 minutes → stale
+		{Key: key, Synthesis: "old synthesis", WrittenAt: time.Now().Add(-10 * time.Minute)},
+	}
+
+	loaded, skipped := cache.Warm(entries)
+	if loaded != 0 {
+		t.Fatalf("Warm loaded = %d, want 0 (stale)", loaded)
+	}
+	if skipped != 1 {
+		t.Fatalf("Warm skippedStale = %d, want 1", skipped)
+	}
+
+	_, ok := cache.Get("old", "pair")
+	if ok {
+		t.Error("cache.Get hit for stale entry, want miss")
+	}
+}
+
+// TestArbiterCacheWarmNilCache verifies the nil-safe contract.
+func TestArbiterCacheWarmNilCache(t *testing.T) {
+	var cache *ArbiterCache
+	loaded, skipped := cache.Warm(nil)
+	if loaded != 0 || skipped != 0 {
+		t.Fatalf("Warm on nil cache: loaded=%d skipped=%d, want 0/0", loaded, skipped)
+	}
+}
+
+// TestArbiterCacheWarmRespectsMaxEntries verifies that LRU eviction
+// fires during Warm when the cache exceeds capacity (issue #1176).
+func TestArbiterCacheWarmRespectsMaxEntries(t *testing.T) {
+	ttl := 5 * time.Minute
+	cache := NewArbiterCache(ttl, 2) // small cap
+
+	now := time.Now()
+	entries := []ArbiterCacheWarmEntry{
+		{Key: CacheKey("a1", "b1"), Synthesis: "s1", WrittenAt: now},
+		{Key: CacheKey("a2", "b2"), Synthesis: "s2", WrittenAt: now},
+		{Key: CacheKey("a3", "b3"), Synthesis: "s3", WrittenAt: now},
+	}
+
+	loaded, _ := cache.Warm(entries)
+	if loaded != 3 {
+		t.Fatalf("Warm loaded = %d, want 3", loaded)
+	}
+	// Capacity is 2, but Warm inserts one at a time, evicting as it goes
+	if cache.Len() > 2 {
+		t.Errorf("cache.Len() = %d, want <= 2 (maxEntries)", cache.Len())
+	}
+	// The first entry should have been evicted (LRU)
+	_, ok := cache.Get("a1", "b1")
+	if ok {
+		t.Error("cache.Get hit for 'a1','b1' which should have been evicted")
+	}
+}

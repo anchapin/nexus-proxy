@@ -62,6 +62,11 @@ func (s *stubConf) LocalConfidence(category string) (float64, error) {
 	return s.value, nil
 }
 
+func (s *stubConf) ComparativeConfidence(category string) (float64, float64, error) {
+	s.queried = append(s.queried, category)
+	return s.value, NeutralConfidence, nil
+}
+
 // formattingPatterns matches the handler's NEXUS_DSL_FORMATTING_PATTERNS default.
 var formattingPatterns = []*regexp.Regexp{regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`)}
 
@@ -83,6 +88,7 @@ func TestDecisionSourceTraceReason(t *testing.T) {
 		{name: "slm error", source: SourceSLMError, want: "slm-error"},
 		{name: "slm no client", source: SourceEscalation, want: "slm-no-client"},
 		{name: "slm low confidence", source: SourceSLMEscalation, want: "slm-low-confidence"},
+		{name: "budget down tier", source: SourceBudgetDownTier, want: "budget-down-tier"},
 	}
 
 	for _, tt := range tests {
@@ -603,6 +609,10 @@ func (s *errorStubConf) LocalConfidence(category string) (float64, error) {
 	return NeutralConfidence, s.err
 }
 
+func (s *errorStubConf) ComparativeConfidence(category string) (float64, float64, error) {
+	return NeutralConfidence, NeutralConfidence, s.err
+}
+
 // TestPlanner_NilConfidenceTaskType verifies issue #441: every decision
 // reaching the SLM stage must have a non-empty TaskType even when no
 // ConfidenceStore is wired. This ensures Prometheus and JSONL telemetry
@@ -954,4 +964,137 @@ func stringOf(b byte, n int) string {
 		buf[i] = b
 	}
 	return string(buf)
+}
+
+// stubBudget is a deterministic BudgetChecker for planner tests (issue #1163).
+type stubBudget struct {
+	remaining   float64
+	wouldExceed bool
+}
+
+func (s *stubBudget) Remaining() float64       { return s.remaining }
+func (s *stubBudget) WouldExceed(float64) bool { return s.wouldExceed }
+
+// TestPlanner_BudgetDownTier verifies that when the budget checker
+// reports the estimated frontier cost would exceed the remaining
+// budget, the planner down-tiers to RouteLocal with Source
+// SourceBudgetDownTier (issue #1163).
+func TestPlanner_BudgetDownTier(t *testing.T) {
+	slm := &stubSLM{route: RouteFrontier}
+	p := &Planner{
+		SLM:                slm,
+		FusionPatterns:     fusionPatterns,
+		FormattingRegex:    formattingPatterns,
+		LocalPatternsRegex: localPatterns,
+		Budget:             &stubBudget{remaining: 0.01, wouldExceed: true},
+		FrontierCostPer1K:  0.005,
+	}
+	req := PlanRequest{
+		Prompt:          "explain quantum computing in detail", // no DSL match
+		GuardrailBudget: 6000,
+		GuardrailSource: "static-fallback",
+		Context:         context.Background(),
+	}
+	dec := p.Plan(req)
+
+	if dec.Route != RouteLocal {
+		t.Errorf("Route = %q, want local (budget exhausted)", dec.Route)
+	}
+	if dec.Source != SourceBudgetDownTier {
+		t.Errorf("Source = %q, want %q", dec.Source, SourceBudgetDownTier)
+	}
+	if dec.Reason != "budget-exhausted" {
+		t.Errorf("Reason = %q, want budget-exhausted", dec.Reason)
+	}
+	if slm.calledDecide || slm.calledWithConf {
+		t.Error("SLM should not be called when budget down-tiers")
+	}
+}
+
+// TestPlanner_BudgetHealthyNoDownTier verifies that when the budget is
+// healthy, the planner routes normally — no down-tier (issue #1163).
+func TestPlanner_BudgetHealthyNoDownTier(t *testing.T) {
+	slm := &stubSLM{route: RouteFrontier}
+	p := &Planner{
+		SLM:                slm,
+		FusionPatterns:     fusionPatterns,
+		FormattingRegex:    formattingPatterns,
+		LocalPatternsRegex: localPatterns,
+		Budget:             &stubBudget{remaining: 50.0, wouldExceed: false},
+		FrontierCostPer1K:  0.005,
+	}
+	req := PlanRequest{
+		Prompt:          "explain quantum computing in detail",
+		GuardrailBudget: 6000,
+		GuardrailSource: "static-fallback",
+		Context:         context.Background(),
+	}
+	dec := p.Plan(req)
+
+	if dec.Route != RouteFrontier {
+		t.Errorf("Route = %q, want frontier (budget healthy)", dec.Route)
+	}
+	if dec.Source != SourceSLM {
+		t.Errorf("Source = %q, want %q", dec.Source, SourceSLM)
+	}
+}
+
+// TestPlanner_GuardrailPrecedenceOverBudget verifies that the VRAM
+// guardrail takes precedence over the budget check — even when the
+// budget is exhausted, an oversized prompt still routes to frontier
+// (issue #1163).
+func TestPlanner_GuardrailPrecedenceOverBudget(t *testing.T) {
+	slm := &stubSLM{route: RouteLocal}
+	p := &Planner{
+		SLM:                slm,
+		FusionPatterns:     fusionPatterns,
+		FormattingRegex:    formattingPatterns,
+		LocalPatternsRegex: localPatterns,
+		Budget:             &stubBudget{remaining: 0.0, wouldExceed: true},
+		FrontierCostPer1K:  0.005,
+	}
+	req := PlanRequest{
+		// 50000 'a's = 6250 tokens > 6000 guardrail budget.
+		Prompt:          stringOf('a', 50000),
+		GuardrailBudget: 6000,
+		GuardrailSource: "static-fallback",
+		Context:         context.Background(),
+	}
+	dec := p.Plan(req)
+
+	if dec.Route != RouteFrontier {
+		t.Errorf("Route = %q, want frontier (VRAM guardrail wins)", dec.Route)
+	}
+	if dec.Source != SourceGuardrail {
+		t.Errorf("Source = %q, want %q", dec.Source, SourceGuardrail)
+	}
+}
+
+// TestPlanner_NilBudgetCheckerBackwardCompat verifies that when no
+// BudgetChecker is wired, the planner behaves exactly as before
+// (backward compatible) — no budget stage runs (issue #1163).
+func TestPlanner_NilBudgetCheckerBackwardCompat(t *testing.T) {
+	slm := &stubSLM{route: RouteFrontier}
+	p := &Planner{
+		SLM:                slm,
+		FusionPatterns:     fusionPatterns,
+		FormattingRegex:    formattingPatterns,
+		LocalPatternsRegex: localPatterns,
+		Budget:             nil, // disabled
+		FrontierCostPer1K:  0.005,
+	}
+	req := PlanRequest{
+		Prompt:          "explain quantum computing in detail",
+		GuardrailBudget: 6000,
+		GuardrailSource: "static-fallback",
+		Context:         context.Background(),
+	}
+	dec := p.Plan(req)
+
+	if dec.Route != RouteFrontier {
+		t.Errorf("Route = %q, want frontier (nil BudgetChecker)", dec.Route)
+	}
+	if dec.Source != SourceSLM {
+		t.Errorf("Source = %q, want %q", dec.Source, SourceSLM)
+	}
 }

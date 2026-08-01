@@ -522,7 +522,8 @@ func TestPanelArbiterTimeoutBoundsHangingCall(t *testing.T) {
 		arbiterSrv.URL+"/v1/chat/completions", "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, // perFetchTimeout (panel members)
+		5*time.Second, // localFetchTimeout
+		5*time.Second, // frontierFetchTimeout
 		arbiterTO,     // arbiterTimeout
 		false,         // skipLocal
 		"test-request-id",
@@ -542,6 +543,116 @@ func TestPanelArbiterTimeoutBoundsHangingCall(t *testing.T) {
 	if elapsed > 5*arbiterTO {
 		t.Errorf("Panel took %v with arbiter timeout %v; expected <%v",
 			elapsed, arbiterTO, 5*arbiterTO)
+	}
+}
+
+// TestPanelLocalTimeoutBoundsLocalMember verifies that the local member
+// is bounded by localFetchTimeout, not the frontier timeout (issue #1164).
+// The frontier server responds instantly while the local server blocks.
+// The local fetch must complete within ~localFetchTimeout, not the
+// (larger) frontierFetchTimeout.
+func TestPanelLocalTimeoutBoundsLocalMember(t *testing.T) {
+	localSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+	}))
+	defer localSrv.Close()
+
+	frontierSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier reply"}}]}`)
+	}))
+	defer frontierSrv.Close()
+
+	arbiterSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"synth"}}]}`)
+	}))
+	defer arbiterSrv.Close()
+
+	const localTO = 200 * time.Millisecond
+	start := time.Now()
+	_, _, err := Panel(
+		context.Background(), newSSERW(), http.DefaultClient,
+		localSrv.URL, "local-m",
+		frontierSrv.URL, "", "frontier-m",
+		arbiterSrv.URL+"/v1/chat/completions", "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		localTO,        // localFetchTimeout — short
+		10*time.Second, // frontierFetchTimeout — deliberately large
+		5*time.Second,  // arbiterTimeout
+		false,          // skipLocal
+		"test-request-id",
+		nil, 0*time.Second,
+		false, // isFusion
+	)
+	elapsed := time.Since(start)
+
+	// The arbiter must have received the local error and still synthesized
+	// from the frontier alone. We don't assert on err==nil because Panel
+	// streams the arbiter reply and may return nil.
+	_ = err
+
+	// The local timeout (200ms) must have fired well before the frontier
+	// timeout (10s). Allow generous CI slack.
+	if elapsed > 2*time.Second {
+		t.Errorf("Panel took %v; local timeout %v should have bounded it, not the %v frontier timeout",
+			elapsed, localTO, 10*time.Second)
+	}
+}
+
+// TestPanelFrontierTimeoutBoundsFrontierMember verifies that the frontier
+// member is bounded by frontierFetchTimeout, not the local timeout (issue #1164).
+func TestPanelFrontierTimeoutBoundsFrontierMember(t *testing.T) {
+	localSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local reply"}}]}`)
+	}))
+	defer localSrv.Close()
+
+	frontierSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+	}))
+	defer frontierSrv.Close()
+
+	arbiterSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"synth"}}]}`)
+	}))
+	defer arbiterSrv.Close()
+
+	const frontierTO = 200 * time.Millisecond
+	start := time.Now()
+	_, _, err := Panel(
+		context.Background(), newSSERW(), http.DefaultClient,
+		localSrv.URL, "local-m",
+		frontierSrv.URL, "", "frontier-m",
+		arbiterSrv.URL+"/v1/chat/completions", "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		10*time.Second, // localFetchTimeout — deliberately large
+		frontierTO,     // frontierFetchTimeout — short
+		5*time.Second,  // arbiterTimeout
+		false,          // skipLocal
+		"test-request-id",
+		nil, 0*time.Second,
+		false, // isFusion
+	)
+	elapsed := time.Since(start)
+
+	_ = err
+
+	if elapsed > 2*time.Second {
+		t.Errorf("Panel took %v; frontier timeout %v should have bounded it, not the %v local timeout",
+			elapsed, frontierTO, 10*time.Second)
 	}
 }
 
@@ -579,7 +690,8 @@ func TestPanelArbiterHappyPathNoRegression(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, // perFetchTimeout
+		5*time.Second, // localFetchTimeout
+		5*time.Second, // frontierFetchTimeout
 		5*time.Second, // arbiterTimeout
 		false,         // skipLocal
 		"test-request-id",
@@ -637,7 +749,8 @@ func TestPanelSkipLocalOmitsLocalFetch(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, // perFetchTimeout
+		5*time.Second, // localFetchTimeout
+		5*time.Second, // frontierFetchTimeout
 		5*time.Second, // arbiterTimeout
 		true,          // skipLocal
 		"test-request-id",
@@ -690,7 +803,7 @@ func TestPanelSkipLocalArbiterPromptHasDegradedMarker(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"the user prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		true, // skipLocal
 		"test-request-id",
 		nil, 0*time.Second,
@@ -1015,6 +1128,7 @@ func TestPanelArbiterHonorsStreamFlagFalse(t *testing.T) {
 		"test prompt",
 		5*time.Second,
 		5*time.Second,
+		5*time.Second,
 		false, // skipLocal (issue #8)
 		"test-request-id",
 		nil, 0*time.Second,
@@ -1079,6 +1193,7 @@ func TestPanelArbiterHonorsStreamFlagTrueRegression(t *testing.T) {
 		"test prompt",
 		5*time.Second,
 		5*time.Second,
+		5*time.Second,
 		false, // skipLocal (issue #8)
 		"test-request-id",
 		nil, 0*time.Second,
@@ -1127,7 +1242,7 @@ func TestPanelForwardsFrontierBearerToken(t *testing.T) {
 		"http://arbiter.local/v1/chat/completions", "sk-arbiter-key", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, "test-request-id", nil, 0*time.Second,
 		false, // isFusion
 	); err != nil {
@@ -1180,7 +1295,8 @@ func TestPanelStreamingAgreementSkipsArbiter(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, // perFetchTimeout
+		5*time.Second, // localFetchTimeout
+		5*time.Second, // frontierFetchTimeout
 		5*time.Second, // arbiterTimeout
 		false,         // skipLocal
 		0.85,          // agreementThreshold
@@ -1287,7 +1403,8 @@ func TestPanelStreamingAgreementCancelsSlowMember(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, // perFetchTimeout
+		5*time.Second, // localFetchTimeout
+		5*time.Second, // frontierFetchTimeout
 		5*time.Second, // arbiterTimeout
 		false,         // skipLocal
 		0.85,          // agreementThreshold
@@ -1327,6 +1444,49 @@ func TestPanelStreamingAgreementCancelsSlowMember(t *testing.T) {
 	}
 }
 
+// TestPanelStreamingFrontierTimeoutBoundsFrontierMember verifies that the
+// frontier member in PanelStreaming is bounded by frontierFetchTimeout, not
+// the local timeout (issue #1164).
+func TestPanelStreamingFrontierTimeoutBoundsFrontierMember(t *testing.T) {
+	localSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local reply"}}]}`)
+	}))
+	defer localSrv.Close()
+
+	frontierSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+	}))
+	defer frontierSrv.Close()
+
+	const frontierTO = 200 * time.Millisecond
+	start := time.Now()
+	_, _ = PanelStreaming(
+		context.Background(), newSSERW(), http.DefaultClient,
+		localSrv.URL, "local-m",
+		frontierSrv.URL, "", "frontier-m",
+		frontierSrv.URL, "", "frontier-m", // arbiter = frontier (won't be reached)
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		10*time.Second, // localFetchTimeout — deliberately large
+		frontierTO,     // frontierFetchTimeout — short
+		5*time.Second,  // arbiterTimeout
+		false,          // skipLocal
+		0.85,           // agreementThreshold
+		"test-request-id",
+		nil, 0*time.Second,
+	)
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Errorf("PanelStreaming took %v; frontier timeout %v should have bounded it, not the %v local timeout",
+			elapsed, frontierTO, 10*time.Second)
+	}
+}
+
 // TestPanelStreamingDisagreementRunsArbiter exercises the second
 // branch of issue #48's progressive delivery: when the two panel
 // members diverge (similarity < threshold), the speculative answer is
@@ -1362,6 +1522,7 @@ func TestPanelStreamingDisagreementRunsArbiter(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
+		5*time.Second,
 		5*time.Second,
 		5*time.Second,
 		false,
@@ -1451,6 +1612,7 @@ func TestPanelStreamingArbiterCtxFromRequest(t *testing.T) {
 		"test prompt",
 		5*time.Second,
 		5*time.Second,
+		5*time.Second,
 		false,
 		0.85,
 		"test-request-id",
@@ -1496,7 +1658,7 @@ func TestPanelStreamingDegradedSkipLocal(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		true, // skipLocal
 		0.85,
 		"test-request-id",
@@ -1560,7 +1722,7 @@ func TestPanelStreamingOneMemberFailedSkipsArbiter(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
@@ -1612,7 +1774,7 @@ func TestPanelStreamingBothMembersFailedSurfacesError(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
@@ -1678,7 +1840,7 @@ func TestPanelStreamingHonorsStreamFalseFallsBackToPanel(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}, "stream": false},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
@@ -1745,7 +1907,7 @@ func TestPanelStreamingThresholdClamping(t *testing.T) {
 			arbiterURL, "", "arbiter-m",
 			map[string]interface{}{"messages": []interface{}{}},
 			"test prompt",
-			5*time.Second, 5*time.Second,
+			5*time.Second, 5*time.Second, 5*time.Second,
 			false,
 			-1.0, // negative: clamped to 0 → "always skip when both succeed"
 			"test-request-id",
@@ -1791,7 +1953,7 @@ func TestPanelStreamingThresholdClamping(t *testing.T) {
 			arbiterURL, "", "arbiter-m",
 			map[string]interface{}{"messages": []interface{}{}},
 			"test prompt",
-			5*time.Second, 5*time.Second,
+			5*time.Second, 5*time.Second, 5*time.Second,
 			false,
 			2.0, // >1: clamps to 1 → only identical content skips
 			"test-request-id",
@@ -1842,7 +2004,7 @@ func TestPanelStreamingSpeculativeSourceIdentified(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
@@ -1892,7 +2054,7 @@ func TestPanelStreamingSetsProgressiveHeader(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
@@ -1943,7 +2105,7 @@ func TestPanelStreamingToolCallWinnerSkipsArbiter(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
@@ -2082,7 +2244,7 @@ func TestPanelStreamingClientAbortSkipsArbiter(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85, "test-request",
 		nil, 0*time.Second,
 	)
@@ -2140,7 +2302,7 @@ func TestFusionClientAbortTotalIncrementsSpeculative(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85, "test-request",
 		nil, 0*time.Second,
 	)
@@ -2211,7 +2373,7 @@ func TestPanelStreamingForwardsFrontierBearerToken(t *testing.T) {
 		"http://arbiter.local/v1/chat/completions", "sk-arbiter-key", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85, "test-request",
 		nil, 0*time.Second,
 	)
@@ -2360,7 +2522,7 @@ func TestPanelCacheHitStream_SetsSSEContentType(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}, "stream": true},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false,
 		"test-request-id",
 		cache, 5*time.Minute,
@@ -2429,7 +2591,7 @@ func TestPanelCacheMissWithExpiredEntry_FallsBackToFetch(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}, "stream": true},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false,
 		"test-request-id",
 		cache, 1*time.Millisecond,
@@ -2487,7 +2649,7 @@ func TestPanelCacheHitNonStream_SetsJSONContentType(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}, "stream": false},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false,
 		"test-request-id",
 		cache, 5*time.Minute,
@@ -2842,6 +3004,7 @@ func TestPanel_MalformedArbiterEmptyChoices_ReturnsError(t *testing.T) {
 		"test prompt",
 		5*time.Second,
 		5*time.Second,
+		5*time.Second,
 		false,
 		"test-request-id",
 		nil, 0*time.Second,
@@ -2888,6 +3051,7 @@ func TestPanel_ValidArbiterResponse_ReturnsNoError(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}, "stream": false},
 		"test prompt",
+		5*time.Second,
 		5*time.Second,
 		5*time.Second,
 		false,
@@ -2941,7 +3105,7 @@ func TestPanel_CacheHit_ReturnsNoError(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}, "stream": false},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false,
 		"test-request-id",
 		cache, 5*time.Minute,

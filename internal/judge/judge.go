@@ -65,6 +65,17 @@ type Sample struct {
 	// the correct route instead of always defaulting to RouteLocal.
 	Route string
 
+	// RAGInjected reports whether a RAG few-shot snippet was injected
+	// into the prompt for this request (issue #1167). Carried through
+	// to JudgeScore so the correlation metrics can partition quality
+	// scores by injected=true|false.
+	RAGInjected bool
+
+	// RAGSimilarity is the cosine-similarity score of the best RAG
+	// match (0 when RAG was not injected). Persisted alongside the
+	// judge score for offline retrieval-effectiveness analysis (issue #1167).
+	RAGSimilarity float64
+
 	// TraceParent and TraceState carry the W3C trace context from the
 	// inbound request so the async worker can create a child span (issue #233).
 	TraceParent string
@@ -89,6 +100,17 @@ type JudgeScore struct {
 	// scored. This lets the confidenceBridge record the outcome against
 	// the correct route instead of always defaulting to RouteLocal (issue #970).
 	Route string
+
+	// RAGInjected reports whether a RAG few-shot snippet was injected
+	// into the prompt for the request that produced this score (issue #1167).
+	// Populated from Sample.RAGInjected so Prometheus metrics can
+	// partition quality scores by injected=true|false.
+	RAGInjected bool
+
+	// RAGSimilarity is the cosine-similarity score of the best RAG
+	// match (0 when RAG was not injected). Persisted for offline
+	// retrieval-effectiveness analysis (issue #1167).
+	RAGSimilarity float64
 }
 
 // Storage persists JudgeScore records. A future PR will supply a
@@ -109,15 +131,16 @@ type HTTPClient interface {
 // NewEvaluator so callers can construct an evaluator from a partial
 // config without exploding.
 type Config struct {
-	URL         string        // frontier endpoint for judge calls
-	Model       string        // judge model name
-	APIKey      string        // bearer token; empty = no Authorization header
-	SampleRate  float64       // 0..1; <=0 disables sampling
-	Concurrency int           // max parallel judge calls (default 2)
-	QueueDepth  int           // buffered channel size (default 64)
-	Timeout     time.Duration // per-call judge timeout (default 30s)
-	CostPer1K   float64       // USD per 1k tokens (input+output); default 0.002
-	BudgetGuard *budget.Guard // optional budget guard to record judge costs
+	URL                string        // frontier endpoint for judge calls
+	Model              string        // judge model name
+	APIKey             string        // bearer token; empty = no Authorization header
+	SampleRate         float64       // 0..1; <=0 disables sampling (local route)
+	FrontierSampleRate float64       // 0..1; fraction of frontier completions to judge (issue #1162)
+	Concurrency        int           // max parallel judge calls (default 2)
+	QueueDepth         int           // buffered channel size (default 64)
+	Timeout            time.Duration // per-call judge timeout (default 30s)
+	CostPer1K          float64       // USD per 1k tokens (input+output); default 0.002
+	BudgetGuard        *budget.Guard // optional budget guard to record judge costs
 }
 
 // applyDefaults fills zero fields with sane values. It mutates cfg.
@@ -156,11 +179,25 @@ type Evaluator struct {
 	// across observability surfaces (issue #111).
 	dropped atomic.Uint64
 
+	// frontierSampled counts frontier completions that passed the
+	// frontier sample rate gate (issue #1162). Exposed via
+	// FrontierSampled() for the Prometheus counter
+	// nexus_judge_frontier_sampled_total.
+	frontierSampled atomic.Uint64
+
 	// onDrop is an optional callback invoked atomically once per
 	// dropped sample. The callback receives the running total of
 	// drops so callers can feed a Prometheus counter without
 	// polling.
 	onDrop func(uint64)
+
+	// onScore is an optional callback invoked after each judge attempt
+	// completes (success or failure). Callers use it to feed
+	// Prometheus metrics — notably the RAG-vs-quality correlation
+	// metrics (issue #1167). The callback receives the final
+	// JudgeScore; it is invoked synchronously on the worker goroutine,
+	// so keep it cheap (e.g. a handful of atomic increments).
+	onScore func(JudgeScore)
 }
 
 // newSeededRand returns a *rand.Rand seeded from a cryptographic
@@ -246,6 +283,16 @@ func (e *Evaluator) SetDropCallback(fn func(uint64)) {
 	e.onDrop = fn
 }
 
+// SetScoreCallback registers an optional callback invoked after each
+// judge attempt completes. The callback receives the resulting
+// JudgeScore (success or failure) and is called synchronously on the
+// worker goroutine — keep it cheap (e.g. a handful of atomic
+// increments). Pass nil to clear. Used to feed Prometheus metrics
+// such as the RAG-vs-quality correlation (issue #1167).
+func (e *Evaluator) SetScoreCallback(fn func(JudgeScore)) {
+	e.onScore = fn
+}
+
 // Sample returns true if a fresh request should be enqueued for judge
 // evaluation, given the configured sample rate. It is the canonical
 // "Sample" entry point listed in the issue's acceptance criteria.
@@ -259,6 +306,37 @@ func (e *Evaluator) Sample() bool {
 	r := e.rng.Float64()
 	e.rngMu.Unlock()
 	return r < e.cfg.SampleRate
+}
+
+// SampleFrontier returns true if a frontier-route completion should be
+// enqueued for judge evaluation (issue #1162). It uses the separate
+// FrontierSampleRate (default 0.02) which is lower than the local
+// SampleRate (default 0.1) because frontier completions are more
+// expensive to replicate. Returns false when FrontierSampleRate <= 0.
+//
+// SampleFrontier is safe to call from many goroutines concurrently.
+func (e *Evaluator) SampleFrontier() bool {
+	if e == nil || e.cfg.FrontierSampleRate <= 0 {
+		return false
+	}
+	e.rngMu.Lock()
+	r := e.rng.Float64()
+	e.rngMu.Unlock()
+	if r < e.cfg.FrontierSampleRate {
+		e.frontierSampled.Add(1)
+		return true
+	}
+	return false
+}
+
+// FrontierSampled returns the total number of frontier completions that
+// passed the frontier sample rate gate. Monotonically increasing and
+// safe to read from any goroutine.
+func (e *Evaluator) FrontierSampled() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.frontierSampled.Load()
 }
 
 // Enqueue is the non-blocking submit used by the chat handler. It is
@@ -323,6 +401,13 @@ func (e *Evaluator) worker() {
 		if e.cfg.BudgetGuard != nil && score.Cost > 0 {
 			e.cfg.BudgetGuard.Record(context.Background(), score.Cost, "judge")
 		}
+		// Notify the optional score callback so observability metrics
+		// (e.g. RAG-vs-quality correlation, issue #1167) can record the
+		// outcome. Invoked after persistence so the callback sees the
+		// final score even if storage.Record logged an error.
+		if e.onScore != nil {
+			e.onScore(score)
+		}
 	}
 }
 
@@ -345,7 +430,13 @@ func (e *Evaluator) evaluate(s Sample) JudgeScore {
 }
 
 func (e *Evaluator) evaluateCtx(ctx context.Context, s Sample) JudgeScore {
-	score := JudgeScore{RequestID: s.RequestID, Timestamp: time.Now().UTC(), Route: s.Route}
+	score := JudgeScore{
+		RequestID:     s.RequestID,
+		Timestamp:     time.Now().UTC(),
+		Route:         s.Route,
+		RAGInjected:   s.RAGInjected,
+		RAGSimilarity: s.RAGSimilarity,
+	}
 
 	prompt := PromptFor(s)
 	// Use a struct so the JSON field order is deterministic — Go's
