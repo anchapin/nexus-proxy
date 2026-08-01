@@ -54,7 +54,7 @@ func runRoutePatterns(_ []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "nexus route patterns: %v\n", err)
 		return 0
 	}
-	defer promoter.Close()
+	defer func() { _ = promoter.Close() }()
 
 	patterns := promoter.PromotedPatterns()
 	if len(patterns) == 0 {
