@@ -1796,7 +1796,9 @@ func Chat(d Deps) http.Handler {
 					d.Config.OllamaURL, d.Config.LocalModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
-					body, latestPrompt, d.Config.FusionTimeout,
+					body, latestPrompt,
+					effectiveFusionTimeout(d.Config.FusionLocalTimeout, d.Config.FusionTimeout),
+					effectiveFusionTimeout(d.Config.FusionFrontierTimeout, d.Config.FusionTimeout),
 					d.Config.ArbiterTimeout,
 					skipLocal,
 					d.Config.FusionAgreementThreshold,
@@ -1834,7 +1836,9 @@ func Chat(d Deps) http.Handler {
 					d.Config.OllamaURL, d.Config.LocalModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
-					body, latestPrompt, d.Config.FusionTimeout,
+					body, latestPrompt,
+					effectiveFusionTimeout(d.Config.FusionLocalTimeout, d.Config.FusionTimeout),
+					effectiveFusionTimeout(d.Config.FusionFrontierTimeout, d.Config.FusionTimeout),
 					d.Config.ArbiterTimeout,
 					skipLocal,
 					reqID,
@@ -2509,6 +2513,16 @@ type captureWriter struct {
 	cap      int
 	buf      strings.Builder
 	overflow bool
+}
+
+// effectiveFusionTimeout returns the per-member timeout, falling back to
+// the shared FusionTimeout when the member-specific value is zero/unset
+// (issue #1164 backward compatibility).
+func effectiveFusionTimeout(specific, fallback time.Duration) time.Duration {
+	if specific > 0 {
+		return specific
+	}
+	return fallback
 }
 
 // newCaptureWriter wires a captureWriter around w with the given

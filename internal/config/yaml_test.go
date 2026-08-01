@@ -38,6 +38,12 @@ func TestLoadYAMLDefaults(t *testing.T) {
 	if cfg.FusionTimeout != 120*time.Second {
 		t.Errorf("FusionTimeout = %v, want 120s", cfg.FusionTimeout)
 	}
+	if cfg.FusionLocalTimeout != 90*time.Second {
+		t.Errorf("FusionLocalTimeout = %v, want 90s", cfg.FusionLocalTimeout)
+	}
+	if cfg.FusionFrontierTimeout != 30*time.Second {
+		t.Errorf("FusionFrontierTimeout = %v, want 30s", cfg.FusionFrontierTimeout)
+	}
 	if cfg.ArbiterTimeout != 60*time.Second {
 		t.Errorf("ArbiterTimeout = %v, want 60s", cfg.ArbiterTimeout)
 	}
@@ -84,6 +90,8 @@ zai_api_key: "zai-yaml-key"
 token_guardrail: 8000
 slm_timeout: "12s"
 fusion_timeout: "180s"
+fusion_local_timeout: "150s"
+fusion_frontier_timeout: "60s"
 cascade_timeout: "45s"
 cascade_timeout_floor: "10s"
 cascade_timeout_ceiling: "180s"
@@ -152,6 +160,12 @@ auth_rate_limit_window: "3m"
 	}
 	if cfg.FusionTimeout != 180*time.Second {
 		t.Errorf("FusionTimeout = %v", cfg.FusionTimeout)
+	}
+	if cfg.FusionLocalTimeout != 150*time.Second {
+		t.Errorf("FusionLocalTimeout = %v, want 150s", cfg.FusionLocalTimeout)
+	}
+	if cfg.FusionFrontierTimeout != 60*time.Second {
+		t.Errorf("FusionFrontierTimeout = %v, want 60s", cfg.FusionFrontierTimeout)
 	}
 	if cfg.CascadeTimeout != 45*time.Second {
 		t.Errorf("CascadeTimeout = %v", cfg.CascadeTimeout)
@@ -248,6 +262,8 @@ frontier_api_key: "sk-yaml-key"
 	t.Setenv("NEXUS_TOKEN_GUARDRAIL", "10000")
 	t.Setenv("NEXUS_SLM_TIMEOUT", "20s")
 	t.Setenv("NEXUS_FUSION_TIMEOUT", "240s")
+	t.Setenv("NEXUS_FUSION_LOCAL_TIMEOUT", "120s")
+	t.Setenv("NEXUS_FUSION_FRONTIER_TIMEOUT", "20s")
 	t.Setenv("NEXUS_FRONTIER_API_KEY", "sk-env-key")
 
 	cfg, err := LoadYAML(path)
@@ -268,6 +284,12 @@ frontier_api_key: "sk-yaml-key"
 	}
 	if cfg.FusionTimeout != 240*time.Second {
 		t.Errorf("FusionTimeout = %v, want 240s", cfg.FusionTimeout)
+	}
+	if cfg.FusionLocalTimeout != 120*time.Second {
+		t.Errorf("FusionLocalTimeout = %v, want 120s (env overrides YAML default)", cfg.FusionLocalTimeout)
+	}
+	if cfg.FusionFrontierTimeout != 20*time.Second {
+		t.Errorf("FusionFrontierTimeout = %v, want 20s (env overrides YAML default)", cfg.FusionFrontierTimeout)
 	}
 	if cfg.FrontierKey != "sk-env-key" {
 		t.Errorf("FrontierKey = %q, want sk-env-key (env overrides YAML)", cfg.FrontierKey)
