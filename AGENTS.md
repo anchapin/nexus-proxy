@@ -345,6 +345,23 @@ event shape.
 Config validation rejects an unknown `type` at boot
 (`LoadFromEnv` / `nexus config validate` both enforce the closed set).
 
+## Per-provider cost model (issue #1183)
+
+`NEXUS_COST_USE_OUTPUT_TOKENS` (default `false`) switches the per-request
+cost estimate from the legacy flat input-only rate to a per-provider
+input/output token split. When enabled, `frontierCostEstimate` looks up the
+serving provider via `ProviderRegistry.ByModel(model)` and computes
+`inputTokens*inputRate/1000 + outputTokens*outputRate/1000`, counting output
+tokens with the tiktoken tokenizer. When disabled (default), the estimate is
+byte-for-byte identical to the pre-issue-#1183 single-rate path.
+
+`NEXUS_FRONTIER_PROVIDERS` JSON entries accept `inputCostPer1K` and
+`outputCostPer1K` (the flat `costPer1K` still parses and seeds the input rate
+when the split keys are absent). `ProviderConfig` exposes
+`InputCostPer1KUSD()` / `OutputCostPer1KUSD()`; `CostPer1KUSD()` is retained
+as the selector weight. The metrics row surfaces `input_cost_usd` and
+`output_cost_usd` as distinct SQLite columns.
+
 ## Adding new env vars
 
 Config env vars are split across two files. New vars need **both**:

@@ -66,6 +66,9 @@ type YAMLConfig struct {
 	CostBaselineModel     string  `yaml:"cost_baseline_model"`
 	CostBaselineRatePer1K float64 `yaml:"cost_baseline_rate_per_1k"`
 
+	// Per-provider cost model (issue #1183)
+	CostUseOutputTokens bool `yaml:"cost_use_output_tokens"`
+
 	// Budget
 	BudgetDailyLimit      float64 `yaml:"budget_daily_limit"`
 	BudgetAlertEnabled    bool    `yaml:"budget_alert_enabled"`
@@ -446,6 +449,11 @@ func LoadYAML(path string) (Config, error) {
 			f = 0
 		}
 		cfg.CostBaselineRatePer1K = f
+	}
+
+	// Per-provider cost model with input/output token split (issue #1183).
+	if v := os.Getenv("NEXUS_COST_USE_OUTPUT_TOKENS"); v != "" {
+		cfg.CostUseOutputTokens = parseBoolEnvStr(v, false)
 	}
 
 	// Budget
@@ -1271,6 +1279,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		CostBaselineProvider:  yc.stringDefault(yc.CostBaselineProvider, "frontier"),
 		CostBaselineModel:     yc.stringDefault(yc.CostBaselineModel, ""),   // Falls back to FrontierModel later
 		CostBaselineRatePer1K: yc.floatDefault(yc.CostBaselineRatePer1K, 0), // Falls back to FrontierCostPer1K later
+		CostUseOutputTokens:   yc.boolFieldDefault(yc.CostUseOutputTokens, false),
 
 		QualityConcurrency:     yc.intDefault(yc.QualityConcurrency, 2),
 		QualityQueueDepth:      yc.intDefault(yc.QualityQueueDepth, 64),

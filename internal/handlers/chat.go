@@ -447,6 +447,13 @@ type MetricsEvent struct {
 	RAGCacheHit      bool // true when the RAG embedding was served from the embed cache (issue #227)
 	EstimatedCostUSD float64
 
+	// InputCostUSD / OutputCostUSD break the EstimatedCostUSD total into
+	// the input-token and output-token components (issue #1183). When
+	// NEXUS_COST_USE_OUTPUT_TOKENS is false the output component is zero
+	// and InputCostUSD equals EstimatedCostUSD (legacy flat-rate path).
+	InputCostUSD  float64
+	OutputCostUSD float64
+
 	// BaselineCostUSD is what the request would have cost at the
 	// configured frontier baseline rate (issue #73). SavingsUSD is
 	// max(BaselineCostUSD - EstimatedCostUSD, 0).
@@ -1989,7 +1996,11 @@ func Chat(d Deps) http.Handler {
 			postCompressionChars := totalMessageChars(messages)
 			savings := totalTokenSavings(preCompressionChars, postCompressionChars)
 			inputTokens := telemetry.EstimateTokens(latestPrompt)
-			cost := frontierCostEstimate(string(route), model, inputTokens, d.Config.FrontierCostPer1K)
+			res := frontierCostEstimate(
+				string(route), model, inputTokens, outputTokens,
+				d.Config.FrontierCostPer1K, d.Config.CostUseOutputTokens, d.Providers,
+			)
+			cost := res.Total
 			baselineCost := baselineCostEstimate(inputTokens+outputTokens, d.Config.CostBaselineRatePer1K)
 			savingsCost := baselineCost - cost
 			if savingsCost < 0 {
@@ -2000,11 +2011,16 @@ func Chat(d Deps) http.Handler {
 			// FrontierCostPer1K. The arbiter prompt is approximately
 			// the latestPrompt plus the two panel responses; we use
 			// inputTokens as a conservative proxy since the streamed
-			// responses are not retained after serving.
+			// responses are not retained after serving. Output tokens
+			// are not counted for the arbiter (its output is folded
+			// into the main response stream) so we pass 0.
 			var fusionArbiterCostUSD float64
 			if route == router.RouteFusion && !fusionArbiterSkipped {
-				fusionArbiterCostUSD = frontierCostEstimate(
-					string(router.RouteFrontier), model, inputTokens, d.Config.FrontierCostPer1K)
+				arb := frontierCostEstimate(
+					string(router.RouteFrontier), model, inputTokens, 0,
+					d.Config.FrontierCostPer1K, d.Config.CostUseOutputTokens, d.Providers,
+				)
+				fusionArbiterCostUSD = arb.Total
 			}
 			tps := telemetry.ComputeTPS(outputTokens, ttftMs, totalMs)
 			d.MetricsObserver.Submit(MetricsEvent{
@@ -2019,6 +2035,8 @@ func Chat(d Deps) http.Handler {
 				RAGFilename:             ragFilename,
 				RAGCacheHit:             false, // issue #227: EmbedCache tracking not active with CachedEmbedder (issue #115)
 				EstimatedCostUSD:        cost,
+				InputCostUSD:            res.InputCost,
+				OutputCostUSD:           res.OutputCost,
 				BaselineCostUSD:         baselineCost,
 				SavingsUSD:              savingsCost,
 				OutputTokens:            outputTokens,
@@ -2519,21 +2537,79 @@ func totalTokenSavings(preChars, postChars int) int {
 	return (preChars - postChars) / 4
 }
 
-// frontierCostEstimate multiplies input tokens by the configured
-// cost-per-1k. Returns zero for non-frontier routes so local +
-// fusion-trail rows count as zero cost in the dashboard.
+// costEstimateResult holds the per-request cost split computed by
+// frontierCostEstimate (issue #1183). Total = InputCost + OutputCost.
+type costEstimateResult struct {
+	Total      float64
+	InputCost  float64
+	OutputCost float64
+}
+
+// frontierCostEstimate multiplies tokens by the configured cost-per-1k
+// and returns the per-direction split (issue #1183). Returns zero for
+// non-frontier routes so local + fusion-trail rows count as zero cost
+// in the dashboard.
+//
+// Legacy path (useOutputTokens == false): computes
+// inputTokens * costPer1KUSD / 1000 byte-for-byte identical to the
+// pre-issue-#1183 estimate; OutputCost is zero and InputCost == Total.
+//
+// Split path (useOutputTokens == true): looks up the serving provider
+// by model in the registry. When found, uses the provider's
+// InputCostPer1K / OutputCostPer1K rates; when no provider matches (or
+// the registry is nil) it falls back to costPer1KUSD as the input rate
+// and a zero output rate. Output tokens are counted via the tiktoken
+// tokenizer (passed in by the caller, which already computed them) so
+// the output stream is costed accurately instead of bytes/4.
 //
 //gitleaks:ignore
-func frontierCostEstimate(route, model string, inputTokens int, costPer1KUSD float64) float64 {
-	// model is reserved for future per-model pricing tables.
-	_ = model
+func frontierCostEstimate(
+	route, model string,
+	inputTokens, outputTokens int,
+	costPer1KUSD float64,
+	useOutputTokens bool,
+	registry *providers.ProviderRegistry,
+) costEstimateResult {
 	if route != string(router.RouteFrontier) {
-		return 0
+		return costEstimateResult{}
 	}
-	if costPer1KUSD <= 0 || inputTokens <= 0 {
-		return 0
+	if costPer1KUSD <= 0 && inputTokens <= 0 {
+		return costEstimateResult{}
 	}
-	return float64(inputTokens) * costPer1KUSD / 1000.0
+
+	// Legacy single-rate estimate (default). Reproduces the
+	// pre-issue-#1183 behaviour exactly so savings numbers are stable
+	// when the operator has not opted into the split model.
+	if !useOutputTokens {
+		if costPer1KUSD <= 0 || inputTokens <= 0 {
+			return costEstimateResult{}
+		}
+		total := float64(inputTokens) * costPer1KUSD / 1000.0
+		return costEstimateResult{Total: total, InputCost: total}
+	}
+
+	// Per-provider split (issue #1183). Resolve input/output rates from
+	// the registry; fall back to the flat config rate for input and a
+	// zero output rate when no provider matches.
+	inputRate := costPer1KUSD
+	outputRate := 0.0
+	if registry != nil {
+		if p := registry.ByModel(model); p != nil {
+			if r := p.InputCostPer1KUSD(); r > 0 {
+				inputRate = r
+			}
+			outputRate = p.OutputCostPer1KUSD()
+		}
+	}
+
+	var in, out float64
+	if inputRate > 0 && inputTokens > 0 {
+		in = float64(inputTokens) * inputRate / 1000.0
+	}
+	if outputRate > 0 && outputTokens > 0 {
+		out = float64(outputTokens) * outputRate / 1000.0
+	}
+	return costEstimateResult{Total: in + out, InputCost: in, OutputCost: out}
 }
 
 // formatConfidence renders a [0,1] confidence as the X-Nexus-Route-

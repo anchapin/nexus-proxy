@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS requests (
     rag_injected INTEGER NOT NULL DEFAULT 0,
     rag_filename TEXT NOT NULL DEFAULT '',
     estimated_cost_usd REAL NOT NULL DEFAULT 0,
+    input_cost_usd REAL NOT NULL DEFAULT 0,
+    output_cost_usd REAL NOT NULL DEFAULT 0,
     baseline_cost_usd REAL NOT NULL DEFAULT 0,
     savings_usd REAL NOT NULL DEFAULT 0,
     ttft_ms INTEGER NOT NULL DEFAULT 0,
@@ -89,6 +91,9 @@ var additiveMigrations = []string{
 	`ALTER TABLE requests ADD COLUMN toon_compression_method TEXT NOT NULL DEFAULT ''`,
 	// Issue #239: arbiter cost tracking
 	`ALTER TABLE requests ADD COLUMN fusion_arbiter_cost_usd REAL NOT NULL DEFAULT 0`,
+	// Issue #1183: per-provider cost split (input/output token streams)
+	`ALTER TABLE requests ADD COLUMN input_cost_usd REAL NOT NULL DEFAULT 0`,
+	`ALTER TABLE requests ADD COLUMN output_cost_usd REAL NOT NULL DEFAULT 0`,
 	// Issue #227: rag cache hit tracking
 	`ALTER TABLE requests ADD COLUMN rag_cache_hit INTEGER NOT NULL DEFAULT 0`,
 }
@@ -136,11 +141,12 @@ const insertSQL = `INSERT INTO requests
     (timestamp, request_id, route, model,
      input_tokens, output_tokens, toon_savings_tokens, toon_compression_method,
      rag_injected, rag_filename, rag_cache_hit, estimated_cost_usd,
+     input_cost_usd, output_cost_usd,
      baseline_cost_usd, savings_usd,
      ttft_ms, total_latency_ms, tps, streaming,
      fusion_arbiter_skipped, fusion_jaccard_similarity, fusion_arbiter_cost_usd, error,
      route_source, route_reason, slm_confidence, slm_task_type)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // SQLiteStore is the production Store implementation (issue #4).
 // Writes are funnelled through a buffered channel and a single
@@ -417,6 +423,7 @@ func (s *SQLiteStore) writeOne(req Request) {
 		ts.UTC(), req.RequestID, route, model,
 		req.InputTokens, req.OutputTokens, req.TOONSavingsTokens, req.TOONCompressionMethod,
 		ragInjected, req.RAGFilename, req.RAGCacheHit, req.EstimatedCostUSD,
+		req.InputCostUSD, req.OutputCostUSD,
 		req.BaselineCostUSD, req.SavingsUSD,
 		req.TTFTMs, req.TotalLatencyMs, req.TPS, streaming,
 		fusionArbiterSkipped, req.FusionJaccardSimilarity, req.FusionArbiterCostUSD, req.Error,
@@ -562,6 +569,8 @@ SELECT
     COALESCE(SUM(toon_savings_tokens), 0),
     COALESCE(SUM(CASE WHEN rag_injected = 1 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(estimated_cost_usd), 0),
+    COALESCE(SUM(input_cost_usd), 0),
+    COALESCE(SUM(output_cost_usd), 0),
     COALESCE(SUM(baseline_cost_usd), 0),
     COALESCE(SUM(savings_usd), 0),
     COALESCE(SUM(total_latency_ms), 0),
@@ -588,6 +597,8 @@ func (s *SQLiteStore) scanRange(from, to, dateLabel time.Time) (Summary, error) 
 		&sum.TOONSavingsTokens,
 		&sum.RAGInjectedCount,
 		&sum.EstimatedCostTotal,
+		&sum.InputCostTotal,
+		&sum.OutputCostTotal,
 		&sum.BaselineCostTotal,
 		&sum.SavingsTotal,
 		&sum.TotalLatencyMsSum,
