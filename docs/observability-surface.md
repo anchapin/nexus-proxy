@@ -5,6 +5,11 @@ the SQLite metrics-store schema, the telemetry JSONL fields, and the
 distributed-tracing surface. It exists so operators and contributors
 can see the full observability contract in one place.
 
+> **Alerting rules:** the repo ships production-ready Prometheus
+> alerting and recording rules in `deploy/prometheus/` (alerting
+> runbook, load path, and per-alert remediation in
+> [alerting.md](alerting.md)). Validate them with `make check-rules`.
+
 ## Prometheus metrics (`GET /metrics`)
 
 The proxy implements a bespoke Prometheus text-format exposition

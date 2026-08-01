@@ -1,0 +1,261 @@
+# Prometheus alerting rules for nexus-proxy.
+#
+# Load this file (and recording-rules.yaml) into Prometheus via the
+# `rule_files` list in prometheus.yml:
+#
+#   rule_files:
+#     - /etc/prometheus/nexus-recording-rules.yaml
+#     - /etc/prometheus/nexus-alerts.yaml
+#
+# Every rule below carries a `# rationale:` comment explaining the
+# threshold choice, and a `severity` label so Alertmanager can route
+# critical vs. warning differently (e.g. page vs. Slack).
+#
+# Validation: `make check-rules` runs `promtool check rules` over both
+# rule files. See docs/alerting.md for the full load path, per-alert
+# remediation runbook, and how to wire severity into Alertmanager routes.
+#
+# Severity conventions:
+#   critical — user-facing degradation; page the on-call.
+#   warning  — latent risk / capacity headroom; notify the team channel.
+groups:
+  - name: nexus-alerts
+    interval: 30s
+    rules:
+      # ====================================================================
+      # Budget
+      # ====================================================================
+
+      # ----------------------------------------------------------------------
+      # NexusBudgetExceeded
+      # ----------------------------------------------------------------------
+      # rationale: nexus_budget_exceeded_total increments once per frontier
+      # request that the daily budget gate rejected (WouldExceed == true).
+      # A single increment over a 5m window means a user-facing request was
+      # denied because the rolling 24h spend is at the cap — this is a hard
+      # spend-limit trip, not a projection. `increase(...[5m]) > 0` is used
+      # (rather than rate()) because the counter only moves on rejection
+      # events, which are sparse; a rate would round a lone rejection down
+      # to near-zero and miss it. For windows are intentionally short (5m)
+      # so the alert clears as soon as spend rolls off and the gate stops
+      # tripping.
+      - alert: NexusBudgetExceeded
+        expr: increase(nexus_budget_exceeded_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: budget
+        annotations:
+          summary: "nexus-proxy daily budget gate is rejecting requests"
+          description: "The frontier budget gate denied {{ $value }} request(s) in the last 5 minutes. Rolling 24h spend ({{ $value | printf \"%.2f\" }} via nexus_budget_spend_usd) is at the configured cap; frontier requests are now being refused."
+          runbook: "Raise NEXUS_BUDGET_ALERT_THRESHOLD, or wait for the oldest spend records to age out of the 24h rolling window."
+
+      # ----------------------------------------------------------------------
+      # NexusBudgetApproaching
+      # ----------------------------------------------------------------------
+      # rationale: nexus:budget_utilization_ratio (defined in
+      # recording-rules.yaml) is spend divided by the configured daily cap
+      # constant. Firing at >0.8 for 10m gives operators a head-start to
+      # raise the cap before the NexusBudgetExceeded alert fires and starts
+      # rejecting user requests. The 10m `for` suppresses churn from a brief
+      # spend burst (a single large fusion request) without delaying the
+      # warning past the point where action is still useful. NOTE: this rule
+      # is only accurate once the NEXUS_BUDGET_DAILY_CAP_USD constant in
+      # recording-rules.yaml matches the deployment's
+      # NEXUS_BUDGET_ALERT_THRESHOLD; see docs/alerting.md.
+      - alert: NexusBudgetApproaching
+        expr: nexus:budget_utilization_ratio > 0.8
+        for: 10m
+        labels:
+          severity: warning
+          component: budget
+        annotations:
+          summary: "nexus-proxy budget utilization above 80%"
+          description: "Daily frontier spend is at {{ $value | humanizePercentage }} of the configured cap and has held there for 10m. Frontier requests will start being rejected if spend continues."
+          runbook: "Raise NEXUS_BUDGET_ALERT_THRESHOLD before NexusBudgetExceeded starts rejecting traffic."
+
+      # ====================================================================
+      # Circuit breakers
+      # ====================================================================
+
+      # ----------------------------------------------------------------------
+      # NexusCircuitBreakerOpen
+      # ----------------------------------------------------------------------
+      # rationale: nexus_circuit_breaker_state{circuit="ollama"} is
+      # 0=closed, 1=half_open, 2=open. When the Ollama health breaker is
+      # open (==2), ALL local/fusion routing is transparently rerouted to
+      # frontier — meaning every request that would have been served free
+      # by the local model is now billed at frontier rates. 5 minutes open
+      # is the threshold beyond which the spend impact is material and
+      # unlikely to be a transient Ollama restart; it also matches the
+      # health poller's recovery probe cadence, so a breaker stuck open for
+      # 5m has had multiple chances to reclose and failed. Critical because
+      # it silently inflates cost and removes the latency advantage of local
+      # routing.
+      - alert: NexusCircuitBreakerOpen
+        expr: nexus_circuit_breaker_state{circuit="ollama"} == 2
+        for: 5m
+        labels:
+          severity: critical
+          component: circuit-breaker
+        annotations:
+          summary: "nexus-proxy Ollama circuit breaker is open"
+          description: "The Ollama health circuit breaker has been open for 5m. Local and fusion requests are being rerouted to the frontier (paid) endpoint. Check Ollama availability and the X-Nexus-Degraded response header."
+          runbook: "Verify Ollama is reachable (NEXUS_OLLAMA_BASE_URL) and responsive. The breaker recloses automatically on the next successful health probe; if it does not, check NEXUS_HEALTH_BREAKER_THRESHOLD."
+
+      # ----------------------------------------------------------------------
+      # NexusRAGCircuitOpen
+      # ----------------------------------------------------------------------
+      # rationale: nexus_rag_circuit_state is 0=closed, 1=half_open, 2=open
+      # for each RAG embedder service (ollama/openai/cohere). When open,
+      # RAG retrieval is skipped entirely — queries lose their context
+      # augmentation silently (no error, just degraded answer quality).
+      # Warning (not critical) because RAG is an enhancement layer: the
+      # request still succeeds, just without injected context. 5m matches
+      # the Ollama breaker window for consistency and gives the embedder
+      # time to recover on its own before paging.
+      - alert: NexusRAGCircuitOpen
+        expr: nexus_rag_circuit_state == 2
+        for: 5m
+        labels:
+          severity: warning
+          component: circuit-breaker
+        annotations:
+          summary: "nexus-proxy RAG embedder circuit breaker is open"
+          description: "The RAG embedder circuit breaker for service {{ $labels.service }} has been open for 5m. RAG context injection is disabled until it recovers; requests will succeed but without retrieved context."
+          runbook: "Check the embedder endpoint (NEXUS_EMBEDDER_TYPE / NEXUS_RAG_EMBEDDER_URL). The breaker recloses after NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD consecutive failures reset on the first successful embed."
+
+      # ====================================================================
+      # Error rate
+      # ====================================================================
+
+      # ----------------------------------------------------------------------
+      # NexusHighErrorRate
+      # ----------------------------------------------------------------------
+      # rationale: nexus:error_rate5m (recording rule) is the cascade
+      # fallback rate as a fraction of route decisions per route. >0.10
+      # means more than 1 in 10 requests on a given route failed locally
+      # and had to fall back — a clear service-level regression. Critical
+      # because a 10%+ fallback rate either inflates frontier spend
+      # dramatically (every local request billed) or, if the frontier is
+      # also failing, drops requests entirely. 5m `for` smooths the brief
+      # spikes that a single slow Ollama batch causes. The route label is
+      # preserved so operators can see whether the regression is local-only
+      # or systemic.
+      - alert: NexusHighErrorRate
+        expr: nexus:error_rate5m > 0.10
+        for: 5m
+        labels:
+          severity: critical
+          component: routing
+        annotations:
+          summary: "nexus-proxy high cascade-fallback error rate on route {{ $labels.route }}"
+          description: "Cascade fallback rate is {{ $value | humanizePercentage }} (threshold 10%) on the {{ $labels.route }} route for the last 5m. Local requests are failing and falling back to frontier."
+          runbook: "Check Ollama health and the cascade fallback reasons via `sum by(reason)(rate(nexus_cascade_fallback_total[5m]))` to distinguish timeout vs. transport_error vs. http_error."
+
+      # ====================================================================
+      # Distributed tracing
+      # ====================================================================
+
+      # ----------------------------------------------------------------------
+      # NexusTraceDropsSpiking
+      # ----------------------------------------------------------------------
+      # rationale: nexus_tracing_dropped_total counts spans shed at Submit
+      # time because the in-memory queue was full — back-pressure, not
+      # collector trouble. >1 span/s sustained means the proxy is producing
+      # spans faster than the background loop drains them; traces are being
+      # silently lost and observability is degrading. The threshold is a
+      # hard rate (>1/s) rather than a ratio because there is no
+      # "total spans produced" counter to ratio against. Warning: tracing
+      # loss reduces observability but does not affect request serving.
+      - alert: NexusTraceDropsSpiking
+        expr: rate(nexus_tracing_dropped_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+          component: tracing
+        annotations:
+          summary: "nexus-proxy is dropping trace spans (queue back-pressure)"
+          description: "Trace span drop rate is {{ $value | humanize }} spans/s. The in-memory trace queue (NEXUS_TRACING_QUEUE_SIZE) is saturated; spans are being shed before export."
+          runbook: "Raise NEXUS_TRACING_QUEUE_SIZE, or increase NEXUS_TRACING_BATCH_SIZE / reduce NEXUS_TRACING_SAMPLE_RATE to slow span production. Distinguish from flush failures: nexus_tracing_flush_failures_total should be flat here."
+
+      # ----------------------------------------------------------------------
+      # NexusTraceFlushFailures
+      # ----------------------------------------------------------------------
+      # rationale: nexus_tracing_flush_failures_total counts batches that
+      # failed to POST (HTTP 4xx/5xx, timeout, transport error). Unlike
+      # drops (back-pressure), flush failures mean the collector is
+      # unreachable or rejecting — the proxy will not retry, so each failed
+      # batch (up to NEXUS_TRACING_BATCH_SIZE spans) is gone. >3 failures
+      # in 15m is a clear signal the collector endpoint needs attention; a
+      # single transient 5xx should not page. `increase(...[15m])` is used
+      # rather than rate() because flush failures are sparse burst events.
+      - alert: NexusTraceFlushFailures
+        expr: increase(nexus_tracing_flush_failures_total[15m]) > 3
+        for: 0m
+        labels:
+          severity: warning
+          component: tracing
+        annotations:
+          summary: "nexus-proxy trace export flush failures"
+          description: "{{ $value }} trace batch flush(es) failed in the last 15m. The OTLP collector (NEXUS_TRACING_ENDPOINT) is unreachable or rejecting batches; up to NEXUS_TRACING_BATCH_SIZE spans per failed batch are permanently lost."
+          runbook: "Check NEXUS_TRACING_ENDPOINT reachability and the collector's health. Verify NEXUS_TRACING_TIMEOUT is not too short for the collector's response time."
+
+      # ====================================================================
+      # Local-route cooldown
+      # ====================================================================
+
+      # ----------------------------------------------------------------------
+      # NexusLocalCooldownStuck
+      # ----------------------------------------------------------------------
+      # rationale: nexus_local_cooldown_active is 1 when the cascade-failure
+      # cooldown window is armed. The cooldown is meant to be short
+      # (default NEXUS_LOCAL_COOLDOWN); 30 minutes armed is far beyond any
+      # sane cooldown window, meaning either the window was misconfigured to
+      # an excessively long value or the cooldown keeps re-arming because
+      # Ollama is repeatedly failing. Either way the local arm has been
+      # bypassed for half an hour — sustained frontier spend and lost
+      # latency advantage. Warning: the NexusCircuitBreakerOpen alert
+      # covers the harder-failure case; this catches the chronic flapping
+      # case the breaker alert misses.
+      - alert: NexusLocalCooldownStuck
+        expr: nexus_local_cooldown_active == 1
+        for: 30m
+        labels:
+          severity: warning
+          component: circuit-breaker
+        annotations:
+          summary: "nexus-proxy local-route cooldown has been active for 30m"
+          description: "The cascade-failure cooldown has been armed continuously for 30m, bypassing local routing. Either NEXUS_LOCAL_COOLDOWN is set too high, or Ollama is failing repeatedly and re-arming the cooldown."
+          runbook: "Check NEXUS_LOCAL_COOLDOWN (should be seconds, not minutes). Inspect nexus_local_cooldown_triggers_total for the re-arm rate and verify Ollama health."
+
+      # ====================================================================
+      # SLO: p99 latency
+      # ====================================================================
+
+      # ----------------------------------------------------------------------
+      # NexusSLOp99Breach
+      # ----------------------------------------------------------------------
+      # rationale: nexus_upstream_request_latency_p99_seconds{route="local"}
+      # is the p99 of the local arm's latency in seconds. The local (Ollama)
+      # route exists to be fast and free; a p99 above 2s means 1% of local
+      # requests are slower than a typical frontier request — the cost
+      # advantage is being eaten by latency. 2s is the documented SLO target
+      # (see docs/observability-surface.md per-route latency section). 10m
+      # `for` prevents paging on a single slow batch / cold model load while
+      # still catching a sustained regression. Scoped to route="local"
+      # because the frontier route's p99 is governed by the upstream
+      # provider, not the proxy. Uses the raw gauge rather than the
+      # nexus:request_latency_p99_5m recording rule so the alert reacts to
+      # the live tail rather than the smoothed average — the SLO is about
+      # the worst 1%, which a 5m average can mask.
+      - alert: NexusSLOp99Breach
+        expr: nexus_upstream_request_latency_p99_seconds{route="local"} > 2
+        for: 10m
+        labels:
+          severity: warning
+          component: slo
+        annotations:
+          summary: "nexus-proxy local-route p99 latency above 2s SLO"
+          description: "Local-route p99 latency is {{ $value | humanizeDuration }} (SLO target 2s) for the last 10m. The local arm is no longer delivering its latency advantage over the frontier."
+          runbook: "Check Ollama load (nexus_local_concurrency_in_flight vs effective_slots), model size vs available VRAM, and whether a larger model was loaded. A cold model load will spike p99 transiently."
