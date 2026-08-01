@@ -846,6 +846,14 @@ type Deps struct {
 	// unaffected when nil.
 	CircuitBreakerObserver CircuitBreakerObserver
 
+	// RedactionObserver is invoked after the upstream dispatch
+	// completes with the total number of patterns replaced during
+	// this request (issue #1172). When substitutions > 0 the
+	// observer increments nexus_redacted_total. Nil means "no
+	// observer"; the hot path is unaffected and redaction is
+	// disabled regardless of Config settings.
+	RedactionObserver func(profile string, substitutions int64)
+
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
 	// copy used for sampling is bounded. Zero uses DefaultObservedCap.
@@ -1554,6 +1562,37 @@ func Chat(d Deps) http.Handler {
 		// and decide whether to enable captureWriter globally in a
 		// follow-up.
 		var capw *captureWriter
+
+		// Writer chain (outermost first):
+		//   upstream.Write -> ResponseRedactor (issue #1172, when enabled) ->
+		//   captureWriter (judge + quality tee OR debug) ->
+		//   ObservingWriter (telemetry byte count + TTFT + status) ->
+		//   underlying ResponseWriter.
+		//
+		// ResponseRedactor sits between captureWriter and obs so that
+		// captured content (judge samples, debug traces) is also
+		// redacted. When redaction is disabled, redactW aliases obs
+		// and the chain is byte-for-byte identical to the pre-#1172
+		// path.
+		redactW := http.ResponseWriter(obs)
+		var redactor *ResponseRedactor
+		if RedactionEnabled(d.Config.RedactEnabled, d.Config.RedactProfile) && d.RedactionObserver != nil {
+			customRegexes := compileCustomPatternsOrNil(d.Config.RedactPatternsRaw)
+			patterns := PatternsForProfile(d.Config.RedactProfile, customRegexes)
+			bufBytes := d.Config.RedactBufferBytes
+			if bufBytes <= 0 {
+				bufBytes = config.DefaultRedactBufferBytes
+			}
+			redactor = NewResponseRedactor(obs, patterns, 0)
+			redactor.maxBuffer = bufBytes
+			redactW = redactor
+		}
+		rw := redactW
+		if d.JudgeObserver != nil || d.QualityObserver != nil || d.Config.Debug {
+			capw = newCaptureWriter(redactW, d.maxObservedBytes)
+			rw = capw
+		}
+
 		switch route {
 		case router.RouteFusion:
 			slog.Info("starting fusion panel", slog.String("request_id", reqID))
@@ -1592,7 +1631,7 @@ func Chat(d Deps) http.Handler {
 				var outcome upstream.PanelOutcome
 				outcome, upErr = upstream.PanelStreaming(
 					r.Context(),
-					obs, d.Client,
+					redactW, d.Client,
 					d.Config.OllamaURL, d.Config.LocalModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
@@ -1630,7 +1669,7 @@ func Chat(d Deps) http.Handler {
 				var cacheHit bool
 				outcome, cacheHit, upErr = upstream.Panel(
 					r.Context(),
-					obs, d.Client,
+					redactW, d.Client,
 					d.Config.OllamaURL, d.Config.LocalModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
 					d.Config.FrontierURL, d.Config.FrontierKey, d.Config.FrontierModel,
@@ -1775,19 +1814,6 @@ func Chat(d Deps) http.Handler {
 				})
 			}
 
-			// Writer chain (outermost first):
-			//   upstream.Write -> captureWriter (judge + quality tee OR debug) ->
-			//   ObservingWriter (telemetry byte count + TTFT + status) ->
-			//   underlying ResponseWriter.
-			// captureWriter is installed when at least one observer
-			// is set OR debug tracing is on (issue #33); otherwise
-			// the dispatch writes directly through obs with zero
-			// overhead.
-			rw := http.ResponseWriter(obs)
-			if d.JudgeObserver != nil || d.QualityObserver != nil || d.Config.Debug {
-				capw = newCaptureWriter(obs, d.maxObservedBytes)
-				rw = capw
-			}
 			if streaming {
 				// Cascade (issue #14): try local Ollama first, fall
 				// back to configured frontier endpoints (frontier,
@@ -1980,10 +2006,10 @@ func Chat(d Deps) http.Handler {
 			// BufferedFetch collects the full body and returns a
 			// single chatCompletionResponse JSON object.
 			if streaming {
-				upErr = upstream.Stream(obs, d.Client,
+				upErr = upstream.Stream(redactW, d.Client,
 					frontierURL, frontierKey, body)
 			} else {
-				upErr = upstream.BufferedFetch(obs, d.Client,
+				upErr = upstream.BufferedFetch(redactW, d.Client,
 					frontierURL, frontierKey, body)
 			}
 			if upErr != nil {
@@ -2039,6 +2065,12 @@ func Chat(d Deps) http.Handler {
 		// truncation used to flip to 0 on fast hardware and
 		// exposed a write race against the recorder's reader.
 		totalMs := float64(time.Since(started).Microseconds()) / 1000.0
+		// Response-content redaction metric (issue #1172). Report the
+		// total substitution count for this request so the observer
+		// can increment nexus_redacted_total.
+		if redactor != nil && d.RedactionObserver != nil {
+			d.RedactionObserver(d.Config.RedactProfile, redactor.Substitutions())
+		}
 		var ttftMs int64
 		if streaming && firstWriteAt.Load() > 0 {
 			ttftMs = time.Unix(0, firstWriteAt.Load()).Sub(started).Milliseconds()

@@ -592,6 +592,27 @@ type Config struct {
 	TracingBatchSize  int
 	TracingSampleRate float64
 
+	// Response-content redaction (issue #1172). When RedactEnabled is
+	// true and RedactProfile is one of {secrets, pii, custom}, the chat
+	// handler wraps the response writer with a ResponseRedactor that
+	// scans every write against the profile's regex set and replaces
+	// matches with [REDACTED]. Disabled by default (RedactEnabled=false)
+	// so a stock deployment is byte-for-byte identical to the pre-#1172
+	// behaviour.
+	//
+	// RedactProfile selects the built-in pattern set ("secrets" for
+	// bearer tokens / private keys, "pii" for credit cards / SSNs /
+	// emails) or "custom" to use operator-supplied regexes from
+	// RedactPatternsRaw.
+	//
+	// RedactBufferBytes caps the rolling buffer used for cross-chunk
+	// multi-line pattern matching (e.g. PEM private keys split across
+	// SSE chunks). Defaults to 4096.
+	RedactEnabled     bool
+	RedactProfile     string
+	RedactPatternsRaw string
+	RedactBufferBytes int
+
 	// SSRF egress guard (issue #1174). When EgressGuardEnabled is true
 	// (the default), the shared HTTP client rejects redirects and
 	// dial-time connections to private, loopback, and link-local IP
@@ -1870,6 +1891,20 @@ func Load() (Config, error) {
 	}
 	cfg.TracingSampleRate = tracingSampleRate
 
+	// Response-content redaction (issue #1172).
+	cfg.RedactEnabled = getEnvBool("NEXUS_REDACT_ENABLED", false)
+	cfg.RedactProfile = getEnv("NEXUS_REDACT_PROFILE", RedactProfileDefault)
+	cfg.RedactPatternsRaw = getEnvAllowEmpty("NEXUS_REDACT_PATTERNS", "")
+
+	redactBuffer, err := getEnvInt("NEXUS_REDACT_BUFFER_BYTES", DefaultRedactBufferBytes)
+	if err != nil {
+		return cfg, err
+	}
+	if redactBuffer < 0 {
+		redactBuffer = DefaultRedactBufferBytes
+	}
+	cfg.RedactBufferBytes = redactBuffer
+
 	// SSRF egress guard (issue #1174). Defaults to enabled=true so a
 	// stock deployment is protected out of the box. The allowlist
 	// defaults to empty (no override); operators running local Ollama
@@ -1905,6 +1940,15 @@ func (c Config) Validate() error {
 		// Recognised values.
 	default:
 		return fmt.Errorf("config: NEXUS_SECRET_BACKEND value %q is not recognised; want \"env\", \"vault\", or \"awssm\"", c.SecretBackend)
+	}
+	switch c.RedactProfile {
+	case "off", "secrets", "pii", "custom":
+		// Recognised values.
+	default:
+		return fmt.Errorf("config: NEXUS_REDACT_PROFILE value %q is not recognised; want \"off\", \"secrets\", \"pii\", or \"custom\"", c.RedactProfile)
+	}
+	if c.RedactProfile == "custom" && c.RedactPatternsRaw == "" {
+		return fmt.Errorf("config: NEXUS_REDACT_PROFILE is \"custom\" but NEXUS_REDACT_PATTERNS is empty; supply comma-separated regex patterns")
 	}
 	return nil
 }
@@ -2069,6 +2113,16 @@ const DefaultDebugBodyBytes = 512
 // only affects the dynamic shrink path; when the probe is unavailable
 // the full NEXUS_LOCAL_MAX_CONCURRENT ceiling is used regardless.
 const DefaultLocalVRAMBytesPerSlot int64 = 2 << 30 // 2 GiB
+
+// Redaction defaults (issue #1172).
+const (
+	// RedactProfileDefault is the default profile when NEXUS_REDACT_PROFILE
+	// is unset. "off" disables redaction entirely.
+	RedactProfileDefault = "off"
+	// DefaultRedactBufferBytes is the default rolling buffer cap for
+	// cross-chunk multi-line pattern matching.
+	DefaultRedactBufferBytes = 4 * 1024
+)
 
 // EffectiveDebugBodyBytes returns the response-body preview cap the
 // debug trace should honour. Zero or negative falls back to

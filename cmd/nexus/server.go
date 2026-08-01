@@ -937,8 +937,11 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		PanelPanicObserver:      panelPanicObs,
 		InjectionHitObserver:    injectionHitObs,
 		CircuitBreakerObserver:  circuitBreakerObs,
-		ArbiterCache:            arbiterCache,
-		Providers:               providerRegistry,
+		RedactionObserver: func(profile string, substitutions int64) {
+			routeCounters.ObserveRedaction(profile, substitutions)
+		},
+		ArbiterCache: arbiterCache,
+		Providers:    providerRegistry,
 		PipelineStageObserver: handlers.PipelineStageObserverFunc(
 			func(e handlers.PipelineStageEvent) {
 				stageCollector.ObservePipelineStage(observability.PipelineStageEvent{
