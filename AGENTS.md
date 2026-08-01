@@ -468,6 +468,20 @@ to record/replay HTTP calls. All tests run in <2s with `-race`.
 **Focused testing:** `go test ./internal/packagename` runs a single package.
 Prefix with `-v` for verbose output.
 
+**E2E integration tests** (issue #1160): `cmd/nexus/integration_test.go`
+exercises the full HTTP → middleware → routing → upstream → response
+pipeline through the real `buildServer` handler stack with mock Ollama
+and mock frontier upstreams. Covers local cascade, frontier stream,
+fusion, SSE streaming, security headers, auth exemption, rate-limit
+scoping, and Ollama degradation (`X-Nexus-Degraded`). Run with
+`go test -run TestE2E ./cmd/nexus/...`.
+
+**Shared handler wiring** (issue #1160): `buildHandler(inner, tlsEnabled,
+panicObs)` in `cmd/nexus/server.go` is the single source of truth for the
+outermost middleware chain (SecurityHeaders → Recover). Both `buildServer`
+(production) and integration tests construct identical wiring through this
+function.
+
 **Pre-commit hook** (`make install-hooks` once after cloning): runs `gofmt -l`
 on staged `.go` files and fails the commit if any need formatting. The hook
 lives in `.githooks/pre-commit`; `make install-hooks` sets `git

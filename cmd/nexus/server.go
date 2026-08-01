@@ -930,7 +930,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		ragEmbed.SetTripCallback(kind, circuitBreakerObs.IncRAGCircuitTrip)
 	}
 
-	chatHandler := handlers.Chat(handlers.Deps{
+	deps := handlers.Deps{
 		Config:                  cfg,
 		Client:                  httpClient,
 		RAG:                     store,
@@ -946,8 +946,6 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		Recorder:                recorder,
 		Health:                  hpoller,
 		BudgetObserver:          budgetObserver(probeMgr),
-		SpendGuard:              budgetGuard,
-		BudgetChecker:           budgetGuard,
 		LocalLimiter:            localLimiter,
 		LocalCooldown:           localCooldown,
 		RouteDecisionObserver:   routeDecisionObs,
@@ -993,7 +991,16 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 			},
 		),
 		LocalPatternsRegex: cfg.DSLLocalPatterns,
-	})
+	}
+	// Only wire SpendGuard when the budget subsystem is actually enabled.
+	// Assigning a nil *budget.Guard to the interface field would make the
+	// interface non-nil (typed-nil) and cause a nil-pointer panic when the
+	// handler calls Check/Record.
+	if budgetGuard != nil {
+		deps.SpendGuard = budgetGuard
+		deps.BudgetChecker = budgetGuard
+	}
+	chatHandler := handlers.Chat(deps)
 	if rateLimiter != nil {
 		rateLimiter.SetRejectionHook(func() {
 			routeCounters.ObserveRejection(handlers.RejectionRateLimit)
@@ -1267,10 +1274,8 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 	parts.authLimiter = authLimiter
 
 	srv := &http.Server{
-		Addr: cfg.Addr,
-		Handler: handlers.SecurityHeaders(cfg.TLSEnabled)(handlers.Recover(func(path string) {
-			routeCounters.ObserveHandlerPanic(path)
-		})(rootHandler)),
+		Addr:              cfg.Addr,
+		Handler:           buildHandler(rootHandler, cfg.TLSEnabled, routeCounters.ObserveHandlerPanic),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
@@ -1279,6 +1284,17 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 	}
 
 	return srv, parts, cleanup, nil
+}
+
+// buildHandler applies the outermost middleware chain (SecurityHeaders → Recover)
+// to the supplied inner handler. This is the single source of truth for the
+// outer middleware ordering so that main.go (via buildServer) and e2e integration
+// tests (integration_test.go) construct identical wiring (issue #1160).
+//
+// The panicObs callback is invoked when Recover catches a panic; pass nil for
+// a no-op. tlsEnabled controls HSTS emission (issue #444).
+func buildHandler(inner http.Handler, tlsEnabled bool, panicObs func(string)) http.Handler {
+	return handlers.SecurityHeaders(tlsEnabled)(handlers.Recover(panicObs)(inner))
 }
 
 // drainComponents is called from the signal handler to stop async
