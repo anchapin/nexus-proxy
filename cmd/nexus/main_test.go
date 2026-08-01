@@ -803,6 +803,10 @@ func (s *stubConfidenceStore) LocalConfidence(category string) (float64, error) 
 	return 0.5, nil // neutral confidence for tests
 }
 
+func (s *stubConfidenceStore) ComparativeConfidence(category string) (float64, float64, error) {
+	return 0.5, 0.5, nil // neutral confidence for tests
+}
+
 func (s *stubConfidenceStore) Close() error { return nil }
 
 // TestConfidenceBridgeRecordOutOfRangeScore (issue #981) verifies that

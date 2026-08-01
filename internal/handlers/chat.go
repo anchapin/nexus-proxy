@@ -2200,9 +2200,26 @@ func Chat(d Deps) http.Handler {
 					writeJSONError(w, http.StatusBadGateway, ErrTypeUpstreamError,
 						"Frontier upstream call failed")
 				}
-			} else if d.SpendGuard != nil && frontierCost > 0 {
-				// Budget guard: record after successful frontier call (issue #220).
-				d.SpendGuard.Record(r.Context(), frontierCost, "frontier")
+			} else {
+				if d.SpendGuard != nil && frontierCost > 0 {
+					// Budget guard: record after successful frontier call (issue #220).
+					d.SpendGuard.Record(r.Context(), frontierCost, "frontier")
+				}
+				// Issue #1162: submit frontier completion to the judge
+				// observer so it can be sampled and scored against the
+				// frontier baseline.
+				if d.JudgeObserver != nil && capw != nil {
+					d.JudgeObserver.Submit(LocalCompletion{
+						RequestID:   reqID,
+						Instruction: latestPrompt,
+						Output:      capw.Buffer(),
+						LocalModel:  d.Config.FrontierModel,
+						Route:       string(route),
+					})
+				}
+				if d.QualityObserver != nil && capw != nil {
+					emitDetectedEdits(capw.Buffer(), reqID, "", "", d.QualityObserver)
+				}
 			}
 			// Debug trace (issue #33): route=frontier is a single
 			// endpoint with no cascade — populate the trace with

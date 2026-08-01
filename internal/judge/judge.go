@@ -131,15 +131,16 @@ type HTTPClient interface {
 // NewEvaluator so callers can construct an evaluator from a partial
 // config without exploding.
 type Config struct {
-	URL         string        // frontier endpoint for judge calls
-	Model       string        // judge model name
-	APIKey      string        // bearer token; empty = no Authorization header
-	SampleRate  float64       // 0..1; <=0 disables sampling
-	Concurrency int           // max parallel judge calls (default 2)
-	QueueDepth  int           // buffered channel size (default 64)
-	Timeout     time.Duration // per-call judge timeout (default 30s)
-	CostPer1K   float64       // USD per 1k tokens (input+output); default 0.002
-	BudgetGuard *budget.Guard // optional budget guard to record judge costs
+	URL                string        // frontier endpoint for judge calls
+	Model              string        // judge model name
+	APIKey             string        // bearer token; empty = no Authorization header
+	SampleRate         float64       // 0..1; <=0 disables sampling (local route)
+	FrontierSampleRate float64       // 0..1; fraction of frontier completions to judge (issue #1162)
+	Concurrency        int           // max parallel judge calls (default 2)
+	QueueDepth         int           // buffered channel size (default 64)
+	Timeout            time.Duration // per-call judge timeout (default 30s)
+	CostPer1K          float64       // USD per 1k tokens (input+output); default 0.002
+	BudgetGuard        *budget.Guard // optional budget guard to record judge costs
 }
 
 // applyDefaults fills zero fields with sane values. It mutates cfg.
@@ -177,6 +178,12 @@ type Evaluator struct {
 	// full. Exposed via Dropped() so callers can surface the counter
 	// across observability surfaces (issue #111).
 	dropped atomic.Uint64
+
+	// frontierSampled counts frontier completions that passed the
+	// frontier sample rate gate (issue #1162). Exposed via
+	// FrontierSampled() for the Prometheus counter
+	// nexus_judge_frontier_sampled_total.
+	frontierSampled atomic.Uint64
 
 	// onDrop is an optional callback invoked atomically once per
 	// dropped sample. The callback receives the running total of
@@ -299,6 +306,37 @@ func (e *Evaluator) Sample() bool {
 	r := e.rng.Float64()
 	e.rngMu.Unlock()
 	return r < e.cfg.SampleRate
+}
+
+// SampleFrontier returns true if a frontier-route completion should be
+// enqueued for judge evaluation (issue #1162). It uses the separate
+// FrontierSampleRate (default 0.02) which is lower than the local
+// SampleRate (default 0.1) because frontier completions are more
+// expensive to replicate. Returns false when FrontierSampleRate <= 0.
+//
+// SampleFrontier is safe to call from many goroutines concurrently.
+func (e *Evaluator) SampleFrontier() bool {
+	if e == nil || e.cfg.FrontierSampleRate <= 0 {
+		return false
+	}
+	e.rngMu.Lock()
+	r := e.rng.Float64()
+	e.rngMu.Unlock()
+	if r < e.cfg.FrontierSampleRate {
+		e.frontierSampled.Add(1)
+		return true
+	}
+	return false
+}
+
+// FrontierSampled returns the total number of frontier completions that
+// passed the frontier sample rate gate. Monotonically increasing and
+// safe to read from any goroutine.
+func (e *Evaluator) FrontierSampled() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.frontierSampled.Load()
 }
 
 // Enqueue is the non-blocking submit used by the chat handler. It is

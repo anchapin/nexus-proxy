@@ -62,6 +62,11 @@ func (s *stubConf) LocalConfidence(category string) (float64, error) {
 	return s.value, nil
 }
 
+func (s *stubConf) ComparativeConfidence(category string) (float64, float64, error) {
+	s.queried = append(s.queried, category)
+	return s.value, NeutralConfidence, nil
+}
+
 // formattingPatterns matches the handler's NEXUS_DSL_FORMATTING_PATTERNS default.
 var formattingPatterns = []*regexp.Regexp{regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`)}
 
@@ -602,6 +607,10 @@ func (s *errorStubConf) RecordOutcome(_ string, _ Route, _ int) error { return n
 
 func (s *errorStubConf) LocalConfidence(category string) (float64, error) {
 	return NeutralConfidence, s.err
+}
+
+func (s *errorStubConf) ComparativeConfidence(category string) (float64, float64, error) {
+	return NeutralConfidence, NeutralConfidence, s.err
 }
 
 // TestPlanner_NilConfidenceTaskType verifies issue #441: every decision
