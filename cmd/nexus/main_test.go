@@ -734,6 +734,37 @@ func TestPublicPathExempt(t *testing.T) {
 	}
 }
 
+// TestPublicPathExemptDashboard (issue #1182) pins the auth posture of
+// the built-in web dashboard path. It mirrors /status: gated by default,
+// exempt only when NEXUS_DASHBOARD_PUBLIC=true. A regression here
+// re-exposes savings/routing metrics without auth, so the default-off
+// direction is security-critical.
+func TestPublicPathExemptDashboard(t *testing.T) {
+	dashGET := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+
+	// Default: dashboard gated (DashboardPublic=false).
+	if publicPathExempt(config.Config{})(dashGET) {
+		t.Error("dashboard must be gated when DashboardPublic=false (security-critical default)")
+	}
+	// Opt-in public: dashboard exempt.
+	if !publicPathExempt(config.Config{DashboardPublic: true})(dashGET) {
+		t.Error("dashboard must be exempt when DashboardPublic=true")
+	}
+	// Custom path is honoured when configured.
+	custom := httptest.NewRequest(http.MethodGet, "/stats", nil)
+	if publicPathExempt(config.Config{DashboardEndpoint: "/stats", DashboardPublic: false})(custom) {
+		t.Error("custom dashboard path must still be gated when DashboardPublic=false")
+	}
+	if !publicPathExempt(config.Config{DashboardEndpoint: "/stats", DashboardPublic: true})(custom) {
+		t.Error("custom dashboard path must be exempt when DashboardPublic=true")
+	}
+	// Empty endpoint falls back to /dashboard default; exempt here
+	// because DashboardPublic=true.
+	if !publicPathExempt(config.Config{DashboardEndpoint: "", DashboardPublic: true})(dashGET) {
+		t.Error("empty DashboardEndpoint should fall back to /dashboard and be exempt when DashboardPublic=true")
+	}
+}
+
 // stubJudgeStorage is a minimal judge.Storage implementation for testing
 // confidenceBridge without hitting any real storage.
 type stubJudgeStorage struct {

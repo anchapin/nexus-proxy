@@ -228,6 +228,11 @@ type RouteCounters struct {
 	// the other map-based counters.
 	localCooldownTriggers uint64
 
+	// budgetDowntier counts how many times the planner down-tiered to
+	// local because the estimated frontier cost would exceed the
+	// remaining 24h budget (issue #1163).
+	budgetDowntier uint64
+
 	// DSL fast-pass counters (issue #875). dslHits is keyed by reason
 	// ("fusion", "formatting", "local", "unicode"); dslMisses is a
 	// single counter incremented when DSL had no opinion and the
@@ -533,6 +538,16 @@ func (rc *RouteCounters) IncLocalCooldownTriggers() {
 		return
 	}
 	atomic.AddUint64(&rc.localCooldownTriggers, 1)
+}
+
+// IncBudgetDowntier increments the budget-down-tier counter (issue
+// #1163). Called when the planner routes to local because the frontier
+// budget is exhausted. Nil receivers are safe — no-op.
+func (rc *RouteCounters) IncBudgetDowntier() {
+	if rc == nil {
+		return
+	}
+	atomic.AddUint64(&rc.budgetDowntier, 1)
 }
 
 // IncAuthReaperEvictions increments the auth limiter reaper evictions counter
@@ -996,6 +1011,13 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	// Local-route cooldown triggers (issue #530).
 	cooldownTriggers := atomic.LoadUint64(&rc.localCooldownTriggers)
 	if n, err := fmt.Fprintf(w, "# HELP nexus_local_cooldown_triggers_total Total local-route cooldown arm events.\n# TYPE nexus_local_cooldown_triggers_total counter\nnexus_local_cooldown_triggers_total %d\n", cooldownTriggers); err != nil {
+		return total, err
+	} else {
+		total += int64(n)
+	}
+	// Budget down-tier events (issue #1163).
+	budgetDowntier := atomic.LoadUint64(&rc.budgetDowntier)
+	if n, err := fmt.Fprintf(w, "# HELP nexus_route_budget_downtier_total Total requests down-tiered to local because the frontier budget was exhausted (issue #1163).\n# TYPE nexus_route_budget_downtier_total counter\nnexus_route_budget_downtier_total %d\n", budgetDowntier); err != nil {
 		return total, err
 	} else {
 		total += int64(n)

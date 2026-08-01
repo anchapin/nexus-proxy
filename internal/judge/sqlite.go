@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,16 +33,27 @@ CREATE TABLE IF NOT EXISTS judge_scores (
     cost_usd REAL NOT NULL DEFAULT 0,
     prompt_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
-    error TEXT NOT NULL DEFAULT ''
+    error TEXT NOT NULL DEFAULT '',
+    rag_injected INTEGER NOT NULL DEFAULT 0,
+    rag_similarity REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_judge_scores_timestamp ON judge_scores(timestamp);
 CREATE INDEX IF NOT EXISTS idx_judge_scores_request_id ON judge_scores(request_id);
 `
 
+// judgeScoreMigrations holds additive ALTER TABLE statements that bring
+// a pre-existing judge_scores table up to the current schema (issue #1167).
+// Each is safe to re-run: the "duplicate column name" error is suppressed
+// so a fresh database (created with the full schema above) is unaffected.
+var judgeScoreMigrations = []string{
+	`ALTER TABLE judge_scores ADD COLUMN rag_injected INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE judge_scores ADD COLUMN rag_similarity REAL NOT NULL DEFAULT 0`,
+}
+
 // insertScoreSQL is the prepared statement for Record.
 const insertScoreSQL = `INSERT INTO judge_scores
-    (timestamp, request_id, score, raw_response, cost_usd, prompt_tokens, output_tokens, error)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    (timestamp, request_id, score, raw_response, cost_usd, prompt_tokens, output_tokens, error, rag_injected, rag_similarity)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // bufferedChannelSize caps the in-flight queue per store. Records
 // serialise to one INSERT each, so this caps memory at roughly
@@ -90,6 +102,10 @@ func OpenSQLiteStore(path string) (*SQLiteStore, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("judge: create schema: %w", err)
 	}
+	if err := migrateJudgeScores(context.Background(), db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("judge: migrate: %w", err)
+	}
 
 	s := &SQLiteStore{
 		db:   db,
@@ -111,6 +127,24 @@ func buildDSN(path string) string {
 		"file:%s?mode=rwc&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)",
 		path,
 	)
+}
+
+// migrateJudgeScores runs every additive ALTER TABLE in
+// judgeScoreMigrations. Each statement is attempted individually;
+// "duplicate column name" errors mean the column already exists (the
+// database was created by a newer build) and are silently ignored.
+// Any other error aborts Open so the operator sees the problem at boot
+// (issue #1167).
+func migrateJudgeScores(ctx context.Context, db *sql.DB) error {
+	for _, stmt := range judgeScoreMigrations {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			if strings.Contains(err.Error(), "duplicate column name") {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 // Path returns the on-disk path the store was opened with. Empty for
@@ -164,6 +198,11 @@ func (s *SQLiteStore) writeOne(score JudgeScore) {
 		errStr = score.Err.Error()
 	}
 
+	ragInjected := 0
+	if score.RAGInjected {
+		ragInjected = 1
+	}
+
 	_, err := s.db.ExecContext(ctx, insertScoreSQL,
 		ts,
 		score.RequestID,
@@ -173,6 +212,8 @@ func (s *SQLiteStore) writeOne(score JudgeScore) {
 		score.PromptTok,
 		score.OutputTok,
 		errStr,
+		ragInjected,
+		score.RAGSimilarity,
 	)
 	if err != nil {
 		// Best-effort: log and continue. Judge scores are
