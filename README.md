@@ -514,6 +514,7 @@ invocation (no args) starts the proxy on `:8000`.
 | `nexus check` | Run the boot-time diagnostic suite and exit. Use `--json` for machine-readable output. See [Verify](#verify-before-serving-traffic) above. |
 | `nexus doctor` | Alias for `nexus check`. |
 | `nexus config validate <file>` | Parse and validate a YAML config file, then print the resolved keys. Exits `0` on success, `1` on parse / indentation errors. |
+| `nexus config migrate <file>` | Rewrite deprecated env-var / YAML keys to current names in place (writes a `.bak` backup). Exits `0` on success or no-op, `1` on errors. |
 | `nexus dashboard` | Print the daily savings summary from the SQLite metrics store. Flags: `--json`, `--since YYYY-MM-DD`, `--days N`, `--db PATH`, `--cost-per-1k RATE`. |
 | `nexus --version` / `-v` | Print the build version (`nexus dev` for local builds). |
 | `nexus --help` / `-h` | Print the usage banner. |

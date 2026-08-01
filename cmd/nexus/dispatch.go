@@ -38,6 +38,7 @@ func dispatch(args []string, stdout, stderr io.Writer) (exitCode int, handled bo
 		fmt.Fprintln(stderr, "Run `nexus check` to validate boot-time configuration.")
 		fmt.Fprintln(stderr, "Run `nexus dashboard` to view the daily savings summary.")
 		fmt.Fprintln(stderr, "Run `nexus config validate <file>` to validate a config file.")
+		fmt.Fprintln(stderr, "Run `nexus config migrate <file>` to upgrade deprecated config keys.")
 		fmt.Fprintln(stderr, "Run `nexus judge stats` to view adaptive routing confidence.")
 		fmt.Fprintln(stderr, "Run `nexus routing-preview \"prompt\"` to preview routing decisions.")
 		fmt.Fprintln(stderr, "Run `nexus --version` to print the build version.")
