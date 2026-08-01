@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/ioutils"
+	"github.com/anchapin/nexus-proxy/internal/tokenizer"
 	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
@@ -38,8 +39,20 @@ type CascadeStep struct {
 // changes without restarting the process (issue #14 acceptance criteria).
 type Cascade struct {
 	Steps            []CascadeStep
-	Timeout          time.Duration // per-attempt; <=0 falls back to cascadeDefaultTimeout
+	Timeout          time.Duration // per-attempt fixed fallback; <=0 falls back to cascadeDefaultTimeout
 	MaxResponseBytes int           // per-response cap; <=0 falls back to defaultMaxResponseBytes (64 MiB)
+
+	// Adaptive per-attempt timeout (issue #1175). When TimeoutPer1kTokens
+	// > 0 the effective per-attempt timeout scales with the estimated
+	// prompt token count:
+	//
+	//	effective = clamp(floor + per1k * estimatedPromptTokens/1000, floor, ceiling)
+	//
+	// When TimeoutPer1kTokens <= 0 the fixed Timeout field is used
+	// (backward compatible — identical to pre-issue-#1175 behaviour).
+	TimeoutFloor       time.Duration
+	TimeoutCeiling     time.Duration
+	TimeoutPer1kTokens time.Duration
 }
 
 // CascadeResult is the per-request outcome suitable for telemetry.
@@ -81,6 +94,15 @@ type CascadeResult struct {
 // cascadeDefaultTimeout is the per-attempt timeout used when Cascade.Timeout
 // is <= 0. Mirrors the issue default ("configurable, default 30s").
 const cascadeDefaultTimeout = 30 * time.Second
+
+// Adaptive per-attempt timeout defaults (issue #1175). Used when the
+// corresponding Cascade field is <= 0 so that a freshly built Cascade
+// still gets sensible adaptive behaviour.
+const (
+	cascadeDefaultFloor       = 5 * time.Second
+	cascadeDefaultCeiling     = 120 * time.Second
+	cascadeDefaultPer1kTokens = 1500 * time.Millisecond
+)
 
 // ErrSSEPartialWrite is returned by writeSSEResponse when an SSE body write
 // fails after HTTP headers have already been committed (WriteHeader called).
@@ -146,10 +168,7 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 	if len(c.Steps) == 0 {
 		return CascadeResult{}, errors.New("cascade: no steps configured")
 	}
-	timeout := c.Timeout
-	if timeout <= 0 {
-		timeout = cascadeDefaultTimeout
-	}
+	timeout := c.effectiveTimeout(payload)
 
 	res := CascadeResult{}
 	var lastErr error
@@ -166,6 +185,7 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 				slog.String("step", step.Name),
 				slog.Int("attempt", i+1),
 				slog.Int("total", len(c.Steps)),
+				slog.Duration("timeout", timeout),
 			)
 			res.Succeeded = true
 			res.ServedBy = step.Name
@@ -199,6 +219,7 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 			slog.Int("attempt", i+1),
 			slog.Int("total", len(c.Steps)),
 			slog.Bool("retry", retry),
+			slog.Duration("timeout", timeout),
 			slog.Any("err", err),
 		)
 		if !retry {
@@ -253,6 +274,79 @@ func joinStepNames(steps []CascadeStep) string {
 		names[i] = s.Name
 	}
 	return strings.Join(names, "->")
+}
+
+// effectiveTimeout returns the per-attempt timeout for this cascade given
+// the request payload. When adaptive scaling is enabled
+// (TimeoutPer1kTokens > 0, issue #1175) the timeout scales with the
+// estimated prompt token count:
+//
+//	effective = clamp(floor + per1k * tokens/1000, floor, ceiling)
+//
+// When adaptive scaling is disabled (TimeoutPer1kTokens <= 0) the fixed
+// Timeout field is used (backward compatible with pre-issue-#1175
+// behaviour).
+func (c *Cascade) effectiveTimeout(payload map[string]interface{}) time.Duration {
+	if c.TimeoutPer1kTokens <= 0 {
+		t := c.Timeout
+		if t <= 0 {
+			t = cascadeDefaultTimeout
+		}
+		return t
+	}
+	floor := c.TimeoutFloor
+	if floor <= 0 {
+		floor = cascadeDefaultFloor
+	}
+	ceiling := c.TimeoutCeiling
+	if ceiling <= 0 || ceiling < floor {
+		ceiling = cascadeDefaultCeiling
+	}
+	tokens := estimatePromptTokens(payload)
+	// per1k * tokens / 1000 using integer math to avoid float drift.
+	computed := floor + time.Duration(int64(c.TimeoutPer1kTokens)*int64(tokens)/1000)
+	if computed < floor {
+		computed = floor
+	}
+	if computed > ceiling {
+		computed = ceiling
+	}
+	return computed
+}
+
+// estimatePromptTokens returns an approximate token count for the prompt
+// portion of an OpenAI-compatible chat-completion payload. It concatenates
+// the textual content of every message in payload["messages"], then counts
+// tokens via the shared tokenizer (issue #1175). On error it falls back to
+// the len(s)/4 heuristic.
+func estimatePromptTokens(payload map[string]interface{}) int {
+	msgs, ok := payload["messages"].([]interface{})
+	if !ok || len(msgs) == 0 {
+		return len(fmt.Sprint(payload)) / 4
+	}
+	var sb strings.Builder
+	for _, m := range msgs {
+		mp, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch content := mp["content"].(type) {
+		case string:
+			sb.WriteString(content)
+		case []interface{}:
+			// Vision/multi-part content: extract the "text" field of
+			// each part, ignoring image_url entries.
+			for _, part := range content {
+				if pp, ok := part.(map[string]interface{}); ok {
+					if txt, ok := pp["text"].(string); ok {
+						sb.WriteString(txt)
+					}
+				}
+			}
+		}
+		sb.WriteByte(' ')
+	}
+	return tokenizer.CountTokens(sb.String())
 }
 
 // fetchCascadeStep does a single non-streaming POST to step.URL, validates
@@ -497,6 +591,11 @@ type CascadeConfig struct {
 	ZAIKey        string
 	Timeout       time.Duration
 
+	// Adaptive per-attempt timeout (issue #1175). See Cascade struct docs.
+	TimeoutFloor       time.Duration
+	TimeoutCeiling     time.Duration
+	TimeoutPer1kTokens time.Duration
+
 	// MaxResponseBytes caps per-response bodies in the cascade. Zero or
 	// negative falls back to defaultMaxResponseBytes (64 MiB).
 	MaxResponseBytes int
@@ -544,7 +643,14 @@ func BuildLocalCascade(cfg CascadeConfig) *Cascade {
 			Model:  cfg.ZAIModel,
 		})
 	}
-	return &Cascade{Steps: steps, Timeout: cfg.Timeout, MaxResponseBytes: cfg.MaxResponseBytes}
+	return &Cascade{
+		Steps:              steps,
+		Timeout:            cfg.Timeout,
+		TimeoutFloor:       cfg.TimeoutFloor,
+		TimeoutCeiling:     cfg.TimeoutCeiling,
+		TimeoutPer1kTokens: cfg.TimeoutPer1kTokens,
+		MaxResponseBytes:   cfg.MaxResponseBytes,
+	}
 }
 
 const truncateSuffix = "...(truncated)"

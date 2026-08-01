@@ -298,6 +298,17 @@ body preview capped at `NEXUS_DEBUG_BODY_BYTES` (default 512).
 **Distributed tracing** (`NEXUS_TRACING_ENDPOINT`): OTLP/JSON exporter.
 See `docs/tracing.example.md` for setup.
 
+## Adaptive cascade timeout (issue #1175)
+
+The cascade per-attempt timeout scales with prompt token count instead of
+a fixed value: `effective = clamp(floor + per1k * tokens/1000, floor, ceiling)`.
+- `NEXUS_CASCADE_TIMEOUT_FLOOR` (default 5s): minimum per-attempt timeout.
+- `NEXUS_CASCADE_TIMEOUT_CEILING` (default 120s): maximum per-attempt timeout.
+- `NEXUS_CASCADE_TIMEOUT_PER_1K_TOKENS` (default 1500ms): additive per-1k
+  estimated prompt tokens. Set `<=0` to disable adaptive scaling and revert to
+  the fixed `NEXUS_CASCADE_TIMEOUT` (default 30s). Prompt tokens are estimated
+  via the shared `internal/tokenizer` (tiktoken cl100k_base).
+
 ## Provider selector (issue #45)
 
 The multi-provider registry picks the cheapest provider based on observed
