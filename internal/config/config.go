@@ -268,6 +268,14 @@ type Config struct {
 	// which the probe treats free VRAM as 0 and forces the static
 	// guardrail (issue #597). 0 disables the thermal check.
 	ProbeThermalThreshold int // GPU temp (°C) threshold; default 90, 0 disables
+	// ProbeNVIDIAInterval is the cadence of the periodic NVIDIA
+	// free-VRAM refresh (issue #1178). On NVIDIA-only hosts the AMD
+	// sysfs path returns nothing, so without this refresh the
+	// budget's FreeVRAMBytes — read on every Acquire by the
+	// concurrency limiter — would stay frozen at boot for the whole
+	// process lifetime. Zero (default) keeps the boot-only behaviour
+	// (nvidia-smi is invoked once at boot and by `nexus check`).
+	ProbeNVIDIAInterval time.Duration // periodic nvidia-smi refresh; 0 disables
 
 	// Local-route concurrency ceiling (issue #81). The limiter bounds
 	// in-flight local-route requests so a small GPU does not OOM under
@@ -1243,6 +1251,20 @@ func Load() (Config, error) {
 		probeThermal = 0
 	}
 	cfg.ProbeThermalThreshold = probeThermal
+
+	// Periodic NVIDIA free-VRAM refresh (issue #1178). The default
+	// of 0 keeps the boot-only nvidia-smi behaviour; a positive
+	// duration arms a background goroutine in the probe Manager that
+	// republishes the budget so the VRAM-aware limiter adapts to
+	// model-swap and co-tenant VRAM-grab events on NVIDIA-only hosts.
+	probeNVIDIAInterval, err := getEnvDuration("NEXUS_PROBE_NVIDIA_INTERVAL", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if probeNVIDIAInterval < 0 {
+		probeNVIDIAInterval = 0
+	}
+	cfg.ProbeNVIDIAInterval = probeNVIDIAInterval
 
 	// Local-route concurrency ceiling (issue #81). The limiter is
 	// dormant unless the operator sets NEXUS_LOCAL_MAX_CONCURRENT

@@ -394,6 +394,7 @@ Key knobs not covered elsewhere (verify defaults in `.env.example`):
 - **`NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT`** (default 5s): max waiter time for concurrent in-flight Embeds; 0 = wait indefinitely (issue #800).
 - **`NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD`** (default 3): consecutive embed failures before RAG circuit trips.
 - **`NEXUS_ARBITER_CACHE_MAX_ENTRIES`** (default 512): LRU cap for arbiter synthesis cache.
+- **`NEXUS_PROBE_NVIDIA_INTERVAL`** (default 0): cadence of the periodic NVIDIA free-VRAM refresh (issue #1178). On NVIDIA-only hosts the AMD sysfs path returns nothing, so without this refresh the VRAM-aware limiter's `FreeVRAMBytes` is frozen at boot. When > 0 (e.g. `5m`), a background goroutine shells out to `nvidia-smi` and republishes the budget so the limiter adapts to model-swap / co-tenant VRAM-grab events. Missing `nvidia-smi` is a silent no-op; 0 = boot-only.
 - **`NEXUS_READINESS_MODE`** (`degraded`|`strict`): `/readyz` returns 503 in `strict` mode when Ollama is degraded or down.
 
 ## `nexus check` exit codes

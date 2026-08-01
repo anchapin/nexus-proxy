@@ -167,6 +167,9 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		)
 	}
 	probeMgr := probe.NewManager(probeImpl, cfg.ProbePollInterval, cfg.ProbeTimeout)
+	if cfg.ProbeNVIDIAInterval > 0 {
+		probeMgr.EnableNVIDIARefresh(cfg.ProbeNVIDIAInterval)
+	}
 	go probeMgr.Run(bgCtx)
 	addCleanup(func() {
 		if err := probeMgr.Close(); err != nil {

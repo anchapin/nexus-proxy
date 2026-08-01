@@ -797,3 +797,50 @@ func TestNewVRAMLimiterNilFreeVRAMFallsBackToCeiling(t *testing.T) {
 		t.Errorf("total in-flight = %d, want 4 (ceil(4/2)=2 per GPU * 2 GPUs)", total)
 	}
 }
+
+// --- VRAM refresh regression (issue #1178) --------------------------------
+
+// TestLimiterEffectiveShrinksAfterVRAMRefresh is the regression test
+// mandated by issue #1178: the limiter must return a SMALLER Effective()
+// after a VRAM refresh reports reduced free VRAM. The limiter reads the
+// probe snapshot via its FreeVRAM closure on every Effective/Acquire, so
+// when the periodic NVIDIA refresh republishes a smaller FreeVRAMBytes
+// the limiter must react on the very next request without a restart.
+func TestLimiterEffectiveShrinksAfterVRAMRefresh(t *testing.T) {
+	ceiling := 8
+	bytesPerSlot := int64(1 << 30)        // 1 GiB
+	v, freeVRAM := vramFn(int64(8) << 30) // 8 GiB free initially
+	l := New(ceiling, bytesPerSlot, freeVRAM)
+
+	// 8 GiB / 1 GiB = 8 slots, capped to ceiling 8.
+	if eff := l.Effective(); eff != 8 {
+		t.Fatalf("initial Effective = %d, want 8 (8 GiB/1 GiB capped at ceiling)", eff)
+	}
+
+	// Simulate a VRAM refresh that reports reduced free VRAM
+	// (model swap / co-tenant grab / thermal throttle). 2 GiB free
+	// -> 2 slots, well below the ceiling.
+	v.Store(int64(2) << 30)
+	if eff := l.Effective(); eff != 2 {
+		t.Errorf("post-refresh Effective = %d, want 2 (2 GiB/1 GiB)", eff)
+	}
+}
+
+// TestLimiterEffectiveGrowsAfterVRAMRefresh confirms the symmetric case:
+// when a refresh reports MORE free VRAM the limiter widens Effective()
+// again, so freed-up VRAM is immediately usable (no stale clamp).
+func TestLimiterEffectiveGrowsAfterVRAMRefresh(t *testing.T) {
+	ceiling := 8
+	bytesPerSlot := int64(1 << 30)
+	v, freeVRAM := vramFn(int64(2) << 30) // 2 GiB free -> 2 slots
+	l := New(ceiling, bytesPerSlot, freeVRAM)
+
+	if eff := l.Effective(); eff != 2 {
+		t.Fatalf("initial Effective = %d, want 2", eff)
+	}
+
+	v.Store(int64(8) << 30)
+	if eff := l.Effective(); eff != 8 {
+		t.Errorf("post-refresh Effective = %d, want 8 (grew back to ceiling)", eff)
+	}
+}

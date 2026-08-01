@@ -145,6 +145,7 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("NEXUS_PROBE_TIMEOUT", "2s")
 	t.Setenv("NEXUS_PROBE_BYTES_PER_TOKEN", "131072")
 	t.Setenv("NEXUS_PROBE_THERMAL_THRESHOLD", "75")
+	t.Setenv("NEXUS_PROBE_NVIDIA_INTERVAL", "5m")
 	t.Setenv("NEXUS_PROVIDER_TAIL_WEIGHT", "0.25")
 
 	cfg, err := Load()
@@ -189,6 +190,9 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if cfg.ProbeThermalThreshold != 75 {
 		t.Errorf("ProbeThermalThreshold = %d, want 75", cfg.ProbeThermalThreshold)
+	}
+	if cfg.ProbeNVIDIAInterval != 5*time.Minute {
+		t.Errorf("ProbeNVIDIAInterval = %v, want 5m", cfg.ProbeNVIDIAInterval)
 	}
 	if cfg.ProviderTailWeight != 0.25 {
 		t.Errorf("ProviderTailWeight = %v, want 0.25", cfg.ProviderTailWeight)
@@ -404,6 +408,19 @@ func TestLoadProbeDisabledByZeroInterval(t *testing.T) {
 	}
 }
 
+// TestLoadProbeNVIDIAIntervalDefaultZero verifies the periodic NVIDIA
+// refresh defaults to boot-only (issue #1178): no background goroutine
+// unless the operator opts in.
+func TestLoadProbeNVIDIAIntervalDefaultZero(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ProbeNVIDIAInterval != 0 {
+		t.Errorf("ProbeNVIDIAInterval = %v, want 0 (boot-only default)", cfg.ProbeNVIDIAInterval)
+	}
+}
+
 func TestLoadProbeInvalidValues(t *testing.T) {
 	cases := []struct {
 		name string
@@ -414,6 +431,7 @@ func TestLoadProbeInvalidValues(t *testing.T) {
 		{"bad timeout", "NEXUS_PROBE_TIMEOUT", "ten seconds"},
 		{"bad bytes per token", "NEXUS_PROBE_BYTES_PER_TOKEN", "lots"},
 		{"bad thermal threshold", "NEXUS_PROBE_THERMAL_THRESHOLD", "hot"},
+		{"bad nvidia interval", "NEXUS_PROBE_NVIDIA_INTERVAL", "5 min"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
