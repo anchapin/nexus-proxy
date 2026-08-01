@@ -6,6 +6,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -85,6 +86,17 @@ type Config struct {
 	ZAIURL   string // "https://api.z.ai/v1/chat/completions"
 	ZAIModel string // "glm-4.6"
 	ZAIKey   string // empty == skipped from cascade
+
+	// Model aliasing (issue #1184). Maps client-requested model names
+	// to "providerName/upstreamModel" so an operator can transparently
+	// remap e.g. "gpt-4" to "anthropic/claude-3-5-sonnet". When a
+	// request's model matches an alias the handler rewrites the body
+	// and routes directly to the target provider. Empty map = disabled
+	// (backward compatible). ModelAliasesStrict, when true, returns
+	// HTTP 400 for a model that matches no alias and no exact provider
+	// model; false (default) passes unknown models through unchanged.
+	ModelAliases       map[string]string // NEXUS_MODEL_ALIASES JSON
+	ModelAliasesStrict bool              // NEXUS_MODEL_ALIASES_STRICT
 
 	// Inbound auth (issue #109). When ProxyAPIKey is non-empty, every
 	// non-exempt endpoint requires a matching Bearer token in the
@@ -1491,6 +1503,19 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.ModelsCacheTTL = modelsCacheTTL
+
+	// Model aliasing (issue #1184). NEXUS_MODEL_ALIASES is a JSON map
+	// of client-requested model names to "providerName/upstreamModel".
+	// Empty/unset = disabled (backward compatible). Invalid JSON fails
+	// boot so an operator typo does not silently pass models through.
+	if raw := os.Getenv("NEXUS_MODEL_ALIASES"); raw != "" {
+		var aliases map[string]string
+		if err := json.Unmarshal([]byte(raw), &aliases); err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_MODEL_ALIASES: %w", err)
+		}
+		cfg.ModelAliases = aliases
+	}
+	cfg.ModelAliasesStrict = parseBoolEnv("NEXUS_MODEL_ALIASES_STRICT", false)
 
 	// Prompt-injection hardening (issue #76). Defaults to warn so a
 	// stock deployment logs injection attempts out of the box.

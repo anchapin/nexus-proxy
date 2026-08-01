@@ -1028,6 +1028,43 @@ func Chat(d Deps) http.Handler {
 			}
 		}
 
+		// Model aliasing (issue #1184). Resolve the client-requested
+		// model against the configured alias map before routing. When a
+		// match is found the request body's model is rewritten to the
+		// upstream model and the route is forced to frontier using the
+		// target provider's endpoint. In strict mode an unknown model
+		// (no alias and no exact provider match) is rejected with 400.
+		var aliasTarget providers.AliasTarget
+		aliasResolved := false
+		if requestedModel, ok := body["model"].(string); ok && requestedModel != "" {
+			if target, found := providers.ResolveAlias(d.Config.ModelAliases, d.Providers, requestedModel); found {
+				aliasTarget = target
+				aliasResolved = true
+				body["model"] = target.Model
+				trace.Request.ModelRequested = requestedModel // preserve original for trace
+				slog.Info("model alias resolved",
+					slog.String("alias", requestedModel),
+					slog.String("provider", target.ProviderName),
+					slog.String("model", target.Model),
+					slog.String("request_id", reqID),
+				)
+			} else if d.Config.ModelAliasesStrict {
+				// Strict mode: reject when the model matches no alias
+				// and no exact provider model. This prevents silently
+				// forwarding unknown models to the default frontier.
+				if !providers.HasProviderModel(d.Providers, requestedModel) {
+					slog.Info("strict mode rejecting unknown model",
+						slog.String("model", requestedModel),
+						slog.String("request_id", reqID),
+					)
+					recordRejection(RejectionBadRequest)
+					writeJSONError(w, http.StatusBadRequest, ErrTypeInvalidRequest,
+						fmt.Sprintf("Model '%s' is not a known alias or configured provider model", requestedModel))
+					return
+				}
+			}
+		}
+
 		messages := rawMessages
 
 		// Apply prompt engineering.
@@ -1261,6 +1298,14 @@ func Chat(d Deps) http.Handler {
 		})
 		slmRoutingMs = time.Since(started).Milliseconds() - promptEngineeringMs - ragRetrievalMs - toonCompressionMs
 		route := decision.Route
+
+		// Model aliasing (issue #1184): when an alias was resolved
+		// earlier, force the route to frontier so the request is
+		// dispatched to the target provider regardless of what the
+		// planner decided.
+		if aliasResolved {
+			route = router.RouteFrontier
+		}
 
 		// Surface route-decision metadata on the response and via the
 		// observer hook (issue #74). The four X-Nexus-Route-* headers
@@ -1844,7 +1889,18 @@ func Chat(d Deps) http.Handler {
 			}
 
 		default:
-			model = d.Config.FrontierModel
+			// Model aliasing (issue #1184): when an alias was resolved,
+			// dispatch to the target provider's endpoint and model
+			// instead of the default frontier config.
+			frontierURL := d.Config.FrontierURL
+			frontierKey := d.Config.FrontierKey
+			if aliasResolved {
+				model = aliasTarget.Model
+				frontierURL = strings.TrimRight(aliasTarget.BaseURL, "/") + "/v1/chat/completions"
+				frontierKey = aliasTarget.APIKey
+			} else {
+				model = d.Config.FrontierModel
+			}
 			// Budget guard: check before frontier dispatch (issue #220).
 			if d.SpendGuard != nil && frontierCost > 0 && d.SpendGuard.Check(r.Context(), frontierCost) {
 				slog.Warn("budget exhausted, rejecting frontier request",
@@ -1862,10 +1918,10 @@ func Chat(d Deps) http.Handler {
 			// single chatCompletionResponse JSON object.
 			if streaming {
 				upErr = upstream.Stream(obs, d.Client,
-					d.Config.FrontierURL, d.Config.FrontierKey, body)
+					frontierURL, frontierKey, body)
 			} else {
 				upErr = upstream.BufferedFetch(obs, d.Client,
-					d.Config.FrontierURL, d.Config.FrontierKey, body)
+					frontierURL, frontierKey, body)
 			}
 			if upErr != nil {
 				if errors.Is(upErr, upstream.ErrUpstreamTruncated) {
@@ -1900,7 +1956,7 @@ func Chat(d Deps) http.Handler {
 			trace.Upstream.Route = string(route)
 			trace.Upstream.Streaming = streaming
 			trace.Upstream.Model = model
-			trace.Upstream.TargetHost = HostOfURL(d.Config.FrontierURL)
+			trace.Upstream.TargetHost = HostOfURL(frontierURL)
 			if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
 				rootSpan.SetAttr("ai.model", model)
 				rootSpan.SetAttr("upstream_target", trace.Upstream.TargetHost)
