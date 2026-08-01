@@ -157,6 +157,14 @@ type Config struct {
 	// chunking (whole-file indexing, backward compatible).
 	RAGChunkTokens int
 
+	// RAG top-K retrieval (issue #1166). When > 1, up to K examples above
+	// threshold are injected per request, ordered by descending score.
+	// Default 1 preserves byte-for-byte backward compatibility.
+	RAGTopK int // NEXUS_RAG_TOP_K; 1 = legacy single-example
+	// RAGMaxInjectionTokens caps total injected context (issue #1166).
+	// Lowest-ranked examples are truncated first. Default 4096.
+	RAGMaxInjectionTokens int // NEXUS_RAG_MAX_INJECTION_TOKENS
+
 	// Routing
 	TokenGuardrail                int           // estimated tokens above this force frontier (6000)
 	SLMTimeout                    time.Duration // Qwen3-Coder routing timeout (8s)
@@ -1019,6 +1027,27 @@ func Load() (Config, error) {
 		ragChunkTokens = 0
 	}
 	cfg.RAGChunkTokens = ragChunkTokens
+
+	// RAG top-K retrieval (issue #1166). Default 1 = legacy single-example.
+	ragTopK, err := getEnvInt("NEXUS_RAG_TOP_K", 1)
+	if err != nil {
+		return cfg, err
+	}
+	if ragTopK < 1 {
+		ragTopK = 1
+	}
+	cfg.RAGTopK = ragTopK
+
+	// RAG injection token cap (issue #1166). Lowest-ranked examples are
+	// truncated first when total tokens exceed this budget.
+	ragMaxInjTokens, err := getEnvInt("NEXUS_RAG_MAX_INJECTION_TOKENS", 4096)
+	if err != nil {
+		return cfg, err
+	}
+	if ragMaxInjTokens < 1 {
+		ragMaxInjTokens = 4096
+	}
+	cfg.RAGMaxInjectionTokens = ragMaxInjTokens
 
 	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
 	if err != nil {
