@@ -602,6 +602,19 @@ type Config struct {
 	// blocking other private ranges.
 	EgressGuardEnabled bool
 	EgressAllowCIDRs   string // raw comma-separated CIDR string from env/YAML
+
+	// Secret management (issue #1173). SecretBackend selects the credential
+	// resolution backend: "env" (default, backward-compatible), "vault", or
+	// "awssm". When a non-env backend is selected, config.Load consults the
+	// external store before falling back to env vars, and an unreachable
+	// configured backend causes boot to fail (fail-closed).
+	SecretBackend string
+	VaultAddr     string
+	VaultToken    string
+	VaultRole     string
+	VaultPath     string
+	AWSSMPrefix   string
+	SecretRefresh time.Duration
 }
 
 // DefaultMetricsDBPath returns the canonical metrics DB location:
@@ -744,6 +757,20 @@ func Load() (Config, error) {
 	cfg.ZAIModel = getFileString("zai_model", "NEXUS_ZAI_MODEL", "glm-4.6")
 	cfg.ZAIKey = getEnv("NEXUS_ZAI_API_KEY", "")        // secrets via env only
 	cfg.ProxyAPIKey = getEnv("NEXUS_PROXY_API_KEY", "") // secrets via env only
+
+	// Secret-manager backend configuration (issue #1173). These are always
+	// read from env — they configure the resolver itself, not secrets.
+	cfg.SecretBackend = getEnv("NEXUS_SECRET_BACKEND", "env")
+	cfg.VaultAddr = getEnv("NEXUS_VAULT_ADDR", "")
+	cfg.VaultToken = getEnv("NEXUS_VAULT_TOKEN", "")
+	cfg.VaultRole = getEnv("NEXUS_VAULT_ROLE", "")
+	cfg.VaultPath = getEnv("NEXUS_VAULT_PATH", "secret")
+	cfg.AWSSMPrefix = getEnv("NEXUS_AWSSM_PREFIX", "")
+	secretRefresh, err := getEnvDuration("NEXUS_SECRET_REFRESH", 0)
+	if err != nil {
+		return cfg, fmt.Errorf("config: NEXUS_SECRET_REFRESH: %w", err)
+	}
+	cfg.SecretRefresh = secretRefresh
 	cfg.StatusPublic = getFileBool("status_public", "NEXUS_STATUS_PUBLIC", false)
 	cfg.ExamplesDir = getFileString("examples_dir", "NEXUS_EXAMPLES_DIR", "./few_shot_examples")
 	cfg.MetaPrompt = defaultMetaPrompt
@@ -1872,6 +1899,12 @@ func (c Config) Validate() error {
 		// Recognised values.
 	default:
 		return configError("NEXUS_READINESS_MODE", `must be "strict" or "degraded"`, c.ReadinessMode, "degraded")
+	}
+	switch c.SecretBackend {
+	case "", "env", "vault", "awssm":
+		// Recognised values.
+	default:
+		return fmt.Errorf("config: NEXUS_SECRET_BACKEND value %q is not recognised; want \"env\", \"vault\", or \"awssm\"", c.SecretBackend)
 	}
 	return nil
 }
