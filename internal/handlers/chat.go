@@ -701,6 +701,20 @@ type Deps struct {
 		Record(ctx context.Context, cost float64, source string)
 	}
 
+	// BudgetChecker is the pre-routing budget quick-check (issue #1163).
+	// When non-nil the planner checks whether the estimated frontier
+	// cost would exceed the remaining 24h budget BEFORE the DSL stage,
+	// down-tiering to RouteLocal to avoid wasting the SLM call on a
+	// request that would be rejected with 429 at dispatch time. The
+	// dispatch-time SpendGuard.Check remains as a final safety net.
+	// Nil means the pre-routing budget check is disabled (backward
+	// compatible). Typically wired to the same *budget.Guard as
+	// SpendGuard.
+	BudgetChecker interface {
+		Remaining() float64
+		WouldExceed(estimatedCost float64) bool
+	}
+
 	// LocalLimiter bounds concurrent local-route requests (issue
 	// #81). When non-nil the handler Acquires a slot before issuing
 	// the local upstream dispatch and Releases it once the dispatch
@@ -1311,6 +1325,8 @@ func Chat(d Deps) http.Handler {
 			SLMCache:             d.SLMCache,
 			ConfidenceThreshold:  d.Config.SLMConfidenceThreshold,
 			ConfidenceErrorHook:  d.ConfidenceErrorHook,
+			Budget:               d.BudgetChecker,
+			FrontierCostPer1K:    d.Config.FrontierCostPer1K,
 		}
 		if d.Config.SLMConfidenceThreshold > 0 && d.Confidence == nil {
 			slog.Warn("planner: ConfidenceThreshold set but no ConfidenceStore — threshold disabled")

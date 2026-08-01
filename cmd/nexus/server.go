@@ -765,6 +765,9 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		if e.DSLMiss {
 			routeCounters.ObserveDSLMiss()
 		}
+		if e.Source == string(router.SourceBudgetDownTier) {
+			routeCounters.IncBudgetDowntier()
+		}
 	})
 	rejectionObs := handlers.RejectionObserverFunc(func(e handlers.RejectionEvent) {
 		routeCounters.ObserveRejection(e.Reason)
@@ -921,6 +924,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		Health:                  hpoller,
 		BudgetObserver:          budgetObserver(probeMgr),
 		SpendGuard:              budgetGuard,
+		BudgetChecker:           budgetGuard,
 		LocalLimiter:            localLimiter,
 		LocalCooldown:           localCooldown,
 		RouteDecisionObserver:   routeDecisionObs,

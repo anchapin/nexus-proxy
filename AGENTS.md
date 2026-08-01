@@ -140,12 +140,13 @@ Tune with `NEXUS_TRACING_TIMEOUT` (default 10s), `NEXUS_TRACING_MAX_RETRIES` (3)
 
 ## Routing pipeline
 
-`internal/router`: Guardrail → DSL → SLM.Decide. Every failure defaults
-to **frontier** (safe choice).
+`internal/router`: Guardrail → Budget → DSL → SLM.Decide. Every failure
+defaults to **frontier** (safe choice).
 
 | Trigger | Route |
 | ------- | ----- |
 | `len(prompt)/4 > NEXUS_TOKEN_GUARDRAIL` | `frontier` (VRAM guardrail) |
+| Estimated frontier cost > remaining 24h budget (issue #1163) | `local` (budget down-tier) |
 | Prompt matches `NEXUS_DSL_FUSION_PATTERNS` (default: `architectural design\|system architecture`) | `fusion` |
 | Prompt matches `NEXUS_DSL_FORMATTING_PATTERNS` (default: `css\|format\|docstring\|lint\|typo\|boilerplate\|debug\|fix bug\|git commit\|sql query\|parse json\|validate input\|regex\|api endpoint\|test\|optimize\|readme`) | `local` |
 | Prompt matches `NEXUS_DSL_LOCAL_PATTERNS` (default: `refactor\|security scan\|generate tests\|explain this code\|performance analysis`) | `local` |
@@ -318,6 +319,7 @@ flagged regardless of this setting.
 - `nexus_health_circuit_*` — Ollama circuit breaker state transitions
 - `nexus_rag_circuit_*` — RAG embedder circuit breaker state transitions
 - `nexus_upstream_*` — per-route/upstream counters and histograms
+- `nexus_route_budget_downtier_total` — requests down-tiered to local because the frontier budget was exhausted (issue #1163)
 
 See `docs/observability-surface.md` for the full metric reference.
 

@@ -293,3 +293,63 @@ func TestCheckApproachingRefiresAfterDipBelow(t *testing.T) {
 		t.Fatal("after re-crossing, CheckApproaching should fire again")
 	}
 }
+
+// TestGuardRemaining verifies Remaining returns limit - spent and 0
+// when over budget or disabled (issue #1163).
+func TestGuardRemaining(t *testing.T) {
+	g := NewGuard(100.0)
+	if r := g.Remaining(); r != 100.0 {
+		t.Errorf("Remaining() = %.2f, want 100.0 (empty guard)", r)
+	}
+	g.Record(context.Background(), 30.0, "frontier")
+	if r := g.Remaining(); r != 70.0 {
+		t.Errorf("Remaining() = %.2f, want 70.0 after $30 spend", r)
+	}
+	g.Record(context.Background(), 80.0, "frontier")
+	if r := g.Remaining(); r != 0.0 {
+		t.Errorf("Remaining() = %.2f, want 0.0 when over budget", r)
+	}
+	// Disabled guard always returns 0.
+	disabled := NewGuard(0)
+	if r := disabled.Remaining(); r != 0.0 {
+		t.Errorf("Remaining() on disabled guard = %.2f, want 0.0", r)
+	}
+}
+
+// TestGuardWouldExceed verifies WouldExceed is a read-only check that
+// reports whether a prospective cost would exceed the budget (issue #1163).
+func TestGuardWouldExceed(t *testing.T) {
+	g := NewGuard(100.0)
+	g.Record(context.Background(), 80.0, "frontier")
+	if !g.WouldExceed(30.0) {
+		t.Error("WouldExceed(30) on $80 spent / $100 limit should be true (80+30 > 100)")
+	}
+	if g.WouldExceed(15.0) {
+		t.Error("WouldExceed(15) on $80 spent / $100 limit should be false (80+15 <= 100)")
+	}
+	// WouldExceed must not record the spend.
+	if state := g.State(); state.Spent != 80.0 {
+		t.Errorf("WouldExceed leaked spend: Spent=%.2f, want 80.0", state.Spent)
+	}
+}
+
+// TestGuardWouldExceedDisabled verifies WouldExceed returns false when
+// the guard has no limit configured (issue #1163).
+func TestGuardWouldExceedDisabled(t *testing.T) {
+	g := NewGuard(0) // disabled
+	if g.WouldExceed(1000.0) {
+		t.Error("WouldExceed on disabled guard should always return false")
+	}
+}
+
+// TestGuardWouldExceedBoundary verifies WouldExceed uses > not >=
+// (matching Check's semantics): spending exactly the remaining budget
+// does not trip the guard.
+func TestGuardWouldExceedBoundary(t *testing.T) {
+	g := NewGuard(100.0)
+	g.Record(context.Background(), 80.0, "frontier")
+	// 80 + 20 == 100 → not > 100, so WouldExceed should be false.
+	if g.WouldExceed(20.0) {
+		t.Error("WouldExceed(20) with exactly remaining budget should be false (boundary)")
+	}
+}
