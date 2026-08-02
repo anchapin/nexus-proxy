@@ -36,6 +36,46 @@ jobs:
       - name: go build
         run: go build ./cmd/nexus
 
+      # ── nexus check (issue #1248) ───────────────────────────────
+      # Runs the built binary's diagnostic suite and surfaces results
+      # as GitHub Actions annotations. Always exits 0 because service-
+      # dependent checks (Ollama, frontier, metrics DB) naturally fail
+      # in CI without those services. Actual CI gates are test + lint.
+      - name: nexus check
+        run: |
+          set -uo pipefail
+          # Build a binary we can invoke (matches go build above).
+          go build -trimpath -o /tmp/nexus ./cmd/nexus
+
+          # Capture JSON on stdout; logs go to stderr for separate handling.
+          OUTPUT=$(/tmp/nexus check --json 2>/tmp/nexus-check-stderr) || CHECK_EXIT=$?
+          CHECK_EXIT=${CHECK_EXIT:-0}
+          # Print logs (stderr) then JSON (stdout) for full CI visibility.
+          cat /tmp/nexus-check-stderr || true
+          echo "$OUTPUT"
+
+          # Surface check results as GitHub Actions annotations.
+          if command -v jq &>/dev/null; then
+            # Warn on each individual failure for visibility.
+            echo "$OUTPUT" | jq -r '
+              if type == "array" then
+                .[] | select(.status == "fail") | "warn:\(.name): \(.detail)"
+              else
+                empty
+              end
+            ' | while IFS= read -r line; do
+              if [ -n "$line" ]; then
+                echo "::warning::nexus check — ${line#warn:}"
+              fi
+            done
+
+            # Summary line with exit code.
+            if [ "$CHECK_EXIT" -ne 0 ]; then
+              TOTAL=$(echo "$OUTPUT" | jq -r '[.[] | select(.status == "fail")] | length')
+              echo "::notice::nexus check: ${TOTAL} failure(s) (expected in CI without services)"
+            fi
+          fi
+
       - name: go test (with race detector)
         run: go test -race -coverprofile=coverage.txt -covermode=atomic ./...
 
