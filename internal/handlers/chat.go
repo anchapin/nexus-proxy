@@ -6,12 +6,14 @@ package handlers
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -326,6 +328,39 @@ type FusionOutcomeObserverFunc func(FusionOutcomeEvent)
 
 // ObserveFusionOutcome implements FusionOutcomeObserver.
 func (f FusionOutcomeObserverFunc) ObserveFusionOutcome(e FusionOutcomeEvent) { f(e) }
+
+// AuditEvent carries the per-request routing attribution needed by the
+// tamper-evident audit log (issue #1153). The handler dispatches one event
+// per proxied request after the upstream response completes, plus one per
+// rejected request (route="rejected"). ClientIP is the direct TCP peer
+// (port stripped); KeyHash is the 16-hex SHA-256 of the accepted bearer
+// credential (empty when auth is disabled — the raw key is never emitted).
+type AuditEvent struct {
+	Timestamp time.Time
+	RequestID string
+	ClientIP  string
+	KeyHash   string
+	Route     string
+	Model     string
+	Outcome   string // "success", "error", or the rejection reason
+}
+
+// AuditObserver is the hook invoked once per proxied or rejected request
+// with the routing attribution data for the tamper-evident audit log
+// (issue #1153). Safe for concurrent use; must not block. Nil means "no
+// observer"; the hot path is unaffected and byte-for-byte identical to
+// pre-issue-#1153 behaviour. The handler does not import the audit
+// package; main.go wires a closure that adapts the event to the auditor.
+type AuditObserver interface {
+	RecordAudit(AuditEvent)
+}
+
+// AuditObserverFunc adapts a plain function to the AuditObserver interface
+// so wiring from main.go stays a one-liner.
+type AuditObserverFunc func(AuditEvent)
+
+// RecordAudit implements AuditObserver.
+func (f AuditObserverFunc) RecordAudit(e AuditEvent) { f(e) }
 
 // RAGEvent carries the outcome of a single RAG retrieval attempt
 // (issue #186, extended in #447). Hit is true when Retrieve returned a
@@ -883,6 +918,15 @@ type Deps struct {
 	// coalescing is disabled (default).
 	Coalescer *upstream.Coalescer
 
+	// AuditObserver is invoked once per proxied or rejected request
+	// with the routing attribution data (who routed what, to where,
+	// and when) for the tamper-evident audit log (issue #1153). Nil
+	// means audit logging is disabled; the hot path is byte-for-byte
+	// identical to pre-issue-#1153 behaviour. The handler does not
+	// import the audit package; main.go wires a closure that adapts
+	// the event to the file-backed auditor.
+	AuditObserver AuditObserver
+
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
 	// copy used for sampling is bounded. Zero uses DefaultObservedCap.
@@ -966,6 +1010,19 @@ func Chat(d Deps) http.Handler {
 			)
 		}
 
+		// Audit attribution (issue #1153). Computed once, up front, so
+		// both the rejection closure and the success path can reuse the
+		// values. Guarded by d.AuditObserver so the hot path is
+		// byte-for-byte identical when audit is disabled.
+		var auditIP, auditKeyHash string
+		if d.AuditObserver != nil {
+			auditIP = stripPort(r.RemoteAddr)
+			if tok := auth.BearerToken(r); tok != "" {
+				sum := sha256.Sum256([]byte(tok))
+				auditKeyHash = hex.EncodeToString(sum[:])[:16] // 16 hex, never the raw key
+			}
+		}
+
 		// recordRejection (issue #119) emits the terminal signal for
 		// every early-return path: one telemetry Record (route=
 		// "rejected") OR one MetricsEvent when the metrics store is
@@ -1001,6 +1058,18 @@ func Chat(d Deps) http.Handler {
 				d.RejectionObserver.ObserveRejection(RejectionEvent{
 					RequestID: reqID,
 					Reason:    reason,
+				})
+			}
+			// Tamper-evident audit log (issue #1153): record the
+			// rejection with full client attribution.
+			if d.AuditObserver != nil {
+				d.AuditObserver.RecordAudit(AuditEvent{
+					Timestamp: ts,
+					RequestID: reqID,
+					ClientIP:  auditIP,
+					KeyHash:   auditKeyHash,
+					Route:     "rejected",
+					Outcome:   reason,
 				})
 			}
 		}
@@ -2410,6 +2479,24 @@ func Chat(d Deps) http.Handler {
 			d.Recorder.Record(rec)
 		}
 
+		// Tamper-evident audit log (issue #1153): record who routed what,
+		// to where, and when. Nil observer = audit disabled (zero overhead).
+		if d.AuditObserver != nil {
+			outcome := "success"
+			if upErr != nil || obs.StatusCode() >= 400 {
+				outcome = "error"
+			}
+			d.AuditObserver.RecordAudit(AuditEvent{
+				Timestamp: time.Now().UTC(),
+				RequestID: reqID,
+				ClientIP:  auditIP,
+				KeyHash:   auditKeyHash,
+				Route:     string(route),
+				Model:     model,
+				Outcome:   outcome,
+			})
+		}
+
 		// Stamp remaining observability attributes on the root span so
 		// OTLP backends can filter traces by streaming mode, correlate
 		// errors, and analyze token counts without joining telemetry store.
@@ -2595,6 +2682,17 @@ func requestID(r *http.Request) string {
 		return "req-unknown"
 	}
 	return "req-" + hex.EncodeToString(b[:])
+}
+
+// stripPort removes the :port suffix from an address of the form
+// "host:port" or "[host]:port", returning the bare host. It is used to
+// extract the client IP from r.RemoteAddr for the audit log (issue #1153).
+// When SplitHostPort fails (no port present) the input is returned as-is.
+func stripPort(addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
 }
 
 // captureWriter is an http.ResponseWriter that tees every Write into
