@@ -140,6 +140,16 @@ DSL patterns are **comma-separated regexes** (set via env var, not a map).
 
 **SLM decision cache:** `NEXUS_SLM_CACHE_MAX_ENTRIES` + `NEXUS_SLM_CACHE_TTL`
 (default 512 entries / 30s). Set `NEXUS_SLM_CACHE_TTL=0` to disable.
+
+**Conversation context** (issue #1147): the planner prepends a bounded
+summary of prior conversation turns to the prompt for DSL matching, SLM
+calls, and cache keys. This prevents misrouting of terse multi-turn
+follow-ups (e.g. "fix it" inherits "system architecture" from a prior
+turn → fusion). Controlled by `NEXUS_ROUTING_CONTEXT_TURNS` (default 3,
+max 10; 0 disables — byte-for-byte pre-#1147 behaviour) and
+`NEXUS_ROUTING_CONTEXT_CHARS` (default 2000). The guardrail stage uses
+the latest prompt alone so conversation history never inflates the VRAM
+ceiling.
 Semantic dedup via `NEXUS_SLMCACHE_SIMILARITY_THRESHOLD` (range 0..1).
 
 **Fusion progressive delivery** (`NEXUS_FUSION_PROGRESSIVE=true`, default):
@@ -389,6 +399,8 @@ fallback. Set `NEXUS_LOCAL_COOLDOWN=0` to disable (pre-issue-#80 behaviour).
 
 Key knobs not covered elsewhere (verify defaults in `.env.example`):
 - **`NEXUS_SLM_CONFIDENCE_THRESHOLD`** (default 0.3): SLM decisions below this bypass DSL/SLM and go to frontier.
+- **`NEXUS_ROUTING_CONTEXT_TURNS`** (default 3, max 10): prior conversation turns fed to the router for multi-turn context (issue #1147). 0 disables.
+- **`NEXUS_ROUTING_CONTEXT_CHARS`** (default 2000): char cap on the conversation-context window fed to the router.
 - **`NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT`** (default 0): retained for backward compat; fix for issue #1038 makes semantic dedup always scan all entries and exit early only on perfect score=1.0, so this var has no effect.
 - **`NEXUS_RAG_EMBED_CACHE_*`** (size 256, TTL 24h): LRU cache for prompt embeddings — repeat prompts skip Ollama entirely.
 - **`NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT`** (default 5s): max waiter time for concurrent in-flight Embeds; 0 = wait indefinitely (issue #800).

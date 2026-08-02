@@ -247,6 +247,16 @@ type PlanRequest struct {
 	// not derive a timeout from it — the SLMClient applies its own
 	// configured timeout via context.WithTimeout internally.
 	Context context.Context
+
+	// ConversationContext is an optional summary of prior conversation
+	// turns assembled by the handler (issue #1147). When non-empty the
+	// planner prepends it to Prompt for the DSL fast-pass, SLM cache key,
+	// SLM call, and Categorize — so multi-turn follow-ups like "fix it"
+	// are routed using the full conversational thread. The guardrail
+	// stage still uses Prompt alone (the latest message) so the VRAM
+	// ceiling is never inflated by conversation history. When empty,
+	// routing is byte-for-byte identical to the pre-#1147 behaviour.
+	ConversationContext string
 }
 
 // Plan runs the routing pipeline and returns a Decision.
@@ -292,6 +302,15 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	// will be routed to fusion because fusionPatterns are checked first.
 	// If you need different precedence, the patterns themselves must be
 	// narrowed to avoid overlap.
+	//
+	// Conversation context (issue #1147): the DSL matches against the
+	// combined context + prompt so a follow-up like "fix it" can match a
+	// keyword from a prior turn. When ConversationContext is empty the
+	// routingText is identical to req.Prompt (byte-for-byte).
+	routingText := req.Prompt
+	if req.ConversationContext != "" {
+		routingText = req.ConversationContext + "\n" + req.Prompt
+	}
 	fusionPatterns := p.FusionPatterns
 	if len(fusionPatterns) == 0 {
 		fusionPatterns = DefaultFusionPatterns
@@ -308,7 +327,7 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	if len(unicodePatterns) == 0 {
 		unicodePatterns = DefaultUnicodePatterns
 	}
-	if r, reason, hit := DSL(req.Prompt, fusionPatterns, formattingPatterns, localPatterns, unicodePatterns); hit {
+	if r, reason, hit := DSL(routingText, fusionPatterns, formattingPatterns, localPatterns, unicodePatterns); hit {
 		return Decision{
 			Route:           r,
 			Source:          SourceDSL,
@@ -340,12 +359,16 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	// Categorize once for observability. Every decision reaching the SLM
 	// stage (including cache hits) carries a non-empty TaskType so that
 	// Prometheus and JSONL telemetry lose their per-category dimension
-	// even when no ConfidenceStore is wired (issue #441).
-	category := Categorize(req.Prompt)
+	// even when no ConfidenceStore is wired (issue #441). Uses the
+	// combined routingText so a terse follow-up inherits its category
+	// from the conversation context (issue #1147).
+	category := Categorize(routingText)
 
-	// Check cache first if enabled.
+	// Check cache first if enabled. The cache key is the routingText so
+	// identical latest prompts with different conversation context do not
+	// share a stale decision (issue #1147).
 	if p.SLMCache != nil {
-		if cached, hit, hitKind := p.SLMCache.Get(req.Context, req.Prompt); hit {
+		if cached, hit, hitKind := p.SLMCache.Get(req.Context, routingText); hit {
 			if p.Confidence != nil {
 				if conf, err := p.Confidence.LocalConfidence(category); err != nil {
 					slog.Warn("planner: confidence lookup",
@@ -401,9 +424,9 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 		} else {
 			confidence = conf
 		}
-		dec, err = p.SLM.DecideWithConfidence(req.Context, req.Prompt, confidence)
+		dec, err = p.SLM.DecideWithConfidence(req.Context, routingText, confidence)
 	} else {
-		dec, err = p.SLM.Decide(req.Context, req.Prompt)
+		dec, err = p.SLM.Decide(req.Context, routingText)
 	}
 	if err != nil {
 		return Decision{
@@ -440,7 +463,7 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 
 	// Cache the successful decision for future identical prompts.
 	if p.SLMCache != nil {
-		p.SLMCache.Set(req.Context, req.Prompt, dec)
+		p.SLMCache.Set(req.Context, routingText, dec)
 	}
 	return Decision{
 		Route:           dec,

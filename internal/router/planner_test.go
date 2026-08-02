@@ -955,3 +955,128 @@ func stringOf(b byte, n int) string {
 	}
 	return string(buf)
 }
+
+// TestPlanner_ConversationContext (issue #1147) verifies that the
+// planner prepends ConversationContext to the prompt for DSL matching,
+// SLM calls, and cache keys — so terse multi-turn follow-ups are routed
+// using the full conversational thread. The guardrail continues to use
+// the latest prompt alone.
+func TestPlanner_ConversationContext(t *testing.T) {
+	basePlanner := func(slm *stubSLM) *Planner {
+		return &Planner{
+			SLM:                slm,
+			FusionPatterns:     fusionPatterns,
+			FormattingRegex:    formattingPatterns,
+			LocalPatternsRegex: localPatterns,
+		}
+	}
+
+	t.Run("dsl matches keyword from prior context not latest prompt", func(t *testing.T) {
+		slm := &stubSLM{route: RouteFrontier}
+		p := basePlanner(slm)
+		// Latest prompt "fix it" matches "fix bug" formatting pattern, but
+		// the prior context reveals an architecture discussion that should
+		// win via fusion precedence.
+		req := PlanRequest{
+			Prompt:              "fix it",
+			ConversationContext: "user: review the system architecture\nassistant: here is my review",
+			GuardrailBudget:     6000,
+			GuardrailSource:     "static-fallback",
+			Context:             context.Background(),
+		}
+		dec := p.Plan(req)
+		if dec.Route != RouteFusion {
+			t.Errorf("Route = %q, want fusion (from context keyword), source=%q", dec.Route, dec.Source)
+		}
+		if dec.Source != SourceDSL {
+			t.Errorf("Source = %q, want %q", dec.Source, SourceDSL)
+		}
+		if slm.calledDecide || slm.calledWithConf {
+			t.Error("SLM should not be called when DSL matches")
+		}
+	})
+
+	t.Run("dsl matches formatting keyword from context alone", func(t *testing.T) {
+		slm := &stubSLM{route: RouteFrontier}
+		p := basePlanner(slm)
+		req := PlanRequest{
+			Prompt:              "do that now",
+			ConversationContext: "user: fix the css for the navbar",
+			GuardrailBudget:     6000,
+			GuardrailSource:     "static-fallback",
+			Context:             context.Background(),
+		}
+		dec := p.Plan(req)
+		if dec.Route != RouteLocal {
+			t.Errorf("Route = %q, want local (css from context)", dec.Route)
+		}
+	})
+
+	t.Run("slm receives combined context plus prompt", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		p := basePlanner(slm)
+		// "now explain line 42" has no DSL match; falls to SLM.
+		req := PlanRequest{
+			Prompt:              "now explain line 42",
+			ConversationContext: "user: review the distributed systems design",
+			GuardrailBudget:     6000,
+			GuardrailSource:     "static-fallback",
+			Context:             context.Background(),
+		}
+		dec := p.Plan(req)
+		if dec.Source != SourceSLM {
+			t.Fatalf("Source = %q, want %q", dec.Source, SourceSLM)
+		}
+		if !slm.calledDecide {
+			t.Fatal("SLM.Decide was not called")
+		}
+		// The SLM must have received the combined text.
+		if slm.lastPrompt == req.Prompt {
+			t.Errorf("SLM received bare prompt; expected context-prepended text")
+		}
+		if slm.lastPrompt == "" {
+			t.Error("SLM received empty prompt")
+		}
+		_ = dec
+	})
+
+	t.Run("guardrail uses latest prompt only not inflated by context", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		p := basePlanner(slm)
+		// Prompt is small (under guardrail), but context is huge. The
+		// guardrail must NOT trip on the context — it uses req.Prompt only.
+		bigContext := stringOf('x', 60000)
+		req := PlanRequest{
+			Prompt:              "fix it",
+			ConversationContext: bigContext,
+			GuardrailBudget:     6000,
+			GuardrailSource:     "static-fallback",
+			Context:             context.Background(),
+		}
+		dec := p.Plan(req)
+		if dec.Source == SourceGuardrail {
+			t.Errorf("guardrail tripped on conversation context — should use latest prompt only")
+		}
+	})
+
+	t.Run("empty context is byte-for-byte identical to current behavior", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		p := basePlanner(slm)
+		req := PlanRequest{
+			Prompt:          "please fix the css",
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+		if dec.Route != RouteLocal {
+			t.Errorf("Route = %q, want local", dec.Route)
+		}
+		if dec.Source != SourceDSL {
+			t.Errorf("Source = %q, want %q", dec.Source, SourceDSL)
+		}
+		if slm.lastPrompt != "" && slm.lastPrompt != req.Prompt {
+			t.Errorf("SLM prompt = %q, want %q or empty", slm.lastPrompt, req.Prompt)
+		}
+	})
+}
