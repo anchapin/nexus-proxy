@@ -637,6 +637,27 @@ func (c *Collector) LatencyPercentileGauges() []GaugeSample {
 // decision logic (when a request is "accepted" vs "rejected_invalid"
 // etc.); the collector only stores the resulting counts.
 
+// AuthCountersSnapshot returns a shallow snapshot of the three auth
+// counter maps (accepted, rejectedInvalid, rejectedMissing) under
+// authMu so callers can iterate without racing against IncAuth* writers.
+func (c *Collector) AuthCountersSnapshot() (accepted, rejectedInvalid, rejectedMissing map[string]*atomic.Uint64) {
+	c.authMu.Lock()
+	accepted = make(map[string]*atomic.Uint64, len(c.authAccepted))
+	for k, v := range c.authAccepted {
+		accepted[k] = v
+	}
+	rejectedInvalid = make(map[string]*atomic.Uint64, len(c.authRejectedInvalid))
+	for k, v := range c.authRejectedInvalid {
+		rejectedInvalid[k] = v
+	}
+	rejectedMissing = make(map[string]*atomic.Uint64, len(c.authRejectedMissing))
+	for k, v := range c.authRejectedMissing {
+		rejectedMissing[k] = v
+	}
+	c.authMu.Unlock()
+	return
+}
+
 // IncAuthAccepted records one accepted authentication request from the
 // given client IP (issue #1061).
 func (c *Collector) IncAuthAccepted(clientIP string) {

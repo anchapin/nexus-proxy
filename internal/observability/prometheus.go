@@ -368,15 +368,18 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	// request is not an authentication decision and would dilute the
 	// per-decision counts. Adding client_ip enables operators to identify
 	// which IPs are generating auth failures (issue #1061).
+	// Snapshot auth maps under authMu to avoid racing with IncAuth*
+	// writers that insert new keys (issue #1239 CI fix).
+	authAcc, authRejInv, authRejMiss := c.AuthCountersSnapshot()
 	// Collect all unique client IPs across all three outcome maps.
 	authIPs := make(map[string]struct{})
-	for ip := range c.authAccepted {
+	for ip := range authAcc {
 		authIPs[ip] = struct{}{}
 	}
-	for ip := range c.authRejectedInvalid {
+	for ip := range authRejInv {
 		authIPs[ip] = struct{}{}
 	}
-	for ip := range c.authRejectedMissing {
+	for ip := range authRejMiss {
 		authIPs[ip] = struct{}{}
 	}
 	// Build sorted slice for deterministic output.
@@ -387,13 +390,13 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	sort.Strings(authIPSlice)
 	authSamples := make([]labelSample2, 0, len(authIPs)*3)
 	for _, ip := range authIPSlice {
-		if v, ok := c.authAccepted[ip]; ok {
+		if v, ok := authAcc[ip]; ok {
 			authSamples = append(authSamples, labelSample2{value1: "accepted", value2: ip, n: v.Load()})
 		}
-		if v, ok := c.authRejectedInvalid[ip]; ok {
+		if v, ok := authRejInv[ip]; ok {
 			authSamples = append(authSamples, labelSample2{value1: "rejected_invalid", value2: ip, n: v.Load()})
 		}
-		if v, ok := c.authRejectedMissing[ip]; ok {
+		if v, ok := authRejMiss[ip]; ok {
 			authSamples = append(authSamples, labelSample2{value1: "rejected_missing", value2: ip, n: v.Load()})
 		}
 	}

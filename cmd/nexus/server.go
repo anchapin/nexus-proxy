@@ -1117,8 +1117,13 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 	)
 
 	mux.Handle("/status", handlers.Status(handlers.StatusDeps{
-		JudgeEnabled:  func() bool { return judgeEval != nil && judgeEval.Enabled() },
-		JudgeDepth:    func() int { return judgeEval.QueueDepth() },
+		JudgeEnabled: func() bool { return judgeEval != nil && judgeEval.Enabled() },
+		JudgeDepth: func() int {
+			if judgeEval == nil {
+				return 0
+			}
+			return judgeEval.QueueDepth()
+		},
 		JudgeCapacity: func() int { return cfg.JudgeQueueDepth },
 		JudgeWorkers: func() int {
 			if judgeEval == nil {
