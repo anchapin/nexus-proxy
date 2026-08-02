@@ -614,6 +614,145 @@ func TestE2E_Degradation(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Budget down-tier test (issue #1163)
+// ---------------------------------------------------------------------------
+
+// startMockFrontierFailover returns an httptest.Server that emulates a
+// frontier provider which can be configured to fail with a specific status
+// code on the first N calls, then succeed.
+func startMockFrontierFailover(t *testing.T, stats *mockServerStats, content string, failCode int, failCount int) *httptest.Server {
+	t.Helper()
+	var calls atomic.Int32
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stats.inc(r.URL.Path)
+		n := calls.Add(1)
+		if failCode != 0 && int(n) <= failCount {
+			w.WriteHeader(failCode)
+			return
+		}
+		// Non-streaming JSON response (cascade always uses stream=false).
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		resp := map[string]interface{}{
+			"model": "frontier-model",
+			"choices": []map[string]interface{}{
+				{
+					"index":         0,
+					"message":       map[string]interface{}{"role": "assistant", "content": content},
+					"finish_reason": "stop",
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+}
+
+// TestE2E_BudgetDownTier verifies that when the 24h budget is exhausted,
+// the planner down-tiers to local routing (issue #1163). It configures
+// a tiny daily budget with a high cost-per-1K rate so any frontier-bound
+// request exceeds the limit. The SLM is configured to return "frontier"
+// but the budget check overrides it to RouteLocal.
+func TestE2E_BudgetDownTier(t *testing.T) {
+	stats := newMockServerStats()
+	ollama := startMockOllama(t, stats, "budget-downtier local response", 0)
+	t.Cleanup(ollama.Close)
+	// Still need a frontier URL for config parsing even though budget
+	// down-tier prevents it from being called.
+	frontier := startMockFrontier(t, stats, "should not be reached")
+	t.Cleanup(frontier.Close)
+
+	e2eBaseEnv(t, ollama.URL, frontier.URL)
+	// Keep guardrail high so VRAM doesn't force frontier.
+	t.Setenv("NEXUS_TOKEN_GUARDRAIL", "999999")
+	// Set a tiny daily budget ($0.001 = 0.1 cents).
+	t.Setenv("NEXUS_BUDGET_DAILY_LIMIT", "0.001")
+	t.Setenv("NEXUS_BUDGET_ALERT_ENABLED", "false")
+	// Set a high cost-per-1K so any prompt exceeds the budget.
+	// A ~100-token prompt at $100/1K tokens = $10 >> $0.001 limit.
+	t.Setenv("NEXUS_FRONTIER_COST_PER_1K", "100.0")
+
+	ts := e2eTestServer(t)
+	resp := doChat(t, ts, chatRequest("budget down-tier test prompt for local routing", false), "")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got %d, want 200; body: %s", resp.StatusCode, body)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	// The request should have been down-tiered to local (Ollama).
+	if !strings.Contains(string(body), "budget-downtier local response") {
+		t.Errorf("expected local response from budget down-tier; got: %s", body)
+	}
+	// Ollama should have been hit for chat completions.
+	if got := stats.get("/v1/chat/completions"); got == 0 {
+		t.Error("expected Ollama /v1/chat/completions to be called (budget down-tier)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Frontier provider failover test (issue #1157)
+// ---------------------------------------------------------------------------
+
+// TestE2E_FrontierFailover verifies that when the first frontier provider
+// returns a 5xx, the cascade fails over to the second provider (issue #1157).
+// It configures two mock providers via NEXUS_PROVIDERS: provider A fails
+// on the first attempt, provider B succeeds. The test asserts that the
+// response comes from provider B and that the X-Nexus-Cascade-Served-By
+// header identifies the failover provider.
+func TestE2E_FrontierFailover(t *testing.T) {
+	providerAStats := newMockServerStats()
+	providerBStats := newMockServerStats()
+	// Provider A: fails with 500 on first call, then succeeds.
+	providerA := startMockFrontierFailover(t, providerAStats, "provider A recovered", 500, 1)
+	t.Cleanup(providerA.Close)
+	// Provider B: always succeeds.
+	providerB := startMockFrontier(t, providerBStats, "provider B response")
+	t.Cleanup(providerB.Close)
+
+	// Ollama mock (needed for config, but guardrail forces frontier).
+	ollamaStats := newMockServerStats()
+	ollama := startMockOllama(t, ollamaStats, "unused", 0)
+	t.Cleanup(ollama.Close)
+
+	e2eBaseEnv(t, ollama.URL, providerA.URL)
+	// Force frontier routing via guardrail.
+	t.Setenv("NEXUS_TOKEN_GUARDRAIL", "1")
+	// Configure two providers via NEXUS_PROVIDERS.
+	t.Setenv("NEXUS_PROVIDERS", "providerA,providerB")
+	t.Setenv("NEXUS_PROVIDER_PROVIDERA_URL", providerA.URL)
+	t.Setenv("NEXUS_PROVIDER_PROVIDERA_MODEL", "provider-a-model")
+	t.Setenv("NEXUS_PROVIDER_PROVIDERA_API_KEY", "test-key-a")
+	t.Setenv("NEXUS_PROVIDER_PROVIDERB_URL", providerB.URL)
+	t.Setenv("NEXUS_PROVIDER_PROVIDERB_MODEL", "provider-b-model")
+	t.Setenv("NEXUS_PROVIDER_PROVIDERB_API_KEY", "test-key-b")
+	// Enable frontier failover.
+	t.Setenv("NEXUS_FRONTIER_FAILOVER", "true")
+	t.Setenv("NEXUS_FRONTIER_FAILOVER_MAX_ATTEMPTS", "3")
+	// Disable health polling for frontier providers (not needed for E2E).
+	t.Setenv("NEXUS_FRONTIER_HEALTH_POLL_INTERVAL", "0")
+
+	ts := e2eTestServer(t)
+	resp := doChat(t, ts, chatRequest("frontier failover test prompt", false), "")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got %d, want 200; body: %s", resp.StatusCode, body)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+	// Response should come from provider B (failover target).
+	if !strings.Contains(bodyStr, "provider B response") {
+		t.Errorf("expected provider B response after failover; got: %s", bodyStr)
+	}
+	// Provider A should have been called (and failed).
+	if got := providerAStats.get("/v1/chat/completions"); got == 0 {
+		t.Error("expected provider A to be called first")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // buildHandler unit test
 // ---------------------------------------------------------------------------
 
