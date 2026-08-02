@@ -14,7 +14,7 @@ LINT        ?= golangci-lint
 VERSION     ?= dev
 LDFLAGS     := -s -w -X main.version=$(VERSION)
 
-.PHONY: help build run test test-race bench bench-short bench-baseline vet fmt lint tidy ci clean docker-build install-hooks release release-snapshot check-rules
+.PHONY: help build run test test-race bench bench-short bench-baseline vet fmt lint tidy ci clean docker-build install-hooks release release-snapshot check-rules check
 
 help:
 	@echo "Targets:"
@@ -29,7 +29,8 @@ help:
 	@echo "  fmt         - gofmt -w (writes in place)"
 	@echo "  lint        - golangci-lint run"
 	@echo "  tidy        - go mod tidy"
-	@echo "  ci          - vet + build + test + test-race + lint (what CI runs)"
+	@echo "  check       - run 'nexus check' boot-time diagnostics (issue #1248)"
+	@echo "  ci          - vet + build + check + test + test-race + lint (what CI runs)"
 	@echo "  docker-build - build the container image (smoke; needs Docker)"
 	@echo "  clean       - remove ./bin/ and coverage files"
 	@echo "  install-hooks - install git pre-commit hook (gofmt check)"
@@ -40,6 +41,12 @@ help:
 build:
 	@mkdir -p bin
 	$(GO) build -trimpath -ldflags="$(LDFLAGS)" -o bin/$(BINARY) ./cmd/nexus
+
+# check runs the built binary's diagnostic suite (issue #1248). Network-
+# dependent checks (Ollama, frontier) skip (not fail) when services are
+# absent, so this is safe to run in CI without any external deps.
+check: build
+	./bin/$(BINARY) check --json
 
 run:
 	$(GO) run ./cmd/nexus
@@ -88,7 +95,7 @@ tidy:
 # `test-race` is included here because race conditions in concurrent code
 # (transport, metrics, budget tracker, VRAM limiter) are easy to miss in
 # manual testing and can hide in CI for weeks before surfacing in prod.
-ci: vet build test test-race lint bench-short
+ci: vet build check test test-race lint bench-short
 
 # docker-build smoke-builds the container image. Used by the ci.yml
 # `docker` job (issue #541) so Dockerfile / go.mod Go-version drift is

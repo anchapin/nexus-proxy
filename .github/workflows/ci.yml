@@ -36,6 +36,39 @@ jobs:
       - name: go build
         run: go build ./cmd/nexus
 
+      # ── nexus check gate (issue #1248) ──────────────────────────
+      # Runs the built binary's diagnostic suite (config validation,
+      # Ollama connectivity, frontier key presence). Network-dependent
+      # checks skip (not fail) when services are absent, so this is
+      # safe in CI. Uses --json so jq can parse failures; falls back
+      # to the exit code when jq is unavailable.
+      - name: nexus check
+        run: |
+          set -euo pipefail
+          # Build a binary we can invoke (matches go build above).
+          go build -trimpath -o /tmp/nexus ./cmd/nexus
+
+          OUTPUT=$(/tmp/nexus check --json 2>&1) || CHECK_EXIT=$?
+          CHECK_EXIT=${CHECK_EXIT:-0}
+          echo "$OUTPUT"
+
+          # If the check exited non-zero and jq is available, surface
+          # which checks failed in the GitHub Actions log.
+          if [ "$CHECK_EXIT" -ne 0 ] && command -v jq &>/dev/null; then
+            FAILS=$(echo "$OUTPUT" | jq -r '
+              if type == "array" then
+                [.[] | select(.status == "fail") | "\(.name): \(.message)"]
+              else
+                "nexus check exited \($CHECK_EXIT)"
+              end
+            ' | jq -r '.[]')
+            if [ -n "$FAILS" ]; then
+              echo "::error::nexus check failures:"
+              echo "$FAILS"
+            fi
+          fi
+          exit "$CHECK_EXIT"
+
       - name: go test (with race detector)
         run: go test -race -coverprofile=coverage.txt -covermode=atomic ./...
 
