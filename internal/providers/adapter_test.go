@@ -216,9 +216,15 @@ func TestAnthropicAdapterTransformRequest(t *testing.T) {
 	if got.Temperature == nil || *got.Temperature != 0.7 {
 		t.Errorf("Temperature = %v, want 0.7", got.Temperature)
 	}
-	// System hoisted out of messages array.
-	if got.System != "You are helpful." {
-		t.Errorf("System = %q, want %q", got.System, "You are helpful.")
+	// System hoisted out of messages array. Since System is now
+	// json.RawMessage (to support either string or array form),
+	// unmarshal it to compare.
+	var sysStr string
+	if err := json.Unmarshal(got.System, &sysStr); err != nil {
+		t.Fatalf("unmarshal system as string: %v (raw: %s)", err, got.System)
+	}
+	if sysStr != "You are helpful." {
+		t.Errorf("System = %q, want %q", sysStr, "You are helpful.")
 	}
 	// Messages array excludes the system message.
 	if len(got.Messages) != 2 {
@@ -596,5 +602,297 @@ func TestProviderAdapterMethod(t *testing.T) {
 	bad := Provider{Type: "nope"}
 	if _, err := bad.Adapter(); err == nil {
 		t.Error("expected error for bad type")
+	}
+}
+
+// --- Anthropic cache-control hints (issue #1245) ------------------------
+
+// TestAnthropicAdapterCacheControlBelowThreshold verifies that when the
+// system field is shorter than the cache threshold, the adapter emits the
+// system as a plain string (no cache_control array form).
+func TestAnthropicAdapterCacheControlBelowThreshold(t *testing.T) {
+	orig := AnthropicCacheMinSystemChars
+	AnthropicCacheMinSystemChars = 1024
+	defer func() { AnthropicCacheMinSystemChars = orig }()
+
+	a, _ := NewAdapter(AdapterTypeAnthropic)
+	req := map[string]any{
+		"model": "claude-sonnet-4",
+		"messages": []map[string]any{
+			{"role": "system", "content": "Short."},
+		},
+	}
+	body, _ := json.Marshal(req)
+	out, err := a.TransformRequest(body)
+	if err != nil {
+		t.Fatalf("TransformRequest: %v", err)
+	}
+
+	// System should be a plain string, not an array.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(out, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	var sysStr string
+	if err := json.Unmarshal(raw["system"], &sysStr); err != nil {
+		// It's not a plain string — could be an array (wrong).
+		t.Errorf("system should be a plain string when below threshold, got %s", raw["system"])
+	}
+	if sysStr != "Short." {
+		t.Errorf("system = %q, want %q", sysStr, "Short.")
+	}
+}
+
+// TestAnthropicAdapterCacheControlAboveThreshold verifies that when the
+// system field exceeds the cache threshold, the adapter emits it as an
+// array of content blocks with cache_control: {type: "ephemeral"} on the
+// final block.
+func TestAnthropicAdapterCacheControlAboveThreshold(t *testing.T) {
+	orig := AnthropicCacheMinSystemChars
+	AnthropicCacheMinSystemChars = 50
+	defer func() { AnthropicCacheMinSystemChars = orig }()
+
+	a, _ := NewAdapter(AdapterTypeAnthropic)
+	// Build a system prompt that exceeds the threshold.
+	longSystem := strings.Repeat("A", 100)
+	req := map[string]any{
+		"model": "claude-sonnet-4",
+		"messages": []map[string]any{
+			{"role": "system", "content": longSystem},
+			{"role": "user", "content": "Hello"},
+		},
+	}
+	body, _ := json.Marshal(req)
+	out, err := a.TransformRequest(body)
+	if err != nil {
+		t.Fatalf("TransformRequest: %v", err)
+	}
+
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// System should be a JSON array.
+	var blocks []anthropicSystemBlock
+	if err := json.Unmarshal(got["system"], &blocks); err != nil {
+		t.Fatalf("system should be an array of blocks, got %s: %v", got["system"], err)
+	}
+	if len(blocks) != 1 {
+		t.Fatalf("len(system blocks) = %d, want 1", len(blocks))
+	}
+	if blocks[0].Type != "text" {
+		t.Errorf("block type = %q, want text", blocks[0].Type)
+	}
+	if blocks[0].Text != longSystem {
+		t.Errorf("block text length = %d, want %d", len(blocks[0].Text), len(longSystem))
+	}
+	if blocks[0].CacheControl == nil {
+		t.Fatal("final block missing cache_control")
+	}
+	if blocks[0].CacheControl.Type != "ephemeral" {
+		t.Errorf("cache_control type = %q, want ephemeral", blocks[0].CacheControl.Type)
+	}
+}
+
+// TestAnthropicAdapterCacheControlMultipleSystemParts verifies that
+// multiple system messages produce multiple blocks with cache_control
+// only on the final block.
+func TestAnthropicAdapterCacheControlMultipleSystemParts(t *testing.T) {
+	orig := AnthropicCacheMinSystemChars
+	AnthropicCacheMinSystemChars = 10
+	defer func() { AnthropicCacheMinSystemChars = orig }()
+
+	a, _ := NewAdapter(AdapterTypeAnthropic)
+	req := map[string]any{
+		"model": "claude-sonnet-4",
+		"messages": []map[string]any{
+			{"role": "system", "content": "First instruction"},
+			{"role": "system", "content": "Second instruction"},
+			{"role": "system", "content": "Third instruction"},
+			{"role": "user", "content": "Go"},
+		},
+	}
+	body, _ := json.Marshal(req)
+	out, err := a.TransformRequest(body)
+	if err != nil {
+		t.Fatalf("TransformRequest: %v", err)
+	}
+
+	var got anthropicRequest
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	var blocks []anthropicSystemBlock
+	if err := json.Unmarshal(got.System, &blocks); err != nil {
+		t.Fatalf("system blocks: %v", err)
+	}
+	if len(blocks) != 3 {
+		t.Fatalf("len(system blocks) = %d, want 3", len(blocks))
+	}
+	// First two blocks must NOT have cache_control.
+	for i := 0; i < 2; i++ {
+		if blocks[i].CacheControl != nil {
+			t.Errorf("block[%d] should not have cache_control, got %+v", i, blocks[i].CacheControl)
+		}
+	}
+	// Final block must have cache_control.
+	if blocks[2].CacheControl == nil {
+		t.Error("final block missing cache_control")
+	}
+	if blocks[2].CacheControl.Type != "ephemeral" {
+		t.Errorf("final block cache_control type = %q, want ephemeral", blocks[2].CacheControl.Type)
+	}
+}
+
+// TestAnthropicAdapterCacheControlDisabled verifies that setting the
+// threshold to zero disables cache-control injection entirely.
+func TestAnthropicAdapterCacheControlDisabled(t *testing.T) {
+	orig := AnthropicCacheMinSystemChars
+	AnthropicCacheMinSystemChars = 0
+	defer func() { AnthropicCacheMinSystemChars = orig }()
+
+	a, _ := NewAdapter(AdapterTypeAnthropic)
+	longSystem := strings.Repeat("X", 5000)
+	req := map[string]any{
+		"model": "claude-sonnet-4",
+		"messages": []map[string]any{
+			{"role": "system", "content": longSystem},
+		},
+	}
+	body, _ := json.Marshal(req)
+	out, err := a.TransformRequest(body)
+	if err != nil {
+		t.Fatalf("TransformRequest: %v", err)
+	}
+
+	var got map[string]json.RawMessage
+	_ = json.Unmarshal(out, &got)
+
+	// Should be a plain string, not an array.
+	var sysStr string
+	err = json.Unmarshal(got["system"], &sysStr)
+	if err != nil {
+		t.Errorf("system should be a plain string when cache disabled, got %s", got["system"])
+	}
+}
+
+// --- Azure content filter detection (issue #1245) ---------------------
+
+// TestAzureAdapterContentFilterDisabled verifies that the Azure adapter
+// returns the reader unchanged when content filter detection is disabled
+// (the default).
+func TestAzureAdapterContentFilterDisabled(t *testing.T) {
+	orig := AzureContentFilterEnabled
+	AzureContentFilterEnabled = false
+	defer func() { AzureContentFilterEnabled = orig }()
+
+	a, _ := NewAdapter(AdapterTypeAzure)
+	r := strings.NewReader("test data")
+	if a.NormalizeSSE(r) != io.Reader(r) {
+		t.Error("azure NormalizeSSE should return reader unchanged when disabled")
+	}
+}
+
+// TestAzureAdapterContentFilterEnabled verifies that the Azure adapter
+// detects content_filter finish_reason and emits an error frame.
+func TestAzureAdapterContentFilterEnabled(t *testing.T) {
+	orig := AzureContentFilterEnabled
+	AzureContentFilterEnabled = true
+	defer func() { AzureContentFilterEnabled = orig }()
+
+	a, _ := NewAdapter(AdapterTypeAzure)
+
+	// Simulate an Azure SSE stream with content_filter finish_reason.
+	stream := strings.Join([]string{
+		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"filtered"},"finish_reason":"content_filter"}]}`,
+		``,
+		"",
+	}, "\n")
+
+	r := a.NormalizeSSE(strings.NewReader(stream))
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	outStr := string(out)
+
+	// Should contain the original chunk (transparent passthrough).
+	if !strings.Contains(outStr, `"content":"filtered"`) {
+		t.Error("original content_filter chunk not preserved")
+	}
+	// Should contain the error frame.
+	if !strings.Contains(outStr, `"content_filter"`) {
+		t.Error("error frame missing content_filter type")
+	}
+	if !strings.Contains(outStr, `"object":"error"`) {
+		t.Error("error frame missing object:error")
+	}
+	// Should contain [DONE].
+	if !strings.Contains(outStr, "data: [DONE]") {
+		t.Error("stream missing [DONE] after error frame")
+	}
+}
+
+// TestAzureAdapterContentFilterNormalChunk verifies that normal finish
+// reasons pass through unmodified.
+func TestAzureAdapterContentFilterNormalChunk(t *testing.T) {
+	orig := AzureContentFilterEnabled
+	AzureContentFilterEnabled = true
+	defer func() { AzureContentFilterEnabled = orig }()
+
+	a, _ := NewAdapter(AdapterTypeAzure)
+
+	stream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+		``,
+		"",
+	}, "\n")
+
+	r := a.NormalizeSSE(strings.NewReader(stream))
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	outStr := string(out)
+
+	if !strings.Contains(outStr, `"hello"`) {
+		t.Error("normal content lost")
+	}
+	if !strings.Contains(outStr, `"stop"`) {
+		t.Error("normal finish_reason lost")
+	}
+	// No error frame for normal completion.
+	if strings.Contains(outStr, `"object":"error"`) {
+		t.Error("error frame should not be emitted for normal completion")
+	}
+}
+
+// --- Provider cache cost fields (issue #1245) -------------------------
+
+// TestProviderCacheCostFields verifies that the new cache cost fields
+// round-trip through ToConfig correctly.
+func TestProviderCacheCostFields(t *testing.T) {
+	p := Provider{
+		Name:                        "anthropic",
+		InputCostPer1K:              0.003,
+		OutputCostPer1K:             0.015,
+		CacheReadInputCostPer1K:     0.0003,
+		CacheCreationInputCostPer1K: 0.00375,
+	}
+	cfg := p.ToConfig()
+	if cfg.CacheReadInputCostPer1KUSD() != 0.0003 {
+		t.Errorf("CacheReadInputCostPer1KUSD = %v, want 0.0003", cfg.CacheReadInputCostPer1KUSD())
+	}
+	if cfg.CacheCreationInputCostPer1KUSD() != 0.00375 {
+		t.Errorf("CacheCreationInputCostPer1KUSD = %v, want 0.00375", cfg.CacheCreationInputCostPer1KUSD())
+	}
+	// Zero defaults should propagate.
+	zero := Provider{Name: "test"}
+	zCfg := zero.ToConfig()
+	if zCfg.CacheReadInputCostPer1KUSD() != 0 {
+		t.Errorf("zero CacheReadInputCostPer1KUSD = %v, want 0", zCfg.CacheReadInputCostPer1KUSD())
 	}
 }

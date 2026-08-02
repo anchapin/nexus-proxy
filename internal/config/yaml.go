@@ -84,6 +84,10 @@ type YAMLConfig struct {
 	// Per-provider cost model (issue #1183)
 	CostUseOutputTokens bool `yaml:"cost_use_output_tokens"`
 
+	// Anthropic prompt caching (issue #1245)
+	AnthropicCacheMinSystemChars int  `yaml:"anthropic_cache_min_system_chars"`
+	AzureContentFilterEnabled    bool `yaml:"azure_content_filter_enabled"`
+
 	// Budget
 	BudgetDailyLimit      float64 `yaml:"budget_daily_limit"`
 	BudgetAlertEnabled    bool    `yaml:"budget_alert_enabled"`
@@ -571,6 +575,20 @@ func LoadYAML(path string) (Config, error) {
 	// Per-provider cost model with input/output token split (issue #1183).
 	if v := os.Getenv("NEXUS_COST_USE_OUTPUT_TOKENS"); v != "" {
 		cfg.CostUseOutputTokens = parseBoolEnvStr(v, false)
+	}
+
+	// Anthropic prompt caching threshold (issue #1245).
+	if v := os.Getenv("NEXUS_ANTHROPIC_CACHE_MIN_SYSTEM_CHARS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("NEXUS_ANTHROPIC_CACHE_MIN_SYSTEM_CHARS: %w", err)
+		}
+		cfg.AnthropicCacheMinSystemChars = n
+	}
+
+	// Azure content filter detection (issue #1245).
+	if v := os.Getenv("NEXUS_AZURE_CONTENT_FILTER_ENABLED"); v != "" {
+		cfg.AzureContentFilterEnabled = parseBoolEnvStr(v, false)
 	}
 
 	// Budget
@@ -1744,6 +1762,9 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		CostBaselineModel:     yc.stringDefault(yc.CostBaselineModel, ""),   // Falls back to FrontierModel later
 		CostBaselineRatePer1K: yc.floatDefault(yc.CostBaselineRatePer1K, 0), // Falls back to FrontierCostPer1K later
 		CostUseOutputTokens:   yc.boolFieldDefault(yc.CostUseOutputTokens, false),
+
+		AnthropicCacheMinSystemChars: yc.intDefault(yc.AnthropicCacheMinSystemChars, 1024),
+		AzureContentFilterEnabled:    yc.boolFieldDefault(yc.AzureContentFilterEnabled, false),
 
 		QualityConcurrency:     yc.intDefault(yc.QualityConcurrency, 2),
 		QualityQueueDepth:      yc.intDefault(yc.QualityQueueDepth, 64),

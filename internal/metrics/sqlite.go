@@ -69,7 +69,9 @@ CREATE TABLE IF NOT EXISTS requests (
     slm_task_type TEXT NOT NULL DEFAULT '',
     arbiter_cache_key TEXT NOT NULL DEFAULT '',
     arbiter_synthesis TEXT NOT NULL DEFAULT '',
-    tenant TEXT NOT NULL DEFAULT ''
+    tenant TEXT NOT NULL DEFAULT '',
+    cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
 CREATE INDEX IF NOT EXISTS idx_requests_request_id ON requests(request_id);
@@ -102,6 +104,9 @@ var additiveMigrations = []string{
 	// Issue #1176: arbiter cache key + synthesis for boot-time pre-warming
 	`ALTER TABLE requests ADD COLUMN arbiter_cache_key TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN arbiter_synthesis TEXT NOT NULL DEFAULT ''`,
+	// Issue #1245: Anthropic prompt caching token tracking
+	`ALTER TABLE requests ADD COLUMN cache_read_input_tokens INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE requests ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0`,
 	// Issue #1154: tenant attribution (multi-key inbound auth)
 	`ALTER TABLE requests ADD COLUMN tenant TEXT NOT NULL DEFAULT ''`,
 }
@@ -153,9 +158,10 @@ const insertSQL = `INSERT INTO requests
      baseline_cost_usd, savings_usd,
      ttft_ms, total_latency_ms, tps, streaming,
      fusion_arbiter_skipped, fusion_jaccard_similarity, fusion_arbiter_cost_usd, error,
-      route_source, route_reason, slm_confidence, slm_task_type,
-      arbiter_cache_key, arbiter_synthesis, tenant)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       route_source, route_reason, slm_confidence, slm_task_type,
+       arbiter_cache_key, arbiter_synthesis, tenant,
+       cache_read_input_tokens, cache_creation_input_tokens)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // SQLiteStore is the production Store implementation (issue #4).
 // Writes are funnelled through a buffered channel and a single
@@ -439,6 +445,7 @@ func (s *SQLiteStore) writeOne(req Request) {
 		req.RouteSource, req.RouteReason, req.SLMConfidence, req.SLMTaskType,
 		req.ArbiterCacheKeyHex, req.ArbiterSynthesis,
 		req.Tenant,
+		req.CacheReadInputTokens, req.CacheCreationInputTokens,
 	)
 	if err != nil {
 		s.logger("ERROR: insert request_id=%s: %v", req.RequestID, err)
