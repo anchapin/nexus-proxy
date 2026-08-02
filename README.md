@@ -733,6 +733,12 @@ progress. The metrics DB lives in the user's cache directory by default
 \metrics.db on Windows); set `NEXUS_METRICS_DB` to relocate it or
 empty the variable to disable.
 
+## Community
+
+- **[GitHub Discussions](https://github.com/anchapin/nexus-proxy/discussions)** — usage questions, configurations, show & tell, and ideas.
+- **[Contributing Guide](CONTRIBUTING.md)** — how to set up the dev environment and submit PRs.
+- **[Code of Conduct](CODE_OF_CONDUCT.md)** — our community standards (Contributor Covenant v2.1).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

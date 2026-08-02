@@ -33,7 +33,19 @@ We use GitHub Issues to track bugs and requested features. Please use the provid
 - **Test**: `make test`.
 - **Lint**: `make lint`.
 
+## Code of Conduct
+
+This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md).
+All contributors and maintainers are expected to uphold this standard.
+
 ## Guidelines
 - Be respectful and inclusive in all communications.
 - Follow the existing Go style and project patterns.
 - Keep changes atomic and focused.
+
+## Community & Support
+
+- **GitHub Discussions** — ask usage questions, share configurations, and propose ideas:
+  https://github.com/anchapin/nexus-proxy/discussions
+- **Issue Tracker** — bug reports and feature requests:
+  https://github.com/anchapin/nexus-proxy/issues
