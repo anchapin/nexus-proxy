@@ -1386,9 +1386,18 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 				slog.Bool("status_public", cfg.StatusPublic),
 			)
 		} else {
-			authMw := auth.NewMiddleware(cfg.ProxyAPIKey, publicPathExempt(cfg), authLimiter, circuitCollector)
+			authenticator := buildAuthenticator(cfg, httpClient, addCleanup)
+			// The "gate key" keeps Enabled() true for JWT/both modes even
+			// when ProxyAPIKey is empty — the authenticator does the actual
+			// validation.
+			gateKey := cfg.ProxyAPIKey
+			if gateKey == "" && authenticator != nil {
+				gateKey = "jwt-gate"
+			}
+			authMw := auth.NewMiddlewareWithAuthenticator(gateKey, authenticator, publicPathExempt(cfg), authLimiter, circuitCollector)
 			rootHandler = authMw.Wrap(mux)
 			slog.Info("inbound auth enabled",
+				slog.String("mode", cfg.AuthMode),
 				slog.Bool("status_public", cfg.StatusPublic),
 			)
 		}
@@ -1555,4 +1564,43 @@ func warmArbiterCache(cache *upstream.ArbiterCache, store metrics.Store, cfg con
 		slog.String("source", "sqlite"),
 	)
 	return loaded
+}
+
+// buildAuthenticator constructs the JWT/OIDC authenticator when JWT or
+// "both" mode is configured (issue #1152). Returns nil for static mode
+// or when JWKS URL is absent — callers fall through to legacy paths.
+func buildAuthenticator(cfg config.Config, httpClient *http.Client, addCleanup func(func())) auth.Authenticator {
+	mode := cfg.AuthMode
+	if mode != "jwt" && mode != "both" {
+		return nil
+	}
+	if cfg.OIDCJWKSURL == "" {
+		slog.Warn("JWT auth mode requested but NEXUS_OIDC_JWKS_URL is empty — JWT validation disabled")
+		return nil
+	}
+	refresh := cfg.OIDCJWKSRefresh
+	if refresh <= 0 {
+		refresh = 15 * time.Minute
+	}
+	jwtAuth, err := auth.NewJWTAuthenticator(auth.JWKSConfig{
+		JWKSURL:         cfg.OIDCJWKSURL,
+		Issuer:          cfg.OIDCIssuer,
+		Audience:        cfg.OIDCAudience,
+		RefreshInterval: refresh,
+		HTTPClient:      httpClient,
+	})
+	if err != nil {
+		slog.Error("failed to create JWT authenticator",
+			slog.String("jwks_url", cfg.OIDCJWKSURL),
+			slog.Any("error", err),
+		)
+		return nil
+	}
+	addCleanup(func() { jwtAuth.Close() })
+	slog.Info("JWT/OIDC authenticator initialized",
+		slog.String("jwks_url", cfg.OIDCJWKSURL),
+		slog.String("mode", mode),
+		slog.Duration("refresh_interval", refresh),
+	)
+	return jwtAuth
 }
