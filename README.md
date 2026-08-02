@@ -250,8 +250,8 @@ export LLM_BASE_URL=http://localhost:8000/v1
 export LLM_API_KEY=any-non-empty-string
 ```
 
-For other OpenAI-compatible agents, set their respective base-URL / API-key
-option to the same `http://localhost:8000/v1` value and any non-empty key.
+For more agents (Cursor, Windsurf, Cline, Continue.dev), see the
+[Agent Integration Guides](docs/agent-integrations.md).
 
 ### Add few-shot examples
 
