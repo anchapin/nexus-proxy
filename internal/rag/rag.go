@@ -542,9 +542,10 @@ type Store struct {
 	thresholdOverrides map[string]float64 // dir -> threshold; unspecified dirs use global threshold
 	index              *HNSWIndex
 	indexConfig        HNSWConfig
-	batchSize          int  // number of files to embed per batch; 0 disables batching
-	recursive          bool // walk subdirectories during IndexDir (issue #1149)
-	chunkTokens        int  // max tokens per chunk; 0 disables chunking (issue #1168)
+	batchSize          int         // number of files to embed per batch; 0 disables batching
+	recursive          bool        // walk subdirectories during IndexDir (issue #1149)
+	chunkTokens        int         // max tokens per chunk; 0 disables chunking (issue #1168)
+	fileFilter         *FileFilter // optional include/exclude filter for IndexDir (issue #1148)
 
 	lastIndexAt               int64
 	retrievalAttempts         uint64
@@ -581,6 +582,13 @@ func WithRecursive(r bool) StoreOption {
 // A value of 0 (default) disables chunking — whole-file indexing.
 func WithChunkTokens(n int) StoreOption {
 	return func(s *Store) { s.chunkTokens = n }
+}
+
+// WithFileFilter sets the include/exclude filter used by IndexDir to skip
+// non-source files during indexing (issue #1148). A nil filter (the default)
+// indexes all regular files, preserving backward compatibility.
+func WithFileFilter(f *FileFilter) StoreOption {
+	return func(s *Store) { s.fileFilter = f }
 }
 
 // indexThreshold is the minimum store size before the HNSW index is used.
@@ -997,6 +1005,20 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 	_, validFiles, err := collectIndexFiles(dir, s.recursive)
 	if err != nil {
 		return err
+	}
+
+	if s.fileFilter != nil {
+		filtered := validFiles[:0]
+		for _, f := range validFiles {
+			if s.fileFilter.ShouldIndex(f.relPath) {
+				filtered = append(filtered, f)
+			} else {
+				slog.Debug("rag: skipping file filtered by extension/pattern (issue #1148)",
+					slog.String("filename", f.relPath),
+				)
+			}
+		}
+		validFiles = filtered
 	}
 
 	if s.batchSize > 0 && len(validFiles) > 0 {

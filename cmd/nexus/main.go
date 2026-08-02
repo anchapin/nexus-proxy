@@ -287,12 +287,16 @@ func (b *confidenceBridge) Close() error { return b.inner.Close() }
 func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context) (rag.RAGStore, *rag.PersistentStore, *rag.Watcher, rag.Embedder) {
 	// emb is already wrapped with EmbedCache by the caller (issue #115, #303)
 	cachedEmb := emb
+	// Build the file extension/pattern filter (issue #1148). Nil when
+	// both vars are empty → backward-compatible (index all files).
+	fileFilter := rag.NewFileFilter(cfg.RAGFileExtensions, cfg.RAGExcludePatterns)
 	if !cfg.RAGPersistentEnabled() {
 		slog.Info("rag persistent store disabled (NEXUS_RAG_DB is empty); using in-memory store")
 		store := rag.NewStore(cachedEmb, cfg.RAGThreshold,
 			rag.WithBatchSize(cfg.RAGBatchSize),
 			rag.WithChunkTokens(cfg.RAGChunkTokens),
-			rag.WithRecursive(cfg.RAGRecursive))
+			rag.WithRecursive(cfg.RAGRecursive),
+			rag.WithFileFilter(fileFilter))
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
@@ -302,7 +306,8 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 	ps, err := rag.OpenPersistentStore(cfg.RAGDBPath, cachedEmb, cfg.RAGThreshold,
 		rag.WithBatchSize(cfg.RAGBatchSize),
 		rag.WithChunkTokens(cfg.RAGChunkTokens),
-		rag.WithRecursive(cfg.RAGRecursive))
+		rag.WithRecursive(cfg.RAGRecursive),
+		rag.WithFileFilter(fileFilter))
 	if err != nil {
 		// Persistence is a best-effort optimisation. Fall back to
 		// the in-memory store so the proxy still serves traffic —
@@ -315,7 +320,8 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 		store := rag.NewStore(cachedEmb, cfg.RAGThreshold,
 			rag.WithBatchSize(cfg.RAGBatchSize),
 			rag.WithChunkTokens(cfg.RAGChunkTokens),
-			rag.WithRecursive(cfg.RAGRecursive))
+			rag.WithRecursive(cfg.RAGRecursive),
+			rag.WithFileFilter(fileFilter))
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}

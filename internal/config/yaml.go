@@ -118,6 +118,8 @@ type YAMLConfig struct {
 	RAGChunkTokens           int     `yaml:"rag_chunk_tokens"`
 	RAGTopK                  int     `yaml:"rag_top_k"`
 	RAGMaxInjectionTokens    int     `yaml:"rag_max_injection_tokens"`
+	RAGFileExtensions        string  `yaml:"rag_file_extensions"`
+	RAGExcludePatterns       string  `yaml:"rag_exclude_patterns"`
 
 	// Routing
 	TokenGuardrail                int     `yaml:"token_guardrail"`
@@ -731,6 +733,12 @@ func LoadYAML(path string) (Config, error) {
 			n = 0
 		}
 		cfg.RAGChunkTokens = n
+	}
+	if v := os.Getenv("NEXUS_RAG_FILE_EXTENSIONS"); v != "" {
+		cfg.RAGFileExtensions = ragpkg.ParseCommaSeparated(v)
+	}
+	if v := os.Getenv("NEXUS_RAG_EXCLUDE_PATTERNS"); v != "" {
+		cfg.RAGExcludePatterns = ragpkg.ParseCommaSeparated(v)
 	}
 
 	// Routing
@@ -1615,6 +1623,8 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		RAGChunkTokens:                yc.intDefault(yc.RAGChunkTokens, 0),
 		RAGTopK:                       yc.intDefault(yc.RAGTopK, 1),
 		RAGMaxInjectionTokens:         yc.intDefault(yc.RAGMaxInjectionTokens, 4096),
+		RAGFileExtensions:             ragpkg.ParseCommaSeparated(yc.RAGFileExtensions),
+		RAGExcludePatterns:            ragpkg.ParseCommaSeparated(yc.RAGExcludePatterns),
 		TokenGuardrail:                yc.intDefault(yc.TokenGuardrail, 6000),
 		SLMTimeout:                    yc.durationDefault(yc.SLMTimeout, 8*time.Second),
 		SLMCacheMaxEntries:            yc.intDefault(yc.SLMCacheMaxEntries, 512),
