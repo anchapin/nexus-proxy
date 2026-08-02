@@ -648,6 +648,15 @@ func TestPublicPathExempt(t *testing.T) {
 		// config, judge state, VRAM) without auth — the exact bug #109 fixed.
 		{"status gated by default", false, http.MethodGet, "/status", false},
 
+		// --- Branch 1c: /debug/* always exempt (issue #1150) ---
+		// The debug subtree carries its own independent gate
+		// (DebugPprofGate) so it bypasses the main inbound auth.
+		{"debug pprof heap exempt", false, http.MethodGet, "/debug/pprof/heap", true},
+		{"debug vars exempt", false, http.MethodGet, "/debug/vars", true},
+		{"debug pprof index exempt", false, http.MethodGet, "/debug/pprof/", true},
+		// /debug (no trailing slash) is NOT exempt — must match /debug/ prefix.
+		{"debug no slash gated", false, http.MethodGet, "/debug", false},
+
 		// --- Branch 4: fallthrough — protected paths never exempt ---
 		{"chat completions protected", false, http.MethodPost, "/v1/chat/completions", false},
 		{"chat completions protected status-public", true, http.MethodPost, "/v1/chat/completions", false},

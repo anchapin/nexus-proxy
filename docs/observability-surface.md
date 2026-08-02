@@ -491,3 +491,32 @@ Top-level fields:
 | Field | Type | Description |
 |-------|------|-------------|
 | `version` | string | Build version string injected via `-ldflags "-X main.version=..."` at compile time (issue #529); `"dev"` when built without ldflags. |
+
+## Runtime profiling (`/debug/pprof/*`, `/debug/vars`) (issue #1150)
+
+When `NEXUS_DEBUG_PPROF_ENABLED=true`, the proxy registers the standard
+`net/http/pprof` and `expvar` handlers under `/debug/`:
+
+| Endpoint | Description |
+|----------|-------------|
+| `/debug/pprof/` | Index page listing available profiles |
+| `/debug/pprof/heap` | Heap allocation profile |
+| `/debug/pprof/goroutine` | Goroutine stack dump |
+| `/debug/pprof/profile` | CPU profile (30s default) |
+| `/debug/pprof/trace` | Execution trace |
+| `/debug/pprof/{allocs,block,mutex,threadcreate}` | Other runtime profiles |
+| `/debug/pprof/{cmdline,symbol}` | Build info + symbol resolution |
+| `/debug/vars` | Published `expvar` variables (memstats, cmdline) |
+
+### Access control
+
+| Mode | Config | Behaviour |
+|------|--------|-----------|
+| Disabled (default) | `NEXUS_DEBUG_PPROF_ENABLED=false` | `/debug/*` returns 404 |
+| Loopback-only | `PPROF_ENABLED=true`, key empty | Only `127.0.0.1`/`::1` served; others get 403 |
+| API-key gated | `PPROF_ENABLED=true`, key set | Requires `Authorization: Bearer <key>`; others get 401 |
+
+The `/debug/` subtree is exempt from the main inbound auth gate
+(`NEXUS_PROXY_API_KEY`) because it carries its own independent gate.
+
+`nexus check` reports the exposure mode in the `pprof_endpoint` line.

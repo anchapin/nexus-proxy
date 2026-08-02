@@ -1327,6 +1327,12 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		slog.Info("dashboard endpoint disabled (NEXUS_DASHBOARD_ENDPOINT=false)")
 	}
 
+	// Debug pprof + expvar endpoints (issue #1150). Registered on the
+	// same mux as /metrics; gated by DebugPprofGate (API key or
+	// loopback). Exempt from the main inbound auth gate via
+	// publicPathExempt in main.go.
+	handlers.RegisterDebugPprof(mux, cfg)
+
 	slog.Info("starting nexus proxy",
 		slog.String("addr", cfg.Addr),
 		slog.String("local_model", cfg.LocalModel),

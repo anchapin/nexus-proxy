@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -545,7 +546,10 @@ func healthzHandler(hpoller *health.Health, fhpoller *health.FrontierHealth, mgr
 // judge enabled, VRAM state) is reconnaissance-grade and should be
 // gated by default. The web dashboard path (issue #1182, default
 // /dashboard) is exempt only when NEXUS_DASHBOARD_PUBLIC=true, mirroring
-// the /status posture.
+// the /status posture. /debug/* is always exempt because the pprof/expvar
+// subtree carries its own independent gate (DebugPprofGate, issue
+// #1150); double-gating would require operators to pass the proxy API
+// key before the debug key, adding friction without security gain.
 func publicPathExempt(cfg config.Config) func(*http.Request) bool {
 	dashPath := cfg.DashboardEndpoint
 	if dashPath == "" {
@@ -560,6 +564,12 @@ func publicPathExempt(cfg config.Config) func(*http.Request) bool {
 		case dashPath:
 			return cfg.DashboardPublic
 		default:
+			// Debug pprof/expvar subtree (issue #1150). The
+			// /debug/ prefix is exempt so the debug gate
+			// (API key or loopback) is the sole access control.
+			if strings.HasPrefix(r.URL.Path, "/debug/") {
+				return true
+			}
 			return false
 		}
 	}
