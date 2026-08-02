@@ -567,6 +567,16 @@ type Config struct {
 	Debug          bool
 	DebugBodyBytes int
 
+	// Debug pprof + expvar endpoints (issue #1150). When
+	// DebugPprofEnabled is true, the server registers /debug/pprof/*
+	// and /debug/vars on the unprotected mux. DebugPprofAPIKey gates
+	// access: when set, a matching Bearer token is required (401
+	// otherwise); when empty, only loopback peers are allowed (403
+	// for non-loopback). Default false so a stock deployment has no
+	// debug surface exposed.
+	DebugPprofEnabled bool
+	DebugPprofAPIKey  string
+
 	// OpenAI-compatible model discovery (issue #78). When enabled the
 	// proxy serves GET /v1/models and GET /v1/models/{id} listing the
 	// configured local, router, and frontier models, plus any models
@@ -1857,6 +1867,13 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.DebugBodyBytes = debugBodyBytes
+
+	// Debug pprof + expvar endpoints (issue #1150). Off by default so
+	// production has no debug surface. The API key is read via
+	// getEnvAllowEmpty so an operator can explicitly set it to "" to
+	// force loopback-only mode.
+	cfg.DebugPprofEnabled = parseBoolEnv("NEXUS_DEBUG_PPROF_ENABLED", false)
+	cfg.DebugPprofAPIKey = getEnvAllowEmpty("NEXUS_DEBUG_PPROF_API_KEY", "")
 
 	// OpenAI-compatible model discovery (issue #78). Enabled by
 	// default so a stock deployment is discoverable by OpenAI-

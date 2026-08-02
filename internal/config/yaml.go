@@ -39,6 +39,10 @@ type YAMLConfig struct {
 	Debug          bool `yaml:"debug"`
 	DebugBodyBytes int  `yaml:"debug_body_bytes"`
 
+	// Debug pprof + expvar (issue #1150)
+	DebugPprofEnabled bool   `yaml:"debug_pprof_enabled"`
+	DebugPprofAPIKey  string `yaml:"debug_pprof_api_key"`
+
 	// Ollama
 	OllamaURL      string `yaml:"ollama_url"`
 	RouterModel    string `yaml:"router_model"`
@@ -443,6 +447,14 @@ func LoadYAML(path string) (Config, error) {
 			return cfg, fmt.Errorf("config: NEXUS_DEBUG_BODY_BYTES: %w; see .env.example", err)
 		}
 		cfg.DebugBodyBytes = n
+	}
+
+	// Debug pprof + expvar (issue #1150)
+	if v := os.Getenv("NEXUS_DEBUG_PPROF_ENABLED"); v != "" {
+		cfg.DebugPprofEnabled = parseBoolEnvStr(v, false)
+	}
+	if v := os.Getenv("NEXUS_DEBUG_PPROF_API_KEY"); v != "" {
+		cfg.DebugPprofAPIKey = v
 	}
 
 	// Ollama
@@ -1710,6 +1722,9 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 
 		Debug:          yc.Debug, // defaults to false in toConfig if not set
 		DebugBodyBytes: yc.intDefault(yc.DebugBodyBytes, DefaultDebugBodyBytes),
+
+		DebugPprofEnabled: yc.DebugPprofEnabled,
+		DebugPprofAPIKey:  yc.DebugPprofAPIKey,
 
 		ModelsEndpointEnabled: yc.boolFieldDefault(yc.ModelsEndpointEnabled, true),
 		ModelsCacheTTL:        yc.durationDefault(yc.ModelsCacheTTL, 5*time.Minute),

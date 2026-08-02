@@ -364,6 +364,13 @@ body preview capped at `NEXUS_DEBUG_BODY_BYTES` (default 512).
 **Distributed tracing** (`NEXUS_TRACING_ENDPOINT`): OTLP/JSON exporter.
 See `docs/tracing.example.md` for setup.
 
+**Runtime profiling** (`NEXUS_DEBUG_PPROF_ENABLED`, issue #1150):
+registers `net/http/pprof` and `expvar` under `/debug/pprof/*` and
+`/debug/vars` on the unprotected mux. When `NEXUS_DEBUG_PPROF_API_KEY`
+is set, requests require a matching Bearer token (401 otherwise); when
+empty, only loopback peers are served (403 for non-loopback). Default
+false. `nexus check` reports the exposure mode in `pprof_endpoint`.
+
 ## Adaptive cascade timeout (issue #1175)
 
 The cascade per-attempt timeout scales with prompt token count instead of
