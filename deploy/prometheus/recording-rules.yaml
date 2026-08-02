@@ -96,3 +96,60 @@ groups:
       # aggregation rather than the per-reason breakdown.
       - record: nexus:cascade_fallback_rate5m
         expr: sum by (reason) (rate(nexus_cascade_fallback_total[5m]))
+
+      # ==================================================================
+      # SLO error budget and compliance (issue #1239)
+      # ==================================================================
+
+      # ----------------------------------------------------------------------
+      # nexus:error_budget_remaining_ratio
+      # ----------------------------------------------------------------------
+      # rationale: Computes the remaining error budget ratio for the
+      # 99.9% availability SLO over a 30-day window. The error budget is
+      # 1 - target = 0.001 (0.1%). The remaining ratio is:
+      #   1 - (actual_error_rate / error_budget).
+      # When the ratio drops to 0, the budget is fully consumed.
+      # Clamped to [0, 1] so the gauge never goes negative.
+      - record: nexus:error_budget_remaining_ratio
+        expr: |
+          clamp_max(
+            1 - (
+              sum(rate(nexus_cascade_fallback_total[30d]))
+              / clamp_min(sum(rate(nexus_route_decisions_total[30d])), 1)
+              / 0.001
+            ),
+            1
+          )
+
+      # ----------------------------------------------------------------------
+      # nexus:slo_compliance_30d
+      # ----------------------------------------------------------------------
+      # rationale: Overall SLO compliance as a fraction over the last 30
+      # days. 1.0 means fully compliant; <0.999 means the availability SLO
+      # was breached at some point in the window. This single number lets
+      # operators see at a glance whether the 30-day SLO is on track.
+      - record: nexus:slo_compliance_30d
+        expr: |
+          1 - clamp_min(
+            sum(rate(nexus_cascade_fallback_total[30d]))
+            / clamp_min(sum(rate(nexus_route_decisions_total[30d])), 1),
+            0
+          )
+
+      # ----------------------------------------------------------------------
+      # nexus:local_p99_breach_fraction_30d
+      # ----------------------------------------------------------------------
+      # rationale: Fraction of the last 30 days that the local-route p99
+      # latency was above the 2s SLO threshold. Computed by averaging the
+      # indicator (1 when above, 0 when below) over the window. This feeds
+      # the in-process nexus_slo_error_budget_remaining gauge for the
+      # local_latency_p99 SLO.
+      - record: nexus:local_p99_breach_fraction_30d
+        expr: |
+          avg_over_time(
+            clamp(
+              nexus_upstream_request_latency_p99_seconds{route="local"} - 2,
+              0,
+              1
+            )[30d]
+          )
