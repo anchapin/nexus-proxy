@@ -537,6 +537,20 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 		return err
 	}
 
+	if p.Store.fileFilter != nil {
+		filtered := validFiles[:0]
+		for _, f := range validFiles {
+			if p.Store.fileFilter.ShouldIndex(f.relPath) {
+				filtered = append(filtered, f)
+			} else {
+				slog.Debug("rag: skipping file filtered by extension/pattern (issue #1148)",
+					slog.String("filename", f.relPath),
+				)
+			}
+		}
+		validFiles = filtered
+	}
+
 	if p.Store.batchSize > 0 && len(validFiles) > 0 {
 		for i := 0; i < len(validFiles); i += p.Store.batchSize {
 			end := i + p.Store.batchSize

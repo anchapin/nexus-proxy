@@ -42,6 +42,8 @@ type Watcher struct {
 	interval  time.Duration // fallback poll interval (fsnotify-unavailable cases)
 	recursive bool          // walk subdirectories during scanOnce (issue #1149)
 
+	fileFilter *FileFilter // optional include/exclude filter (issue #1148)
+
 	mu    sync.Mutex
 	known map[string]fileSnapshot
 
@@ -72,6 +74,7 @@ func NewWatcher(store *PersistentStore, dir string, interval time.Duration) *Wat
 		stopCh:       make(chan struct{}),
 		doneCh:       make(chan struct{}),
 		newWatcherFn: fsnotify.NewWatcher,
+		fileFilter:   store.Store.fileFilter, // share the store's filter (issue #1148)
 	}
 }
 
@@ -81,6 +84,15 @@ func NewWatcher(store *PersistentStore, dir string, interval time.Duration) *Wat
 // Must be called before Start.
 func (w *Watcher) SetRecursive(r bool) {
 	w.recursive = r
+}
+
+// SetFileFilter sets the include/exclude filter used by scanOnce to skip
+// non-source files (issue #1148). Safe to call before Start. A nil filter
+// allows all files (backward compatible).
+func (w *Watcher) SetFileFilter(f *FileFilter) {
+	w.mu.Lock()
+	w.fileFilter = f
+	w.mu.Unlock()
 }
 
 // Start launches the polling goroutine and returns immediately. The
@@ -290,6 +302,13 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 				return nil
 			}
 			name := filepath.ToSlash(rel)
+			if w.fileFilter != nil && !w.fileFilter.ShouldIndex(name) {
+				slog.Debug("rag: skipping file filtered by extension/pattern (issue #1148)",
+					slog.String("component", "rag"),
+					slog.String("filename", name),
+				)
+				return nil
+			}
 			snap := fileSnapshot{name: name, modTime: info.ModTime(), size: info.Size()}
 			seen[name] = struct{}{}
 
@@ -332,11 +351,18 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 				)
 				continue
 			}
+			name := f.Name()
+			if w.fileFilter != nil && !w.fileFilter.ShouldIndex(name) {
+				slog.Debug("rag: skipping file filtered by extension/pattern (issue #1148)",
+					slog.String("component", "rag"),
+					slog.String("filename", name),
+				)
+				continue
+			}
 			info, err := f.Info()
 			if err != nil {
 				continue
 			}
-			name := f.Name()
 			snap := fileSnapshot{name: name, modTime: info.ModTime(), size: info.Size()}
 			seen[name] = struct{}{}
 

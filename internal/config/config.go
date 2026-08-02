@@ -189,6 +189,14 @@ type Config struct {
 	// Lowest-ranked examples are truncated first. Default 4096.
 	RAGMaxInjectionTokens int // NEXUS_RAG_MAX_INJECTION_TOKENS
 
+	// RAG file extension filter (issue #1148). When non-empty, only files
+	// whose extension matches one of the listed extensions are indexed.
+	// When empty, all files are indexed (backward compatible).
+	RAGFileExtensions []string // e.g. [".go", ".py", ".ts"]
+	// RAG exclude patterns (issue #1148). Glob patterns matched against
+	// the file's base name; matching files are skipped during indexing.
+	RAGExcludePatterns []string // e.g. ["*_test.go", "*.gen.go"]
+
 	// Routing
 	TokenGuardrail                int           // estimated tokens above this force frontier (6000)
 	SLMTimeout                    time.Duration // Qwen3-Coder routing timeout (8s)
@@ -1127,6 +1135,13 @@ func Load() (Config, error) {
 		ragMaxInjTokens = 4096
 	}
 	cfg.RAGMaxInjectionTokens = ragMaxInjTokens
+
+	// RAG file extension filter (issue #1148). Comma-separated list of
+	// extensions (e.g. ".go,.py,.ts"). When empty, all files are indexed.
+	cfg.RAGFileExtensions = ragpkg.ParseCommaSeparated(getEnvAllowEmpty("NEXUS_RAG_FILE_EXTENSIONS", ""))
+	// RAG exclude patterns (issue #1148). Comma-separated glob patterns
+	// (e.g. "*_test.go,*.gen.go"). Matching files are skipped.
+	cfg.RAGExcludePatterns = ragpkg.ParseCommaSeparated(getEnvAllowEmpty("NEXUS_RAG_EXCLUDE_PATTERNS", ""))
 
 	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
 	if err != nil {
