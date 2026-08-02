@@ -206,6 +206,8 @@ type Config struct {
 	SLMCacheStaleCleanupThreshold int           // Get-triggered eviction threshold; 0 = disabled (issue #1037)
 	SLMCacheSemanticScanLimit     int           // max entries scanned in getSemantic; 0 = unlimited (issue #933)
 	SLMConfidenceThreshold        float64       // hard escalation threshold: local/fusion decisions below this force frontier (default 0.3, issue #301)
+	RoutingContextTurns           int           // prior conversation turns fed to the router for multi-turn context (default 3, issue #1147)
+	RoutingContextChars           int           // char cap on the conversation-context window fed to the router (default 2000, issue #1147)
 	FusionTimeout                 time.Duration // per-panel-member fetch timeout (120s), shared fallback
 	FusionLocalTimeout            time.Duration // per-panel-member timeout for the local Ollama member (90s, issue #1164)
 	FusionFrontierTimeout         time.Duration // per-panel-member timeout for the frontier API member (30s, issue #1164)
@@ -1180,6 +1182,24 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.SLMConfidenceThreshold = slmConfThreshold
+
+	// Conversation-context window for routing (issue #1147). The handler
+	// assembles a bounded summary of prior turns so the DSL fast-pass and
+	// SLM see the conversational thread — preventing misrouting of terse
+	// follow-ups like "fix it". Turns=0 disables injection entirely
+	// (byte-for-byte identical to pre-#1147 behaviour). Turns is capped at
+	// 10 by BuildConversationContext; chars bounds the SLM payload size.
+	routingContextTurns, err := getEnvInt("NEXUS_ROUTING_CONTEXT_TURNS", 3)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RoutingContextTurns = routingContextTurns
+
+	routingContextChars, err := getEnvInt("NEXUS_ROUTING_CONTEXT_CHARS", 2000)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RoutingContextChars = routingContextChars
 
 	fusionTimeout, err := getEnvDuration("NEXUS_FUSION_TIMEOUT", 120*time.Second)
 	if err != nil {

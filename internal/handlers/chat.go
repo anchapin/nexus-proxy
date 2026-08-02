@@ -1568,10 +1568,11 @@ func Chat(d Deps) http.Handler {
 			slog.Warn("planner: ConfidenceThreshold set but no ConfidenceStore — threshold disabled")
 		}
 		decision := planner.Plan(router.PlanRequest{
-			Prompt:          latestPrompt,
-			GuardrailBudget: guardrailBudget,
-			GuardrailSource: guardrailSource,
-			Context:         r.Context(),
+			Prompt:              latestPrompt,
+			ConversationContext: middleware.BuildConversationContext(messages, d.Config.RoutingContextTurns, d.Config.RoutingContextChars),
+			GuardrailBudget:     guardrailBudget,
+			GuardrailSource:     guardrailSource,
+			Context:             r.Context(),
 		})
 		slmRoutingMs = time.Since(started).Milliseconds() - promptEngineeringMs - ragRetrievalMs - toonCompressionMs
 		route := decision.Route

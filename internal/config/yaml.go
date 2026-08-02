@@ -205,6 +205,10 @@ type YAMLConfig struct {
 	RoutingConfidenceMinSamples int     `yaml:"routing_confidence_min_samples"`
 	RoutingConfidenceWindow     string  `yaml:"routing_confidence_window"`
 
+	// Routing conversation context (issue #1147)
+	RoutingContextTurns int `yaml:"routing_context_turns"`
+	RoutingContextChars int `yaml:"routing_context_chars"`
+
 	// Quality
 	QualityConcurrency     int    `yaml:"quality_concurrency"`
 	QualityQueueDepth      int    `yaml:"quality_queue"`
@@ -1203,6 +1207,22 @@ func LoadYAML(path string) (Config, error) {
 		cfg.RoutingConfidenceWindow = d
 	}
 
+	// Routing conversation context (issue #1147)
+	if v := os.Getenv("NEXUS_ROUTING_CONTEXT_TURNS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_ROUTING_CONTEXT_TURNS: %w", err)
+		}
+		cfg.RoutingContextTurns = n
+	}
+	if v := os.Getenv("NEXUS_ROUTING_CONTEXT_CHARS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_ROUTING_CONTEXT_CHARS: %w", err)
+		}
+		cfg.RoutingContextChars = n
+	}
+
 	// Quality
 	if v := os.Getenv("NEXUS_QUALITY_CONCURRENCY"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -1678,6 +1698,9 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		RoutingConfidenceCeiling:    clampFloat(yc.floatDefault(yc.RoutingConfidenceCeiling, 0.85), 0, 1),
 		RoutingConfidenceMinSamples: yc.intDefault(yc.RoutingConfidenceMinSamples, 5),
 		RoutingConfidenceWindow:     yc.durationDefault(yc.RoutingConfidenceWindow, 168*time.Hour),
+
+		RoutingContextTurns: yc.intDefault(yc.RoutingContextTurns, 3),
+		RoutingContextChars: yc.intDefault(yc.RoutingContextChars, 2000),
 
 		HealthPollInterval:     yc.durationDefault(yc.HealthPollInterval, 30*time.Second),
 		HealthBreakerThreshold: yc.intDefault(yc.HealthBreakerThreshold, 3),

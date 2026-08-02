@@ -126,3 +126,122 @@ func TestInjectRAGWithLimit_NoUserMessage(t *testing.T) {
 		t.Errorf("len = %d, want %d", len(out), len(msgs))
 	}
 }
+
+// --- BuildConversationContext tests (issue #1147) ---
+
+func TestBuildConversationContext_DisabledWhenTurnsZero(t *testing.T) {
+	msgs := []interface{}{
+		map[string]interface{}{"role": "user", "content": "hello"},
+		map[string]interface{}{"role": "assistant", "content": "hi"},
+	}
+	got := BuildConversationContext(msgs, 0, 2000)
+	if got != "" {
+		t.Errorf("turns=0 should disable; got %q", got)
+	}
+}
+
+func TestBuildConversationContext_DisabledWhenCharsZero(t *testing.T) {
+	msgs := []interface{}{
+		map[string]interface{}{"role": "user", "content": "hello"},
+	}
+	got := BuildConversationContext(msgs, 3, 0)
+	if got != "" {
+		t.Errorf("maxChars=0 should disable; got %q", got)
+	}
+}
+
+func TestBuildConversationContext_BasicWindow(t *testing.T) {
+	msgs := []interface{}{
+		map[string]interface{}{"role": "system", "content": "sys"},
+		map[string]interface{}{"role": "user", "content": "review the architecture"},
+		map[string]interface{}{"role": "assistant", "content": "here is my review"},
+		map[string]interface{}{"role": "user", "content": "fix it"}, // latest, excluded
+	}
+	got := BuildConversationContext(msgs, 3, 2000)
+	// Window is the 3 messages before the latest user msg.
+	want := "user: review the architecture\nassistant: here is my review"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestBuildConversationContext_TurnCapTruncation(t *testing.T) {
+	msgs := []interface{}{
+		map[string]interface{}{"role": "user", "content": "m1"},
+		map[string]interface{}{"role": "assistant", "content": "a1"},
+		map[string]interface{}{"role": "user", "content": "m2"},
+		map[string]interface{}{"role": "assistant", "content": "a2"},
+		map[string]interface{}{"role": "user", "content": "latest"},
+	}
+	// Only 2 turns before the latest user message.
+	got := BuildConversationContext(msgs, 2, 2000)
+	want := "user: m2\nassistant: a2"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestBuildConversationContext_TurnCapCappedAtTen(t *testing.T) {
+	msgs := make([]interface{}, 20)
+	for i := range msgs {
+		msgs[i] = map[string]interface{}{"role": "user", "content": "m"}
+	}
+	// turns=100 should be capped at 10; window is 10 messages before the last.
+	got := BuildConversationContext(msgs, 100, 10000)
+	count := 0
+	for _, c := range got {
+		if c == '\n' {
+			count++
+		}
+	}
+	// 10 lines → 9 newlines.
+	if count != 9 {
+		t.Errorf("expected 10 lines (9 newlines), got %d newlines", count)
+	}
+}
+
+func TestBuildConversationContext_CharCapTruncation(t *testing.T) {
+	msgs := []interface{}{
+		map[string]interface{}{"role": "user", "content": "abcdefghij"}, // 10 chars
+		map[string]interface{}{"role": "assistant", "content": "xyz"},
+		map[string]interface{}{"role": "user", "content": "latest"},
+	}
+	// Cap at 15 chars. "user: abcdefghij" = 16 chars (with "user: " prefix).
+	// Only the first 15 fit.
+	got := BuildConversationContext(msgs, 3, 15)
+	if len(got) > 15 {
+		t.Errorf("result len = %d, want <= 15", len(got))
+	}
+	if got != "user: abcdefghij"[:15] {
+		t.Errorf("got %q (len %d)", got, len(got))
+	}
+}
+
+func TestBuildConversationContext_NoUserMessage(t *testing.T) {
+	msgs := []interface{}{
+		map[string]interface{}{"role": "system", "content": "sys"},
+		map[string]interface{}{"role": "assistant", "content": "hi"},
+	}
+	// No user message → window is the last `turns` messages.
+	// System messages are skipped, so only the assistant turn remains.
+	got := BuildConversationContext(msgs, 3, 2000)
+	want := "assistant: hi"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestBuildConversationContext_SkipsNonMapEntries(t *testing.T) {
+	msgs := []interface{}{
+		"raw string",
+		map[string]interface{}{"role": "user", "content": "first"},
+		map[string]interface{}{"content": "no role"}, // role missing
+		map[string]interface{}{"role": "user", "content": "latest"},
+	}
+	got := BuildConversationContext(msgs, 5, 2000)
+	// "raw string" is not a map → skipped. "no role" has empty role → skipped.
+	want := "user: first"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}

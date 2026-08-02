@@ -1,5 +1,7 @@
 package middleware
 
+import "strings"
+
 // ApplyPromptEngineering injects enhancement onto the system prompt.
 //
 // If a system message already exists, the enhancement is appended to its
@@ -86,4 +88,70 @@ func InjectRAGWithLimit(messages []interface{}, contextBlock string, maxBytes in
 		}
 	}
 	return messages, false
+}
+
+// BuildConversationContext assembles a bounded summary of prior
+// conversation turns for routing context (issue #1147). It collects the
+// `turns` messages immediately preceding the most recent user message,
+// prefixes each with its role ("user: ...", "assistant: ..."), and caps
+// the total length at maxChars.
+//
+// The latest user message is intentionally excluded — it is already
+// extracted into PlanRequest.Prompt by the handler. When turns <= 0 or
+// maxChars <= 0 the result is "" and context injection is disabled
+// (byte-for-byte identical to the pre-#1147 routing behaviour). turns is
+// capped at 10 to bound the window even if the operator sets a large
+// value.
+func BuildConversationContext(messages []interface{}, turns, maxChars int) string {
+	if turns <= 0 || maxChars <= 0 {
+		return ""
+	}
+	if turns > 10 {
+		turns = 10
+	}
+	// Locate the most recent user message — the context window is the
+	// `turns` messages immediately before it. When there is no user
+	// message, the window ends at the tail of the slice.
+	endIdx := len(messages)
+	for i := len(messages) - 1; i >= 0; i-- {
+		if msg, ok := messages[i].(map[string]interface{}); ok {
+			if role, _ := msg["role"].(string); role == "user" {
+				endIdx = i
+				break
+			}
+		}
+	}
+	startIdx := endIdx - turns
+	if startIdx < 0 {
+		startIdx = 0
+	}
+
+	var sb strings.Builder
+	for _, raw := range messages[startIdx:endIdx] {
+		msg, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if role == "" || role == "system" {
+			// System messages are proxy-injected instructions, not
+			// conversational turns — skip them so only the actual
+			// user/assistant dialogue feeds the routing context.
+			continue
+		}
+		content, _ := msg["content"].(string)
+		line := role + ": " + content
+		if sb.Len() > 0 {
+			line = "\n" + line
+		}
+		if sb.Len()+len(line) > maxChars {
+			remaining := maxChars - sb.Len()
+			if remaining > 0 {
+				sb.WriteString(line[:remaining])
+			}
+			break
+		}
+		sb.WriteString(line)
+	}
+	return sb.String()
 }
