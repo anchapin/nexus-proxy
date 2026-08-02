@@ -584,3 +584,229 @@ func TestWatcherCloseWhenFsnotifyUnavailable(t *testing.T) {
 	}
 	cancel()
 }
+
+// --- Recursive mode tests (issue #1149) ---
+
+func TestWatcherRecursiveDetectsNewFileInSubdir(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	ps, emb := newWatcherStore(t)
+
+	w := NewWatcher(ps, dir, 10*time.Millisecond)
+	w.SetRecursive(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.Start(ctx)
+	defer w.Stop()
+
+	// Wait for initial scan (empty dir).
+	time.Sleep(50 * time.Millisecond)
+
+	if err := os.WriteFile(filepath.Join(sub, "deep.go"), []byte("deep content"), 0o644); err != nil {
+		t.Fatalf("write deep: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if ps.Size() == 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if ps.Size() != 1 {
+		t.Fatalf("watcher did not pick up file in subdir (size=%d)", ps.Size())
+	}
+	snaps := ps.Snapshot()
+	if len(snaps) != 1 || snaps[0].Filename != "sub/deep.go" {
+		t.Errorf("expected filename sub/deep.go, got %+v", snaps)
+	}
+	if len(emb.Called()) == 0 {
+		t.Error("embedder was not called")
+	}
+}
+
+func TestWatcherRecursiveDetectsModifiedFileInSubdir(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "pkg")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	initial := []byte("v1")
+	if err := os.WriteFile(filepath.Join(sub, "mod.go"), initial, 0o644); err != nil {
+		t.Fatalf("write v1: %v", err)
+	}
+	ps, emb := newWatcherStore(t)
+
+	w := NewWatcher(ps, dir, 10*time.Millisecond)
+	w.SetRecursive(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.Start(ctx)
+	defer w.Stop()
+
+	// Wait for initial scan.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if ps.Size() == 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if ps.Size() != 1 {
+		t.Fatalf("initial scan failed (size=%d)", ps.Size())
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(sub, "mod.go"), []byte("v2 longer content"), 0o644); err != nil {
+		t.Fatalf("write v2: %v", err)
+	}
+
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		snaps := ps.Snapshot()
+		if len(snaps) == 1 && snaps[0].Content == "v2 longer content" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("watcher did not update content in subdir (calls=%d)", len(emb.Called()))
+}
+
+func TestWatcherRecursiveDetectsDeletedFileInSubdir(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "removable")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "doomed.go"), []byte("doomed"), 0o644); err != nil {
+		t.Fatalf("write doomed: %v", err)
+	}
+	ps, _ := newWatcherStore(t)
+
+	w := NewWatcher(ps, dir, 10*time.Millisecond)
+	w.SetRecursive(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.Start(ctx)
+	defer w.Stop()
+
+	// Wait for initial scan.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if ps.Size() == 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if ps.Size() != 1 {
+		t.Fatalf("initial scan failed (size=%d)", ps.Size())
+	}
+
+	if err := os.Remove(filepath.Join(sub, "doomed.go")); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if ps.Size() == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("watcher did not remove deleted file in subdir (size=%d)", ps.Size())
+}
+
+func TestWatcherRecursiveNoCollisionSameBasename(t *testing.T) {
+	dir := t.TempDir()
+	subA := filepath.Join(dir, "pkgA")
+	subB := filepath.Join(dir, "pkgB")
+	for _, d := range []string{subA, subB} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(subA, "main.go"), []byte("package pkgA"), 0o644); err != nil {
+		t.Fatalf("write pkgA/main.go: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(subB, "main.go"), []byte("package pkgB"), 0o644); err != nil {
+		t.Fatalf("write pkgB/main.go: %v", err)
+	}
+	ps, _ := newWatcherStore(t)
+
+	w := NewWatcher(ps, dir, 10*time.Millisecond)
+	w.SetRecursive(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.Start(ctx)
+	defer w.Stop()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if ps.Size() == 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if ps.Size() != 2 {
+		t.Fatalf("expected 2 files indexed, got %d", ps.Size())
+	}
+
+	snaps := ps.Snapshot()
+	names := make(map[string]bool, len(snaps))
+	for _, s := range snaps {
+		names[s.Filename] = true
+	}
+	if !names["pkgA/main.go"] || !names["pkgB/main.go"] {
+		t.Errorf("expected pkgA/main.go and pkgB/main.go, got %v", names)
+	}
+}
+
+func TestWatcherRecursiveScanOnceDirect(t *testing.T) {
+	dir := t.TempDir()
+	deep := filepath.Join(dir, "a", "b", "c")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(deep, "nested.go"), []byte("nested"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "root.go"), []byte("root"), 0o644); err != nil {
+		t.Fatalf("write root: %v", err)
+	}
+	ps, _ := newWatcherStore(t)
+
+	w := NewWatcher(ps, dir, time.Hour)
+	w.SetRecursive(true)
+
+	if err := w.scanOnce(context.Background()); err != nil {
+		t.Fatalf("scanOnce: %v", err)
+	}
+	if ps.Size() != 2 {
+		t.Fatalf("expected 2 files, got %d", ps.Size())
+	}
+}
+
+func TestStoreIndexDirRecursive(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "handlers")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "chat.go"), []byte("package handlers"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	emb := &recordingEmbedder{}
+	store := NewStore(emb, 0.5, WithRecursive(true))
+	if err := store.IndexDir(context.Background(), dir); err != nil {
+		t.Fatalf("IndexDir: %v", err)
+	}
+	if store.Size() != 2 {
+		t.Fatalf("expected 2 examples, got %d", store.Size())
+	}
+}

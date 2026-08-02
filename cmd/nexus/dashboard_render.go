@@ -229,3 +229,233 @@ func resolveRange(sinceRaw string, days int) (start, end time.Time, err error) {
 	}
 	return start, end, nil
 }
+
+// --- Range mode (issue #1170) ---------------------------------------------
+//
+// Range mode collapses a weekly / monthly / quarterly / custom window
+// into a single aggregate Summary via Store.RangeSummary (one SQL
+// round-trip). --compare fetches the previous equivalent period and
+// emits a delta row. These types and the resolver are pure and tested
+// without a real store; the renderers below mirror the per-day table /
+// JSON shapes so an operator switching between modes sees a consistent
+// column layout.
+
+// rangeWindow describes a resolved range-mode period. start and end are
+// inclusive UTC-day truncations; prevStart / prevEnd are the same-length
+// window immediately preceding start (used by --compare). label is the
+// human / JSON period identifier (e.g. "2026-07", "2026-Q3").
+type rangeWindow struct {
+	label     string
+	start     time.Time
+	end       time.Time
+	prevStart time.Time
+	prevEnd   time.Time
+}
+
+// rangeView is the data the range renderers consume: the current-period
+// Summary, an optional previous-period Summary, and the period label.
+type rangeView struct {
+	label    string
+	current  metrics.Summary
+	previous metrics.Summary
+	compare  bool
+}
+
+// validRangeNames is the set of accepted --range values. Kept as a map
+// for O(1) membership; the switch in resolveRangeWindow guarantees
+// exhaustiveness.
+var validRangeNames = map[string]bool{
+	"weekly":    true,
+	"monthly":   true,
+	"quarterly": true,
+	"custom":    true,
+}
+
+// resolveRangeWindow maps the --range flag (plus --from / --to for
+// custom) into a rangeWindow anchored on "today" (UTC). Period
+// semantics:
+//
+//   - weekly    → last 7 days ending today (inclusive)
+//   - monthly   → first day of current month through today (month-to-date)
+//   - quarterly → first day of current calendar quarter through today
+//   - custom    → --from through --to (both required)
+//
+// The previous equivalent period (prevStart..prevEnd) has the same
+// length as the current window and immediately precedes it. This keeps
+// the compare delta meaningful regardless of where in the month we are.
+func resolveRangeWindow(name, fromRaw, toRaw string) (rangeWindow, error) {
+	if !validRangeNames[name] {
+		return rangeWindow{}, fmt.Errorf("--range: want weekly|monthly|quarterly|custom, got %q", name)
+	}
+
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	var win rangeWindow
+
+	switch name {
+	case "weekly":
+		win.start = today.AddDate(0, 0, -6) // last 7 days inclusive
+		win.end = today
+		win.label = win.start.Format("2006-01-02")
+	case "monthly":
+		win.start = time.Date(today.Year(), today.Month(), 1, 0, 0, 0, 0, time.UTC)
+		win.end = today
+		win.label = today.Format("2006-01")
+	case "quarterly":
+		qStartMonth := ((int(today.Month())-1)/3)*3 + 1 // 1, 4, 7, or 10
+		win.start = time.Date(today.Year(), time.Month(qStartMonth), 1, 0, 0, 0, 0, time.UTC)
+		win.end = today
+		win.label = fmt.Sprintf("%d-Q%d", today.Year(), (int(today.Month())-1)/3+1)
+	case "custom":
+		if fromRaw == "" || toRaw == "" {
+			return rangeWindow{}, fmt.Errorf("--range custom requires --from and --to")
+		}
+		from, err := time.Parse("2006-01-02", fromRaw)
+		if err != nil {
+			return rangeWindow{}, fmt.Errorf("--from: want YYYY-MM-DD, got %q", fromRaw)
+		}
+		to, err := time.Parse("2006-01-02", toRaw)
+		if err != nil {
+			return rangeWindow{}, fmt.Errorf("--to: want YYYY-MM-DD, got %q", toRaw)
+		}
+		from = from.UTC()
+		to = to.UTC()
+		if to.Before(from) {
+			return rangeWindow{}, fmt.Errorf("--to %s is before --from %s", toRaw, fromRaw)
+		}
+		win.start = from
+		win.end = to
+		win.label = from.Format("2006-01-02")
+	}
+
+	// Previous equivalent period: same length, immediately before start.
+	span := win.end.Sub(win.start)
+	win.prevEnd = win.start.AddDate(0, 0, -1)
+	win.prevStart = win.prevEnd.Add(-span)
+	return win, nil
+}
+
+// rangeSummaryJSON is the per-period object emitted by
+// renderRangeSummaryJSON. The "previous" field is omitted (via omitempty
+// on the pointer) when --compare is not set.
+type rangeSummaryJSON struct {
+	Period   string            `json:"period"`
+	Summary  rangeMetricsJSON  `json:"summary"`
+	Previous *rangeMetricsJSON `json:"previous,omitempty"`
+}
+
+// rangeMetricsJSON carries the same metric set as the per-day dayJSON
+// but uses "period" instead of "date" and omits the date field so the
+// range output is self-describing.
+type rangeMetricsJSON struct {
+	TotalRequests       int     `json:"total_requests"`
+	Local               int     `json:"local"`
+	Frontier            int     `json:"frontier"`
+	Fusion              int     `json:"fusion"`
+	TOONSavedTokens     int     `json:"toon_saved_tokens"`
+	EstimatedSavingsUSD float64 `json:"estimated_savings_usd"`
+}
+
+// toRangeMetricsJSON converts a Summary into the JSON metric subset.
+func toRangeMetricsJSON(s metrics.Summary, costPer1k float64) rangeMetricsJSON {
+	return rangeMetricsJSON{
+		TotalRequests:       s.RequestCount,
+		Local:               s.LocalCount,
+		Frontier:            s.FrontierCount,
+		Fusion:              s.FusionCount,
+		TOONSavedTokens:     s.TOONSavingsTokens,
+		EstimatedSavingsUSD: roundUSD(savingsUSD(s, costPer1k)),
+	}
+}
+
+// renderRangeSummaryJSON writes a single-element JSON array containing
+// the current period (and, with --compare, the previous period). The
+// array wrapper keeps it a drop-in for tooling that already consumes
+// the per-day JSON array shape.
+func renderRangeSummaryJSON(view rangeView, costPer1k float64, w io.Writer) error {
+	out := rangeSummaryJSON{
+		Period:  view.label,
+		Summary: toRangeMetricsJSON(view.current, costPer1k),
+	}
+	if view.compare {
+		prev := toRangeMetricsJSON(view.previous, costPer1k)
+		out.Previous = &prev
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	arr := []rangeSummaryJSON{out}
+	if err := enc.Encode(arr); err != nil {
+		return fmt.Errorf("dashboard: encode range json: %w", err)
+	}
+	return nil
+}
+
+// renderRangeSummaryTable writes a tab-aligned table for range mode.
+// Without --compare it prints one data row; with --compare it prints
+// current, previous, and delta rows. The delta row uses a leading "Δ"
+// label and signed integer formatting.
+func renderRangeSummaryTable(view rangeView, costPer1k float64, w io.Writer) error {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "PERIOD\tTOTAL\tLOCAL\tFRONTIER\tFUSION\tTOON SAVED\t$$ SAVED (TOON)")
+
+	writeRangeRow(tw, view.label, view.current, costPer1k)
+
+	if view.compare {
+		writeRangeRow(tw, "previous", view.previous, costPer1k)
+		writeRangeDeltaRow(tw, "Δ", view.current, view.previous, costPer1k)
+	}
+
+	if err := tw.Flush(); err != nil {
+		return fmt.Errorf("dashboard: flush range table: %w", err)
+	}
+	if view.current.RequestCount == 0 && (!view.compare || view.previous.RequestCount == 0) {
+		if _, err := fmt.Fprintln(w, "(no requests recorded for this period)"); err != nil {
+			return fmt.Errorf("dashboard: write hint: %w", err)
+		}
+	}
+	return nil
+}
+
+// writeRangeRow emits one data line into the tabwriter.
+func writeRangeRow(tw *tabwriter.Writer, label string, s metrics.Summary, costPer1k float64) {
+	fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\t%s\t%s\n",
+		label,
+		s.RequestCount,
+		s.LocalCount,
+		s.FrontierCount,
+		s.FusionCount,
+		comma(s.TOONSavingsTokens),
+		formatUSD(savingsUSD(s, costPer1k)),
+	)
+}
+
+// writeRangeDeltaRow emits the signed difference between current and
+// previous for each numeric column.
+func writeRangeDeltaRow(tw *tabwriter.Writer, label string, cur, prev metrics.Summary, costPer1k float64) {
+	fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		label,
+		signedInt(cur.RequestCount-prev.RequestCount),
+		signedInt(cur.LocalCount-prev.LocalCount),
+		signedInt(cur.FrontierCount-prev.FrontierCount),
+		signedInt(cur.FusionCount-prev.FusionCount),
+		signedInt(cur.TOONSavingsTokens-prev.TOONSavingsTokens),
+		signedUSD(savingsUSD(cur, costPer1k)-savingsUSD(prev, costPer1k)),
+	)
+}
+
+// signedInt renders an integer with an explicit leading "+" when
+// non-negative, so delta columns are unambiguous.
+func signedInt(n int) string {
+	if n >= 0 {
+		return "+" + comma(n)
+	}
+	return comma(n)
+}
+
+// signedUSD renders a dollar delta with an explicit leading "+" when
+// non-negative, mirroring signedInt.
+func signedUSD(v float64) string {
+	if v >= 0 {
+		return "+" + formatUSD(v)
+	}
+	return formatUSD(v)
+}

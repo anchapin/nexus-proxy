@@ -112,6 +112,21 @@ type ArbiterCacheStatus struct {
 	TTLSeconds int  `json:"ttl_seconds"`
 }
 
+// FrontierProviderHealth reports the circuit state of one frontier
+// provider (issue #1158).
+type FrontierProviderHealth struct {
+	Name         string `json:"name"`
+	Healthy      bool   `json:"healthy"`
+	FailureCount int32  `json:"failure_count"`
+}
+
+// FrontierHealthStatus reports the state of the frontier provider
+// health poller (issue #1158).
+type FrontierHealthStatus struct {
+	Enabled   bool                     `json:"enabled"`
+	Providers []FrontierProviderHealth `json:"providers"`
+}
+
 // StatusDeps bundles the collaborators the status handler needs.
 type StatusDeps struct {
 	JudgeDepth    func() int  // returns current judge queue depth (0 if disabled)
@@ -157,6 +172,12 @@ type StatusDeps struct {
 
 	// Version returns the build version string (issue #529).
 	Version func() string
+
+	// FrontierHealth reports the per-provider frontier health poller
+	// state (issue #1158). Returns an empty slice when the poller is
+	// disabled; nil means "not wired" (the status handler omits the
+	// field).
+	FrontierHealth func() []FrontierProviderHealth
 }
 
 // Status returns an http.Handler that serves a JSON diagnostic snapshot of
@@ -209,17 +230,18 @@ func Status(d StatusDeps) http.Handler {
 		}
 
 		resp := struct {
-			Version      string             `json:"version"`
-			Judge        JudgeStatus        `json:"judge"`
-			Quality      QualityStatus      `json:"quality"`
-			RAG          RAGStatus          `json:"rag"`
-			Routing      RoutingSnapshot    `json:"routing"`
-			Uptime       int64              `json:"uptime_ms"`
-			RateLimiter  RateLimiterStatus  `json:"rate_limiter"`
-			Budget       BudgetStatus       `json:"budget"`
-			MetricsDB    MetricsDBStatus    `json:"metrics_db"`
-			SLMCache     SLMCacheStatus     `json:"slm_cache"`
-			ArbiterCache ArbiterCacheStatus `json:"arbiter_cache"`
+			Version        string               `json:"version"`
+			Judge          JudgeStatus          `json:"judge"`
+			Quality        QualityStatus        `json:"quality"`
+			RAG            RAGStatus            `json:"rag"`
+			Routing        RoutingSnapshot      `json:"routing"`
+			Uptime         int64                `json:"uptime_ms"`
+			RateLimiter    RateLimiterStatus    `json:"rate_limiter"`
+			Budget         BudgetStatus         `json:"budget"`
+			MetricsDB      MetricsDBStatus      `json:"metrics_db"`
+			SLMCache       SLMCacheStatus       `json:"slm_cache"`
+			ArbiterCache   ArbiterCacheStatus   `json:"arbiter_cache"`
+			FrontierHealth FrontierHealthStatus `json:"frontier_health"`
 		}{
 			Version: stringOrZero(d.Version),
 			Judge: JudgeStatus{
@@ -260,6 +282,10 @@ func Status(d StatusDeps) http.Handler {
 				Enabled:    d.ArbiterCacheEnabled != nil && d.ArbiterCacheEnabled(),
 				TTLSeconds: intOrZero(d.ArbiterCacheTTLSeconds),
 			},
+			FrontierHealth: FrontierHealthStatus{
+				Enabled:   d.FrontierHealth != nil,
+				Providers: frontierHealthProviders(d.FrontierHealth),
+			},
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -271,6 +297,16 @@ func Status(d StatusDeps) http.Handler {
 func intOrZero(fn func() int) int {
 	if fn == nil {
 		return 0
+	}
+	return fn()
+}
+
+// frontierHealthProviders calls the optional FrontierHealth callback and
+// returns the provider slice. Returns nil when the callback is unset
+// (frontier health poller not wired).
+func frontierHealthProviders(fn func() []FrontierProviderHealth) []FrontierProviderHealth {
+	if fn == nil {
+		return nil
 	}
 	return fn()
 }

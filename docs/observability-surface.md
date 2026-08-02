@@ -5,6 +5,11 @@ the SQLite metrics-store schema, the telemetry JSONL fields, and the
 distributed-tracing surface. It exists so operators and contributors
 can see the full observability contract in one place.
 
+> **Alerting rules:** the repo ships production-ready Prometheus
+> alerting and recording rules in `deploy/prometheus/` (alerting
+> runbook, load path, and per-alert remediation in
+> [alerting.md](alerting.md)). Validate them with `make check-rules`.
+
 ## Prometheus metrics (`GET /metrics`)
 
 The proxy implements a bespoke Prometheus text-format exposition
@@ -32,11 +37,15 @@ snake_case naming.
 | `nexus_cascade_fallback_total` | counter | `reason` | 6 (`timeout`, `transport_error`, `rate_limited`, `http_error`, `malformed_toolcall`, `malformed_response`) | `routemetrics.go` |
 | `nexus_rag_retrieval_total` | counter | `hit`, `reason` (miss only) | 1 + 3 = 4 | `routemetrics.go` |
 | `nexus_judge_dropped_total` | counter | *(none)* | 1 | `routemetrics.go` |
+| `nexus_rag_judge_score_sum` | counter | `injected` | 2 (`true`, `false`) | `prometheus.go` (issue #1167) |
+| `nexus_rag_judge_score_count` | counter | `injected` | 2 (`true`, `false`) | `prometheus.go` (issue #1167) |
 | `nexus_fusion_client_abort_total` | counter | *(none)* | 1 | `prometheus.go` (issue #1046) |
+| `nexus_frontier_probe_total` | counter | `provider`, `result` | 2 × N providers | `collector.go` (issue #1158) |
+| `nexus_frontier_circuit_open_total` | counter | `provider` | N providers | `collector.go` (issue #1158) |
 | `nexus_rate_limit_bucket_utilization` | histogram | `bucket_id` | dynamic (≤ concurrent client IPs) | `prometheus.go` (issue #746) |
 | `nexus_build_info` | gauge | `version`, `commit`, `go_version` | 1 | `prometheus.go` (issue #529) |
 
-**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 1 + 1 + 4 + 6 + 4 + 1 + 1 + 1 + 1 = 144 series.
+**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 1 + 1 + 4 + 6 + 4 + 1 + 2 + 2 + 1 + 1 = 151 series.
 
 > **Note (issue #486):** `nexus_rag_retrieval_total` previously carried
 > a `filename` label whose value was the raw RAG source filename, which
@@ -153,6 +162,24 @@ extended in #497, #534):
 > returns invalid responses (`malformed_response`) — these have
 > completely different remediations. Update any PromQL/JSON-stat panels
 > that keyed on the old three-value closed set.
+
+#### `injected`
+
+Used by the RAG-vs-judge quality correlation metrics (issue #1167):
+
+| Value | Meaning |
+|-------|---------|
+| `true` | A RAG few-shot snippet was injected into the prompt for the sampled request |
+| `false` | No RAG context was injected |
+
+`nexus_rag_judge_score_sum{injected}` and
+`nexus_rag_judge_score_count{injected}` let operators compute the
+average judge quality score per label via
+`sum / count by (injected)`. A higher average for `injected="true"`
+indicates the RAG corpus is improving model output; a flat or lower
+average suggests `NEXUS_RAG_THRESHOLD` should be tightened or the
+corpus needs better examples. Only valid scores (1–5) are recorded;
+parse failures are excluded.
 
 ### Naming convention audit
 
@@ -464,3 +491,32 @@ Top-level fields:
 | Field | Type | Description |
 |-------|------|-------------|
 | `version` | string | Build version string injected via `-ldflags "-X main.version=..."` at compile time (issue #529); `"dev"` when built without ldflags. |
+
+## Runtime profiling (`/debug/pprof/*`, `/debug/vars`) (issue #1150)
+
+When `NEXUS_DEBUG_PPROF_ENABLED=true`, the proxy registers the standard
+`net/http/pprof` and `expvar` handlers under `/debug/`:
+
+| Endpoint | Description |
+|----------|-------------|
+| `/debug/pprof/` | Index page listing available profiles |
+| `/debug/pprof/heap` | Heap allocation profile |
+| `/debug/pprof/goroutine` | Goroutine stack dump |
+| `/debug/pprof/profile` | CPU profile (30s default) |
+| `/debug/pprof/trace` | Execution trace |
+| `/debug/pprof/{allocs,block,mutex,threadcreate}` | Other runtime profiles |
+| `/debug/pprof/{cmdline,symbol}` | Build info + symbol resolution |
+| `/debug/vars` | Published `expvar` variables (memstats, cmdline) |
+
+### Access control
+
+| Mode | Config | Behaviour |
+|------|--------|-----------|
+| Disabled (default) | `NEXUS_DEBUG_PPROF_ENABLED=false` | `/debug/*` returns 404 |
+| Loopback-only | `PPROF_ENABLED=true`, key empty | Only `127.0.0.1`/`::1` served; others get 403 |
+| API-key gated | `PPROF_ENABLED=true`, key set | Requires `Authorization: Bearer <key>`; others get 401 |
+
+The `/debug/` subtree is exempt from the main inbound auth gate
+(`NEXUS_PROXY_API_KEY`) because it carries its own independent gate.
+
+`nexus check` reports the exposure mode in the `pprof_endpoint` line.

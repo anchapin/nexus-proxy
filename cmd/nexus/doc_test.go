@@ -181,6 +181,7 @@ func TestReadmeCLIReferenceMatchesSubcommands(t *testing.T) {
 	// Every subcommand wired up in cmd/nexus/main.go (see the
 	// switch on os.Args[1]) must appear in the CLI reference.
 	for _, verb := range []string{
+		"nexus init",      // case "init": (issue #1156)
 		"nexus check",     // case "check", "doctor":
 		"nexus doctor",    // alias
 		"nexus config",    // case "config":

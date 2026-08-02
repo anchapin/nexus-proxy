@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -27,7 +28,9 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/probe"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
+	"github.com/anchapin/nexus-proxy/internal/secrets"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
 const (
@@ -76,7 +79,61 @@ func main() {
 		// errors (issue #3).
 		log.Fatalf("config: %v", err)
 	}
+
+	// External secret-manager resolution (issue #1173). When a non-env
+	// backend is configured, resolve API keys from Vault / AWS SM before
+	// proceeding. Fail-closed: unreachable backend aborts boot.
+	if cfg.SecretBackend != "" && cfg.SecretBackend != "env" {
+		resolver, err := secrets.NewResolver(secrets.BackendConfig{
+			Backend:     cfg.SecretBackend,
+			VaultAddr:   cfg.VaultAddr,
+			VaultToken:  cfg.VaultToken,
+			VaultRole:   cfg.VaultRole,
+			VaultPath:   cfg.VaultPath,
+			AWSSMPrefix: cfg.AWSSMPrefix,
+		})
+		if err != nil {
+			log.Fatalf("secrets: %v", err)
+		}
+		store := secrets.NewSecretStore(resolver)
+		if err := store.Populate(); err != nil {
+			log.Fatalf("secrets: %v", err)
+		}
+		// Override env-sourced credentials with resolver values. A resolver
+		// value of "" (not found in external store, not in env) is left as-is.
+		if v := store.Get("NEXUS_FRONTIER_API_KEY"); v != "" {
+			cfg.FrontierKey = v
+		}
+		if v := store.Get("NEXUS_ZAI_API_KEY"); v != "" {
+			cfg.ZAIKey = v
+		}
+		if v := store.Get("NEXUS_PROXY_API_KEY"); v != "" {
+			cfg.ProxyAPIKey = v
+		}
+		if v := store.Get("NEXUS_JUDGE_API_KEY"); v != "" {
+			cfg.JudgeAPIKey = v
+		}
+		if v := store.Get("NEXUS_COHERE_API_KEY"); v != "" {
+			cfg.CohereAPIKey = v
+		}
+		// Start periodic refresh if configured (issue #1173 acceptance criterion).
+		if cfg.SecretRefresh > 0 {
+			slog.Info("secret refresh enabled",
+				slog.String("component", "secrets"),
+				slog.Duration("interval", cfg.SecretRefresh),
+			)
+			cancel := store.StartRefresh(cfg.SecretRefresh)
+			defer cancel()
+		}
+		defer store.Close()
+	}
 	logger := cfg.NewLogger()
+	// Wrap the slog handler so trace_id / span_id are injected into
+	// every log record inside a traced request's context (issue #1169).
+	// Only wraps when tracing is enabled — when disabled, zero overhead.
+	if cfg.TracingEndpoint != "" && cfg.LogTraceID {
+		logger = slog.New(tracing.NewLogHandler(logger.Handler()))
+	}
 	slog.SetDefault(logger)
 
 	srv, parts, cleanup, err := buildServer(cfg, startTime)
@@ -230,16 +287,27 @@ func (b *confidenceBridge) Close() error { return b.inner.Close() }
 func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context) (rag.RAGStore, *rag.PersistentStore, *rag.Watcher, rag.Embedder) {
 	// emb is already wrapped with EmbedCache by the caller (issue #115, #303)
 	cachedEmb := emb
+	// Build the file extension/pattern filter (issue #1148). Nil when
+	// both vars are empty → backward-compatible (index all files).
+	fileFilter := rag.NewFileFilter(cfg.RAGFileExtensions, cfg.RAGExcludePatterns)
 	if !cfg.RAGPersistentEnabled() {
 		slog.Info("rag persistent store disabled (NEXUS_RAG_DB is empty); using in-memory store")
-		store := rag.NewStore(cachedEmb, cfg.RAGThreshold, rag.WithBatchSize(cfg.RAGBatchSize))
+		store := rag.NewStore(cachedEmb, cfg.RAGThreshold,
+			rag.WithBatchSize(cfg.RAGBatchSize),
+			rag.WithChunkTokens(cfg.RAGChunkTokens),
+			rag.WithRecursive(cfg.RAGRecursive),
+			rag.WithFileFilter(fileFilter))
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
 		return store, nil, nil, cachedEmb
 	}
 
-	ps, err := rag.OpenPersistentStore(cfg.RAGDBPath, cachedEmb, cfg.RAGThreshold, rag.WithBatchSize(cfg.RAGBatchSize))
+	ps, err := rag.OpenPersistentStore(cfg.RAGDBPath, cachedEmb, cfg.RAGThreshold,
+		rag.WithBatchSize(cfg.RAGBatchSize),
+		rag.WithChunkTokens(cfg.RAGChunkTokens),
+		rag.WithRecursive(cfg.RAGRecursive),
+		rag.WithFileFilter(fileFilter))
 	if err != nil {
 		// Persistence is a best-effort optimisation. Fall back to
 		// the in-memory store so the proxy still serves traffic —
@@ -249,7 +317,11 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 			slog.String("path", cfg.RAGDBPath),
 			slog.Any("err", err),
 		)
-		store := rag.NewStore(cachedEmb, cfg.RAGThreshold, rag.WithBatchSize(cfg.RAGBatchSize))
+		store := rag.NewStore(cachedEmb, cfg.RAGThreshold,
+			rag.WithBatchSize(cfg.RAGBatchSize),
+			rag.WithChunkTokens(cfg.RAGChunkTokens),
+			rag.WithRecursive(cfg.RAGRecursive),
+			rag.WithFileFilter(fileFilter))
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
@@ -266,7 +338,8 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 			slog.Any("err", err),
 		)
 		_ = ps.Close()
-		store := rag.NewStore(cachedEmb, cfg.RAGThreshold)
+		store := rag.NewStore(cachedEmb, cfg.RAGThreshold,
+			rag.WithRecursive(cfg.RAGRecursive))
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
@@ -280,6 +353,7 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 	var watcher *rag.Watcher
 	if cfg.RAGWatcherEnabled() {
 		watcher = rag.NewWatcher(ps, cfg.ExamplesDir, cfg.RAGPollInterval)
+		watcher.SetRecursive(cfg.RAGRecursive)
 		watcher.Start(context.Background())
 		slog.Info("rag file watcher enabled",
 			slog.String("dir", cfg.ExamplesDir),
@@ -350,27 +424,30 @@ func buildMetrics(cfg config.Config) (metrics.Store, handlers.MetricsObserver) {
 		// (currently always-nil) error so the handler stays
 		// caller-agnostic.
 		_ = store.RecordRequest(metrics.Request{
-			Timestamp:         e.Timestamp,
-			RequestID:         e.RequestID,
-			Route:             e.Route,
-			Model:             e.Model,
-			InputTokens:       e.InputTokens,
-			TOONSavingsTokens: e.TOONSavingsTokens,
-			RAGInjected:       e.RAGInjected,
-			RAGFilename:       e.RAGFilename,
-			EstimatedCostUSD:  e.EstimatedCostUSD,
-			BaselineCostUSD:   e.BaselineCostUSD,
-			SavingsUSD:        e.SavingsUSD,
-			OutputTokens:      e.OutputTokens,
-			TTFTMs:            e.TTFTMs,
-			TotalLatencyMs:    e.TotalLatencyMs,
-			TPS:               e.TPS,
-			Streaming:         e.Streaming,
-			Error:             e.Error,
-			RouteSource:       e.RouteSource,
-			RouteReason:       e.RouteReason,
-			SLMConfidence:     e.SLMConfidence,
-			SLMTaskType:       e.SLMTaskType,
+			Timestamp:          e.Timestamp,
+			RequestID:          e.RequestID,
+			Route:              e.Route,
+			Model:              e.Model,
+			InputTokens:        e.InputTokens,
+			TOONSavingsTokens:  e.TOONSavingsTokens,
+			RAGInjected:        e.RAGInjected,
+			RAGFilename:        e.RAGFilename,
+			EstimatedCostUSD:   e.EstimatedCostUSD,
+			BaselineCostUSD:    e.BaselineCostUSD,
+			SavingsUSD:         e.SavingsUSD,
+			OutputTokens:       e.OutputTokens,
+			TTFTMs:             e.TTFTMs,
+			TotalLatencyMs:     e.TotalLatencyMs,
+			TPS:                e.TPS,
+			Streaming:          e.Streaming,
+			Error:              e.Error,
+			RouteSource:        e.RouteSource,
+			RouteReason:        e.RouteReason,
+			SLMConfidence:      e.SLMConfidence,
+			SLMTaskType:        e.SLMTaskType,
+			ArbiterCacheKeyHex: e.ArbiterCacheKeyHex,
+			ArbiterSynthesis:   e.ArbiterSynthesis,
+			Tenant:             e.Tenant,
 		})
 	})
 	return store, obs
@@ -408,10 +485,11 @@ func budgetObserver(mgr *probe.Manager) handlers.BudgetObserver {
 // healthzHandler returns the /healthz handler. Status code is
 // always 200 when the binary is alive; the JSON body carries the
 // per-request VRAM budget, the source label, the fallback value
-// the operator configured, and whether the local Ollama poller
+// the operator configured, whether the local Ollama poller
 // considers Ollama healthy (nil hpoller -> true, matches the
-// health.Health nil-safe contract).
-func healthzHandler(hpoller *health.Health, mgr *probe.Manager, cfg config.Config) http.HandlerFunc {
+// health.Health nil-safe contract), and the per-frontier-provider
+// circuit state (issue #1158).
+func healthzHandler(hpoller *health.Health, fhpoller *health.FrontierHealth, mgr *probe.Manager, cfg config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -430,22 +508,42 @@ func healthzHandler(hpoller *health.Health, mgr *probe.Manager, cfg config.Confi
 			displayTokens = cfg.TokenGuardrail
 			source = string(probe.SourceStatic)
 		}
+
+		// Per-frontier-provider circuit state (issue #1158). When
+		// the poller is nil the map is empty so the field is omitted
+		// from the JSON (omitempty).
+		type providerHealth struct {
+			Name         string `json:"name"`
+			Healthy      bool   `json:"healthy"`
+			FailureCount int32  `json:"failure_count"`
+		}
+		var frontierProviders []providerHealth
+		for _, st := range fhpoller.States() {
+			frontierProviders = append(frontierProviders, providerHealth{
+				Name:         st.Name,
+				Healthy:      st.Healthy,
+				FailureCount: st.FailureCount,
+			})
+		}
+
 		resp := struct {
-			Status         string `json:"status"`
-			OllamaHealthy  bool   `json:"ollama_healthy"`
-			BudgetTokens   int    `json:"budget_tokens"`
-			BudgetSource   string `json:"budget_source"`
-			FreeVRAMBytes  int64  `json:"free_vram_bytes,omitempty"`
-			ModelContext   int    `json:"model_context,omitempty"`
-			StaticFallback int    `json:"static_fallback_tokens"`
+			Status            string           `json:"status"`
+			OllamaHealthy     bool             `json:"ollama_healthy"`
+			BudgetTokens      int              `json:"budget_tokens"`
+			BudgetSource      string           `json:"budget_source"`
+			FreeVRAMBytes     int64            `json:"free_vram_bytes,omitempty"`
+			ModelContext      int              `json:"model_context,omitempty"`
+			StaticFallback    int              `json:"static_fallback_tokens"`
+			FrontierProviders []providerHealth `json:"frontier_providers,omitempty"`
 		}{
-			Status:         "ok",
-			OllamaHealthy:  hpoller == nil || hpoller.IsLocalHealthy(),
-			BudgetTokens:   displayTokens,
-			BudgetSource:   source,
-			FreeVRAMBytes:  budget.FreeVRAMBytes,
-			ModelContext:   budget.ModelContext,
-			StaticFallback: cfg.TokenGuardrail,
+			Status:            "ok",
+			OllamaHealthy:     hpoller == nil || hpoller.IsLocalHealthy(),
+			BudgetTokens:      displayTokens,
+			BudgetSource:      source,
+			FreeVRAMBytes:     budget.FreeVRAMBytes,
+			ModelContext:      budget.ModelContext,
+			StaticFallback:    cfg.TokenGuardrail,
+			FrontierProviders: frontierProviders,
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}
@@ -457,15 +555,32 @@ func healthzHandler(hpoller *health.Health, mgr *probe.Manager, cfg config.Confi
 // credentials. /status is exempt only when NEXUS_STATUS_PUBLIC=true
 // (default false) — the diagnostics surface (frontier configured,
 // judge enabled, VRAM state) is reconnaissance-grade and should be
-// gated by default.
+// gated by default. The web dashboard path (issue #1182, default
+// /dashboard) is exempt only when NEXUS_DASHBOARD_PUBLIC=true, mirroring
+// the /status posture. /debug/* is always exempt because the pprof/expvar
+// subtree carries its own independent gate (DebugPprofGate, issue
+// #1150); double-gating would require operators to pass the proxy API
+// key before the debug key, adding friction without security gain.
 func publicPathExempt(cfg config.Config) func(*http.Request) bool {
+	dashPath := cfg.DashboardEndpoint
+	if dashPath == "" {
+		dashPath = "/dashboard"
+	}
 	return func(r *http.Request) bool {
 		switch r.URL.Path {
 		case "/healthz", "/metrics", "/readyz":
 			return true
 		case "/status":
 			return cfg.StatusPublic
+		case dashPath:
+			return cfg.DashboardPublic
 		default:
+			// Debug pprof/expvar subtree (issue #1150). The
+			// /debug/ prefix is exempt so the debug gate
+			// (API key or loopback) is the sole access control.
+			if strings.HasPrefix(r.URL.Path, "/debug/") {
+				return true
+			}
 			return false
 		}
 	}

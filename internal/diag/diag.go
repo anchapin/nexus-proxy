@@ -104,6 +104,7 @@ const (
 	checkProviderRegistry     = "provider_registry"
 	checkMiddlewareChain      = "middleware_chain"
 	checkModelsEndpoint       = "models_endpoint"
+	checkPprofEndpoint        = "pprof_endpoint"
 )
 
 // Run executes every diagnostic check against cfg and returns the
@@ -144,6 +145,7 @@ func Run(ctx context.Context, cfg config.Config, opts Options) Result {
 	r = append(r, checkProviderRegistryFn())
 	r = append(r, checkMiddlewareChainFn(cfg))
 	r = append(r, checkModelsEndpointFn(ctx, cfg, opts))
+	r = append(r, checkPprofEndpointFn(cfg))
 	return r
 }
 
@@ -943,5 +945,34 @@ func checkModelsEndpointFn(ctx context.Context, cfg config.Config, opts Options)
 		Name:   checkModelsEndpoint,
 		Status: StatusPass,
 		Detail: fmt.Sprintf("/v1/models accessible at %s", nexusURL),
+	}
+}
+
+// --- pprof endpoint (issue #1150) -----------------------------------------
+
+// checkPprofEndpointFn reports the exposure mode of the debug pprof +
+// expvar endpoints. When disabled (the default) the check passes
+// silently. When enabled with an API key it passes with a detail line
+// describing the mode. When enabled without a key (loopback-only) it
+// warns the operator that remote access requires setting the key.
+func checkPprofEndpointFn(cfg config.Config) Check {
+	if !cfg.DebugPprofEnabled {
+		return Check{
+			Name:   checkPprofEndpoint,
+			Status: StatusPass,
+			Detail: "disabled (NEXUS_DEBUG_PPROF_ENABLED=false)",
+		}
+	}
+	if cfg.DebugPprofAPIKey != "" {
+		return Check{
+			Name:   checkPprofEndpoint,
+			Status: StatusPass,
+			Detail: "enabled, API-key gated (/debug/pprof/*, /debug/vars)",
+		}
+	}
+	return Check{
+		Name:   checkPprofEndpoint,
+		Status: StatusWarn,
+		Detail: "enabled, loopback-only — set NEXUS_DEBUG_PPROF_API_KEY for remote access",
 	}
 }

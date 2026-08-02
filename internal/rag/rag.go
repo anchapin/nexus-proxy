@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/ioutils"
+	"github.com/anchapin/nexus-proxy/internal/tokenizer"
 
 	"time"
 )
@@ -85,10 +87,11 @@ type BreakerConfig struct {
 
 // FewShotExample is one indexed code snippet with its embedding.
 type FewShotExample struct {
-	Filename  string // base filename only (no path)
-	Dir       string // directory from which this example was indexed
-	Content   string
-	Embedding []float64
+	Filename   string // base filename only (no path)
+	Dir        string // directory from which this example was indexed
+	Content    string
+	Embedding  []float64
+	ChunkIndex int // 0 for whole-file; 0..N for chunked files (issue #1168)
 }
 
 // Embedder turns text into a vector. Implementations must be safe for
@@ -480,6 +483,16 @@ type RAGStore interface {
 	LastSuccessfulKind() string
 }
 
+// TopKRetriever is an optional interface implemented by *Store (and
+// inherited by *PersistentStore) for retrieving the K most-relevant
+// examples above threshold (issue #1166). The chat handler type-asserts
+// d.RAG to this interface when Config.RAGTopK > 1; when the assertion
+// fails it transparently falls back to the single-example Retrieve
+// path.
+type TopKRetriever interface {
+	RetrieveTopK(ctx context.Context, prompt string, k int) ([]FewShotExample, []float64, IndexPath, error)
+}
+
 // EmbedCacheStats is the observability surface for the prompt embedding cache.
 // It is implemented by *EmbedCache and is also exposed by *Store (where it
 // delegates to the wrapped embedder when it is an *EmbedCache).
@@ -529,7 +542,10 @@ type Store struct {
 	thresholdOverrides map[string]float64 // dir -> threshold; unspecified dirs use global threshold
 	index              *HNSWIndex
 	indexConfig        HNSWConfig
-	batchSize          int // number of files to embed per batch; 0 disables batching
+	batchSize          int         // number of files to embed per batch; 0 disables batching
+	recursive          bool        // walk subdirectories during IndexDir (issue #1149)
+	chunkTokens        int         // max tokens per chunk; 0 disables chunking (issue #1168)
+	fileFilter         *FileFilter // optional include/exclude filter for IndexDir (issue #1148)
 
 	lastIndexAt               int64
 	retrievalAttempts         uint64
@@ -550,6 +566,29 @@ type StoreOption func(*Store)
 // A value of 0 disables batching (each file is embedded individually).
 func WithBatchSize(n int) StoreOption {
 	return func(s *Store) { s.batchSize = n }
+}
+
+// WithRecursive enables recursive subdirectory walking in IndexDir
+// (issue #1149). When true, filepath.WalkDir descends into all
+// subdirectories; file paths are stored relative to the root.
+func WithRecursive(r bool) StoreOption {
+	return func(s *Store) { s.recursive = r }
+}
+
+// WithChunkTokens enables token-aware file chunking (issue #1168).
+// When > 0, files whose token count exceeds the threshold are split into
+// overlapping chunks that prefer natural code boundaries (blank lines).
+// Each chunk is stored as a separate FewShotExample with a unique ChunkIndex.
+// A value of 0 (default) disables chunking — whole-file indexing.
+func WithChunkTokens(n int) StoreOption {
+	return func(s *Store) { s.chunkTokens = n }
+}
+
+// WithFileFilter sets the include/exclude filter used by IndexDir to skip
+// non-source files during indexing (issue #1148). A nil filter (the default)
+// indexes all regular files, preserving backward compatibility.
+func WithFileFilter(f *FileFilter) StoreOption {
+	return func(s *Store) { s.fileFilter = f }
 }
 
 // indexThreshold is the minimum store size before the HNSW index is used.
@@ -802,6 +841,141 @@ func (s *Store) EmbedHitCount() int64 {
 	return 0
 }
 
+// collectedFile holds the relative path and content of a file selected
+// for indexing. relPath uses forward slashes so it is stable as a
+// primary key across operating systems (issue #1149).
+type collectedFile struct {
+	relPath string
+	dir     string // parent directory relative to root (recursive mode); safeDir (flat mode)
+	content string
+}
+
+// collectIndexFiles enumerates all regular files under dir. When
+// recursive is true, filepath.WalkDir descends into all subdirectories
+// (issue #1149). Symlinks — both files and directories — are always
+// skipped (issue #107). The returned safeDir is the EvalSymlinks-
+// resolved canonical path used by verifyInsideDir.
+func collectIndexFiles(dir string, recursive bool) (safeDir string, files []collectedFile, err error) {
+	safeDir, err = resolveDir(dir)
+	if err != nil {
+		return "", nil, err
+	}
+
+	if recursive {
+		err = filepath.WalkDir(dir, func(path string, d os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				slog.Warn("rag: walk error, skipping",
+					slog.String("path", path),
+					slog.Any("err", walkErr),
+				)
+				return nil
+			}
+			if d.IsDir() {
+				if isSymlink(d) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if isSymlink(d) {
+				slog.Warn("rag: skipping symlink in examples dir (issue #107)",
+					slog.String("filename", d.Name()),
+					slog.String("dir", dir),
+				)
+				return nil
+			}
+			resolved, rErr := filepath.EvalSymlinks(path)
+			if rErr != nil {
+				slog.Error("rag: cannot resolve path, skipping",
+					slog.String("path", path),
+					slog.Any("err", rErr),
+				)
+				return nil
+			}
+			if !verifyInsideDir(safeDir, resolved) {
+				slog.Warn("rag: skipping file that escapes examples dir (issue #107)",
+					slog.String("resolved", resolved),
+					slog.String("base", safeDir),
+				)
+				return nil
+			}
+			content, rErr := os.ReadFile(path)
+			if rErr != nil {
+				slog.Error("rag read file", slog.String("path", path), slog.Any("err", rErr))
+				return nil
+			}
+			rel, rErr := filepath.Rel(dir, path)
+			if rErr != nil {
+				slog.Error("rag: cannot compute relative path, skipping",
+					slog.String("path", path),
+					slog.Any("err", rErr),
+				)
+				return nil
+			}
+			relPath := filepath.ToSlash(rel)
+			parent := filepath.ToSlash(filepath.Dir(rel))
+			if parent == "." {
+				parent = ""
+			}
+			files = append(files, collectedFile{
+				relPath: relPath,
+				dir:     parent,
+				content: string(content),
+			})
+			return nil
+		})
+		if err != nil {
+			return safeDir, nil, fmt.Errorf("rag: walk examples dir %q: %w", dir, err)
+		}
+		return safeDir, files, nil
+	}
+
+	// Flat mode: read top-level only (pre-#1149 behaviour).
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return safeDir, nil, fmt.Errorf("rag: read examples dir %q: %w", dir, err)
+	}
+	for _, f := range entries {
+		if f.IsDir() {
+			continue
+		}
+		if isSymlink(f) {
+			slog.Warn("rag: skipping symlink in examples dir (issue #107)",
+				slog.String("filename", f.Name()),
+				slog.String("dir", dir),
+			)
+			continue
+		}
+		path := filepath.Join(dir, f.Name())
+		resolved, rErr := filepath.EvalSymlinks(path)
+		if rErr != nil {
+			slog.Error("rag: cannot resolve path, skipping",
+				slog.String("filename", f.Name()),
+				slog.Any("err", rErr),
+			)
+			continue
+		}
+		if !verifyInsideDir(safeDir, resolved) {
+			slog.Warn("rag: skipping file that escapes examples dir (issue #107)",
+				slog.String("filename", f.Name()),
+				slog.String("resolved", resolved),
+				slog.String("base", safeDir),
+			)
+			continue
+		}
+		content, rErr := os.ReadFile(path)
+		if rErr != nil {
+			slog.Error("rag read file", slog.String("filename", f.Name()), slog.Any("err", rErr))
+			continue
+		}
+		files = append(files, collectedFile{
+			relPath: f.Name(), // backward compat: flat mode uses basename
+			dir:     safeDir,
+			content: string(content),
+		})
+	}
+	return safeDir, files, nil
+}
+
 // IndexDir walks dir, embedding every regular file's contents. It is
 // permissive: a missing directory is created (and indexing returns empty),
 // per-file read or embed errors are logged and skipped. This matches the
@@ -811,6 +985,11 @@ func (s *Store) EmbedHitCount() int64 {
 // leaks via injected few-shot examples. The directory path is resolved
 // once to canonicalize it, and every file's resolved path is verified
 // to remain inside the resolved directory.
+//
+// When the Store is configured with WithRecursive(true) (issue #1149),
+// filepath.WalkDir descends into all subdirectories and file paths are
+// stored relative to dir (e.g. "sub/deep.go") to avoid primary-key
+// collisions when multiple directories contain files with the same name.
 func (s *Store) IndexDir(ctx context.Context, dir string) error {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
@@ -823,56 +1002,23 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 		return nil
 	}
 
-	safeDir, err := resolveDir(dir)
+	_, validFiles, err := collectIndexFiles(dir, s.recursive)
 	if err != nil {
 		return err
 	}
 
-	files, err := os.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("rag: read examples dir %q: %w", dir, err)
-	}
-
-	type fileInfo struct {
-		name    string
-		content string
-	}
-	var validFiles []fileInfo
-
-	for _, f := range files {
-		if f.IsDir() {
-			continue
+	if s.fileFilter != nil {
+		filtered := validFiles[:0]
+		for _, f := range validFiles {
+			if s.fileFilter.ShouldIndex(f.relPath) {
+				filtered = append(filtered, f)
+			} else {
+				slog.Debug("rag: skipping file filtered by extension/pattern (issue #1148)",
+					slog.String("filename", f.relPath),
+				)
+			}
 		}
-		if isSymlink(f) {
-			slog.Warn("rag: skipping symlink in examples dir (issue #107)",
-				slog.String("filename", f.Name()),
-				slog.String("dir", dir),
-			)
-			continue
-		}
-		path := filepath.Join(dir, f.Name())
-		resolved, err := filepath.EvalSymlinks(path)
-		if err != nil {
-			slog.Error("rag: cannot resolve path, skipping",
-				slog.String("filename", f.Name()),
-				slog.Any("err", err),
-			)
-			continue
-		}
-		if !verifyInsideDir(safeDir, resolved) {
-			slog.Warn("rag: skipping file that escapes examples dir (issue #107)",
-				slog.String("filename", f.Name()),
-				slog.String("resolved", resolved),
-				slog.String("base", safeDir),
-			)
-			continue
-		}
-		content, err := os.ReadFile(path)
-		if err != nil {
-			slog.Error("rag read file", slog.String("filename", f.Name()), slog.Any("err", err))
-			continue
-		}
-		validFiles = append(validFiles, fileInfo{name: f.Name(), content: string(content)})
+		validFiles = filtered
 	}
 
 	if s.batchSize > 0 && len(validFiles) > 0 {
@@ -882,15 +1028,26 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 				end = len(validFiles)
 			}
 			batch := validFiles[i:end]
-			texts := make([]string, len(batch))
-			for j, fi := range batch {
-				texts[j] = fi.content
+			// Expand files into chunks (issue #1168).
+			var chunkTexts []string
+			var chunkMeta []struct {
+				name string
+				dir  string
+				idx  int
 			}
-			embs, err := s.embedder.EmbedBatch(ctx, texts)
+			for _, fi := range batch {
+				chunks := chunkFile(fi.content, s.chunkTokens)
+				for _, c := range chunks {
+					chunkTexts = append(chunkTexts, c.Content)
+					chunkMeta = append(chunkMeta, struct {
+						name string
+						dir  string
+						idx  int
+					}{fi.relPath, fi.dir, c.Index})
+				}
+			}
+			embs, err := s.embedder.EmbedBatch(ctx, chunkTexts)
 			if err != nil {
-				// Partial batch: entries were appended to s.examples but
-				// upsertExample was never called, so the HNSW index is stale.
-				// Invalidate it so Retrieve falls back to brute-force.
 				s.mu.Lock()
 				s.index = nil
 				s.mu.Unlock()
@@ -902,44 +1059,43 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 				continue
 			}
 			s.mu.Lock()
-			for j, fi := range batch {
+			for j := range chunkTexts {
 				s.examples = append(s.examples, FewShotExample{
-					Filename:  fi.name,
-					Dir:       safeDir,
-					Content:   fi.content,
-					Embedding: embs[j],
+					Filename:   chunkMeta[j].name,
+					Dir:        chunkMeta[j].dir,
+					Content:    chunkTexts[j],
+					Embedding:  embs[j],
+					ChunkIndex: chunkMeta[j].idx,
 				})
-				s.markIndexed(time.Now().UTC())
-				slog.Info("rag indexed", slog.String("filename", fi.name))
 			}
+			s.markIndexed(time.Now().UTC())
 			s.mu.Unlock()
 		}
 	} else {
 		for _, fi := range validFiles {
-			emb, err := s.embedder.Embed(ctx, fi.content)
-			if err != nil {
-				slog.Error("rag embed file", slog.String("filename", fi.name), slog.Any("err", err))
-				continue
+			chunks := chunkFile(fi.content, s.chunkTokens)
+			for _, c := range chunks {
+				emb, err := s.embedder.Embed(ctx, c.Content)
+				if err != nil {
+					slog.Error("rag embed file", slog.String("filename", fi.relPath), slog.Any("err", err))
+					continue
+				}
+				s.mu.Lock()
+				s.examples = append(s.examples, FewShotExample{
+					Filename:   fi.relPath,
+					Dir:        fi.dir,
+					Content:    c.Content,
+					Embedding:  emb,
+					ChunkIndex: c.Index,
+				})
+				s.mu.Unlock()
 			}
-			s.mu.Lock()
-			s.examples = append(s.examples, FewShotExample{
-				Filename:  fi.name,
-				Dir:       safeDir,
-				Content:   fi.content,
-				Embedding: emb,
-			})
-			s.mu.Unlock()
 			s.markIndexed(time.Now().UTC())
-			slog.Info("rag indexed", slog.String("filename", fi.name))
+			slog.Info("rag indexed", slog.String("filename", fi.relPath))
 		}
 	}
 
-	// If EmbedBatch failed mid-way, s.index was invalidated but later batches
-	// still appended to s.examples. Rebuild synchronously now so IndexDir
-	// returns with a consistent state instead of leaving the index incomplete
-	// until the next Retrieve call (issue #976).
 	s.maybeRebuildIndex()
-
 	return nil
 }
 
@@ -1039,9 +1195,125 @@ func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, f
 	return nil, bestScore, IndexPathBruteForce, nil
 }
 
+// RetrieveTopK returns up to k examples whose cosine similarity to the
+// prompt embedding meets the configured threshold, ordered by descending
+// score. When fewer than k examples clear the threshold, only those that
+// do are returned. An empty store or empty prompt always yields empty
+// slices. k <= 0 returns empty slices without searching.
+//
+// The IndexPath and stats counters behave identically to Retrieve.
+// PersistentStore inherits this method via the embedded *Store.
+func (s *Store) RetrieveTopK(ctx context.Context, prompt string, k int) ([]FewShotExample, []float64, IndexPath, error) {
+	if k <= 0 {
+		return nil, nil, IndexPathNone, nil
+	}
+	atomic.AddUint64(&s.retrievalAttempts, 1)
+	s.mu.RLock()
+	n := len(s.examples)
+	s.mu.RUnlock()
+	if n == 0 {
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.emptyStoreMisses, 1)
+		return nil, nil, IndexPathNone, nil
+	}
+	if prompt == "" {
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.thresholdMisses, 1)
+		return nil, nil, IndexPathNone, nil
+	}
+	promptEmb, err := s.embedder.Embed(ctx, prompt)
+	if err != nil {
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.embedErrors, 1)
+		return nil, nil, IndexPathNone, err
+	}
+
+	s.maybeRebuildIndex()
+
+	type scored struct {
+		ex    FewShotExample
+		score float64
+	}
+
+	s.mu.RLock()
+	useIndex := n >= indexThreshold && s.index != nil && s.index.Size() >= n
+	examples := s.examples
+	var idx *HNSWIndex
+	if useIndex {
+		idx = s.index
+	}
+	s.mu.RUnlock()
+
+	var candidates []scored
+
+	if useIndex && idx != nil {
+		// HNSW path: search for enough candidates to re-rank and filter.
+		searchK := k
+		if searchK < 10 {
+			searchK = 10
+		}
+		candidateIDs := idx.Search(promptEmb, searchK)
+		s.mu.RLock()
+		for _, id := range candidateIDs {
+			if id < 0 || id >= len(examples) {
+				continue
+			}
+			score := CosineSimilarity(promptEmb, examples[id].Embedding)
+			if score > s.ThresholdFor(examples[id].Dir) {
+				candidates = append(candidates, scored{ex: examples[id], score: score})
+			}
+		}
+		s.mu.RUnlock()
+	} else {
+		// Brute-force path: O(n) scan.
+		s.mu.RLock()
+		for i := range s.examples {
+			score := CosineSimilarity(promptEmb, s.examples[i].Embedding)
+			if score > s.ThresholdFor(s.examples[i].Dir) {
+				candidates = append(candidates, scored{ex: s.examples[i], score: score})
+			}
+		}
+		s.mu.RUnlock()
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].score > candidates[j].score
+	})
+
+	if len(candidates) > k {
+		candidates = candidates[:k]
+	}
+
+	if len(candidates) == 0 {
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.thresholdMisses, 1)
+		path := IndexPathBruteForce
+		if useIndex && idx != nil {
+			path = IndexPathHNSW
+		}
+		return nil, nil, path, nil
+	}
+
+	result := make([]FewShotExample, len(candidates))
+	scores := make([]float64, len(candidates))
+	for i, c := range candidates {
+		result[i] = c.ex
+		scores[i] = c.score
+	}
+	atomic.AddUint64(&s.retrievalHits, 1)
+	path := IndexPathBruteForce
+	if useIndex && idx != nil {
+		path = IndexPathHNSW
+	}
+	return result, scores, path, nil
+}
+
 // CosineSimilarity returns the cosine of the angle between a and b. A zero
 // vector on either side yields 0 (rather than NaN) so callers can sort
-// scores without a special case.
+// scores without a special case. Inputs large enough to overflow the
+// intermediate dot/norm accumulators also return 0, and the result is
+// clamped to [-1, 1] to guard against floating-point drift from
+// denormalized numbers (issue #1161).
 func CosineSimilarity(a, b []float64) float64 {
 	n := len(a)
 	if len(b) < n {
@@ -1056,16 +1328,146 @@ func CosineSimilarity(a, b []float64) float64 {
 	if na == 0 || nb == 0 {
 		return 0
 	}
-	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+	result := dot / (math.Sqrt(na) * math.Sqrt(nb))
+	if math.IsNaN(result) || math.IsInf(result, 0) {
+		return 0
+	}
+	if result > 1 {
+		return 1
+	}
+	if result < -1 {
+		return -1
+	}
+	return result
 }
 
 // FormatInjection returns the standard "[PROXY RETRIEVAL CONTEXT]" block
 // appended to a user message when a high-similarity example is found.
+// When the example is a chunk (ChunkIndex > 0), the label includes the
+// chunk suffix (e.g. "handler.go#chunk2") for traceability.
 func FormatInjection(ex *FewShotExample) string {
+	label := ex.Filename
+	if ex.ChunkIndex > 0 {
+		label = fmt.Sprintf("%s#chunk%d", ex.Filename, ex.ChunkIndex)
+	}
 	return fmt.Sprintf(
 		"\n\n[PROXY RETRIEVAL CONTEXT]: Here is a highly relevant, validated few-shot example from the local codebase (%s):\n```\n%s\n```\nAnalyze its architecture and apply its patterns if relevant to this task.",
-		ex.Filename, ex.Content,
+		label, ex.Content,
 	)
+}
+
+// chunkInfo represents a single chunk of a file's content.
+type chunkInfo struct {
+	Content string
+	Index   int
+}
+
+// chunkFile splits content into overlapping chunks of approximately maxTokens
+// tokens each, preferring natural code boundaries (blank lines). Returns a
+// single chunk containing the entire content when maxTokens <= 0 or the
+// content fits within the threshold. Each chunk has a 25% overlap with the
+// preceding chunk so that related code split across boundaries remains
+// retrievable (issue #1168).
+func chunkFile(content string, maxTokens int) []chunkInfo {
+	if maxTokens <= 0 {
+		return []chunkInfo{{Content: content, Index: 0}}
+	}
+	if tokenizer.CountTokens(content) <= maxTokens {
+		return []chunkInfo{{Content: content, Index: 0}}
+	}
+
+	blocks := splitByBlankLines(content)
+
+	var chunks []chunkInfo
+	var currentParts []string
+	currentTokens := 0
+	chunkIdx := 0
+	overlapTokens := maxTokens / 4
+
+	for i, block := range blocks {
+		var sep string
+		if i > 0 {
+			sep = "\n\n"
+		}
+		bText := sep + block
+		bTokens := tokenizer.CountTokens(bText)
+
+		if currentTokens > 0 && currentTokens+bTokens > maxTokens {
+			chunks = append(chunks, chunkInfo{
+				Content: strings.Join(currentParts, ""),
+				Index:   chunkIdx,
+			})
+			chunkIdx++
+
+			var overlap []string
+			overlapSum := 0
+			for j := len(currentParts) - 1; j >= 0; j-- {
+				bt := tokenizer.CountTokens(currentParts[j])
+				if overlapSum+bt > overlapTokens && len(overlap) > 0 {
+					break
+				}
+				overlap = append([]string{currentParts[j]}, overlap...)
+				overlapSum += bt
+			}
+			currentParts = overlap
+			currentTokens = overlapSum
+		}
+
+		currentParts = append(currentParts, bText)
+		currentTokens += bTokens
+	}
+
+	if len(currentParts) > 0 {
+		chunks = append(chunks, chunkInfo{
+			Content: strings.Join(currentParts, ""),
+			Index:   chunkIdx,
+		})
+	}
+
+	if len(chunks) <= 1 {
+		return []chunkInfo{{Content: content, Index: 0}}
+	}
+
+	return chunks
+}
+
+// splitByBlankLines splits content into blocks separated by one or more
+// blank lines. This aligns chunk boundaries with natural code structure
+// (function/method boundaries, paragraph breaks in prose).
+func splitByBlankLines(content string) []string {
+	lines := strings.Split(content, "\n")
+	var blocks []string
+	var current []string
+
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			if len(current) > 0 {
+				blocks = append(blocks, strings.Join(current, "\n"))
+				current = nil
+			}
+		} else {
+			current = append(current, line)
+		}
+	}
+	if len(current) > 0 {
+		blocks = append(blocks, strings.Join(current, "\n"))
+	}
+	return blocks
+}
+
+// FormatInjectionMulti formats multiple few-shot examples as concatenated
+// [PROXY RETRIEVAL CONTEXT] blocks (issue #1166). The examples slice must
+// be ordered by descending relevance. Returns an empty string when no
+// examples are provided.
+func FormatInjectionMulti(examples []*FewShotExample) string {
+	if len(examples) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for _, ex := range examples {
+		sb.WriteString(FormatInjection(ex))
+	}
+	return sb.String()
 }
 
 // Add is a test/seed helper to insert a precomputed example directly into
@@ -1181,7 +1583,7 @@ func (s *Store) upsertExample(ex FewShotExample) {
 	defer s.mu.Unlock()
 	existingIdx := -1
 	for i := range s.examples {
-		if s.examples[i].Filename == ex.Filename {
+		if s.examples[i].Filename == ex.Filename && s.examples[i].ChunkIndex == ex.ChunkIndex {
 			existingIdx = i
 			break
 		}

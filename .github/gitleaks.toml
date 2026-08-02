@@ -23,8 +23,11 @@ description = "False positive files for generic-api-key rule"
 paths = [
   "internal/handlers/chat.go",
   "internal/handlers/recover_test.go",
+  "internal/handlers/redact_test.go",
   "internal/config/file_integration_test.go",
   "internal/config/file_test.go",
+  "cmd/nexus/init_test.go",
+  "internal/audit/audit_test.go",
 ]
 
 # Historical commits with false positives - skip entire commits

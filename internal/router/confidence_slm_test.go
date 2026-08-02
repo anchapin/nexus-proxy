@@ -135,3 +135,67 @@ func TestAdaptiveRoutingIntegration(t *testing.T) {
 		t.Errorf("SLM did not receive negative-bias augmentation: %s", seen)
 	}
 }
+
+// TestDecideWithComparativeConfidenceBothLowInjectsFusionBias (issue #1162):
+// when both local and frontier confidence are below the floor, the SLM
+// should receive the fusion bias note ("both models struggle — consider fusion").
+func TestDecideWithComparativeConfidenceBothLowInjectsFusionBias(t *testing.T) {
+	var seen string
+	c := NewSLMClient("http://x", "m", time.Second, newClient(func(r *http.Request) (*http.Response, error) {
+		b, _ := io.ReadAll(r.Body)
+		seen = string(b)
+		return okBody(`{"message":{"content":"{\"route\":\"fusion\"}"}}`)
+	}))
+	if _, err := c.DecideWithComparativeConfidence(context.Background(), "debug this", 0.1, 0.15); err != nil {
+		t.Fatalf("DecideWithComparativeConfidence: %v", err)
+	}
+	if !strings.Contains(seen, "BOTH the local and frontier") {
+		t.Errorf("both-low payload missing fusion bias note: %s", seen)
+	}
+	if !strings.Contains(seen, "combined analysis") {
+		t.Errorf("both-low payload should suggest fusion route: %s", seen)
+	}
+}
+
+// TestDecideWithComparativeConfidenceLocalLowOnlyInjectsNegativeBias
+// (issue #1162): when only local confidence is low but frontier is fine,
+// the SLM should receive the standard negative (frontier) bias note.
+func TestDecideWithComparativeConfidenceLocalLowOnlyInjectsNegativeBias(t *testing.T) {
+	var seen string
+	c := NewSLMClient("http://x", "m", time.Second, newClient(func(r *http.Request) (*http.Response, error) {
+		b, _ := io.ReadAll(r.Body)
+		seen = string(b)
+		return okBody(`{"message":{"content":"{\"route\":\"frontier\"}"}}`)
+	}))
+	if _, err := c.DecideWithComparativeConfidence(context.Background(), "debug this", 0.1, 0.9); err != nil {
+		t.Fatalf("DecideWithComparativeConfidence: %v", err)
+	}
+	if !strings.Contains(seen, "LOCAL model has performed POORLY") {
+		t.Errorf("local-low-only payload missing negative bias note: %s", seen)
+	}
+	if strings.Contains(seen, "BOTH the local and frontier") {
+		t.Errorf("local-low-only payload should not contain fusion note: %s", seen)
+	}
+}
+
+// TestSystemPromptForComparativeRespectsCustomBounds (issue #1162):
+// the comparative path respects custom floor/ceiling bounds.
+func TestSystemPromptForComparativeRespectsCustomBounds(t *testing.T) {
+	c := &SLMClient{ConfidenceFloor: 0.3, ConfidenceCeiling: 0.7}
+	// Both below custom floor -> fusion bias.
+	if got := c.systemPromptForComparative(0.2, 0.25); !strings.Contains(got, "BOTH") {
+		t.Error("both below custom floor should get fusion note")
+	}
+	// Only local below custom floor, frontier above -> negative bias.
+	if got := c.systemPromptForComparative(0.2, 0.5); !strings.Contains(got, "POORLY") {
+		t.Error("local below custom floor only should get negative note")
+	}
+	// Local above ceiling -> positive bias.
+	if got := c.systemPromptForComparative(0.8, 0.2); !strings.Contains(got, "WELL") {
+		t.Error("local above custom ceiling should get positive note")
+	}
+	// Both in band -> no augmentation.
+	if got := c.systemPromptForComparative(0.5, 0.5); got != slmSystemPrompt {
+		t.Error("both in band should be unaugmented")
+	}
+}
