@@ -435,6 +435,7 @@ func buildMetrics(cfg config.Config) (metrics.Store, handlers.MetricsObserver) {
 			SLMTaskType:        e.SLMTaskType,
 			ArbiterCacheKeyHex: e.ArbiterCacheKeyHex,
 			ArbiterSynthesis:   e.ArbiterSynthesis,
+			Tenant:             e.Tenant,
 		})
 	})
 	return store, obs

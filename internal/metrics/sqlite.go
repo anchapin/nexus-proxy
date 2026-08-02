@@ -68,7 +68,8 @@ CREATE TABLE IF NOT EXISTS requests (
     slm_confidence REAL NOT NULL DEFAULT 0,
     slm_task_type TEXT NOT NULL DEFAULT '',
     arbiter_cache_key TEXT NOT NULL DEFAULT '',
-    arbiter_synthesis TEXT NOT NULL DEFAULT ''
+    arbiter_synthesis TEXT NOT NULL DEFAULT '',
+    tenant TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
 CREATE INDEX IF NOT EXISTS idx_requests_request_id ON requests(request_id);
@@ -101,6 +102,8 @@ var additiveMigrations = []string{
 	// Issue #1176: arbiter cache key + synthesis for boot-time pre-warming
 	`ALTER TABLE requests ADD COLUMN arbiter_cache_key TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN arbiter_synthesis TEXT NOT NULL DEFAULT ''`,
+	// Issue #1154: tenant attribution (multi-key inbound auth)
+	`ALTER TABLE requests ADD COLUMN tenant TEXT NOT NULL DEFAULT ''`,
 }
 
 // runAdditiveMigrations executes the additive ALTER TABLE migrations.
@@ -151,8 +154,8 @@ const insertSQL = `INSERT INTO requests
      ttft_ms, total_latency_ms, tps, streaming,
      fusion_arbiter_skipped, fusion_jaccard_similarity, fusion_arbiter_cost_usd, error,
       route_source, route_reason, slm_confidence, slm_task_type,
-      arbiter_cache_key, arbiter_synthesis)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      arbiter_cache_key, arbiter_synthesis, tenant)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // SQLiteStore is the production Store implementation (issue #4).
 // Writes are funnelled through a buffered channel and a single
@@ -435,6 +438,7 @@ func (s *SQLiteStore) writeOne(req Request) {
 		fusionArbiterSkipped, req.FusionJaccardSimilarity, req.FusionArbiterCostUSD, req.Error,
 		req.RouteSource, req.RouteReason, req.SLMConfidence, req.SLMTaskType,
 		req.ArbiterCacheKeyHex, req.ArbiterSynthesis,
+		req.Tenant,
 	)
 	if err != nil {
 		s.logger("ERROR: insert request_id=%s: %v", req.RequestID, err)

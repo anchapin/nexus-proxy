@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/anchapin/nexus-proxy/internal/auth"
 	"github.com/anchapin/nexus-proxy/internal/circuit"
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/health"
@@ -505,6 +506,10 @@ type MetricsEvent struct {
 	// subsequent boot can pre-warm the cache.
 	ArbiterCacheKeyHex string
 	ArbiterSynthesis   string
+
+	// Tenant (issue #1154) is the resolved tenant identifier from
+	// multi-key inbound auth. Empty for the legacy single-key path.
+	Tenant string
 }
 
 // MetricsObserver is the hook the chat handler invokes once per
@@ -2397,6 +2402,7 @@ func Chat(d Deps) http.Handler {
 				SLMTaskType:             decision.TaskType,
 				ArbiterCacheKeyHex:      fusionArbiterCacheKeyHex,
 				ArbiterSynthesis:        fusionArbiterSynthesis,
+				Tenant:                  auth.TenantFromRequest(r),
 			})
 		}
 		// Both observers receive the record when both are wired (issue #164).
