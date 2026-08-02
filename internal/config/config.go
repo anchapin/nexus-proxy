@@ -191,6 +191,13 @@ type Config struct {
 	FrontierFailover            bool // NEXUS_FRONTIER_FAILOVER (default true when >1 provider)
 	FrontierFailoverMaxAttempts int  // NEXUS_FRONTIER_FAILOVER_MAX_ATTEMPTS (default 3)
 
+	// Coalesce (issue #1155): deduplicate identical concurrent
+	// non-streaming cascade requests via singleflight so bursty
+	// duplicate traffic makes one upstream call instead of N.
+	CoalesceEnabled    bool          // NEXUS_COALESCE_ENABLED (default false)
+	CoalesceTTL        time.Duration // NEXUS_COALESCE_TTL (default 250ms)
+	CoalesceMaxEntries int           // NEXUS_COALESCE_MAX_ENTRIES (default 512)
+
 	// DSL fast-pass patterns (issue #305). DSLFormattingPatterns
 	// matches simple formatting keywords (css, format, docstring, ...).
 	// DSLFusionPatterns matches architecture keywords that warrant
@@ -1188,6 +1195,19 @@ func Load() (Config, error) {
 		failoverMaxAttempts = 1
 	}
 	cfg.FrontierFailoverMaxAttempts = failoverMaxAttempts
+
+	// Coalesce (issue #1155).
+	cfg.CoalesceEnabled = getEnvBool("NEXUS_COALESCE_ENABLED", false)
+	coalesceTTL, err := getEnvDuration("NEXUS_COALESCE_TTL", 250*time.Millisecond)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.CoalesceTTL = coalesceTTL
+	coalesceMaxEntries, err := getEnvInt("NEXUS_COALESCE_MAX_ENTRIES", 512)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.CoalesceMaxEntries = coalesceMaxEntries
 
 	// Fusion arbiter synthesis (issue #12). Shorter than FusionTimeout
 	// because the arbiter is doing synthesis, not generation — a slow

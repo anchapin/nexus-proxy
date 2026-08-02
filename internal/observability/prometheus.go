@@ -446,6 +446,14 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	writeCounter(w, "nexus_fusion_client_abort_total",
 		"Total client aborts during fusion speculative streaming and arbiter synthesis streaming (issue #1046).", upstream.FusionClientAbortTotal())
 
+	// Coalesce counters (issue #1155). Hits are requests deduplicated via
+	// singleflight or served from the TTL cache; misses are requests that
+	// actually executed the upstream call.
+	writeCounter(w, "nexus_coalesce_hits_total",
+		"Total coalesced requests served from cache or singleflight dedup (issue #1155).", upstream.CoalesceHitsTotal())
+	writeCounter(w, "nexus_coalesce_misses_total",
+		"Total coalesce misses that executed the upstream call (issue #1155).", upstream.CoalesceMissesTotal())
+
 	// Auth gauge: cumulative accepted authentications. The metric name
 	// carries "_clients" per the issue spec; semantically this is a
 	// monotonic counter that operators usually want charted as a

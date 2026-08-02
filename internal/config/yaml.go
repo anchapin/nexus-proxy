@@ -128,6 +128,11 @@ type YAMLConfig struct {
 	FrontierFailover            bool `yaml:"frontier_failover"`
 	FrontierFailoverMaxAttempts int  `yaml:"frontier_failover_max_attempts"`
 
+	// Coalesce (issue #1155)
+	CoalesceEnabled    bool   `yaml:"coalesce_enabled"`
+	CoalesceTTL        string `yaml:"coalesce_ttl"`
+	CoalesceMaxEntries int    `yaml:"coalesce_max_entries"`
+
 	// Fusion
 	FusionProgressiveDelivery bool    `yaml:"fusion_progressive_delivery"`
 	FusionAgreementThreshold  float64 `yaml:"fusion_agreement_threshold"`
@@ -813,6 +818,25 @@ func LoadYAML(path string) (Config, error) {
 			return cfg, fmt.Errorf("config: NEXUS_CASCADE_TIMEOUT_PER_1K_TOKENS: %w", err)
 		}
 		cfg.CascadeTimeoutPer1kTokens = d
+	}
+
+	// Coalesce (issue #1155).
+	if v := os.Getenv("NEXUS_COALESCE_ENABLED"); v != "" {
+		cfg.CoalesceEnabled = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v := os.Getenv("NEXUS_COALESCE_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_COALESCE_TTL: %w", err)
+		}
+		cfg.CoalesceTTL = d
+	}
+	if v := os.Getenv("NEXUS_COALESCE_MAX_ENTRIES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_COALESCE_MAX_ENTRIES: %w", err)
+		}
+		cfg.CoalesceMaxEntries = n
 	}
 	if v := os.Getenv("NEXUS_ARBITER_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -1540,6 +1564,10 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		PoolBufferMaxBytes:            yc.intDefault(yc.PoolBufferMaxBytes, DefaultPoolBufferMaxBytes),
 		FrontierFailover:              yc.boolFieldDefault(yc.FrontierFailover, true),
 		FrontierFailoverMaxAttempts:   yc.intDefault(yc.FrontierFailoverMaxAttempts, 3),
+
+		CoalesceEnabled:    yc.CoalesceEnabled,
+		CoalesceTTL:        yc.durationDefault(yc.CoalesceTTL, 250*time.Millisecond),
+		CoalesceMaxEntries: yc.intDefault(yc.CoalesceMaxEntries, 512),
 
 		FusionProgressiveDelivery: yc.boolFieldDefault(yc.FusionProgressiveDelivery, true),
 		FusionAgreementThreshold:  yc.floatDefault(yc.FusionAgreementThreshold, 0.85),

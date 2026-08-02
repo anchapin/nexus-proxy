@@ -881,6 +881,18 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 			cacheWarmedEntries = warmArbiterCache(arbiterCache, metricsStore, cfg)
 		}
 	}
+
+	// Coalesce (issue #1155): deduplicate identical concurrent
+	// non-streaming cascade requests via singleflight.
+	var coalescer *upstream.Coalescer
+	if cfg.CoalesceEnabled {
+		coalescer = upstream.NewCoalescer(cfg.CoalesceTTL, cfg.CoalesceMaxEntries)
+		slog.Info("request coalescing enabled",
+			slog.Duration("ttl", cfg.CoalesceTTL),
+			slog.Int("max_entries", cfg.CoalesceMaxEntries),
+		)
+	}
+
 	mux.Handle("/metrics", routeCounters.Handler())
 	slog.Info("metrics endpoint serves prometheus text format",
 		slog.String("path", "/metrics"),
@@ -1010,6 +1022,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 			routeCounters.ObserveRedaction(profile, substitutions)
 		},
 		ArbiterCache: arbiterCache,
+		Coalescer:    coalescer,
 		Providers:    providerRegistry,
 		PipelineStageObserver: handlers.PipelineStageObserverFunc(
 			func(e handlers.PipelineStageEvent) {

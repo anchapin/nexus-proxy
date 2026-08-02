@@ -871,6 +871,13 @@ type Deps struct {
 	// disabled regardless of Config settings.
 	RedactionObserver func(profile string, substitutions int64)
 
+	// Coalescer deduplicates identical concurrent non-streaming
+	// cascade requests (issue #1155). When non-nil, the cascade
+	// wraps each fetchCascadeStep call in a singleflight.Do so
+	// bursty duplicate traffic shares one upstream call. Nil means
+	// coalescing is disabled (default).
+	Coalescer *upstream.Coalescer
+
 	// maxObservedBytes caps the body the observer sees. The full
 	// response is still streamed to the client — only the buffered
 	// copy used for sampling is bounded. Zero uses DefaultObservedCap.
@@ -1978,6 +1985,7 @@ func Chat(d Deps) http.Handler {
 					SkipLocal:          skipLocal,
 				})
 			}
+			cas.Coalescer = d.Coalescer // nil-safe: nil = disabled (issue #1155)
 
 			if streaming {
 				// Cascade (issue #14): try local Ollama first, fall
