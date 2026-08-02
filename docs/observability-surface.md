@@ -44,6 +44,7 @@ snake_case naming.
 | `nexus_frontier_circuit_open_total` | counter | `provider` | N providers | `collector.go` (issue #1158) |
 | `nexus_rate_limit_bucket_utilization` | histogram | `bucket_id` | dynamic (≤ concurrent client IPs) | `prometheus.go` (issue #746) |
 | `nexus_build_info` | gauge | `version`, `commit`, `go_version` | 1 | `prometheus.go` (issue #529) |
+| `nexus_slo_error_budget_remaining` | gauge | `slo` | 3 (`availability`, `local_latency_p99`, `ttft_p95`) | `collector.go` (issue #1239) |
 
 **Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 1 + 1 + 4 + 6 + 4 + 1 + 2 + 2 + 1 + 1 = 151 series.
 
@@ -207,6 +208,7 @@ parse failures are excluded.
 | SLM cache gauges (issue #531) | N/A | 2 | `nexus_slm_cache_entries` and `nexus_slm_cache_max_entries` are unlabelled gauges (cardinality 1 each); no label cardinality concerns. |
 | Local-route cooldown (issue #530) | N/A | 2 | `nexus_local_cooldown_active` (gauge, cardinality 1) and `nexus_local_cooldown_triggers_total` (counter, cardinality 1) are both unlabelled; no label cardinality concerns. |
 | `bucket_id` (rate-limit utilization, issue #746) | Yes | ≤ concurrent client IPs | Each distinct bucket ID (SHA256 of client IP, 8 hex chars) creates 6 series (4 quartile buckets + sum + count). Bounded by the number of distinct IPs seen within the bucket TTL window (10 minutes). Operators who need per-IP granularity can hash the `bucket_id` label downstream. |
+| `slo` (error budget remaining, issue #1239) | Yes | 3 | `availability`, `local_latency_p99`, `ttft_p95` — fixed set of defined SLO names. |
 
 **No unbounded cardinality labels exist.** All label values are
 short, pre-defined strings with no user-controlled input. The
@@ -447,6 +449,60 @@ Values are expressed in **seconds** (Prometheus convention for latency).
 p99 is critical for SLA monitoring: p95 misses the tail outliers that
 cause user-visible issues. With p99, operators can alert on the latency
 that only 1% of requests exceed.
+
+## SLO error budget tracking (issue #1239)
+
+The proxy exposes an in-process gauge that tracks the remaining error
+budget fraction for each defined SLO. The gauge is computed from the
+in-process percentile ring buffers at scrape time and is labelled by
+SLO name so operators can chart budget consumption in Grafana and wire
+alerts on budget exhaustion.
+
+| Metric | Type | Labels | Source |
+|--------|------|--------|--------|
+| `nexus_slo_error_budget_remaining` | gauge | `slo` | `Collector.SLOErrorBudgetGauges()` (issue #1239) |
+
+`slo` label values: `availability`, `local_latency_p99`, `ttft_p95`.
+
+Values are in **[0, 1]**: 1 = full budget, 0 = exhausted.
+
+### SLO definitions
+
+| SLO | Target | Threshold | Error Budget | Meaning |
+|-----|--------|-----------|-------------|---------|
+| `availability` | 99.9% | 0.1% error rate | 0.1% of requests over 30d | Fraction of successful requests (no cascade fallback, no 5xx) |
+| `local_latency_p99` | 99% | < 2s | 1% of requests over 30d | p99 of local-route (Ollama) request latency |
+| `ttft_p95` | 95% | < 500ms | 5% of requests over 30d | p95 of time-to-first-token across all routes |
+
+### Multi-window burn-rate alerts
+
+The repo ships multi-window multi-burn-rate alerting rules in
+`deploy/prometheus/alerts.yaml` (group `nexus-slo-burn-rate`) and
+recording rules in `deploy/prometheus/recording-rules.yaml`. See
+`deploy/prometheus/slos.yaml` for the full SLO contract.
+
+**Alert severity levels:**
+
+| Alert | Severity | Condition |
+|-------|----------|-----------|
+| `NexusSLOAvailabilityBurnRatePage` | critical | Error rate > 14.4× budget burn rate (5m window) |
+| `NexusSLOAvailabilityBurnRatePageLong` | critical | Error rate > 14.4× budget burn rate (30m window) |
+| `NexusSLOAvailabilityBurnRateTicket` | warning | Error rate > 6× budget burn rate (1h window) |
+| `NexusSLOAvailabilityBurnRateTicketLong` | warning | Error rate > 6× budget burn rate (6h window) |
+| `NexusSLOLatencyP99BurnRatePage` | critical | Local p99 > 2s, burning at > 14.4× rate |
+| `NexusSLOLatencyP99BurnRateTicket` | warning | Local p99 > 2s, burning at > 6× rate |
+| `NexusSLOTTFTP95BurnRatePage` | critical | TTFT p95 > 500ms, burning at > 14.4× rate |
+| `NexusSLOTTFTP95BurnRateTicket` | warning | TTFT p95 > 500ms, burning at > 6× rate |
+| `NexusSLOErrorBudgetExhausted` | critical | `nexus_slo_error_budget_remaining < 0.10` for 5m |
+| `NexusSLOErrorBudgetLow` | warning | `nexus_slo_error_budget_remaining < 0.50` for 15m |
+
+**Recording rules:**
+
+| Rule | Meaning |
+|------|---------|
+| `nexus:error_budget_remaining_ratio` | Remaining availability error budget fraction over 30d |
+| `nexus:slo_compliance_30d` | Overall SLO compliance fraction over 30d |
+| `nexus:local_p99_breach_fraction_30d` | Fraction of time local p99 was above 2s over 30d |
 
 ## Observer wiring
 

@@ -298,6 +298,12 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total frontier provider circuit-open transitions (issue #1158).",
 		typ:  "counter",
 	},
+	// SLO error budget remaining (issue #1239). One gauge per SLO,
+	// labelled by slo name. Values in [0, 1]: 1 = full budget, 0 = exhausted.
+	"nexus_slo_error_budget_remaining": {
+		help: "Remaining error budget fraction (0..1) for the named SLO (issue #1239). 1 = full budget, 0 = exhausted. Label slo is one of: availability, local_latency_p99, ttft_p95.",
+		typ:  "gauge",
+	},
 }
 
 // RenderPrometheus writes the full /metrics body in Prometheus

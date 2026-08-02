@@ -1,0 +1,86 @@
+# SLO definitions for nexus-proxy.
+#
+# This file documents the service-level objectives that underpin the
+# multi-window burn-rate alerts in alerts.yaml and the error budget
+# recording rules in recording-rules.yaml. It is NOT a Prometheus rule
+# file — it is a human-readable contract that operators can diff against
+# actual compliance metrics.
+#
+# Load the derived rules (alerts + recording) into Prometheus via
+# prometheus.yml:
+#
+#   rule_files:
+#     - /etc/prometheus/nexus-recording-rules.yaml
+#     - /etc/prometheus/nexus-alerts.yaml
+#
+# See docs/observability-surface.md for the full metric inventory.
+
+slos:
+  # Availability: fraction of requests that complete without a server-side
+  # error (no cascade fallback, no 5xx from upstream). The error budget is
+  # 1 - 0.999 = 0.1% of requests over a 30-day window, or ~43 minutes of
+  # downtime per month.
+  - name: availability
+    target: 0.999
+    window: 30d
+    description: >
+      99.9% of /v1/chat/completions requests return a successful response.
+      Measured as 1 - (error rate), where errors are cascade fallbacks or
+      upstream 5xx responses. Covers local, frontier, and fusion routes.
+    sli: |
+      1 - (
+        sum(rate(nexus_cascade_fallback_total[1h]))
+        + sum(rate(nexus_upstream_errors_total[1h]))
+      )
+      / clamp_min(sum(rate(nexus_route_decisions_total[1h])), 1)
+    alerting:
+      page_burn_rate: 14.4
+      # At 14.4× burn rate the entire 30-day budget is consumed in 50h.
+      ticket_burn_rate: 6.0
+      # At 6× burn rate the budget is consumed in 5 days.
+    # Multi-window alert matrix (short/long window pairs):
+    #   Page:  burn_rate(5m, 1h) > 14.4 OR burn_rate(30m, 6h) > 14.4
+    #   Ticket: burn_rate(1h, 6h) > 6.0  OR burn_rate(6h, 3d)  > 6.0
+
+  # Local-route latency p99: the worst 1% of local (Ollama) responses must
+  # complete within 2 seconds. The local route exists to be fast and free;
+  # p99 above 2s means the latency advantage is lost.
+  - name: local_latency_p99
+    target: 0.99  # 99% of requests must be below the threshold
+    threshold_seconds: 2.0
+    window: 30d
+    description: >
+      p99 of local-route (Ollama) request latency must be < 2 seconds.
+      Measured from the in-process ring-buffer percentile gauge
+      nexus_upstream_request_latency_p99_seconds{route="local"}.
+    sli: |
+      clamp_min(
+        1 - (
+          sum(rate(nexus_upstream_request_latency_seconds_bucket{route="local",le="2.0"}[1h]))
+          / clamp_min(sum(rate(nexus_upstream_request_latency_seconds_count{route="local"}[1h])), 1)
+        ),
+        0
+      )
+      # Simplified for recording rules: uses the p99 gauge directly.
+      # When p99 < 2s the SLO is met; error budget = time p99 exceeds 2s.
+    alerting:
+      page_burn_rate: 14.4
+      ticket_burn_rate: 6.0
+
+  # Time-to-first-token (TTFT) p95: 95% of streaming responses must
+  # begin emitting tokens within 500ms. TTFT measures the upstream call
+  # latency to the first SSE data frame — the user-perceived "thinking"
+  # time.
+  - name: ttft_p95
+    target: 0.95  # 95% of requests must be below the threshold
+    threshold_seconds: 0.5
+    window: 30d
+    description: >
+      p95 of time-to-first-token (TTFT) across all routes must be < 500ms.
+      Measured from the in-process ring-buffer percentile computation
+      on the TTFT histogram.
+    sli: >
+      Uses TTFT percentile gauge. When p95 < 500ms the SLO is met.
+    alerting:
+      page_burn_rate: 14.4
+      ticket_burn_rate: 6.0

@@ -334,6 +334,15 @@ type Collector struct {
 	frontierHealthMu         sync.RWMutex
 	frontierProbeTotal       map[string]*atomic.Uint64 // keyed by "provider|result"
 	frontierCircuitOpenTotal map[string]*atomic.Uint64 // keyed by provider
+
+	// --- SLO error budget tracking (issue #1239) ------------------------
+	//
+	// sloErrorBudgetBits stores the IEEE-754 bits of the error budget
+	// remaining ratio per SLO (0..1, where 1 = full budget, 0 = exhausted).
+	// Keyed by SLO name: "availability", "local_latency_p99", "ttft_p95".
+	// Updated at scrape time from the in-process percentile gauges.
+	sloBudgetMu        sync.RWMutex
+	sloErrorBudgetBits map[string]*atomic.Uint64 // keyed by SLO name
 }
 
 // circuitBreakerState holds the atomic state for one named circuit.
@@ -390,6 +399,11 @@ func NewCollector() *Collector {
 	for _, l := range ragSimilarityLabels {
 		key := ragSimilarityKey(l.path, l.outcome, 0) // 0 = default/global threshold
 		c.ragSimilarityHistograms[key] = NewHistogram(RAGSimilarityBuckets)
+	}
+	// Pre-allocate SLO error budget storage (issue #1239).
+	c.sloErrorBudgetBits = make(map[string]*atomic.Uint64, 3)
+	for _, slo := range []string{"availability", "local_latency_p99", "ttft_p95"} {
+		c.sloErrorBudgetBits[slo] = &atomic.Uint64{}
 	}
 	return c
 }
@@ -826,7 +840,8 @@ func (c *Collector) RAGCircuitGauges() []GaugeSample {
 // directly to RenderPrometheus via the RouteCounters.Handler() chain
 // (issue #443). It returns the circuit-breaker state, failures,
 // last-failure samples, RAG circuit breaker state/failure count (issue #886),
-// and latency percentile gauges (issue #774).
+// latency percentile gauges (issue #774), and SLO error budget gauges
+// (issue #1239).
 // Safe for a nil receiver — returns nil so the collector can be
 // omitted without panicking during boot or in tests.
 func (c *Collector) Gauges() []GaugeSample {
@@ -837,6 +852,7 @@ func (c *Collector) Gauges() []GaugeSample {
 	out = append(out, c.CircuitBreakerGauges()...)
 	out = append(out, c.RAGCircuitGauges()...)
 	out = append(out, c.LatencyPercentileGauges()...)
+	out = append(out, c.SLOErrorBudgetGauges()...)
 	return out
 }
 
@@ -1080,6 +1096,59 @@ func (c *Collector) FrontierCircuitOpenTotals() map[string]uint64 {
 	out := make(map[string]uint64, len(c.frontierCircuitOpenTotal))
 	for k, v := range c.frontierCircuitOpenTotal {
 		out[k] = v.Load()
+	}
+	return out
+}
+
+// --- SLO error budget tracking (issue #1239) -----------------------------
+
+// SLOTarget defines an SLO threshold for error budget computation.
+type SLOTarget struct {
+	Name         string  // SLO identifier: "availability", "local_latency_p99", "ttft_p95"
+	Threshold    float64 // SLO threshold (e.g. 0.001 error rate, 2.0s latency, 0.5s TTFT)
+	ErrorBudget  float64 // Allowed error fraction per window (e.g. 0.001 = 0.1%)
+	CurrentValue float64 // Current observed value (error rate, latency, TTFT)
+}
+
+// SetSLOErrorBudget updates the error budget remaining for the named SLO.
+// value is the remaining fraction in [0, 1], where 1 = full budget and
+// 0 = exhausted. Values are clamped to [0, 1]. Safe for concurrent use.
+// Called from the Prometheus scrape path to recompute budgets from the
+// in-process percentile gauges.
+func (c *Collector) SetSLOErrorBudget(sloName string, value float64) {
+	if c == nil || sloName == "" {
+		return
+	}
+	if value < 0 {
+		value = 0
+	} else if value > 1 {
+		value = 1
+	}
+	c.sloBudgetMu.RLock()
+	bits, ok := c.sloErrorBudgetBits[sloName]
+	c.sloBudgetMu.RUnlock()
+	if ok && bits != nil {
+		bits.Store(math.Float64bits(value))
+	}
+}
+
+// SLOErrorBudgetGauges returns the current error budget remaining for all
+// tracked SLOs as gauge samples for the Prometheus renderer. Each SLO emits
+// one sample labelled by slo name. Values are in [0, 1].
+// Safe for a nil receiver — returns nil.
+func (c *Collector) SLOErrorBudgetGauges() []GaugeSample {
+	if c == nil {
+		return nil
+	}
+	c.sloBudgetMu.RLock()
+	defer c.sloBudgetMu.RUnlock()
+	out := make([]GaugeSample, 0, len(c.sloErrorBudgetBits))
+	for name, bits := range c.sloErrorBudgetBits {
+		out = append(out, GaugeSample{
+			Name:   "nexus_slo_error_budget_remaining",
+			Labels: map[string]string{"slo": name},
+			Value:  math.Float64frombits(bits.Load()),
+		})
 	}
 	return out
 }

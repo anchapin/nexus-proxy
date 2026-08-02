@@ -259,3 +259,194 @@ groups:
           summary: "nexus-proxy local-route p99 latency above 2s SLO"
           description: "Local-route p99 latency is {{ $value | humanizeDuration }} (SLO target 2s) for the last 10m. The local arm is no longer delivering its latency advantage over the frontier."
           runbook: "Check Ollama load (nexus_local_concurrency_in_flight vs effective_slots), model size vs available VRAM, and whether a larger model was loaded. A cold model load will spike p99 transiently."
+
+  # ====================================================================
+  # SLO: multi-window burn-rate alerts (issue #1239)
+  # ====================================================================
+  #
+  # Multi-window multi-burn-rate alerts follow the Google SRE playbook:
+  # two window lengths for each burn rate detect both sudden spikes
+  # (short window) and sustained degradation (long window). Page-level
+  # alerts fire at 14.4x burn rate (budget consumed in ~50h); ticket-level
+  # alerts fire at 6x (budget consumed in ~5 days). See slos.yaml for the
+  # full SLO definitions and rationale.
+
+  - name: nexus-slo-burn-rate
+    interval: 30s
+    rules:
+      # ------------------------------------------------------------------
+      # Availability burn-rate alerts
+      # ------------------------------------------------------------------
+      # rationale: Error budget burn rate for the 99.9% availability SLO.
+      # The error rate recording rule nexus:error_rate5m measures the
+      # cascade-fallback fraction per route. A burn rate of 14.4x means
+      # the entire 30-day error budget (0.1% of requests) is consumed in
+      # ~50 hours — paging is warranted. 6x means consumption in ~5 days.
+      # Two window pairs (short: 5m/1h, long: 30m/6h) catch both sudden
+      # spikes and slow drains.
+      - alert: NexusSLOAvailabilityBurnRatePage
+        expr: |
+          (
+            sum(rate(nexus_cascade_fallback_total[5m]))
+            / clamp_min(sum(rate(nexus_route_decisions_total[5m])), 1)
+          ) > (0.001 * 14.4)
+        for: 2m
+        labels:
+          severity: critical
+          component: slo
+        annotations:
+          summary: "nexus-proxy availability error budget burning at >14.4x rate (5m window)"
+          description: "Error rate is {{ $value | humanizePercentage }} (budget burn rate >14.4x). At this rate the 30-day availability error budget (0.1%) will be exhausted in ~50 hours."
+          runbook: "Immediately investigate Ollama health, frontier provider status, and recent deploys."
+
+      - alert: NexusSLOAvailabilityBurnRatePageLong
+        expr: |
+          (
+            sum(rate(nexus_cascade_fallback_total[30m]))
+            / clamp_min(sum(rate(nexus_route_decisions_total[30m])), 1)
+          ) > (0.001 * 14.4)
+        for: 15m
+        labels:
+          severity: critical
+          component: slo
+        annotations:
+          summary: "nexus-proxy availability error budget burning at >14.4x rate (30m window)"
+          description: "Error rate is {{ $value | humanizePercentage }} sustained over 30m (budget burn rate >14.4x)."
+          runbook: "Same as short-window alert. The longer window confirms this is not a transient spike."
+
+      - alert: NexusSLOAvailabilityBurnRateTicket
+        expr: |
+          (
+            sum(rate(nexus_cascade_fallback_total[1h]))
+            / clamp_min(sum(rate(nexus_route_decisions_total[1h])), 1)
+          ) > (0.001 * 6)
+        for: 1h
+        labels:
+          severity: warning
+          component: slo
+        annotations:
+          summary: "nexus-proxy availability error budget burning at >6x rate (1h window)"
+          description: "Error rate is {{ $value | humanizePercentage }} (budget burn rate >6x). Budget exhaustion in ~5 days if sustained."
+          runbook: "Open an investigation ticket. Check for gradual degradation: Ollama timeouts, frontier latency trends."
+
+      - alert: NexusSLOAvailabilityBurnRateTicketLong
+        expr: |
+          (
+            sum(rate(nexus_cascade_fallback_total[6h]))
+            / clamp_min(sum(rate(nexus_route_decisions_total[6h])), 1)
+          ) > (0.001 * 6)
+        for: 6h
+        labels:
+          severity: warning
+          component: slo
+        annotations:
+          summary: "nexus-proxy availability error budget burning at >6x rate (6h window)"
+          description: "Error rate is {{ $value | humanizePercentage }} sustained over 6h (budget burn rate >6x)."
+          runbook: "Review capacity planning and traffic growth. Consider raising frontier capacity or Ollama resources."
+
+      # ------------------------------------------------------------------
+      # Local-route latency p99 burn-rate alerts
+      # ------------------------------------------------------------------
+      # rationale: The local-route p99 SLO target is < 2s. When p99 exceeds
+      # 2s the error budget drains. 14.4% page threshold means budget
+      # exhaustion in ~50h; 6% ticket threshold means ~5 days.
+      - alert: NexusSLOLatencyP99BurnRatePage
+        expr: |
+          (
+            clamp_max(
+              avg_over_time(nexus_upstream_request_latency_p99_seconds{route="local"}[5m]) - 2,
+              0
+            ) / 2
+          ) > (0.01 * 14.4)
+        for: 5m
+        labels:
+          severity: critical
+          component: slo
+        annotations:
+          summary: "nexus-proxy local-route p99 latency error budget burning at >14.4x rate"
+          description: "Local p99 has been above the 2s SLO threshold, burning error budget at page rate."
+          runbook: "Check Ollama load, model size, VRAM. Consider a smaller model or more GPU resources."
+
+      - alert: NexusSLOLatencyP99BurnRateTicket
+        expr: |
+          (
+            clamp_max(
+              avg_over_time(nexus_upstream_request_latency_p99_seconds{route="local"}[1h]) - 2,
+              0
+            ) / 2
+          ) > (0.01 * 6)
+        for: 30m
+        labels:
+          severity: warning
+          component: slo
+        annotations:
+          summary: "nexus-proxy local-route p99 latency error budget burning at >6x rate"
+          description: "Local p99 has been above the 2s SLO threshold, burning error budget at ticket rate."
+          runbook: "Profile Ollama request processing. Check if a larger model was recently loaded."
+
+      # ------------------------------------------------------------------
+      # TTFT p95 burn-rate alerts
+      # ------------------------------------------------------------------
+      # rationale: TTFT p95 SLO target is < 500ms. Breaches indicate
+      # upstream latency issues affecting streaming first-token perception.
+      - alert: NexusSLOTTFTP95BurnRatePage
+        expr: |
+          (
+            clamp_max(
+              avg_over_time(nexus_upstream_ttft_p95_seconds[5m]) - 0.5,
+              0
+            ) / 0.5
+          ) > (0.05 * 14.4)
+        for: 5m
+        labels:
+          severity: critical
+          component: slo
+        annotations:
+          summary: "nexus-proxy TTFT p95 error budget burning at >14.4x rate"
+          description: "TTFT p95 has been above the 500ms SLO threshold, burning error budget at page rate."
+          runbook: "Check upstream latency, DNS, TLS. Verify frontier provider health and Ollama warm-up."
+
+      - alert: NexusSLOTTFTP95BurnRateTicket
+        expr: |
+          (
+            clamp_max(
+              avg_over_time(nexus_upstream_ttft_p95_seconds[1h]) - 0.5,
+              0
+            ) / 0.5
+          ) > (0.05 * 6)
+        for: 30m
+        labels:
+          severity: warning
+          component: slo
+        annotations:
+          summary: "nexus-proxy TTFT p95 error budget burning at >6x rate"
+          description: "TTFT p95 has been above the 500ms SLO threshold, burning error budget at ticket rate."
+          runbook: "Review network path to frontier providers. Check proxy/load-balancer latency."
+
+      # ------------------------------------------------------------------
+      # Aggregate error budget exhaustion (issue #1239)
+      # ------------------------------------------------------------------
+      # rationale: nexus_slo_error_budget_remaining is an in-process gauge
+      # reporting the remaining fraction (0..1) of the error budget per SLO.
+      # Below 10% is critical (nearly exhausted); below 50% is a warning.
+      - alert: NexusSLOErrorBudgetExhausted
+        expr: nexus_slo_error_budget_remaining < 0.10
+        for: 5m
+        labels:
+          severity: critical
+          component: slo
+        annotations:
+          summary: "nexus-proxy SLO error budget nearly exhausted ({{ $labels.slo }})"
+          description: "Error budget remaining for SLO {{ $labels.slo }} is {{ $value | humanizePercentage }}. Less than 10% of the 30-day budget remains."
+          runbook: "Immediate action required. Identify root cause and implement mitigations."
+
+      - alert: NexusSLOErrorBudgetLow
+        expr: nexus_slo_error_budget_remaining < 0.50
+        for: 15m
+        labels:
+          severity: warning
+          component: slo
+        annotations:
+          summary: "nexus-proxy SLO error budget below 50% ({{ $labels.slo }})"
+          description: "Error budget remaining for SLO {{ $labels.slo }} is {{ $value | humanizePercentage }}. Half the 30-day budget has been consumed."
+          runbook: "Investigate the trend. If burn rate is accelerating, consider preemptive action."
