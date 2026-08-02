@@ -47,8 +47,11 @@ jobs:
           # Build a binary we can invoke (matches go build above).
           go build -trimpath -o /tmp/nexus ./cmd/nexus
 
-          OUTPUT=$(/tmp/nexus check --json 2>&1) || CHECK_EXIT=$?
+          # Capture JSON on stdout; logs go to stderr for separate handling.
+          OUTPUT=$(/tmp/nexus check --json 2>/tmp/nexus-check-stderr) || CHECK_EXIT=$?
           CHECK_EXIT=${CHECK_EXIT:-0}
+          # Print logs (stderr) then JSON (stdout) for full CI visibility.
+          cat /tmp/nexus-check-stderr || true
           echo "$OUTPUT"
 
           # Surface check results as GitHub Actions annotations.
