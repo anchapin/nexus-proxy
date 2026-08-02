@@ -42,6 +42,14 @@ type ProviderV2 interface {
 	// charge 3-5x for output vs input, so combining both streams yields
 	// a materially more accurate estimate than the flat CostPer1KUSD.
 	OutputCostPer1KUSD() float64
+	// CacheReadInputCostPer1KUSD returns the USD cost per 1k
+	// cache-read input tokens for Anthropic prompt caching (issue
+	// #1245). Zero means "use InputCostPer1KUSD" (no discount).
+	CacheReadInputCostPer1KUSD() float64
+	// CacheCreationInputCostPer1KUSD returns the USD cost per 1k
+	// cache-creation input tokens for Anthropic prompt caching (issue
+	// #1245). Zero means "use InputCostPer1KUSD" (no surcharge).
+	CacheCreationInputCostPer1KUSD() float64
 }
 
 // AuthProviderV2 is a ProviderV2 that carries an API key for transport-level
@@ -65,22 +73,28 @@ type AuthProviderV2 interface {
 // operator only sets "costPer1K" in JSON it is mirrored into
 // InputCostPer1KVal so the split estimate degrades gracefully.
 type ProviderConfig struct {
-	NameVal            string
-	BaseURLVal         string
-	ModelVal           string
-	APIKeyVal          string
-	CostPer1KVal       float64 // flat rate — selector weight / legacy
-	InputCostPer1KVal  float64 // USD per 1k input tokens (issue #1183)
-	OutputCostPer1KVal float64 // USD per 1k output tokens (issue #1183)
+	NameVal                        string
+	BaseURLVal                     string
+	ModelVal                       string
+	APIKeyVal                      string
+	CostPer1KVal                   float64 // flat rate — selector weight / legacy
+	InputCostPer1KVal              float64 // USD per 1k input tokens (issue #1183)
+	OutputCostPer1KVal             float64 // USD per 1k output tokens (issue #1183)
+	CacheReadInputCostPer1KVal     float64 // USD per 1k cache-read input tokens (issue #1245)
+	CacheCreationInputCostPer1KVal float64 // USD per 1k cache-creation input tokens (issue #1245)
 }
 
-func (p ProviderConfig) Name() string                { return p.NameVal }
-func (p ProviderConfig) BaseURL() string             { return p.BaseURLVal }
-func (p ProviderConfig) Model() string               { return p.ModelVal }
-func (p ProviderConfig) APIKey() string              { return p.APIKeyVal }
-func (p ProviderConfig) CostPer1KUSD() float64       { return p.CostPer1KVal }
-func (p ProviderConfig) InputCostPer1KUSD() float64  { return p.InputCostPer1KVal }
-func (p ProviderConfig) OutputCostPer1KUSD() float64 { return p.OutputCostPer1KVal }
+func (p ProviderConfig) Name() string                        { return p.NameVal }
+func (p ProviderConfig) BaseURL() string                     { return p.BaseURLVal }
+func (p ProviderConfig) Model() string                       { return p.ModelVal }
+func (p ProviderConfig) APIKey() string                      { return p.APIKeyVal }
+func (p ProviderConfig) CostPer1KUSD() float64               { return p.CostPer1KVal }
+func (p ProviderConfig) InputCostPer1KUSD() float64          { return p.InputCostPer1KVal }
+func (p ProviderConfig) OutputCostPer1KUSD() float64         { return p.OutputCostPer1KVal }
+func (p ProviderConfig) CacheReadInputCostPer1KUSD() float64 { return p.CacheReadInputCostPer1KVal }
+func (p ProviderConfig) CacheCreationInputCostPer1KUSD() float64 {
+	return p.CacheCreationInputCostPer1KVal
+}
 
 // ProviderRegistry holds registered providers and allows lookup by name.
 // It is safe for concurrent use.
@@ -184,6 +198,8 @@ func (r *ProviderRegistry) Len() int {
 //     the input rate so the split estimate degrades gracefully.
 //   - inputCostPer1K: (optional, issue #1183) USD cost per 1k input tokens
 //   - outputCostPer1K: (optional, issue #1183) USD cost per 1k output tokens
+//   - cacheReadInputCostPer1K: (optional, issue #1245) USD cost per 1k cache-read tokens
+//   - cacheCreationInputCostPer1K: (optional, issue #1245) USD cost per 1k cache-creation tokens
 //
 // When the env var is empty, ParseProvidersFromEnv returns a nil registry
 // and nil error (no providers registered).
@@ -193,13 +209,15 @@ func ParseProvidersFromEnv() (*ProviderRegistry, error) {
 		return nil, nil
 	}
 	var configs []struct {
-		Name            string  `json:"name"`
-		URL             string  `json:"url"`
-		Model           string  `json:"model"`
-		APIKey          string  `json:"apiKey"`
-		CostPer1K       float64 `json:"costPer1K"`
-		InputCostPer1K  float64 `json:"inputCostPer1K"`
-		OutputCostPer1K float64 `json:"outputCostPer1K"`
+		Name                        string  `json:"name"`
+		URL                         string  `json:"url"`
+		Model                       string  `json:"model"`
+		APIKey                      string  `json:"apiKey"`
+		CostPer1K                   float64 `json:"costPer1K"`
+		InputCostPer1K              float64 `json:"inputCostPer1K"`
+		OutputCostPer1K             float64 `json:"outputCostPer1K"`
+		CacheReadInputCostPer1K     float64 `json:"cacheReadInputCostPer1K"`
+		CacheCreationInputCostPer1K float64 `json:"cacheCreationInputCostPer1K"`
 	}
 	if err := json.Unmarshal([]byte(raw), &configs); err != nil {
 		return nil, fmt.Errorf("NEXUS_FRONTIER_PROVIDERS: parse JSON: %w", err)
@@ -228,13 +246,15 @@ func ParseProvidersFromEnv() (*ProviderRegistry, error) {
 			inputRate = c.CostPer1K
 		}
 		reg.Register(ProviderConfig{
-			NameVal:            c.Name,
-			BaseURLVal:         strings.TrimRight(c.URL, "/"),
-			ModelVal:           c.Model,
-			APIKeyVal:          c.APIKey,
-			CostPer1KVal:       c.CostPer1K,
-			InputCostPer1KVal:  inputRate,
-			OutputCostPer1KVal: c.OutputCostPer1K,
+			NameVal:                        c.Name,
+			BaseURLVal:                     strings.TrimRight(c.URL, "/"),
+			ModelVal:                       c.Model,
+			APIKeyVal:                      c.APIKey,
+			CostPer1KVal:                   c.CostPer1K,
+			InputCostPer1KVal:              inputRate,
+			OutputCostPer1KVal:             c.OutputCostPer1K,
+			CacheReadInputCostPer1KVal:     c.CacheReadInputCostPer1K,
+			CacheCreationInputCostPer1KVal: c.CacheCreationInputCostPer1K,
 		})
 	}
 	return reg, nil

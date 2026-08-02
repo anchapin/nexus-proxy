@@ -298,6 +298,18 @@ type Config struct {
 	// the tiktoken tokenizer instead of the bytes/4 heuristic.
 	CostUseOutputTokens bool // true => per-provider input/output cost split (issue #1183)
 
+	// AnthropicCacheMinSystemChars (issue #1245) is the minimum
+	// system-field character count above which the Anthropic adapter
+	// injects cache_control: {type: "ephemeral"} on the system field.
+	// Zero or negative disables Anthropic prompt caching hints entirely.
+	AnthropicCacheMinSystemChars int
+
+	// AzureContentFilterEnabled (issue #1245) gates the Azure adapter's
+	// content_filter finish_reason detection. When true, the adapter
+	// rewrites content_filter finish reasons into structured OpenAI
+	// error frames.
+	AzureContentFilterEnabled bool
+
 	// Fusion progressive delivery (issue #48). When enabled and the
 	// harness requests a streaming response, the chat handler
 	// dispatches route=fusion to upstream.PanelStreaming instead of
@@ -1425,6 +1437,19 @@ func Load() (Config, error) {
 	// identical to the legacy flat input-only rate. Operators opt in to
 	// the richer per-provider model that counts output tokens separately.
 	cfg.CostUseOutputTokens = getEnvBool("NEXUS_COST_USE_OUTPUT_TOKENS", false)
+
+	// Anthropic cache-control hint threshold (issue #1245). Default
+	// 1024 characters: below this the cache overhead exceeds the
+	// savings for most Anthropic models. Zero disables.
+	anthropicCacheMinChars, err := getEnvInt("NEXUS_ANTHROPIC_CACHE_MIN_SYSTEM_CHARS", 1024)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.AnthropicCacheMinSystemChars = anthropicCacheMinChars
+
+	// Azure content filter detection (issue #1245). Default false
+	// so the Azure adapter remains a pure no-op until opted in.
+	cfg.AzureContentFilterEnabled = getEnvBool("NEXUS_AZURE_CONTENT_FILTER_ENABLED", false)
 
 	// Fusion progressive delivery (issue #48). Defaults to ON so a
 	// stock `.env.example` boots into the new behaviour; operators

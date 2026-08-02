@@ -27,10 +27,41 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
+
+// AnthropicCacheMinSystemChars is the minimum system-field character
+// count above which the Anthropic adapter injects a cache_control hint
+// (issue #1245). Set via NEXUS_ANTHROPIC_CACHE_MIN_SYSTEM_CHARS; zero
+// or negative disables cache-control injection entirely.
+var AnthropicCacheMinSystemChars = func() int {
+	v := os.Getenv("NEXUS_ANTHROPIC_CACHE_MIN_SYSTEM_CHARS")
+	if v == "" {
+		return 1024
+	}
+	n := 0
+	for _, c := range v {
+		if c >= '0' && c <= '9' {
+			n = n*10 + int(c-'0')
+		} else {
+			return 1024
+		}
+	}
+	return n
+}()
+
+// AzureContentFilterEnabled reports whether the Azure adapter should
+// detect content_filter finish reasons and map them to structured
+// OpenAI error frames (issue #1245). Set via
+// NEXUS_AZURE_CONTENT_FILTER_ENABLED (default false).
+var AzureContentFilterEnabled = func() bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("NEXUS_AZURE_CONTENT_FILTER_ENABLED")))
+	return v == "true" || v == "1" || v == "yes"
+}()
 
 // AdapterTypeOpenAI is the canonical no-op adapter. It is the default
 // for any provider that omits an explicit type.
@@ -202,10 +233,14 @@ func (anthropicAdapter) RequestPath(baseURL string) string {
 // anthropicRequest is the subset of the Anthropic Messages API request
 // body TransformRequest emits. It mirrors the OpenAI fields the proxy
 // already populates (model, messages, stream, temperature, max_tokens).
+//
+// The System field uses json.RawMessage so TransformRequest can emit
+// either a plain string (the default) or an array of content blocks
+// carrying cache_control hints (issue #1245).
 type anthropicRequest struct {
 	Model       string             `json:"model"`
 	Messages    []anthropicMessage `json:"messages"`
-	System      string             `json:"system,omitempty"`
+	System      json.RawMessage    `json:"system,omitempty"`
 	Stream      bool               `json:"stream,omitempty"`
 	MaxTokens   int                `json:"max_tokens,omitempty"`
 	Temperature *float64           `json:"temperature,omitempty"`
@@ -214,6 +249,20 @@ type anthropicRequest struct {
 type anthropicMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+}
+
+// anthropicSystemBlock is a single block in Anthropic's array-form system
+// field (issue #1245). The cache_control field is only set on the final
+// block to enable Anthropic prompt caching on the entire system prefix.
+type anthropicSystemBlock struct {
+	Type         string                 `json:"type"`
+	Text         string                 `json:"text"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+}
+
+// anthropicCacheControl represents Anthropic's cache_control object.
+type anthropicCacheControl struct {
+	Type string `json:"type"` // "ephemeral"
 }
 
 // openAIRequest is the subset of the OpenAI chat-completions request
@@ -296,7 +345,31 @@ func (anthropicAdapter) TransformRequest(body []byte) ([]byte, error) {
 		out.Messages = append(out.Messages, anthropicMessage{Role: role, Content: text})
 	}
 	if len(sysParts) > 0 {
-		out.System = strings.Join(sysParts, "\n\n")
+		systemText := strings.Join(sysParts, "\n\n")
+		if AnthropicCacheMinSystemChars > 0 && len(systemText) >= AnthropicCacheMinSystemChars {
+			// Emit system as an array of content blocks with
+			// cache_control: {type: ephemeral} on the final block
+			// (issue #1245). Anthropic caches everything up to and
+			// including the cache_control breakpoint.
+			blocks := make([]anthropicSystemBlock, 0, len(sysParts))
+			for i, part := range sysParts {
+				block := anthropicSystemBlock{Type: "text", Text: part}
+				if i == len(sysParts)-1 {
+					block.CacheControl = &anthropicCacheControl{Type: "ephemeral"}
+				}
+				blocks = append(blocks, block)
+			}
+			raw, err := json.Marshal(blocks)
+			if err != nil {
+				return nil, fmt.Errorf("anthropic adapter: marshal system blocks: %w", err)
+			}
+			out.System = raw
+		} else {
+			// Below threshold: emit as plain string (backward
+			// compatible and avoids the array-form overhead).
+			raw, _ := json.Marshal(systemText)
+			out.System = raw
+		}
 	}
 
 	encoded, err := json.Marshal(out)
@@ -514,7 +587,122 @@ func (azureAdapter) RequestPath(baseURL string) string { return baseURL }
 
 func (azureAdapter) TransformRequest(body []byte) ([]byte, error) { return body, nil }
 
-func (azureAdapter) NormalizeSSE(r io.Reader) io.Reader { return r }
+// NormalizeSSE wraps the Azure SSE stream to detect content_filter
+// finish reasons and map them to structured OpenAI error frames
+// (issue #1245). When NEXUS_AZURE_CONTENT_FILTER_ENABLED is false (the
+// default), the reader is returned unchanged.
+func (azureAdapter) NormalizeSSE(r io.Reader) io.Reader {
+	if !AzureContentFilterEnabled {
+		return r
+	}
+	return &azureContentFilterNormalizer{
+		source: bufio.NewReader(r),
+	}
+}
+
+// azureContentFilterNormalizer reads an Azure OpenAI SSE stream and
+// rewrites finish_reason "content_filter" into an OpenAI-shaped error
+// frame. All other frames pass through unchanged.
+type azureContentFilterNormalizer struct {
+	source *bufio.Reader
+	pr     *io.PipeReader
+	pw     *io.PipeWriter
+	once   bool
+}
+
+func (n *azureContentFilterNormalizer) Read(p []byte) (int, error) {
+	if !n.once {
+		n.once = true
+		n.pr, n.pw = io.Pipe()
+		go n.convert()
+	}
+	return n.pr.Read(p)
+}
+
+// convert reads the Azure SSE stream line-by-line. When it encounters
+// a chunk with finish_reason "content_filter", it emits an OpenAI error
+// frame instead. The stream continues after the error frame so the
+// caller's SSE loop can terminate cleanly.
+func (n *azureContentFilterNormalizer) convert() {
+	defer func() { _ = n.pw.Close() }()
+
+	for {
+		line, err := n.source.ReadString('\n')
+		if line != "" {
+			// Check for content_filter finish reason.
+			if rewritten, ok := n.rewriteContentFilter(line); ok {
+				if _, werr := io.WriteString(n.pw, rewritten); werr != nil {
+					return
+				}
+			} else {
+				if _, werr := io.WriteString(n.pw, line); werr != nil {
+					return
+				}
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return
+		}
+	}
+}
+
+// rewriteContentFilter inspects an SSE data line for a content_filter
+// finish_reason. When detected, it returns an error frame and a [DONE]
+// sentinel; otherwise it returns ("", false).
+func (n *azureContentFilterNormalizer) rewriteContentFilter(line string) (string, bool) {
+	trimmed := strings.TrimRight(line, "\r\n")
+	if !strings.HasPrefix(trimmed, "data: ") {
+		return "", false
+	}
+	payload := strings.TrimPrefix(trimmed, "data: ")
+	if payload == "[DONE]" || payload == "" {
+		return "", false
+	}
+
+	var chunk map[string]any
+	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+		return "", false
+	}
+
+	choices, _ := chunk["choices"].([]any)
+	if len(choices) == 0 {
+		return "", false
+	}
+	choice, _ := choices[0].(map[string]any)
+	fr, _ := choice["finish_reason"].(string)
+	if fr != "content_filter" {
+		return "", false
+	}
+
+	// Log the content_filter detection at debug level.
+	slog.Debug("azure adapter: detected content_filter finish_reason, mapping to error frame",
+		"model", chunk["model"],
+	)
+
+	// Emit an OpenAI error frame matching the OpenAI error shape.
+	errFrame := map[string]any{
+		"error": map[string]any{
+			"message": "Response was filtered due to content policy. The model's output was blocked by Azure content filtering.",
+			"type":    "content_filter",
+			"code":    "content_filter",
+		},
+		"object": "error",
+	}
+	errBody, _ := json.Marshal(errFrame)
+
+	// Emit a stop chunk with finish_reason "content_filter" (so the
+	// caller's SSE loop sees a proper finish), then the error frame,
+	// then [DONE].
+	var b strings.Builder
+	b.WriteString(line) // original content_filter chunk (transparent)
+	b.WriteString("\n")
+	b.WriteString("data: " + string(errBody) + "\n\n")
+	b.WriteString("data: [DONE]\n\n")
+	return b.String(), true
+}
 
 // --- Google Gemini --------------------------------------------------------
 

@@ -86,6 +86,18 @@ type Provider struct {
 	// considers input tokens.
 	OutputCostPer1K float64
 
+	// CacheReadInputCostPer1K is the per-1k-token cost for cache-read
+	// input tokens (issue #1245). Anthropic charges ~0.1× the input
+	// rate for cached tokens. Zero means "use InputCostPer1K as-is"
+	// (no cache discount tracking).
+	CacheReadInputCostPer1K float64
+
+	// CacheCreationInputCostPer1K is the per-1k-token cost for
+	// cache-creation input tokens (issue #1245). Anthropic charges
+	// ~1.25× the input rate for cache-write tokens. Zero means
+	// "use InputCostPer1K as-is".
+	CacheCreationInputCostPer1K float64
+
 	// MaxTokens is the upstream's max context window. Zero means
 	// "unspecified"; downstream code can use it for VRAM budgeting
 	// or request-size validation without affecting existing callers.
@@ -263,13 +275,15 @@ func LoadFromEnv() (Registry, error) {
 // /chat/completions path to.
 func (p Provider) ToConfig() ProviderConfig {
 	return ProviderConfig{
-		NameVal:            p.Name,
-		BaseURLVal:         strings.TrimRight(p.URL, "/"),
-		ModelVal:           p.Model,
-		APIKeyVal:          p.APIKey,
-		CostPer1KVal:       p.InputCostPer1K,
-		InputCostPer1KVal:  p.InputCostPer1K,
-		OutputCostPer1KVal: p.OutputCostPer1K,
+		NameVal:                        p.Name,
+		BaseURLVal:                     strings.TrimRight(p.URL, "/"),
+		ModelVal:                       p.Model,
+		APIKeyVal:                      p.APIKey,
+		CostPer1KVal:                   p.InputCostPer1K,
+		InputCostPer1KVal:              p.InputCostPer1K,
+		OutputCostPer1KVal:             p.OutputCostPer1K,
+		CacheReadInputCostPer1KVal:     p.CacheReadInputCostPer1K,
+		CacheCreationInputCostPer1KVal: p.CacheCreationInputCostPer1K,
 	}
 }
 
@@ -324,6 +338,8 @@ func loadOneProvider(cfg envProviderConfig) (Provider, error) {
 	priorityKey := "NEXUS_PROVIDER_" + cfg.suffix + "_PRIORITY"
 	inCostKey := "NEXUS_PROVIDER_" + cfg.suffix + "_INPUT_COST_PER_1K"
 	outCostKey := "NEXUS_PROVIDER_" + cfg.suffix + "_OUTPUT_COST_PER_1K"
+	cacheReadKey := "NEXUS_PROVIDER_" + cfg.suffix + "_CACHE_READ_INPUT_COST_PER_1K"
+	cacheCreateKey := "NEXUS_PROVIDER_" + cfg.suffix + "_CACHE_CREATION_INPUT_COST_PER_1K"
 	maxTokKey := "NEXUS_PROVIDER_" + cfg.suffix + "_MAX_TOKENS"
 	typeKey := "NEXUS_PROVIDER_" + cfg.suffix + "_TYPE"
 
@@ -364,6 +380,20 @@ func loadOneProvider(cfg envProviderConfig) (Provider, error) {
 			return Provider{}, fmt.Errorf("%s must be a number: %w", outCostKey, err)
 		}
 		p.OutputCostPer1K = f
+	}
+	if v := strings.TrimSpace(os.Getenv(cacheReadKey)); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return Provider{}, fmt.Errorf("%s must be a number: %w", cacheReadKey, err)
+		}
+		p.CacheReadInputCostPer1K = f
+	}
+	if v := strings.TrimSpace(os.Getenv(cacheCreateKey)); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return Provider{}, fmt.Errorf("%s must be a number: %w", cacheCreateKey, err)
+		}
+		p.CacheCreationInputCostPer1K = f
 	}
 	if v := strings.TrimSpace(os.Getenv(maxTokKey)); v != "" {
 		n, err := strconv.Atoi(v)

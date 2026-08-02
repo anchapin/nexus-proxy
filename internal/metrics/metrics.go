@@ -149,6 +149,14 @@ type Request struct {
 	// or when auth is disabled. Written to a nullable tenant column
 	// in the requests table.
 	Tenant string
+
+	// CacheReadInputTokens / CacheCreationInputTokens track Anthropic
+	// prompt-caching token categories (issue #1245). When the Anthropic
+	// adapter injects cache_control hints, the upstream response includes
+	// usage.cache_read_input_tokens and usage.cache_creation_input_tokens.
+	// These fields let operators measure cache hit rates and cost savings.
+	CacheReadInputTokens     int
+	CacheCreationInputTokens int
 }
 
 // Summary is the per-day roll-up returned by Store.DailySummary.
