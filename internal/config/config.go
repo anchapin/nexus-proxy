@@ -670,49 +670,19 @@ type Config struct {
 
 	// MetricsExemplars controls whether histogram buckets carry OTLP
 	// trace exemplars in the Prometheus exposition (issue #1171).
-	// When true, non-+Inf bucket lines carry a
-	// `# {trace_id="...",span_id="..."} <value>` suffix so Grafana
-	// can link latency outliers to the trace that produced them.
-	// Defaults to true when NEXUS_TRACING_ENDPOINT is set.
 	MetricsExemplars bool
 
-	// Response-content redaction (issue #1172). When RedactEnabled is
-	// true and RedactProfile is one of {secrets, pii, custom}, the chat
-	// handler wraps the response writer with a ResponseRedactor that
-	// scans every write against the profile's regex set and replaces
-	// matches with [REDACTED]. Disabled by default (RedactEnabled=false)
-	// so a stock deployment is byte-for-byte identical to the pre-#1172
-	// behaviour.
-	//
-	// RedactProfile selects the built-in pattern set ("secrets" for
-	// bearer tokens / private keys, "pii" for credit cards / SSNs /
-	// emails) or "custom" to use operator-supplied regexes from
-	// RedactPatternsRaw.
-	//
-	// RedactBufferBytes caps the rolling buffer used for cross-chunk
-	// multi-line pattern matching (e.g. PEM private keys split across
-	// SSE chunks). Defaults to 4096.
+	// Response-content redaction (issue #1172).
 	RedactEnabled     bool
 	RedactProfile     string
 	RedactPatternsRaw string
 	RedactBufferBytes int
 
-	// SSRF egress guard (issue #1174). When EgressGuardEnabled is true
-	// (the default), the shared HTTP client rejects redirects and
-	// dial-time connections to private, loopback, and link-local IP
-	// ranges — preventing server-side request forgery via upstream
-	// redirect chains. EgressAllowCIDRs is an operator-supplied
-	// comma-separated CIDR allowlist that overrides the block list,
-	// so local-Ollama deployments can permit 127.0.0.0/8 while still
-	// blocking other private ranges.
+	// SSRF egress guard (issue #1174).
 	EgressGuardEnabled bool
 	EgressAllowCIDRs   string // raw comma-separated CIDR string from env/YAML
 
-	// Secret management (issue #1173). SecretBackend selects the credential
-	// resolution backend: "env" (default, backward-compatible), "vault", or
-	// "awssm". When a non-env backend is selected, config.Load consults the
-	// external store before falling back to env vars, and an unreachable
-	// configured backend causes boot to fail (fail-closed).
+	// Secret management (issue #1173).
 	SecretBackend string
 	VaultAddr     string
 	VaultToken    string
@@ -720,6 +690,17 @@ type Config struct {
 	VaultPath     string
 	AWSSMPrefix   string
 	SecretRefresh time.Duration
+
+	// Tamper-evident audit log (issue #1153). When AuditEnabled is true
+	// and AuditPath is non-empty, every /v1/chat/completions request
+	// appends one hash-chained JSON line capturing who routed what, to
+	// where, and when. AuditPath empty disables the file backend.
+	// AuditSync is "full" (fsync after each append, default) or "none"
+	// (rely on OS page cache). When disabled, behaviour is byte-for-byte
+	// identical to pre-issue-#1153.
+	AuditEnabled bool
+	AuditPath    string
+	AuditSync    string
 }
 
 // DefaultMetricsDBPath returns the canonical metrics DB location:
@@ -2129,6 +2110,13 @@ func Load() (Config, error) {
 	// should set NEXUS_EGRESS_ALLOW=127.0.0.0/8 to permit loopback.
 	cfg.EgressGuardEnabled = getEnvBool("NEXUS_EGRESS_BLOCK_PRIVATE", true)
 	cfg.EgressAllowCIDRs = getEnvAllowEmpty("NEXUS_EGRESS_ALLOW", "")
+
+	// Tamper-evident audit log (issue #1153). Disabled by default; when
+	// enabled + path set, every proxied request appends one hash-chained
+	// JSON line with client attribution.
+	cfg.AuditEnabled = getEnvBool("NEXUS_AUDIT_ENABLED", false)
+	cfg.AuditPath = getEnvAllowEmpty("NEXUS_AUDIT_PATH", "")
+	cfg.AuditSync = getEnv("NEXUS_AUDIT_SYNC", "full")
 
 	if err := cfg.Validate(); err != nil {
 		return cfg, err

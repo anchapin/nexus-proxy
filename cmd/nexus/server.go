@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/anchapin/nexus-proxy/internal/audit"
 	"github.com/anchapin/nexus-proxy/internal/auth"
 	"github.com/anchapin/nexus-proxy/internal/budget"
 	"github.com/anchapin/nexus-proxy/internal/circuit"
@@ -991,6 +992,32 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		ragEmbed.SetTripCallback(kind, circuitBreakerObs.IncRAGCircuitTrip)
 	}
 
+	// Tamper-evident audit log (issue #1153). Constructed only when
+	// enabled + a path is set; otherwise auditObs stays nil and the hot
+	// path is byte-for-byte identical to pre-issue-#1153 behaviour.
+	var auditObs handlers.AuditObserver
+	if cfg.AuditEnabled && cfg.AuditPath != "" {
+		aud, err := audit.Open(cfg.AuditPath, audit.ParseSyncMode(cfg.AuditSync))
+		if err != nil {
+			cleanup()
+			return nil, nil, nil, fmt.Errorf("audit: %w", err)
+		}
+		addCleanup(func() { _ = aud.Close() })
+		auditObs = handlers.AuditObserverFunc(func(e handlers.AuditEvent) {
+			_ = aud.Record(audit.AuditEntry{
+				Timestamp: e.Timestamp,
+				RequestID: e.RequestID,
+				ClientIP:  e.ClientIP,
+				KeyHash:   e.KeyHash,
+				Route:     e.Route,
+				Model:     e.Model,
+				Outcome:   e.Outcome,
+			})
+		})
+	} else {
+		slog.Info("audit log disabled (NEXUS_AUDIT_ENABLED=false or NEXUS_AUDIT_PATH empty)")
+	}
+
 	deps := handlers.Deps{
 		Config:                  cfg,
 		Client:                  httpClient,
@@ -1022,9 +1049,10 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		RedactionObserver: func(profile string, substitutions int64) {
 			routeCounters.ObserveRedaction(profile, substitutions)
 		},
-		ArbiterCache: arbiterCache,
-		Coalescer:    coalescer,
-		Providers:    providerRegistry,
+		AuditObserver: auditObs,
+		ArbiterCache:  arbiterCache,
+		Coalescer:     coalescer,
+		Providers:     providerRegistry,
 		PipelineStageObserver: handlers.PipelineStageObserverFunc(
 			func(e handlers.PipelineStageEvent) {
 				stageCollector.ObservePipelineStage(observability.PipelineStageEvent{

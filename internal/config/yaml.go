@@ -276,6 +276,11 @@ type YAMLConfig struct {
 	VaultPath     string `yaml:"vault_path"`
 	AWSSMPrefix   string `yaml:"awssm_prefix"`
 	SecretRefresh string `yaml:"secret_refresh"`
+
+	// Tamper-evident audit log (issue #1153)
+	AuditEnabled bool   `yaml:"audit_enabled"`
+	AuditPath    string `yaml:"audit_path"`
+	AuditSync    string `yaml:"audit_sync"`
 }
 
 // LoadYAML reads configuration from a YAML file at path, then overlays
@@ -1482,6 +1487,17 @@ func LoadYAML(path string) (Config, error) {
 		cfg.SecretRefresh = d
 	}
 
+	// Tamper-evident audit log (issue #1153)
+	if v := os.Getenv("NEXUS_AUDIT_ENABLED"); v != "" {
+		cfg.AuditEnabled = parseBoolEnvStr(v, false)
+	}
+	if v := os.Getenv("NEXUS_AUDIT_PATH"); v != "" {
+		cfg.AuditPath = v
+	}
+	if v := os.Getenv("NEXUS_AUDIT_SYNC"); v != "" {
+		cfg.AuditSync = v
+	}
+
 	ValidateShutdownTimeout(cfg)
 	ValidateFusionTimeouts(cfg)
 
@@ -1708,6 +1724,10 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		VaultPath:     yc.stringDefault(yc.VaultPath, "secret"),
 		AWSSMPrefix:   yc.AWSSMPrefix,
 		SecretRefresh: yc.durationDefault(yc.SecretRefresh, 0),
+
+		AuditEnabled: yc.AuditEnabled,
+		AuditPath:    yc.stringDefault(yc.AuditPath, ""),
+		AuditSync:    yc.stringDefault(yc.AuditSync, "full"),
 	}
 
 	// Metrics exemplars (issue #1171). YAML pointer (nil = use env default);
