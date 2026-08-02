@@ -18,7 +18,7 @@ make test-race      # race detector — required to merge
 make lint           # golangci-lint v2.12.2
 make fmt            # gofmt -w (in place)
 make bench-baseline # regenerate bench/baseline.txt for benchstat (issue #1186)
-make ci             # vet + build + test + test-race + lint + bench-short
+make ci             # vet + build + test + test-race + lint
 ```
 
 `go run ./cmd/nexus` also works. **Go 1.26** (CI pin); `go.mod` declares 1.25.
@@ -26,12 +26,14 @@ make ci             # vet + build + test + test-race + lint + bench-short
 **Coverage floor is 70%** — CI fails if total drops below `COVERAGE_THRESHOLD`.
 Per-package numbers print for visibility; only the total gates.
 
-**CI runs five jobs** (`.github/workflows/ci.yml`): `test` (vet → build →
+**CI runs seven jobs** (`.github/workflows/ci.yml`): `test` (vet → build →
 `go test -race -coverprofile=coverage.txt -covermode=atomic ./...` + coverage
 gate), `bench` (non-blocking `bench-short`, `continue-on-error: true`),
 `bench-regression` (benchstat comparison against `bench/baseline.txt`, posts
 PR comment, `continue-on-error: true` — issue #1186), `lint`
-(`golangci-lint-action@v9`, golangci-lint **v2.12.2**), and `docker`
+(`golangci-lint-action@v9`, golangci-lint **v2.12.2**), `fuzz` (non-blocking
+Go native fuzz smoke on TOON compression, DSL regex, and RAG similarity —
+issue #1161), and `docker`
 (smoke `make docker-build` — catches Dockerfile↔go.mod Go-version drift,
 issue #541). `make ci` is a local convenience wrapper; CI does not invoke it.
 
@@ -68,12 +70,14 @@ start the proxy):
 ```
 cmd/nexus/              # main: wires config → middleware → handlers → HTTP server
 internal/
+  audit/               # request/response audit logging
   auth/                 # inbound API-key middleware
   budget/               # 24h rolling frontier spend cap
   circuit/              # local-route cooldown after cascade failure (issue #80)
   concurrencylimit/     # VRAM-aware local-route semaphore
   config/               # Load() (env parsing) + LoadYAML() (file + env override)
   diag/                  # boot-time diagnostics (nexus check / nexus doctor)
+  e2e/                  # end-to-end test helpers
   handlers/             # chat.go + health.go + recover/security/sanitize
   health/               # Ollama circuit breaker + frontier health poller (issue #1158)
   ioutils/              # shared io helpers (decompression, etc.)
@@ -87,7 +91,9 @@ internal/
   rag/                  # PersistentStore (SQLite) + Store + Watcher + embedders
   ratelimit/            # ClientIPResolver + HTTP middleware (NOT in middleware/)
   router/               # Guardrail → DSL → SLM.Decide routing pipeline
+  secrets/              # secret scanning / redaction
   telemetry/            # Recorder interface + JSONLRecorder
+  testutil/             # shared test helpers
   tokenizer/            # tiktoken wrapper (single shared instance)
   tracing/              # W3C trace context + OTLP/JSON exporter
   tracingtest/          # test helpers for the tracing package
@@ -560,6 +566,12 @@ function.
 on staged `.go` files and fails the commit if any need formatting. The hook
 lives in `.githooks/pre-commit`; `make install-hooks` sets `git
 core.hooksPath` to point at it.
+
+**Fuzz tests** (issue #1161): Go native fuzz targets run in CI (`fuzz` job,
+non-blocking). Three targets: `FuzzSerializeToTOON` (`internal/middleware`),
+`FuzzDSLRegex` (`internal/router`), `FuzzSimilarity` (`internal/rag`).
+Run locally: `go test -run='^$' -fuzz=FuzzSerializeToTOON -fuzztime=30s
+./internal/middleware/`.
 
 ## Local-route cooldown (issue #80)
 
