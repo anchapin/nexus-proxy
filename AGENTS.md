@@ -266,6 +266,12 @@ A second pass handles bare/prose-embedded arrays of ≥2 objects. Set
 full embed if DB is empty). `Watcher` reconciles on mtime+size changes.
 Set `NEXUS_RAG_DB=` to disable persistence (legacy in-memory path).
 
+**Recursive subdirectory indexing** (`NEXUS_RAG_RECURSIVE`, default `false`, issue #1149):
+when `true`, `IndexDir` and the `Watcher` use `filepath.WalkDir` to descend into
+all subdirectories. File paths are stored relative to the root (e.g.
+`internal/handlers/chat.go`) to avoid primary-key collisions when multiple
+directories contain files with the same name. Symlinks are still skipped (issue #107).
+
 **RAG embedder is pluggable** (`NEXUS_EMBEDDER_TYPE`): `ollama` (default),
 `openai`, or `cohere`.
 

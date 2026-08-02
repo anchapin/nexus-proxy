@@ -514,6 +514,10 @@ func (p *PersistentStore) LoadOrIndex(ctx context.Context, dir string) (int, err
 // logic). When batchSize == 0, each file is embedded individually via
 // Embed.
 //
+// When the embedded Store is configured with WithRecursive(true)
+// (issue #1149), filepath.WalkDir descends into all subdirectories
+// and file paths are stored relative to dir.
+//
 // Security: symlinks are skipped (issue #107) to prevent confidentiality
 // leaks via injected few-shot examples.
 func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
@@ -528,59 +532,9 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 		return nil
 	}
 
-	safeDir, err := resolveDir(dir)
+	_, validFiles, err := collectIndexFiles(dir, p.Store.recursive)
 	if err != nil {
 		return err
-	}
-
-	files, err := os.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("rag: read examples dir %q: %w", dir, err)
-	}
-
-	type fileInfo struct {
-		name    string
-		content string
-	}
-	var validFiles []fileInfo
-
-	for _, f := range files {
-		if f.IsDir() {
-			continue
-		}
-		if isSymlink(f) {
-			slog.Warn("rag: skipping symlink in examples dir (issue #107)",
-				slog.String("filename", f.Name()),
-				slog.String("dir", dir),
-			)
-			continue
-		}
-		path := filepath.Join(dir, f.Name())
-		resolved, err := filepath.EvalSymlinks(path)
-		if err != nil {
-			slog.Error("rag: cannot resolve path, skipping",
-				slog.String("filename", f.Name()),
-				slog.Any("err", err),
-			)
-			continue
-		}
-		if !verifyInsideDir(safeDir, resolved) {
-			slog.Warn("rag: skipping file that escapes examples dir (issue #107)",
-				slog.String("filename", f.Name()),
-				slog.String("resolved", resolved),
-				slog.String("base", safeDir),
-			)
-			continue
-		}
-		content, err := os.ReadFile(path)
-		if err != nil {
-			slog.Error("rag read file",
-				slog.String("filename", f.Name()),
-				slog.Any("err", err),
-			)
-			continue
-		}
-		validFiles = append(validFiles, fileInfo{name: f.Name(), content: string(content)})
 	}
 
 	if p.Store.batchSize > 0 && len(validFiles) > 0 {
@@ -594,6 +548,7 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 			var chunkTexts []string
 			var chunkMeta []struct {
 				name string
+				dir  string
 				idx  int
 			}
 			for _, fi := range batch {
@@ -602,8 +557,9 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 					chunkTexts = append(chunkTexts, c.Content)
 					chunkMeta = append(chunkMeta, struct {
 						name string
+						dir  string
 						idx  int
-					}{fi.name, c.Index})
+					}{fi.relPath, fi.dir, c.Index})
 				}
 			}
 			embs, err := p.embedder.EmbedBatch(ctx, chunkTexts)
@@ -621,6 +577,7 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 			for j := range chunkTexts {
 				if err := p.Upsert(ctx, FewShotExample{
 					Filename:   chunkMeta[j].name,
+					Dir:        chunkMeta[j].dir,
 					Content:    chunkTexts[j],
 					Embedding:  embs[j],
 					ChunkIndex: chunkMeta[j].idx,
@@ -643,25 +600,26 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 				emb, err := p.embedder.Embed(ctx, c.Content)
 				if err != nil {
 					slog.Error("rag embed file",
-						slog.String("filename", fi.name),
+						slog.String("filename", fi.relPath),
 						slog.Any("err", err),
 					)
 					continue
 				}
 				if err := p.Upsert(ctx, FewShotExample{
-					Filename:   fi.name,
+					Filename:   fi.relPath,
+					Dir:        fi.dir,
 					Content:    c.Content,
 					Embedding:  emb,
 					ChunkIndex: c.Index,
 				}); err != nil {
 					slog.Error("rag persist file",
-						slog.String("filename", fi.name),
+						slog.String("filename", fi.relPath),
 						slog.Any("err", err),
 					)
 					continue
 				}
 			}
-			slog.Info("rag indexed", slog.String("filename", fi.name))
+			slog.Info("rag indexed", slog.String("filename", fi.relPath))
 		}
 	}
 
