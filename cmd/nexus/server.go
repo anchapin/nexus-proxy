@@ -49,6 +49,7 @@ type serverParts struct {
 	judgeEval      *judge.Evaluator
 	rateLimiter    *ratelimit.Middleware
 	authLimiter    *ratelimit.AuthLimiter
+	authMiddleware *auth.Middleware // multi-key auth (issue #1154); nil for single-key
 	exporterCloser func() error
 	ipResolver     *ratelimit.ClientIPResolver
 }
@@ -1338,11 +1339,31 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 				}),
 			)
 		}
-		authMw := auth.NewMiddleware(cfg.ProxyAPIKey, publicPathExempt(cfg), authLimiter, circuitCollector)
-		rootHandler = authMw.Wrap(mux)
-		slog.Info("inbound auth enabled",
-			slog.Bool("status_public", cfg.StatusPublic),
-		)
+		// Multi-key inbound auth (issue #1154). When NEXUS_API_KEYS_FILE
+		// is set, load the credential set and use the multi-key middleware
+		// so per-tenant attribution flows into metrics. The multi-key path
+		// takes precedence over the single-key path.
+		if cfg.APIKeysFile != "" {
+			entries, err := auth.LoadAPIKeysFile(cfg.APIKeysFile)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("config: %w", err)
+			}
+			creds := auth.NewCredentialSet(entries)
+			authMw := auth.NewMultiKeyMiddleware(cfg.ProxyAPIKey, creds, publicPathExempt(cfg), authLimiter, circuitCollector)
+			parts.authMiddleware = authMw
+			rootHandler = authMw.Wrap(mux)
+			slog.Info("multi-key inbound auth enabled",
+				slog.String("keys_file", cfg.APIKeysFile),
+				slog.Int("key_count", creds.Len()),
+				slog.Bool("status_public", cfg.StatusPublic),
+			)
+		} else {
+			authMw := auth.NewMiddleware(cfg.ProxyAPIKey, publicPathExempt(cfg), authLimiter, circuitCollector)
+			rootHandler = authMw.Wrap(mux)
+			slog.Info("inbound auth enabled",
+				slog.Bool("status_public", cfg.StatusPublic),
+			)
+		}
 	} else {
 		slog.Info("inbound auth disabled (NEXUS_PROXY_API_KEY unset)")
 	}
@@ -1409,6 +1430,23 @@ func (p *serverParts) handleSIGHUP(cfg config.Config) config.Config {
 	}
 	if p.ipResolver != nil {
 		p.ipResolver.SetTrustedProxies(newCfg.TrustedProxies)
+	}
+	// Hot-reload multi-key credentials (issue #1154). Re-read the API
+	// keys file so individual keys can be rotated without a restart.
+	if p.authMiddleware != nil && newCfg.APIKeysFile != "" {
+		if entries, err := auth.LoadAPIKeysFile(newCfg.APIKeysFile); err != nil {
+			slog.Error("failed to reload API keys file, keeping previous credentials",
+				slog.String("keys_file", newCfg.APIKeysFile),
+				slog.Any("err", err),
+			)
+		} else {
+			creds := auth.NewCredentialSet(entries)
+			p.authMiddleware.SetCredentials(creds)
+			slog.Info("multi-key credentials reloaded via SIGHUP",
+				slog.String("keys_file", newCfg.APIKeysFile),
+				slog.Int("key_count", creds.Len()),
+			)
+		}
 	}
 	newLogger := newCfg.NewLogger()
 	slog.SetDefault(newLogger)

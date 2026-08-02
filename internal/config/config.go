@@ -108,6 +108,13 @@ type Config struct {
 	ProxyAPIKey  string // NEXUS_PROXY_API_KEY; empty disables auth
 	StatusPublic bool   // NEXUS_STATUS_PUBLIC; exposes /status without auth
 
+	// APIKeysFile (issue #1154) is the path to a JSON file containing
+	// multiple inbound API keys with per-tenant labels. When set, takes
+	// precedence over NEXUS_PROXY_API_KEY. Read at boot and on SIGHUP
+	// hot-reload so individual keys can be rotated without disrupting
+	// other tenants. Format: [{"key":"...","tenant":"team-a"}, ...].
+	APIKeysFile string // NEXUS_API_KEYS_FILE; empty means single-key legacy path
+
 	// RAG
 	ExamplesDir  string  // "./few_shot_examples"
 	RAGThreshold float64 // cosine similarity cutoff for retrieval (0.55)
@@ -870,6 +877,11 @@ func Load() (Config, error) {
 	}
 	cfg.SecretRefresh = secretRefresh
 	cfg.StatusPublic = getFileBool("status_public", "NEXUS_STATUS_PUBLIC", false)
+
+	// Multi-key inbound auth (issue #1154). NEXUS_API_KEYS_FILE takes
+	// precedence over NEXUS_PROXY_API_KEY when set. The file is parsed
+	// by the auth package at boot and on SIGHUP hot-reload.
+	cfg.APIKeysFile = getEnv("NEXUS_API_KEYS_FILE", "")
 	cfg.ExamplesDir = getFileString("examples_dir", "NEXUS_EXAMPLES_DIR", "./few_shot_examples")
 	cfg.MetaPrompt = defaultMetaPrompt
 	cfg.TOONNotice = defaultTOONNotice
@@ -2487,8 +2499,12 @@ func (c Config) RoutingConfidenceEnabled() bool {
 
 // AuthEnabled reports whether the inbound API-key gate (issue #109)
 // is active. When false, all endpoints are open — the binary behaves
-// identically to the pre-auth proxy.
-func (c Config) AuthEnabled() bool { return c.ProxyAPIKey != "" }
+// identically to the pre-auth proxy. Active when either the legacy
+// NEXUS_PROXY_API_KEY or the multi-key NEXUS_API_KEYS_FILE is set
+// (issue #1154).
+func (c Config) AuthEnabled() bool {
+	return c.ProxyAPIKey != "" || c.APIKeysFile != ""
+}
 
 // SLMCacheEnabled reports whether the SLM decision cache (issue #206)
 // should be active. Disabled when SLMCacheTTL <= 0, which preserves
@@ -2585,6 +2601,11 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 	}
 
 	// Hot-reloadable settings.
+
+	// Multi-key auth file (issue #1154): re-read the path so the SIGHUP
+	// handler can reload credentials without a restart.
+	next.APIKeysFile = os.Getenv("NEXUS_API_KEYS_FILE")
+
 	rateRPM, _ := getEnvInt("NEXUS_RATE_LIMIT_RPM", prev.RateLimitRPM)
 	if rateRPM < 0 {
 		rateRPM = 0

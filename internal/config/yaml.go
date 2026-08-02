@@ -61,6 +61,10 @@ type YAMLConfig struct {
 	ProxyAPIKey  string `yaml:"proxy_api_key"`
 	StatusPublic bool   `yaml:"status_public"`
 
+	// Multi-key inbound auth (issue #1154). Path to JSON file with
+	// per-tenant API key mappings. Takes precedence over proxy_api_key.
+	APIKeysFile string `yaml:"api_keys_file"`
+
 	// Cost baseline
 	CostBaselineProvider  string  `yaml:"cost_baseline_provider"`
 	CostBaselineModel     string  `yaml:"cost_baseline_model"`
@@ -488,6 +492,9 @@ func LoadYAML(path string) (Config, error) {
 	// Auth
 	if v := os.Getenv("NEXUS_PROXY_API_KEY"); v != "" {
 		cfg.ProxyAPIKey = v
+	}
+	if v := os.Getenv("NEXUS_API_KEYS_FILE"); v != "" {
+		cfg.APIKeysFile = v
 	}
 	if v := os.Getenv("NEXUS_STATUS_PUBLIC"); v != "" {
 		cfg.StatusPublic = parseBoolEnvStr(v, false)
@@ -1516,6 +1523,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		ZAIKey:                 yc.ZAIKey,
 		ProxyAPIKey:            yc.ProxyAPIKey,
 		StatusPublic:           yc.StatusPublic,
+		APIKeysFile:            yc.APIKeysFile,
 		ExamplesDir:            yc.stringDefault(yc.ExamplesDir, "./few_shot_examples"),
 		MetaPrompt:             yc.stringDefault(yc.MetaPrompt, defaultMetaPrompt),
 		TOONNotice:             yc.stringDefault(yc.TOONNotice, defaultTOONNotice),

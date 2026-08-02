@@ -143,6 +143,12 @@ type Request struct {
 	// storage overhead.
 	ArbiterCacheKeyHex string
 	ArbiterSynthesis   string
+
+	// Tenant (issue #1154) is the resolved tenant identifier from
+	// multi-key inbound auth. Empty for the legacy single-key path
+	// or when auth is disabled. Written to a nullable tenant column
+	// in the requests table.
+	Tenant string
 }
 
 // Summary is the per-day roll-up returned by Store.DailySummary.
