@@ -54,13 +54,18 @@ type clientSlot struct {
 // request context via auth.WithTenant. The multi-key path takes
 // precedence over the single-key path so an operator can migrate from
 // NEXUS_PROXY_API_KEY to NEXUS_API_KEYS_FILE without downtime.
+//
+// Pluggable authenticator (issue #1152): when authenticator is non-nil,
+// JWT/OIDC token validation is delegated to it. The authenticator path
+// is checked after multi-key and before the single-key fallback.
 type Middleware struct {
-	key         string
-	creds       *CredentialSet // multi-key set; nil means single-key legacy path
-	exempt      func(*http.Request) bool
-	authLimiter *ratelimit.AuthLimiter
-	observer    AuthObserver
-	resolver    *ratelimit.ClientIPResolver
+	key           string
+	creds         *CredentialSet // multi-key set; nil means single-key legacy path
+	authenticator Authenticator  // optional: issue #1152 pluggable JWT/OIDC auth
+	exempt        func(*http.Request) bool
+	authLimiter   *ratelimit.AuthLimiter
+	observer      AuthObserver
+	resolver      *ratelimit.ClientIPResolver
 
 	mu    sync.Mutex
 	slots map[string]*clientSlot // keyed by client IP
@@ -112,12 +117,25 @@ func (m *Middleware) SetCredentials(creds *CredentialSet) {
 	m.mu.Unlock()
 }
 
+// NewMiddlewareWithAuthenticator returns a middleware that validates
+// tokens using the provided Authenticator (issue #1152). The key
+// parameter should be non-empty so Enabled() returns true; it is used
+// only for the enabled/disabled gate. When the authenticator is set,
+// token validation is delegated to it instead of the constant-time
+// comparison.
+func NewMiddlewareWithAuthenticator(key string, authenticator Authenticator, exempt func(*http.Request) bool, authLimiter *ratelimit.AuthLimiter, observer AuthObserver) *Middleware {
+	m := NewMiddleware(key, exempt, authLimiter, observer)
+	m.authenticator = authenticator
+	return m
+}
+
 // Enabled reports whether the middleware actually enforces auth.
 func (m *Middleware) Enabled() bool {
 	m.mu.Lock()
 	hasCreds := m.creds != nil && m.creds.Len() > 0
+	hasAuth := m.authenticator != nil
 	m.mu.Unlock()
-	return m.key != "" || hasCreds
+	return m.key != "" || hasCreds || hasAuth
 }
 
 // acquireSlot acquires an auth slot for the given IP. If the IP already has
@@ -231,12 +249,15 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			m.renewSlot(clientIP)
 			return
 		}
-		// Validate the token. Two paths:
+		// Validate the token. Three paths (checked in order):
 		// 1. Multi-key (issue #1154): match against the CredentialSet,
 		//    resolve tenant, and place it on the request context.
-		// 2. Single-key (legacy): constant-time compare against m.key.
+		// 2. Pluggable authenticator (issue #1152): delegate to the
+		//    Authenticator (e.g. JWT/OIDC validator).
+		// 3. Single-key (legacy): constant-time compare against m.key.
 		m.mu.Lock()
 		creds := m.creds
+		authenticator := m.authenticator
 		m.mu.Unlock()
 
 		if creds != nil && creds.Len() > 0 {
@@ -263,6 +284,38 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 				span.SetAttr("auth.tenant", tenant)
 			}
 			r = r.WithContext(WithTenant(r.Context(), tenant))
+			next.ServeHTTP(w, r)
+			if m.observer != nil {
+				m.observer.IncAuthAccepted(clientIP)
+			}
+			m.renewSlot(clientIP)
+			return
+		}
+
+		// Pluggable authenticator path (issue #1152). When an
+		// Authenticator is wired (JWT/OIDC), delegate token validation
+		// to it instead of the constant-time comparison.
+		if authenticator != nil {
+			if err := authenticator.Authenticate(token); err != nil {
+				if span != nil {
+					span.SetAttr("auth.outcome", "invalid")
+				}
+				w.Header().Set("WWW-Authenticate", `Bearer realm="nexus-proxy", error="invalid_token"`)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = fmt.Fprint(w, `{"error":"invalid token"}`)
+				if m.observer != nil {
+					m.observer.IncAuthRejectedInvalid(clientIP)
+				}
+				if m.authLimiter != nil && m.authLimiter.Enabled() {
+					m.authLimiter.RecordFailure(clientIP, "invalid")
+				}
+				m.renewSlot(clientIP)
+				return
+			}
+			if span != nil {
+				span.SetAttr("auth.outcome", "accept")
+			}
 			next.ServeHTTP(w, r)
 			if m.observer != nil {
 				m.observer.IncAuthAccepted(clientIP)

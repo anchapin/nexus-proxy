@@ -115,6 +115,16 @@ type Config struct {
 	// other tenants. Format: [{"key":"...","tenant":"team-a"}, ...].
 	APIKeysFile string // NEXUS_API_KEYS_FILE; empty means single-key legacy path
 
+	// Pluggable JWT/OIDC inbound authentication (issue #1152).
+	// AuthMode selects the authenticator strategy: "static" (default,
+	// pre-#1152), "jwt", or "both" (accept static OR JWT).
+	// OIDCJWKSURL/Issuer/Audience configure the JWT validator.
+	AuthMode        string        // NEXUS_AUTH_MODE (static|jwt|both)
+	OIDCJWKSURL     string        // NEXUS_OIDC_JWKS_URL
+	OIDCIssuer      string        // NEXUS_OIDC_ISSUER
+	OIDCAudience    string        // NEXUS_OIDC_AUDIENCE
+	OIDCJWKSRefresh time.Duration // NEXUS_OIDC_JWKS_REFRESH
+
 	// RAG
 	ExamplesDir  string  // "./few_shot_examples"
 	RAGThreshold float64 // cosine similarity cutoff for retrieval (0.55)
@@ -863,6 +873,14 @@ func Load() (Config, error) {
 	// precedence over NEXUS_PROXY_API_KEY when set. The file is parsed
 	// by the auth package at boot and on SIGHUP hot-reload.
 	cfg.APIKeysFile = getEnv("NEXUS_API_KEYS_FILE", "")
+	cfg.AuthMode = getFileString("auth_mode", "NEXUS_AUTH_MODE", "static")
+	cfg.OIDCJWKSURL = getFileString("oidc_jwks_url", "NEXUS_OIDC_JWKS_URL", "")
+	cfg.OIDCIssuer = getFileString("oidc_issuer", "NEXUS_OIDC_ISSUER", "")
+	cfg.OIDCAudience = getFileString("oidc_audience", "NEXUS_OIDC_AUDIENCE", "")
+	{
+		d, _ := getEnvDuration("NEXUS_OIDC_JWKS_REFRESH", 15*time.Minute)
+		cfg.OIDCJWKSRefresh = d
+	}
 	cfg.ExamplesDir = getFileString("examples_dir", "NEXUS_EXAMPLES_DIR", "./few_shot_examples")
 	cfg.MetaPrompt = defaultMetaPrompt
 	cfg.TOONNotice = defaultTOONNotice
@@ -2489,9 +2507,15 @@ func (c Config) RoutingConfidenceEnabled() bool {
 // is active. When false, all endpoints are open — the binary behaves
 // identically to the pre-auth proxy. Active when either the legacy
 // NEXUS_PROXY_API_KEY or the multi-key NEXUS_API_KEYS_FILE is set
-// (issue #1154).
+// (issue #1154), or when JWT/OIDC mode is configured (issue #1152).
 func (c Config) AuthEnabled() bool {
-	return c.ProxyAPIKey != "" || c.APIKeysFile != ""
+	if c.ProxyAPIKey != "" || c.APIKeysFile != "" {
+		return true
+	}
+	if (c.AuthMode == "jwt" || c.AuthMode == "both") && c.OIDCJWKSURL != "" {
+		return true
+	}
+	return false
 }
 
 // SLMCacheEnabled reports whether the SLM decision cache (issue #206)

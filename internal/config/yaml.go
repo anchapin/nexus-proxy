@@ -65,6 +65,13 @@ type YAMLConfig struct {
 	// per-tenant API key mappings. Takes precedence over proxy_api_key.
 	APIKeysFile string `yaml:"api_keys_file"`
 
+	// Pluggable JWT/OIDC inbound auth (issue #1152)
+	AuthMode        string `yaml:"auth_mode"`
+	OIDCJWKSURL     string `yaml:"oidc_jwks_url"`
+	OIDCIssuer      string `yaml:"oidc_issuer"`
+	OIDCAudience    string `yaml:"oidc_audience"`
+	OIDCJWKSRefresh string `yaml:"oidc_jwks_refresh"`
+
 	// Cost baseline
 	CostBaselineProvider  string  `yaml:"cost_baseline_provider"`
 	CostBaselineModel     string  `yaml:"cost_baseline_model"`
@@ -503,6 +510,25 @@ func LoadYAML(path string) (Config, error) {
 	}
 	if v := os.Getenv("NEXUS_STATUS_PUBLIC"); v != "" {
 		cfg.StatusPublic = parseBoolEnvStr(v, false)
+	}
+	if v := os.Getenv("NEXUS_AUTH_MODE"); v != "" {
+		cfg.AuthMode = v
+	}
+	if v := os.Getenv("NEXUS_OIDC_JWKS_URL"); v != "" {
+		cfg.OIDCJWKSURL = v
+	}
+	if v := os.Getenv("NEXUS_OIDC_ISSUER"); v != "" {
+		cfg.OIDCIssuer = v
+	}
+	if v := os.Getenv("NEXUS_OIDC_AUDIENCE"); v != "" {
+		cfg.OIDCAudience = v
+	}
+	if v := os.Getenv("NEXUS_OIDC_JWKS_REFRESH"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_OIDC_JWKS_REFRESH: %w", err)
+		}
+		cfg.OIDCJWKSRefresh = d
 	}
 
 	// Cost baseline
@@ -1540,6 +1566,11 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		ProxyAPIKey:            yc.ProxyAPIKey,
 		StatusPublic:           yc.StatusPublic,
 		APIKeysFile:            yc.APIKeysFile,
+		AuthMode:               yc.stringDefault(yc.AuthMode, "static"),
+		OIDCJWKSURL:            yc.OIDCJWKSURL,
+		OIDCIssuer:             yc.OIDCIssuer,
+		OIDCAudience:           yc.OIDCAudience,
+		OIDCJWKSRefresh:        yc.durationDefault(yc.OIDCJWKSRefresh, 15*time.Minute),
 		ExamplesDir:            yc.stringDefault(yc.ExamplesDir, "./few_shot_examples"),
 		MetaPrompt:             yc.stringDefault(yc.MetaPrompt, defaultMetaPrompt),
 		TOONNotice:             yc.stringDefault(yc.TOONNotice, defaultTOONNotice),
