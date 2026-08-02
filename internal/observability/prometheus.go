@@ -108,6 +108,10 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total judge samples dropped because the judge queue was full (issue #892).",
 		typ:  "counter",
 	},
+	"nexus_judge_frontier_sampled_total": {
+		help: "Total frontier completions sampled for judge evaluation (issue #1162).",
+		typ:  "counter",
+	},
 	"nexus_confidence_store_rows_total": {
 		help: "Current number of rows in the routing_outcomes confidence store table (issue #834).",
 		typ:  "gauge",
@@ -241,6 +245,11 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Build metadata for the running nexus-proxy binary (issue #529). Always 1.",
 		typ:  "gauge",
 	},
+	// Arbiter cache pre-warming gauge (issue #1176). Set once at boot.
+	"nexus_cache_warmed_entries": {
+		help: "Number of entries loaded into the arbiter cache from historical SQLite metrics during boot-time pre-warming (issue #1176). 0 when pre-warming is disabled or no data was found.",
+		typ:  "gauge",
+	},
 	// Per-route latency percentile gauges (issue #774). Computed from a
 	// sliding window ring buffer per route (local/frontier/fusion).
 	// Values are in seconds (ms → s conversion at render time).
@@ -278,6 +287,15 @@ var gaugeMeta = map[string]metricMeta{
 	// Confidence store error counter (issue #927).
 	"nexus_confidence_errors_total": {
 		help: "Total LocalConfidence errors in the planner where the SQLite confidence store returned an error (DB locked, query failed, etc.).",
+		typ:  "counter",
+	},
+	// Frontier provider health counters (issue #1158).
+	"nexus_frontier_probe_total": {
+		help: "Total frontier provider health probes by provider and result (success/failure) (issue #1158).",
+		typ:  "counter",
+	},
+	"nexus_frontier_circuit_open_total": {
+		help: "Total frontier provider circuit-open transitions (issue #1158).",
 		typ:  "counter",
 	},
 }
@@ -428,6 +446,14 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	writeCounter(w, "nexus_fusion_client_abort_total",
 		"Total client aborts during fusion speculative streaming and arbiter synthesis streaming (issue #1046).", upstream.FusionClientAbortTotal())
 
+	// Coalesce counters (issue #1155). Hits are requests deduplicated via
+	// singleflight or served from the TTL cache; misses are requests that
+	// actually executed the upstream call.
+	writeCounter(w, "nexus_coalesce_hits_total",
+		"Total coalesced requests served from cache or singleflight dedup (issue #1155).", upstream.CoalesceHitsTotal())
+	writeCounter(w, "nexus_coalesce_misses_total",
+		"Total coalesce misses that executed the upstream call (issue #1155).", upstream.CoalesceMissesTotal())
+
 	// Auth gauge: cumulative accepted authentications. The metric name
 	// carries "_clients" per the issue spec; semantically this is a
 	// monotonic counter that operators usually want charted as a
@@ -488,22 +514,81 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 		"Total LocalConfidence errors in the planner where the SQLite confidence store returned an error (DB locked, query failed, etc.).",
 		c.ConfidenceErrors())
 
+	// RAG-vs-judge quality correlation (issue #1167). Sum and count of
+	// judge scores partitioned by whether RAG context was injected.
+	// Operators compute avg = sum/count per label to measure retrieval
+	// effectiveness.
+	writeMeta(w, "nexus_rag_judge_score_sum",
+		"Cumulative judge quality score sum partitioned by RAG injection (issue #1167). Compute avg via nexus_rag_judge_score_sum / nexus_rag_judge_score_count.", "counter")
+	//nolint:errcheck // ResponseWriter error cannot be handled after headers committed.
+	fmt.Fprintf(w, "nexus_rag_judge_score_sum{injected=\"true\"} %s\n", formatFloat(c.RAGJudgeScoreSum(true)))
+	//nolint:errcheck // ResponseWriter error cannot be handled after headers committed.
+	fmt.Fprintf(w, "nexus_rag_judge_score_sum{injected=\"false\"} %s\n", formatFloat(c.RAGJudgeScoreSum(false)))
+	writeCounterLabeled(w, "nexus_rag_judge_score_count",
+		"Count of judge quality scores partitioned by RAG injection (issue #1167).",
+		"injected", []labelSample{
+			{value: "true", n: c.RAGJudgeScoreCount(true)},
+			{value: "false", n: c.RAGJudgeScoreCount(false)},
+		})
+
+	// Frontier provider health probe counter (issue #1158).
+	if probes := c.FrontierProbeTotals(); len(probes) > 0 {
+		type pr struct {
+			provider string
+			result   string
+			n        uint64
+		}
+		var samples []pr
+		for key, count := range probes {
+			parts := strings.SplitN(key, "|", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			samples = append(samples, pr{provider: parts[0], result: parts[1], n: count})
+		}
+		sort.Slice(samples, func(i, j int) bool {
+			if samples[i].provider != samples[j].provider {
+				return samples[i].provider < samples[j].provider
+			}
+			return samples[i].result < samples[j].result
+		})
+		writeMeta(w, "nexus_frontier_probe_total",
+			"Total frontier provider health probes by provider and result (success/failure) (issue #1158).", "counter")
+		for _, s := range samples {
+			//nolint:errcheck // cannot check error after headers committed
+			fmt.Fprintf(w, "nexus_frontier_probe_total{provider=%q,result=%q} %d\n",
+				s.provider, s.result, s.n)
+		}
+	}
+
+	// Frontier provider circuit-open counter (issue #1158).
+	if opens := c.FrontierCircuitOpenTotals(); len(opens) > 0 {
+		samples := make([]labelSample, 0, len(opens))
+		for provider, count := range opens {
+			samples = append(samples, labelSample{value: provider, n: count})
+		}
+		writeCounterLabeled(w, "nexus_frontier_circuit_open_total",
+			"Total frontier provider circuit-open transitions (issue #1158).",
+			"provider", samples)
+	}
+
 	// --- Histograms -----------------------------------------------------
 
+	exemplars := c.ExemplarsEnabled()
 	writeHistogramLabeled(w, "nexus_request_duration_ms",
 		"End-to-end request duration in milliseconds, from body read to final flush, by route.",
 		"route", map[string]*Histogram{
 			"local":    c.latencyLocal,
 			"frontier": c.latencyFrontier,
 			"fusion":   c.latencyFusion,
-		})
+		}, exemplars)
 	writeHistogramLabeled(w, "nexus_ttft_ms",
 		"Time to first token in milliseconds (0 / unobserved for non-streaming responses), by route.",
 		"route", map[string]*Histogram{
 			"local":    c.ttftLocal,
 			"frontier": c.ttftFrontier,
 			"fusion":   c.ttftFusion,
-		})
+		}, exemplars)
 	// Per-stage pipeline latency histograms (issue #300).
 	writeStageHistogram(w, c)
 
@@ -618,8 +703,12 @@ func writeCounterLabeled2(w io.Writer, name, help, label1, label2 string, sample
 // Routes are emitted in a fixed order (local, frontier, fusion) for
 // deterministic output.
 //
+// When exemplars is true, non-+Inf bucket lines carry the most recent
+// trace exemplar (issue #1171): `... %d # {trace_id="...",span_id="..."} %s`.
+// +Inf, _sum, and _count lines never carry exemplars.
+//
 //nolint:errcheck
-func writeHistogramLabeled(w io.Writer, name, help, label string, histograms map[string]*Histogram) {
+func writeHistogramLabeled(w io.Writer, name, help, label string, histograms map[string]*Histogram, exemplars bool) {
 	writeMeta(w, name, help, "histogram")
 	// Fixed route order for deterministic output.
 	for _, route := range []string{"local", "frontier", "fusion"} {
@@ -627,13 +716,38 @@ func writeHistogramLabeled(w io.Writer, name, help, label string, histograms map
 		if !ok || h == nil {
 			continue
 		}
-		cum, upperBounds, sum, count := h.Snapshot()
-		for i, ub := range upperBounds {
-			fmt.Fprintf(w, "%s_bucket{%s=%q,le=%q} %d\n", name, label, route, formatFloat(ub), cum[i])
+		if exemplars {
+			cum, upperBounds, sum, count, exs := h.SnapshotWithExemplars()
+			for i, ub := range upperBounds {
+				writeBucketLineWithExemplar(w, fmt.Sprintf("%s_bucket{%s=%q,le=%q}", name, label, route, formatFloat(ub)), cum[i], exs[i])
+			}
+			fmt.Fprintf(w, "%s_bucket{%s=%q,le=%q} %d\n", name, label, route, "+Inf", cum[len(upperBounds)])
+			fmt.Fprintf(w, "%s_sum{%s=%q} %s\n", name, label, route, formatFloat(sum))
+			fmt.Fprintf(w, "%s_count{%s=%q} %d\n", name, label, route, count)
+		} else {
+			cum, upperBounds, sum, count := h.Snapshot()
+			for i, ub := range upperBounds {
+				fmt.Fprintf(w, "%s_bucket{%s=%q,le=%q} %d\n", name, label, route, formatFloat(ub), cum[i])
+			}
+			fmt.Fprintf(w, "%s_bucket{%s=%q,le=%q} %d\n", name, label, route, "+Inf", cum[len(upperBounds)])
+			fmt.Fprintf(w, "%s_sum{%s=%q} %s\n", name, label, route, formatFloat(sum))
+			fmt.Fprintf(w, "%s_count{%s=%q} %d\n", name, label, route, count)
 		}
-		fmt.Fprintf(w, "%s_bucket{%s=%q,le=%q} %d\n", name, label, route, "+Inf", cum[len(upperBounds)])
-		fmt.Fprintf(w, "%s_sum{%s=%q} %s\n", name, label, route, formatFloat(sum))
-		fmt.Fprintf(w, "%s_count{%s=%q} %d\n", name, label, route, count)
+	}
+}
+
+// writeBucketLineWithExemplar emits one non-+Inf histogram bucket line
+// with an optional exemplar suffix (issue #1171). When ex.TraceID is
+// non-empty, the line carries `# {trace_id="...",span_id="..."} <value>`;
+// otherwise it is a plain bucket line (byte-compatible with pre-exemplar
+// output when no exemplar was stored for this bucket).
+//
+//nolint:errcheck
+func writeBucketLineWithExemplar(w io.Writer, prefix string, count uint64, ex Exemplar) {
+	if ex.TraceID != "" {
+		fmt.Fprintf(w, "%s %d # {trace_id=%q,span_id=%q} %s\n", prefix, count, ex.TraceID, ex.SpanID, formatFloat(ex.Value))
+	} else {
+		fmt.Fprintf(w, "%s %d\n", prefix, count)
 	}
 }
 
@@ -662,6 +776,7 @@ func writeHistogram(w io.Writer, name, help string, h *Histogram) {
 //
 //nolint:errcheck
 func writeStageHistogram(w io.Writer, c *Collector) {
+	exemplars := c.ExemplarsEnabled()
 	stages := []struct {
 		name string
 		h    *Histogram
@@ -679,17 +794,32 @@ func writeStageHistogram(w io.Writer, c *Collector) {
 		if s.h == nil {
 			continue
 		}
-		cum, upperBounds, sum, count := s.h.Snapshot()
-		for i, ub := range upperBounds {
+		if exemplars {
+			cum, upperBounds, sum, count, exs := s.h.SnapshotWithExemplars()
+			for i, ub := range upperBounds {
+				writeBucketLineWithExemplar(w,
+					fmt.Sprintf("nexus_pipeline_stage_latency_ms_bucket{stage=%q,le=%q}", s.name, formatFloat(ub)),
+					cum[i], exs[i])
+			}
 			fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_bucket{stage=%q,le=%q} %d\n",
-				s.name, formatFloat(ub), cum[i])
+				s.name, "+Inf", cum[len(upperBounds)])
+			fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_sum{stage=%q} %s\n",
+				s.name, formatFloat(sum))
+			fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_count{stage=%q} %d\n",
+				s.name, count)
+		} else {
+			cum, upperBounds, sum, count := s.h.Snapshot()
+			for i, ub := range upperBounds {
+				fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_bucket{stage=%q,le=%q} %d\n",
+					s.name, formatFloat(ub), cum[i])
+			}
+			fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_bucket{stage=%q,le=%q} %d\n",
+				s.name, "+Inf", cum[len(upperBounds)])
+			fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_sum{stage=%q} %s\n",
+				s.name, formatFloat(sum))
+			fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_count{stage=%q} %d\n",
+				s.name, count)
 		}
-		fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_bucket{stage=%q,le=%q} %d\n",
-			s.name, "+Inf", cum[len(upperBounds)])
-		fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_sum{stage=%q} %s\n",
-			s.name, formatFloat(sum))
-		fmt.Fprintf(w, "nexus_pipeline_stage_latency_ms_count{stage=%q} %d\n",
-			s.name, count)
 	}
 }
 

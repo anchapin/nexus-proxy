@@ -3,6 +3,7 @@ package rag
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -382,28 +383,43 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 // indexFile reads a single file, embeds its content, and upserts it
 // into the persistent store. name is either a bare filename (flat
 // mode) or a forward-slash relative path like "sub/deep.go" (recursive
-// mode). Pulled out so tests can exercise it without the goroutine.
+// mode). When chunking is enabled on the store (issue #1168), the file
+// is split into overlapping chunks and each chunk is embedded and
+// upserted individually. Old chunks for this filename are removed first
+// so that a file that shrinks (fewer chunks than before) does not leave
+// stale entries behind.
 func (w *Watcher) indexFile(ctx context.Context, name string) error {
 	content, err := os.ReadFile(filepath.Join(w.dir, name))
 	if err != nil {
 		return err
 	}
-	emb, err := w.store.embedder.Embed(ctx, string(content))
-	if err != nil {
-		return err
+	// Clear any existing chunks so stale rows from a previous (larger)
+	// version of the file don't linger (issue #1168).
+	if err := w.store.Remove(ctx, name); err != nil {
+		return fmt.Errorf("rag: remove old chunks for %q: %w", name, err)
 	}
-	ex := FewShotExample{
-		Filename:  name,
-		Content:   string(content),
-		Embedding: emb,
-	}
-	if w.recursive {
-		parent := filepath.ToSlash(filepath.Dir(name))
-		if parent != "." {
-			ex.Dir = parent
+	for _, c := range chunkFile(string(content), w.store.chunkTokens) {
+		emb, err := w.store.embedder.Embed(ctx, c.Content)
+		if err != nil {
+			return err
+		}
+		ex := FewShotExample{
+			Filename:   name,
+			Content:    c.Content,
+			Embedding:  emb,
+			ChunkIndex: c.Index,
+		}
+		if w.recursive {
+			parent := filepath.ToSlash(filepath.Dir(name))
+			if parent != "." {
+				ex.Dir = parent
+			}
+		}
+		if err := w.store.Upsert(ctx, ex); err != nil {
+			return err
 		}
 	}
-	return w.store.Upsert(ctx, ex)
+	return nil
 }
 
 // addWatchSubdirs recursively adds all subdirectories under w.dir to

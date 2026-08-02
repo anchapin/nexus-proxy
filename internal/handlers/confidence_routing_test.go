@@ -29,6 +29,13 @@ func (s *stubConfidenceStore) LocalConfidence(category string) (float64, error) 
 	return s.confidence, nil
 }
 
+func (s *stubConfidenceStore) ComparativeConfidence(category string) (float64, float64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.queried = append(s.queried, category)
+	return s.confidence, router.NeutralConfidence, nil
+}
+
 func (s *stubConfidenceStore) queriedCategories() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()

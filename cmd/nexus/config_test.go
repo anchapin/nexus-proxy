@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -123,5 +124,120 @@ token_guardrail: 8000
 				t.Errorf("runConfig output = %q, want substring %q", out, tt.wantSubstr)
 			}
 		})
+	}
+}
+
+func TestRunConfigMigrateYAML(t *testing.T) {
+	tmp := t.TempDir()
+	file := filepath.Join(tmp, "config.yaml")
+	original := "quality_droped_ring_size: 128\nollama_url: http://localhost:11434\n"
+	if err := os.WriteFile(file, []byte(original), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runConfig([]string{"migrate", file}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0\nstderr: %s", code, stderr.String())
+	}
+
+	// Backup should exist.
+	bak := file + ".bak"
+	bakData, err := os.ReadFile(bak)
+	if err != nil {
+		t.Fatalf("backup not written: %v", err)
+	}
+	if string(bakData) != original {
+		t.Errorf("backup content = %q, want %q", bakData, original)
+	}
+
+	// File should have the new key.
+	migrated, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Contains(migrated, []byte("quality_dropped_ring_size: 128")) {
+		t.Errorf("migrated file missing new key:\n%s", migrated)
+	}
+	if bytes.Contains(migrated, []byte("quality_droped_ring_size:")) {
+		t.Errorf("migrated file still has old key:\n%s", migrated)
+	}
+	if !bytes.Contains(migrated, []byte("ollama_url: http://localhost:11434")) {
+		t.Errorf("unrelated line changed:\n%s", migrated)
+	}
+}
+
+func TestRunConfigMigrateEnv(t *testing.T) {
+	tmp := t.TempDir()
+	file := filepath.Join(tmp, ".env")
+	original := "NEXUS_QUALITY_DROPED_RING_SIZE=128\nNEXUS_OLLAMA_URL=http://localhost:11434\n"
+	if err := os.WriteFile(file, []byte(original), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runConfig([]string{"migrate", file}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0\nstderr: %s", code, stderr.String())
+	}
+
+	migrated, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Contains(migrated, []byte("NEXUS_QUALITY_DROPPED_RING_SIZE=128")) {
+		t.Errorf("migrated file missing new key:\n%s", migrated)
+	}
+	if bytes.Contains(migrated, []byte("NEXUS_QUALITY_DROPED_RING_SIZE=")) {
+		t.Errorf("migrated file still has old key:\n%s", migrated)
+	}
+}
+
+func TestRunConfigMigrateNoOpWhenClean(t *testing.T) {
+	tmp := t.TempDir()
+	file := filepath.Join(tmp, "clean.yaml")
+	if err := os.WriteFile(file, []byte("ollama_url: http://localhost:11434\n"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runConfig([]string{"migrate", file}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "no deprecated keys found") {
+		t.Errorf("expected 'no deprecated keys found' message, got: %s", out)
+	}
+
+	// No backup should be written when nothing changed.
+	if _, err := os.Stat(file + ".bak"); !os.IsNotExist(err) {
+		t.Errorf("backup should not be written when no changes made")
+	}
+}
+
+func TestRunConfigMigrateMissingFile(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runConfig([]string{"migrate", "/nonexistent/path.yaml"}, &stdout, &stderr)
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+}
+
+func TestRunConfigMigrateNoFileSpecified(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runConfig([]string{"migrate"}, &stdout, &stderr)
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+}
+
+func TestRunConfigMigrateHelpShownInUsage(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	_ = runConfig([]string{}, &stdout, &stderr)
+	out := stdout.String() + stderr.String()
+	if !strings.Contains(out, "migrate") {
+		t.Errorf("usage should document migrate subcommand:\n%s", out)
 	}
 }
