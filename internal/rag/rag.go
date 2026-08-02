@@ -529,7 +529,8 @@ type Store struct {
 	thresholdOverrides map[string]float64 // dir -> threshold; unspecified dirs use global threshold
 	index              *HNSWIndex
 	indexConfig        HNSWConfig
-	batchSize          int // number of files to embed per batch; 0 disables batching
+	batchSize          int  // number of files to embed per batch; 0 disables batching
+	recursive          bool // walk subdirectories during IndexDir (issue #1149)
 
 	lastIndexAt               int64
 	retrievalAttempts         uint64
@@ -550,6 +551,13 @@ type StoreOption func(*Store)
 // A value of 0 disables batching (each file is embedded individually).
 func WithBatchSize(n int) StoreOption {
 	return func(s *Store) { s.batchSize = n }
+}
+
+// WithRecursive enables recursive subdirectory walking in IndexDir
+// (issue #1149). When true, filepath.WalkDir descends into all
+// subdirectories; file paths are stored relative to the root.
+func WithRecursive(r bool) StoreOption {
+	return func(s *Store) { s.recursive = r }
 }
 
 // indexThreshold is the minimum store size before the HNSW index is used.
@@ -802,6 +810,141 @@ func (s *Store) EmbedHitCount() int64 {
 	return 0
 }
 
+// collectedFile holds the relative path and content of a file selected
+// for indexing. relPath uses forward slashes so it is stable as a
+// primary key across operating systems (issue #1149).
+type collectedFile struct {
+	relPath string
+	dir     string // parent directory relative to root (recursive mode); safeDir (flat mode)
+	content string
+}
+
+// collectIndexFiles enumerates all regular files under dir. When
+// recursive is true, filepath.WalkDir descends into all subdirectories
+// (issue #1149). Symlinks — both files and directories — are always
+// skipped (issue #107). The returned safeDir is the EvalSymlinks-
+// resolved canonical path used by verifyInsideDir.
+func collectIndexFiles(dir string, recursive bool) (safeDir string, files []collectedFile, err error) {
+	safeDir, err = resolveDir(dir)
+	if err != nil {
+		return "", nil, err
+	}
+
+	if recursive {
+		err = filepath.WalkDir(dir, func(path string, d os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				slog.Warn("rag: walk error, skipping",
+					slog.String("path", path),
+					slog.Any("err", walkErr),
+				)
+				return nil
+			}
+			if d.IsDir() {
+				if isSymlink(d) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if isSymlink(d) {
+				slog.Warn("rag: skipping symlink in examples dir (issue #107)",
+					slog.String("filename", d.Name()),
+					slog.String("dir", dir),
+				)
+				return nil
+			}
+			resolved, rErr := filepath.EvalSymlinks(path)
+			if rErr != nil {
+				slog.Error("rag: cannot resolve path, skipping",
+					slog.String("path", path),
+					slog.Any("err", rErr),
+				)
+				return nil
+			}
+			if !verifyInsideDir(safeDir, resolved) {
+				slog.Warn("rag: skipping file that escapes examples dir (issue #107)",
+					slog.String("resolved", resolved),
+					slog.String("base", safeDir),
+				)
+				return nil
+			}
+			content, rErr := os.ReadFile(path)
+			if rErr != nil {
+				slog.Error("rag read file", slog.String("path", path), slog.Any("err", rErr))
+				return nil
+			}
+			rel, rErr := filepath.Rel(dir, path)
+			if rErr != nil {
+				slog.Error("rag: cannot compute relative path, skipping",
+					slog.String("path", path),
+					slog.Any("err", rErr),
+				)
+				return nil
+			}
+			relPath := filepath.ToSlash(rel)
+			parent := filepath.ToSlash(filepath.Dir(rel))
+			if parent == "." {
+				parent = ""
+			}
+			files = append(files, collectedFile{
+				relPath: relPath,
+				dir:     parent,
+				content: string(content),
+			})
+			return nil
+		})
+		if err != nil {
+			return safeDir, nil, fmt.Errorf("rag: walk examples dir %q: %w", dir, err)
+		}
+		return safeDir, files, nil
+	}
+
+	// Flat mode: read top-level only (pre-#1149 behaviour).
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return safeDir, nil, fmt.Errorf("rag: read examples dir %q: %w", dir, err)
+	}
+	for _, f := range entries {
+		if f.IsDir() {
+			continue
+		}
+		if isSymlink(f) {
+			slog.Warn("rag: skipping symlink in examples dir (issue #107)",
+				slog.String("filename", f.Name()),
+				slog.String("dir", dir),
+			)
+			continue
+		}
+		path := filepath.Join(dir, f.Name())
+		resolved, rErr := filepath.EvalSymlinks(path)
+		if rErr != nil {
+			slog.Error("rag: cannot resolve path, skipping",
+				slog.String("filename", f.Name()),
+				slog.Any("err", rErr),
+			)
+			continue
+		}
+		if !verifyInsideDir(safeDir, resolved) {
+			slog.Warn("rag: skipping file that escapes examples dir (issue #107)",
+				slog.String("filename", f.Name()),
+				slog.String("resolved", resolved),
+				slog.String("base", safeDir),
+			)
+			continue
+		}
+		content, rErr := os.ReadFile(path)
+		if rErr != nil {
+			slog.Error("rag read file", slog.String("filename", f.Name()), slog.Any("err", rErr))
+			continue
+		}
+		files = append(files, collectedFile{
+			relPath: f.Name(), // backward compat: flat mode uses basename
+			dir:     safeDir,
+			content: string(content),
+		})
+	}
+	return safeDir, files, nil
+}
+
 // IndexDir walks dir, embedding every regular file's contents. It is
 // permissive: a missing directory is created (and indexing returns empty),
 // per-file read or embed errors are logged and skipped. This matches the
@@ -811,6 +954,11 @@ func (s *Store) EmbedHitCount() int64 {
 // leaks via injected few-shot examples. The directory path is resolved
 // once to canonicalize it, and every file's resolved path is verified
 // to remain inside the resolved directory.
+//
+// When the Store is configured with WithRecursive(true) (issue #1149),
+// filepath.WalkDir descends into all subdirectories and file paths are
+// stored relative to dir (e.g. "sub/deep.go") to avoid primary-key
+// collisions when multiple directories contain files with the same name.
 func (s *Store) IndexDir(ctx context.Context, dir string) error {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
@@ -823,56 +971,9 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 		return nil
 	}
 
-	safeDir, err := resolveDir(dir)
+	_, validFiles, err := collectIndexFiles(dir, s.recursive)
 	if err != nil {
 		return err
-	}
-
-	files, err := os.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("rag: read examples dir %q: %w", dir, err)
-	}
-
-	type fileInfo struct {
-		name    string
-		content string
-	}
-	var validFiles []fileInfo
-
-	for _, f := range files {
-		if f.IsDir() {
-			continue
-		}
-		if isSymlink(f) {
-			slog.Warn("rag: skipping symlink in examples dir (issue #107)",
-				slog.String("filename", f.Name()),
-				slog.String("dir", dir),
-			)
-			continue
-		}
-		path := filepath.Join(dir, f.Name())
-		resolved, err := filepath.EvalSymlinks(path)
-		if err != nil {
-			slog.Error("rag: cannot resolve path, skipping",
-				slog.String("filename", f.Name()),
-				slog.Any("err", err),
-			)
-			continue
-		}
-		if !verifyInsideDir(safeDir, resolved) {
-			slog.Warn("rag: skipping file that escapes examples dir (issue #107)",
-				slog.String("filename", f.Name()),
-				slog.String("resolved", resolved),
-				slog.String("base", safeDir),
-			)
-			continue
-		}
-		content, err := os.ReadFile(path)
-		if err != nil {
-			slog.Error("rag read file", slog.String("filename", f.Name()), slog.Any("err", err))
-			continue
-		}
-		validFiles = append(validFiles, fileInfo{name: f.Name(), content: string(content)})
 	}
 
 	if s.batchSize > 0 && len(validFiles) > 0 {
@@ -888,9 +989,6 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 			}
 			embs, err := s.embedder.EmbedBatch(ctx, texts)
 			if err != nil {
-				// Partial batch: entries were appended to s.examples but
-				// upsertExample was never called, so the HNSW index is stale.
-				// Invalidate it so Retrieve falls back to brute-force.
 				s.mu.Lock()
 				s.index = nil
 				s.mu.Unlock()
@@ -904,13 +1002,13 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 			s.mu.Lock()
 			for j, fi := range batch {
 				s.examples = append(s.examples, FewShotExample{
-					Filename:  fi.name,
-					Dir:       safeDir,
+					Filename:  fi.relPath,
+					Dir:       fi.dir,
 					Content:   fi.content,
 					Embedding: embs[j],
 				})
 				s.markIndexed(time.Now().UTC())
-				slog.Info("rag indexed", slog.String("filename", fi.name))
+				slog.Info("rag indexed", slog.String("filename", fi.relPath))
 			}
 			s.mu.Unlock()
 		}
@@ -918,28 +1016,23 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 		for _, fi := range validFiles {
 			emb, err := s.embedder.Embed(ctx, fi.content)
 			if err != nil {
-				slog.Error("rag embed file", slog.String("filename", fi.name), slog.Any("err", err))
+				slog.Error("rag embed file", slog.String("filename", fi.relPath), slog.Any("err", err))
 				continue
 			}
 			s.mu.Lock()
 			s.examples = append(s.examples, FewShotExample{
-				Filename:  fi.name,
-				Dir:       safeDir,
+				Filename:  fi.relPath,
+				Dir:       fi.dir,
 				Content:   fi.content,
 				Embedding: emb,
 			})
 			s.mu.Unlock()
 			s.markIndexed(time.Now().UTC())
-			slog.Info("rag indexed", slog.String("filename", fi.name))
+			slog.Info("rag indexed", slog.String("filename", fi.relPath))
 		}
 	}
 
-	// If EmbedBatch failed mid-way, s.index was invalidated but later batches
-	// still appended to s.examples. Rebuild synchronously now so IndexDir
-	// returns with a consistent state instead of leaving the index incomplete
-	// until the next Retrieve call (issue #976).
 	s.maybeRebuildIndex()
-
 	return nil
 }
 

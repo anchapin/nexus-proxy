@@ -84,6 +84,7 @@ type YAMLConfig struct {
 	CohereAPIKey             string  `yaml:"cohere_api_key"`
 	RAGDBPath                string  `yaml:"rag_db_path"`
 	RAGPollInterval          string  `yaml:"rag_poll_interval"`
+	RAGRecursive             bool    `yaml:"rag_recursive"`
 	RAGEmbedCacheSize        int     `yaml:"rag_embed_cache_size"`
 	RAGEmbedCacheTTL         string  `yaml:"rag_embed_cache_ttl"`
 	RAGEmbedCacheWaitTimeout string  `yaml:"rag_embed_cache_wait_timeout"`
@@ -535,6 +536,9 @@ func LoadYAML(path string) (Config, error) {
 			d = 0
 		}
 		cfg.RAGPollInterval = d
+	}
+	if v := os.Getenv("NEXUS_RAG_RECURSIVE"); v != "" {
+		cfg.RAGRecursive = parseBoolEnvStr(v, false)
 	}
 	if v := os.Getenv("NEXUS_RAG_EMBED_CACHE_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -1172,6 +1176,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		// Non-string fields with defaults
 		RAGThreshold:                  yc.floatDefault(yc.RAGThreshold, 0.55),
 		RAGDBPath:                     yc.stringDefault(yc.RAGDBPath, DefaultRAGDBPath()),
+		RAGRecursive:                  yc.boolFieldDefault(yc.RAGRecursive, false),
 		RAGEmbedCacheSize:             yc.intDefault(yc.RAGEmbedCacheSize, 256),
 		RAGEmbedCacheTTL:              yc.durationDefault(yc.RAGEmbedCacheTTL, 24*time.Hour),
 		RAGEmbedCacheWaitTimeout:      yc.durationDefault(yc.RAGEmbedCacheWaitTimeout, 5*time.Second),

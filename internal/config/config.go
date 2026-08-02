@@ -118,6 +118,13 @@ type Config struct {
 	RAGDBPath       string        // on-disk SQLite database for the RAG store
 	RAGPollInterval time.Duration // watcher cadence; 0 disables the watcher
 
+	// RAG recursive indexing (issue #1149). When true, IndexDir and the
+	// watcher use filepath.WalkDir to descend into all subdirectories.
+	// FewShotExample.Filename stores the relative path from the root
+	// (e.g. "internal/handlers/chat.go") to avoid primary-key collisions
+	// when multiple directories contain files with the same name.
+	RAGRecursive bool // recursive subdirectory indexing; false = flat scan
+
 	// RAG embedding cache (issue #115). Prompt embeddings are
 	// deterministic for a given model+text pair, so they are memoized
 	// in a bounded LRU with TTL. RAGEmbedCacheSize=0 disables the cache;
@@ -796,6 +803,10 @@ func Load() (Config, error) {
 		pollInterval = 0
 	}
 	cfg.RAGPollInterval = pollInterval
+
+	// RAG recursive subdirectory indexing (issue #1149). Default false
+	// for backward compatibility.
+	cfg.RAGRecursive = getFileBool("rag_recursive", "NEXUS_RAG_RECURSIVE", false)
 
 	// RAG embedding cache size (issue #115). Default 256 keeps the
 	// cache useful for repetitive coding prompts while bounding

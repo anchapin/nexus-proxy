@@ -458,6 +458,10 @@ func (p *PersistentStore) LoadOrIndex(ctx context.Context, dir string) (int, err
 // logic). When batchSize == 0, each file is embedded individually via
 // Embed.
 //
+// When the embedded Store is configured with WithRecursive(true)
+// (issue #1149), filepath.WalkDir descends into all subdirectories
+// and file paths are stored relative to dir.
+//
 // Security: symlinks are skipped (issue #107) to prevent confidentiality
 // leaks via injected few-shot examples.
 func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
@@ -472,59 +476,9 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 		return nil
 	}
 
-	safeDir, err := resolveDir(dir)
+	_, validFiles, err := collectIndexFiles(dir, p.Store.recursive)
 	if err != nil {
 		return err
-	}
-
-	files, err := os.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("rag: read examples dir %q: %w", dir, err)
-	}
-
-	type fileInfo struct {
-		name    string
-		content string
-	}
-	var validFiles []fileInfo
-
-	for _, f := range files {
-		if f.IsDir() {
-			continue
-		}
-		if isSymlink(f) {
-			slog.Warn("rag: skipping symlink in examples dir (issue #107)",
-				slog.String("filename", f.Name()),
-				slog.String("dir", dir),
-			)
-			continue
-		}
-		path := filepath.Join(dir, f.Name())
-		resolved, err := filepath.EvalSymlinks(path)
-		if err != nil {
-			slog.Error("rag: cannot resolve path, skipping",
-				slog.String("filename", f.Name()),
-				slog.Any("err", err),
-			)
-			continue
-		}
-		if !verifyInsideDir(safeDir, resolved) {
-			slog.Warn("rag: skipping file that escapes examples dir (issue #107)",
-				slog.String("filename", f.Name()),
-				slog.String("resolved", resolved),
-				slog.String("base", safeDir),
-			)
-			continue
-		}
-		content, err := os.ReadFile(path)
-		if err != nil {
-			slog.Error("rag read file",
-				slog.String("filename", f.Name()),
-				slog.Any("err", err),
-			)
-			continue
-		}
-		validFiles = append(validFiles, fileInfo{name: f.Name(), content: string(content)})
 	}
 
 	if p.Store.batchSize > 0 && len(validFiles) > 0 {
@@ -540,9 +494,6 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 			}
 			embs, err := p.embedder.EmbedBatch(ctx, texts)
 			if err != nil {
-				// Partial batch: entries were upserted to DB but the HNSW
-				// index was not invalidated via upsertExample. Invalidate it
-				// so Retrieve falls back to brute-force.
 				p.mu.Lock()
 				p.index = nil
 				p.mu.Unlock()
@@ -555,12 +506,13 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 			}
 			for j, fi := range batch {
 				if err := p.Upsert(ctx, FewShotExample{
-					Filename:  fi.name,
+					Filename:  fi.relPath,
+					Dir:       fi.dir,
 					Content:   fi.content,
 					Embedding: embs[j],
 				}); err != nil {
 					slog.Warn("rag: embed batch upsert failed",
-						slog.String("filename", fi.name),
+						slog.String("filename", fi.relPath),
 						slog.Any("err", err),
 					)
 					p.mu.Lock()
@@ -568,7 +520,7 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 					p.mu.Unlock()
 					continue
 				}
-				slog.Info("rag indexed", slog.String("filename", fi.name))
+				slog.Info("rag indexed", slog.String("filename", fi.relPath))
 			}
 		}
 	} else {
@@ -576,23 +528,24 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 			emb, err := p.embedder.Embed(ctx, fi.content)
 			if err != nil {
 				slog.Error("rag embed file",
-					slog.String("filename", fi.name),
+					slog.String("filename", fi.relPath),
 					slog.Any("err", err),
 				)
 				continue
 			}
 			if err := p.Upsert(ctx, FewShotExample{
-				Filename:  fi.name,
+				Filename:  fi.relPath,
+				Dir:       fi.dir,
 				Content:   fi.content,
 				Embedding: emb,
 			}); err != nil {
 				slog.Error("rag persist file",
-					slog.String("filename", fi.name),
+					slog.String("filename", fi.relPath),
 					slog.Any("err", err),
 				)
 				continue
 			}
-			slog.Info("rag indexed", slog.String("filename", fi.name))
+			slog.Info("rag indexed", slog.String("filename", fi.relPath))
 		}
 	}
 

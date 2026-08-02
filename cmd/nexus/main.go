@@ -232,14 +232,14 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 	cachedEmb := emb
 	if !cfg.RAGPersistentEnabled() {
 		slog.Info("rag persistent store disabled (NEXUS_RAG_DB is empty); using in-memory store")
-		store := rag.NewStore(cachedEmb, cfg.RAGThreshold, rag.WithBatchSize(cfg.RAGBatchSize))
+		store := rag.NewStore(cachedEmb, cfg.RAGThreshold, rag.WithBatchSize(cfg.RAGBatchSize), rag.WithRecursive(cfg.RAGRecursive))
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
 		return store, nil, nil, cachedEmb
 	}
 
-	ps, err := rag.OpenPersistentStore(cfg.RAGDBPath, cachedEmb, cfg.RAGThreshold, rag.WithBatchSize(cfg.RAGBatchSize))
+	ps, err := rag.OpenPersistentStore(cfg.RAGDBPath, cachedEmb, cfg.RAGThreshold, rag.WithBatchSize(cfg.RAGBatchSize), rag.WithRecursive(cfg.RAGRecursive))
 	if err != nil {
 		// Persistence is a best-effort optimisation. Fall back to
 		// the in-memory store so the proxy still serves traffic —
@@ -249,7 +249,7 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 			slog.String("path", cfg.RAGDBPath),
 			slog.Any("err", err),
 		)
-		store := rag.NewStore(cachedEmb, cfg.RAGThreshold, rag.WithBatchSize(cfg.RAGBatchSize))
+		store := rag.NewStore(cachedEmb, cfg.RAGThreshold, rag.WithBatchSize(cfg.RAGBatchSize), rag.WithRecursive(cfg.RAGRecursive))
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
@@ -266,7 +266,7 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 			slog.Any("err", err),
 		)
 		_ = ps.Close()
-		store := rag.NewStore(cachedEmb, cfg.RAGThreshold)
+		store := rag.NewStore(cachedEmb, cfg.RAGThreshold, rag.WithRecursive(cfg.RAGRecursive))
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
@@ -280,6 +280,7 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 	var watcher *rag.Watcher
 	if cfg.RAGWatcherEnabled() {
 		watcher = rag.NewWatcher(ps, cfg.ExamplesDir, cfg.RAGPollInterval)
+		watcher.SetRecursive(cfg.RAGRecursive)
 		watcher.Start(context.Background())
 		slog.Info("rag file watcher enabled",
 			slog.String("dir", cfg.ExamplesDir),
