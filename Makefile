@@ -103,6 +103,12 @@ ci: vet build check test test-race lint bench-short
 docker-build:
 	docker build .
 
+# docker-build smoke-builds the container image. Used by the ci.yml
+# `docker` job (issue #541) so Dockerfile / go.mod Go-version drift is
+# caught on every PR. Build only — never pushes. Requires Docker.
+docker-build:
+	docker build .
+
 clean:
 	rm -rf bin/ coverage.txt coverage.html
 

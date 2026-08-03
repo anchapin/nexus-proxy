@@ -18,7 +18,7 @@ make test-race      # race detector — required to merge
 make lint           # golangci-lint v2.12.2
 make fmt            # gofmt -w (in place)
 make bench-baseline # regenerate bench/baseline.txt for benchstat (issue #1186)
-make ci             # vet + build + test + test-race + lint
+make ci             # vet + build + check + test + test-race + lint + bench-short
 ```
 
 `go run ./cmd/nexus` also works. **Go 1.26** (CI pin); `go.mod` declares 1.25.
@@ -58,6 +58,9 @@ start the proxy):
 - `nexus config migrate <file>` — rewrite deprecated env-var/YAML keys to
   current names in place (writes a `.bak` backup). Uses the compile-time
   registry in `internal/config/deprecations.go` (issue #1180).
+- `nexus config show` — print resolved config (env + file merged).
+  `--json` for machine-readable output, `--reloadable` for hot-reloadable
+  vars only, `--diff <file>` to compare against a YAML file (issue #1237).
 - `nexus dashboard` — daily savings summary view.
 - `nexus --version` (`-v` / `version`) — build version (`dev` unless
   `-ldflags -X main.version=...` overrides it; Makefile + release.yml set it).
@@ -263,6 +266,12 @@ breaker.
 TCP peer is in `NEXUS_TRUSTED_PROXIES` CIDR allowlist. Empty =
 trust nobody (safe default). **Invalid CIDR fails boot** (not silent).
 
+**Inbound IP allowlist** (`NEXUS_ALLOW_CIDRS`, issue #1240): when set,
+only clients whose IP falls within at least one CIDR are permitted; all
+others receive HTTP 403. For air-gapped/local-only deployments. Empty
+(default) disables. `NEXUS_ALLOW_CIDRS_STRICT` (default false) controls
+whether `/healthz` and `/metrics` are exempt from the allowlist.
+
 ## TOON compression (issue #123)
 
 `middleware.SerializeToTOON` rewrites JSON arrays into CSV-like shape.
@@ -295,6 +304,11 @@ directories contain files with the same name. Symlinks are still skipped (issue 
 
 Async LLM-as-a-judge samples ~10% of `RouteLocal` completions and scores
 them 1–5 via a frontier endpoint. Disabled when `NEXUS_JUDGE_SAMPLE_RATE <= 0`.
+
+**Adaptive judge sampling** (`NEXUS_JUDGE_ADAPTIVE_ENABLED`, default false, issue #1232):
+when enabled, the sample rate adapts based on historical quality scores —
+high-confidence periods reduce sampling to save frontier calls; low-confidence
+periods increase it to catch regressions early.
 
 **Judge-guided adaptive routing** (`NEXUS_ROUTING_CONFIDENCE_DB`):
 historical scores aggregated by task category feed back to the SLM as a
@@ -339,6 +353,11 @@ stock plaintext bind must not advertise HSTS.
 `internal/middleware/security.go` does not exist — do not add it.
 `internal/middleware` is intentionally net/http-free. Any response-header
 middleware belongs in `internal/handlers`.
+
+**Inbound mTLS** (`NEXUS_TLS_CLIENT_CA_FILE`, issue #1241): when set,
+the proxy requires and verifies client certificates using the specified CA
+PEM file. The verified certificate's CN is surfaced via `X-Nexus-Client-CN`
+in logs and audit records. Requires `NEXUS_TLS_ENABLED=true`.
 
 ## Auth brute-force protection (issue #296)
 

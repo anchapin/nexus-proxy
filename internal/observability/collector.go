@@ -540,6 +540,14 @@ func (c *Collector) Submit(e ObservabilityEvent) {
 	if e.SLMConfidence > 0 && e.SLMTaskType != "" {
 		c.ObserveSLMConfidence(e.SLMTaskType, e.SLMConfidence)
 	}
+	// SLM confidence histogram (issue #425). Recorded when both
+	// Confidence > 0 and TaskType is a known category. A zero
+	// confidence means the SLM was not consulted (guardrail/DSL
+	// path); an empty TaskType means cache hit or no confidence
+	// store was wired.
+	if e.SLMConfidence > 0 && e.SLMTaskType != "" {
+		c.ObserveSLMConfidence(e.SLMTaskType, e.SLMConfidence)
+	}
 }
 
 // RequestsLocal returns the cumulative local-route request count.
@@ -1236,6 +1244,10 @@ func (c *Collector) ObservePipelineStage(e PipelineStageEvent) {
 		} else {
 			c.stageUpstream.Observe(float64(e.UpstreamFirstByteMs))
 		}
+	}
+	// SLM confidence histogram (issue #425).
+	if e.SLMConfidence > 0 && e.SLMTaskType != "" {
+		c.ObserveSLMConfidence(e.SLMTaskType, e.SLMConfidence)
 	}
 	// SLM confidence histogram (issue #425).
 	if e.SLMConfidence > 0 && e.SLMTaskType != "" {

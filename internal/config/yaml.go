@@ -1019,6 +1019,9 @@ func LoadYAML(path string) (Config, error) {
 		if f < 0 || f > 1 {
 			return cfg, configError("NEXUS_FUSION_AGREEMENT_THRESHOLD", "must be a number in [0,1]", v, "0.85")
 		}
+		if f < 0 || f > 1 {
+			return cfg, fmt.Errorf("config: NEXUS_FUSION_AGREEMENT_THRESHOLD must be in [0,1], got %v", f)
+		}
 		cfg.FusionAgreementThreshold = f
 	}
 	if v := os.Getenv("NEXUS_FUSION_SIMILARITY_MODE"); v != "" {
@@ -1696,6 +1699,87 @@ func LoadYAML(path string) (Config, error) {
 	WarnDeprecatedEnv()
 	warnDeprecatedYAMLKeysFromData(data)
 
+	// Auth brute-force protection (issue #840)
+	if v := os.Getenv("NEXUS_AUTH_RATE_LIMIT_RPM"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_AUTH_RATE_LIMIT_RPM: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.AuthRateLimitRPM = n
+	}
+	if v := os.Getenv("NEXUS_AUTH_RATE_LIMIT_BURST"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_AUTH_RATE_LIMIT_BURST: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.AuthRateLimitBurst = n
+	}
+	if v := os.Getenv("NEXUS_AUTH_RATE_LIMIT_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_AUTH_RATE_LIMIT_WINDOW: %w", err)
+		}
+		if d < 0 {
+			d = 0
+		}
+		cfg.AuthRateLimitWindow = d
+	}
+
+	// Tracing
+	if v := os.Getenv("NEXUS_TRACING_ENDPOINT"); v != "" {
+		cfg.TracingEndpoint = v
+	}
+	if v := os.Getenv("NEXUS_TRACING_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_TIMEOUT: %w", err)
+		}
+		if d < 0 {
+			d = 10 * time.Second
+		}
+		cfg.TracingTimeout = d
+	}
+	if v := os.Getenv("NEXUS_TRACING_QUEUE_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_QUEUE_SIZE: %w", err)
+		}
+		if n < 0 {
+			n = 256
+		}
+		cfg.TracingQueueSize = n
+	}
+	if v := os.Getenv("NEXUS_TRACING_BATCH_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_BATCH_SIZE: %w", err)
+		}
+		if n < 1 {
+			n = 64
+		}
+		cfg.TracingBatchSize = n
+	}
+	if v := os.Getenv("NEXUS_TRACING_SAMPLE_RATE"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_TRACING_SAMPLE_RATE: %w", err)
+		}
+		if f < 0 {
+			f = 0
+		}
+		if f > 1 {
+			f = 1
+		}
+		cfg.TracingSampleRate = f
+	}
+
+	ValidateShutdownTimeout(cfg)
 	return cfg, nil
 }
 
