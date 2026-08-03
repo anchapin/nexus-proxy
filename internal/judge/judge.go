@@ -242,28 +242,6 @@ func newSeededRand() *rand.Rand {
 	return rand.New(rand.NewSource(seed))
 }
 
-// newSeededRand returns a *rand.Rand seeded from a cryptographic
-// entropy source. Seeding exclusively from time.Now().UnixNano()
-// collapses to identical streams when multiple evaluators are
-// constructed within the same nanosecond, biasing the sample rate
-// (issue #589). crypto/rand supplies 64 bits of entropy; if it fails
-// (extremely rare — e.g. /dev/urandom unavailable) the fallback mixes
-// the nanosecond clock with the PID so a same-nanosecond pair of
-// evaluators on the same host still diverge.
-//
-// The seed is drawn once at construction; Sample() remains a single
-// mutex-guarded Float64() draw, so this change is latency-neutral.
-func newSeededRand() *rand.Rand {
-	var seed int64
-	var b [8]byte
-	if _, err := crand.Read(b[:]); err == nil {
-		seed = int64(binary.LittleEndian.Uint64(b[:]))
-	} else {
-		seed = time.Now().UnixNano() ^ (int64(os.Getpid()) << 32)
-	}
-	return rand.New(rand.NewSource(seed))
-}
-
 // NewEvaluator wires the evaluator and starts its worker pool. The
 // workers live until Close is called.
 //
@@ -767,11 +745,6 @@ type noopStorage struct{}
 func (noopStorage) Record(JudgeScore) error         { return nil }
 func (noopStorage) RecentScores(int) ([]int, error) { return nil, nil }
 func (noopStorage) Close() error                    { return nil }
-
-// cleanEveryN is the interval (in inserts) between stale-entry cleanup
-// passes. Every cleanEveryN inserts, entries older than 2*window are deleted
-// to keep memory bounded regardless of the sliding window size.
-const cleanEveryN = 1000
 
 // cleanEveryN is the interval (in inserts) between stale-entry cleanup
 // passes. Every cleanEveryN inserts, entries older than 2*window are deleted
