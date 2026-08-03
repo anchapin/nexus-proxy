@@ -2961,13 +2961,6 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 	}
 	next.AuthRateLimitWindow = authRateLimitWindow
 
-	// RAG circuit breaker threshold (issue #1311).
-	cbThreshold, _ := getEnvInt("NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD", prev.RAGCircuitBreakerThreshold)
-	if cbThreshold < 0 {
-		cbThreshold = 0
-	}
-	next.RAGCircuitBreakerThreshold = cbThreshold
-
 	logLevel, logLevelErr := parseLogLevel(os.Getenv("NEXUS_LOG_LEVEL"))
 	if logLevelErr != nil {
 		slog.Warn("invalid NEXUS_LOG_LEVEL, using info level", slog.String("reason", logLevelErr.Error()))
@@ -3041,6 +3034,22 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 		tracingSampleRate = clamped
 	}
 	next.TracingSampleRate = tracingSampleRate
+
+	// OIDC JWKS refresh interval (issue #1306): re-read from env so SIGHUP
+	// pushes the updated interval into any live JWTAuthenticator on next refresh.
+	jwksRefresh, _ := getEnvDuration("NEXUS_OIDC_JWKS_REFRESH", prev.OIDCJWKSRefresh)
+	if jwksRefresh <= 0 {
+		jwksRefresh = 15 * time.Minute
+	}
+	next.OIDCJWKSRefresh = jwksRefresh
+
+	// RAG circuit breaker threshold: re-read from env so SIGHUP pushes the
+	// updated threshold into the live RAG embedder circuit breaker.
+	cbThreshold, _ := getEnvInt("NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD", prev.RAGCircuitBreakerThreshold)
+	if cbThreshold < 0 {
+		cbThreshold = 0
+	}
+	next.RAGCircuitBreakerThreshold = cbThreshold
 
 	return next, result
 }
@@ -3309,6 +3318,7 @@ var hotReloadableEnvs = map[string]bool{
 	"NEXUS_BUDGET_ALERT_THRESHOLD":        true,
 	"NEXUS_FUSION_AGREEMENT_THRESHOLD":    true,
 	"NEXUS_TRACING_SAMPLE_RATE":           true,
+	"NEXUS_OIDC_JWKS_REFRESH":             true, // issue #1306
 	"NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD": true,
 }
 
