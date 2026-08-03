@@ -209,7 +209,11 @@ type Config struct {
 	// same directory as the new chunk. When true, compares against all
 	// indexed chunks regardless of directory.
 	RAGDedupCrossDir bool // NEXUS_RAG_DEDUP_CROSS_DIR
-
+	// RAG hybrid retrieval (issue #1242). When > 0, BM25 keyword scores
+	// are combined with cosine similarity via Reciprocal Rank Fusion.
+	// 0.0 = pure semantic (backward compatible), 1.0 = pure keyword.
+	// Values between 0 and 1 blend both signals; 0.5 is a balanced default.
+	RAGHybridWeight float64 // NEXUS_RAG_HYBRID_WEIGHT
 	// Routing
 	TokenGuardrail                int           // estimated tokens above this force frontier (6000)
 	SLMTimeout                    time.Duration // Qwen3-Coder routing timeout (8s)
@@ -1194,7 +1198,13 @@ func Load() (Config, error) {
 	// only compares against chunks in the same directory. When true,
 	// compares against all indexed chunks regardless of directory.
 	cfg.RAGDedupCrossDir = getEnvBool("NEXUS_RAG_DEDUP_CROSS_DIR", false)
-
+	// RAG hybrid BM25 + semantic retrieval (issue #1242). 0.0 = pure semantic,
+	// 1.0 = pure keyword. Default 0.0 preserves byte-for-byte backward compatibility.
+	hybridWeight, err := getEnvFloat("NEXUS_RAG_HYBRID_WEIGHT", 0.0)
+	if err != nil {
+		return cfg, fmt.Errorf("NEXUS_RAG_HYBRID_WEIGHT: %w", err)
+	}
+	cfg.RAGHybridWeight = hybridWeight
 	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
 	if err != nil {
 		return cfg, err
