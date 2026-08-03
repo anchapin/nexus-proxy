@@ -28,9 +28,13 @@ Flags:
   --explain  Append the bias note that would be injected into the SLM
              system prompt (if any).
 
-Exit code is always 0. Errors are printed to stderr and the command
-continues to the next prompt.
+Exit codes:
+  0   All prompts routed successfully (or no prompts provided)
+  1   More than 50%% of prompts produced per-prompt errors (SLM timeout,
+      invalid JSON, etc.)
+  2   Fatal error: config load failure or HTTP client creation failure
 
+Per-prompt errors are printed to stderr and count toward the 50%% threshold.
 Examples:
   nexus routing-preview "refactor this CSS"
   nexus routing-preview --stdin < prompts.txt
@@ -58,7 +62,7 @@ func runRoutingPreview(args []string, stdout, stderr io.Writer) int {
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(stderr, "nexus routing-preview: config: %v\n", err)
-		return 0
+		return 2
 	}
 
 	httpClient := &http.Client{}
@@ -81,7 +85,7 @@ func runRoutingPreview(args []string, stdout, stderr io.Writer) int {
 		prompts, err = readStdinLines(os.Stdin)
 		if err != nil {
 			fmt.Fprintf(stderr, "nexus routing-preview: stdin: %v\n", err)
-			return 0
+			return 1
 		}
 		if len(prompts) == 0 {
 			return 0
@@ -96,6 +100,7 @@ func runRoutingPreview(args []string, stdout, stderr io.Writer) int {
 
 	ctx := context.Background()
 
+	var perPromptErrors int
 	for _, prompt := range prompts {
 		if prompt == "" {
 			continue
@@ -106,6 +111,10 @@ func runRoutingPreview(args []string, stdout, stderr io.Writer) int {
 			GuardrailSource: "static-fallback",
 			Context:         ctx,
 		})
+		if dec.Source == router.SourceSLMError {
+			perPromptErrors++
+			fmt.Fprintf(stderr, "nexus routing-preview: prompt %d: slm error: %s\n", perPromptErrors, dec.Reason)
+		}
 		reason := decisionReason(dec, cfg.DSLFusionPatterns, cfg.DSLFormattingPatterns, cfg.DSLLocalPatterns, cfg.DSLUnicodePatterns, prompt)
 		line := formatDecision(dec, reason)
 		if explain {
@@ -114,6 +123,14 @@ func runRoutingPreview(args []string, stdout, stderr io.Writer) int {
 			}
 		}
 		fmt.Fprintln(stdout, line)
+	}
+
+	// If more than 50% of prompts failed, exit 1
+	if len(prompts) > 0 && perPromptErrors > 0 {
+		// Use integer division to calculate threshold: errors > prompts/2
+		if perPromptErrors*2 > len(prompts) {
+			return 1
+		}
 	}
 
 	return 0
