@@ -216,8 +216,9 @@ type RouteCounters struct {
 	// ("fusion", "formatting", "local", "unicode"); dslMisses is a
 	// single counter incremented when DSL had no opinion and the
 	// request fell through to SLM.
-	dslHits   map[string]*uint64
-	dslMisses *uint64
+	dslHits     map[string]*uint64
+	dslMisses   *uint64
+	dslPromoted *uint64 // nexus_route_dsl_promoted_total (issue #1297)
 
 	// Response-content redaction counter (issue #1172). Labelled by
 	// profile ("secrets", "pii", "custom"). Incremented by the
@@ -246,6 +247,7 @@ func NewRouteCounters() *RouteCounters {
 	ragHits := uint64(0)
 	slmEmbedErrs := uint64(0)
 	dslMisses := uint64(0)
+	dslPromoted := uint64(0)
 	return &RouteCounters{
 		routeDecisions:           make(map[counterKey]*uint64),
 		slmDecisions:             make(map[counterKey]*uint64),
@@ -268,6 +270,7 @@ func NewRouteCounters() *RouteCounters {
 		promptInjectionHits:      make(map[string]*uint64),
 		dslHits:                  make(map[string]*uint64),
 		dslMisses:                &dslMisses,
+		dslPromoted:              &dslPromoted,
 		redacted:                 make(map[string]*uint64),
 	}
 }
@@ -549,6 +552,16 @@ func (rc *RouteCounters) ObserveDSLMiss() {
 		return
 	}
 	atomic.AddUint64(rc.dslMisses, 1)
+}
+
+// IncDSLPromoted increments the auto-promoted DSL counter (issue #1297).
+// Called when the PatternPromoter auto-promotes an n-gram to the DSL fast-pass.
+// Safe for concurrent use; nil receivers are no-ops.
+func (rc *RouteCounters) IncDSLPromoted() {
+	if rc == nil || rc.dslPromoted == nil {
+		return
+	}
+	atomic.AddUint64(rc.dslPromoted, 1)
 }
 
 // slmCacheEvictionSlot returns the *uint64 for the SLM cache eviction
@@ -1078,6 +1091,13 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 		return total, err
 	} else {
 		total += n
+	}
+	// Auto-promoted DSL counter (issue #1297).
+	dslPromoted := atomic.LoadUint64(rc.dslPromoted)
+	if n, err := fmt.Fprintf(w, "# HELP nexus_route_dsl_promoted_total Total n-gram patterns auto-promoted to the DSL fast-pass by the PatternPromoter (issue #1297).\n# TYPE nexus_route_dsl_promoted_total counter\nnexus_route_dsl_promoted_total %d\n", dslPromoted); err != nil {
+		return total, err
+	} else {
+		total += int64(n)
 	}
 	// Response-content redaction counter (issue #1172).
 	if n, err := writeLabelledSeries(w, "nexus_redacted_total",

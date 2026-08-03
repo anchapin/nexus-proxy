@@ -71,6 +71,7 @@ snake_case naming.
 |-------|----------|---------|
 | `guardrail` | `router.SourceGuardrail` | VRAM-aware token budget forced frontier |
 | `dsl` | `router.SourceDSL` | Regex fast-pass matched |
+| `dsl-promoted` | `router.SourceDSLPromoted` | N-gram auto-promoted to DSL fast-pass by PatternPromoter (issue #1165) |
 | `slm` | `router.SourceSLM` | SLM returned a valid decision |
 | `slm-error` | `router.SourceSLMError` | SLM call failed (timeout, bad JSON) |
 | `escalation` | `router.SourceEscalation` | Defensive nil-SLM fallback to frontier |
