@@ -113,6 +113,7 @@ type Config struct {
 	// StatusPublic is true (default false) — the diagnostics surface
 	// (frontier configured, judge enabled, VRAM state) is
 	// reconnaissance-grade and should be gated by default.
+	// gitleaks:allow // issue #1274: false positive — "APIKey" matches generic-api-key but this is a struct field name, not a secret.
 	ProxyAPIKey  string // NEXUS_PROXY_API_KEY; empty disables auth
 	StatusPublic bool   // NEXUS_STATUS_PUBLIC; exposes /status without auth
 
@@ -958,10 +959,13 @@ func Load() (Config, error) {
 	cfg.EmbeddingModel = getFileString("embedding_model", "NEXUS_EMBEDDING_MODEL", "nomic-embed-text")
 	cfg.FrontierURL = getFileString("frontier_url", "NEXUS_FRONTIER_URL", "https://api.openai.com/v1/chat/completions")
 	cfg.FrontierModel = getFileString("frontier_model", "NEXUS_FRONTIER_MODEL", "gpt-4o")
+	// gitleaks:allow // issue #1274: false positive — "API_KEY" matches generic-api-key but this is an env var name, not a secret.
 	cfg.FrontierKey = getEnv("NEXUS_FRONTIER_API_KEY", "") // secrets via env only
 	cfg.ZAIURL = getFileString("zai_url", "NEXUS_ZAI_URL", "https://api.z.ai/v1/chat/completions")
 	cfg.ZAIModel = getFileString("zai_model", "NEXUS_ZAI_MODEL", "glm-4.6")
+	// gitleaks:allow // issue #1274: false positive — "API_KEY" matches generic-api-key but this is an env var name, not a secret.
 	cfg.ZAIKey = getEnv("NEXUS_ZAI_API_KEY", "")        // secrets via env only
+	// gitleaks:allow // issue #1274: false positive — "API_KEY" matches generic-api-key but this is an env var name, not a secret.
 	cfg.ProxyAPIKey = getEnv("NEXUS_PROXY_API_KEY", "") // secrets via env only
 
 	// Secret-manager backend configuration (issue #1173). These are always
@@ -3330,13 +3334,13 @@ var EnvToYAMLKey = map[string]string{
 	"NEXUS_EMBEDDING_MODEL":                   "embedding_model",
 	"NEXUS_FRONTIER_URL":                      "frontier_url",
 	"NEXUS_FRONTIER_MODEL":                    "frontier_model",
-	"NEXUS_FRONTIER_API_KEY":                  "frontier_api_key",
+	"NEXUS_FRONTIER_API_KEY":                  "frontier_api_key", // gitleaks:allow // issue #1274: false positive — map key is an env var name, not a secret.
 	"NEXUS_FRONTIER_COST_PER_1K":              "frontier_cost_per_1k",
 	"NEXUS_ZAI_URL":                           "zai_url",
 	"NEXUS_ZAI_MODEL":                         "zai_model",
 	"NEXUS_ZAI_API_KEY":                       "zai_api_key",
 	"NEXUS_ZAI_COST_PER_1K":                   "zai_cost_per_1k",
-	"NEXUS_PROXY_API_KEY":                     "proxy_api_key",
+	"NEXUS_PROXY_API_KEY":                     "proxy_api_key", // gitleaks:allow // issue #1274: false positive — map key is an env var name, not a secret.
 	"NEXUS_STATUS_PUBLIC":                     "status_public",
 	"NEXUS_API_KEYS_FILE":                     "api_keys_file",
 	"NEXUS_AUTH_MODE":                         "auth_mode",
@@ -3593,6 +3597,7 @@ var allEnvFields = []envField{
 	{"NEXUS_EMBEDDER_BASE_URL", func(c *Config) string { return c.EmbedderBaseURL }},
 	{"NEXUS_EMBEDDER_TYPE", func(c *Config) string { return string(c.EmbedderType) }},
 	{"NEXUS_EXAMPLES_DIR", func(c *Config) string { return c.ExamplesDir }},
+	// gitleaks:allow // issue #1274: false positive — map key is an env var name, not a secret.
 	{"NEXUS_FRONTIER_API_KEY", func(c *Config) string { return redact(c.FrontierKey) }},
 	{"NEXUS_FRONTIER_COST_PER_1K", func(c *Config) string { return fmt.Sprintf("%g", c.FrontierCostPer1K) }},
 	{"NEXUS_FRONTIER_FAILOVER", func(c *Config) string { return fmt.Sprintf("%t", c.FrontierFailover) }},
@@ -3651,6 +3656,7 @@ var allEnvFields = []envField{
 	{"NEXUS_PROBE_TIMEOUT", func(c *Config) string { return c.ProbeTimeout.String() }},
 	{"NEXUS_PROMPT_INJECTION_MODE", func(c *Config) string { return injectionModeString(c.PromptInjectionMode) }},
 	{"NEXUS_PROVIDER_TAIL_WEIGHT", func(c *Config) string { return fmt.Sprintf("%g", c.ProviderTailWeight) }},
+	// gitleaks:allow // issue #1274: false positive — map key is an env var name, not a secret.
 	{"NEXUS_PROXY_API_KEY", func(c *Config) string { return redact(c.ProxyAPIKey) }},
 	{"NEXUS_RAG_BATCH_SIZE", func(c *Config) string { return fmt.Sprintf("%d", c.RAGBatchSize) }},
 	{"NEXUS_RAG_CHUNK_TOKENS", func(c *Config) string { return fmt.Sprintf("%d", c.RAGChunkTokens) }},
