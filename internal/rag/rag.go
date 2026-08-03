@@ -631,6 +631,7 @@ func WithDedupCrossDir(b bool) StoreOption {
 func WithHybridWeight(w float64) StoreOption {
 	return func(s *Store) { s.hybridWeight = w }
 }
+
 // indexThreshold is the minimum store size before the HNSW index is used.
 // Below this threshold, brute-force scan is fast enough and avoids the
 // index build cost. Issue #420 measured ~1ms for 50 snippets brute-force
