@@ -286,6 +286,10 @@ func (c *Cascade) RunBuffered(ctx context.Context, w http.ResponseWriter, client
 			slog.Any("err", err),
 		)
 		if !retry {
+			res.ServedBy = step.Name
+			h := w.Header()
+			h.Set("X-Nexus-Cascade-Served-By", step.Name)
+			w.WriteHeader(http.StatusOK)
 			return res, err
 		}
 	}
@@ -293,6 +297,10 @@ func (c *Cascade) RunBuffered(ctx context.Context, w http.ResponseWriter, client
 		lastErr = errors.New("cascade: no steps attempted")
 	}
 	res.FallbackReason = CascadeFallbackReason(lastErr)
+	res.ServedBy = c.Steps[len(c.Steps)-1].Name
+	h := w.Header()
+	h.Set("X-Nexus-Cascade-Served-By", res.ServedBy)
+	w.WriteHeader(http.StatusOK)
 	return res, fmt.Errorf("frontier cascade: all %d providers failed; last error: %w", len(c.Steps), lastErr)
 }
 

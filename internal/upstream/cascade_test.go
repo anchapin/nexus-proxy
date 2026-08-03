@@ -1396,3 +1396,64 @@ func TestCascadeFallsBackOnReadError(t *testing.T) {
 		t.Errorf("fallback counter = %d, want 1", *ft.counter("http://fallback.local/v1/chat/completions"))
 	}
 }
+
+// TestRunBufferedSetsHeaderOnNonRetryableError verifies issue #1313: when
+// RunBuffered returns after a non-retryable error, the X-Nexus-Cascade-Served-By
+// header is set so callers can identify which provider errored without parsing
+// the error message.
+func TestRunBufferedSetsHeaderOnNonRetryableError(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(401)
+		_, _ = io.WriteString(w, "unauthorized")
+	})
+	// Second step should NOT be called for non-retryable 401.
+	ft.on("http://fallback.local/v1/chat/completions", func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("fallback should NOT have been called for non-retryable 401")
+	})
+
+	rec := httptest.NewRecorder()
+	_, err := twoStepCascade().RunBuffered(context.Background(), rec, &http.Client{Transport: ft}, nil, "")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "401") {
+		t.Errorf("err = %v", err)
+	}
+	got := rec.Header().Get("X-Nexus-Cascade-Served-By")
+	if got == "" {
+		t.Error("X-Nexus-Cascade-Served-By header is empty, want local")
+	}
+	if got != "local" {
+		t.Errorf("X-Nexus-Cascade-Served-By = %q, want local", got)
+	}
+}
+
+// TestRunBufferedSetsHeaderWhenAllStepsFail verifies issue #1313: when
+// RunBuffered returns after exhausting all steps (all failing with retryable
+// errors), the X-Nexus-Cascade-Served-By header is set to the last step.
+func TestRunBufferedSetsHeaderWhenAllStepsFail(t *testing.T) {
+	ft := newFakeTransport()
+	// Both steps return 500 (retryable) so all steps are exhausted.
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(500)
+		_, _ = io.WriteString(w, "internal server error")
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(500)
+		_, _ = io.WriteString(w, "internal server error")
+	})
+
+	rec := httptest.NewRecorder()
+	_, err := twoStepCascade().RunBuffered(context.Background(), rec, &http.Client{Transport: ft}, nil, "")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	got := rec.Header().Get("X-Nexus-Cascade-Served-By")
+	if got == "" {
+		t.Error("X-Nexus-Cascade-Served-By header is empty, want frontier")
+	}
+	if got != "frontier" {
+		t.Errorf("X-Nexus-Cascade-Served-By = %q, want frontier", got)
+	}
+}
