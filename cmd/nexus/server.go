@@ -47,12 +47,13 @@ import (
 // needs to hot-reload. It is returned by buildServer so main() can
 // wire the handlers without re-creating the collaborators.
 type serverParts struct {
-	judgeEval      *judge.Evaluator
-	rateLimiter    *ratelimit.Middleware
-	authLimiter    *ratelimit.AuthLimiter
-	authMiddleware *auth.Middleware // multi-key auth (issue #1154); nil for single-key
-	exporterCloser func() error
-	ipResolver     *ratelimit.ClientIPResolver
+	judgeEval           *judge.Evaluator
+	rateLimiter         *ratelimit.Middleware
+	allowlistMiddleware *ratelimit.AllowCIDRsMiddleware // inbound IP allowlist (issue #1240)
+	authLimiter         *ratelimit.AuthLimiter
+	authMiddleware      *auth.Middleware // multi-key auth (issue #1154); nil for single-key
+	exporterCloser      func() error
+	ipResolver          *ratelimit.ClientIPResolver
 }
 
 // buildServer constructs the fully-wired HTTP server from cfg.
@@ -1339,13 +1340,44 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 	// publicPathExempt in main.go.
 	handlers.RegisterDebugPprof(mux, cfg)
 
+	// Inbound IP allowlist (issue #1240). Applied at mux level before auth.
+	// Exempts /healthz and /metrics by default; NEXUS_ALLOW_CIDRS_STRICT=true
+	// removes the exemption so the allowlist covers all paths.
+	var allowlistMiddleware *ratelimit.AllowCIDRsMiddleware
+	if cfg.AllowCIDRsConfigured() {
+		exempt := func(r *http.Request) bool {
+			if cfg.AllowCIDRsStrict {
+				return false // strict mode: no exemptions
+			}
+			// Default: exempt health and metrics endpoints so K8s probes
+			// and Prometheus scrapers work without IP restrictions.
+			switch r.URL.Path {
+			case "/healthz", "/metrics", "/readyz":
+				return true
+			default:
+				return false
+			}
+		}
+		allowlistMiddleware = ratelimit.NewAllowCIDRsMiddleware(cfg.AllowCIDRs, exempt, parts.ipResolver)
+		parts.allowlistMiddleware = allowlistMiddleware
+		slog.Info("inbound IP allowlist enabled",
+			slog.Int("cidr_count", len(cfg.AllowCIDRs)),
+			slog.Bool("strict", cfg.AllowCIDRsStrict),
+		)
+	}
+
 	slog.Info("starting nexus proxy",
 		slog.String("addr", cfg.Addr),
 		slog.String("local_model", cfg.LocalModel),
 		slog.String("frontier_model", cfg.FrontierModel),
 	)
 
-	var rootHandler http.Handler = mux
+	// Apply allowlist middleware before auth wrapping.
+	handlerForAuth := http.Handler(mux)
+	if allowlistMiddleware != nil {
+		handlerForAuth = allowlistMiddleware.Wrap(handlerForAuth)
+	}
+	var rootHandler http.Handler = handlerForAuth
 	var authLimiter *ratelimit.AuthLimiter
 	if cfg.AuthEnabled() {
 		if cfg.AuthRateLimitEnabled() {
@@ -1479,6 +1511,15 @@ func (p *serverParts) handleSIGHUP(cfg config.Config) config.Config {
 	}
 	if p.ipResolver != nil {
 		p.ipResolver.SetTrustedProxies(newCfg.TrustedProxies)
+	}
+	// Inbound IP allowlist hot-reload (issue #1240). Re-parse CIDRs and
+	// update the live allowlist middleware without a restart.
+	if p.allowlistMiddleware != nil {
+		p.allowlistMiddleware.SetCIDRs(newCfg.AllowCIDRs)
+		slog.Info("inbound IP allowlist reloaded via SIGHUP",
+			slog.Int("cidr_count", len(newCfg.AllowCIDRs)),
+			slog.Bool("strict", newCfg.AllowCIDRsStrict),
+		)
 	}
 	// Hot-reload multi-key credentials (issue #1154). Re-read the API
 	// keys file so individual keys can be rotated without a restart.

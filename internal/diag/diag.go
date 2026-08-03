@@ -101,6 +101,7 @@ const (
 	checkQualityVerifier      = "quality_verifier"
 	checkBudgetGuard          = "budget_guard"
 	checkRateLimitProxyConfig = "rate_limit_proxy_config"
+	checkAllowCIDRs           = "allow_cidrs"
 	checkProviderRegistry     = "provider_registry"
 	checkMiddlewareChain      = "middleware_chain"
 	checkModelsEndpoint       = "models_endpoint"
@@ -142,6 +143,7 @@ func Run(ctx context.Context, cfg config.Config, opts Options) Result {
 	r = append(r, checkQualityVerifierFn(cfg))
 	r = append(r, checkBudgetGuardFn(cfg))
 	r = append(r, checkRateLimitProxyConfigFn(cfg))
+	r = append(r, checkAllowCIDRsFn(cfg))
 	r = append(r, checkProviderRegistryFn())
 	r = append(r, checkMiddlewareChainFn(cfg))
 	r = append(r, checkModelsEndpointFn(ctx, cfg, opts))
@@ -771,6 +773,38 @@ func checkRateLimitProxyConfigFn(cfg config.Config) Check {
 	}
 	return Check{
 		Name:   checkRateLimitProxyConfig,
+		Status: StatusPass,
+		Detail: detail,
+	}
+}
+
+// --- Inbound IP allowlist (issue #1240) -----------------------------------
+
+// checkAllowCIDRsFn validates the inbound IP allowlist configuration.
+// When AllowCIDRs is non-empty, the proxy restricts access to clients
+// whose IP falls within the configured CIDRs; all others get 403.
+// When AllowCIDRsStrict is false (default), /healthz and /metrics
+// are exempt so K8s probes and Prometheus scrapers work without IP
+// restrictions.
+func checkAllowCIDRsFn(cfg config.Config) Check {
+	if !cfg.AllowCIDRsConfigured() {
+		return Check{
+			Name:   checkAllowCIDRs,
+			Status: StatusSkip,
+			Detail: "inbound IP allowlist disabled (NEXUS_ALLOW_CIDRS empty)",
+		}
+	}
+	detail := fmt.Sprintf("%d allowlisted CIDR(s)", len(cfg.AllowCIDRs))
+	if cfg.AllowCIDRsRaw != "" {
+		detail = fmt.Sprintf("%s: %s", detail, cfg.AllowCIDRsRaw)
+	}
+	if cfg.AllowCIDRsStrict {
+		detail += "; STRICT mode (no path exemptions)"
+	} else {
+		detail += "; /healthz and /metrics exempt"
+	}
+	return Check{
+		Name:   checkAllowCIDRs,
 		Status: StatusPass,
 		Detail: detail,
 	}

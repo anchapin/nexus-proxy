@@ -654,6 +654,19 @@ type Config struct {
 	// throttling); <=0 falls back to RateLimitRPM in the limiter.
 	TrustedProxies    []*net.IPNet
 	TrustedProxiesRaw string
+
+	// AllowCIDRs is the inbound IP allowlist sourced from NEXUS_ALLOW_CIDRS.
+	// When non-empty, only clients whose IP falls within at least one CIDR
+	// are permitted; all others receive HTTP 403. When empty (the default),
+	// the allowlist is disabled and all IPs are permitted. This provides
+	// network-layer access control for local-only / air-gapped deployments
+	// (issue #1240). AllowCIDRsRaw preserves the raw source value for
+	// diagnostic display. AllowCIDRsStrict controls whether /healthz and
+	// /metrics are exempt from the allowlist (default: not strict).
+	AllowCIDRs       []*net.IPNet
+	AllowCIDRsRaw    string
+	AllowCIDRsStrict bool // when true, no path is exempt from the allowlist
+
 	RateLimitRPM      int
 	RateLimitBurst    int
 	RateLimitByAPIKey bool // issue #776: bucket on SHA256(IP + ":" + APIKey) when true
@@ -2042,6 +2055,27 @@ func Load() (Config, error) {
 	}
 	cfg.TrustedProxies = parsed
 
+	// NEXUS_ALLOW_CIDRS is a comma-separated inbound IP allowlist.
+	// When non-empty, only clients whose IP falls within at least one
+	// CIDR are permitted; all others receive HTTP 403. This provides
+	// network-layer access control for local-only deployments (issue #1240).
+	// Invalid CIDRs fail boot with a clear error. A bare IP (no /prefix)
+	// is accepted and treated as a /32 or /128.
+	cfg.AllowCIDRsRaw = strings.TrimSpace(os.Getenv("NEXUS_ALLOW_CIDRS"))
+	if cfg.AllowCIDRsRaw != "" {
+		parsed, err := parseTrustedProxies(cfg.AllowCIDRsRaw)
+		if err != nil {
+			return cfg, fmt.Errorf("config: invalid NEXUS_ALLOW_CIDRS entry %q: %w", cfg.AllowCIDRsRaw, err)
+		}
+		cfg.AllowCIDRs = parsed
+	}
+
+	// NEXUS_ALLOW_CIDRS_STRICT controls whether /healthz and /metrics are
+	// exempt from the inbound allowlist. Default (false) means those
+	// endpoints are always reachable; true removes the exemption so the
+	// allowlist applies to all paths.
+	cfg.AllowCIDRsStrict = getEnvBool("NEXUS_ALLOW_CIDRS_STRICT", false)
+
 	// Rolling 24h frontier spend guard (issue #183, #201). When
 	// BudgetDailyLimit > 0 the guard is active. Alerting is
 	// separately enabled via BudgetAlertEnabled.
@@ -2523,6 +2557,10 @@ func (c Config) AuthRateLimitEnabled() bool { return c.AuthRateLimitRPM > 0 }
 // let a single NATed IP exhaust the whole per-client budget.
 func (c Config) TrustedProxiesConfigured() bool { return len(c.TrustedProxies) > 0 }
 
+// AllowCIDRsConfigured reports whether any inbound allowlist CIDRs are set.
+// When true, only clients in the allowlist are permitted; others get 403.
+func (c Config) AllowCIDRsConfigured() bool { return len(c.AllowCIDRs) > 0 }
+
 // IsLoopbackBind reports whether the configured NEXUS_ADDR binds only
 // to a loopback interface. A listen address is considered loopback when
 // its host portion is empty ("", as in ":8000" — binds all interfaces
@@ -2715,7 +2753,25 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 		next.TrustedProxies = parsed
 	}
 
+	// Allow CIDRs: re-parse from env so the SIGHUP handler can push the
+	// updated list into the live allowlister without a restart (issue #1240).
+	next.AllowCIDRsRaw = strings.TrimSpace(os.Getenv("NEXUS_ALLOW_CIDRS"))
+	if parsed, err := parseTrustedProxies(next.AllowCIDRsRaw); err != nil {
+		// Bogus value after boot: add to NeedsRestart so the operator is told
+		// a restart is required instead of silently preserving the previous
+		// value (issue #1055).
+		slog.Warn("invalid NEXUS_ALLOW_CIDRS, restart required to apply change",
+			slog.String("reason", err.Error()))
+		next.AllowCIDRs = prev.AllowCIDRs
+		result.NeedsRestart = append(result.NeedsRestart, "NEXUS_ALLOW_CIDRS")
+	} else {
+		next.AllowCIDRs = parsed
+	}
+
 	// Hot-reloadable settings.
+
+	// AllowCIDRsStrict is hot-reloadable (issue #1240).
+	next.AllowCIDRsStrict = getEnvBool("NEXUS_ALLOW_CIDRS_STRICT", prev.AllowCIDRsStrict)
 
 	// Multi-key auth file (issue #1154): re-read the path so the SIGHUP
 	// handler can reload credentials without a restart.
