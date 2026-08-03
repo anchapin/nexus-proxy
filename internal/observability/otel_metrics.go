@@ -759,6 +759,246 @@ func CollectMetricSnapshot() []MetricSnapshot {
 		Sum:  float64(collectorSlow.ConfidenceErrors()),
 	})
 
+	// RouteCounters metrics (issue #1302)
+	if routeCountersSlow != nil {
+		// nexus_route_decisions_total{route, source}
+		for k, cnt := range routeCountersSlow.RouteDecisionsSnapshot() {
+			out = append(out, MetricSnapshot{
+				Name:   "nexus_route_decisions_total",
+				Type:   MetricTypeCounter,
+				Labels: map[string]string{"route": k.route, "source": k.source},
+				Sum:    float64(cnt),
+			})
+		}
+
+		// nexus_slm_decisions_total{route, confidence_bucket, task_type}
+		for k, cnt := range routeCountersSlow.SLMDecisionsSnapshot() {
+			out = append(out, MetricSnapshot{
+				Name:   "nexus_slm_decisions_total",
+				Type:   MetricTypeCounter,
+				Labels: map[string]string{"route": k.route, "confidence_bucket": k.confBucket, "task_type": k.taskType},
+				Sum:    float64(cnt),
+			})
+		}
+
+		// nexus_slm_low_confidence_escalations_total{task_type}
+		for k, cnt := range routeCountersSlow.LowConfidenceEscalationsSnapshot() {
+			out = append(out, MetricSnapshot{
+				Name:   "nexus_slm_low_confidence_escalations_total",
+				Type:   MetricTypeCounter,
+				Labels: map[string]string{"task_type": k.taskType},
+				Sum:    float64(cnt),
+			})
+		}
+
+		// nexus_slm_escalations_total{reason}
+		for reason, cnt := range routeCountersSlow.SLMEscalationsSnapshot() {
+			out = append(out, MetricSnapshot{
+				Name:   "nexus_slm_escalations_total",
+				Type:   MetricTypeCounter,
+				Labels: map[string]string{"reason": reason},
+				Sum:    float64(cnt),
+			})
+		}
+
+		// nexus_slm_cache_hits_total{kind}
+		for kind, cnt := range routeCountersSlow.SLMCacheHitsSnapshot() {
+			out = append(out, MetricSnapshot{
+				Name:   "nexus_slm_cache_hits_total",
+				Type:   MetricTypeCounter,
+				Labels: map[string]string{"kind": kind},
+				Sum:    float64(cnt),
+			})
+		}
+
+		// nexus_slm_cache_misses_total
+		out = append(out, MetricSnapshot{
+			Name: "nexus_slm_cache_misses_total",
+			Type: MetricTypeCounter,
+			Sum:  float64(routeCountersSlow.SLMCacheMisses()),
+		})
+
+		// nexus_slm_cache_evictions_total{reason}
+		for reason, cnt := range routeCountersSlow.SLMCacheEvictionsSnapshot() {
+			out = append(out, MetricSnapshot{
+				Name:   "nexus_slm_cache_evictions_total",
+				Type:   MetricTypeCounter,
+				Labels: map[string]string{"reason": reason},
+				Sum:    float64(cnt),
+			})
+		}
+
+		// nexus_slm_cache_embedding_errors_total
+		out = append(out, MetricSnapshot{
+			Name: "nexus_slm_cache_embedding_errors_total",
+			Type: MetricTypeCounter,
+			Sum:  float64(routeCountersSlow.SLMCacheEmbedErrors()),
+		})
+
+		// nexus_requests_rejected_total{reason}
+		for reason, cnt := range routeCountersSlow.RejectionsSnapshot() {
+			out = append(out, MetricSnapshot{
+				Name:   "nexus_requests_rejected_total",
+				Type:   MetricTypeCounter,
+				Labels: map[string]string{"reason": reason},
+				Sum:    float64(cnt),
+			})
+		}
+
+		// nexus_fusion_arbiter_total{reason}
+		for reason, cnt := range routeCountersSlow.FusionArbiterSnapshot() {
+			out = append(out, MetricSnapshot{
+				Name:   "nexus_fusion_arbiter_total",
+				Type:   MetricTypeCounter,
+				Labels: map[string]string{"reason": reason},
+				Sum:    float64(cnt),
+			})
+		}
+
+		// nexus_rag_retrieval_total{hit="true"} and nexus_rag_retrieval_total{hit="false",reason=...}
+		hits := routeCountersSlow.RAGRetrievalHits()
+		out = append(out, MetricSnapshot{
+			Name:   "nexus_rag_retrieval_total",
+			Type:   MetricTypeCounter,
+			Labels: map[string]string{"hit": "true"},
+			Sum:    float64(hits),
+		})
+		for reason, cnt := range routeCountersSlow.RAGRetrievalMissesSnapshot() {
+			out = append(out, MetricSnapshot{
+				Name:   "nexus_rag_retrieval_total",
+				Type:   MetricTypeCounter,
+				Labels: map[string]string{"hit": "false", "reason": reason},
+				Sum:    float64(cnt),
+			})
+		}
+
+		// nexus_rag_cache_hits_total
+		out = append(out, MetricSnapshot{
+			Name: "nexus_rag_cache_hits_total",
+			Type: MetricTypeCounter,
+			Sum:  float64(routeCountersSlow.RAGCacheHits()),
+		})
+
+		// nexus_rag_cache_misses_total
+		out = append(out, MetricSnapshot{
+			Name: "nexus_rag_cache_misses_total",
+			Type: MetricTypeCounter,
+			Sum:  float64(routeCountersSlow.RAGCacheMisses()),
+		})
+
+		// nexus_cascade_fallback_total{reason}
+		for reason, cnt := range routeCountersSlow.CascadeFallbacksSnapshot() {
+			out = append(out, MetricSnapshot{
+				Name:   "nexus_cascade_fallback_total",
+				Type:   MetricTypeCounter,
+				Labels: map[string]string{"reason": reason},
+				Sum:    float64(cnt),
+			})
+		}
+
+		// nexus_fusion_arbiter_cache_total{hit}
+		for hit, cnt := range routeCountersSlow.ArbiterCacheSnapshot() {
+			out = append(out, MetricSnapshot{
+				Name:   "nexus_fusion_arbiter_cache_total",
+				Type:   MetricTypeCounter,
+				Labels: map[string]string{"hit": hit},
+				Sum:    float64(cnt),
+			})
+		}
+
+		// nexus_arbiter_cache_evictions_total{reason}
+		for reason, cnt := range routeCountersSlow.ArbiterCacheEvictionsSnapshot() {
+			out = append(out, MetricSnapshot{
+				Name:   "nexus_arbiter_cache_evictions_total",
+				Type:   MetricTypeCounter,
+				Labels: map[string]string{"reason": reason},
+				Sum:    float64(cnt),
+			})
+		}
+
+		// nexus_judge_queue_overflow_total
+		out = append(out, MetricSnapshot{
+			Name: "nexus_judge_queue_overflow_total",
+			Type: MetricTypeCounter,
+			Sum:  float64(routeCountersSlow.JudgeQueueOverflow()),
+		})
+
+		// nexus_quality_queue_overflow_total
+		out = append(out, MetricSnapshot{
+			Name: "nexus_quality_queue_overflow_total",
+			Type: MetricTypeCounter,
+			Sum:  float64(routeCountersSlow.QualityQueueOverflow()),
+		})
+
+		// nexus_panel_panics_total
+		out = append(out, MetricSnapshot{
+			Name: "nexus_panel_panics_total",
+			Type: MetricTypeCounter,
+			Sum:  float64(routeCountersSlow.PanelPanics()),
+		})
+
+		// nexus_prompt_injection_hits_total{mode}
+		for mode, cnt := range routeCountersSlow.PromptInjectionHitsSnapshot() {
+			out = append(out, MetricSnapshot{
+				Name:   "nexus_prompt_injection_hits_total",
+				Type:   MetricTypeCounter,
+				Labels: map[string]string{"mode": mode},
+				Sum:    float64(cnt),
+			})
+		}
+
+		// nexus_handler_panics_total{path}
+		for path, cnt := range routeCountersSlow.HandlerPanicsSnapshot() {
+			out = append(out, MetricSnapshot{
+				Name:   "nexus_handler_panics_total",
+				Type:   MetricTypeCounter,
+				Labels: map[string]string{"path": path},
+				Sum:    float64(cnt),
+			})
+		}
+
+		// nexus_local_cooldown_triggers_total
+		out = append(out, MetricSnapshot{
+			Name: "nexus_local_cooldown_triggers_total",
+			Type: MetricTypeCounter,
+			Sum:  float64(routeCountersSlow.LocalCooldownTriggers()),
+		})
+
+		// nexus_route_budget_downtier_total
+		out = append(out, MetricSnapshot{
+			Name: "nexus_route_budget_downtier_total",
+			Type: MetricTypeCounter,
+			Sum:  float64(routeCountersSlow.BudgetDowntier()),
+		})
+
+		// nexus_router_dsl_hits_total{reason}
+		for reason, cnt := range routeCountersSlow.DSLHitsSnapshot() {
+			out = append(out, MetricSnapshot{
+				Name:   "nexus_router_dsl_hits_total",
+				Type:   MetricTypeCounter,
+				Labels: map[string]string{"reason": reason},
+				Sum:    float64(cnt),
+			})
+		}
+
+		// nexus_router_dsl_misses_total
+		out = append(out, MetricSnapshot{
+			Name: "nexus_router_dsl_misses_total",
+			Type: MetricTypeCounter,
+			Sum:  float64(routeCountersSlow.DSLMisses()),
+		})
+
+		// nexus_redacted_total{profile}
+		for profile, cnt := range routeCountersSlow.RedactedSnapshot() {
+			out = append(out, MetricSnapshot{
+				Name:   "nexus_redacted_total",
+				Type:   MetricTypeCounter,
+				Labels: map[string]string{"profile": profile},
+				Sum:    float64(cnt),
+			})
+		}
+	}
+
 	// OTLP metrics export self-monitoring (issue #1313)
 	if exp := GlobalOtelMetricsExporter(); exp != nil {
 		out = append(out, MetricSnapshot{
@@ -957,6 +1197,7 @@ func buildLabels(m map[string]string) []otlpMetricsAttr {
 // as an interface{}.
 
 var collectorSlow *Collector
+var routeCountersSlow *RouteCounters
 
 // globalOtelMetricsExporter holds the currently registered OTEL metrics
 // exporter so the Prometheus gauge provider in server.go can read the
@@ -983,6 +1224,12 @@ func GlobalOtelMetricsExporter() *OtelMetricsExporter {
 // Called once from server.go during boot.
 func RegisterCollector(c *Collector) {
 	collectorSlow = c
+}
+
+// RegisterRouteCounters registers the global RouteCounters for OTLP metric
+// export. Called once from server.go during boot.
+func RegisterRouteCounters(rc *RouteCounters) {
+	routeCountersSlow = rc
 }
 
 // InputTokensTotal returns the cumulative input token count.
