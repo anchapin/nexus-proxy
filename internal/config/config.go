@@ -223,6 +223,12 @@ type Config struct {
 	// 0.0 = pure semantic (backward compatible), 1.0 = pure keyword.
 	// Values between 0 and 1 blend both signals; 0.5 is a balanced default.
 	RAGHybridWeight float64 // NEXUS_RAG_HYBRID_WEIGHT
+
+	// Diag RAG minimum files (issue #1290). Minimum number of files
+	// required in NEXUS_EXAMPLES_DIR for the rag_directory diagnostic
+	// check to pass. 0 files = fail, 1..(min-1) = warn, ≥ min = pass.
+	DiagRAGMinFiles int // NEXUS_DIAG_RAG_MIN_FILES; default 3
+
 	// Routing
 	TokenGuardrail                int           // estimated tokens above this force frontier (6000)
 	SLMTimeout                    time.Duration // Qwen3-Coder routing timeout (8s)
@@ -1281,6 +1287,13 @@ func Load() (Config, error) {
 		return cfg, fmt.Errorf("NEXUS_RAG_HYBRID_WEIGHT: %w", err)
 	}
 	cfg.RAGHybridWeight = hybridWeight
+
+	diagRAGMinFiles, err := getEnvInt("NEXUS_DIAG_RAG_MIN_FILES", 3)
+	if err != nil {
+		return cfg, fmt.Errorf("NEXUS_DIAG_RAG_MIN_FILES: %w", err)
+	}
+	cfg.DiagRAGMinFiles = diagRAGMinFiles
+
 	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
 	if err != nil {
 		return cfg, err
