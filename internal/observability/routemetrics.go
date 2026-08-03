@@ -41,18 +41,6 @@ const (
 	bucketNone   = "none" // guardrail / DSL / non-SLM sources
 )
 
-// responseTruncated is a package-level counter for truncated upstream
-// responses (issue #365). It is set by SetTruncationCounter and
-// incremented by IncrementTruncationCounter. When nil, increments are
-// no-ops.
-var responseTruncated *uint64
-
-// SetTruncationCounter configures the package-level truncation counter.
-// Called once at startup from main.go.
-func SetTruncationCounter(p *uint64) {
-	responseTruncated = p
-}
-
 // panicSSEWriteFailuresCounter is a package-level counter for SSE error frame
 // write failures in the panic recovery path (issue #1115). It is set by
 // SetPanicSSEWriteFailuresCounter and incremented by
@@ -70,14 +58,6 @@ func SetPanicSSEWriteFailuresCounter(p *uint64) {
 func IncrementPanicSSEWriteFailuresCounter() {
 	if panicSSEWriteFailuresCounter != nil {
 		atomic.AddUint64(panicSSEWriteFailuresCounter, 1)
-	}
-}
-
-// IncrementTruncationCounter atomically increments the truncation counter.
-// Safe for concurrent use. Nil counter is a no-op.
-func IncrementTruncationCounter() {
-	if responseTruncated != nil {
-		atomic.AddUint64(responseTruncated, 1)
 	}
 }
 
@@ -191,7 +171,6 @@ type RouteCounters struct {
 	slmCacheEvictions        map[string]*uint64 // "ttl" | "lru" (issue #449)
 	slmCacheEmbedErrors      *uint64            // nexus_slm_cache_embedding_errors_total (issue #741)
 	rejections               map[string]*uint64
-	responseTruncated        uint64 // nexus_upstream_response_truncated_total
 	fusionArbiter            map[string]*uint64
 	rRAGHits                 *uint64 // single unlabelled hit counter (issue #486)
 	rRAGMisses               map[string]*uint64
@@ -293,14 +272,6 @@ func NewRouteCounters() *RouteCounters {
 	}
 }
 
-// SetGlobalTruncationCounter sets the package-level truncation counter
-// to point at the RouteCounters' internal truncation counter. Called
-// once at startup so ReadAllLimited can increment the counter without
-// needing a *RouteCounters reference.
-func (rc *RouteCounters) SetGlobalTruncationCounter() {
-	SetTruncationCounter(&rc.responseTruncated)
-}
-
 // Observe records a single routing decision. Call this from the chat
 // handler after planner.Plan returns. The method is safe for
 // concurrent use; it never blocks.
@@ -377,16 +348,6 @@ func (rc *RouteCounters) ObserveRejection(reason string) {
 		return
 	}
 	atomic.AddUint64(rc.reasonSlot(reason), 1)
-}
-
-// ObserveResponseTruncated increments the counter for upstream responses
-// that were truncated because they exceeded MaxResponseBytes (issue #365).
-// Safe for concurrent use; nil receivers are a no-op.
-func (rc *RouteCounters) ObserveResponseTruncated() {
-	if rc == nil {
-		return
-	}
-	atomic.AddUint64(&rc.responseTruncated, 1)
 }
 
 // ObserveFusionOutcome records the outcome of a fusion panel after
@@ -804,29 +765,6 @@ func (rc *RouteCounters) reasonSlot(reason string) *uint64 {
 	}
 	rc.mu.Unlock()
 	return p
-}
-
-// ReadAllLimited reads from r with a byte limit of maxBytes. If the
-// response body is larger than maxBytes, the body is truncated and
-// ObserveResponseTruncated is called on rc (if non-nil) or the
-// package-level counter is incremented (issue #365). This prevents
-// memory exhaustion from a malicious upstream returning gigabytes.
-// The returned error is any read error encountered before hitting the
-// limit; a truncation itself is not treated as an error.
-func ReadAllLimited(rc *RouteCounters, r io.Reader, maxBytes int) ([]byte, error) {
-	lr := io.LimitReader(r, int64(maxBytes))
-	body, err := io.ReadAll(lr)
-	// If we read exactly maxBytes, the response was likely truncated.
-	// The edge case of a response that is exactly maxBytes is
-	// astronomically unlikely at 64 MiB.
-	if len(body) >= maxBytes {
-		if rc != nil {
-			rc.ObserveResponseTruncated()
-		} else {
-			IncrementTruncationCounter()
-		}
-	}
-	return body, err
 }
 
 // cascadeFallbackSlot returns the *uint64 for cascade fallback reason,
