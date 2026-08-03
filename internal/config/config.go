@@ -61,6 +61,14 @@ type Config struct {
 	// posture.
 	TLSEnabled bool // emit HSTS; true when the effective inbound is TLS
 
+	// Inbound mTLS client certificate verification (issue #1241). When
+	// set, the proxy requires and verifies client certificates from
+	// downstream agents using the supplied CA certificate file.
+	// The Common Name of the verified certificate is surfaced in
+	// structured logs and audit records via X-Nexus-Client-CN.
+	// Bearer-token auth remains active as defense-in-depth.
+	TLSClientCAFile string // path to CA cert for client cert verification
+
 	// Graceful shutdown timeout (issue #121). Upper bound on the drain
 	// window the HTTP server observes after SIGTERM/SIGINT — a frontier
 	// SSE stream mid-token or a fusion arbiter call that just opened its
@@ -1861,6 +1869,12 @@ func Load() (Config, error) {
 	// proxy that strips/rewrites the inner scheme — in both cases the
 	// outer hop is HTTPS and HSTS is safe to advertise.
 	cfg.TLSEnabled = getEnvBool("NEXUS_TLS_ENABLED", false)
+
+	// Inbound mTLS client certificate verification (issue #1241). When
+	// non-empty, the proxy requires and verifies client certificates
+	// from downstream agents using the supplied CA certificate file.
+	// Bearer-token auth remains active as defense-in-depth.
+	cfg.TLSClientCAFile = getEnv("NEXUS_TLS_CLIENT_CA_FILE", "")
 
 	// Graceful shutdown drain window (issue #121). Replaces the prior
 	// hardcoded `const shutdownTimeout = 10 * time.Second` in main.go

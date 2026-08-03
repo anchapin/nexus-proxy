@@ -10,6 +10,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -1429,6 +1431,30 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		MaxHeaderBytes:    cfg.MaxHeaderBytes,
 	}
 
+	// Inbound mTLS client certificate verification (issue #1241).
+	// When TLSClientCAFile is set, load the CA certificate and configure
+	// the server to require and verify client certificates. The verified
+	// certificate's Common Name is surfaced via X-Nexus-Client-CN.
+	// Note: serving TLS requires NEXUS_TLS_CERT_FILE and NEXUS_TLS_KEY_FILE
+	// to also be configured; this wires the client-cert verification only.
+	if cfg.TLSClientCAFile != "" {
+		caCertPEM, err := os.ReadFile(cfg.TLSClientCAFile)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("config: NEXUS_TLS_CLIENT_CA_FILE=%q: %w", cfg.TLSClientCAFile, err)
+		}
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCertPEM) {
+			return nil, nil, nil, fmt.Errorf("config: NEXUS_TLS_CLIENT_CA_FILE=%q: no valid PEM certificates found", cfg.TLSClientCAFile)
+		}
+		srv.TLSConfig = &tls.Config{
+			ClientCAs:  caCertPool,
+			ClientAuth: tls.RequireAndVerifyClientCert,
+		}
+		slog.Info("inbound mTLS configured",
+			slog.String("client_ca_file", cfg.TLSClientCAFile),
+		)
+	}
+
 	return srv, parts, cleanup, nil
 }
 
@@ -1440,7 +1466,60 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 // The panicObs callback is invoked when Recover catches a panic; pass nil for
 // a no-op. tlsEnabled controls HSTS emission (issue #444).
 func buildHandler(inner http.Handler, tlsEnabled bool, panicObs func(string)) http.Handler {
-	return handlers.SecurityHeaders(tlsEnabled)(handlers.Recover(panicObs)(inner))
+	// clientCNMiddleware is the outermost layer that runs for every request.
+	// It extracts the verified client-certificate CN and stamps X-Nexus-Client-CN
+	// on the response when a valid mTLS client cert is present (issue #1241).
+	return clientCNMiddleware(
+		handlers.SecurityHeaders(tlsEnabled)(
+			handlers.Recover(panicObs)(inner),
+		),
+	)
+}
+
+// clientCNMiddleware extracts the verified client certificate Common Name
+// from the TLS connection state and surfaces it on the response as the
+// X-Nexus-Client-CN header (issue #1241). This allows downstream systems
+// (audit logging, request attribution) to identify which mTLS client
+// certificate authenticated the incoming request. The header is only present
+// when a valid client certificate was verified; absent in plain HTTP.
+func clientCNMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var clientCN string
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+			cert := r.TLS.PeerCertificates[0]
+			// Extract CN from Subject.
+			clientCN = cert.Subject.CommonName
+			// Fallback: use the first DNS name if CN is empty.
+			if clientCN == "" && len(cert.DNSNames) > 0 {
+				clientCN = cert.DNSNames[0]
+			}
+		}
+		if clientCN != "" {
+			// Use a ResponseWriter wrapper so the header is set on every response,
+			// including those that never called w.WriteHeader explicitly.
+			w = &clientCNHeaderWriter{
+				ResponseWriter: w,
+				clientCN:       clientCN,
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// clientCNHeaderWriter wraps http.ResponseWriter to inject X-Nexus-Client-CN
+// on the first WriteHeader call.
+type clientCNHeaderWriter struct {
+	http.ResponseWriter
+	clientCN string
+	headerSet bool
+}
+
+func (rw *clientCNHeaderWriter) WriteHeader(statusCode int) {
+	if !rw.headerSet {
+		rw.Header().Set("X-Nexus-Client-CN", rw.clientCN)
+		rw.headerSet = true
+	}
+	rw.ResponseWriter.WriteHeader(statusCode)
 }
 
 // drainComponents is called from the signal handler to stop async

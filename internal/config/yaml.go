@@ -30,6 +30,7 @@ type YAMLConfig struct {
 	ShutdownTimeout string `yaml:"shutdown_timeout"`
 	MaxBodyBytes    int    `yaml:"max_body_bytes"`
 	TLSEnabled      bool   `yaml:"tls_enabled"`
+	TLSClientCAFile string `yaml:"tls_client_ca_file"` // issue #1241
 
 	// Logging
 	LogLevel  string `yaml:"log_level"`
@@ -437,6 +438,9 @@ func LoadYAML(path string) (Config, error) {
 	}
 	if v := os.Getenv("NEXUS_TLS_ENABLED"); v != "" {
 		cfg.TLSEnabled = parseBoolEnvStr(v, false)
+	}
+	if v := os.Getenv("NEXUS_TLS_CLIENT_CA_FILE"); v != "" {
+		cfg.TLSClientCAFile = v
 	}
 
 	// Logging
@@ -1781,6 +1785,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		MaxHeaderBytes:  yc.intDefault(yc.MaxHeaderBytes, DefaultServerMaxHeaderBytes),
 		ShutdownTimeout: yc.durationDefault(yc.ShutdownTimeout, DefaultShutdownTimeout),
 		TLSEnabled:      yc.TLSEnabled,
+		TLSClientCAFile: yc.TLSClientCAFile,
 
 		BudgetDailyLimit:      yc.floatDefault(yc.BudgetDailyLimit, 0),
 		BudgetAlertEnabled:    yc.BudgetAlertEnabled,
