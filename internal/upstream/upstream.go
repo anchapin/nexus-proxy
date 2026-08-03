@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -40,6 +41,57 @@ func IncPanelPanics() { panelPanicsTotal.Add(1) }
 
 // PanelPanicsTotal returns the cumulative panel panic count.
 func PanelPanicsTotal() uint64 { return panelPanicsTotal.Load() }
+
+// Fusion semantic similarity metrics (issue #1244).
+var (
+	// semanticSimilarityTotal counts the number of times semantic
+	// similarity was used for fusion agreement detection.
+	semanticSimilarityTotal atomic.Uint64
+	// semanticSimilaritySum accumulates the cosine similarity scores
+	// so /metrics can report the average. Using float64→uint64 bits
+	// to avoid requiring sync/atomic.LoadFloat64 (Go 1.19+).
+	semanticSimilaritySumBits atomic.Uint64
+	// semanticSimilarityCount is the count of observations that
+	// contributed to semanticSimilaritySumBits.
+	semanticSimilarityCount atomic.Uint64
+	// jaccardSimilarityTotal counts the number of times Jaccard
+	// similarity was used (either mode=jaccard or semantic fallback).
+	jaccardSimilarityTotal atomic.Uint64
+)
+
+// RecordSemanticSimilarity records a semantic similarity observation.
+func RecordSemanticSimilarity(score float64) {
+	semanticSimilarityTotal.Add(1)
+	semanticSimilarityCount.Add(1)
+	for {
+		old := semanticSimilaritySumBits.Load()
+		newBits := math.Float64bits(math.Float64frombits(old) + score)
+		if semanticSimilaritySumBits.CompareAndSwap(old, newBits) {
+			break
+		}
+	}
+}
+
+// SemanticSimilarityTotal returns the count of semantic similarity checks.
+func SemanticSimilarityTotal() uint64 { return semanticSimilarityTotal.Load() }
+
+// SemanticSimilarityAvg returns the average semantic similarity score,
+// or 0 if no observations exist.
+func SemanticSimilarityAvg() float64 {
+	count := semanticSimilarityCount.Load()
+	if count == 0 {
+		return 0
+	}
+	return math.Float64frombits(semanticSimilaritySumBits.Load()) / float64(count)
+}
+
+// RecordJaccardSimilarity records a Jaccard similarity observation.
+func RecordJaccardSimilarity() {
+	jaccardSimilarityTotal.Add(1)
+}
+
+// JaccardSimilarityTotal returns the count of Jaccard similarity checks.
+func JaccardSimilarityTotal() uint64 { return jaccardSimilarityTotal.Load() }
 
 // fusionClientAbortTotal counts client aborts during fusion streaming
 // (issue #1046). Exposed via FusionClientAbortTotal for the /metrics endpoint.
@@ -641,9 +693,8 @@ func Panel(
 	requestID string,
 	arbiterCache *ArbiterCache,
 	arbiterCacheTTL time.Duration,
-	embedder Embedder,
-	similarityMode string,
 	isFusion bool,
+	simCfg FusionSimilarityConfig,
 ) (outcome PanelOutcome, cacheHit bool, _ error) {
 	results := make(chan PanelResult, 2)
 	if skipLocal {
@@ -740,7 +791,7 @@ func Panel(
 			cacheHit = true
 			outcome.ArbiterCacheHit = true
 			outcome.ArbiterSkipped = true
-			outcome.Similarity = computeSimilarity(r1.Content, r2.Content, embedder, similarityMode)
+			outcome.Similarity = simCfg.ComputeSimilarity(ctx, r1.Content, r2.Content)
 			outcome.SkipReason = "cache_hit"
 			if isFusion {
 				w.Header().Set("X-Nexus-Fusion-Progressive", "true")
@@ -953,8 +1004,7 @@ func PanelStreaming(
 	requestID string,
 	arbiterCache *ArbiterCache,
 	arbiterCacheTTL time.Duration,
-	embedder Embedder,
-	similarityMode string,
+	simCfg FusionSimilarityConfig,
 ) (PanelOutcome, error) {
 	var outcome PanelOutcome
 
@@ -969,8 +1019,7 @@ func PanelStreaming(
 			arbiterURL, arbiterKey, arbiterModel,
 			body, latestPrompt, localFetchTimeout, frontierFetchTimeout, arbiterTimeout,
 			skipLocal, requestID, arbiterCache, arbiterCacheTTL,
-			embedder, similarityMode,
-			true) // isFusion: set X-Nexus-Fusion-Progressive header (issue #984)
+			true, simCfg) // isFusion + simCfg (issue #984, #1244)
 		if err != nil {
 			return outcome, err
 		}
@@ -1153,13 +1202,14 @@ func PanelStreaming(
 	}
 
 	// Both members succeeded: compare and decide on the arbiter.
-	outcome.Similarity = computeSimilarity(first.Content, second.Content, embedder, similarityMode)
+	outcome.Similarity = simCfg.ComputeSimilarity(ctx, first.Content, second.Content)
 	if outcome.Similarity >= agreementThreshold {
 		outcome.ArbiterSkipped = true
 		outcome.SkipReason = "agreement"
 		slog.Info("fusion agreement, arbiter skipped",
 			slog.String("request_id", requestID),
 			slog.String("source", outcome.Source),
+			slog.String("similarity_mode", string(simCfg.Mode)),
 			slog.Float64("similarity", outcome.Similarity),
 			slog.Float64("threshold", agreementThreshold),
 		)
@@ -1193,6 +1243,7 @@ func PanelStreaming(
 	slog.Info("fusion disagreement, invoking arbiter",
 		slog.String("request_id", requestID),
 		slog.String("first_source", outcome.Source),
+		slog.String("similarity_mode", string(simCfg.Mode)),
 		slog.Float64("similarity", outcome.Similarity),
 		slog.Float64("threshold", agreementThreshold),
 	)

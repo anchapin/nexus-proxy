@@ -631,11 +631,10 @@ type LocalLimiter interface {
 // Deps bundles the collaborators the chat handler needs. Wiring them
 // explicitly makes the handler trivial to unit-test with stubs.
 type Deps struct {
-	Config   config.Config
-	Client   upstream.Client // http.Client satisfies this interface
-	RAG      rag.RAGStore
-	Embedder rag.Embedder // raw embedder for fusion semantic similarity (issue #1244)
-	SLM      *router.SLMClient
+	Config config.Config
+	Client upstream.Client // http.Client satisfies this interface
+	RAG    rag.RAGStore
+	SLM    *router.SLMClient
 
 	// MiddlewareChain is the ordered list of registered middleware names
 	// to apply to each request's messages slice (issue #224). The handler
@@ -887,6 +886,13 @@ type Deps struct {
 	// Nil means caching is disabled (the default for backwards
 	// compatibility).
 	ArbiterCache *upstream.ArbiterCache
+
+	// FusionEmbedder is the optional RAG embedder for semantic
+	// similarity in fusion agreement detection (issue #1244). When
+	// non-nil and Config.FusionSimilarityMode == "semantic", the
+	// fusion panel uses cosine similarity instead of Jaccard.
+	// Nil or unhealthy embedder falls back to Jaccard automatically.
+	FusionEmbedder rag.Embedder
 
 	// Providers is the optional registry of frontier providers (issue #223).
 	// When non-nil the handler uses it to build the cascade for
@@ -1888,8 +1894,10 @@ func Chat(d Deps) http.Handler {
 					reqID,
 					d.ArbiterCache,
 					d.Config.ArbiterCacheTTL,
-					upstream.Embedder(d.Embedder), // issue #1244: semantic similarity mode
-					d.Config.FusionSimilarityMode,
+					upstream.FusionSimilarityConfig{
+						Mode:     upstream.SimilarityMode(d.Config.FusionSimilarityMode),
+						Embedder: d.FusionEmbedder,
+					},
 				)
 				fusionArbiterSkipped = outcome.ArbiterSkipped
 				fusionJaccardSimilarity = outcome.Similarity
@@ -1929,9 +1937,11 @@ func Chat(d Deps) http.Handler {
 					reqID,
 					d.ArbiterCache,
 					d.Config.ArbiterCacheTTL,
-					upstream.Embedder(d.Embedder), // issue #1244: semantic similarity mode
-					d.Config.FusionSimilarityMode,
 					false, // isFusion: false when called directly (legacy path, issue #984)
+					upstream.FusionSimilarityConfig{
+						Mode:     upstream.SimilarityMode(d.Config.FusionSimilarityMode),
+						Embedder: d.FusionEmbedder,
+					},
 				)
 				if d.ArbiterCacheObserver != nil {
 					d.ArbiterCacheObserver(cacheHit)

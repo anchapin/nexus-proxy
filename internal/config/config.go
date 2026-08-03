@@ -1472,10 +1472,18 @@ func Load() (Config, error) {
 
 	// Fusion similarity mode (issue #1244): "jaccard" (default, lexical) or
 	// "semantic" (cosine similarity via RAG embedder).
-	cfg.FusionSimilarityMode = getEnv("NEXUS_FUSION_SIMILARITY_MODE", "jaccard")
-	if cfg.FusionSimilarityMode != "jaccard" && cfg.FusionSimilarityMode != "semantic" {
-		slog.Warn("invalid NEXUS_FUSION_SIMILARITY_MODE, using jaccard",
-			slog.String("value", cfg.FusionSimilarityMode))
+	// Fusion similarity mode (issue #1244). "jaccard" is the default
+	// (byte-for-byte backward compatible). "semantic" uses cosine
+	// similarity via the RAG embedder, falling back to Jaccard when
+	// the embedder is unavailable.
+	simMode := strings.ToLower(strings.TrimSpace(
+		getEnv("NEXUS_FUSION_SIMILARITY_MODE", "jaccard")))
+	switch simMode {
+	case "jaccard", "semantic":
+		cfg.FusionSimilarityMode = simMode
+	default:
+		slog.Warn("unknown NEXUS_FUSION_SIMILARITY_MODE value, falling back to jaccard",
+			slog.String("value", simMode))
 		cfg.FusionSimilarityMode = "jaccard"
 	}
 

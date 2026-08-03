@@ -528,8 +528,8 @@ func TestPanelArbiterTimeoutBoundsHangingCall(t *testing.T) {
 		false,         // skipLocal
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	elapsed := time.Since(start)
 
@@ -589,8 +589,8 @@ func TestPanelLocalTimeoutBoundsLocalMember(t *testing.T) {
 		false,          // skipLocal
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	elapsed := time.Since(start)
 
@@ -646,8 +646,8 @@ func TestPanelFrontierTimeoutBoundsFrontierMember(t *testing.T) {
 		false,          // skipLocal
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	elapsed := time.Since(start)
 
@@ -699,8 +699,8 @@ func TestPanelArbiterHappyPathNoRegression(t *testing.T) {
 		false,         // skipLocal
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -759,8 +759,8 @@ func TestPanelSkipLocalOmitsLocalFetch(t *testing.T) {
 		true,          // skipLocal
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -812,8 +812,8 @@ func TestPanelSkipLocalArbiterPromptHasDegradedMarker(t *testing.T) {
 		true, // skipLocal
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -1138,8 +1138,8 @@ func TestPanelArbiterHonorsStreamFlagFalse(t *testing.T) {
 		false, // skipLocal (issue #8)
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -1204,8 +1204,8 @@ func TestPanelArbiterHonorsStreamFlagTrueRegression(t *testing.T) {
 		false, // skipLocal (issue #8)
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -1252,8 +1252,8 @@ func TestPanelForwardsFrontierBearerToken(t *testing.T) {
 		"test prompt",
 		5*time.Second, 5*time.Second, 5*time.Second,
 		false, "test-request-id", nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -1311,7 +1311,7 @@ func TestPanelStreamingAgreementSkipsArbiter(t *testing.T) {
 		0.85,          // agreementThreshold
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1420,7 +1420,7 @@ func TestPanelStreamingAgreementCancelsSlowMember(t *testing.T) {
 		0.85,          // agreementThreshold
 		"testing-"+t.Name()+"-unique",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1489,7 +1489,7 @@ func TestPanelStreamingFrontierTimeoutBoundsFrontierMember(t *testing.T) {
 		0.85,           // agreementThreshold
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	elapsed := time.Since(start)
 
@@ -1541,7 +1541,7 @@ func TestPanelStreamingDisagreementRunsArbiter(t *testing.T) {
 		0.85,
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1630,7 +1630,7 @@ func TestPanelStreamingArbiterCtxFromRequest(t *testing.T) {
 		0.85,
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if !observed {
 		t.Fatal("arbiter did not observe request-context cancellation within 250ms; arbiterCtx not derived from request ctx (issue #488)")
@@ -1677,7 +1677,7 @@ func TestPanelStreamingDegradedSkipLocal(t *testing.T) {
 		0.85,
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1741,7 +1741,7 @@ func TestPanelStreamingOneMemberFailedSkipsArbiter(t *testing.T) {
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1794,7 +1794,7 @@ func TestPanelStreamingBothMembersFailedSurfacesError(t *testing.T) {
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err == nil {
 		t.Fatal("expected error when both members fail")
@@ -1861,7 +1861,7 @@ func TestPanelStreamingHonorsStreamFalseFallsBackToPanel(t *testing.T) {
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1930,7 +1930,7 @@ func TestPanelStreamingThresholdClamping(t *testing.T) {
 			-1.0, // negative: clamped to 0 → "always skip when both succeed"
 			"test-request-id",
 			nil, 0*time.Second,
-			nil, "jaccard", // issue #1244
+			FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 		)
 		if err != nil {
 			t.Fatalf("PanelStreaming: %v", err)
@@ -1977,7 +1977,7 @@ func TestPanelStreamingThresholdClamping(t *testing.T) {
 			2.0, // >1: clamps to 1 → only identical content skips
 			"test-request-id",
 			nil, 0*time.Second,
-			nil, "jaccard", // issue #1244
+			FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 		)
 		if err != nil {
 			t.Fatalf("PanelStreaming: %v", err)
@@ -2028,7 +2028,7 @@ func TestPanelStreamingSpeculativeSourceIdentified(t *testing.T) {
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -2079,7 +2079,7 @@ func TestPanelStreamingSetsProgressiveHeader(t *testing.T) {
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	); err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
 	}
@@ -2131,7 +2131,7 @@ func TestPanelStreamingToolCallWinnerSkipsArbiter(t *testing.T) {
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -2270,7 +2270,7 @@ func TestPanelStreamingClientAbortSkipsArbiter(t *testing.T) {
 		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85, "test-request",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	// Issue #167: client abort is NOT returned as an error — we return nil
 	// so the handler does not render a 502 error page to a disconnected client.
@@ -2329,7 +2329,7 @@ func TestFusionClientAbortTotalIncrementsSpeculative(t *testing.T) {
 		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85, "test-request",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: got error %v, want nil (client abort)", err)
@@ -2401,7 +2401,7 @@ func TestPanelStreamingForwardsFrontierBearerToken(t *testing.T) {
 		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85, "test-request",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -2552,8 +2552,8 @@ func TestPanelCacheHitStream_SetsSSEContentType(t *testing.T) {
 		false,
 		"test-request-id",
 		cache, 5*time.Minute,
-		nil, "jaccard", // issue #1244
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("Panel: %v", err)
@@ -2622,8 +2622,8 @@ func TestPanelCacheMissWithExpiredEntry_FallsBackToFetch(t *testing.T) {
 		false,
 		"test-request-id",
 		cache, 1*time.Millisecond,
-		nil, "jaccard", // issue #1244
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("Panel: %v", err)
@@ -2681,8 +2681,8 @@ func TestPanelCacheHitNonStream_SetsJSONContentType(t *testing.T) {
 		false,
 		"test-request-id",
 		cache, 5*time.Minute,
-		nil, "jaccard", // issue #1244
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("Panel: %v", err)
@@ -3037,8 +3037,8 @@ func TestPanel_MalformedArbiterEmptyChoices_ReturnsError(t *testing.T) {
 		false,
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err == nil {
 		t.Fatalf("Panel: expected error for empty choices, got nil")
@@ -3087,8 +3087,8 @@ func TestPanel_ValidArbiterResponse_ReturnsNoError(t *testing.T) {
 		false,
 		"test-request-id",
 		nil, 0*time.Second,
-		nil, "jaccard", // issue #1244
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("Panel: unexpected error: %v", err)
@@ -3140,8 +3140,8 @@ func TestPanel_CacheHit_ReturnsNoError(t *testing.T) {
 		false,
 		"test-request-id",
 		cache, 5*time.Minute,
-		nil, "jaccard", // issue #1244
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("Panel: %v", err)
