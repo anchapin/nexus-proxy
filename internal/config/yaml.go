@@ -264,6 +264,8 @@ type YAMLConfig struct {
 
 	// Trusted proxies
 	TrustedProxies    string `yaml:"trusted_proxies"`
+	AllowCIDRs        string `yaml:"allow_cidrs"`
+	AllowCIDRsStrict  bool   `yaml:"allow_cidrs_strict"`
 	RateLimitRPM      int    `yaml:"rate_limit_rpm"`
 	RateLimitBurst    int    `yaml:"rate_limit_burst"`
 	RateLimitByAPIKey bool   `yaml:"rate_limit_by_api_key"`
@@ -1441,6 +1443,19 @@ func LoadYAML(path string) (Config, error) {
 		cfg.TrustedProxies = parsed
 	}
 
+	// Inbound IP allowlist (issue #1240)
+	if v := os.Getenv("NEXUS_ALLOW_CIDRS"); v != "" {
+		cfg.AllowCIDRsRaw = v
+		parsed, err := parseTrustedProxies(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: invalid NEXUS_ALLOW_CIDRS entry: %w", err)
+		}
+		cfg.AllowCIDRs = parsed
+	}
+	if v := os.Getenv("NEXUS_ALLOW_CIDRS_STRICT"); v != "" {
+		cfg.AllowCIDRsStrict = parseBoolEnvStr(v, false)
+	}
+
 	// Rate limit
 	if v := os.Getenv("NEXUS_RATE_LIMIT_RPM"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -1938,6 +1953,14 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		cfg.TrustedProxies = parsed
 		cfg.TrustedProxiesRaw = yc.TrustedProxies
 	}
+
+	// Inbound IP allowlist (issue #1240)
+	if yc.AllowCIDRs != "" {
+		parsed, _ := parseTrustedProxies(yc.AllowCIDRs)
+		cfg.AllowCIDRs = parsed
+		cfg.AllowCIDRsRaw = yc.AllowCIDRs
+	}
+	cfg.AllowCIDRsStrict = yc.AllowCIDRsStrict
 
 	return cfg, nil
 }
