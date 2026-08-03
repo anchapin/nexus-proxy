@@ -964,7 +964,7 @@ func Load() (Config, error) {
 	cfg.ZAIURL = getFileString("zai_url", "NEXUS_ZAI_URL", "https://api.z.ai/v1/chat/completions")
 	cfg.ZAIModel = getFileString("zai_model", "NEXUS_ZAI_MODEL", "glm-4.6")
 	// gitleaks:allow // issue #1274: false positive — "API_KEY" matches generic-api-key but this is an env var name, not a secret.
-	cfg.ZAIKey = getEnv("NEXUS_ZAI_API_KEY", "")        // secrets via env only
+	cfg.ZAIKey = getEnv("NEXUS_ZAI_API_KEY", "") // secrets via env only
 	// gitleaks:allow // issue #1274: false positive — "API_KEY" matches generic-api-key but this is an env var name, not a secret.
 	cfg.ProxyAPIKey = getEnv("NEXUS_PROXY_API_KEY", "") // secrets via env only
 
