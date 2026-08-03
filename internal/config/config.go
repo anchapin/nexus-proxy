@@ -2462,6 +2462,12 @@ func (c Config) Validate() error {
 	if c.RedactProfile == "custom" && c.RedactPatternsRaw == "" {
 		return fmt.Errorf("config: NEXUS_REDACT_PROFILE is \"custom\" but NEXUS_REDACT_PATTERNS is empty; supply comma-separated regex patterns")
 	}
+	switch c.AuthMode {
+	case "static", "jwt", "both":
+		// Recognised values.
+	default:
+		return fmt.Errorf("config: NEXUS_AUTH_MODE value %q is not recognised; want \"static\", \"jwt\", or \"both\"", c.AuthMode)
+	}
 	return nil
 }
 

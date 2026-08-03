@@ -538,6 +538,7 @@ func TestLoadYAMLValidateErrorPaths(t *testing.T) {
 		{"tracing_sample_rate_high", "tracing_sample_rate", "3.0"},
 		{"routing_confidence_floor_high", "routing_confidence_floor", "5.0"},
 		{"routing_confidence_ceiling_high", "routing_confidence_ceiling", "5.0"},
+		{"auth_mode_invalid", "auth_mode", "ldap"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

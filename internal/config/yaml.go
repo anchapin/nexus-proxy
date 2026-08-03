@@ -1160,6 +1160,12 @@ func LoadYAML(path string) (Config, error) {
 		cfg.ProbeNVIDIAInterval = d
 	}
 
+	// Readiness mode for /readyz (issue #302)
+	cfg.ReadinessMode = "degraded"
+	if v := os.Getenv("NEXUS_READINESS_MODE"); v != "" {
+		cfg.ReadinessMode = v
+	}
+
 	// Local concurrency
 	if v := os.Getenv("NEXUS_LOCAL_MAX_CONCURRENT"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -1779,6 +1785,9 @@ func LoadYAML(path string) (Config, error) {
 		cfg.TracingSampleRate = f
 	}
 
+	if err := cfg.Validate(); err != nil {
+		return cfg, err
+	}
 	ValidateShutdownTimeout(cfg)
 	return cfg, nil
 }
