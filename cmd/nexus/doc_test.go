@@ -72,7 +72,7 @@ func TestWaveOrchestratorReferenceImplementationTemplateIsConflictFree(t *testin
 		t.Error("implementation sub-agent template must include the closingReferences verification step")
 	}
 
-	openPRIdx := strings.Index(section, "8. Open PR with an EXPLICIT body")
+	openPRIdx := strings.Index(section, "8. **PR CREATION — MANDATORY STEP.")
 	verifyIdx := strings.Index(section, "9. Verify closingReferences count matches the number of issues this PR resolves:")
 	finalOutputIdx := strings.Index(section, "10. **FINAL OUTPUT**")
 	if openPRIdx < 0 || verifyIdx < 0 || finalOutputIdx < 0 {
