@@ -1023,30 +1023,50 @@ func TestRunModelsEndpointAllModelsPresentIsPass(t *testing.T) {
 	}
 }
 
-// --- pprof_endpoint tests (issue #1150) -----------------------------------
+// --- pprof_endpoint tests (issue #1292) -----------------------------------
 
-func TestRunPprofEndpointDisabledIsPass(t *testing.T) {
+func TestRunPprofEndpointDisabledIsSkip(t *testing.T) {
 	ollama := newOllamaFixture(t)
 	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
 	cfg.DebugPprofEnabled = false
 
 	res := Run(context.Background(), cfg, withOptions(ollama.URL))
 	got := checkByName(res, checkPprofEndpoint)
-	if got.Status != StatusPass {
-		t.Errorf("pprof_endpoint = %s, want pass (disabled)", got.Status)
+	if got.Status != StatusSkip {
+		t.Errorf("pprof_endpoint = %s, want skip (disabled)", got.Status)
 	}
 }
 
-func TestRunPprofEndpointLoopbackIsWarn(t *testing.T) {
+func TestRunPprofEndpointLoopbackIsPass(t *testing.T) {
 	ollama := newOllamaFixture(t)
 	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
 	cfg.DebugPprofEnabled = true
 	cfg.DebugPprofAPIKey = ""
+	// No trusted proxies — loopback-only is a protection.
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkPprofEndpoint)
+	if got.Status != StatusPass {
+		t.Errorf("pprof_endpoint = %s, want pass (loopback-only, no trusted proxies)", got.Status)
+	}
+}
+
+func TestRunPprofEndpointLoopbackWithTrustedProxiesIsWarn(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.DebugPprofEnabled = true
+	cfg.DebugPprofAPIKey = ""
+	// Set up trusted proxies directly with a parsed CIDR.
+	_, cidr, err := net.ParseCIDR("10.0.0.1/24")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+	cfg.TrustedProxies = []*net.IPNet{cidr}
 
 	res := Run(context.Background(), cfg, withOptions(ollama.URL))
 	got := checkByName(res, checkPprofEndpoint)
 	if got.Status != StatusWarn {
-		t.Errorf("pprof_endpoint = %s, want warn (loopback-only)", got.Status)
+		t.Errorf("pprof_endpoint = %s, want warn (loopback but trusted proxies configured)", got.Status)
 	}
 }
 
