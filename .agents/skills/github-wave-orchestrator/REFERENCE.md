@@ -77,6 +77,7 @@ Rules:
 - Do NOT modify files outside the scope of this issue
 - Include tests for the fix/feature if the repo has a test suite
 - Follow the repo's AGENTS.md and code style conventions
+- **Avoid iterative Read calls for finding insertion points (issue #1273).** When searching for a symbol or section in a file larger than ~500 lines, first use `grep -n "SYMBOL" file.go` or `rg -n "SYMBOL" file.go` to find the exact line number, then use Read with that line number to view context. Do NOT use repeated Read calls with different offsets to "search" for a location — this causes infinite loops in large files.
 - If the issue is unclear, add a comment asking for clarification: gh issue comment {NUMBER} -b "..."
 - Report back: PR number, files changed, any blockers encountered
 ```
