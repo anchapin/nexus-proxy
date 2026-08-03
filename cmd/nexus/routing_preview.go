@@ -73,6 +73,7 @@ func runRoutingPreview(args []string, stdout, stderr io.Writer) int {
 		LocalPatternsRegex:   cfg.DSLLocalPatterns,
 		UnicodePatternsRegex: cfg.DSLUnicodePatterns,
 		ConfidenceThreshold:  cfg.SLMConfidenceThreshold,
+		SLMTokenHint:         cfg.SLMTokenHint,
 	}
 
 	var prompts []string

@@ -231,6 +231,7 @@ type Config struct {
 	SLMCacheStaleCleanupThreshold int           // Get-triggered eviction threshold; 0 = disabled (issue #1037)
 	SLMCacheSemanticScanLimit     int           // max entries scanned in getSemantic; 0 = unlimited (issue #933)
 	SLMConfidenceThreshold        float64       // hard escalation threshold: local/fusion decisions below this force frontier (default 0.3, issue #301)
+	SLMTokenHint                  bool          // prepend [tokens: ~N] hint to SLM routing prompt (issue #1233)
 	RoutingContextTurns           int           // prior conversation turns fed to the router for multi-turn context (default 3, issue #1147)
 	RoutingContextChars           int           // char cap on the conversation-context window fed to the router (default 2000, issue #1147)
 	FusionTimeout                 time.Duration // per-panel-member fetch timeout (120s), shared fallback
@@ -1309,6 +1310,12 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.SLMConfidenceThreshold = slmConfThreshold
+
+	// SLM token hint (issue #1233). When true, prepends [tokens: ~N]
+	// to the routingText passed to the SLM so it can make better-informed
+	// routing decisions for medium-length prompts. Does not affect the
+	// guardrail or any other stage. Default true.
+	cfg.SLMTokenHint = getEnvBool("NEXUS_SLM_TOKEN_HINT", true)
 
 	// Conversation-context window for routing (issue #1147). The handler
 	// assembles a bounded summary of prior turns so the DSL fast-pass and

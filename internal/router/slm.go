@@ -60,11 +60,17 @@ func NewSLMClient(baseURL, model string, timeout time.Duration, client *http.Cli
 // slmSystemPrompt is the static instruction we send to the routing SLM.
 // Keeping it as a package var (not a config field) makes it trivial to grep
 // and to snapshot in tests.
-const slmSystemPrompt = `You are an intelligent routing assistant for a coding agent proxy. 
-    Analyze the user's prompt. 
-    - If it is a simple task (boilerplate, styling, small isolated functions), output {"route": "local"}. 
-    - If it is a complex task (deep debugging, multi-file refactoring), output {"route": "frontier"}. 
+//
+// Token hint (issue #1233): when SLMTokenHint is enabled the prompt
+// is prefixed with [tokens: ~N] so the routing model has length context.
+// Longer prompts (500-2000 tokens) often warrant frontier even when the
+// content seems simple — the gray zone between short and the guardrail.
+const slmSystemPrompt = `You are an intelligent routing assistant for a coding agent proxy.
+    Analyze the user's prompt.
+    - If it is a simple task (boilerplate, styling, small isolated functions), output {"route": "local"}.
+    - If it is a complex task (deep debugging, multi-file refactoring), output {"route": "frontier"}.
     - If it requires extreme architectural deliberation and planning, output {"route": "fusion"}.
+    The prompt may begin with [tokens: ~N] indicating its approximate token length — use this context to assess complexity.
 	Respond ONLY in valid JSON. No explanations.`
 
 // negativeBiasNote is appended to slmSystemPrompt when empirical local

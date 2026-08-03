@@ -583,6 +583,7 @@ fallback. Set `NEXUS_LOCAL_COOLDOWN=0` to disable (pre-issue-#80 behaviour).
 
 Key knobs not covered elsewhere (verify defaults in `.env.example`):
 - **`NEXUS_SLM_CONFIDENCE_THRESHOLD`** (default 0.3): SLM decisions below this bypass DSL/SLM and go to frontier.
+- **`NEXUS_SLM_TOKEN_HINT`** (default true): prepends `[tokens: ~N]` to the prompt fed to the SLM so it has length context for medium-length prompts (500-2000 tokens) that sit in the gray zone between short and the guardrail. Does not affect the guardrail or any other stage; set to false to restore byte-identical pre-issue-#1233 behaviour.
 - **`NEXUS_ROUTING_CONTEXT_TURNS`** (default 3, max 10): prior conversation turns fed to the router for multi-turn context (issue #1147). 0 disables.
 - **`NEXUS_ROUTING_CONTEXT_CHARS`** (default 2000): char cap on the conversation-context window fed to the router.
 - **`NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT`** (default 0): retained for backward compat; fix for issue #1038 makes semantic dedup always scan all entries and exit early only on perfect score=1.0, so this var has no effect.

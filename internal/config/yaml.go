@@ -137,6 +137,7 @@ type YAMLConfig struct {
 	SLMCacheMaxStale              int     `yaml:"slm_cache_max_stale"`               // issue #835
 	SLMCacheStaleCleanupThreshold int     `yaml:"slm_cache_stale_cleanup_threshold"` // issue #1037
 	SLMCacheSemanticScanLimit     int     `yaml:"slm_cache_semantic_scan_limit"`     // issue #933
+	SLMTokenHint                  bool    `yaml:"slm_token_hint"`                    // issue #1233
 	FusionTimeout                 string  `yaml:"fusion_timeout"`
 	FusionLocalTimeout            string  `yaml:"fusion_local_timeout"`    // issue #1164
 	FusionFrontierTimeout         string  `yaml:"fusion_frontier_timeout"` // issue #1164
@@ -873,6 +874,10 @@ func LoadYAML(path string) (Config, error) {
 			n = 0
 		}
 		cfg.SLMCacheSemanticScanLimit = n
+	}
+	// SLM token hint (issue #1233)
+	if v := os.Getenv("NEXUS_SLM_TOKEN_HINT"); v != "" {
+		cfg.SLMTokenHint = strings.EqualFold(v, "true") || v == "1"
 	}
 	// DSL auto-promotion env overrides (issue #1165)
 	if v := os.Getenv("NEXUS_DSL_PROMOTION_MIN_SAMPLES"); v != "" {
@@ -1771,6 +1776,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		SLMCacheMaxStale:              yc.intDefault(yc.SLMCacheMaxStale, 0),              // issue #835
 		SLMCacheStaleCleanupThreshold: yc.intDefault(yc.SLMCacheStaleCleanupThreshold, 0), // issue #1037
 		SLMCacheSemanticScanLimit:     yc.intDefault(yc.SLMCacheSemanticScanLimit, 0),     // issue #933
+		SLMTokenHint:                  yc.boolFieldDefault(yc.SLMTokenHint, true),         // issue #1233
 		FusionTimeout:                 yc.durationDefault(yc.FusionTimeout, 120*time.Second),
 		FusionLocalTimeout:            yc.durationDefault(yc.FusionLocalTimeout, 90*time.Second),    // issue #1164
 		FusionFrontierTimeout:         yc.durationDefault(yc.FusionFrontierTimeout, 30*time.Second), // issue #1164
