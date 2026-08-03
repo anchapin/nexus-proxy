@@ -50,9 +50,9 @@ const bufferedChannelSize = 1024
 // flushes a partial batch after this duration has elapsed since the
 // last flush. Callback is invoked after every successful COMMIT.
 type BatchConfig struct {
-	Size      int           // default 64; <= 0 means "flush every record"
-	Timeout   time.Duration // default 100ms; <= 0 means "no timeout flush"
-	Callback  func()        // invoked after every COMMIT; may be nil
+	Size     int           // default 64; <= 0 means "flush every record"
+	Timeout  time.Duration // default 100ms; <= 0 means "no timeout flush"
+	Callback func()        // invoked after every COMMIT; may be nil
 }
 
 // RecordRequestErrorTimeout bounds how long a Write op waits for a

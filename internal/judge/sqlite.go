@@ -84,7 +84,7 @@ type SQLiteStore struct {
 	closeMu sync.Mutex
 
 	// Batch config (issue #1234). Same semantics as metrics store.
-	batchSize     int
+	batchSize    int
 	batchTimeout time.Duration
 }
 

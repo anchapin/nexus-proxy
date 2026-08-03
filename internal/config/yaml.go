@@ -1665,8 +1665,8 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		TelemetryFlushInterval: yc.durationDefault(yc.TelemetryFlushInterval, 5*time.Second),
 		MetricsDBPath:          yc.stringDefault(yc.MetricsDBPath, DefaultMetricsDBPath()),
 		MetricsRetentionDays:   yc.intDefault(yc.MetricsRetentionDays, 0),
-		MetricsBatchSize:      yc.intDefault(yc.MetricsBatchSize, 64),
-		MetricsBatchTimeout:   yc.durationDefault(yc.MetricsBatchTimeout, 100*time.Millisecond),
+		MetricsBatchSize:       yc.intDefault(yc.MetricsBatchSize, 64),
+		MetricsBatchTimeout:    yc.durationDefault(yc.MetricsBatchTimeout, 100*time.Millisecond),
 
 		// OTLP retry/back-off parameters (issue #803).
 		TracerMaxRetries:     yc.intDefault(yc.TracerMaxRetries, 0),
