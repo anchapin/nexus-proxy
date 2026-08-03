@@ -22,7 +22,8 @@ snake_case naming.
 
 | Family | Type | Labels | Cardinality | Defined in |
 |--------|------|--------|-------------|------------|
-| `nexus_route_decisions_total` | counter | `route`, `source` | 3 × 5 = 15 | `routemetrics.go` |
+| `nexus_route_decisions_total` | counter | `route`, `source` | 3 × 8 = 24 | `routemetrics.go` |
+| `nexus_route_budget_downtier_total` | counter | *(none)* | 1 | `routemetrics.go` (issue #1163) |
 | `nexus_slm_decisions_total` | counter | `route`, `confidence_bucket`, `task_type` | 3 × 4 × 8 = 96 | `routemetrics.go` |
 | `nexus_slm_low_confidence_escalations_total` | counter | `task_type` | 8 | `routemetrics.go` |
 | `nexus_slm_cache_hits_total` | counter | `kind` | 2 (`exact`, `semantic`) | `routemetrics.go` |
@@ -46,7 +47,7 @@ snake_case naming.
 | `nexus_build_info` | gauge | `version`, `commit`, `go_version` | 1 | `prometheus.go` (issue #529) |
 | `nexus_slo_error_budget_remaining` | gauge | `slo` | 3 (`availability`, `local_latency_p99`, `ttft_p95`) | `collector.go` (issue #1239) |
 
-**Maximum theoretical series**: 15 + 96 + 8 + 2 + 1 + 2 + 1 + 1 + 4 + 6 + 4 + 1 + 2 + 2 + 1 + 1 = 151 series.
+**Maximum theoretical series**: 24 + 96 + 8 + 2 + 1 + 2 + 1 + 1 + 4 + 6 + 4 + 1 + 2 + 2 + 1 + 1 + 1 = 161 series.
 
 > **Note (issue #486):** `nexus_rag_retrieval_total` previously carried
 > a `filename` label whose value was the raw RAG source filename, which
@@ -71,9 +72,13 @@ snake_case naming.
 |-------|----------|---------|
 | `guardrail` | `router.SourceGuardrail` | VRAM-aware token budget forced frontier |
 | `dsl` | `router.SourceDSL` | Regex fast-pass matched |
+| `dsl-promoted` | `router.SourceDSLPromoted` | N-gram auto-promoted to DSL fast-pass by PatternPromoter (issue #1165) |
 | `slm` | `router.SourceSLM` | SLM returned a valid decision |
 | `slm-error` | `router.SourceSLMError` | SLM call failed (timeout, bad JSON) |
 | `escalation` | `router.SourceEscalation` | Defensive nil-SLM fallback to frontier |
+| `slm-low-confidence` | `router.SourceSLMEscalation` | SLM confidence below threshold, escalated to frontier |
+| `budget-down-tier` | `router.SourceBudgetDownTier` | Frontier budget exhausted, down-tiered to local |
+| `dsl-promoted` | `router.SourceDSLPromoted` | DSL matched a fusion pattern, promoted to fusion |
 
 #### `confidence_bucket`
 

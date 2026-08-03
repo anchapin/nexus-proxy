@@ -7,10 +7,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/tracing"
@@ -67,6 +70,13 @@ type Middleware struct {
 
 	mu      sync.Mutex
 	buckets map[string]*bucket
+
+	// nexus_ratelimit_hits_total{bucket} counter (issue #1305).
+	// bucket is the hashed bucket key (hashedBucketKey result).
+	rateLimitHitsTotal map[string]*uint64
+
+	// nexus_ratelimit_rejections_total counter (issue #1305).
+	rateLimitRejectionsTotal uint64
 }
 
 // bucket is a per-client token bucket. The refiller is implicit: we
@@ -78,6 +88,70 @@ type bucket struct {
 	tokens     float64   // current token count (fractional under the hood)
 	lastRefill time.Time // wall time of the last refill computation
 	lastSeen   time.Time // for the idle reaper
+}
+
+// incRateLimitHit increments the nexus_ratelimit_hits_total counter
+// for the given bucket. Safe for concurrent use.
+func (m *Middleware) incRateLimitHit(bucketID string) {
+	if m == nil || m.rateLimitHitsTotal == nil {
+		return
+	}
+	m.mu.Lock()
+	p, ok := m.rateLimitHitsTotal[bucketID]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		m.rateLimitHitsTotal[bucketID] = p
+	}
+	m.mu.Unlock()
+	atomic.AddUint64(p, 1)
+}
+
+// incRateLimitRejection increments the nexus_ratelimit_rejections_total
+// counter. Safe for concurrent use.
+func (m *Middleware) incRateLimitRejection() {
+	if m == nil {
+		return
+	}
+	atomic.AddUint64(&m.rateLimitRejectionsTotal, 1)
+}
+
+// WritePrometheusMetrics writes the nexus_ratelimit_hits_total and
+// nexus_ratelimit_rejections_total counter families to w in Prometheus
+// text exposition format. Safe for concurrent use; nil receivers are a
+// no-op.
+func (m *Middleware) WritePrometheusMetrics(w io.Writer) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// nexus_ratelimit_rejections_total
+	//nolint:errcheck // Writer error cannot be handled after partial write.
+	fmt.Fprintf(w, "# HELP nexus_ratelimit_rejections_total Requests rejected (429) by the rate limiter (issue #1305).\n")
+	//nolint:errcheck // Writer error cannot be handled after partial write.
+	fmt.Fprintf(w, "# TYPE nexus_ratelimit_rejections_total counter\n")
+	rejections := atomic.LoadUint64(&m.rateLimitRejectionsTotal)
+	//nolint:errcheck // Writer error cannot be handled after partial write.
+	fmt.Fprintf(w, "nexus_ratelimit_rejections_total %d\n", rejections)
+
+	// nexus_ratelimit_hits_total{bucket}
+	//nolint:errcheck // Writer error cannot be handled after partial write.
+	fmt.Fprintf(w, "# HELP nexus_ratelimit_hits_total Requests allowed by the rate limiter, by bucket (issue #1305).\n")
+	//nolint:errcheck // Writer error cannot be handled after partial write.
+	fmt.Fprintf(w, "# TYPE nexus_ratelimit_hits_total counter\n")
+
+	// Collect and sort keys for deterministic output.
+	keys := make([]string, 0, len(m.rateLimitHitsTotal))
+	for k := range m.rateLimitHitsTotal {
+		keys = append(keys, k)
+	}
+	for _, k := range keys {
+		v := atomic.LoadUint64(m.rateLimitHitsTotal[k])
+		//nolint:errcheck // Writer error cannot be handled after partial write.
+		fmt.Fprintf(w, "nexus_ratelimit_hits_total{bucket=%q} %d\n", k, v)
+	}
 }
 
 // NewMiddleware constructs a rate-limit middleware. A non-positive rpm
@@ -110,14 +184,16 @@ func NewMiddleware(rpm, burst int, resolver *ClientIPResolver, keyFn func(*http.
 		keyType = "apikey"
 	}
 	m := &Middleware{
-		resolver: resolver,
-		rpm:      rpm,
-		burst:    burst,
-		ttl:      10 * time.Minute, // reap buckets idle for 10 min
-		stopCh:   make(chan struct{}),
-		buckets:  make(map[string]*bucket),
-		keyFn:    keyFn,
-		keyType:  keyType,
+		resolver:                 resolver,
+		rpm:                      rpm,
+		burst:                    burst,
+		ttl:                      10 * time.Minute, // reap buckets idle for 10 min
+		stopCh:                   make(chan struct{}),
+		buckets:                  make(map[string]*bucket),
+		keyFn:                    keyFn,
+		keyType:                  keyType,
+		rateLimitHitsTotal:       make(map[string]*uint64),
+		rateLimitRejectionsTotal: 0,
 	}
 	m.reaperWG.Add(1)
 	go m.reaper()
@@ -218,6 +294,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			if m.onReject != nil {
 				m.onReject()
 			}
+			m.incRateLimitRejection()
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Retry-After", "60")
 			w.Header().Set("X-Nexus-RateLimit-Remaining", "0")
@@ -236,6 +313,8 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			)
 			return
 		}
+		// Request allowed: increment hits counter with hashed bucket key.
+		m.incRateLimitHit(hashedBucketKey(bucketKey))
 		w.Header().Set("X-Nexus-RateLimit-Key-Type", m.keyType)
 		next.ServeHTTP(w, r)
 	})

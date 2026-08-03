@@ -501,6 +501,9 @@ type Config struct {
 	JudgeCostPer1KUSD       float64       // rough USD/1k-token rate for cost estimates
 	JudgeDBPath             string        // on-disk SQLite database for judge scores; empty disables Detected
 	JudgeAdaptiveEnabled    bool          // enable adaptive sampling based on rolling avg of recent scores (issue #1232)
+	JudgeAdaptiveWindow     time.Duration // look-back period for rolling average of recent scores (issue #1301)
+	JudgeAdaptiveHighConf   float64       // high confidence threshold — decay to min rate when avg > this (issue #1301)
+	JudgeAdaptiveLowConf    float64       // low confidence threshold — increase to max rate when avg < this (issue #1301)
 	// edits enqueue a background `cargo check` / `npx tsc` and the
 	// verdict (1 = clean, 0 = fail/timeout) is reported via a
 	// callback to cmd/nexus/main.go. QualityEnabled is true iff
@@ -2024,9 +2027,29 @@ func Load() (Config, error) {
 
 	// Judge adaptive sampling (issue #1232). When enabled, the sample
 	// rate is dynamically adjusted based on the rolling average of
-	// recent judge scores: decay to 1% if avg > 4.0, increase to 10%
-	// if avg < 3.0, else hold at 5%.
+	// recent judge scores: decay to 1% if avg > high, increase to 10%
+	// if avg < low, else hold at 5%. Windows and thresholds are
+	// configurable via NEXUS_JUDGE_ADAPTIVE_WINDOW / _HIGH_CONFIDENCE /
+	// _LOW_CONFIDENCE (issue #1301).
 	cfg.JudgeAdaptiveEnabled = getEnvBool("NEXUS_JUDGE_ADAPTIVE_ENABLED", false)
+
+	adaptiveWindow, err := getEnvDuration("NEXUS_JUDGE_ADAPTIVE_WINDOW", 30*time.Second)
+	if err != nil {
+		return cfg, fmt.Errorf("NEXUS_JUDGE_ADAPTIVE_WINDOW: %w", err)
+	}
+	cfg.JudgeAdaptiveWindow = adaptiveWindow
+
+	highConf, err := getEnvFloat("NEXUS_JUDGE_ADAPTIVE_HIGH_CONFIDENCE", 4.0)
+	if err != nil {
+		return cfg, fmt.Errorf("NEXUS_JUDGE_ADAPTIVE_HIGH_CONFIDENCE: %w", err)
+	}
+	cfg.JudgeAdaptiveHighConf = highConf
+
+	lowConf, err := getEnvFloat("NEXUS_JUDGE_ADAPTIVE_LOW_CONFIDENCE", 3.0)
+	if err != nil {
+		return cfg, fmt.Errorf("NEXUS_JUDGE_ADAPTIVE_LOW_CONFIDENCE: %w", err)
+	}
+	cfg.JudgeAdaptiveLowConf = lowConf
 
 	// The judge is "enabled" iff the operator actually configured
 	// sampling above zero. Zero/negative rate keeps the worker pool
@@ -2461,6 +2484,12 @@ func (c Config) Validate() error {
 	}
 	if c.RedactProfile == "custom" && c.RedactPatternsRaw == "" {
 		return fmt.Errorf("config: NEXUS_REDACT_PROFILE is \"custom\" but NEXUS_REDACT_PATTERNS is empty; supply comma-separated regex patterns")
+	}
+	switch c.AuthMode {
+	case "static", "jwt", "both":
+		// Recognised values.
+	default:
+		return fmt.Errorf("config: NEXUS_AUTH_MODE value %q is not recognised; want \"static\", \"jwt\", or \"both\"", c.AuthMode)
 	}
 	return nil
 }
@@ -3646,6 +3675,9 @@ var allEnvFields = []envField{
 	{"NEXUS_JUDGE_TIMEOUT", func(c *Config) string { return c.JudgeTimeout.String() }},
 	{"NEXUS_JUDGE_URL", func(c *Config) string { return c.JudgeURL }},
 	{"NEXUS_JUDGE_ADAPTIVE_ENABLED", func(c *Config) string { return fmt.Sprintf("%t", c.JudgeAdaptiveEnabled) }},
+	{"NEXUS_JUDGE_ADAPTIVE_WINDOW", func(c *Config) string { return c.JudgeAdaptiveWindow.String() }},
+	{"NEXUS_JUDGE_ADAPTIVE_HIGH_CONFIDENCE", func(c *Config) string { return fmt.Sprintf("%g", c.JudgeAdaptiveHighConf) }},
+	{"NEXUS_JUDGE_ADAPTIVE_LOW_CONFIDENCE", func(c *Config) string { return fmt.Sprintf("%g", c.JudgeAdaptiveLowConf) }},
 	{"NEXUS_LOCAL_COOLDOWN", func(c *Config) string { return c.LocalCooldown.String() }},
 	{"NEXUS_LOCAL_MAX_CONCURRENT", func(c *Config) string { return fmt.Sprintf("%d", c.LocalMaxConcurrent) }},
 	{"NEXUS_LOCAL_MODEL", func(c *Config) string { return c.LocalModel }},

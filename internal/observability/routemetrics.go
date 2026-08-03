@@ -216,8 +216,9 @@ type RouteCounters struct {
 	// ("fusion", "formatting", "local", "unicode"); dslMisses is a
 	// single counter incremented when DSL had no opinion and the
 	// request fell through to SLM.
-	dslHits   map[string]*uint64
-	dslMisses *uint64
+	dslHits     map[string]*uint64
+	dslMisses   *uint64
+	dslPromoted *uint64 // nexus_route_dsl_promoted_total (issue #1297)
 
 	// Response-content redaction counter (issue #1172). Labelled by
 	// profile ("secrets", "pii", "custom"). Incremented by the
@@ -246,6 +247,7 @@ func NewRouteCounters() *RouteCounters {
 	ragHits := uint64(0)
 	slmEmbedErrs := uint64(0)
 	dslMisses := uint64(0)
+	dslPromoted := uint64(0)
 	return &RouteCounters{
 		routeDecisions:           make(map[counterKey]*uint64),
 		slmDecisions:             make(map[counterKey]*uint64),
@@ -268,6 +270,7 @@ func NewRouteCounters() *RouteCounters {
 		promptInjectionHits:      make(map[string]*uint64),
 		dslHits:                  make(map[string]*uint64),
 		dslMisses:                &dslMisses,
+		dslPromoted:              &dslPromoted,
 		redacted:                 make(map[string]*uint64),
 	}
 }
@@ -549,6 +552,16 @@ func (rc *RouteCounters) ObserveDSLMiss() {
 		return
 	}
 	atomic.AddUint64(rc.dslMisses, 1)
+}
+
+// IncDSLPromoted increments the auto-promoted DSL counter (issue #1297).
+// Called when the PatternPromoter auto-promotes an n-gram to the DSL fast-pass.
+// Safe for concurrent use; nil receivers are no-ops.
+func (rc *RouteCounters) IncDSLPromoted() {
+	if rc == nil || rc.dslPromoted == nil {
+		return
+	}
+	atomic.AddUint64(rc.dslPromoted, 1)
 }
 
 // slmCacheEvictionSlot returns the *uint64 for the SLM cache eviction
@@ -885,6 +898,334 @@ func (rc *RouteCounters) Snapshot() []RouteCounterEntry {
 	return entries
 }
 
+// RouteDecisionsSnapshot returns a point-in-time copy of all route-decision
+// counters keyed by counterKey. Used by CollectMetricSnapshot for OTLP export.
+func (rc *RouteCounters) RouteDecisionsSnapshot() map[counterKey]uint64 {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make(map[counterKey]uint64, len(rc.routeDecisions))
+	for k, v := range rc.routeDecisions {
+		out[k] = atomic.LoadUint64(v)
+	}
+	return out
+}
+
+// SLMDecisionsSnapshot returns a point-in-time copy of all SLM-decision
+// counters keyed by counterKey. Used by CollectMetricSnapshot for OTLP export.
+func (rc *RouteCounters) SLMDecisionsSnapshot() map[counterKey]uint64 {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make(map[counterKey]uint64, len(rc.slmDecisions))
+	for k, v := range rc.slmDecisions {
+		out[k] = atomic.LoadUint64(v)
+	}
+	return out
+}
+
+// LowConfidenceEscalationsSnapshot returns a point-in-time copy of low-confidence
+// escalation counters keyed by counterKey. Used by CollectMetricSnapshot.
+func (rc *RouteCounters) LowConfidenceEscalationsSnapshot() map[counterKey]uint64 {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make(map[counterKey]uint64, len(rc.lowConfidenceEscalations))
+	for k, v := range rc.lowConfidenceEscalations {
+		out[k] = atomic.LoadUint64(v)
+	}
+	return out
+}
+
+// SLMEscalationsSnapshot returns a point-in-time copy of SLM escalation
+// counters keyed by reason string. Used by CollectMetricSnapshot.
+func (rc *RouteCounters) SLMEscalationsSnapshot() map[string]uint64 {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make(map[string]uint64, len(rc.slmEscalations))
+	for k, v := range rc.slmEscalations {
+		out[k] = atomic.LoadUint64(v)
+	}
+	return out
+}
+
+// SLMCacheHitsSnapshot returns a point-in-time copy of SLM cache hits keyed
+// by kind ("exact" or "semantic"). Used by CollectMetricSnapshot.
+func (rc *RouteCounters) SLMCacheHitsSnapshot() map[string]uint64 {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make(map[string]uint64, len(rc.slmCacheHits))
+	for k, v := range rc.slmCacheHits {
+		out[k] = atomic.LoadUint64(v)
+	}
+	return out
+}
+
+// SLMCacheMisses returns the SLM cache misses count.
+func (rc *RouteCounters) SLMCacheMisses() uint64 {
+	if rc == nil || rc.slmCacheMisses == nil {
+		return 0
+	}
+	return atomic.LoadUint64(rc.slmCacheMisses)
+}
+
+// SLMCacheEvictionsSnapshot returns a point-in-time copy of SLM cache eviction
+// counters keyed by reason ("ttl" or "lru"). Used by CollectMetricSnapshot.
+func (rc *RouteCounters) SLMCacheEvictionsSnapshot() map[string]uint64 {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make(map[string]uint64, len(rc.slmCacheEvictions))
+	for k, v := range rc.slmCacheEvictions {
+		out[k] = atomic.LoadUint64(v)
+	}
+	return out
+}
+
+// SLMCacheEmbedErrors returns the SLM cache embedder error count.
+func (rc *RouteCounters) SLMCacheEmbedErrors() uint64 {
+	if rc == nil || rc.slmCacheEmbedErrors == nil {
+		return 0
+	}
+	return atomic.LoadUint64(rc.slmCacheEmbedErrors)
+}
+
+// RejectionsSnapshot returns a point-in-time copy of rejection counters
+// keyed by reason string. Used by CollectMetricSnapshot.
+func (rc *RouteCounters) RejectionsSnapshot() map[string]uint64 {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make(map[string]uint64, len(rc.rejections))
+	for k, v := range rc.rejections {
+		out[k] = atomic.LoadUint64(v)
+	}
+	return out
+}
+
+// FusionArbiterSnapshot returns a point-in-time copy of fusion arbiter
+// counters keyed by outcome reason. Used by CollectMetricSnapshot.
+func (rc *RouteCounters) FusionArbiterSnapshot() map[string]uint64 {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make(map[string]uint64, len(rc.fusionArbiter))
+	for k, v := range rc.fusionArbiter {
+		out[k] = atomic.LoadUint64(v)
+	}
+	return out
+}
+
+// RAGRetrievalHits returns the RAG retrieval hits count.
+func (rc *RouteCounters) RAGRetrievalHits() uint64 {
+	if rc == nil || rc.rRAGHits == nil {
+		return 0
+	}
+	return atomic.LoadUint64(rc.rRAGHits)
+}
+
+// RAGRetrievalMissesSnapshot returns a point-in-time copy of RAG retrieval
+// miss counters keyed by reason. Used by CollectMetricSnapshot.
+func (rc *RouteCounters) RAGRetrievalMissesSnapshot() map[string]uint64 {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make(map[string]uint64, len(rc.rRAGMisses))
+	for k, v := range rc.rRAGMisses {
+		out[k] = atomic.LoadUint64(v)
+	}
+	return out
+}
+
+// RAGCacheHits returns the RAG prompt embedding cache hits count.
+func (rc *RouteCounters) RAGCacheHits() uint64 {
+	if rc == nil || rc.ragCacheHits == nil {
+		return 0
+	}
+	return atomic.LoadUint64(rc.ragCacheHits)
+}
+
+// RAGCacheMisses returns the RAG prompt embedding cache misses count.
+func (rc *RouteCounters) RAGCacheMisses() uint64 {
+	if rc == nil || rc.ragCacheMisses == nil {
+		return 0
+	}
+	return atomic.LoadUint64(rc.ragCacheMisses)
+}
+
+// CascadeFallbacksSnapshot returns a point-in-time copy of cascade fallback
+// counters keyed by reason. Used by CollectMetricSnapshot.
+func (rc *RouteCounters) CascadeFallbacksSnapshot() map[string]uint64 {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make(map[string]uint64, len(rc.cascadeFallbacks))
+	for k, v := range rc.cascadeFallbacks {
+		out[k] = atomic.LoadUint64(v)
+	}
+	return out
+}
+
+// ArbiterCacheSnapshot returns a point-in-time copy of arbiter cache
+// counters keyed by "hit" or "miss". Used by CollectMetricSnapshot.
+func (rc *RouteCounters) ArbiterCacheSnapshot() map[string]uint64 {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make(map[string]uint64, len(rc.arbiterCache))
+	for k, v := range rc.arbiterCache {
+		out[k] = atomic.LoadUint64(v)
+	}
+	return out
+}
+
+// ArbiterCacheEvictionsSnapshot returns a point-in-time copy of arbiter cache
+// eviction counters keyed by reason. Used by CollectMetricSnapshot.
+func (rc *RouteCounters) ArbiterCacheEvictionsSnapshot() map[string]uint64 {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make(map[string]uint64, len(rc.arbiterCacheEvictions))
+	for k, v := range rc.arbiterCacheEvictions {
+		out[k] = atomic.LoadUint64(v)
+	}
+	return out
+}
+
+// JudgeQueueOverflow returns the judge queue overflow count.
+func (rc *RouteCounters) JudgeQueueOverflow() uint64 {
+	if rc == nil {
+		return 0
+	}
+	return atomic.LoadUint64(&rc.judgeQueueOverflow)
+}
+
+// QualityQueueOverflow returns the quality verifier queue overflow count.
+func (rc *RouteCounters) QualityQueueOverflow() uint64 {
+	if rc == nil {
+		return 0
+	}
+	return atomic.LoadUint64(&rc.qualityQueueOverflow)
+}
+
+// PanelPanics returns the panel panic count.
+func (rc *RouteCounters) PanelPanics() uint64 {
+	if rc == nil {
+		return 0
+	}
+	return atomic.LoadUint64(&rc.panelPanics)
+}
+
+// PromptInjectionHitsSnapshot returns a point-in-time copy of prompt injection
+// hit counters keyed by mode ("warn" or "strict"). Used by CollectMetricSnapshot.
+func (rc *RouteCounters) PromptInjectionHitsSnapshot() map[string]uint64 {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make(map[string]uint64, len(rc.promptInjectionHits))
+	for k, v := range rc.promptInjectionHits {
+		out[k] = atomic.LoadUint64(v)
+	}
+	return out
+}
+
+// HandlerPanicsSnapshot returns a point-in-time copy of handler panic counters
+// keyed by normalized route path. Used by CollectMetricSnapshot.
+func (rc *RouteCounters) HandlerPanicsSnapshot() map[string]uint64 {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make(map[string]uint64, len(rc.handlerPanics))
+	for k, v := range rc.handlerPanics {
+		out[k] = atomic.LoadUint64(v.counter)
+	}
+	return out
+}
+
+// LocalCooldownTriggers returns the local-route cooldown triggers count.
+func (rc *RouteCounters) LocalCooldownTriggers() uint64 {
+	if rc == nil {
+		return 0
+	}
+	return atomic.LoadUint64(&rc.localCooldownTriggers)
+}
+
+// BudgetDowntier returns the budget down-tier count.
+func (rc *RouteCounters) BudgetDowntier() uint64 {
+	if rc == nil {
+		return 0
+	}
+	return atomic.LoadUint64(&rc.budgetDowntier)
+}
+
+// DSLHitsSnapshot returns a point-in-time copy of DSL fast-pass hit counters
+// keyed by reason. Used by CollectMetricSnapshot.
+func (rc *RouteCounters) DSLHitsSnapshot() map[string]uint64 {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make(map[string]uint64, len(rc.dslHits))
+	for k, v := range rc.dslHits {
+		out[k] = atomic.LoadUint64(v)
+	}
+	return out
+}
+
+// DSLMisses returns the DSL fast-pass misses count.
+func (rc *RouteCounters) DSLMisses() uint64 {
+	if rc == nil || rc.dslMisses == nil {
+		return 0
+	}
+	return atomic.LoadUint64(rc.dslMisses)
+}
+
+// RedactedSnapshot returns a point-in-time copy of redaction counters keyed
+// by profile. Used by CollectMetricSnapshot.
+func (rc *RouteCounters) RedactedSnapshot() map[string]uint64 {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make(map[string]uint64, len(rc.redacted))
+	for k, v := range rc.redacted {
+		out[k] = atomic.LoadUint64(v)
+	}
+	return out
+}
+
 // RouteCounterEntry is one route/source bucket from the routing snapshot.
 type RouteCounterEntry struct {
 	Route  string `json:"route"`
@@ -1078,6 +1419,13 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 		return total, err
 	} else {
 		total += n
+	}
+	// Auto-promoted DSL counter (issue #1297).
+	dslPromoted := atomic.LoadUint64(rc.dslPromoted)
+	if n, err := fmt.Fprintf(w, "# HELP nexus_route_dsl_promoted_total Total n-gram patterns auto-promoted to the DSL fast-pass by the PatternPromoter (issue #1297).\n# TYPE nexus_route_dsl_promoted_total counter\nnexus_route_dsl_promoted_total %d\n", dslPromoted); err != nil {
+		return total, err
+	} else {
+		total += int64(n)
 	}
 	// Response-content redaction counter (issue #1172).
 	if n, err := writeLabelledSeries(w, "nexus_redacted_total",

@@ -360,6 +360,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		})
 		if otelExp != nil {
 			observability.RegisterCollector(circuitCollector)
+			observability.RegisterRouteCounters(routeCounters)
 			observability.RegisterOtelMetricsExporter(otelExp)
 			parts.otelMetricsCloser = otelExp.Close
 			slog.Info("otel metrics exporter wired",
@@ -378,17 +379,20 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 	stageCollector := observability.NewCollector()
 	if cfg.JudgeEnabled && cfg.JudgeAPIKey != "" {
 		evalCfg := judge.Config{
-			URL:                cfg.JudgeURL,
-			Model:              cfg.JudgeModel,
-			APIKey:             cfg.JudgeAPIKey,
-			SampleRate:         cfg.JudgeSampleRate,
-			FrontierSampleRate: cfg.JudgeFrontierSampleRate,
-			Concurrency:        cfg.JudgeConcurrency,
-			QueueDepth:         cfg.JudgeQueueDepth,
-			Timeout:            cfg.JudgeTimeout,
-			CostPer1K:          cfg.JudgeCostPer1KUSD,
-			BudgetGuard:        budgetGuard,
-			AdaptiveEnabled:    cfg.JudgeAdaptiveEnabled,
+			URL:                    cfg.JudgeURL,
+			Model:                  cfg.JudgeModel,
+			APIKey:                 cfg.JudgeAPIKey,
+			SampleRate:             cfg.JudgeSampleRate,
+			FrontierSampleRate:     cfg.JudgeFrontierSampleRate,
+			Concurrency:            cfg.JudgeConcurrency,
+			QueueDepth:             cfg.JudgeQueueDepth,
+			Timeout:                cfg.JudgeTimeout,
+			CostPer1K:              cfg.JudgeCostPer1KUSD,
+			BudgetGuard:            budgetGuard,
+			AdaptiveEnabled:        cfg.JudgeAdaptiveEnabled,
+			AdaptiveWindow:         cfg.JudgeAdaptiveWindow,
+			AdaptiveHighConfidence: cfg.JudgeAdaptiveHighConf,
+			AdaptiveLowConfidence:  cfg.JudgeAdaptiveLowConf,
 		}
 		var storage judge.Storage
 		if cfg.JudgeDBEnabled() {
@@ -842,6 +846,14 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 				Name: "nexus_cache_warmed_entries", Value: float64(cacheWarmedEntries),
 			}}
 		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			if persistentStore == nil {
+				return nil
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_rag_document_count", Value: float64(persistentStore.Size())},
+			}
+		}),
 	)
 
 	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.TOONUnfenced, cfg.PromptInjectionIsolated())
@@ -874,6 +886,9 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		}
 		if e.Source == "dsl" {
 			routeCounters.ObserveDSLHit(e.Reason)
+		}
+		if e.Source == "dsl-promoted" {
+			routeCounters.IncDSLPromoted()
 		}
 		if e.DSLMiss {
 			routeCounters.ObserveDSLMiss()
@@ -939,7 +954,21 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		)
 	}
 
-	mux.Handle("/metrics", routeCounters.Handler())
+	// Combined metrics handler: route counters + auth metrics (issue #1305) + ratelimit metrics (issue #1305).
+	// routeCounters.Handler() writes routing, collector, and gauge metrics.
+	// We append auth and ratelimit metrics after.
+	baseMetricsHandler := routeCounters.Handler()
+	mux.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		baseMetricsHandler.ServeHTTP(w, r)
+		// Write auth metrics (issue #1305).
+		if parts.authMiddleware != nil {
+			parts.authMiddleware.WritePrometheusMetrics(w)
+		}
+		// Write ratelimit metrics (issue #1305).
+		if rateLimiter != nil {
+			rateLimiter.WritePrometheusMetrics(w)
+		}
+	}))
 	slog.Info("metrics endpoint serves prometheus text format",
 		slog.String("path", "/metrics"),
 	)
