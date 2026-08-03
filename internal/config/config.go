@@ -2961,6 +2961,13 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 	}
 	next.AuthRateLimitWindow = authRateLimitWindow
 
+	// RAG circuit breaker threshold (issue #1311).
+	cbThreshold, _ := getEnvInt("NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD", prev.RAGCircuitBreakerThreshold)
+	if cbThreshold < 0 {
+		cbThreshold = 0
+	}
+	next.RAGCircuitBreakerThreshold = cbThreshold
+
 	logLevel, logLevelErr := parseLogLevel(os.Getenv("NEXUS_LOG_LEVEL"))
 	if logLevelErr != nil {
 		slog.Warn("invalid NEXUS_LOG_LEVEL, using info level", slog.String("reason", logLevelErr.Error()))
@@ -3299,9 +3306,10 @@ var hotReloadableEnvs = map[string]bool{
 	"NEXUS_DEBUG":                      true,
 	"NEXUS_SHUTDOWN_TIMEOUT":           true,
 	"NEXUS_SERVER_READ_TIMEOUT":        true,
-	"NEXUS_BUDGET_ALERT_THRESHOLD":     true,
+	"NEXUS_BUDGET_ALERT_THRESHOLD":      true,
 	"NEXUS_FUSION_AGREEMENT_THRESHOLD": true,
 	"NEXUS_TRACING_SAMPLE_RATE":        true,
+	"NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD": true,
 }
 
 // IsHotReloadable returns true when the given env var name (e.g. "NEXUS_RATE_LIMIT_RPM")
