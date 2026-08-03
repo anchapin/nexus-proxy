@@ -22,49 +22,55 @@ IMPORTANT — Silent Failure Prevention:
 - If you do not output a PR number, the orchestrator will treat your run as FAILED.
 - The orchestrator verifies git log origin/develop..HEAD is non-empty before accepting "done".
 - If your worktree is unchanged after you report done, recovery will be triggered.
-- **CRITICAL: PR CREATION IS MANDATORY.** You MUST run `gh pr create` and verify
-  the PR was created before outputting `PR: {PR_NUMBER}`. Skipping PR creation will
-  trigger the orchestrator's recovery sequence, which creates the PR directly — but
-  this adds overhead and risks incorrect PR metadata. Do NOT skip step 8.
+- **CRITICAL: PR CREATION IS MANDATORY — and it happens BEFORE push.**
+  You MUST run `gh pr create` (step 7) and verify the PR was created before
+  running `git push` (step 8). Skipping PR creation will trigger the orchestrator's
+  recovery sequence, which creates the PR directly — but this adds overhead and risks
+  incorrect PR metadata. Do NOT skip step 7.
+- **GUARD: If you do not see a PR URL in your output after step 7, you have NOT
+  finished. Do NOT proceed to step 8 (push) without a verified PR number.**
 
-Steps:
-1. Read the full issue: gh issue view {NUMBER}
-2. Read the issue comments for additional context: gh issue view {NUMBER} --comments
-3. Analyze what code needs to change
-4. Implement the fix/feature with tests
-5. Run local checks if available (make test-fast, make lint)
-6. Commit: git add -A && git commit -m "{fix|feat}: resolve #{NUMBER} — {brief description}"
-7. Push: git push -u origin fix/issue-{NUMBER}-{SLUG} --force-with-lease
-   NOTE: If push fails (e.g., remote branch exists with newer commits), use
-   `git pull --rebase origin develop` first, then push again with --force-with-lease.
-8. **PR CREATION — MANDATORY STEP. Do NOT skip.**
-   Run this exact command and capture the output:
-   ```
-   gh pr create --base develop \
-     --title "{fix|feat}: resolve #{NUMBER} — {TITLE}" \
-     --body "$(cat <<'EOF'
-   Closes #{NUMBER}
+ Steps:
+ 1. Read the full issue: gh issue view {NUMBER}
+ 2. Read the issue comments for additional context: gh issue view {NUMBER} --comments
+ 3. Analyze what code needs to change
+ 4. Implement the fix/feature with tests
+ 5. Run local checks if available (make test-fast, make lint)
+ 6. Commit: git add -A && git commit -m "{fix|feat}: resolve #{NUMBER} — {brief description}"
+ 7. **PR CREATION — MANDATORY STEP. Do NOT skip.**
+    Run this exact command and capture the output:
+    ```
+    gh pr create --base develop \
+      --title "{fix|feat}: resolve #{NUMBER} — {TITLE}" \
+      --body "$(cat <<'EOF'
+    Closes #{NUMBER}
 
-   <one-paragraph description of the change>
-   EOF
-   )"
-   ```
-   - The body must list ALL issues that this PR resolves. If the
-     commit also fixes a related issue, add another `Closes #N` line.
-   - Do NOT include issue numbers in the title — see
-     `docs/orchestration/pr-body-conventions.md` for the rationale.
-   - **Verify the PR was created**: after `gh pr create` succeeds, run:
-     ```
-     gh pr list --search "fix/issue-{NUMBER}" --json number --jq 'length'
-     ```
-     This must return 1. If it returns 0, the PR creation failed silently —
-     retry `gh pr create` or use `gh pr create --fill` as fallback.
-   - **Capture the PR number** from `gh pr create` output or from:
-     ```
-     gh pr list --search "fix/issue-{NUMBER}" --json number --jq '.[0].number'
-     ```
+    <one-paragraph description of the change>
+    EOF
+    )"
+    ```
+    - The body must list ALL issues that this PR resolves. If the
+      commit also fixes a related issue, add another `Closes #N` line.
+    - Do NOT include issue numbers in the title — see
+      `docs/orchestration/pr-body-conventions.md` for the rationale.
+    - **Verify the PR was created**: after `gh pr create` succeeds, run:
+      ```
+      gh pr list --search "fix/issue-{NUMBER}" --json number --jq 'length'
+      ```
+      This must return 1. If it returns 0, the PR creation failed silently —
+      retry `gh pr create` or use `gh pr create --fill` as fallback.
+    - **Capture the PR number** from `gh pr create` output or from:
+      ```
+      gh pr list --search "fix/issue-{NUMBER}" --json number --jq '.[0].number'
+      ```
+    - **GUARD: If you do not see a PR URL in your output, you have NOT finished.**
+      Do NOT report done. Do NOT skip to the push step without a verified PR.
 
-9. Verify closingReferences count matches the number of issues this PR resolves:
+ 8. Push: git push -u origin fix/issue-{NUMBER}-{SLUG} --force-with-lease
+    NOTE: If push fails (e.g., remote branch exists with newer commits), use
+    `git pull --rebase origin develop` first, then push again with --force-with-lease.
+
+ 9. Verify closingReferences count matches the number of issues this PR resolves:
    ```
    bash scripts/check_pr_closing_refs.sh <PR_NUMBER> <COUNT>
    ```
@@ -72,9 +78,10 @@ Steps:
    to strip the spurious references, then re-run the check.
 
    NOTE: After this step the orchestrator independently verifies the PR exists.
-   If the sub-agent exits before completing step 8, the orchestrator's
+   If the sub-agent exits before completing step 8 (push), the orchestrator's
    wave-level recovery sequence (see SKILL.md Phase 3c § Recovery) will push
-   the branch and create the PR directly using --force-with-lease.
+   the branch. Since PR creation is now step 7, the PR should already exist;
+   if not, the recovery sequence will also create the PR directly using --force-with-lease.
 10. **FINAL OUTPUT**: Your last line of output MUST be:
     ```
     PR: {PR_NUMBER}
@@ -83,7 +90,7 @@ Steps:
     The orchestrator parses this line to confirm success.
 
     **IMPORTANT**: The PR number must be REAL and VERIFIED. You must have run
-    `gh pr create` in step 8 and confirmed the PR exists in step 8's verification.
+    `gh pr create` in step 7 and confirmed the PR exists in step 7's verification.
     Do NOT output a PR number you made up or that came from a failed command.
 
 Rules:
@@ -114,7 +121,7 @@ Rules:
   **Loop detection:** If you find yourself calling Read with the same offset 3+ times, stop — use `rg` or `grep` instead.
 - If the issue is unclear, add a comment asking for clarification: gh issue comment {NUMBER} -b "..."
 - Report back: PR number, files changed, any blockers encountered
-- **PR CREATION IS MANDATORY**: You MUST create the PR using `gh pr create` in step 8
+- **PR CREATION IS MANDATORY**: You MUST create the PR using `gh pr create` in step 7
   and verify it exists before reporting completion. Do NOT skip this step.
 ```
 
