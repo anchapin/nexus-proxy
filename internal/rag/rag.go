@@ -531,6 +531,7 @@ type StoreStats struct {
 	CacheMisses               uint64
 	InjectionSkippedSizeLimit uint64
 	IndexGeneration           int64
+	DedupSkipped              uint64
 }
 
 // Store holds the indexed few-shot examples.
@@ -546,6 +547,8 @@ type Store struct {
 	recursive          bool        // walk subdirectories during IndexDir (issue #1149)
 	chunkTokens        int         // max tokens per chunk; 0 disables chunking (issue #1168)
 	fileFilter         *FileFilter // optional include/exclude filter for IndexDir (issue #1148)
+	dedupThreshold     float64     // cosine similarity above which new chunks are skipped (0 = disabled, issue #1243)
+	dedupCrossDir      bool        // allow cross-directory dedup; false = same-dir only (issue #1243)
 
 	lastIndexAt               int64
 	retrievalAttempts         uint64
@@ -555,6 +558,7 @@ type Store struct {
 	thresholdMisses           uint64
 	embedErrors               uint64
 	injectionSkippedSizeLimit uint64
+	dedupSkipped              uint64
 	generation                int64
 	lastSuccessfulKind        string // circuit kind of last successful embedder (issue #886)
 }
@@ -589,6 +593,21 @@ func WithChunkTokens(n int) StoreOption {
 // indexes all regular files, preserving backward compatibility.
 func WithFileFilter(f *FileFilter) StoreOption {
 	return func(s *Store) { s.fileFilter = f }
+}
+
+// WithDedupThreshold sets the cosine similarity threshold above which
+// new chunks are suppressed at index time (issue #1243). A value of 0
+// (default) disables deduplication entirely.
+func WithDedupThreshold(t float64) StoreOption {
+	return func(s *Store) { s.dedupThreshold = t }
+}
+
+// WithDedupCrossDir controls whether dedup scans across directory
+// boundaries (issue #1243). When false (default), only chunks in the
+// same directory are compared. When true, all indexed chunks are
+// candidates for dedup regardless of directory.
+func WithDedupCrossDir(b bool) StoreOption {
+	return func(s *Store) { s.dedupCrossDir = b }
 }
 
 // indexThreshold is the minimum store size before the HNSW index is used.
@@ -769,6 +788,7 @@ func (s *Store) Stats() StoreStats {
 		ThresholdMisses:           atomic.LoadUint64(&s.thresholdMisses),
 		EmbedErrors:               atomic.LoadUint64(&s.embedErrors),
 		InjectionSkippedSizeLimit: atomic.LoadUint64(&s.injectionSkippedSizeLimit),
+		DedupSkipped:              atomic.LoadUint64(&s.dedupSkipped),
 	}
 	if cacheHits > 0 {
 		stats.CacheHits = uint64(cacheHits)
@@ -788,6 +808,34 @@ func (s *Store) markIndexed(at time.Time) {
 		at = time.Now().UTC()
 	}
 	atomic.StoreInt64(&s.lastIndexAt, at.UnixNano())
+}
+
+// isDuplicate checks if the new embedding at newDir is too similar to any
+// existing chunk, using cosine similarity. It increments s.dedupSkipped
+// when a duplicate is found and returns true to signal the caller should
+// skip adding the new chunk. When dedupThreshold is 0 (default), dedup is
+// disabled and the function returns false immediately. When dedupCrossDir is
+// false, only chunks whose Dir matches newDir are candidates; otherwise all
+// chunks are candidates (issue #1243).
+func (s *Store) isDuplicate(newDir string, newEmbedding []float64) bool {
+	if s.dedupThreshold <= 0 || len(newEmbedding) == 0 {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, ex := range s.examples {
+		if !s.dedupCrossDir && ex.Dir != newDir {
+			continue
+		}
+		if len(ex.Embedding) == 0 {
+			continue
+		}
+		if CosineSimilarity(newEmbedding, ex.Embedding) >= s.dedupThreshold {
+			atomic.AddUint64(&s.dedupSkipped, 1)
+			return true
+		}
+	}
+	return false
 }
 
 // IncInjectionSkippedSizeLimit bumps the counter for RAG injections that

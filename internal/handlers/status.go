@@ -72,6 +72,7 @@ type RAGStatus struct {
 	LastIndexAt     time.Time          `json:"last_index_at"`
 	Retrieval       ragRetrievalStatus `json:"retrieval"`
 	Cache           ragCacheStatus     `json:"cache"`
+	DedupSkipped    uint64             `json:"rag_dedup_skipped"`
 }
 
 // RoutingSnapshot is a point-in-time copy of the routing decision counters.

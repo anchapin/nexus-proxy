@@ -1177,6 +1177,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 				IndexMode:       store.IndexMode(),
 				IndexGeneration: stats.IndexGeneration,
 				LastIndexAt:     stats.LastIndexAt,
+				DedupSkipped:    stats.DedupSkipped,
 			}
 			status.Embedder.Type = string(cfg.EmbedderType)
 			status.Embedder.Model = cfg.EmbeddingModel

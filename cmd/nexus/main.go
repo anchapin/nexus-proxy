@@ -296,7 +296,9 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 			rag.WithBatchSize(cfg.RAGBatchSize),
 			rag.WithChunkTokens(cfg.RAGChunkTokens),
 			rag.WithRecursive(cfg.RAGRecursive),
-			rag.WithFileFilter(fileFilter))
+			rag.WithFileFilter(fileFilter),
+			rag.WithDedupThreshold(cfg.RAGDedupThreshold),
+			rag.WithDedupCrossDir(cfg.RAGDedupCrossDir))
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
@@ -307,7 +309,9 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 		rag.WithBatchSize(cfg.RAGBatchSize),
 		rag.WithChunkTokens(cfg.RAGChunkTokens),
 		rag.WithRecursive(cfg.RAGRecursive),
-		rag.WithFileFilter(fileFilter))
+		rag.WithFileFilter(fileFilter),
+		rag.WithDedupThreshold(cfg.RAGDedupThreshold),
+		rag.WithDedupCrossDir(cfg.RAGDedupCrossDir))
 	if err != nil {
 		// Persistence is a best-effort optimisation. Fall back to
 		// the in-memory store so the proxy still serves traffic —
@@ -321,7 +325,9 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 			rag.WithBatchSize(cfg.RAGBatchSize),
 			rag.WithChunkTokens(cfg.RAGChunkTokens),
 			rag.WithRecursive(cfg.RAGRecursive),
-			rag.WithFileFilter(fileFilter))
+			rag.WithFileFilter(fileFilter),
+			rag.WithDedupThreshold(cfg.RAGDedupThreshold),
+			rag.WithDedupCrossDir(cfg.RAGDedupCrossDir))
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
