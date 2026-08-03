@@ -286,6 +286,11 @@ type YAMLConfig struct {
 	// Metrics exemplars (issue #1171)
 	MetricsExemplars *bool `yaml:"metrics_exemplars"`
 
+	// OtelMetrics (issue #1238)
+	OtelMetricsEndpoint string `yaml:"otel_metrics_endpoint"`
+	OtelMetricsInterval string `yaml:"otel_metrics_interval"`
+	OtelMetricsTimeout  string `yaml:"otel_metrics_timeout"`
+
 	// Response-content redaction (issue #1172).
 	RedactEnabled     bool   `yaml:"redact_enabled"`
 	RedactProfile     string `yaml:"redact_profile"`
@@ -1574,6 +1579,31 @@ func LoadYAML(path string) (Config, error) {
 		cfg.MetricsExemplars = b
 	}
 
+	// OtelMetrics (issue #1238)
+	if v := os.Getenv("NEXUS_OTEL_METRICS_ENDPOINT"); v != "" {
+		cfg.OtelMetricsEndpoint = v
+	}
+	if v := os.Getenv("NEXUS_OTEL_METRICS_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_OTEL_METRICS_INTERVAL: %w; see .env.example", err)
+		}
+		if d <= 0 {
+			d = 60 * time.Second
+		}
+		cfg.OtelMetricsInterval = d
+	}
+	if v := os.Getenv("NEXUS_OTEL_METRICS_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_OTEL_METRICS_TIMEOUT: %w; see .env.example", err)
+		}
+		if d < 0 {
+			d = 10 * time.Second
+		}
+		cfg.OtelMetricsTimeout = d
+	}
+
 	// Response-content redaction env overrides (issue #1172).
 	if v := os.Getenv("NEXUS_REDACT_ENABLED"); v != "" {
 		cfg.RedactEnabled = strings.EqualFold(v, "true")
@@ -1900,6 +1930,11 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 	} else {
 		cfg.MetricsExemplars = tracingEndpoint != ""
 	}
+
+	// OtelMetrics (issue #1238)
+	cfg.OtelMetricsEndpoint = yc.stringDefault(yc.OtelMetricsEndpoint, "")
+	cfg.OtelMetricsInterval = yc.durationDefault(yc.OtelMetricsInterval, 60*time.Second)
+	cfg.OtelMetricsTimeout = yc.durationDefault(yc.OtelMetricsTimeout, 10*time.Second)
 
 	// Warn if yaml had unrecognized injection scan roles (issue #845)
 	// Only warn when unrecognized tokens exist AND the fallback is ["system"] (issue #879).
