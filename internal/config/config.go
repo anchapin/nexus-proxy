@@ -3035,6 +3035,14 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 	}
 	next.TracingSampleRate = tracingSampleRate
 
+	// OIDC JWKS refresh interval (issue #1306): re-read from env so SIGHUP
+	// pushes the updated interval into any live JWTAuthenticator on next refresh.
+	jwksRefresh, _ := getEnvDuration("NEXUS_OIDC_JWKS_REFRESH", prev.OIDCJWKSRefresh)
+	if jwksRefresh <= 0 {
+		jwksRefresh = 15 * time.Minute
+	}
+	next.OIDCJWKSRefresh = jwksRefresh
+
 	return next, result
 }
 
@@ -3302,6 +3310,7 @@ var hotReloadableEnvs = map[string]bool{
 	"NEXUS_BUDGET_ALERT_THRESHOLD":     true,
 	"NEXUS_FUSION_AGREEMENT_THRESHOLD": true,
 	"NEXUS_TRACING_SAMPLE_RATE":        true,
+	"NEXUS_OIDC_JWKS_REFRESH":          true, // issue #1306
 }
 
 // IsHotReloadable returns true when the given env var name (e.g. "NEXUS_RATE_LIMIT_RPM")
