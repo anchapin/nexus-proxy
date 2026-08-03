@@ -14,8 +14,8 @@ import (
 // a response that exceeded MaxResponseBytes (issue #365).
 var responseTruncated atomic.Uint64
 
-// IncrementTruncationCounter increments the response truncation counter.
-func IncrementTruncationCounter() {
+// IncrementReadTruncationCounter increments the response truncation counter.
+func IncrementReadTruncationCounter() {
 	responseTruncated.Add(1)
 }
 
@@ -26,7 +26,7 @@ func ReadAllTruncatedCounter() uint64 {
 
 // ReadAllLimited reads from r with a byte limit of maxBytes. If the
 // response body is larger than maxBytes, the body is truncated and
-// IncrementTruncationCounter is called. This prevents memory exhaustion
+// IncrementReadTruncationCounter is called. This prevents memory exhaustion
 // from a malicious upstream returning gigabytes. The returned error is
 // any read error encountered before hitting the limit; a truncation
 // itself is not treated as an error.
@@ -37,7 +37,7 @@ func ReadAllLimited(r io.Reader, maxBytes int) ([]byte, error) {
 	// The edge case of a response that is exactly maxBytes is
 	// astronomically unlikely at 64 MiB.
 	if len(body) >= maxBytes {
-		IncrementTruncationCounter()
+		IncrementReadTruncationCounter()
 	}
 	return body, err
 }
@@ -116,7 +116,7 @@ func PutBuffer(b *bytes.Buffer) {
 // byte limit of maxBytes. The caller MUST call PutBuffer on the returned
 // buffer when done — use defer to guarantee it on every code path. If
 // the response body is larger than maxBytes, the body is truncated and
-// IncrementTruncationCounter is called. This is the pooled equivalent of
+// IncrementReadTruncationCounter is called. This is the pooled equivalent of
 // ReadAllLimited: it recycles the underlying buffer across calls to
 // reduce GC pressure on the hot path (issue #1177). The returned buffer
 // is never nil; on read error it contains whatever partial data was
@@ -126,7 +126,7 @@ func ReadAllLimitedPooled(r io.Reader, maxBytes int) (*bytes.Buffer, error) {
 	lr := io.LimitReader(r, int64(maxBytes))
 	_, err := io.Copy(buf, lr)
 	if buf.Len() >= maxBytes {
-		IncrementTruncationCounter()
+		IncrementReadTruncationCounter()
 	}
 	return buf, err
 }

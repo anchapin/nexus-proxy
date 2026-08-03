@@ -156,16 +156,16 @@ func TestReadAllLimitedImmediateReaderError(t *testing.T) {
 	}
 }
 
-// TestTruncationCounterFunctions verifies that IncrementTruncationCounter and
+// TestTruncationCounterFunctions verifies that IncrementReadTruncationCounter and
 // ReadAllTruncatedCounter work as a matched pair, exercising the atomic
 // operations directly (covers the two exported helper functions that
 // ReadAllLimited delegates to).
 func TestTruncationCounterFunctions(t *testing.T) {
 	before := ReadAllTruncatedCounter()
 
-	IncrementTruncationCounter()
-	IncrementTruncationCounter()
-	IncrementTruncationCounter()
+	IncrementReadTruncationCounter()
+	IncrementReadTruncationCounter()
+	IncrementReadTruncationCounter()
 
 	after := ReadAllTruncatedCounter()
 	if delta := after - before; delta != 3 {

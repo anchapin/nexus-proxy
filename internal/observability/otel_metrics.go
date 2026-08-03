@@ -759,6 +759,15 @@ func CollectMetricSnapshot() []MetricSnapshot {
 		Sum:  float64(collectorSlow.ConfidenceErrors()),
 	})
 
+	// OTLP metrics export self-monitoring (issue #1313)
+	if exp := GlobalOtelMetricsExporter(); exp != nil {
+		out = append(out, MetricSnapshot{
+			Name: "nexus_otel_metrics_export_failures_total",
+			Type: MetricTypeCounter,
+			Sum:  float64(exp.ExportFailures()),
+		})
+	}
+
 	return out
 }
 
