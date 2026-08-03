@@ -381,11 +381,42 @@ func (c *Cascade) effectiveTimeout(payload map[string]interface{}) time.Duration
 // the textual content of every message in payload["messages"], then counts
 // tokens via the shared tokenizer (issue #1175). On error it falls back to
 // the len(s)/4 heuristic.
+//
+// For large prompts (total byte count > tokenizer.MaxAccurateEncodeLen) the
+// function short-circuits and returns totalBytes/4 directly, avoiding the
+// cost of building the concatenated string since CountTokens would use the
+// same heuristic anyway (issue #1235).
 func estimatePromptTokens(payload map[string]interface{}) int {
 	msgs, ok := payload["messages"].([]interface{})
 	if !ok || len(msgs) == 0 {
 		return len(fmt.Sprint(payload)) / 4
 	}
+	var totalBytes int
+	// First pass: count bytes and short-circuit if we already exceed the
+	// threshold where CountTokens would fall back to the heuristic anyway.
+	for _, m := range msgs {
+		mp, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch content := mp["content"].(type) {
+		case string:
+			totalBytes += len(content)
+		case []interface{}:
+			for _, part := range content {
+				if pp, ok := part.(map[string]interface{}); ok {
+					if txt, ok := pp["text"].(string); ok {
+						totalBytes += len(txt)
+					}
+				}
+			}
+		}
+		totalBytes++ // separator byte
+	}
+	if totalBytes > tokenizer.MaxAccurateEncodeLen {
+		return totalBytes / 4
+	}
+	// Second pass: build the concatenated string only when accurate counting applies.
 	var sb strings.Builder
 	for _, m := range msgs {
 		mp, ok := m.(map[string]interface{})
@@ -396,8 +427,6 @@ func estimatePromptTokens(payload map[string]interface{}) int {
 		case string:
 			sb.WriteString(content)
 		case []interface{}:
-			// Vision/multi-part content: extract the "text" field of
-			// each part, ignoring image_url entries.
 			for _, part := range content {
 				if pp, ok := part.(map[string]interface{}); ok {
 					if txt, ok := pp["text"].(string); ok {
