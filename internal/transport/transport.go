@@ -10,12 +10,15 @@
 package transport
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"net"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 )
 
@@ -60,6 +63,12 @@ type Config struct {
 	// verify the server certificate. When set, the server certificate
 	// must be signed by this CA. Empty uses the system pool.
 	CAFile string
+
+	// EgressGuard is the SSRF guard applied to redirects and dial-time.
+	// When non-nil and enabled, it blocks connections to private,
+	// loopback, and link-local IP ranges. When nil the client behaves
+	// identically to the pre-guard path (issue #1174).
+	EgressGuard *EgressGuard
 }
 
 // New returns a shared, pre-configured *http.Client. The client holds
@@ -85,6 +94,16 @@ func New(cfg Config) *http.Client {
 		KeepAlive: cfg.IdleConnTimeout,
 	}
 
+	// Wire the SSRF egress guard's dial-time check into the dialer
+	// Control hook when the guard is enabled (issue #1174). This catches
+	// DNS-rebinding: the address resolved cleanly at CheckRedirect time
+	// but the DNS record was swapped before the dial.
+	if cfg.EgressGuard != nil && cfg.EgressGuard.Enabled() {
+		dialer.Control = func(network, address string, c syscall.RawConn) error {
+			return cfg.EgressGuard.DialControl(context.Background(), network, address)
+		}
+	}
+
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           dialer.DialContext,
@@ -108,10 +127,21 @@ func New(cfg Config) *http.Client {
 		}
 	}
 
-	return &http.Client{
+	client := &http.Client{
 		Transport: transport,
 		Timeout:   0, // no per-request timeout; callers use context deadlines
 	}
+
+	// Install the SSRF egress guard's redirect checker when enabled
+	// (issue #1174). Without this, Go follows up to 10 redirects by
+	// default — a malicious upstream can redirect to an internal address
+	// (cloud metadata endpoint, admin UI, etc.) and the proxy would
+	// stream the internal response back to the client.
+	if cfg.EgressGuard != nil && cfg.EgressGuard.Enabled() {
+		client.CheckRedirect = cfg.EgressGuard.CheckRedirectFunc()
+	}
+
+	return client
 }
 
 // NewFromEnv reads NEXUS_HTTP_* knobs from the environment and returns
@@ -176,7 +206,7 @@ func (c *Config) applyDefaults() {
 }
 
 func loadConfigFromEnv() Config {
-	return Config{
+	cfg := Config{
 		MaxIdleConnsPerHost:   parseEnvInt("NEXUS_HTTP_MAX_IDLE_CONNS_PER_HOST", DefaultMaxIdleConnsPerHost),
 		MaxConnsPerHost:       parseEnvInt("NEXUS_HTTP_MAX_CONNS_PER_HOST", DefaultMaxConnsPerHost),
 		IdleConnTimeout:       parseEnvDuration("NEXUS_HTTP_IDLE_CONN_TIMEOUT", DefaultIdleConnTimeout),
@@ -186,6 +216,19 @@ func loadConfigFromEnv() Config {
 		ClientKeyFile:         os.Getenv("NEXUS_HTTP_CLIENT_KEY_FILE"),
 		CAFile:                os.Getenv("NEXUS_HTTP_CA_FILE"),
 	}
+
+	// SSRF egress guard (issue #1174). Defaults to enabled=true so a
+	// stock deployment is protected out of the box. The allowlist
+	// defaults to loopback so local Ollama works without extra config.
+	egressEnabled := parseEnvBool("NEXUS_EGRESS_BLOCK_PRIVATE", true)
+	var egressAllow []string
+	if raw := os.Getenv("NEXUS_EGRESS_ALLOW"); raw != "" {
+		valid, _ := parseAllowedCIDRs(raw)
+		egressAllow = valid
+	}
+	cfg.EgressGuard = NewEgressGuard(egressEnabled, egressAllow)
+
+	return cfg
 }
 
 func parseEnvInt(key string, def int) int {
@@ -204,6 +247,21 @@ func parseEnvDuration(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+func parseEnvBool(key string, def bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	default:
+		return def
+	}
 }
 
 // Default values for Config knobs.

@@ -101,9 +101,12 @@ const (
 	checkQualityVerifier      = "quality_verifier"
 	checkBudgetGuard          = "budget_guard"
 	checkRateLimitProxyConfig = "rate_limit_proxy_config"
+	checkAllowCIDRs           = "allow_cidrs"
 	checkProviderRegistry     = "provider_registry"
 	checkMiddlewareChain      = "middleware_chain"
 	checkModelsEndpoint       = "models_endpoint"
+	checkPprofEndpoint        = "pprof_endpoint"
+	checkInboundMTLS          = "inbound_mtls" // issue #1241
 )
 
 // Run executes every diagnostic check against cfg and returns the
@@ -141,9 +144,12 @@ func Run(ctx context.Context, cfg config.Config, opts Options) Result {
 	r = append(r, checkQualityVerifierFn(cfg))
 	r = append(r, checkBudgetGuardFn(cfg))
 	r = append(r, checkRateLimitProxyConfigFn(cfg))
+	r = append(r, checkAllowCIDRsFn(cfg))
 	r = append(r, checkProviderRegistryFn())
 	r = append(r, checkMiddlewareChainFn(cfg))
 	r = append(r, checkModelsEndpointFn(ctx, cfg, opts))
+	r = append(r, checkPprofEndpointFn(cfg))
+	r = append(r, checkInboundMTLSFn(cfg))
 	return r
 }
 
@@ -774,6 +780,38 @@ func checkRateLimitProxyConfigFn(cfg config.Config) Check {
 	}
 }
 
+// --- Inbound IP allowlist (issue #1240) -----------------------------------
+
+// checkAllowCIDRsFn validates the inbound IP allowlist configuration.
+// When AllowCIDRs is non-empty, the proxy restricts access to clients
+// whose IP falls within the configured CIDRs; all others get 403.
+// When AllowCIDRsStrict is false (default), /healthz and /metrics
+// are exempt so K8s probes and Prometheus scrapers work without IP
+// restrictions.
+func checkAllowCIDRsFn(cfg config.Config) Check {
+	if !cfg.AllowCIDRsConfigured() {
+		return Check{
+			Name:   checkAllowCIDRs,
+			Status: StatusSkip,
+			Detail: "inbound IP allowlist disabled (NEXUS_ALLOW_CIDRS empty)",
+		}
+	}
+	detail := fmt.Sprintf("%d allowlisted CIDR(s)", len(cfg.AllowCIDRs))
+	if cfg.AllowCIDRsRaw != "" {
+		detail = fmt.Sprintf("%s: %s", detail, cfg.AllowCIDRsRaw)
+	}
+	if cfg.AllowCIDRsStrict {
+		detail += "; STRICT mode (no path exemptions)"
+	} else {
+		detail += "; /healthz and /metrics exempt"
+	}
+	return Check{
+		Name:   checkAllowCIDRs,
+		Status: StatusPass,
+		Detail: detail,
+	}
+}
+
 // --- Provider registry ----------------------------------------------------
 
 // checkProviderRegistryFn validates that NEXUS_FRONTIER_PROVIDERS
@@ -943,5 +981,72 @@ func checkModelsEndpointFn(ctx context.Context, cfg config.Config, opts Options)
 		Name:   checkModelsEndpoint,
 		Status: StatusPass,
 		Detail: fmt.Sprintf("/v1/models accessible at %s", nexusURL),
+	}
+}
+
+// --- pprof endpoint (issue #1150) -----------------------------------------
+
+// checkPprofEndpointFn reports the exposure mode of the debug pprof +
+// expvar endpoints. When disabled (the default) the check passes
+// silently. When enabled with an API key it passes with a detail line
+// describing the mode. When enabled without a key (loopback-only) it
+// warns the operator that remote access requires setting the key.
+func checkPprofEndpointFn(cfg config.Config) Check {
+	if !cfg.DebugPprofEnabled {
+		return Check{
+			Name:   checkPprofEndpoint,
+			Status: StatusPass,
+			Detail: "disabled (NEXUS_DEBUG_PPROF_ENABLED=false)",
+		}
+	}
+	if cfg.DebugPprofAPIKey != "" {
+		return Check{
+			Name:   checkPprofEndpoint,
+			Status: StatusPass,
+			Detail: "enabled, API-key gated (/debug/pprof/*, /debug/vars)",
+		}
+	}
+	return Check{
+		Name:   checkPprofEndpoint,
+		Status: StatusWarn,
+		Detail: "enabled, loopback-only — set NEXUS_DEBUG_PPROF_API_KEY for remote access",
+	}
+}
+
+// --- inbound mTLS (issue #1241) ----------------------------------------
+
+// checkInboundMTLSFn verifies the mTLS CA file is readable when configured.
+// When NEXUS_TLS_CLIENT_CA_FILE is set, the proxy requires and verifies
+// client certificates from downstream agents. When unset, mTLS is not
+// configured and the check is skipped.
+func checkInboundMTLSFn(cfg config.Config) Check {
+	if cfg.TLSClientCAFile == "" {
+		return Check{
+			Name:   checkInboundMTLS,
+			Status: StatusSkip,
+			Detail: "not configured (NEXUS_TLS_CLIENT_CA_FILE is unset)",
+		}
+	}
+	// Verify the CA file exists and is readable.
+	data, err := os.ReadFile(cfg.TLSClientCAFile)
+	if err != nil {
+		return Check{
+			Name:   checkInboundMTLS,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("NEXUS_TLS_CLIENT_CA_FILE=%q is not readable: %v", cfg.TLSClientCAFile, err),
+		}
+	}
+	// Basic PEM format sanity check: must contain at least one certificate.
+	if !bytes.Contains(data, []byte("-----BEGIN CERTIFICATE-----")) {
+		return Check{
+			Name:   checkInboundMTLS,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("NEXUS_TLS_CLIENT_CA_FILE=%q does not appear to be a PEM certificate bundle", cfg.TLSClientCAFile),
+		}
+	}
+	return Check{
+		Name:   checkInboundMTLS,
+		Status: StatusPass,
+		Detail: fmt.Sprintf("CA file configured (%s, %d bytes)", cfg.TLSClientCAFile, len(data)),
 	}
 }

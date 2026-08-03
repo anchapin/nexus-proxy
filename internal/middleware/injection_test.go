@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+
+	"github.com/anchapin/nexus-proxy/internal/testutil"
 )
 
 // --- ParseInjectionMode --------------------------------------------------
@@ -398,9 +400,7 @@ func TestNormalizeScanRolesContract(t *testing.T) {
 func captureSlogJSON(t *testing.T, fn func()) string {
 	t.Helper()
 	var buf strings.Builder
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	testutil.SetDefault(t, slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	fn()
 	return buf.String()
 }

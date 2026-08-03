@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS requests (
     rag_injected INTEGER NOT NULL DEFAULT 0,
     rag_filename TEXT NOT NULL DEFAULT '',
     estimated_cost_usd REAL NOT NULL DEFAULT 0,
+    input_cost_usd REAL NOT NULL DEFAULT 0,
+    output_cost_usd REAL NOT NULL DEFAULT 0,
     baseline_cost_usd REAL NOT NULL DEFAULT 0,
     savings_usd REAL NOT NULL DEFAULT 0,
     ttft_ms INTEGER NOT NULL DEFAULT 0,
@@ -64,7 +66,12 @@ CREATE TABLE IF NOT EXISTS requests (
     route_source TEXT NOT NULL DEFAULT '',
     route_reason TEXT NOT NULL DEFAULT '',
     slm_confidence REAL NOT NULL DEFAULT 0,
-    slm_task_type TEXT NOT NULL DEFAULT ''
+    slm_task_type TEXT NOT NULL DEFAULT '',
+    arbiter_cache_key TEXT NOT NULL DEFAULT '',
+    arbiter_synthesis TEXT NOT NULL DEFAULT '',
+    tenant TEXT NOT NULL DEFAULT '',
+    cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
 CREATE INDEX IF NOT EXISTS idx_requests_request_id ON requests(request_id);
@@ -89,8 +96,19 @@ var additiveMigrations = []string{
 	`ALTER TABLE requests ADD COLUMN toon_compression_method TEXT NOT NULL DEFAULT ''`,
 	// Issue #239: arbiter cost tracking
 	`ALTER TABLE requests ADD COLUMN fusion_arbiter_cost_usd REAL NOT NULL DEFAULT 0`,
+	// Issue #1183: per-provider cost split (input/output token streams)
+	`ALTER TABLE requests ADD COLUMN input_cost_usd REAL NOT NULL DEFAULT 0`,
+	`ALTER TABLE requests ADD COLUMN output_cost_usd REAL NOT NULL DEFAULT 0`,
 	// Issue #227: rag cache hit tracking
 	`ALTER TABLE requests ADD COLUMN rag_cache_hit INTEGER NOT NULL DEFAULT 0`,
+	// Issue #1176: arbiter cache key + synthesis for boot-time pre-warming
+	`ALTER TABLE requests ADD COLUMN arbiter_cache_key TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE requests ADD COLUMN arbiter_synthesis TEXT NOT NULL DEFAULT ''`,
+	// Issue #1245: Anthropic prompt caching token tracking
+	`ALTER TABLE requests ADD COLUMN cache_read_input_tokens INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE requests ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0`,
+	// Issue #1154: tenant attribution (multi-key inbound auth)
+	`ALTER TABLE requests ADD COLUMN tenant TEXT NOT NULL DEFAULT ''`,
 }
 
 // runAdditiveMigrations executes the additive ALTER TABLE migrations.
@@ -136,11 +154,14 @@ const insertSQL = `INSERT INTO requests
     (timestamp, request_id, route, model,
      input_tokens, output_tokens, toon_savings_tokens, toon_compression_method,
      rag_injected, rag_filename, rag_cache_hit, estimated_cost_usd,
+     input_cost_usd, output_cost_usd,
      baseline_cost_usd, savings_usd,
      ttft_ms, total_latency_ms, tps, streaming,
      fusion_arbiter_skipped, fusion_jaccard_similarity, fusion_arbiter_cost_usd, error,
-     route_source, route_reason, slm_confidence, slm_task_type)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       route_source, route_reason, slm_confidence, slm_task_type,
+       arbiter_cache_key, arbiter_synthesis, tenant,
+       cache_read_input_tokens, cache_creation_input_tokens)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // SQLiteStore is the production Store implementation (issue #4).
 // Writes are funnelled through a buffered channel and a single
@@ -165,6 +186,14 @@ type SQLiteStore struct {
 	ch      chan Request
 	dropped atomicDropped
 
+	// Batch config (issue #1234). batchSize > 0 triggers a committed
+	// transaction when the drain's accumulator reaches this many records.
+	// batchTimeout > 0 flushes a partial batch after this duration.
+	// batchCallback is invoked after every successful COMMIT.
+	batchSize     int
+	batchTimeout  time.Duration
+	batchCallback func()
+
 	// Retention prune goroutine (issue #483). pruneStop is non-nil
 	// only when retentionDays > 0; Close closes it to unblock the
 	// goroutine before wg.Wait.
@@ -185,8 +214,9 @@ type SQLiteStore struct {
 // newSQLiteStore opens the database, creates the schema (idempotent),
 // and starts the background drain goroutine. When retentionDays > 0 a
 // second goroutine periodically DELETEs rows older than the retention
-// window (issue #483).
-func newSQLiteStore(path string, retentionDays int, lg Logger) (*SQLiteStore, error) {
+// window (issue #483). batch controls the drain batching behaviour
+// (issue #1234).
+func newSQLiteStore(path string, retentionDays int, lg Logger, batch BatchConfig) (*SQLiteStore, error) {
 	dsn := buildDSN(path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -226,10 +256,13 @@ func newSQLiteStore(path string, retentionDays int, lg Logger) (*SQLiteStore, er
 	migrateAutoVacuum(context.Background(), db, lg)
 
 	s := &SQLiteStore{
-		db:     db,
-		logger: lg,
-		ch:     make(chan Request, bufferedChannelSize),
-		path:   path,
+		db:            db,
+		logger:        lg,
+		ch:            make(chan Request, bufferedChannelSize),
+		path:          path,
+		batchSize:     batch.Size,
+		batchTimeout:  batch.Timeout,
+		batchCallback: batch.Callback,
 	}
 	s.wg.Add(1)
 	go s.drain()
@@ -377,18 +410,145 @@ func (s *SQLiteStore) RecordRequest(req Request) error {
 // drain is the single writer goroutine. Owning the connection
 // guarantees database/sql never serialises concurrent writes for us
 // (which it would, but with extra context switches).
+//
+// Issue #1234 batch mode: when s.batchSize > 0, drain accumulates
+// records into an in-memory slice and commits BEGIN...INSERT...COMMIT
+// either when the accumulator reaches s.batchSize or when
+// s.batchTimeout elapses since the last commit. This reduces WAL
+// write amplification from per-record fsyncs. A callback is invoked
+// after every successful COMMIT so the metrics collector can increment
+// its batch counter.
 func (s *SQLiteStore) drain() {
 	defer s.wg.Done()
-	for req := range s.ch {
-		s.writeOne(req)
+
+	// batchAcc accumulates records between commits. nil means no active
+	// batch; a non-nil slice means we're accumulating.
+	var batchAcc []Request
+	var batchTimer *time.Timer
+	var batchTimerCh <-chan time.Time
+
+	// flush commits the current batch (if any) and resets the accumulator.
+	// Errors are logged but not returned — the request path already returned.
+	flush := func() {
+		if len(batchAcc) == 0 {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), recordRequestErrorTimeout)
+		defer cancel()
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			s.logger("ERROR: metrics batch begin: %v", err)
+			batchAcc = batchAcc[:0]
+			return
+		}
+		stmt, err := tx.PrepareContext(ctx, insertSQL)
+		if err != nil {
+			s.logger("ERROR: metrics batch prepare: %v", err)
+			_ = tx.Rollback()
+			batchAcc = batchAcc[:0]
+			return
+		}
+		for _, req := range batchAcc {
+			if err := s.insertRow(ctx, stmt, req); err != nil {
+				s.logger("ERROR: metrics batch insert request_id=%s: %v", req.RequestID, err)
+			}
+		}
+		_ = stmt.Close()
+		if err := tx.Commit(); err != nil {
+			s.logger("ERROR: metrics batch commit: %v", err)
+			_ = tx.Rollback()
+			batchAcc = batchAcc[:0]
+			return
+		}
+		if s.batchCallback != nil {
+			s.batchCallback()
+		}
+		batchAcc = batchAcc[:0]
 	}
+
+	// resetTimer stops and nilifies the batch timer so a subsequent
+	// iteration can call resetTimer() to disarm it without a race.
+	resetTimer := func() {
+		if batchTimer != nil {
+			batchTimer.Stop()
+			batchTimer = nil
+			batchTimerCh = nil
+		}
+	}
+
+	for req := range s.ch {
+		if s.batchSize <= 0 {
+			// Pre-batch path: one record per transaction.
+			s.writeOne(req)
+			continue
+		}
+		// BATCH MODE (issue #1234)
+		if batchAcc == nil {
+			// Start a fresh accumulator and arm the timeout.
+			batchAcc = append(batchAcc, req)
+			if s.batchTimeout > 0 {
+				resetTimer()
+				batchTimer = time.NewTimer(s.batchTimeout)
+				batchTimerCh = batchTimer.C
+			}
+			continue
+		}
+		// Accumulate and check batch size.
+		batchAcc = append(batchAcc, req)
+		if len(batchAcc) >= s.batchSize {
+			flush()
+			resetTimer()
+			continue
+		}
+		// Check timeout.
+		if batchTimerCh != nil {
+			select {
+			case <-batchTimerCh:
+				flush()
+				resetTimer()
+			default:
+				// Timer hasn't fired yet; keep accumulating.
+			}
+		}
+	}
+
+	// Drain remaining accumulated records on close.
+	if len(batchAcc) > 0 {
+		flush()
+	}
+	resetTimer()
 }
 
 // writeOne performs the actual INSERT. Errors are logged at WARN
 // rather than returned — the request path already returned by now.
+// Kept for pre-batch callers and tests.
 func (s *SQLiteStore) writeOne(req Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), recordRequestErrorTimeout)
 	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		s.logger("ERROR: metrics begin: %v", err)
+		return
+	}
+	stmt, err := tx.PrepareContext(ctx, insertSQL)
+	if err != nil {
+		s.logger("ERROR: metrics prepare: %v", err)
+		_ = tx.Rollback()
+		return
+	}
+	if err := s.insertRow(ctx, stmt, req); err != nil {
+		s.logger("ERROR: metrics insert request_id=%s: %v", req.RequestID, err)
+	}
+	_ = stmt.Close()
+	if err := tx.Commit(); err != nil {
+		s.logger("ERROR: metrics commit: %v", err)
+	}
+}
+
+// insertRow is a helper that executes a single INSERT using the provided
+// statement and request. It handles the field normalisation (zero-values,
+// boolean conversion) so drain() and writeOne() stay focused.
+func (s *SQLiteStore) insertRow(ctx context.Context, stmt *sql.Stmt, req Request) error {
 	route := req.Route
 	if route == "" {
 		route = string(router.RouteFrontier)
@@ -413,17 +573,114 @@ func (s *SQLiteStore) writeOne(req Request) {
 	if req.FusionArbiterSkipped {
 		fusionArbiterSkipped = 1
 	}
-	_, err := s.db.ExecContext(ctx, insertSQL,
+	_, err := stmt.ExecContext(ctx,
 		ts.UTC(), req.RequestID, route, model,
 		req.InputTokens, req.OutputTokens, req.TOONSavingsTokens, req.TOONCompressionMethod,
 		ragInjected, req.RAGFilename, req.RAGCacheHit, req.EstimatedCostUSD,
+		req.InputCostUSD, req.OutputCostUSD,
 		req.BaselineCostUSD, req.SavingsUSD,
 		req.TTFTMs, req.TotalLatencyMs, req.TPS, streaming,
 		fusionArbiterSkipped, req.FusionJaccardSimilarity, req.FusionArbiterCostUSD, req.Error,
 		req.RouteSource, req.RouteReason, req.SLMConfidence, req.SLMTaskType,
+		req.ArbiterCacheKeyHex, req.ArbiterSynthesis,
+		req.Tenant,
+		req.CacheReadInputTokens, req.CacheCreationInputTokens,
 	)
+	return err
+}
+
+// --- Retention pruning (issue #483) ---------------------------------------
+//
+// The requests table is the highest-volume table in the metrics DB
+// (~52M rows/year at 100 req/min). Without a retention window the
+// table grows without bound. When the operator sets
+// NEXUS_METRICS_RETENTION_DAYS > 0, newSQLiteStore starts a background
+// goroutine that wakes every pruneInterval and DELETEs rows whose
+// timestamp is older than the retention window.
+//
+// The cutoff is computed in Go and passed as a time.Time parameter so
+// the comparison uses the same storage format modernc.org/sqlite uses
+// for the stored timestamps — no reliance on SQLite datetime() string
+// format compatibility.
+
+// pruneInterval is how often the background prune goroutine wakes.
+// ~1 hour per the issue spec; short enough to meet the "~1 hour"
+// acceptance criterion without burning CPU on a cold table.
+const pruneInterval = time.Hour
+
+// pruneTimeout bounds a single prune pass so a stalled disk cannot
+// pin the goroutine indefinitely. The DELETE is indexed by
+// idx_requests_timestamp so it is cheap even on millions of rows.
+const pruneTimeout = 30 * time.Second
+
+// pruneVacuumThreshold is the minimum DELETE row count that triggers an
+// incremental_vacuum pass for best-effort space reclamation. Below this
+// the overhead outweighs the benefit. Requires auto_vacuum=INCREMENTAL,
+// which is set at database creation time via the DSN pragma (issue #595).
+const pruneVacuumThreshold = 1000
+
+// pruneSQL deletes every row whose timestamp is strictly older than
+// the cutoff (a Go time.Time bound by the caller). The index
+// idx_requests_timestamp makes the range scan cheap.
+const pruneSQL = `DELETE FROM requests WHERE timestamp < ?`
+
+// PruneLastRows returns the number of rows removed by the most recent
+// prune pass. Zero until the first prune runs. Safe for concurrent use.
+func (s *SQLiteStore) PruneLastRows() int64 { return s.pruneLastRows.Load() }
+
+// PruneLastTimestamp returns the Unix timestamp (seconds) of the most
+// recent successful prune pass. Zero until the first prune runs.
+// Safe for concurrent use.
+func (s *SQLiteStore) PruneLastTimestamp() int64 { return s.pruneLastTimestamp.Load() }
+
+// prune is the background retention goroutine. It runs an immediate
+// prune at startup (so retention is enforced right after boot, not up
+// to an hour later), then wakes every pruneInterval. It exits when
+// pruneStop is closed (during Close).
+func (s *SQLiteStore) prune(retentionDays int) {
+	defer s.wg.Done()
+	s.pruneOnce(retentionDays)
+	ticker := time.NewTicker(pruneInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.pruneStop:
+			return
+		case <-ticker.C:
+			s.pruneOnce(retentionDays)
+		}
+	}
+}
+
+// pruneOnce executes one DELETE pass and records the outcome in the
+// atomic gauges. Exported via the struct (lowercase) so tests can call
+// it directly without waiting for the hourly ticker.
+func (s *SQLiteStore) pruneOnce(retentionDays int) {
+	if retentionDays <= 0 {
+		return // retention disabled — no-op guard
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), pruneTimeout)
+	defer cancel()
+
+	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
+	res, err := s.db.ExecContext(ctx, pruneSQL, cutoff)
 	if err != nil {
-		s.logger("ERROR: insert request_id=%s: %v", req.RequestID, err)
+		s.logger("WARN: retention prune failed: %v", err)
+		return
+	}
+	n, _ := res.RowsAffected()
+	s.pruneLastRows.Store(n)
+	s.pruneLastTimestamp.Store(time.Now().Unix())
+
+	// Best-effort space reclamation. Effective on databases created
+	// with auto_vacuum=INCREMENTAL (the default since issue #595).
+	if n >= pruneVacuumThreshold {
+		if _, err := s.db.ExecContext(ctx, "PRAGMA incremental_vacuum(100)"); err != nil {
+			s.logger("WARN: incremental_vacuum after prune: %v", err)
+		}
+	}
+	if n > 0 {
+		s.logger("retention prune: removed %d rows older than %d days", n, retentionDays)
 	}
 }
 
@@ -527,11 +784,32 @@ func (s *SQLiteStore) pruneOnce(retentionDays int) {
 func (s *SQLiteStore) DailySummary(date time.Time) (Summary, error) {
 	day := date.UTC().Truncate(24 * time.Hour)
 	next := day.Add(24 * time.Hour)
+	return s.scanRange(day, next, day)
+}
 
-	// One aggregate per metric — the statement is built once
-	// per call because the date range is parametric. Indexes on
-	// idx_requests_timestamp keep the range scan cheap.
-	const summarySQL = `
+// RangeSummary returns a single Summary aggregating every request whose
+// timestamp falls in the half-open interval [start, end). It collapses a
+// weekly / monthly / quarterly window into one row in a single SQL
+// round-trip, replacing N per-day DailySummary calls for long-horizon
+// dashboard views (issue #1170). The Date field of the returned Summary
+// is the truncated start. An empty range (start not before end) returns
+// an error so a caller never silently sees a zero-row aggregate that
+// masquerades as "no traffic". Safe to call concurrently with writes.
+func (s *SQLiteStore) RangeSummary(start, end time.Time) (Summary, error) {
+	s0 := start.UTC().Truncate(24 * time.Hour)
+	e0 := end.UTC().Truncate(24 * time.Hour)
+	if !s0.Before(e0) {
+		return Summary{}, fmt.Errorf("metrics: range summary: empty range [%s, %s)", s0.Format("2006-01-02"), e0.Format("2006-01-02"))
+	}
+	return s.scanRange(s0, e0, s0)
+}
+
+// rangeAggregateSQL is the shared aggregation statement used by both
+// DailySummary and RangeSummary. It collapses all rows whose timestamp
+// falls in the half-open interval [from, to) into a single Summary.
+// The idx_requests_timestamp index keeps the range scan cheap even over
+// months of data.
+const rangeAggregateSQL = `
 SELECT
     COUNT(*),
     COALESCE(SUM(CASE WHEN route = 'local'    THEN 1 ELSE 0 END), 0),
@@ -541,6 +819,8 @@ SELECT
     COALESCE(SUM(toon_savings_tokens), 0),
     COALESCE(SUM(CASE WHEN rag_injected = 1 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(estimated_cost_usd), 0),
+    COALESCE(SUM(input_cost_usd), 0),
+    COALESCE(SUM(output_cost_usd), 0),
     COALESCE(SUM(baseline_cost_usd), 0),
     COALESCE(SUM(savings_usd), 0),
     COALESCE(SUM(total_latency_ms), 0),
@@ -548,12 +828,16 @@ SELECT
 FROM requests
 WHERE timestamp >= ? AND timestamp < ?`
 
+// scanRange executes rangeAggregateSQL over the half-open [from, to)
+// window and returns the single aggregated Summary, stamping its Date
+// field with dateLabel. Callers pre-truncate the bounds to UTC days.
+func (s *SQLiteStore) scanRange(from, to, dateLabel time.Time) (Summary, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), recordRequestErrorTimeout)
 	defer cancel()
 
-	row := s.db.QueryRowContext(ctx, summarySQL, day, next)
+	row := s.db.QueryRowContext(ctx, rangeAggregateSQL, from, to)
 	var sum Summary
-	sum.Date = day
+	sum.Date = dateLabel
 	if err := row.Scan(
 		&sum.RequestCount,
 		&sum.LocalCount,
@@ -563,14 +847,95 @@ WHERE timestamp >= ? AND timestamp < ?`
 		&sum.TOONSavingsTokens,
 		&sum.RAGInjectedCount,
 		&sum.EstimatedCostTotal,
+		&sum.InputCostTotal,
+		&sum.OutputCostTotal,
 		&sum.BaselineCostTotal,
 		&sum.SavingsTotal,
 		&sum.TotalLatencyMsSum,
 		&sum.ErrorCount,
 	); err != nil {
-		return Summary{}, fmt.Errorf("metrics: daily summary: %w", err)
+		return Summary{}, fmt.Errorf("metrics: range summary: %w", err)
 	}
 	return sum, nil
+}
+
+// ArbiterSynthesisRow is one historical arbiter synthesis entry returned
+// by RecentArbiterSyntheses (issue #1176). CacheKeyHex is the hex-encoded
+// SHA-256 hash of the two panel-member contents; the caller decodes it
+// back to [32]byte for ArbiterCache.Warm.
+type ArbiterSynthesisRow struct {
+	CacheKeyHex string
+	Synthesis   string
+	Timestamp   time.Time
+}
+
+// recentArbiterSynthesesSQL selects the most recent synthesis per unique
+// cache key within the TTL window. GROUP BY deduplicates repeated
+// disagreements on identical panel content so the warmer does not process
+// redundant rows. The composite index on (route, timestamp) plus the
+// arbiter_cache_key != ” filter keeps the scan narrow.
+const recentArbiterSynthesesSQL = `
+SELECT arbiter_cache_key, arbiter_synthesis, MAX(timestamp) AS ts
+FROM requests
+WHERE arbiter_cache_key != '' AND arbiter_synthesis != '' AND timestamp >= ?
+GROUP BY arbiter_cache_key
+ORDER BY ts DESC
+LIMIT ?`
+
+// recentArbiterSynthesesTimeout bounds the boot-time query so a large
+// metrics DB cannot stall startup.
+const recentArbiterSynthesesTimeout = 10 * time.Second
+
+// ArbiterSynthesisReader is the capability interface implemented by
+// SQLiteStore for querying historical arbiter syntheses (issue #1176).
+// Callers type-assert to check whether the Store supports pre-warming.
+type ArbiterSynthesisReader interface {
+	RecentArbiterSyntheses(ctx context.Context, limit int, since time.Time) ([]ArbiterSynthesisRow, error)
+}
+
+// RecentArbiterSyntheses returns the most recent arbiter synthesis per
+// unique cache key written since the given timestamp (issue #1176).
+// limit caps the number of rows returned. The caller (boot-time warmer)
+// passes since = now - ArbiterCacheTTL so only entries still within
+// the TTL window are loaded.
+func (s *SQLiteStore) RecentArbiterSyntheses(ctx context.Context, limit int, since time.Time) ([]ArbiterSynthesisRow, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	queryCtx, cancel := context.WithTimeout(ctx, recentArbiterSynthesesTimeout)
+	defer cancel()
+
+	rows, err := s.db.QueryContext(queryCtx, recentArbiterSynthesesSQL, since.UTC(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("metrics: recent arbiter syntheses: %w", err)
+	}
+	defer rows.Close()
+
+	var result []ArbiterSynthesisRow
+	for rows.Next() {
+		var r ArbiterSynthesisRow
+		var tsStr string
+		if err := rows.Scan(&r.CacheKeyHex, &r.Synthesis, &tsStr); err != nil {
+			return nil, fmt.Errorf("metrics: scan arbiter synthesis: %w", err)
+		}
+		// SQLite stores DATETIME as a string; parse it back to time.Time.
+		if t, err := time.Parse("2006-01-02 15:04:05.999999999-07:00", tsStr); err == nil {
+			r.Timestamp = t
+		} else if t, err := time.Parse(time.RFC3339Nano, tsStr); err == nil {
+			r.Timestamp = t
+		} else if t, err := time.Parse(time.RFC3339, tsStr); err == nil {
+			r.Timestamp = t
+		} else {
+			// Fall back to raw parse; if it fails, use zero time so the
+			// warmer will treat it as stale and skip it.
+			r.Timestamp, _ = time.Parse(time.DateTime, tsStr)
+		}
+		result = append(result, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("metrics: arbiter synthesis rows: %w", err)
+	}
+	return result, nil
 }
 
 // providerStatsAggregateSQL computes count, average cost, and error

@@ -624,13 +624,20 @@ func TestCollectorSatisfiesGaugeProvider(t *testing.T) {
 }
 
 // TestCollectorGaugesReturnsCircuitState (issue #443) verifies that a
-// fresh collector returns an empty slice, then transitions and reports
-// three labelled samples per known circuit.
+// fresh collector returns only SLO budget gauges (no circuit/RAG/latency),
+// then transitions and reports three labelled samples per known circuit.
 func TestCollectorGaugesReturnsCircuitState(t *testing.T) {
 	c := NewCollector()
 
-	if got := c.Gauges(); len(got) != 0 {
-		t.Errorf("fresh collector Gauges() = %d samples, want 0", len(got))
+	// Fresh collector: only SLO error budget gauges (3 pre-allocated, issue #1239).
+	freshGauges := c.Gauges()
+	if len(freshGauges) != 3 {
+		t.Errorf("fresh collector Gauges() = %d samples, want 3 (SLO budget only)", len(freshGauges))
+	}
+	for _, g := range freshGauges {
+		if g.Name != "nexus_slo_error_budget_remaining" {
+			t.Errorf("fresh collector emitted unexpected gauge %q", g.Name)
+		}
 	}
 
 	c.RecordCircuitFailure("rag")
@@ -1279,5 +1286,259 @@ func TestLatencyPercentileBufferPreciseDistribution(t *testing.T) {
 	}
 	if p99 < 940.975 || p99 > 1000.0 {
 		t.Errorf("p99 = %v, outside 5%% tolerance of 990.5", p99)
+	}
+}
+
+// TestObserveJudgeScorePartitionedByRAG confirms that the RAG-vs-quality
+// correlation counters accumulate correctly partitioned by the injected
+// label (issue #1167).
+func TestObserveJudgeScorePartitionedByRAG(t *testing.T) {
+	c := NewCollector()
+	// Injected: scores 5, 4, 3 → sum=12, count=3
+	c.ObserveJudgeScore(true, 5)
+	c.ObserveJudgeScore(true, 4)
+	c.ObserveJudgeScore(true, 3)
+	// Non-injected: scores 2, 1 → sum=3, count=2
+	c.ObserveJudgeScore(false, 2)
+	c.ObserveJudgeScore(false, 1)
+
+	if got := c.RAGJudgeScoreSum(true); got != 12 {
+		t.Errorf("RAGJudgeScoreSum(true) = %v, want 12", got)
+	}
+	if got := c.RAGJudgeScoreCount(true); got != 3 {
+		t.Errorf("RAGJudgeScoreCount(true) = %d, want 3", got)
+	}
+	if got := c.RAGJudgeScoreSum(false); got != 3 {
+		t.Errorf("RAGJudgeScoreSum(false) = %v, want 3", got)
+	}
+	if got := c.RAGJudgeScoreCount(false); got != 2 {
+		t.Errorf("RAGJudgeScoreCount(false) = %d, want 2", got)
+	}
+}
+
+// TestObserveJudgeScoreIgnoresInvalid confirms that scores outside 1..5
+// (parse failures, score==0) are silently skipped so the correlation
+// metrics reflect actual model quality (issue #1167).
+func TestObserveJudgeScoreIgnoresInvalid(t *testing.T) {
+	c := NewCollector()
+	c.ObserveJudgeScore(true, 0)  // parse failure
+	c.ObserveJudgeScore(false, 6) // out of range
+	c.ObserveJudgeScore(true, -1) // negative
+
+	if got := c.RAGJudgeScoreCount(true); got != 0 {
+		t.Errorf("RAGJudgeScoreCount(true) = %d, want 0", got)
+	}
+	if got := c.RAGJudgeScoreCount(false); got != 0 {
+		t.Errorf("RAGJudgeScoreCount(false) = %d, want 0", got)
+	}
+}
+
+// TestObserveJudgeScoreNilSafe confirms a nil collector is a no-op.
+func TestObserveJudgeScoreNilSafe(t *testing.T) {
+	var c *Collector
+	c.ObserveJudgeScore(true, 5) // must not panic
+}
+
+// TestObserveJudgeScoreConcurrent confirms the correlation counters are
+// safe under concurrent access (issue #1167).
+func TestObserveJudgeScoreConcurrent(t *testing.T) {
+	c := NewCollector()
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			c.ObserveJudgeScore(true, 5)
+		}()
+		go func() {
+			defer wg.Done()
+			c.ObserveJudgeScore(false, 3)
+		}()
+	}
+	wg.Wait()
+	if got := c.RAGJudgeScoreCount(true); got != 100 {
+		t.Errorf("RAGJudgeScoreCount(true) = %d, want 100", got)
+	}
+	if got := c.RAGJudgeScoreCount(false); got != 100 {
+		t.Errorf("RAGJudgeScoreCount(false) = %d, want 100", got)
+	}
+}
+
+// --- SLO error budget gauge tests (issue #1239) ----------------------------
+
+// TestNewCollectorInitializesSLOBudgets verifies that NewCollector
+// pre-allocates error budget storage for all three SLOs and initializes
+// them to 1.0 (full budget).
+func TestNewCollectorInitializesSLOBudgets(t *testing.T) {
+	c := NewCollector()
+	gauges := c.SLOErrorBudgetGauges()
+	if len(gauges) != 3 {
+		t.Fatalf("SLOErrorBudgetGauges returned %d gauges, want 3", len(gauges))
+	}
+	names := make(map[string]float64, len(gauges))
+	for _, g := range gauges {
+		names[g.Labels["slo"]] = g.Value
+	}
+	for _, slo := range []string{"availability", "local_latency_p99", "ttft_p95"} {
+		if _, ok := names[slo]; !ok {
+			t.Errorf("missing SLO gauge for %q", slo)
+		}
+		// Initial value should be 0 (bits of 0.0)
+		if names[slo] != 0 {
+			t.Errorf("initial budget for %q = %v, want 0 (no SLO updates yet)", slo, names[slo])
+		}
+	}
+}
+
+// TestSetSLOErrorBudgetClamping verifies that values are clamped to [0, 1].
+func TestSetSLOErrorBudgetClamping(t *testing.T) {
+	c := NewCollector()
+
+	// Negative value should be clamped to 0
+	c.SetSLOErrorBudget("availability", -0.5)
+	gauges := c.SLOErrorBudgetGauges()
+	for _, g := range gauges {
+		if g.Labels["slo"] == "availability" {
+			if g.Value != 0 {
+				t.Errorf("clamped -0.5 = %v, want 0", g.Value)
+			}
+		}
+	}
+
+	// Value > 1 should be clamped to 1
+	c.SetSLOErrorBudget("local_latency_p99", 1.5)
+	gauges = c.SLOErrorBudgetGauges()
+	for _, g := range gauges {
+		if g.Labels["slo"] == "local_latency_p99" {
+			if g.Value != 1 {
+				t.Errorf("clamped 1.5 = %v, want 1", g.Value)
+			}
+		}
+	}
+
+	// Value in range should be stored as-is
+	c.SetSLOErrorBudget("ttft_p95", 0.75)
+	gauges = c.SLOErrorBudgetGauges()
+	for _, g := range gauges {
+		if g.Labels["slo"] == "ttft_p95" {
+			if g.Value != 0.75 {
+				t.Errorf("0.75 = %v, want 0.75", g.Value)
+			}
+		}
+	}
+}
+
+// TestSetSLOErrorBudgetNilSafe verifies nil receiver does not panic.
+func TestSetSLOErrorBudgetNilSafe(t *testing.T) {
+	var c *Collector
+	c.SetSLOErrorBudget("availability", 0.5) // must not panic
+	if gauges := c.SLOErrorBudgetGauges(); gauges != nil {
+		t.Errorf("expected nil gauges from nil collector, got %v", gauges)
+	}
+}
+
+// TestSetSLOErrorBudgetEmptyName verifies empty name is silently ignored.
+func TestSetSLOErrorBudgetEmptyName(t *testing.T) {
+	c := NewCollector()
+	c.SetSLOErrorBudget("", 0.5)                // must not panic
+	c.SetSLOErrorBudget("nonexistent_slo", 0.5) // must not panic
+}
+
+// TestSLOErrorBudgetGaugesLabelStructure verifies the gauge name and label
+// match what Prometheus expects and the alerting rules reference.
+func TestSLOErrorBudgetGaugesLabelStructure(t *testing.T) {
+	c := NewCollector()
+	c.SetSLOErrorBudget("availability", 0.85)
+	c.SetSLOErrorBudget("local_latency_p99", 0.42)
+	c.SetSLOErrorBudget("ttft_p95", 0.10)
+
+	gauges := c.SLOErrorBudgetGauges()
+	for _, g := range gauges {
+		if g.Name != "nexus_slo_error_budget_remaining" {
+			t.Errorf("gauge name = %q, want nexus_slo_error_budget_remaining", g.Name)
+		}
+		if g.Labels["slo"] == "" {
+			t.Error("missing slo label")
+		}
+	}
+}
+
+// TestSLOErrorBudgetConcurrent verifies concurrent writes to different SLOs
+// do not race.
+func TestSLOErrorBudgetConcurrent(t *testing.T) {
+	c := NewCollector()
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(3)
+		go func(v float64) {
+			defer wg.Done()
+			c.SetSLOErrorBudget("availability", v)
+		}(float64(i%101) / 100)
+		go func(v float64) {
+			defer wg.Done()
+			c.SetSLOErrorBudget("local_latency_p99", v)
+		}(float64(i%101) / 100)
+		go func(v float64) {
+			defer wg.Done()
+			c.SetSLOErrorBudget("ttft_p95", v)
+		}(float64(i%101) / 100)
+	}
+	wg.Wait()
+	// Verify all three gauges are present and in [0, 1]
+	gauges := c.SLOErrorBudgetGauges()
+	if len(gauges) != 3 {
+		t.Fatalf("got %d gauges, want 3", len(gauges))
+	}
+	for _, g := range gauges {
+		if g.Value < 0 || g.Value > 1 {
+			t.Errorf("SLO %s budget = %v, want [0,1]", g.Labels["slo"], g.Value)
+		}
+	}
+}
+
+// TestGaugesIncludesSLOBudgets verifies that the Gauges() method (used by
+// the Prometheus renderer) includes SLO error budget gauges.
+func TestGaugesIncludesSLOBudgets(t *testing.T) {
+	c := NewCollector()
+	c.SetSLOErrorBudget("availability", 0.9)
+	gauges := c.Gauges()
+	found := false
+	for _, g := range gauges {
+		if g.Name == "nexus_slo_error_budget_remaining" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Gauges() does not include nexus_slo_error_budget_remaining")
+	}
+}
+
+// TestSLOErrorBudgetGaugesInPrometheusOutput verifies the gauge is emitted
+// in Prometheus text format with correct HELP/TYPE annotations.
+func TestSLOErrorBudgetGaugesInPrometheusOutput(t *testing.T) {
+	c := NewCollector()
+	c.SetSLOErrorBudget("availability", 0.85)
+	c.SetSLOErrorBudget("local_latency_p99", 0.50)
+	c.SetSLOErrorBudget("ttft_p95", 0.15)
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c, c) // pass collector as GaugeProvider
+	output := sb.String()
+
+	if !strings.Contains(output, "# HELP nexus_slo_error_budget_remaining") {
+		t.Error("missing HELP line for nexus_slo_error_budget_remaining")
+	}
+	if !strings.Contains(output, "# TYPE nexus_slo_error_budget_remaining gauge") {
+		t.Error("missing TYPE line for nexus_slo_error_budget_remaining")
+	}
+	if !strings.Contains(output, `nexus_slo_error_budget_remaining{slo="availability"} 0.85`) {
+		t.Error("missing or wrong availability gauge sample")
+	}
+	if !strings.Contains(output, `nexus_slo_error_budget_remaining{slo="local_latency_p99"} 0.5`) {
+		t.Error("missing or wrong local_latency_p99 gauge sample")
+	}
+	if !strings.Contains(output, `nexus_slo_error_budget_remaining{slo="ttft_p95"} 0.15`) {
+		t.Error("missing or wrong ttft_p95 gauge sample")
 	}
 }

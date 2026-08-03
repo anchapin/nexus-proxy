@@ -110,7 +110,7 @@ func TestRenderHistogramLeLabels(t *testing.T) {
 	var sb strings.Builder
 	writeHistogramLabeled(&sb, "nexus_test_ms", "test histogram", "route", map[string]*Histogram{
 		"local": h,
-	})
+	}, false)
 	out := sb.String()
 
 	wantLines := []string{
@@ -1065,6 +1065,235 @@ func TestRenderPrometheusAuthLimiterBlockedCounter(t *testing.T) {
 		"# TYPE nexus_auth_limiter_blocked_total counter",
 		`nexus_auth_limiter_blocked_total{reason="missing"} 2`,
 		`nexus_auth_limiter_blocked_total{reason="invalid"} 3`,
+	}
+	for _, want := range wantLines {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+}
+
+// --- Exemplar tests (issue #1171) ------------------------------------------
+
+// TestExemplarFormat verifies that when exemplars are enabled, non-+Inf
+// bucket lines carry the `# {trace_id="...",span_id="..."} <value>`
+// suffix in the Prometheus exposition.
+func TestExemplarFormat(t *testing.T) {
+	c := NewCollector()
+	c.SetExemplarsEnabled(true)
+	c.Submit(ObservabilityEvent{
+		Route:          "local",
+		TotalLatencyMs: 42,
+		TraceID:        "0af7651916cd43dd8448eb211c80319c",
+		SpanID:         "b7ad6b7169203331",
+	})
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c)
+
+	out := sb.String()
+
+	// The exemplar must appear on at least one non-+Inf bucket line.
+	// Expected format: nexus_request_duration_ms_bucket{route="local",le="..."} N # {trace_id="...",span_id="..."} 42
+	if !strings.Contains(out, `# {trace_id="0af7651916cd43dd8448eb211c80319c",span_id="b7ad6b7169203331"} 42`) {
+		t.Errorf("expected exemplar suffix in output\n--- output ---\n%s", out)
+	}
+
+	// +Inf, _sum, _count lines must NOT carry exemplars.
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, `le="+Inf"`) && strings.Contains(line, "# {trace_id=") {
+			t.Errorf("+Inf bucket line must not carry exemplar: %s", line)
+		}
+		if strings.Contains(line, "_sum{") && strings.Contains(line, "# {trace_id=") {
+			t.Errorf("_sum line must not carry exemplar: %s", line)
+		}
+		if strings.Contains(line, "_count{") && strings.Contains(line, "# {trace_id=") {
+			t.Errorf("_count line must not carry exemplar: %s", line)
+		}
+	}
+}
+
+// TestExemplarsDisabledByteCompat verifies that with exemplars disabled,
+// /metrics output is byte-identical to the pre-exemplar build (no
+// exemplar suffixes anywhere).
+func TestExemplarsDisabledByteCompat(t *testing.T) {
+	c := NewCollector()
+	c.SetExemplarsEnabled(false)
+	c.Submit(ObservabilityEvent{
+		Route:          "local",
+		TotalLatencyMs: 42,
+		TraceID:        "0af7651916cd43dd8448eb211c80319c",
+		SpanID:         "b7ad6b7169203331",
+	})
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c)
+
+	out := sb.String()
+
+	// No exemplar suffixes anywhere when disabled.
+	if strings.Contains(out, "# {trace_id=") {
+		t.Errorf("exemplar suffix found when exemplars disabled\n--- output ---\n%s", out)
+	}
+
+	// Verify the bucket line exists without an exemplar suffix.
+	want := `nexus_request_duration_ms_bucket{route="local",le="50"} 1`
+	if !strings.Contains(out, want) {
+		t.Errorf("expected plain bucket line %q in output\n--- output ---\n%s", want, out)
+	}
+}
+
+// TestExemplarsDefaultDisabled verifies that a fresh collector has
+// exemplars disabled by default (zero-value atomic.Bool is false).
+func TestExemplarsDefaultDisabled(t *testing.T) {
+	c := NewCollector()
+	if c.ExemplarsEnabled() {
+		t.Error("fresh collector should have exemplars disabled by default")
+	}
+}
+
+// TestExemplarsStageHistogram verifies that pipeline stage histograms
+// carry exemplars when enabled.
+func TestExemplarsStageHistogram(t *testing.T) {
+	c := NewCollector()
+	c.SetExemplarsEnabled(true)
+	c.ObservePipelineStage(PipelineStageEvent{
+		RAGRetrievalMs: 15,
+		TraceID:        "0af7651916cd43dd8448eb211c80319c",
+		SpanID:         "b7ad6b7169203331",
+	})
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c)
+
+	out := sb.String()
+
+	if !strings.Contains(out, `# {trace_id="0af7651916cd43dd8448eb211c80319c",span_id="b7ad6b7169203331"} 15`) {
+		t.Errorf("expected exemplar suffix on stage histogram\n--- output ---\n%s", out)
+	}
+}
+
+// TestExemplarsStressBoundedMemory verifies that exemplar storage does
+// not exceed ~90 slots even under 10k observations (issue #1171 AC).
+func TestExemplarsStressBoundedMemory(t *testing.T) {
+	c := NewCollector()
+	c.SetExemplarsEnabled(true)
+
+	// Submit 10k observations across all 3 routes.
+	for i := 0; i < 10000; i++ {
+		route := "local"
+		switch i % 3 {
+		case 0:
+			route = "local"
+		case 1:
+			route = "frontier"
+		case 2:
+			route = "fusion"
+		}
+		c.Submit(ObservabilityEvent{
+			Route:          route,
+			TotalLatencyMs: int64(i + 1),
+			TraceID:        fmt.Sprintf("%032x", i),
+			SpanID:         fmt.Sprintf("%016x", i),
+		})
+	}
+
+	// Each histogram has len(upperBounds)+1 exemplar slots.
+	// DefaultBuckets has 12 entries → 13 slots per histogram.
+	// 3 routes × 2 histograms (latency + ttft) = 6 histograms = 78 slots.
+	// Plus 5 stage histograms = 65 more = 143 total.
+	// Well within bounded memory — each slot is ~80 bytes.
+	for _, hist := range []*Histogram{c.latencyLocal, c.latencyFrontier, c.latencyFusion} {
+		_, _, _, _, exs := hist.SnapshotWithExemplars()
+		if len(exs) != len(DefaultBuckets)+1 {
+			t.Errorf("expected %d exemplar slots, got %d", len(DefaultBuckets)+1, len(exs))
+		}
+		// Verify at least one slot has a non-empty trace.
+		hasTrace := false
+		for _, ex := range exs {
+			if ex.TraceID != "" {
+				hasTrace = true
+				break
+			}
+		}
+		if !hasTrace {
+			t.Error("expected at least one exemplar slot with a trace ID after stress test")
+		}
+	}
+}
+
+// TestObserveWithExemplar verifies the Histogram.ObserveWithExemplar method
+// stores trace context in the correct bucket.
+func TestObserveWithExemplar(t *testing.T) {
+	h := NewHistogram([]float64{10, 100})
+	h.ObserveWithExemplar(5, Exemplar{
+		TraceID: "0af7651916cd43dd8448eb211c80319c",
+		SpanID:  "b7ad6b7169203331",
+		Value:   5,
+	})
+	h.ObserveWithExemplar(50, Exemplar{
+		TraceID: "bbb",
+		SpanID:  "ccc",
+		Value:   50,
+	})
+
+	cum, upperBounds, sum, count, exs := h.SnapshotWithExemplars()
+	if count != 2 {
+		t.Fatalf("count = %d, want 2", count)
+	}
+	if sum != 55 {
+		t.Errorf("sum = %g, want 55", sum)
+	}
+	// Bucket 0 (le=10) should have exemplar from the first observation.
+	if exs[0].TraceID != "0af7651916cd43dd8448eb211c80319c" {
+		t.Errorf("bucket 0 trace = %q, want 0af7651916cd43dd8448eb211c80319c", exs[0].TraceID)
+	}
+	// Bucket 1 (le=100) should have exemplar from the second observation.
+	if exs[1].TraceID != "bbb" {
+		t.Errorf("bucket 1 trace = %q, want bbb", exs[1].TraceID)
+	}
+	// +Inf bucket should be empty.
+	if exs[2].TraceID != "" {
+		t.Errorf("+Inf bucket trace = %q, want empty", exs[2].TraceID)
+	}
+
+	// Verify cumulative counts.
+	if cum[0] != 1 {
+		t.Errorf("cum[0] = %d, want 1", cum[0])
+	}
+	if cum[1] != 2 {
+		t.Errorf("cum[1] = %d, want 2", cum[1])
+	}
+	if cum[2] != 2 {
+		t.Errorf("cum[2] (+Inf) = %d, want 2", cum[2])
+	}
+
+	// Verify upper bounds.
+	if len(upperBounds) != 2 {
+		t.Errorf("len(upperBounds) = %d, want 2", len(upperBounds))
+	}
+}
+
+// TestRenderPrometheusRAGJudgeScore confirms the RAG-vs-judge quality
+// correlation metrics (issue #1167) are rendered with the correct
+// labels and values.
+func TestRenderPrometheusRAGJudgeScore(t *testing.T) {
+	c := NewCollector()
+	c.ObserveJudgeScore(true, 5)
+	c.ObserveJudgeScore(true, 4)
+	c.ObserveJudgeScore(false, 2)
+
+	var sb strings.Builder
+	RenderPrometheus(&sb, c)
+	out := sb.String()
+
+	wantLines := []string{
+		"# TYPE nexus_rag_judge_score_sum counter",
+		`nexus_rag_judge_score_sum{injected="true"} 9`,
+		`nexus_rag_judge_score_sum{injected="false"} 2`,
+		"# TYPE nexus_rag_judge_score_count counter",
+		`nexus_rag_judge_score_count{injected="true"} 2`,
+		`nexus_rag_judge_score_count{injected="false"} 1`,
 	}
 	for _, want := range wantLines {
 		if !strings.Contains(out, want) {

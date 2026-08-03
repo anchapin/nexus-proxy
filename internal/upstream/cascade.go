@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/ioutils"
+	"github.com/anchapin/nexus-proxy/internal/tokenizer"
 	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
@@ -38,8 +39,17 @@ type CascadeStep struct {
 // changes without restarting the process (issue #14 acceptance criteria).
 type Cascade struct {
 	Steps            []CascadeStep
-	Timeout          time.Duration // per-attempt; <=0 falls back to cascadeDefaultTimeout
+	Timeout          time.Duration // per-attempt fixed fallback; <=0 falls back to cascadeDefaultTimeout
 	MaxResponseBytes int           // per-response cap; <=0 falls back to defaultMaxResponseBytes (64 MiB)
+
+	TimeoutFloor       time.Duration
+	TimeoutCeiling     time.Duration
+	TimeoutPer1kTokens time.Duration
+
+	// Coalescer deduplicates identical concurrent non-streaming
+	// fetchCascadeStep calls (issue #1155). When nil, coalescing is
+	// disabled and every request makes its own upstream call.
+	Coalescer *Coalescer
 }
 
 // CascadeResult is the per-request outcome suitable for telemetry.
@@ -81,6 +91,15 @@ type CascadeResult struct {
 // cascadeDefaultTimeout is the per-attempt timeout used when Cascade.Timeout
 // is <= 0. Mirrors the issue default ("configurable, default 30s").
 const cascadeDefaultTimeout = 30 * time.Second
+
+// Adaptive per-attempt timeout defaults (issue #1175). Used when the
+// corresponding Cascade field is <= 0 so that a freshly built Cascade
+// still gets sensible adaptive behaviour.
+const (
+	cascadeDefaultFloor       = 5 * time.Second
+	cascadeDefaultCeiling     = 120 * time.Second
+	cascadeDefaultPer1kTokens = 1500 * time.Millisecond
+)
 
 // ErrSSEPartialWrite is returned by writeSSEResponse when an SSE body write
 // fails after HTTP headers have already been committed (WriteHeader called).
@@ -146,10 +165,7 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 	if len(c.Steps) == 0 {
 		return CascadeResult{}, errors.New("cascade: no steps configured")
 	}
-	timeout := c.Timeout
-	if timeout <= 0 {
-		timeout = cascadeDefaultTimeout
-	}
+	timeout := c.effectiveTimeout(payload)
 
 	res := CascadeResult{}
 	var lastErr error
@@ -158,7 +174,7 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 		res.RouteAttempted = joinStepNames(c.Steps[:i+1])
 
 		ctx, cancel := context.WithTimeout(ctx, timeout)
-		msg, servedModel, err := c.fetchCascadeStep(ctx, client, step, payload)
+		msg, servedModel, _, err := c.fetchCascadeStep(ctx, client, step, payload)
 		cancel()
 		if err == nil {
 			slog.Info("cascade served",
@@ -166,6 +182,7 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 				slog.String("step", step.Name),
 				slog.Int("attempt", i+1),
 				slog.Int("total", len(c.Steps)),
+				slog.Duration("timeout", timeout),
 			)
 			res.Succeeded = true
 			res.ServedBy = step.Name
@@ -199,6 +216,7 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 			slog.Int("attempt", i+1),
 			slog.Int("total", len(c.Steps)),
 			slog.Bool("retry", retry),
+			slog.Duration("timeout", timeout),
 			slog.Any("err", err),
 		)
 		if !retry {
@@ -211,6 +229,71 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 	}
 	res.FallbackReason = CascadeFallbackReason(lastErr)
 	return res, fmt.Errorf("cascade: all %d steps failed; last error: %w", len(c.Steps), lastErr)
+}
+
+// RunBuffered executes the cascade like Run, but writes the raw upstream
+// response body as a single JSON object (Content-Type: application/json)
+// instead of an SSE chunk. Used by the route=frontier failover path for
+// non-streaming requests (issue #1157). The same retry / fallback logic
+// as Run applies: retryable failures advance to the next step.
+func (c *Cascade) RunBuffered(ctx context.Context, w http.ResponseWriter, client Client, payload map[string]interface{}, requestID string) (CascadeResult, error) {
+	if len(c.Steps) == 0 {
+		return CascadeResult{}, errors.New("cascade: no steps configured")
+	}
+	timeout := c.Timeout
+	if timeout <= 0 {
+		timeout = cascadeDefaultTimeout
+	}
+
+	res := CascadeResult{}
+	var lastErr error
+	for i, step := range c.Steps {
+		res.Attempts = i + 1
+		res.RouteAttempted = joinStepNames(c.Steps[:i+1])
+
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		_, _, rawBody, err := c.fetchCascadeStep(ctx, client, step, payload)
+		cancel()
+		if err == nil {
+			slog.Info("frontier cascade served (buffered)",
+				slog.String("request_id", requestID),
+				slog.String("step", step.Name),
+				slog.Int("attempt", i+1),
+				slog.Int("total", len(c.Steps)),
+			)
+			res.Succeeded = true
+			res.ServedBy = step.Name
+			h := w.Header()
+			h.Set("Content-Type", "application/json")
+			h.Set("X-Nexus-Cascade-Served-By", step.Name)
+			w.WriteHeader(http.StatusOK)
+			if _, werr := w.Write(rawBody); werr != nil {
+				return res, werr
+			}
+			return res, nil
+		}
+		lastErr = err
+		retry := classifyFailure(err)
+		if retry {
+			res.FallbackReason = CascadeFallbackReason(err)
+		}
+		slog.Warn("frontier cascade step failed",
+			slog.String("request_id", requestID),
+			slog.String("step", step.Name),
+			slog.Int("attempt", i+1),
+			slog.Int("total", len(c.Steps)),
+			slog.Bool("retry", retry),
+			slog.Any("err", err),
+		)
+		if !retry {
+			return res, err
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("cascade: no steps attempted")
+	}
+	res.FallbackReason = CascadeFallbackReason(lastErr)
+	return res, fmt.Errorf("frontier cascade: all %d providers failed; last error: %w", len(c.Steps), lastErr)
 }
 
 // classifyFailure reports whether err was tagged as retryable. Unknown
@@ -255,11 +338,115 @@ func joinStepNames(steps []CascadeStep) string {
 	return strings.Join(names, "->")
 }
 
+// effectiveTimeout returns the per-attempt timeout for this cascade given
+// the request payload. When adaptive scaling is enabled
+// (TimeoutPer1kTokens > 0, issue #1175) the timeout scales with the
+// estimated prompt token count:
+//
+//	effective = clamp(floor + per1k * tokens/1000, floor, ceiling)
+//
+// When adaptive scaling is disabled (TimeoutPer1kTokens <= 0) the fixed
+// Timeout field is used (backward compatible with pre-issue-#1175
+// behaviour).
+func (c *Cascade) effectiveTimeout(payload map[string]interface{}) time.Duration {
+	if c.TimeoutPer1kTokens <= 0 {
+		t := c.Timeout
+		if t <= 0 {
+			t = cascadeDefaultTimeout
+		}
+		return t
+	}
+	floor := c.TimeoutFloor
+	if floor <= 0 {
+		floor = cascadeDefaultFloor
+	}
+	ceiling := c.TimeoutCeiling
+	if ceiling <= 0 || ceiling < floor {
+		ceiling = cascadeDefaultCeiling
+	}
+	tokens := estimatePromptTokens(payload)
+	// per1k * tokens / 1000 using integer math to avoid float drift.
+	computed := floor + time.Duration(int64(c.TimeoutPer1kTokens)*int64(tokens)/1000)
+	if computed < floor {
+		computed = floor
+	}
+	if computed > ceiling {
+		computed = ceiling
+	}
+	return computed
+}
+
+// estimatePromptTokens returns an approximate token count for the prompt
+// portion of an OpenAI-compatible chat-completion payload. It concatenates
+// the textual content of every message in payload["messages"], then counts
+// tokens via the shared tokenizer (issue #1175). On error it falls back to
+// the len(s)/4 heuristic.
+//
+// For large prompts (total byte count > tokenizer.MaxAccurateEncodeLen) the
+// function short-circuits and returns totalBytes/4 directly, avoiding the
+// cost of building the concatenated string since CountTokens would use the
+// same heuristic anyway (issue #1235).
+func estimatePromptTokens(payload map[string]interface{}) int {
+	msgs, ok := payload["messages"].([]interface{})
+	if !ok || len(msgs) == 0 {
+		return len(fmt.Sprint(payload)) / 4
+	}
+	var totalBytes int
+	// First pass: count bytes and short-circuit if we already exceed the
+	// threshold where CountTokens would fall back to the heuristic anyway.
+	for _, m := range msgs {
+		mp, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch content := mp["content"].(type) {
+		case string:
+			totalBytes += len(content)
+		case []interface{}:
+			for _, part := range content {
+				if pp, ok := part.(map[string]interface{}); ok {
+					if txt, ok := pp["text"].(string); ok {
+						totalBytes += len(txt)
+					}
+				}
+			}
+		}
+		totalBytes++ // separator byte
+	}
+	if totalBytes > tokenizer.MaxAccurateEncodeLen {
+		return totalBytes / 4
+	}
+	// Second pass: build the concatenated string only when accurate counting applies.
+	var sb strings.Builder
+	for _, m := range msgs {
+		mp, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch content := mp["content"].(type) {
+		case string:
+			sb.WriteString(content)
+		case []interface{}:
+			for _, part := range content {
+				if pp, ok := part.(map[string]interface{}); ok {
+					if txt, ok := pp["text"].(string); ok {
+						sb.WriteString(txt)
+					}
+				}
+			}
+		}
+		sb.WriteByte(' ')
+	}
+	return tokenizer.CountTokens(sb.String())
+}
+
 // fetchCascadeStep does a single non-streaming POST to step.URL, validates
 // the response, and returns the assistant message + the model name echoed
-// back by the upstream (used in the SSE response). All returned errors are
-// tagged via newCascadeErr so the runner knows whether to fall back.
-func (c *Cascade) fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payload map[string]interface{}) (AssistantMessage, string, error) {
+// back by the upstream (used in the SSE response) + the raw validated
+// response body (used by RunBuffered to forward the upstream JSON verbatim).
+// All returned errors are tagged via newCascadeErr so the runner knows
+// whether to fall back.
+func (c *Cascade) fetchCascadeStep(ctx context.Context, client Client, step CascadeStep, payload map[string]interface{}) (AssistantMessage, string, []byte, error) {
 	body := make(map[string]interface{}, len(payload)+2)
 	for k, v := range payload {
 		body[k] = v
@@ -269,11 +456,29 @@ func (c *Cascade) fetchCascadeStep(ctx context.Context, client Client, step Casc
 
 	jsonPayload, mErr := json.Marshal(body)
 	if mErr != nil {
-		return AssistantMessage{}, "", newCascadeErr(false, "", "marshal: %v", mErr)
+		return AssistantMessage{}, "", nil, newCascadeErr(false, "", "marshal: %v", mErr)
 	}
+
+	// Coalesce identical concurrent requests when enabled (issue #1155).
+	// Only the non-streaming path is coalesced; streaming bypasses the
+	// cascade entirely.
+	if c.Coalescer != nil {
+		key := FlightKey(FlightKeyMethod, step.Model, jsonPayload)
+		return c.Coalescer.Do(key, func() (AssistantMessage, string, []byte, error) {
+			return c.doFetchCascadeStep(ctx, client, step, jsonPayload)
+		})
+	}
+
+	return c.doFetchCascadeStep(ctx, client, step, jsonPayload)
+}
+
+// doFetchCascadeStep performs the actual HTTP call for a cascade step.
+// It is split from fetchCascadeStep so the coalescer can wrap it via
+// singleflight (issue #1155).
+func (c *Cascade) doFetchCascadeStep(ctx context.Context, client Client, step CascadeStep, jsonPayload []byte) (AssistantMessage, string, []byte, error) {
 	req, rErr := http.NewRequestWithContext(ctx, http.MethodPost, step.URL, bytes.NewReader(jsonPayload))
 	if rErr != nil {
-		return AssistantMessage{}, "", newCascadeErr(false, "", "build request: %v", rErr)
+		return AssistantMessage{}, "", nil, newCascadeErr(false, "", "build request: %v", rErr)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if step.APIKey != "" {
@@ -291,38 +496,47 @@ func (c *Cascade) fetchCascadeStep(ctx context.Context, client Client, step Casc
 		if errors.Is(dErr, context.DeadlineExceeded) {
 			reason = "timeout"
 		}
-		return AssistantMessage{}, "", newCascadeErr(true, reason, "transport: %v", dErr)
+		return AssistantMessage{}, "", nil, newCascadeErr(true, reason, "transport: %v", dErr)
 	}
 	defer resp.Body.Close()
 	maxBytes := c.MaxResponseBytes
 	if maxBytes <= 0 {
 		maxBytes = defaultMaxResponseBytes
 	}
-	respBody, _ := ioutils.ReadAllLimited(resp.Body, maxBytes)
+	// Use a pooled buffer to reduce GC pressure on the cascade hot path
+	// (issue #1177). The defer guarantees the buffer is returned to the
+	// pool on every code path — success, validation error, and read
+	// error. PutBuffer discards buffers larger than the retention cap.
+	respBuf, readErr := ioutils.ReadAllLimitedPooled(resp.Body, maxBytes)
+	defer ioutils.PutBuffer(respBuf)
+	respBody := respBuf.Bytes()
+	if readErr != nil {
+		return AssistantMessage{}, "", nil, newCascadeErr(true, "transport_error", "body read: %v", readErr)
+	}
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return AssistantMessage{}, "", newCascadeErr(true, "rate_limited", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
+		return AssistantMessage{}, "", nil, newCascadeErr(true, "rate_limited", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
 	}
 	if ShouldRetry(resp.StatusCode, nil) {
-		return AssistantMessage{}, "", newCascadeErr(true, "http_error", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
+		return AssistantMessage{}, "", nil, newCascadeErr(true, "http_error", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
 	}
 	// Issue #438: A 404 from the local step means the model is missing or
 	// not pulled. Treat as retryable so the cascade falls through to the
 	// frontier. Frontier 404s remain terminal — a missing frontier model
 	// is a configuration error, not a transient condition.
 	if resp.StatusCode == http.StatusNotFound && step.Name == "local" {
-		return AssistantMessage{}, "", newCascadeErr(true, "model_unavailable", "local model not found (404): %s", truncateForLog(respBody, 200))
+		return AssistantMessage{}, "", nil, newCascadeErr(true, "model_unavailable", "local model not found (404): %s", truncateForLog(respBody, 200))
 	}
 	if resp.StatusCode != http.StatusOK {
 		// Non-retryable 4xx (auth, bad request, etc.). Surface to caller.
-		return AssistantMessage{}, "", newCascadeErr(false, "", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
+		return AssistantMessage{}, "", nil, newCascadeErr(false, "", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
 	}
 
 	msg, model, vErr := extractAssistantMessage(respBody)
 	if vErr != nil {
-		return AssistantMessage{}, "", vErr
+		return AssistantMessage{}, "", nil, vErr
 	}
-	return msg, model, nil
+	return msg, model, respBody, nil
 }
 
 // assistantResponse is the slice of the OpenAI-compatible chat-completion
@@ -494,6 +708,11 @@ type CascadeConfig struct {
 	ZAIKey        string
 	Timeout       time.Duration
 
+	// Adaptive per-attempt timeout (issue #1175). See Cascade struct docs.
+	TimeoutFloor       time.Duration
+	TimeoutCeiling     time.Duration
+	TimeoutPer1kTokens time.Duration
+
 	// MaxResponseBytes caps per-response bodies in the cascade. Zero or
 	// negative falls back to defaultMaxResponseBytes (64 MiB).
 	MaxResponseBytes int
@@ -541,7 +760,14 @@ func BuildLocalCascade(cfg CascadeConfig) *Cascade {
 			Model:  cfg.ZAIModel,
 		})
 	}
-	return &Cascade{Steps: steps, Timeout: cfg.Timeout, MaxResponseBytes: cfg.MaxResponseBytes}
+	return &Cascade{
+		Steps:              steps,
+		Timeout:            cfg.Timeout,
+		TimeoutFloor:       cfg.TimeoutFloor,
+		TimeoutCeiling:     cfg.TimeoutCeiling,
+		TimeoutPer1kTokens: cfg.TimeoutPer1kTokens,
+		MaxResponseBytes:   cfg.MaxResponseBytes,
+	}
 }
 
 const truncateSuffix = "...(truncated)"

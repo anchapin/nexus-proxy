@@ -65,6 +65,17 @@ type Sample struct {
 	// the correct route instead of always defaulting to RouteLocal.
 	Route string
 
+	// RAGInjected reports whether a RAG few-shot snippet was injected
+	// into the prompt for this request (issue #1167). Carried through
+	// to JudgeScore so the correlation metrics can partition quality
+	// scores by injected=true|false.
+	RAGInjected bool
+
+	// RAGSimilarity is the cosine-similarity score of the best RAG
+	// match (0 when RAG was not injected). Persisted alongside the
+	// judge score for offline retrieval-effectiveness analysis (issue #1167).
+	RAGSimilarity float64
+
 	// TraceParent and TraceState carry the W3C trace context from the
 	// inbound request so the async worker can create a child span (issue #233).
 	TraceParent string
@@ -89,6 +100,17 @@ type JudgeScore struct {
 	// scored. This lets the confidenceBridge record the outcome against
 	// the correct route instead of always defaulting to RouteLocal (issue #970).
 	Route string
+
+	// RAGInjected reports whether a RAG few-shot snippet was injected
+	// into the prompt for the request that produced this score (issue #1167).
+	// Populated from Sample.RAGInjected so Prometheus metrics can
+	// partition quality scores by injected=true|false.
+	RAGInjected bool
+
+	// RAGSimilarity is the cosine-similarity score of the best RAG
+	// match (0 when RAG was not injected). Persisted for offline
+	// retrieval-effectiveness analysis (issue #1167).
+	RAGSimilarity float64
 }
 
 // Storage persists JudgeScore records. A future PR will supply a
@@ -96,6 +118,11 @@ type JudgeScore struct {
 // MemoryStorage satisfies the interface so the wiring is complete.
 type Storage interface {
 	Record(score JudgeScore) error
+	// RecentScores returns the scores of the most recent `limit` JudgeScore
+	// records, in descending chronological order (newest first). Only records
+	// with a non-zero Score (i.e., successful parse) are included.
+	// Used by adaptive sampling (issue #1232) to compute rolling quality average.
+	RecentScores(limit int) ([]int, error)
 	Close() error
 }
 
@@ -109,15 +136,17 @@ type HTTPClient interface {
 // NewEvaluator so callers can construct an evaluator from a partial
 // config without exploding.
 type Config struct {
-	URL         string        // frontier endpoint for judge calls
-	Model       string        // judge model name
-	APIKey      string        // bearer token; empty = no Authorization header
-	SampleRate  float64       // 0..1; <=0 disables sampling
-	Concurrency int           // max parallel judge calls (default 2)
-	QueueDepth  int           // buffered channel size (default 64)
-	Timeout     time.Duration // per-call judge timeout (default 30s)
-	CostPer1K   float64       // USD per 1k tokens (input+output); default 0.002
-	BudgetGuard *budget.Guard // optional budget guard to record judge costs
+	URL                string        // frontier endpoint for judge calls
+	Model              string        // judge model name
+	APIKey             string        // bearer token; empty = no Authorization header
+	SampleRate         float64       // 0..1; <=0 disables sampling (local route)
+	FrontierSampleRate float64       // 0..1; fraction of frontier completions to judge (issue #1162)
+	Concurrency        int           // max parallel judge calls (default 2)
+	QueueDepth         int           // buffered channel size (default 64)
+	Timeout            time.Duration // per-call judge timeout (default 30s)
+	CostPer1K          float64       // USD per 1k tokens (input+output); default 0.002
+	BudgetGuard        *budget.Guard // optional budget guard to record judge costs
+	AdaptiveEnabled    bool          // enable adaptive sampling based on rolling avg of recent scores (issue #1232)
 }
 
 // applyDefaults fills zero fields with sane values. It mutates cfg.
@@ -156,11 +185,61 @@ type Evaluator struct {
 	// across observability surfaces (issue #111).
 	dropped atomic.Uint64
 
+	// frontierSampled counts frontier completions that passed the
+	// frontier sample rate gate (issue #1162). Exposed via
+	// FrontierSampled() for the Prometheus counter
+	// nexus_judge_frontier_sampled_total.
+	frontierSampled atomic.Uint64
+
 	// onDrop is an optional callback invoked atomically once per
 	// dropped sample. The callback receives the running total of
 	// drops so callers can feed a Prometheus counter without
 	// polling.
 	onDrop func(uint64)
+
+	// onScore is an optional callback invoked after each judge attempt
+	// completes (success or failure). Callers use it to feed
+	// Prometheus metrics — notably the RAG-vs-quality correlation
+	// metrics (issue #1167). The callback receives the final
+	// JudgeScore; it is invoked synchronously on the worker goroutine,
+	// so keep it cheap (e.g. a handful of atomic increments).
+	onScore func(JudgeScore)
+
+	// adaptiveSampleRate is the current effective sample rate when
+	// adaptive sampling is enabled (issue #1232). It is recomputed
+	// periodically from the rolling average of recent scores.
+	adaptiveMu       sync.Mutex
+	adaptiveRate     float64
+	adaptiveCachedAt time.Time
+	adaptiveCacheTTL time.Duration // how long to cache the adaptive rate
+
+	// onAdaptiveSample is an optional callback invoked whenever the
+	// adaptive sample rate is recomputed. Callers use it to expose
+	// the current rate as a Prometheus gauge
+	// (nexus_judge_adaptive_samples_total, issue #1232).
+	onAdaptiveSample func(float64)
+}
+
+// newSeededRand returns a *rand.Rand seeded from a cryptographic
+// entropy source. Seeding exclusively from time.Now().UnixNano()
+// collapses to identical streams when multiple evaluators are
+// constructed within the same nanosecond, biasing the sample rate
+// (issue #589). crypto/rand supplies 64 bits of entropy; if it fails
+// (extremely rare — e.g. /dev/urandom unavailable) the fallback mixes
+// the nanosecond clock with the PID so a same-nanosecond pair of
+// evaluators on the same host still diverge.
+//
+// The seed is drawn once at construction; Sample() remains a single
+// mutex-guarded Float64() draw, so this change is latency-neutral.
+func newSeededRand() *rand.Rand {
+	var seed int64
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err == nil {
+		seed = int64(binary.LittleEndian.Uint64(b[:]))
+	} else {
+		seed = time.Now().UnixNano() ^ (int64(os.Getpid()) << 32)
+	}
+	return rand.New(rand.NewSource(seed))
 }
 
 // newSeededRand returns a *rand.Rand seeded from a cryptographic
@@ -200,12 +279,14 @@ func NewEvaluator(cfg Config, client HTTPClient, storage Storage) *Evaluator {
 		storage = noopStorage{}
 	}
 	e := &Evaluator{
-		cfg:     cfg,
-		client:  client,
-		storage: storage,
-		queue:   make(chan Sample, cfg.QueueDepth),
-		rng:     newSeededRand(),
-		closed:  make(chan struct{}),
+		cfg:              cfg,
+		client:           client,
+		storage:          storage,
+		queue:            make(chan Sample, cfg.QueueDepth),
+		rng:              newSeededRand(),
+		closed:           make(chan struct{}),
+		adaptiveRate:     cfg.SampleRate, // initial rate; updated by adaptive logic
+		adaptiveCacheTTL: 30 * time.Second,
 	}
 	if cfg.SampleRate <= 0 {
 		// Dormant evaluator: do not start workers.
@@ -246,8 +327,21 @@ func (e *Evaluator) SetDropCallback(fn func(uint64)) {
 	e.onDrop = fn
 }
 
+// SetScoreCallback registers an optional callback invoked after each
+// judge attempt completes. The callback receives the resulting
+// JudgeScore (success or failure) and is called synchronously on the
+// worker goroutine — keep it cheap (e.g. a handful of atomic
+// increments). Pass nil to clear. Used to feed Prometheus metrics
+// such as the RAG-vs-quality correlation (issue #1167).
+func (e *Evaluator) SetScoreCallback(fn func(JudgeScore)) {
+	e.onScore = fn
+}
+
 // Sample returns true if a fresh request should be enqueued for judge
-// evaluation, given the configured sample rate. It is the canonical
+// evaluation, given the configured sample rate. When adaptive sampling is
+// enabled (issue #1232), the rate is dynamically adjusted based on the
+// rolling average of recent judge scores: decay to 1% if avg > 4.0,
+// increase to 10% if avg < 3.0, else hold at 5%. It is the canonical
 // "Sample" entry point listed in the issue's acceptance criteria.
 //
 // Sample is safe to call from many goroutines concurrently.
@@ -255,10 +349,103 @@ func (e *Evaluator) Sample() bool {
 	if !e.Enabled() {
 		return false
 	}
+	rate := e.cfg.SampleRate
+	if e.cfg.AdaptiveEnabled {
+		rate = e.effectiveSampleRate()
+	}
 	e.rngMu.Lock()
 	r := e.rng.Float64()
 	e.rngMu.Unlock()
-	return r < e.cfg.SampleRate
+	return r < rate
+}
+
+// effectiveSampleRate returns the current adaptive sample rate, recomputing
+// it from storage if the cache has expired. Thread-safe via adaptiveMu.
+func (e *Evaluator) effectiveSampleRate() float64 {
+	e.adaptiveMu.Lock()
+	defer e.adaptiveMu.Unlock()
+	now := time.Now()
+	if now.Sub(e.adaptiveCachedAt) < e.adaptiveCacheTTL {
+		return e.adaptiveRate
+	}
+	// Cache miss — recompute from storage.
+	scores, err := e.storage.RecentScores(100)
+	var avg float64
+	if err == nil && len(scores) > 0 {
+		sum := 0
+		for _, s := range scores {
+			sum += s
+		}
+		avg = float64(sum) / float64(len(scores))
+	}
+	var rate float64
+	if len(scores) == 0 {
+		// No scores yet — fall back to configured rate.
+		rate = e.cfg.SampleRate
+	} else if avg > 4.0 {
+		rate = 0.01 // high quality → reduce sampling
+	} else if avg < 3.0 {
+		rate = 0.10 // low quality → increase sampling
+	} else {
+		rate = 0.05 // moderate quality → hold at mid
+	}
+	e.adaptiveRate = rate
+	e.adaptiveCachedAt = now
+	if e.onAdaptiveSample != nil {
+		e.onAdaptiveSample(rate)
+	}
+	return rate
+}
+
+// AdaptiveRate returns the current effective adaptive sample rate.
+// Returns cfg.SampleRate when adaptive sampling is disabled.
+func (e *Evaluator) AdaptiveRate() float64 {
+	if !e.cfg.AdaptiveEnabled {
+		return e.cfg.SampleRate
+	}
+	e.adaptiveMu.Lock()
+	rate := e.adaptiveRate
+	e.adaptiveMu.Unlock()
+	return rate
+}
+
+// SetAdaptiveSampleCallback registers an optional callback invoked
+// whenever the adaptive sample rate is recomputed. Callers use it to
+// expose the current rate as a Prometheus gauge
+// (nexus_judge_adaptive_samples_total, issue #1232). Pass nil to clear.
+func (e *Evaluator) SetAdaptiveSampleCallback(fn func(float64)) {
+	e.onAdaptiveSample = fn
+}
+
+// SampleFrontier returns true if a frontier-route completion should be
+// enqueued for judge evaluation (issue #1162). It uses the separate
+// FrontierSampleRate (default 0.02) which is lower than the local
+// SampleRate (default 0.1) because frontier completions are more
+// expensive to replicate. Returns false when FrontierSampleRate <= 0.
+//
+// SampleFrontier is safe to call from many goroutines concurrently.
+func (e *Evaluator) SampleFrontier() bool {
+	if e == nil || e.cfg.FrontierSampleRate <= 0 {
+		return false
+	}
+	e.rngMu.Lock()
+	r := e.rng.Float64()
+	e.rngMu.Unlock()
+	if r < e.cfg.FrontierSampleRate {
+		e.frontierSampled.Add(1)
+		return true
+	}
+	return false
+}
+
+// FrontierSampled returns the total number of frontier completions that
+// passed the frontier sample rate gate. Monotonically increasing and
+// safe to read from any goroutine.
+func (e *Evaluator) FrontierSampled() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.frontierSampled.Load()
 }
 
 // Enqueue is the non-blocking submit used by the chat handler. It is
@@ -323,6 +510,13 @@ func (e *Evaluator) worker() {
 		if e.cfg.BudgetGuard != nil && score.Cost > 0 {
 			e.cfg.BudgetGuard.Record(context.Background(), score.Cost, "judge")
 		}
+		// Notify the optional score callback so observability metrics
+		// (e.g. RAG-vs-quality correlation, issue #1167) can record the
+		// outcome. Invoked after persistence so the callback sees the
+		// final score even if storage.Record logged an error.
+		if e.onScore != nil {
+			e.onScore(score)
+		}
 	}
 }
 
@@ -345,7 +539,13 @@ func (e *Evaluator) evaluate(s Sample) JudgeScore {
 }
 
 func (e *Evaluator) evaluateCtx(ctx context.Context, s Sample) JudgeScore {
-	score := JudgeScore{RequestID: s.RequestID, Timestamp: time.Now().UTC(), Route: s.Route}
+	score := JudgeScore{
+		RequestID:     s.RequestID,
+		Timestamp:     time.Now().UTC(),
+		Route:         s.Route,
+		RAGInjected:   s.RAGInjected,
+		RAGSimilarity: s.RAGSimilarity,
+	}
 
 	prompt := PromptFor(s)
 	// Use a struct so the JSON field order is deterministic — Go's
@@ -564,8 +764,14 @@ func extractContent(body []byte) (string, error) {
 // operator has not wired telemetry yet.
 type noopStorage struct{}
 
-func (noopStorage) Record(JudgeScore) error { return nil }
-func (noopStorage) Close() error            { return nil }
+func (noopStorage) Record(JudgeScore) error         { return nil }
+func (noopStorage) RecentScores(int) ([]int, error) { return nil, nil }
+func (noopStorage) Close() error                    { return nil }
+
+// cleanEveryN is the interval (in inserts) between stale-entry cleanup
+// passes. Every cleanEveryN inserts, entries older than 2*window are deleted
+// to keep memory bounded regardless of the sliding window size.
+const cleanEveryN = 1000
 
 // cleanEveryN is the interval (in inserts) between stale-entry cleanup
 // passes. Every cleanEveryN inserts, entries older than 2*window are deleted
@@ -645,3 +851,30 @@ func (m *MemoryStorage) ScoresSince(t time.Time) []JudgeScore {
 // Close is a no-op for the in-memory store; included to satisfy the
 // Storage interface.
 func (m *MemoryStorage) Close() error { return nil }
+
+// RecentScores implements Storage. Returns the most recent `limit` successful
+// scores in descending chronological order (newest first).
+func (m *MemoryStorage) RecentScores(limit int) ([]int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit <= 0 {
+		return nil, nil
+	}
+	// Collect all non-zero scores. Scores are appended in chronological order
+	// (oldest first), so the newest entries are at the end of the slice.
+	var valid []JudgeScore
+	for _, s := range m.scores {
+		if s.Score > 0 {
+			valid = append(valid, s)
+		}
+	}
+	if len(valid) == 0 {
+		return nil, nil
+	}
+	// Iterate backwards from the newest entries, collecting up to `limit` scores.
+	out := make([]int, 0, limit)
+	for i := len(valid) - 1; i >= 0 && len(out) < limit; i-- {
+		out = append(out, valid[i].Score)
+	}
+	return out, nil
+}

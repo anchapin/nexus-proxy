@@ -60,11 +60,17 @@ func NewSLMClient(baseURL, model string, timeout time.Duration, client *http.Cli
 // slmSystemPrompt is the static instruction we send to the routing SLM.
 // Keeping it as a package var (not a config field) makes it trivial to grep
 // and to snapshot in tests.
-const slmSystemPrompt = `You are an intelligent routing assistant for a coding agent proxy. 
-    Analyze the user's prompt. 
-    - If it is a simple task (boilerplate, styling, small isolated functions), output {"route": "local"}. 
-    - If it is a complex task (deep debugging, multi-file refactoring), output {"route": "frontier"}. 
+//
+// Token hint (issue #1233): when SLMTokenHint is enabled the prompt
+// is prefixed with [tokens: ~N] so the routing model has length context.
+// Longer prompts (500-2000 tokens) often warrant frontier even when the
+// content seems simple — the gray zone between short and the guardrail.
+const slmSystemPrompt = `You are an intelligent routing assistant for a coding agent proxy.
+    Analyze the user's prompt.
+    - If it is a simple task (boilerplate, styling, small isolated functions), output {"route": "local"}.
+    - If it is a complex task (deep debugging, multi-file refactoring), output {"route": "frontier"}.
     - If it requires extreme architectural deliberation and planning, output {"route": "fusion"}.
+    The prompt may begin with [tokens: ~N] indicating its approximate token length — use this context to assess complexity.
 	Respond ONLY in valid JSON. No explanations.`
 
 // negativeBiasNote is appended to slmSystemPrompt when empirical local
@@ -81,6 +87,14 @@ ADAPTIVE ROUTING CONTEXT: Historical quality evaluations show the LOCAL model ha
 const positiveBiasNote = `
 
 ADAPTIVE ROUTING CONTEXT: Historical quality evaluations show the LOCAL model handles tasks similar to this one WELL. Prefer {"route": "local"} when the task is not clearly complex.`
+
+// fusionBiasNote is appended when both local AND frontier confidence are
+// below the floor (issue #1162): both models struggle with this category,
+// so fusion (local + frontier synthesis) may produce a better result than
+// either alone.
+const fusionBiasNote = `
+
+ADAPTIVE ROUTING CONTEXT: Historical quality evaluations show BOTH the local and frontier models perform POORLY on tasks similar to this one. Consider {"route": "fusion"} to leverage combined analysis.`
 
 // Decide returns the routing decision for prompt. It is the neutral-path
 // entry point: equivalent to DecideWithConfidence with NeutralConfidence,
@@ -100,6 +114,50 @@ func (c *SLMClient) Decide(ctx context.Context, prompt string) (Route, error) {
 // inside the neutral band the request is unchanged from Decide.
 func (c *SLMClient) DecideWithConfidence(ctx context.Context, prompt string, confidence float64) (Route, error) {
 	return c.decide(ctx, prompt, c.systemPromptFor(confidence))
+}
+
+// ComparativeSLMDecider is the optional interface an SLM client can
+// implement to accept both local and frontier confidence signals
+// (issue #1162). When the planner has comparative data it type-asserts
+// to this interface; otherwise it falls back to DecideWithConfidence.
+type ComparativeSLMDecider interface {
+	DecideWithComparativeConfidence(ctx context.Context, prompt string, localConf, frontierConf float64) (Route, error)
+}
+
+// DecideWithComparativeConfidence is Decide augmented with both local and
+// frontier confidence signals (issue #1162). When local confidence is below
+// the floor AND frontier confidence is also below the floor, the system
+// prompt gains a fusion bias (both models struggle). When only local is
+// below the floor, the existing frontier bias applies. When local is above
+// the ceiling, the existing local bias applies.
+func (c *SLMClient) DecideWithComparativeConfidence(ctx context.Context, prompt string, localConf, frontierConf float64) (Route, error) {
+	return c.decide(ctx, prompt, c.systemPromptForComparative(localConf, frontierConf))
+}
+
+// systemPromptForComparative returns the SLM system prompt considering both
+// local and frontier confidence. It is separated out so tests can assert
+// the exact augmentation without an HTTP round-trip.
+func (c *SLMClient) systemPromptForComparative(localConf, frontierConf float64) string {
+	floor := c.ConfidenceFloor
+	if floor <= 0 {
+		floor = DefaultConfidenceFloor
+	}
+	ceiling := c.ConfidenceCeiling
+	if ceiling <= 0 {
+		ceiling = DefaultConfidenceCeiling
+	}
+	// When both models struggle, suggest fusion (issue #1162).
+	if localConf < floor && frontierConf < floor {
+		return slmSystemPrompt + fusionBiasNote
+	}
+	switch {
+	case localConf < floor:
+		return slmSystemPrompt + negativeBiasNote
+	case localConf > ceiling:
+		return slmSystemPrompt + positiveBiasNote
+	default:
+		return slmSystemPrompt
+	}
 }
 
 // systemPromptFor returns the SLM system prompt for the given confidence,

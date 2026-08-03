@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/anchapin/nexus-proxy/internal/health"
 	"github.com/anchapin/nexus-proxy/internal/ioutils"
+	"github.com/anchapin/nexus-proxy/internal/tokenizer"
 
 	"time"
 )
@@ -85,10 +87,11 @@ type BreakerConfig struct {
 
 // FewShotExample is one indexed code snippet with its embedding.
 type FewShotExample struct {
-	Filename  string // base filename only (no path)
-	Dir       string // directory from which this example was indexed
-	Content   string
-	Embedding []float64
+	Filename   string // base filename only (no path)
+	Dir        string // directory from which this example was indexed
+	Content    string
+	Embedding  []float64
+	ChunkIndex int // 0 for whole-file; 0..N for chunked files (issue #1168)
 }
 
 // Embedder turns text into a vector. Implementations must be safe for
@@ -480,6 +483,16 @@ type RAGStore interface {
 	LastSuccessfulKind() string
 }
 
+// TopKRetriever is an optional interface implemented by *Store (and
+// inherited by *PersistentStore) for retrieving the K most-relevant
+// examples above threshold (issue #1166). The chat handler type-asserts
+// d.RAG to this interface when Config.RAGTopK > 1; when the assertion
+// fails it transparently falls back to the single-example Retrieve
+// path.
+type TopKRetriever interface {
+	RetrieveTopK(ctx context.Context, prompt string, k int) ([]FewShotExample, []float64, IndexPath, error)
+}
+
 // EmbedCacheStats is the observability surface for the prompt embedding cache.
 // It is implemented by *EmbedCache and is also exposed by *Store (where it
 // delegates to the wrapped embedder when it is an *EmbedCache).
@@ -518,6 +531,7 @@ type StoreStats struct {
 	CacheMisses               uint64
 	InjectionSkippedSizeLimit uint64
 	IndexGeneration           int64
+	DedupSkipped              uint64
 }
 
 // Store holds the indexed few-shot examples.
@@ -529,7 +543,26 @@ type Store struct {
 	thresholdOverrides map[string]float64 // dir -> threshold; unspecified dirs use global threshold
 	index              *HNSWIndex
 	indexConfig        HNSWConfig
-	batchSize          int // number of files to embed per batch; 0 disables batching
+	batchSize          int         // number of files to embed per batch; 0 disables batching
+	recursive          bool        // walk subdirectories during IndexDir (issue #1149)
+	chunkTokens        int         // max tokens per chunk; 0 disables chunking (issue #1168)
+	fileFilter         *FileFilter // optional include/exclude filter for IndexDir (issue #1148)
+	dedupThreshold     float64     // cosine similarity above which new chunks are skipped (0 = disabled, issue #1243)
+	dedupCrossDir      bool        // allow cross-directory dedup; false = same-dir only (issue #1243)
+
+	// Inverted index for BM25 keyword retrieval (issue #1242).
+	// Map: term -> docID -> TF-IDF weight.
+	// Built incrementally during Add() and rebuilt during IndexDir().
+	invertedIndex map[string]map[int]float64
+
+	// avgDL is the average document length (in tokens) across all indexed examples.
+	// Used for BM25 document length normalization.
+	avgDL float64
+
+	// hybridWeight controls the blend between semantic (cosine similarity)
+	// and keyword (BM25) retrieval (issue #1242). 0.0 = pure semantic,
+	// 1.0 = pure keyword. Values between blend both via Reciprocal Rank Fusion.
+	hybridWeight float64
 
 	lastIndexAt               int64
 	retrievalAttempts         uint64
@@ -539,6 +572,7 @@ type Store struct {
 	thresholdMisses           uint64
 	embedErrors               uint64
 	injectionSkippedSizeLimit uint64
+	dedupSkipped              uint64
 	generation                int64
 	lastSuccessfulKind        string // circuit kind of last successful embedder (issue #886)
 }
@@ -550,6 +584,52 @@ type StoreOption func(*Store)
 // A value of 0 disables batching (each file is embedded individually).
 func WithBatchSize(n int) StoreOption {
 	return func(s *Store) { s.batchSize = n }
+}
+
+// WithRecursive enables recursive subdirectory walking in IndexDir
+// (issue #1149). When true, filepath.WalkDir descends into all
+// subdirectories; file paths are stored relative to the root.
+func WithRecursive(r bool) StoreOption {
+	return func(s *Store) { s.recursive = r }
+}
+
+// WithChunkTokens enables token-aware file chunking (issue #1168).
+// When > 0, files whose token count exceeds the threshold are split into
+// overlapping chunks that prefer natural code boundaries (blank lines).
+// Each chunk is stored as a separate FewShotExample with a unique ChunkIndex.
+// A value of 0 (default) disables chunking — whole-file indexing.
+func WithChunkTokens(n int) StoreOption {
+	return func(s *Store) { s.chunkTokens = n }
+}
+
+// WithFileFilter sets the include/exclude filter used by IndexDir to skip
+// non-source files during indexing (issue #1148). A nil filter (the default)
+// indexes all regular files, preserving backward compatibility.
+func WithFileFilter(f *FileFilter) StoreOption {
+	return func(s *Store) { s.fileFilter = f }
+}
+
+// WithDedupThreshold sets the cosine similarity threshold above which
+// new chunks are suppressed at index time (issue #1243). A value of 0
+// (default) disables deduplication entirely.
+func WithDedupThreshold(t float64) StoreOption {
+	return func(s *Store) { s.dedupThreshold = t }
+}
+
+// WithDedupCrossDir controls whether dedup scans across directory
+// boundaries (issue #1243). When false (default), only chunks in the
+// same directory are compared. When true, all indexed chunks are
+// candidates for dedup regardless of directory.
+func WithDedupCrossDir(b bool) StoreOption {
+	return func(s *Store) { s.dedupCrossDir = b }
+}
+
+// WithHybridWeight sets the hybrid retrieval weight (issue #1242).
+// 0.0 = pure semantic (backward compatible), 1.0 = pure keyword.
+// Values between blend semantic (cosine similarity) and keyword (BM25)
+// via Reciprocal Rank Fusion.
+func WithHybridWeight(w float64) StoreOption {
+	return func(s *Store) { s.hybridWeight = w }
 }
 
 // indexThreshold is the minimum store size before the HNSW index is used.
@@ -628,6 +708,16 @@ const (
 	// labelled {path="brute_force"} in
 	// nexus_rag_similarity_histogram carry these observations.
 	IndexPathBruteForce IndexPath = "brute_force"
+
+	// IndexPathHybrid means Retrieve combined semantic and keyword scores
+	// via Reciprocal Rank Fusion (issue #1242). The hybrid path is used
+	// when NEXUS_RAG_HYBRID_WEIGHT is between 0 and 1.
+	IndexPathHybrid IndexPath = "hybrid"
+
+	// IndexPathKeyword means Retrieve used pure BM25 scoring without
+	// semantic embeddings (issue #1242). This path is used when
+	// NEXUS_RAG_HYBRID_WEIGHT=1.0 (pure keyword).
+	IndexPathKeyword IndexPath = "keyword"
 )
 
 // IndexMode describes which retrieval path Store.Retrieve will use for
@@ -730,6 +820,7 @@ func (s *Store) Stats() StoreStats {
 		ThresholdMisses:           atomic.LoadUint64(&s.thresholdMisses),
 		EmbedErrors:               atomic.LoadUint64(&s.embedErrors),
 		InjectionSkippedSizeLimit: atomic.LoadUint64(&s.injectionSkippedSizeLimit),
+		DedupSkipped:              atomic.LoadUint64(&s.dedupSkipped),
 	}
 	if cacheHits > 0 {
 		stats.CacheHits = uint64(cacheHits)
@@ -749,6 +840,34 @@ func (s *Store) markIndexed(at time.Time) {
 		at = time.Now().UTC()
 	}
 	atomic.StoreInt64(&s.lastIndexAt, at.UnixNano())
+}
+
+// isDuplicate checks if the new embedding at newDir is too similar to any
+// existing chunk, using cosine similarity. It increments s.dedupSkipped
+// when a duplicate is found and returns true to signal the caller should
+// skip adding the new chunk. When dedupThreshold is 0 (default), dedup is
+// disabled and the function returns false immediately. When dedupCrossDir is
+// false, only chunks whose Dir matches newDir are candidates; otherwise all
+// chunks are candidates (issue #1243).
+func (s *Store) isDuplicate(newDir string, newEmbedding []float64) bool {
+	if s.dedupThreshold <= 0 || len(newEmbedding) == 0 {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, ex := range s.examples {
+		if !s.dedupCrossDir && ex.Dir != newDir {
+			continue
+		}
+		if len(ex.Embedding) == 0 {
+			continue
+		}
+		if CosineSimilarity(newEmbedding, ex.Embedding) >= s.dedupThreshold {
+			atomic.AddUint64(&s.dedupSkipped, 1)
+			return true
+		}
+	}
+	return false
 }
 
 // IncInjectionSkippedSizeLimit bumps the counter for RAG injections that
@@ -802,6 +921,141 @@ func (s *Store) EmbedHitCount() int64 {
 	return 0
 }
 
+// collectedFile holds the relative path and content of a file selected
+// for indexing. relPath uses forward slashes so it is stable as a
+// primary key across operating systems (issue #1149).
+type collectedFile struct {
+	relPath string
+	dir     string // parent directory relative to root (recursive mode); safeDir (flat mode)
+	content string
+}
+
+// collectIndexFiles enumerates all regular files under dir. When
+// recursive is true, filepath.WalkDir descends into all subdirectories
+// (issue #1149). Symlinks — both files and directories — are always
+// skipped (issue #107). The returned safeDir is the EvalSymlinks-
+// resolved canonical path used by verifyInsideDir.
+func collectIndexFiles(dir string, recursive bool) (safeDir string, files []collectedFile, err error) {
+	safeDir, err = resolveDir(dir)
+	if err != nil {
+		return "", nil, err
+	}
+
+	if recursive {
+		err = filepath.WalkDir(dir, func(path string, d os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				slog.Warn("rag: walk error, skipping",
+					slog.String("path", path),
+					slog.Any("err", walkErr),
+				)
+				return nil
+			}
+			if d.IsDir() {
+				if isSymlink(d) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if isSymlink(d) {
+				slog.Warn("rag: skipping symlink in examples dir (issue #107)",
+					slog.String("filename", d.Name()),
+					slog.String("dir", dir),
+				)
+				return nil
+			}
+			resolved, rErr := filepath.EvalSymlinks(path)
+			if rErr != nil {
+				slog.Error("rag: cannot resolve path, skipping",
+					slog.String("path", path),
+					slog.Any("err", rErr),
+				)
+				return nil
+			}
+			if !verifyInsideDir(safeDir, resolved) {
+				slog.Warn("rag: skipping file that escapes examples dir (issue #107)",
+					slog.String("resolved", resolved),
+					slog.String("base", safeDir),
+				)
+				return nil
+			}
+			content, rErr := os.ReadFile(path)
+			if rErr != nil {
+				slog.Error("rag read file", slog.String("path", path), slog.Any("err", rErr))
+				return nil
+			}
+			rel, rErr := filepath.Rel(dir, path)
+			if rErr != nil {
+				slog.Error("rag: cannot compute relative path, skipping",
+					slog.String("path", path),
+					slog.Any("err", rErr),
+				)
+				return nil
+			}
+			relPath := filepath.ToSlash(rel)
+			parent := filepath.ToSlash(filepath.Dir(rel))
+			if parent == "." {
+				parent = ""
+			}
+			files = append(files, collectedFile{
+				relPath: relPath,
+				dir:     parent,
+				content: string(content),
+			})
+			return nil
+		})
+		if err != nil {
+			return safeDir, nil, fmt.Errorf("rag: walk examples dir %q: %w", dir, err)
+		}
+		return safeDir, files, nil
+	}
+
+	// Flat mode: read top-level only (pre-#1149 behaviour).
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return safeDir, nil, fmt.Errorf("rag: read examples dir %q: %w", dir, err)
+	}
+	for _, f := range entries {
+		if f.IsDir() {
+			continue
+		}
+		if isSymlink(f) {
+			slog.Warn("rag: skipping symlink in examples dir (issue #107)",
+				slog.String("filename", f.Name()),
+				slog.String("dir", dir),
+			)
+			continue
+		}
+		path := filepath.Join(dir, f.Name())
+		resolved, rErr := filepath.EvalSymlinks(path)
+		if rErr != nil {
+			slog.Error("rag: cannot resolve path, skipping",
+				slog.String("filename", f.Name()),
+				slog.Any("err", rErr),
+			)
+			continue
+		}
+		if !verifyInsideDir(safeDir, resolved) {
+			slog.Warn("rag: skipping file that escapes examples dir (issue #107)",
+				slog.String("filename", f.Name()),
+				slog.String("resolved", resolved),
+				slog.String("base", safeDir),
+			)
+			continue
+		}
+		content, rErr := os.ReadFile(path)
+		if rErr != nil {
+			slog.Error("rag read file", slog.String("filename", f.Name()), slog.Any("err", rErr))
+			continue
+		}
+		files = append(files, collectedFile{
+			relPath: f.Name(), // backward compat: flat mode uses basename
+			dir:     safeDir,
+			content: string(content),
+		})
+	}
+	return safeDir, files, nil
+}
+
 // IndexDir walks dir, embedding every regular file's contents. It is
 // permissive: a missing directory is created (and indexing returns empty),
 // per-file read or embed errors are logged and skipped. This matches the
@@ -811,6 +1065,11 @@ func (s *Store) EmbedHitCount() int64 {
 // leaks via injected few-shot examples. The directory path is resolved
 // once to canonicalize it, and every file's resolved path is verified
 // to remain inside the resolved directory.
+//
+// When the Store is configured with WithRecursive(true) (issue #1149),
+// filepath.WalkDir descends into all subdirectories and file paths are
+// stored relative to dir (e.g. "sub/deep.go") to avoid primary-key
+// collisions when multiple directories contain files with the same name.
 func (s *Store) IndexDir(ctx context.Context, dir string) error {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
@@ -823,56 +1082,23 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 		return nil
 	}
 
-	safeDir, err := resolveDir(dir)
+	_, validFiles, err := collectIndexFiles(dir, s.recursive)
 	if err != nil {
 		return err
 	}
 
-	files, err := os.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("rag: read examples dir %q: %w", dir, err)
-	}
-
-	type fileInfo struct {
-		name    string
-		content string
-	}
-	var validFiles []fileInfo
-
-	for _, f := range files {
-		if f.IsDir() {
-			continue
+	if s.fileFilter != nil {
+		filtered := validFiles[:0]
+		for _, f := range validFiles {
+			if s.fileFilter.ShouldIndex(f.relPath) {
+				filtered = append(filtered, f)
+			} else {
+				slog.Debug("rag: skipping file filtered by extension/pattern (issue #1148)",
+					slog.String("filename", f.relPath),
+				)
+			}
 		}
-		if isSymlink(f) {
-			slog.Warn("rag: skipping symlink in examples dir (issue #107)",
-				slog.String("filename", f.Name()),
-				slog.String("dir", dir),
-			)
-			continue
-		}
-		path := filepath.Join(dir, f.Name())
-		resolved, err := filepath.EvalSymlinks(path)
-		if err != nil {
-			slog.Error("rag: cannot resolve path, skipping",
-				slog.String("filename", f.Name()),
-				slog.Any("err", err),
-			)
-			continue
-		}
-		if !verifyInsideDir(safeDir, resolved) {
-			slog.Warn("rag: skipping file that escapes examples dir (issue #107)",
-				slog.String("filename", f.Name()),
-				slog.String("resolved", resolved),
-				slog.String("base", safeDir),
-			)
-			continue
-		}
-		content, err := os.ReadFile(path)
-		if err != nil {
-			slog.Error("rag read file", slog.String("filename", f.Name()), slog.Any("err", err))
-			continue
-		}
-		validFiles = append(validFiles, fileInfo{name: f.Name(), content: string(content)})
+		validFiles = filtered
 	}
 
 	if s.batchSize > 0 && len(validFiles) > 0 {
@@ -882,15 +1108,26 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 				end = len(validFiles)
 			}
 			batch := validFiles[i:end]
-			texts := make([]string, len(batch))
-			for j, fi := range batch {
-				texts[j] = fi.content
+			// Expand files into chunks (issue #1168).
+			var chunkTexts []string
+			var chunkMeta []struct {
+				name string
+				dir  string
+				idx  int
 			}
-			embs, err := s.embedder.EmbedBatch(ctx, texts)
+			for _, fi := range batch {
+				chunks := chunkFile(fi.content, s.chunkTokens)
+				for _, c := range chunks {
+					chunkTexts = append(chunkTexts, c.Content)
+					chunkMeta = append(chunkMeta, struct {
+						name string
+						dir  string
+						idx  int
+					}{fi.relPath, fi.dir, c.Index})
+				}
+			}
+			embs, err := s.embedder.EmbedBatch(ctx, chunkTexts)
 			if err != nil {
-				// Partial batch: entries were appended to s.examples but
-				// upsertExample was never called, so the HNSW index is stale.
-				// Invalidate it so Retrieve falls back to brute-force.
 				s.mu.Lock()
 				s.index = nil
 				s.mu.Unlock()
@@ -902,44 +1139,43 @@ func (s *Store) IndexDir(ctx context.Context, dir string) error {
 				continue
 			}
 			s.mu.Lock()
-			for j, fi := range batch {
+			for j := range chunkTexts {
 				s.examples = append(s.examples, FewShotExample{
-					Filename:  fi.name,
-					Dir:       safeDir,
-					Content:   fi.content,
-					Embedding: embs[j],
+					Filename:   chunkMeta[j].name,
+					Dir:        chunkMeta[j].dir,
+					Content:    chunkTexts[j],
+					Embedding:  embs[j],
+					ChunkIndex: chunkMeta[j].idx,
 				})
-				s.markIndexed(time.Now().UTC())
-				slog.Info("rag indexed", slog.String("filename", fi.name))
 			}
+			s.markIndexed(time.Now().UTC())
 			s.mu.Unlock()
 		}
 	} else {
 		for _, fi := range validFiles {
-			emb, err := s.embedder.Embed(ctx, fi.content)
-			if err != nil {
-				slog.Error("rag embed file", slog.String("filename", fi.name), slog.Any("err", err))
-				continue
+			chunks := chunkFile(fi.content, s.chunkTokens)
+			for _, c := range chunks {
+				emb, err := s.embedder.Embed(ctx, c.Content)
+				if err != nil {
+					slog.Error("rag embed file", slog.String("filename", fi.relPath), slog.Any("err", err))
+					continue
+				}
+				s.mu.Lock()
+				s.examples = append(s.examples, FewShotExample{
+					Filename:   fi.relPath,
+					Dir:        fi.dir,
+					Content:    c.Content,
+					Embedding:  emb,
+					ChunkIndex: c.Index,
+				})
+				s.mu.Unlock()
 			}
-			s.mu.Lock()
-			s.examples = append(s.examples, FewShotExample{
-				Filename:  fi.name,
-				Dir:       safeDir,
-				Content:   fi.content,
-				Embedding: emb,
-			})
-			s.mu.Unlock()
 			s.markIndexed(time.Now().UTC())
-			slog.Info("rag indexed", slog.String("filename", fi.name))
+			slog.Info("rag indexed", slog.String("filename", fi.relPath))
 		}
 	}
 
-	// If EmbedBatch failed mid-way, s.index was invalidated but later batches
-	// still appended to s.examples. Rebuild synchronously now so IndexDir
-	// returns with a consistent state instead of leaving the index incomplete
-	// until the next Retrieve call (issue #976).
 	s.maybeRebuildIndex()
-
 	return nil
 }
 
@@ -989,7 +1225,13 @@ func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, f
 	if useIndex {
 		idx = s.index
 	}
+	hybridWeight := s.hybridWeight
 	s.mu.RUnlock()
+
+	// Hybrid path: blend semantic and keyword scores via RRF (issue #1242).
+	if hybridWeight > 0 {
+		return s.retrieveHybrid(ctx, prompt, promptEmb, examples, useIndex, idx, hybridWeight)
+	}
 
 	if useIndex && idx != nil {
 		// HNSW path: search index for top candidates, then re-rank with exact cosine.
@@ -1039,9 +1281,224 @@ func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, f
 	return nil, bestScore, IndexPathBruteForce, nil
 }
 
+// retrieveHybrid performs hybrid retrieval combining semantic and keyword scores
+// via Reciprocal Rank Fusion. Must be called with the store read lock held.
+func (s *Store) retrieveHybrid(ctx context.Context, prompt string, promptEmb []float64, examples []FewShotExample, useIndex bool, idx *HNSWIndex, hybridWeight float64) (*FewShotExample, float64, IndexPath, error) {
+	// Determine search scope: use HNSW candidates if available, otherwise all docs.
+	var candidateIDs []int
+	if useIndex && idx != nil {
+		// Search HNSW for candidates, then re-rank with hybrid scoring.
+		// Use a larger candidate set for hybrid to capture keyword matches.
+		candidateIDs = idx.Search(promptEmb, 20)
+	} else {
+		// Brute-force: score all documents.
+		candidateIDs = make([]int, len(examples))
+		for i := range examples {
+			candidateIDs[i] = i
+		}
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Score all candidates with both semantic and keyword methods.
+	type scored struct {
+		id            int
+		semanticScore float64
+		keywordScore  float64
+	}
+	var candidates []scored
+
+	for _, id := range candidateIDs {
+		if id < 0 || id >= len(examples) {
+			continue
+		}
+		semantic := CosineSimilarity(promptEmb, examples[id].Embedding)
+		keyword := s.BM25Score(prompt, id)
+		candidates = append(candidates, scored{
+			id:            id,
+			semanticScore: semantic,
+			keywordScore:  keyword,
+		})
+	}
+
+	if len(candidates) == 0 {
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.thresholdMisses, 1)
+		return nil, 0, IndexPathHybrid, nil
+	}
+
+	// Sort by semantic score (descending) to assign semantic ranks.
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].semanticScore > candidates[j].semanticScore
+	})
+	semanticRanks := make([]int, len(candidates))
+	for i := range candidates {
+		semanticRanks[i] = i + 1 // rank: 1 = best
+	}
+
+	// Sort by keyword score (descending) to assign keyword ranks.
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].keywordScore > candidates[j].keywordScore
+	})
+	keywordRanks := make([]int, len(candidates))
+	for i := range candidates {
+		keywordRanks[i] = i + 1 // rank: 1 = best
+	}
+
+	// Compute RRF scores and find the best.
+	var bestIdx int
+	var bestRRFScore float64 = -1
+	for i := range candidates {
+		rrf := hybridScore(0, 0, hybridWeight, semanticRanks[i], keywordRanks[i], rrfK)
+		if rrf > bestRRFScore {
+			bestRRFScore = rrf
+			bestIdx = i
+		}
+	}
+
+	best := &examples[candidates[bestIdx].id]
+	bestSemanticScore := CosineSimilarity(promptEmb, best.Embedding)
+
+	// Determine the index path based on hybrid weight.
+	path := IndexPathHybrid
+	if hybridWeight >= 1.0 {
+		path = IndexPathKeyword
+	} else if hybridWeight <= 0.0 {
+		path = IndexPathHNSW
+		if !useIndex || idx == nil {
+			path = IndexPathBruteForce
+		}
+	}
+
+	if bestSemanticScore > s.ThresholdFor(best.Dir) {
+		atomic.AddUint64(&s.retrievalHits, 1)
+		return best, bestSemanticScore, path, nil
+	}
+	atomic.AddUint64(&s.retrievalMisses, 1)
+	atomic.AddUint64(&s.thresholdMisses, 1)
+	return nil, bestSemanticScore, path, nil
+}
+
+// RetrieveTopK returns up to k examples whose cosine similarity to the
+// prompt embedding meets the configured threshold, ordered by descending
+// score. When fewer than k examples clear the threshold, only those that
+// do are returned. An empty store or empty prompt always yields empty
+// slices. k <= 0 returns empty slices without searching.
+//
+// The IndexPath and stats counters behave identically to Retrieve.
+// PersistentStore inherits this method via the embedded *Store.
+func (s *Store) RetrieveTopK(ctx context.Context, prompt string, k int) ([]FewShotExample, []float64, IndexPath, error) {
+	if k <= 0 {
+		return nil, nil, IndexPathNone, nil
+	}
+	atomic.AddUint64(&s.retrievalAttempts, 1)
+	s.mu.RLock()
+	n := len(s.examples)
+	s.mu.RUnlock()
+	if n == 0 {
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.emptyStoreMisses, 1)
+		return nil, nil, IndexPathNone, nil
+	}
+	if prompt == "" {
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.thresholdMisses, 1)
+		return nil, nil, IndexPathNone, nil
+	}
+	promptEmb, err := s.embedder.Embed(ctx, prompt)
+	if err != nil {
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.embedErrors, 1)
+		return nil, nil, IndexPathNone, err
+	}
+
+	s.maybeRebuildIndex()
+
+	type scored struct {
+		ex    FewShotExample
+		score float64
+	}
+
+	s.mu.RLock()
+	useIndex := n >= indexThreshold && s.index != nil && s.index.Size() >= n
+	examples := s.examples
+	var idx *HNSWIndex
+	if useIndex {
+		idx = s.index
+	}
+	s.mu.RUnlock()
+
+	var candidates []scored
+
+	if useIndex && idx != nil {
+		// HNSW path: search for enough candidates to re-rank and filter.
+		searchK := k
+		if searchK < 10 {
+			searchK = 10
+		}
+		candidateIDs := idx.Search(promptEmb, searchK)
+		s.mu.RLock()
+		for _, id := range candidateIDs {
+			if id < 0 || id >= len(examples) {
+				continue
+			}
+			score := CosineSimilarity(promptEmb, examples[id].Embedding)
+			if score > s.ThresholdFor(examples[id].Dir) {
+				candidates = append(candidates, scored{ex: examples[id], score: score})
+			}
+		}
+		s.mu.RUnlock()
+	} else {
+		// Brute-force path: O(n) scan.
+		s.mu.RLock()
+		for i := range s.examples {
+			score := CosineSimilarity(promptEmb, s.examples[i].Embedding)
+			if score > s.ThresholdFor(s.examples[i].Dir) {
+				candidates = append(candidates, scored{ex: s.examples[i], score: score})
+			}
+		}
+		s.mu.RUnlock()
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].score > candidates[j].score
+	})
+
+	if len(candidates) > k {
+		candidates = candidates[:k]
+	}
+
+	if len(candidates) == 0 {
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.thresholdMisses, 1)
+		path := IndexPathBruteForce
+		if useIndex && idx != nil {
+			path = IndexPathHNSW
+		}
+		return nil, nil, path, nil
+	}
+
+	result := make([]FewShotExample, len(candidates))
+	scores := make([]float64, len(candidates))
+	for i, c := range candidates {
+		result[i] = c.ex
+		scores[i] = c.score
+	}
+	atomic.AddUint64(&s.retrievalHits, 1)
+	path := IndexPathBruteForce
+	if useIndex && idx != nil {
+		path = IndexPathHNSW
+	}
+	return result, scores, path, nil
+}
+
 // CosineSimilarity returns the cosine of the angle between a and b. A zero
 // vector on either side yields 0 (rather than NaN) so callers can sort
-// scores without a special case.
+// scores without a special case. Inputs large enough to overflow the
+// intermediate dot/norm accumulators also return 0, and the result is
+// clamped to [-1, 1] to guard against floating-point drift from
+// denormalized numbers (issue #1161).
 func CosineSimilarity(a, b []float64) float64 {
 	n := len(a)
 	if len(b) < n {
@@ -1056,16 +1513,298 @@ func CosineSimilarity(a, b []float64) float64 {
 	if na == 0 || nb == 0 {
 		return 0
 	}
-	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+	result := dot / (math.Sqrt(na) * math.Sqrt(nb))
+	if math.IsNaN(result) || math.IsInf(result, 0) {
+		return 0
+	}
+	if result > 1 {
+		return 1
+	}
+	if result < -1 {
+		return -1
+	}
+	return result
+}
+
+// BM25 parameters (issue #1242).
+const (
+	// k1 controls term frequency saturation — higher values increase the
+	// influence of repeated terms more slowly. Standard BM25 literature
+	// uses k1=1.5.
+	bm25K1 = 1.5
+	// b controls document length normalisation. b=1 fully normalises by
+	// document length, b=0 disables length normalisation. Standard
+	// literature uses b=0.75.
+	bm25B = 0.75
+	// rrfK is the constant used in Reciprocal Rank Fusion to dampen the
+	// contribution of lower-ranked results. Standard RRF uses k=60.
+	rrfK = 60.0
+)
+
+// tokenize splits text into lowercase tokens by whitespace and punctuation.
+// This is a simple, fast tokenizer suitable for code snippets where
+// identifiers (function names, variables) are the primary search targets.
+func tokenize(text string) []string {
+	// Fast path: allocate only what we need.
+	var tokens []string
+	var current strings.Builder
+	current.Grow(len(text))
+
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' {
+			current.WriteByte(c)
+		} else if c == '$' || c == '@' || c == '#' {
+			// Allow these symbols in identifiers (common in code).
+			current.WriteByte(c)
+		} else {
+			if current.Len() > 0 {
+				tokens = append(tokens, current.String())
+				current.Reset()
+			}
+		}
+	}
+	if current.Len() > 0 {
+		tokens = append(tokens, current.String())
+	}
+
+	// Lowercase all tokens.
+	for i := range tokens {
+		tokens[i] = strings.ToLower(tokens[i])
+	}
+	return tokens
+}
+
+// updateInvertedIndex updates the inverted index for a single document.
+// This is called during Add() and IndexDir() to maintain the index incrementally.
+func (s *Store) updateInvertedIndex(docID int, content string) {
+	tokens := tokenize(content)
+	if len(tokens) == 0 {
+		return
+	}
+
+	// Count term frequencies.
+	tf := make(map[string]int)
+	for _, t := range tokens {
+		tf[t]++
+	}
+
+	// Update the inverted index.
+	if s.invertedIndex == nil {
+		s.invertedIndex = make(map[string]map[int]float64)
+	}
+	for term, count := range tf {
+		if s.invertedIndex[term] == nil {
+			s.invertedIndex[term] = make(map[int]float64)
+		}
+		s.invertedIndex[term][docID] = float64(count)
+	}
+
+	// Update average document length.
+	totalTokens := 0
+	for _, ex := range s.examples {
+		totalTokens += len(tokenize(ex.Content))
+	}
+	if len(s.examples) > 0 {
+		s.avgDL = float64(totalTokens) / float64(len(s.examples))
+	}
+}
+
+// IDF computes the inverse document frequency for a term across the document
+// collection. N is the total number of documents, and n is the number of
+// documents containing the term.
+func IDF(N, n int) float64 {
+	if n == 0 {
+		return 0
+	}
+	return math.Log((float64(N-n) + 0.5) / (float64(n) + 0.5))
+}
+
+// BM25Score returns the BM25 score for a query against a document.
+// The query is tokenized the same way documents are, and the score is the
+// sum of IDF-weighted term frequencies with document length normalisation.
+// Returns 0 when the query terms are not in the document or the inverted
+// index has not been built.
+func (s *Store) BM25Score(query string, docID int) float64 {
+	if s.invertedIndex == nil || s.avgDL == 0 {
+		return 0
+	}
+
+	tokens := tokenize(query)
+	if len(tokens) == 0 {
+		return 0
+	}
+
+	N := len(s.examples)
+	if N == 0 {
+		return 0
+	}
+
+	var score float64
+	docLen := float64(len(tokenize(s.examples[docID].Content)))
+
+	for _, term := range tokens {
+		docTF, ok := s.invertedIndex[term][docID]
+		if !ok {
+			continue
+		}
+
+		// Count how many documents contain this term.
+		n := 0
+		for _, docIDs := range s.invertedIndex[term] {
+			if docIDs > 0 {
+				n++
+			}
+		}
+
+		idf := IDF(N, n)
+		// BM25 term frequency component with saturation.
+		tfComponent := docTF * (bm25K1 + 1) / (docTF + bm25K1*(1-bm25B+bm25B*docLen/s.avgDL))
+		score += idf * tfComponent
+	}
+
+	return score
+}
+
+// hybridScore combines semantic and keyword scores via Reciprocal Rank Fusion.
+// semanticScore and keywordScore are already-ranked scores (higher = better).
+// weight is the hybrid weight (0.0 = pure semantic, 1.0 = pure keyword).
+// rankSemantic and rankKeyword are the 1-based ranks in their respective orderings.
+// k is the RRF damping constant (standard is 60).
+func hybridScore(semanticScore, keywordScore float64, weight float64, rankSemantic, rankKeyword int, k float64) float64 {
+	// Reciprocal Rank Fusion: score = w * 1/(k + rank_semantic) + (1-w) * 1/(k + rank_keyword)
+	rrfSemantic := 1.0 / (k + float64(rankSemantic))
+	rrfKeyword := 1.0 / (k + float64(rankKeyword))
+	return weight*rrfSemantic + (1-weight)*rrfKeyword
 }
 
 // FormatInjection returns the standard "[PROXY RETRIEVAL CONTEXT]" block
 // appended to a user message when a high-similarity example is found.
+// When the example is a chunk (ChunkIndex > 0), the label includes the
+// chunk suffix (e.g. "handler.go#chunk2") for traceability.
 func FormatInjection(ex *FewShotExample) string {
+	label := ex.Filename
+	if ex.ChunkIndex > 0 {
+		label = fmt.Sprintf("%s#chunk%d", ex.Filename, ex.ChunkIndex)
+	}
 	return fmt.Sprintf(
 		"\n\n[PROXY RETRIEVAL CONTEXT]: Here is a highly relevant, validated few-shot example from the local codebase (%s):\n```\n%s\n```\nAnalyze its architecture and apply its patterns if relevant to this task.",
-		ex.Filename, ex.Content,
+		label, ex.Content,
 	)
+}
+
+// chunkInfo represents a single chunk of a file's content.
+type chunkInfo struct {
+	Content string
+	Index   int
+}
+
+// chunkFile splits content into overlapping chunks of approximately maxTokens
+// tokens each, preferring natural code boundaries (blank lines). Returns a
+// single chunk containing the entire content when maxTokens <= 0 or the
+// content fits within the threshold. Each chunk has a 25% overlap with the
+// preceding chunk so that related code split across boundaries remains
+// retrievable (issue #1168).
+func chunkFile(content string, maxTokens int) []chunkInfo {
+	if maxTokens <= 0 {
+		return []chunkInfo{{Content: content, Index: 0}}
+	}
+	if tokenizer.CountTokens(content) <= maxTokens {
+		return []chunkInfo{{Content: content, Index: 0}}
+	}
+
+	blocks := splitByBlankLines(content)
+
+	var chunks []chunkInfo
+	var currentParts []string
+	currentTokens := 0
+	chunkIdx := 0
+	overlapTokens := maxTokens / 4
+
+	for i, block := range blocks {
+		var sep string
+		if i > 0 {
+			sep = "\n\n"
+		}
+		bText := sep + block
+		bTokens := tokenizer.CountTokens(bText)
+
+		if currentTokens > 0 && currentTokens+bTokens > maxTokens {
+			chunks = append(chunks, chunkInfo{
+				Content: strings.Join(currentParts, ""),
+				Index:   chunkIdx,
+			})
+			chunkIdx++
+
+			var overlap []string
+			overlapSum := 0
+			for j := len(currentParts) - 1; j >= 0; j-- {
+				bt := tokenizer.CountTokens(currentParts[j])
+				if overlapSum+bt > overlapTokens && len(overlap) > 0 {
+					break
+				}
+				overlap = append([]string{currentParts[j]}, overlap...)
+				overlapSum += bt
+			}
+			currentParts = overlap
+			currentTokens = overlapSum
+		}
+
+		currentParts = append(currentParts, bText)
+		currentTokens += bTokens
+	}
+
+	if len(currentParts) > 0 {
+		chunks = append(chunks, chunkInfo{
+			Content: strings.Join(currentParts, ""),
+			Index:   chunkIdx,
+		})
+	}
+
+	if len(chunks) <= 1 {
+		return []chunkInfo{{Content: content, Index: 0}}
+	}
+
+	return chunks
+}
+
+// splitByBlankLines splits content into blocks separated by one or more
+// blank lines. This aligns chunk boundaries with natural code structure
+// (function/method boundaries, paragraph breaks in prose).
+func splitByBlankLines(content string) []string {
+	lines := strings.Split(content, "\n")
+	var blocks []string
+	var current []string
+
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			if len(current) > 0 {
+				blocks = append(blocks, strings.Join(current, "\n"))
+				current = nil
+			}
+		} else {
+			current = append(current, line)
+		}
+	}
+	if len(current) > 0 {
+		blocks = append(blocks, strings.Join(current, "\n"))
+	}
+	return blocks
+}
+
+// FormatInjectionMulti formats multiple few-shot examples as concatenated
+// [PROXY RETRIEVAL CONTEXT] blocks (issue #1166). The examples slice must
+// be ordered by descending relevance. Returns an empty string when no
+// examples are provided.
+func FormatInjectionMulti(examples []*FewShotExample) string {
+	if len(examples) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for _, ex := range examples {
+		sb.WriteString(FormatInjection(ex))
+	}
+	return sb.String()
 }
 
 // Add is a test/seed helper to insert a precomputed example directly into
@@ -1082,6 +1821,8 @@ func (s *Store) Add(filename, content string, embedding []float64) {
 	if s.index != nil {
 		s.index.Add(id, embedding)
 	}
+	// Update inverted index for BM25 retrieval (issue #1242).
+	s.updateInvertedIndex(id, content)
 	s.mu.Unlock()
 	s.markIndexed(time.Now().UTC())
 }
@@ -1156,6 +1897,34 @@ func (s *Store) replace(examples []FewShotExample) {
 	s.examples = examples
 	// Rebuild the HNSW index from the new examples slice.
 	s.rebuildIndex()
+	// Rebuild the inverted index for BM25 retrieval (issue #1242).
+	s.rebuildInvertedIndex()
+}
+
+// rebuildInvertedIndex rebuilds the entire inverted index from the examples slice.
+// Must be called while holding the store lock.
+func (s *Store) rebuildInvertedIndex() {
+	s.invertedIndex = make(map[string]map[int]float64)
+	if len(s.examples) == 0 {
+		s.avgDL = 0
+		return
+	}
+	totalTokens := 0
+	for i, ex := range s.examples {
+		tokens := tokenize(ex.Content)
+		totalTokens += len(tokens)
+		tf := make(map[string]int)
+		for _, t := range tokens {
+			tf[t]++
+		}
+		for term, count := range tf {
+			if s.invertedIndex[term] == nil {
+				s.invertedIndex[term] = make(map[int]float64)
+			}
+			s.invertedIndex[term][i] = float64(count)
+		}
+	}
+	s.avgDL = float64(totalTokens) / float64(len(s.examples))
 }
 
 // restoreIndex sets the HNSW index from a serialized blob produced
@@ -1181,7 +1950,7 @@ func (s *Store) upsertExample(ex FewShotExample) {
 	defer s.mu.Unlock()
 	existingIdx := -1
 	for i := range s.examples {
-		if s.examples[i].Filename == ex.Filename {
+		if s.examples[i].Filename == ex.Filename && s.examples[i].ChunkIndex == ex.ChunkIndex {
 			existingIdx = i
 			break
 		}

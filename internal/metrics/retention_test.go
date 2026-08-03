@@ -107,7 +107,7 @@ func TestPruneBoundaryIsExclusive(t *testing.T) {
 // store with retention > 0 starts the prune goroutine (pruneStop is
 // non-nil) and that Close unblocks it without hanging.
 func TestRetentionGoroutineStartsAndStopsCleanly(t *testing.T) {
-	s, err := OpenWithRetention(t.TempDir()+"/metrics.db", 7, silentLogger)
+	s, err := OpenWithRetention(t.TempDir()+"/metrics.db", 7, silentLogger, BatchConfig{})
 	if err != nil {
 		t.Fatalf("OpenWithRetention: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestRetentionGoroutinePrunesAtStartup(t *testing.T) {
 
 	// Phase 2: reopen with retention=7. The prune goroutine fires an
 	// immediate pass at startup; we wait for it to complete.
-	s2, err := OpenWithRetention(path, 7, silentLogger)
+	s2, err := OpenWithRetention(path, 7, silentLogger, BatchConfig{})
 	if err != nil {
 		t.Fatalf("OpenWithRetention: %v", err)
 	}

@@ -12,7 +12,7 @@ import (
 // error. The async channel means we don't wait for the drain goroutine;
 // actual persistence across restarts is tested by TestSQLiteStoreOnDisk.
 func TestSQLiteStoreRecord(t *testing.T) {
-	store, err := OpenSQLiteStore(":memory:")
+	store, err := OpenSQLiteStore(":memory:", 0, 0)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStore: %v", err)
 	}
@@ -39,7 +39,7 @@ func TestSQLiteStoreRecord(t *testing.T) {
 func TestSQLiteStoreOnDisk(t *testing.T) {
 	tmp := t.TempDir() + "/judge_test.db"
 
-	store1, err := OpenSQLiteStore(tmp)
+	store1, err := OpenSQLiteStore(tmp, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStore (first): %v", err)
 	}
@@ -59,7 +59,7 @@ func TestSQLiteStoreOnDisk(t *testing.T) {
 	}
 
 	// Reopen the same file path.
-	store2, err := OpenSQLiteStore(tmp)
+	store2, err := OpenSQLiteStore(tmp, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStore (reopen): %v", err)
 	}
@@ -78,7 +78,7 @@ func TestSQLiteStoreOnDisk(t *testing.T) {
 // allScores reads all rows from the judge_scores table directly
 // using the raw db handle (exported for tests only).
 func (s *SQLiteStore) allScores(ctx context.Context) ([]JudgeScore, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT request_id, score, error, cost_usd FROM judge_scores ORDER BY id")
+	rows, err := s.db.QueryContext(ctx, "SELECT request_id, score, error, cost_usd, rag_injected, rag_similarity FROM judge_scores ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -87,12 +87,14 @@ func (s *SQLiteStore) allScores(ctx context.Context) ([]JudgeScore, error) {
 	for rows.Next() {
 		var s JudgeScore
 		var errStr string
-		if err := rows.Scan(&s.RequestID, &s.Score, &errStr, &s.Cost); err != nil {
+		var ragInjected int
+		if err := rows.Scan(&s.RequestID, &s.Score, &errStr, &s.Cost, &ragInjected, &s.RAGSimilarity); err != nil {
 			return nil, err
 		}
 		if errStr != "" {
 			s.Err = errors.New(errStr)
 		}
+		s.RAGInjected = ragInjected != 0
 		scores = append(scores, s)
 	}
 	return scores, rows.Err()
@@ -102,7 +104,7 @@ func (s *SQLiteStore) allScores(ctx context.Context) ([]JudgeScore, error) {
 // persisted with score=0 and the error string stored in the error column.
 func TestSQLiteStoreRecordError(t *testing.T) {
 	tmp := t.TempDir() + "/judge_error_test.db"
-	store, err := OpenSQLiteStore(tmp)
+	store, err := OpenSQLiteStore(tmp, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStore: %v", err)
 	}
@@ -122,7 +124,7 @@ func TestSQLiteStoreRecordError(t *testing.T) {
 	}
 
 	// Reopen to verify persistence across restarts.
-	store2, err := OpenSQLiteStore(tmp)
+	store2, err := OpenSQLiteStore(tmp, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStore (reopen): %v", err)
 	}
@@ -145,3 +147,97 @@ func TestSQLiteStoreRecordError(t *testing.T) {
 
 // Compile-time guard: SQLiteStore must satisfy judge.Storage.
 var _ Storage = (*SQLiteStore)(nil)
+
+// TestSQLiteStoreRAGColumns verifies that the rag_injected and
+// rag_similarity columns are persisted and survive a close/reopen
+// cycle (issue #1167).
+func TestSQLiteStoreRAGColumns(t *testing.T) {
+	tmp := t.TempDir() + "/judge_rag_test.db"
+
+	store1, err := OpenSQLiteStore(tmp, 0, 0)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore (first): %v", err)
+	}
+
+	if err := store1.Record(JudgeScore{
+		RequestID:     "rag-row",
+		Score:         5,
+		RAGInjected:   true,
+		RAGSimilarity: 0.91,
+		Timestamp:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if err := store1.Record(JudgeScore{
+		RequestID: "plain-row",
+		Score:     3,
+		Timestamp: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if err := store1.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	store2, err := OpenSQLiteStore(tmp, 0, 0)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore (reopen): %v", err)
+	}
+	defer store2.Close()
+
+	got, err := store2.allScores(context.Background())
+	if err != nil {
+		t.Fatalf("allScores: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d scores, want 2", len(got))
+	}
+	if got[0].RequestID != "rag-row" {
+		t.Fatalf("first row = %q, want rag-row", got[0].RequestID)
+	}
+	if !got[0].RAGInjected {
+		t.Error("rag-row RAGInjected = false, want true")
+	}
+	if got[0].RAGSimilarity != 0.91 {
+		t.Errorf("rag-row RAGSimilarity = %v, want 0.91", got[0].RAGSimilarity)
+	}
+	if got[1].RequestID != "plain-row" {
+		t.Fatalf("second row = %q, want plain-row", got[1].RequestID)
+	}
+	if got[1].RAGInjected {
+		t.Error("plain-row RAGInjected = true, want false")
+	}
+	if got[1].RAGSimilarity != 0 {
+		t.Errorf("plain-row RAGSimilarity = %v, want 0", got[1].RAGSimilarity)
+	}
+}
+
+// TestSQLiteStoreMigrationIdempotent verifies that reopening a database
+// already created with the full schema (including rag_injected /
+// rag_similarity) does not error on the duplicate-column migrations
+// (issue #1167).
+func TestSQLiteStoreMigrationIdempotent(t *testing.T) {
+	tmp := t.TempDir() + "/judge_migrate_test.db"
+
+	store1, err := OpenSQLiteStore(tmp, 0, 0)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore (first): %v", err)
+	}
+	if err := store1.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Second open hits the migration on an already-migrated DB.
+	store2, err := OpenSQLiteStore(tmp, 0, 0)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore (second, migration): %v", err)
+	}
+	defer store2.Close()
+
+	// Third open confirms it is still idempotent.
+	store3, err := OpenSQLiteStore(tmp, 0, 0)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore (third): %v", err)
+	}
+	defer store3.Close()
+}

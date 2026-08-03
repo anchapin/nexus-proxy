@@ -174,6 +174,39 @@ func (g *Guard) State() State {
 	return s
 }
 
+// Remaining returns the USD remaining in the rolling 24h window
+// (limit - spent). Returns 0 when the guard is disabled (no limit
+// configured). This is the quick pre-routing check used by the router
+// (issue #1163); the dispatch-time Check method remains the
+// authoritative enforcement point.
+func (g *Guard) Remaining() float64 {
+	g.mu.Lock()
+	g.evictLocked()
+	remaining := g.limit - g.currentSpentLocked()
+	g.mu.Unlock()
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+// WouldExceed reports whether recording a frontier call of the given
+// estimated cost would exceed the daily budget. Returns false when the
+// guard has no limit configured (disabled). This is a read-only check
+// — it does not record the spend. The router uses this to down-tier to
+// local before wasting an SLM round-trip (issue #1163).
+func (g *Guard) WouldExceed(estimatedCost float64) bool {
+	g.mu.Lock()
+	g.evictLocked()
+	if g.limit <= 0 {
+		g.mu.Unlock()
+		return false
+	}
+	over := g.currentSpentLocked()+estimatedCost > g.limit
+	g.mu.Unlock()
+	return over
+}
+
 // Limit returns the configured daily limit in USD.
 func (g *Guard) Limit() float64 {
 	g.mu.Lock()
@@ -202,7 +235,7 @@ func (g *Guard) evictLocked() {
 		return !g.window[i].At.Before(cutoff)
 	})
 	if i > 0 {
-		g.window = append(g.window[:0:0], g.window[i:]...)
+		g.window = append(g.window[:0], g.window[i:]...)
 	}
 }
 

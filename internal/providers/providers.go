@@ -86,10 +86,29 @@ type Provider struct {
 	// considers input tokens.
 	OutputCostPer1K float64
 
+	// CacheReadInputCostPer1K is the per-1k-token cost for cache-read
+	// input tokens (issue #1245). Anthropic charges ~0.1× the input
+	// rate for cached tokens. Zero means "use InputCostPer1K as-is"
+	// (no cache discount tracking).
+	CacheReadInputCostPer1K float64
+
+	// CacheCreationInputCostPer1K is the per-1k-token cost for
+	// cache-creation input tokens (issue #1245). Anthropic charges
+	// ~1.25× the input rate for cache-write tokens. Zero means
+	// "use InputCostPer1K as-is".
+	CacheCreationInputCostPer1K float64
+
 	// MaxTokens is the upstream's max context window. Zero means
 	// "unspecified"; downstream code can use it for VRAM budgeting
 	// or request-size validation without affecting existing callers.
 	MaxTokens int
+
+	// Type selects the ProviderAdapter used to translate between the
+	// proxy's canonical OpenAI shape and the provider's native API
+	// (issue #1185). Empty defaults to "openai" (the byte-for-byte
+	// no-op adapter). Other recognised values: "anthropic", "azure",
+	// "gemini". An unknown value is rejected by LoadFromEnv at boot.
+	Type string
 }
 
 // Registry holds the ordered list of configured providers. The zero
@@ -193,6 +212,8 @@ type envProviderConfig struct {
 //	NEXUS_PROVIDER_<NAME>_INPUT_COST_PER_1K  (optional; default 0)
 //	NEXUS_PROVIDER_<NAME>_OUTPUT_COST_PER_1K (optional; default 0)
 //	NEXUS_PROVIDER_<NAME>_MAX_TOKENS         (optional; default 0)
+//	NEXUS_PROVIDER_<NAME>_TYPE               (optional; default "openai")
+//	                                              one of: openai, anthropic, azure, gemini
 //
 // NAME matching is case-insensitive (the env-var lookups uppercase
 // the suffix); the original Name in the returned Provider preserves
@@ -203,9 +224,10 @@ type envProviderConfig struct {
 // dispatching to /dev/null at request time.
 //
 // LoadFromEnv returns an empty Registry (no error) when NEXUS_PROVIDERS
-// is unset or empty — the config loader is responsible for the
-// backward-compat fallback that synthesises a registry from the
-// legacy NEXUS_FRONTIER_* / NEXUS_ZAI_* vars in that case.
+// is unset or empty — LoadProviderRegistry is then responsible for the
+// fallback to the NEXUS_FRONTIER_PROVIDERS JSON system, and ultimately
+// the legacy NEXUS_FRONTIER_* / NEXUS_ZAI_* vars handled by the config
+// layer.
 func LoadFromEnv() (Registry, error) {
 	raw := strings.TrimSpace(os.Getenv("NEXUS_PROVIDERS"))
 	if raw == "" {
@@ -239,6 +261,72 @@ func LoadFromEnv() (Registry, error) {
 	return NewRegistry(out), nil
 }
 
+// ToConfig adapts the env-var Provider value type to the ProviderV2
+// ProviderConfig stored by the live ProviderRegistry. The cost mapping
+// follows the convention ParseProvidersFromEnv establishes (issue
+// #1183): InputCostPer1K seeds both the flat selector weight
+// (CostPer1KVal) and the per-direction input rate (InputCostPer1KVal)
+// so the env-var system participates in the cost-split model on equal
+// footing with the JSON system. OutputCostPer1K maps straight through.
+// The adapter Type is intentionally not propagated — ProviderConfig has
+// no type field; Type validation still happens in loadOneProvider so a
+// bad NEXUS_PROVIDER_<NAME>_TYPE fails boot. The trailing slash is
+// trimmed to match the base-URL convention callers append the
+// /chat/completions path to.
+func (p Provider) ToConfig() ProviderConfig {
+	return ProviderConfig{
+		NameVal:                        p.Name,
+		BaseURLVal:                     strings.TrimRight(p.URL, "/"),
+		ModelVal:                       p.Model,
+		APIKeyVal:                      p.APIKey,
+		CostPer1KVal:                   p.InputCostPer1K,
+		InputCostPer1KVal:              p.InputCostPer1K,
+		OutputCostPer1KVal:             p.OutputCostPer1K,
+		CacheReadInputCostPer1KVal:     p.CacheReadInputCostPer1K,
+		CacheCreationInputCostPer1KVal: p.CacheCreationInputCostPer1K,
+	}
+}
+
+// LoadProviderRegistry is the single entry point the server uses to
+// obtain the frontier provider registry (issue #1159). It honours two
+// configuration surfaces:
+//
+//  1. NEXUS_PROVIDERS + NEXUS_PROVIDER_<NAME>_* (the per-provider
+//     env-var system; see LoadFromEnv). Takes precedence when set and
+//     sorted by Priority so operators can order the cascade.
+//  2. NEXUS_FRONTIER_PROVIDERS (the JSON-array system; see
+//     ParseProvidersFromEnv). Used when NEXUS_PROVIDERS is unset.
+//
+// Setting BOTH is a configuration error: the two systems are mutually
+// exclusive and mixing them would silently shadow one set of providers.
+// A clear error is returned so an operator notices at boot instead of
+// debugging missing providers at request time.
+//
+// Returns (nil, nil) when neither is set — callers fall back to the
+// legacy NEXUS_FRONTIER_* / NEXUS_ZAI_* vars in the config layer.
+func LoadProviderRegistry() (*ProviderRegistry, error) {
+	reg, err := LoadFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	if reg.Len() > 0 {
+		if strings.TrimSpace(os.Getenv("NEXUS_FRONTIER_PROVIDERS")) != "" {
+			return nil, fmt.Errorf(
+				"NEXUS_PROVIDERS and NEXUS_FRONTIER_PROVIDERS are mutually exclusive; set only one "+
+					"(got %d providers from NEXUS_PROVIDERS and a non-empty NEXUS_FRONTIER_PROVIDERS)",
+				reg.Len(),
+			)
+		}
+		out := NewProviderRegistry()
+		for _, p := range SortByPriority(reg.FrontierProviders()) {
+			out.Register(p.ToConfig())
+		}
+		return out, nil
+	}
+	// NEXUS_PROVIDERS unset — fall back to the JSON system.
+	return ParseProvidersFromEnv()
+}
+
 // loadOneProvider reads the per-provider env vars for cfg and returns
 // the resulting Provider. Errors are returned with the field name
 // prefixed so the caller can append the provider name without losing
@@ -250,7 +338,10 @@ func loadOneProvider(cfg envProviderConfig) (Provider, error) {
 	priorityKey := "NEXUS_PROVIDER_" + cfg.suffix + "_PRIORITY"
 	inCostKey := "NEXUS_PROVIDER_" + cfg.suffix + "_INPUT_COST_PER_1K"
 	outCostKey := "NEXUS_PROVIDER_" + cfg.suffix + "_OUTPUT_COST_PER_1K"
+	cacheReadKey := "NEXUS_PROVIDER_" + cfg.suffix + "_CACHE_READ_INPUT_COST_PER_1K"
+	cacheCreateKey := "NEXUS_PROVIDER_" + cfg.suffix + "_CACHE_CREATION_INPUT_COST_PER_1K"
 	maxTokKey := "NEXUS_PROVIDER_" + cfg.suffix + "_MAX_TOKENS"
+	typeKey := "NEXUS_PROVIDER_" + cfg.suffix + "_TYPE"
 
 	url := strings.TrimSpace(os.Getenv(urlKey))
 	if url == "" {
@@ -290,6 +381,20 @@ func loadOneProvider(cfg envProviderConfig) (Provider, error) {
 		}
 		p.OutputCostPer1K = f
 	}
+	if v := strings.TrimSpace(os.Getenv(cacheReadKey)); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return Provider{}, fmt.Errorf("%s must be a number: %w", cacheReadKey, err)
+		}
+		p.CacheReadInputCostPer1K = f
+	}
+	if v := strings.TrimSpace(os.Getenv(cacheCreateKey)); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return Provider{}, fmt.Errorf("%s must be a number: %w", cacheCreateKey, err)
+		}
+		p.CacheCreationInputCostPer1K = f
+	}
 	if v := strings.TrimSpace(os.Getenv(maxTokKey)); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
@@ -297,7 +402,27 @@ func loadOneProvider(cfg envProviderConfig) (Provider, error) {
 		}
 		p.MaxTokens = n
 	}
+
+	// Adapter type (issue #1185). Default empty == openai (byte-for-byte
+	// legacy path). An unknown value fails here so a typo is caught at
+	// boot, not silently at request time.
+	if v := strings.TrimSpace(os.Getenv(typeKey)); v != "" {
+		if !IsValidAdapterType(v) {
+			return Provider{}, fmt.Errorf("%s must be one of %s, got %q",
+				typeKey, strings.Join(ValidAdapterTypes(), ", "), v)
+		}
+		p.Type = strings.ToLower(v)
+	}
 	return p, nil
+}
+
+// Adapter returns the ProviderAdapter for this provider's Type (issue
+// #1185). A zero Type resolves to the openai no-op adapter. Because
+// LoadFromEnv validates Type at parse time, this never errors for a
+// Provider that came through the normal config path; the error return is
+// kept for providers constructed directly in code.
+func (p Provider) Adapter() (ProviderAdapter, error) {
+	return NewAdapter(p.Type)
 }
 
 // SortByPriority returns a copy of providers ordered by Priority (lower

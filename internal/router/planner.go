@@ -16,6 +16,7 @@ package router
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"regexp"
 
@@ -63,6 +64,21 @@ const (
 	// This is a hard override — the SLM made a decision but the low
 	// confidence signal triggered an automatic escalation.
 	SourceSLMEscalation DecisionSource = "slm-escalation"
+
+	// SourceBudgetDownTier (issue #1163) means the planner down-tiered
+	// to RouteLocal because the estimated frontier cost would exceed
+	// the remaining 24h budget. This fires between the guardrail and
+	// DSL stages — the VRAM guardrail always wins precedence. The
+	// dispatch-time SpendGuard.Check remains as a final safety net
+	// (race guard) since budget can change between routing and dispatch.
+	SourceBudgetDownTier DecisionSource = "budget-down-tier"
+
+	// SourceDSLPromoted (issue #1165) means the decision came from an
+	// auto-promoted DSL fast-pass rule — an n-gram pattern that the
+	// PatternPromoter extracted from historical SLM decisions and
+	// promoted into the DSL fast-pass. Checked before manual DSL patterns
+	// so auto-discovered rules take precedence.
+	SourceDSLPromoted DecisionSource = "dsl-promoted"
 )
 
 // TraceReason returns the stable machine-readable trace label for a decision source:
@@ -84,6 +100,10 @@ func (s DecisionSource) TraceReason() string {
 		return "slm-no-client"
 	case SourceSLMEscalation:
 		return "slm-low-confidence"
+	case SourceBudgetDownTier:
+		return "budget-down-tier"
+	case SourceDSLPromoted:
+		return "dsl-promoted"
 	default:
 		return "slm"
 	}
@@ -158,6 +178,20 @@ type SLMDecider interface {
 	DecideWithConfidence(ctx context.Context, prompt string, confidence float64) (Route, error)
 }
 
+// BudgetChecker is the minimal interface the planner needs from the
+// budget guard to decide whether a frontier/fusion dispatch would
+// exceed the remaining 24h spend cap (issue #1163). *budget.Guard
+// satisfies it; tests substitute a stub.
+type BudgetChecker interface {
+	// Remaining returns the USD remaining in the rolling 24h window.
+	// Returns 0 (or negative) when the guard is disabled or over budget.
+	Remaining() float64
+	// WouldExceed reports whether recording a frontier call of the
+	// given estimated cost would exceed the daily budget. Returns
+	// false when the guard has no limit configured (disabled).
+	WouldExceed(estimatedCost float64) bool
+}
+
 // Planner is the single route-planning seam (issue #82). Construct one
 // per request (or reuse — it holds no mutable state) and call Plan to
 // get a Decision. The planner is pure logic: it performs SLM HTTP calls
@@ -221,6 +255,43 @@ type Planner struct {
 	// (issue #927). The hook logs at Warn level and increments the
 	// nexus_confidence_errors_total counter. Nil is a safe no-op.
 	ConfidenceErrorHook func(category string, err error)
+
+	// Budget is the optional 24h spend guard (issue #1163). When
+	// non-nil the planner checks whether the estimated frontier cost
+	// would exceed the remaining budget BEFORE the DSL stage. If it
+	// would, the planner down-tiers to RouteLocal with Source
+	// SourceBudgetDownTier — but only when the guardrail has not
+	// already forced frontier (VRAM protection always wins).
+	// When nil (budget enforcement disabled) this stage is skipped
+	// entirely and routing is byte-for-byte identical to pre-#1163
+	// behaviour.
+	Budget BudgetChecker
+
+	// FrontierCostPer1K is the USD cost per 1K input tokens used to
+	// estimate the frontier dispatch cost for the budget check. When
+	// Budget is nil this field is unused. When Budget is non-nil and
+	// FrontierCostPer1K <= 0 the planner falls back to a token-count
+	// heuristic (1 token ≈ 1 microcent, i.e. cost = tokens / 1e6) so
+	// a misconfigured cost still produces a conservative estimate.
+	FrontierCostPer1K float64
+
+	// Promoter is the optional auto-promoted DSL pattern matcher
+	// (issue #1165). When non-nil, the planner checks promoted patterns
+	// before the manual DSL fast-pass. A hit returns the promoted route
+	// with Source = SourceDSLPromoted and increments the
+	// nexus_route_dsl_promoted_total counter. When nil the planner
+	// behaves identically to the pre-issue-1165 path.
+	Promoter *PatternPromoter
+
+	// SLMTokenHint enables prepending [tokens: ~N] to the routingText
+	// passed to the SLM (issue #1233). This gives the routing model
+	// a signal about prompt length so it can make better-informed
+	// routing decisions for medium-length prompts (500-2000 tokens)
+	// that sit in the gray zone between short and the guardrail.
+	// When false (or when SLM is nil), routingText is passed to the
+	// SLM without modification — byte-for-byte identical to the
+	// pre-issue-#1233 behaviour.
+	SLMTokenHint bool
 }
 
 // PlanRequest carries the per-request inputs the planner needs. The
@@ -247,6 +318,16 @@ type PlanRequest struct {
 	// not derive a timeout from it — the SLMClient applies its own
 	// configured timeout via context.WithTimeout internally.
 	Context context.Context
+
+	// ConversationContext is an optional summary of prior conversation
+	// turns assembled by the handler (issue #1147). When non-empty the
+	// planner prepends it to Prompt for the DSL fast-pass, SLM cache key,
+	// SLM call, and Categorize — so multi-turn follow-ups like "fix it"
+	// are routed using the full conversational thread. The guardrail
+	// stage still uses Prompt alone (the latest message) so the VRAM
+	// ceiling is never inflated by conversation history. When empty,
+	// routing is byte-for-byte identical to the pre-#1147 behaviour.
+	ConversationContext string
 }
 
 // Plan runs the routing pipeline and returns a Decision.
@@ -277,7 +358,78 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 		}
 	}
 
-	// Stage 2: DSL fast-pass. Use default patterns when config fields are nil.
+	// Stage 1b: Budget-aware down-tier (issue #1163).
+	//
+	// When a BudgetChecker is wired and the estimated frontier cost
+	// would exceed the remaining 24h budget, the planner down-tiers
+	// to RouteLocal instead of routing to frontier/fusion (which
+	// would then be rejected with 429 at dispatch time, wasting the
+	// SLM call). This fires AFTER the guardrail (VRAM protection
+	// always wins) but BEFORE the DSL fast-pass so that obvious
+	// local/fusion matches still take their normal path — only
+	// requests that would have gone to frontier are down-tiered.
+	//
+	// The dispatch-time SpendGuard.Check remains as a final safety
+	// net because the budget can change between routing and dispatch.
+	if p.Budget != nil {
+		cost := estimateFrontierCost(estimatedTokens, p.FrontierCostPer1K)
+		if cost > 0 && p.Budget.WouldExceed(cost) {
+			return Decision{
+				Route:           RouteLocal,
+				Source:          SourceBudgetDownTier,
+				Reason:          "budget-exhausted",
+				Confidence:      NeutralConfidence,
+				EstimatedTokens: estimatedTokens,
+				BudgetSource:    req.GuardrailSource,
+				BudgetTokens:    req.GuardrailBudget,
+			}
+		}
+	}
+
+	// Build the routing text: conversation context + latest prompt
+	// (issue #1147). When ConversationContext is empty this is identical
+	// to req.Prompt (byte-for-byte), preserving the pre-#1147 behaviour.
+	// Used by the DSL fast-pass, promoted patterns, SLM cache key, SLM
+	// call, and Categorize — but NOT the guardrail (which uses req.Prompt
+	// alone so conversation history never inflates the VRAM ceiling).
+	routingText := req.Prompt
+	if req.ConversationContext != "" {
+		routingText = req.ConversationContext + "\n" + req.Prompt
+	}
+
+	// slmPrompt is the text passed to the SLM. When SLMTokenHint is
+	// enabled (issue #1233), prepend [tokens: ~N] so the routing model
+	// has prompt-length context for medium-length prompts that sit in
+	// the gray zone between short and the guardrail. The DSL, cache,
+	// and Categorize all use routingText so they are unaffected.
+	slmPrompt := routingText
+	if p.SLMTokenHint {
+		slmPrompt = fmt.Sprintf("[tokens: ~%d]\n%s", estimatedTokens, routingText)
+	}
+
+	// Stage 2a: Auto-promoted DSL patterns (issue #1165).
+	//
+	// Promoted patterns are checked BEFORE the manual DSL fast-pass so
+	// auto-discovered rules take precedence. These are n-gram patterns
+	// that the PatternPromoter extracted from historical SLM decisions
+	// and promoted into the DSL fast-pass. A hit eliminates the SLM
+	// round-trip for predictable routing patterns.
+	if p.Promoter != nil {
+		if route, pattern, hit := p.Promoter.Match(routingText); hit {
+			p.Promoter.IncPromotedTotal()
+			return Decision{
+				Route:           route,
+				Source:          SourceDSLPromoted,
+				Reason:          "promoted:" + pattern,
+				Confidence:      NeutralConfidence,
+				EstimatedTokens: estimatedTokens,
+				BudgetSource:    req.GuardrailSource,
+				BudgetTokens:    req.GuardrailBudget,
+			}
+		}
+	}
+
+	// Stage 2b: DSL fast-pass. Use default patterns when config fields are nil.
 	//
 	// DSL PATTERN PRECEDENCE (issue #876): when a prompt matches multiple
 	// pattern groups, the FIRST match wins. The fixed check order is:
@@ -292,6 +444,10 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	// will be routed to fusion because fusionPatterns are checked first.
 	// If you need different precedence, the patterns themselves must be
 	// narrowed to avoid overlap.
+	//
+	// Conversation context (issue #1147): the DSL matches against the
+	// combined context + prompt (routingText, computed above) so a
+	// follow-up like "fix it" can match a keyword from a prior turn.
 	fusionPatterns := p.FusionPatterns
 	if len(fusionPatterns) == 0 {
 		fusionPatterns = DefaultFusionPatterns
@@ -308,7 +464,7 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	if len(unicodePatterns) == 0 {
 		unicodePatterns = DefaultUnicodePatterns
 	}
-	if r, reason, hit := DSL(req.Prompt, fusionPatterns, formattingPatterns, localPatterns, unicodePatterns); hit {
+	if r, reason, hit := DSL(routingText, fusionPatterns, formattingPatterns, localPatterns, unicodePatterns); hit {
 		return Decision{
 			Route:           r,
 			Source:          SourceDSL,
@@ -340,14 +496,20 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	// Categorize once for observability. Every decision reaching the SLM
 	// stage (including cache hits) carries a non-empty TaskType so that
 	// Prometheus and JSONL telemetry lose their per-category dimension
-	// even when no ConfidenceStore is wired (issue #441).
-	category := Categorize(req.Prompt)
+	// even when no ConfidenceStore is wired (issue #441). Uses the
+	// combined routingText so a terse follow-up inherits its category
+	// from the conversation context (issue #1147).
+	category := Categorize(routingText)
 
-	// Check cache first if enabled.
+	// Check cache first if enabled. The cache key is the routingText so
+	// identical latest prompts with different conversation context do not
+	// share a stale decision (issue #1147).
 	if p.SLMCache != nil {
-		if cached, hit, hitKind := p.SLMCache.Get(req.Context, req.Prompt); hit {
+		if cached, hit, hitKind := p.SLMCache.Get(req.Context, routingText); hit {
 			if p.Confidence != nil {
-				if conf, err := p.Confidence.LocalConfidence(category); err != nil {
+				// Use comparative confidence when available (issue #1162)
+				// so the hard-override below sees the local fraction.
+				if conf, _, err := p.Confidence.ComparativeConfidence(category); err != nil {
 					slog.Warn("planner: confidence lookup",
 						slog.String("category", category),
 						slog.Any("err", err),
@@ -390,20 +552,39 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	}
 
 	if p.Confidence != nil {
-		if conf, err := p.Confidence.LocalConfidence(category); err != nil {
-			slog.Warn("planner: confidence lookup",
-				slog.String("category", category),
-				slog.Any("err", err),
-			)
-			if p.ConfidenceErrorHook != nil {
-				p.ConfidenceErrorHook(category, err)
+		// Try comparative confidence first (issue #1162). When the store
+		// and SLM both support it, pass both local and frontier signals.
+		// This lets the SLM suggest fusion when both models struggle.
+		if cmpSLM, ok := p.SLM.(ComparativeSLMDecider); ok {
+			lConf, fConf, cerr := p.Confidence.ComparativeConfidence(category)
+			if cerr != nil {
+				slog.Warn("planner: comparative confidence lookup",
+					slog.String("category", category),
+					slog.Any("err", cerr),
+				)
+				if p.ConfidenceErrorHook != nil {
+					p.ConfidenceErrorHook(category, cerr)
+				}
+			} else {
+				confidence = lConf
 			}
+			dec, err = cmpSLM.DecideWithComparativeConfidence(req.Context, slmPrompt, lConf, fConf)
 		} else {
-			confidence = conf
+			if conf, cerr := p.Confidence.LocalConfidence(category); cerr != nil {
+				slog.Warn("planner: confidence lookup",
+					slog.String("category", category),
+					slog.Any("err", cerr),
+				)
+				if p.ConfidenceErrorHook != nil {
+					p.ConfidenceErrorHook(category, cerr)
+				}
+			} else {
+				confidence = conf
+			}
+			dec, err = p.SLM.DecideWithConfidence(req.Context, slmPrompt, confidence)
 		}
-		dec, err = p.SLM.DecideWithConfidence(req.Context, req.Prompt, confidence)
 	} else {
-		dec, err = p.SLM.Decide(req.Context, req.Prompt)
+		dec, err = p.SLM.Decide(req.Context, slmPrompt)
 	}
 	if err != nil {
 		return Decision{
@@ -440,7 +621,7 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 
 	// Cache the successful decision for future identical prompts.
 	if p.SLMCache != nil {
-		p.SLMCache.Set(req.Context, req.Prompt, dec)
+		p.SLMCache.Set(req.Context, routingText, dec)
 	}
 	return Decision{
 		Route:           dec,
@@ -457,3 +638,15 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 // Compile-time assertion: *SLMClient satisfies SLMDecider so the handler
 // can pass it directly to the Planner without an adapter.
 var _ SLMDecider = (*SLMClient)(nil)
+
+// estimateFrontierCost converts a token count into an estimated USD cost
+// using the configured cost-per-1K rate. When the rate is zero or
+// negative (misconfigured) a conservative microcent heuristic is used
+// (1 token ≈ 1 microcent) so the budget check still fires on very
+// large prompts.
+func estimateFrontierCost(tokens int, costPer1K float64) float64 {
+	if costPer1K <= 0 {
+		return float64(tokens) / 1e6
+	}
+	return float64(tokens) * costPer1K / 1000.0
+}

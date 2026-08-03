@@ -1315,3 +1315,84 @@ func TestCascadeRunAuthErrorSurfacesToCallerWithoutRetry(t *testing.T) {
 		t.Errorf("primary counter = %d, want 1 (no retry for auth error)", *ft.counter("http://primary.local/v1/chat/completions"))
 	}
 }
+
+// erroringReadCloser wraps an io.ReadCloser and makes Read return an error
+// after a configurable number of successful reads.
+type erroringReadCloser struct {
+	r        io.ReadCloser
+	errAfter int
+	count    int
+}
+
+func (e *erroringReadCloser) Read(p []byte) (int, error) {
+	e.count++
+	if e.count > e.errAfter {
+		return 0, errors.New("upstream read error")
+	}
+	return e.r.Read(p)
+}
+
+func (e *erroringReadCloser) Close() error { return e.r.Close() }
+
+// errorOnFirstReadTransport is an http.RoundTripper that replaces the response
+// body with an erroring reader for the primary URL, simulating an upstream
+// connection failure mid-stream (issue #1114).
+type errorOnFirstReadTransport struct {
+	primary   string
+	transport http.RoundTripper
+}
+
+func (rt *errorOnFirstReadTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := rt.transport.RoundTrip(req)
+	if err != nil {
+		return resp, err
+	}
+	if req.URL.String() == rt.primary {
+		resp.Body = &erroringReadCloser{r: resp.Body, errAfter: 0}
+	}
+	return resp, nil
+}
+
+// TestCascadeFallsBackOnReadError verifies issue #1114: when the upstream
+// connection errors before maxBytes is reached (i.e., ReadAllLimited returns a
+// non-EOF error), the cascade treats it as a retryable transport_error and
+// falls back to the next step instead of silently returning incomplete data.
+func TestCascadeFallsBackOnReadError(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		// Write a partial response; the erroring transport will abort the read.
+		_, _ = io.WriteString(w, `{"model":"local-m","choices":[{"`)
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+
+	wrapped := &errorOnFirstReadTransport{
+		primary:   "http://primary.local/v1/chat/completions",
+		transport: ft,
+	}
+	client := &http.Client{Transport: wrapped}
+
+	rw := newSSERW()
+	res, err := twoStepCascade().Run(context.Background(), rw, client, nil, "")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Succeeded || res.ServedBy != "frontier" {
+		t.Errorf("Succeeded=%v ServedBy=%q, want true and frontier", res.Succeeded, res.ServedBy)
+	}
+	if res.FallbackReason != "transport_error" {
+		t.Errorf("FallbackReason=%q, want transport_error", res.FallbackReason)
+	}
+	if !res.LocalStepFailed {
+		t.Error("LocalStepFailed should be true when local step fails with retryable error")
+	}
+	if *ft.counter("http://primary.local/v1/chat/completions") != 1 {
+		t.Errorf("primary counter = %d, want 1", *ft.counter("http://primary.local/v1/chat/completions"))
+	}
+	if *ft.counter("http://fallback.local/v1/chat/completions") != 1 {
+		t.Errorf("fallback counter = %d, want 1", *ft.counter("http://fallback.local/v1/chat/completions"))
+	}
+}

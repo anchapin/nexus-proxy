@@ -165,16 +165,3 @@ func hasUpperUnicode(s string) bool {
 	}
 	return false
 }
-
-// containsWord returns true if kw appears in s as a whole word/phrase,
-// using \b word-boundary matching so that e.g. "test" does not match
-// inside "contest". The keyword kw is already lowercased by the caller.
-func containsWord(s, kw string) bool {
-	if kw == "" {
-		return false
-	}
-	// regexp.QuoteMeta escapes all regex metacharacters, then we wrap with \b.
-	pattern := `(?i)\b` + regexp.QuoteMeta(kw) + `\b`
-	matched, _ := regexp.MatchString(pattern, s)
-	return matched
-}

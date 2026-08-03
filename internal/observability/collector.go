@@ -132,6 +132,14 @@ type ObservabilityEvent struct {
 	// consulted (guardrail/DSL stages) or on cache hits.
 	SLMConfidence float64
 	SLMTaskType   string
+
+	// Trace context for exemplar attachment (issue #1171). Populated
+	// by the chat handler from the root span; empty when tracing is
+	// not active. The collector stores the most recent trace per
+	// histogram bucket so Prometheus exemplars link latency outliers
+	// to the trace that produced them.
+	TraceID string
+	SpanID  string
 }
 
 // Collector is the in-process metrics surface. It is safe for
@@ -222,6 +230,14 @@ type Collector struct {
 	budgetExceededTotal   atomic.Uint64
 	budgetRecordedUSDBits atomic.Uint64
 
+	// --- Metrics batch counter (issue #1234) ---------------------------
+	//
+	// metricsBatchTotal counts the number of SQLite batch transactions
+	// committed by the metrics store drain goroutine. Each increment
+	// represents one BEGIN...INSERT...COMMIT cycle that flushed N records
+	// (where N is the batch size or the partial-final batch on timeout).
+	metricsBatchTotal atomic.Uint64
+
 	// TLS counters are bumped from main.go via http.Server.ConnState.
 	// Accepted fires on http.StateTLSHandshakeComplete; Rejected
 	// fires when a connection closes before reaching that state.
@@ -293,6 +309,48 @@ type Collector struct {
 	// Tracks LocalConfidence errors so operators can detect DB/locking
 	// issues in the SQLite-backed confidence store.
 	confidenceErrorsTotal atomic.Uint64
+
+	// --- Exemplar gate (issue #1171) --------------------------------
+	//
+	// When true, the renderer appends OTLP trace exemplars to
+	// histogram bucket lines. Set from config (NEXUS_METRICS_EXEMPLARS)
+	// during boot. When false, the output is byte-identical to the
+	// pre-exemplar renderer because Submit/ObservePipelineStage call
+	// plain Observe (no exemplar slots populated).
+	exemplarsEnabled atomic.Bool
+
+	// --- RAG-vs-judge quality correlation (issue #1167) -------------
+	//
+	// Sum and count of judge scores partitioned by whether RAG context
+	// was injected. Two label values (true|false) so four atomics
+	// total. The sum is stored as IEEE-754 bits (same trick as
+	// estimatedCostUSDBits) so the hot path accumulates a float
+	// without a mutex. Only valid scores (1..5) are recorded; parse
+	// failures are excluded.
+	ragJudgeScoreSumBitsTrue  atomic.Uint64
+	ragJudgeScoreSumBitsFalse atomic.Uint64
+	ragJudgeScoreCountTrue    atomic.Uint64
+	ragJudgeScoreCountFalse   atomic.Uint64
+
+	// --- Frontier provider health metrics (issue #1158) -----------------
+	//
+	// frontierProbeTotal records the cumulative probe count per
+	// (provider, result) pair. Keyed by "provider|result" so the
+	// Prometheus renderer can emit a labelled counter family.
+	// frontierCircuitOpenTotal records the cumulative count of
+	// circuit-open transitions per provider.
+	frontierHealthMu         sync.RWMutex
+	frontierProbeTotal       map[string]*atomic.Uint64 // keyed by "provider|result"
+	frontierCircuitOpenTotal map[string]*atomic.Uint64 // keyed by provider
+
+	// --- SLO error budget tracking (issue #1239) ------------------------
+	//
+	// sloErrorBudgetBits stores the IEEE-754 bits of the error budget
+	// remaining ratio per SLO (0..1, where 1 = full budget, 0 = exhausted).
+	// Keyed by SLO name: "availability", "local_latency_p99", "ttft_p95".
+	// Updated at scrape time from the in-process percentile gauges.
+	sloBudgetMu        sync.RWMutex
+	sloErrorBudgetBits map[string]*atomic.Uint64 // keyed by SLO name
 }
 
 // circuitBreakerState holds the atomic state for one named circuit.
@@ -349,6 +407,11 @@ func NewCollector() *Collector {
 	for _, l := range ragSimilarityLabels {
 		key := ragSimilarityKey(l.path, l.outcome, 0) // 0 = default/global threshold
 		c.ragSimilarityHistograms[key] = NewHistogram(RAGSimilarityBuckets)
+	}
+	// Pre-allocate SLO error budget storage (issue #1239).
+	c.sloErrorBudgetBits = make(map[string]*atomic.Uint64, 3)
+	for _, slo := range []string{"availability", "local_latency_p99", "ttft_p95"} {
+		c.sloErrorBudgetBits[slo] = &atomic.Uint64{}
 	}
 	return c
 }
@@ -415,26 +478,67 @@ func (c *Collector) Submit(e ObservabilityEvent) {
 		atomicAddFloat(&c.estimatedCostUSDBits, e.EstimatedCostUSD)
 	}
 	if e.TotalLatencyMs > 0 && latencyHist != nil {
-		latencyHist.Observe(float64(e.TotalLatencyMs))
+		if e.TraceID != "" {
+			latencyHist.ObserveWithExemplar(float64(e.TotalLatencyMs), Exemplar{TraceID: e.TraceID, SpanID: e.SpanID, Value: float64(e.TotalLatencyMs)})
+		} else {
+			latencyHist.Observe(float64(e.TotalLatencyMs))
+		}
 	}
 	if e.TTFTMs > 0 && ttftHist != nil {
-		ttftHist.Observe(float64(e.TTFTMs))
+		if e.TraceID != "" {
+			ttftHist.ObserveWithExemplar(float64(e.TTFTMs), Exemplar{TraceID: e.TraceID, SpanID: e.SpanID, Value: float64(e.TTFTMs)})
+		} else {
+			ttftHist.Observe(float64(e.TTFTMs))
+		}
 	}
 	// Per-stage pipeline latency histograms (issue #300).
+	ex := Exemplar{TraceID: e.TraceID, SpanID: e.SpanID}
 	if e.RAGRetrievalMs > 0 {
-		c.stageRAG.Observe(float64(e.RAGRetrievalMs))
+		if e.TraceID != "" {
+			ex.Value = float64(e.RAGRetrievalMs)
+			c.stageRAG.ObserveWithExemplar(float64(e.RAGRetrievalMs), ex)
+		} else {
+			c.stageRAG.Observe(float64(e.RAGRetrievalMs))
+		}
 	}
 	if e.PromptEngineeringMs > 0 {
-		c.stagePromptEng.Observe(float64(e.PromptEngineeringMs))
+		if e.TraceID != "" {
+			ex.Value = float64(e.PromptEngineeringMs)
+			c.stagePromptEng.ObserveWithExemplar(float64(e.PromptEngineeringMs), ex)
+		} else {
+			c.stagePromptEng.Observe(float64(e.PromptEngineeringMs))
+		}
 	}
 	if e.TOONCompressionMs > 0 {
-		c.stageTOON.Observe(float64(e.TOONCompressionMs))
+		if e.TraceID != "" {
+			ex.Value = float64(e.TOONCompressionMs)
+			c.stageTOON.ObserveWithExemplar(float64(e.TOONCompressionMs), ex)
+		} else {
+			c.stageTOON.Observe(float64(e.TOONCompressionMs))
+		}
 	}
 	if e.SLMRoutingMs > 0 {
-		c.stageSLM.Observe(float64(e.SLMRoutingMs))
+		if e.TraceID != "" {
+			ex.Value = float64(e.SLMRoutingMs)
+			c.stageSLM.ObserveWithExemplar(float64(e.SLMRoutingMs), ex)
+		} else {
+			c.stageSLM.Observe(float64(e.SLMRoutingMs))
+		}
 	}
 	if e.UpstreamFirstByteMs > 0 {
-		c.stageUpstream.Observe(float64(e.UpstreamFirstByteMs))
+		if e.TraceID != "" {
+			ex.Value = float64(e.UpstreamFirstByteMs)
+			c.stageUpstream.ObserveWithExemplar(float64(e.UpstreamFirstByteMs), ex)
+		} else {
+			c.stageUpstream.Observe(float64(e.UpstreamFirstByteMs))
+		}
+	}
+	// Confidence > 0 and TaskType is a known category. A zero
+	// confidence means the SLM was not consulted (guardrail/DSL
+	// path); an empty TaskType means cache hit or no confidence
+	// store was wired.
+	if e.SLMConfidence > 0 && e.SLMTaskType != "" {
+		c.ObserveSLMConfidence(e.SLMTaskType, e.SLMConfidence)
 	}
 	// SLM confidence histogram (issue #425). Recorded when both
 	// Confidence > 0 and TaskType is a known category. A zero
@@ -548,6 +652,27 @@ func (c *Collector) LatencyPercentileGauges() []GaugeSample {
 // path stays a single atomic add. The middleware packages own the
 // decision logic (when a request is "accepted" vs "rejected_invalid"
 // etc.); the collector only stores the resulting counts.
+
+// AuthCountersSnapshot returns a shallow snapshot of the three auth
+// counter maps (accepted, rejectedInvalid, rejectedMissing) under
+// authMu so callers can iterate without racing against IncAuth* writers.
+func (c *Collector) AuthCountersSnapshot() (accepted, rejectedInvalid, rejectedMissing map[string]*atomic.Uint64) {
+	c.authMu.Lock()
+	accepted = make(map[string]*atomic.Uint64, len(c.authAccepted))
+	for k, v := range c.authAccepted {
+		accepted[k] = v
+	}
+	rejectedInvalid = make(map[string]*atomic.Uint64, len(c.authRejectedInvalid))
+	for k, v := range c.authRejectedInvalid {
+		rejectedInvalid[k] = v
+	}
+	rejectedMissing = make(map[string]*atomic.Uint64, len(c.authRejectedMissing))
+	for k, v := range c.authRejectedMissing {
+		rejectedMissing[k] = v
+	}
+	c.authMu.Unlock()
+	return
+}
 
 // IncAuthAccepted records one accepted authentication request from the
 // given client IP (issue #1061).
@@ -665,6 +790,11 @@ func (c *Collector) BudgetRecordedUSD() float64 {
 // BudgetExceeded returns the cumulative budget-exceeded count.
 func (c *Collector) BudgetExceeded() uint64 { return c.budgetExceededTotal.Load() }
 
+// IncMetricsBatch increments the batch-transaction counter (issue #1234).
+// Called from the metrics and judge SQLite store drain goroutines whenever
+// a BEGIN...INSERT...COMMIT cycle completes.
+func (c *Collector) IncMetricsBatch() { c.metricsBatchTotal.Add(1) }
+
 // IncTLSAccepted bumps the accepted TLS-handshake counter. Wired
 // from main.go via http.Server.ConnState on
 // http.StateTLSHandshakeComplete.
@@ -752,7 +882,8 @@ func (c *Collector) RAGCircuitGauges() []GaugeSample {
 // directly to RenderPrometheus via the RouteCounters.Handler() chain
 // (issue #443). It returns the circuit-breaker state, failures,
 // last-failure samples, RAG circuit breaker state/failure count (issue #886),
-// and latency percentile gauges (issue #774).
+// latency percentile gauges (issue #774), and SLO error budget gauges
+// (issue #1239).
 // Safe for a nil receiver — returns nil so the collector can be
 // omitted without panicking during boot or in tests.
 func (c *Collector) Gauges() []GaugeSample {
@@ -763,6 +894,7 @@ func (c *Collector) Gauges() []GaugeSample {
 	out = append(out, c.CircuitBreakerGauges()...)
 	out = append(out, c.RAGCircuitGauges()...)
 	out = append(out, c.LatencyPercentileGauges()...)
+	out = append(out, c.SLOErrorBudgetGauges()...)
 	return out
 }
 
@@ -879,6 +1011,190 @@ func (c *Collector) IncConfidenceError() { c.confidenceErrorsTotal.Add(1) }
 // Used by the Prometheus renderer (issue #927).
 func (c *Collector) ConfidenceErrors() uint64 { return c.confidenceErrorsTotal.Load() }
 
+// --- Exemplar gate (issue #1171) ---------------------------------------
+
+// SetExemplarsEnabled controls whether the Prometheus renderer emits
+// OTLP trace exemplars on histogram bucket lines. Call once during boot
+// from config (NEXUS_METRICS_EXEMPLARS). When false, Submit and
+// ObservePipelineStage use plain Observe (no exemplar stored) and the
+// renderer omits exemplar suffixes, keeping output byte-identical to
+// the pre-exemplar build.
+func (c *Collector) SetExemplarsEnabled(enabled bool) {
+	if c == nil {
+		return
+	}
+	c.exemplarsEnabled.Store(enabled)
+}
+
+// ExemplarsEnabled reports whether the collector is configured to emit
+// exemplars. Used by the Prometheus renderer to decide whether to call
+// SnapshotWithExemplars.
+func (c *Collector) ExemplarsEnabled() bool {
+	if c == nil {
+		return false
+	}
+	return c.exemplarsEnabled.Load()
+}
+
+// --- RAG-vs-judge quality correlation (issue #1167) -------------------
+
+// ObserveJudgeScore records a judge quality score partitioned by whether
+// RAG context was injected. Called from the judge worker's score callback
+// (wired in cmd/nexus). Only valid scores (1..5) are recorded; parse
+// failures (score == 0 or out of range) are silently skipped so the
+// correlation metrics reflect actual model quality, not judge errors.
+// Safe for concurrent use — all updates are lock-free atomic operations.
+func (c *Collector) ObserveJudgeScore(ragInjected bool, score int) {
+	if c == nil {
+		return
+	}
+	if score < 1 || score > 5 {
+		return
+	}
+	if ragInjected {
+		atomicAddFloat(&c.ragJudgeScoreSumBitsTrue, float64(score))
+		c.ragJudgeScoreCountTrue.Add(1)
+	} else {
+		atomicAddFloat(&c.ragJudgeScoreSumBitsFalse, float64(score))
+		c.ragJudgeScoreCountFalse.Add(1)
+	}
+}
+
+// RAGJudgeScoreSum returns the cumulative judge score sum for the given
+// injected label. Used by the Prometheus renderer (issue #1167).
+func (c *Collector) RAGJudgeScoreSum(injected bool) float64 {
+	if injected {
+		return math.Float64frombits(c.ragJudgeScoreSumBitsTrue.Load())
+	}
+	return math.Float64frombits(c.ragJudgeScoreSumBitsFalse.Load())
+}
+
+// RAGJudgeScoreCount returns the cumulative judge score count for the
+// given injected label. Used by the Prometheus renderer (issue #1167).
+func (c *Collector) RAGJudgeScoreCount(injected bool) uint64 {
+	if injected {
+		return c.ragJudgeScoreCountTrue.Load()
+	}
+	return c.ragJudgeScoreCountFalse.Load()
+}
+
+// --- Frontier provider health metrics (issue #1158) --------------------
+
+// IncFrontierProbe increments the probe counter for the given
+// (provider, result) pair. result is "success" or "failure". Called
+// from the frontier health poller after every probe via the probe
+// callback wired in server.go.
+func (c *Collector) IncFrontierProbe(provider, result string) {
+	if provider == "" || result == "" {
+		return
+	}
+	key := provider + "|" + result
+	c.frontierHealthMu.Lock()
+	defer c.frontierHealthMu.Unlock()
+	if c.frontierProbeTotal == nil {
+		c.frontierProbeTotal = make(map[string]*atomic.Uint64)
+	}
+	if c.frontierProbeTotal[key] == nil {
+		c.frontierProbeTotal[key] = new(atomic.Uint64)
+	}
+	c.frontierProbeTotal[key].Add(1)
+}
+
+// IncFrontierCircuitOpen increments the circuit-open counter for the
+// given provider. Called from the frontier health poller when a
+// provider's circuit transitions from closed to open.
+func (c *Collector) IncFrontierCircuitOpen(provider string) {
+	if provider == "" {
+		return
+	}
+	c.frontierHealthMu.Lock()
+	defer c.frontierHealthMu.Unlock()
+	if c.frontierCircuitOpenTotal == nil {
+		c.frontierCircuitOpenTotal = make(map[string]*atomic.Uint64)
+	}
+	if c.frontierCircuitOpenTotal[provider] == nil {
+		c.frontierCircuitOpenTotal[provider] = new(atomic.Uint64)
+	}
+	c.frontierCircuitOpenTotal[provider].Add(1)
+}
+
+// FrontierProbeTotals returns the cumulative probe counts keyed by
+// "provider|result". Used by the Prometheus renderer (issue #1158).
+func (c *Collector) FrontierProbeTotals() map[string]uint64 {
+	c.frontierHealthMu.RLock()
+	defer c.frontierHealthMu.RUnlock()
+	out := make(map[string]uint64, len(c.frontierProbeTotal))
+	for k, v := range c.frontierProbeTotal {
+		out[k] = v.Load()
+	}
+	return out
+}
+
+// FrontierCircuitOpenTotals returns the cumulative circuit-open counts
+// keyed by provider. Used by the Prometheus renderer (issue #1158).
+func (c *Collector) FrontierCircuitOpenTotals() map[string]uint64 {
+	c.frontierHealthMu.RLock()
+	defer c.frontierHealthMu.RUnlock()
+	out := make(map[string]uint64, len(c.frontierCircuitOpenTotal))
+	for k, v := range c.frontierCircuitOpenTotal {
+		out[k] = v.Load()
+	}
+	return out
+}
+
+// --- SLO error budget tracking (issue #1239) -----------------------------
+
+// SLOTarget defines an SLO threshold for error budget computation.
+type SLOTarget struct {
+	Name         string  // SLO identifier: "availability", "local_latency_p99", "ttft_p95"
+	Threshold    float64 // SLO threshold (e.g. 0.001 error rate, 2.0s latency, 0.5s TTFT)
+	ErrorBudget  float64 // Allowed error fraction per window (e.g. 0.001 = 0.1%)
+	CurrentValue float64 // Current observed value (error rate, latency, TTFT)
+}
+
+// SetSLOErrorBudget updates the error budget remaining for the named SLO.
+// value is the remaining fraction in [0, 1], where 1 = full budget and
+// 0 = exhausted. Values are clamped to [0, 1]. Safe for concurrent use.
+// Called from the Prometheus scrape path to recompute budgets from the
+// in-process percentile gauges.
+func (c *Collector) SetSLOErrorBudget(sloName string, value float64) {
+	if c == nil || sloName == "" {
+		return
+	}
+	if value < 0 {
+		value = 0
+	} else if value > 1 {
+		value = 1
+	}
+	c.sloBudgetMu.RLock()
+	bits, ok := c.sloErrorBudgetBits[sloName]
+	c.sloBudgetMu.RUnlock()
+	if ok && bits != nil {
+		bits.Store(math.Float64bits(value))
+	}
+}
+
+// SLOErrorBudgetGauges returns the current error budget remaining for all
+// tracked SLOs as gauge samples for the Prometheus renderer. Each SLO emits
+// one sample labelled by slo name. Values are in [0, 1].
+// Safe for a nil receiver — returns nil.
+func (c *Collector) SLOErrorBudgetGauges() []GaugeSample {
+	if c == nil {
+		return nil
+	}
+	c.sloBudgetMu.RLock()
+	defer c.sloBudgetMu.RUnlock()
+	out := make([]GaugeSample, 0, len(c.sloErrorBudgetBits))
+	for name, bits := range c.sloErrorBudgetBits {
+		out = append(out, GaugeSample{
+			Name:   "nexus_slo_error_budget_remaining",
+			Labels: map[string]string{"slo": name},
+			Value:  math.Float64frombits(bits.Load()),
+		})
+	}
+	return out
+}
+
 // --- Pipeline stage latency breakdown (issue #300) -------------------
 //
 // ObservePipelineStage records per-stage timing breakdown from the chat
@@ -888,20 +1204,50 @@ func (c *Collector) ConfidenceErrors() uint64 { return c.confidenceErrorsTotal.L
 // Also records the SLM confidence histogram (issue #425) when
 // SLMConfidence > 0 and SLMTaskType is non-empty.
 func (c *Collector) ObservePipelineStage(e PipelineStageEvent) {
+	ex := Exemplar{TraceID: e.TraceID, SpanID: e.SpanID}
 	if e.RAGRetrievalMs > 0 {
-		c.stageRAG.Observe(float64(e.RAGRetrievalMs))
+		if e.TraceID != "" {
+			ex.Value = float64(e.RAGRetrievalMs)
+			c.stageRAG.ObserveWithExemplar(float64(e.RAGRetrievalMs), ex)
+		} else {
+			c.stageRAG.Observe(float64(e.RAGRetrievalMs))
+		}
 	}
 	if e.PromptEngineeringMs > 0 {
-		c.stagePromptEng.Observe(float64(e.PromptEngineeringMs))
+		if e.TraceID != "" {
+			ex.Value = float64(e.PromptEngineeringMs)
+			c.stagePromptEng.ObserveWithExemplar(float64(e.PromptEngineeringMs), ex)
+		} else {
+			c.stagePromptEng.Observe(float64(e.PromptEngineeringMs))
+		}
 	}
 	if e.TOONCompressionMs > 0 {
-		c.stageTOON.Observe(float64(e.TOONCompressionMs))
+		if e.TraceID != "" {
+			ex.Value = float64(e.TOONCompressionMs)
+			c.stageTOON.ObserveWithExemplar(float64(e.TOONCompressionMs), ex)
+		} else {
+			c.stageTOON.Observe(float64(e.TOONCompressionMs))
+		}
 	}
 	if e.SLMRoutingMs > 0 {
-		c.stageSLM.Observe(float64(e.SLMRoutingMs))
+		if e.TraceID != "" {
+			ex.Value = float64(e.SLMRoutingMs)
+			c.stageSLM.ObserveWithExemplar(float64(e.SLMRoutingMs), ex)
+		} else {
+			c.stageSLM.Observe(float64(e.SLMRoutingMs))
+		}
 	}
 	if e.UpstreamFirstByteMs > 0 {
-		c.stageUpstream.Observe(float64(e.UpstreamFirstByteMs))
+		if e.TraceID != "" {
+			ex.Value = float64(e.UpstreamFirstByteMs)
+			c.stageUpstream.ObserveWithExemplar(float64(e.UpstreamFirstByteMs), ex)
+		} else {
+			c.stageUpstream.Observe(float64(e.UpstreamFirstByteMs))
+		}
+	}
+	// SLM confidence histogram (issue #425).
+	if e.SLMConfidence > 0 && e.SLMTaskType != "" {
+		c.ObserveSLMConfidence(e.SLMTaskType, e.SLMConfidence)
 	}
 	// SLM confidence histogram (issue #425).
 	if e.SLMConfidence > 0 && e.SLMTaskType != "" {
@@ -921,6 +1267,10 @@ type PipelineStageEvent struct {
 	// SLM confidence for histogram recording (issue #425).
 	SLMConfidence float64
 	SLMTaskType   string
+
+	// Trace context for exemplar attachment (issue #1171).
+	TraceID string
+	SpanID  string
 }
 
 // Handler returns an http.Handler that renders stage latency histograms
@@ -1167,6 +1517,17 @@ func (b *latencyPercentileBuffer) Count() int {
 	return len(b.samples)
 }
 
+// Exemplar holds the most recent trace context for a single histogram
+// bucket (issue #1171). Prometheus exemplars let operators click a
+// histogram outlier in Grafana and jump directly to the trace that
+// produced it. Each bucket stores one slot — the latest observation —
+// because Prometheus scrapers only consume the most recent exemplar.
+type Exemplar struct {
+	TraceID string  // 32-hex-char W3C trace ID
+	SpanID  string  // 16-hex-char W3C span ID
+	Value   float64 // the observed value that landed in this bucket
+}
+
 // Histogram is a fixed-bucket cumulative histogram. Buckets are
 // pre-allocated at construction; Observe performs a single linear scan
 // over the finite upper bounds (at most one atomic increment) plus the
@@ -1176,11 +1537,19 @@ func (b *latencyPercentileBuffer) Count() int {
 // required by the Prometheus exposition format are derived at render
 // time (Snapshot). This keeps Observe to a single increment regardless
 // of bucket count.
+//
+// Exemplars (issue #1171): the exemplars slice holds one slot per
+// bucket (including +Inf), pre-allocated at construction. Each slot
+// stores the most recent trace context from an ObserveWithExemplar call.
+// exemplarMu guards writes during observation and reads at snapshot time;
+// the mutex is only held for a struct copy, never an allocation.
 type Histogram struct {
 	upperBounds []float64       // finite upper bounds, ascending
 	counts      []atomic.Uint64 // len == len(upperBounds)+1; last is the +Inf overflow bucket
 	sumBits     atomic.Uint64   // float64 bits (math.Float64bits)
 	count       atomic.Uint64   // total observations
+	exemplarMu  sync.Mutex      // guards exemplars slice
+	exemplars   []Exemplar      // len == len(upperBounds)+1; one slot per bucket
 }
 
 // NewHistogram constructs a Histogram whose finite buckets are bounded
@@ -1189,6 +1558,7 @@ func NewHistogram(upperBounds []float64) *Histogram {
 	return &Histogram{
 		upperBounds: upperBounds,
 		counts:      make([]atomic.Uint64, len(upperBounds)+1),
+		exemplars:   make([]Exemplar, len(upperBounds)+1),
 	}
 }
 
@@ -1196,17 +1566,36 @@ func NewHistogram(upperBounds []float64) *Histogram {
 // bucket whose upper bound is >= v, or in the trailing +Inf bucket when
 // v exceeds every finite bound. Observe is safe for concurrent use.
 func (h *Histogram) Observe(v float64) {
-	for i, ub := range h.upperBounds {
-		if v <= ub {
-			h.counts[i].Add(1)
-			h.count.Add(1)
-			atomicAddFloat(&h.sumBits, v)
-			return
-		}
-	}
-	h.counts[len(h.upperBounds)].Add(1)
+	idx := h.bucketIndex(v)
+	h.counts[idx].Add(1)
 	h.count.Add(1)
 	atomicAddFloat(&h.sumBits, v)
+}
+
+// ObserveWithExemplar records a single observation and stores the trace
+// context as an exemplar on the bucket the value landed in (issue #1171).
+// When ex.TraceID is empty, no exemplar is stored and the call is
+// equivalent to Observe. Safe for concurrent use.
+func (h *Histogram) ObserveWithExemplar(v float64, ex Exemplar) {
+	idx := h.bucketIndex(v)
+	h.counts[idx].Add(1)
+	h.count.Add(1)
+	atomicAddFloat(&h.sumBits, v)
+	if ex.TraceID != "" {
+		h.exemplarMu.Lock()
+		h.exemplars[idx] = ex
+		h.exemplarMu.Unlock()
+	}
+}
+
+// bucketIndex returns the index into counts/exemplars for value v.
+func (h *Histogram) bucketIndex(v float64) int {
+	for i, ub := range h.upperBounds {
+		if v <= ub {
+			return i
+		}
+	}
+	return len(h.upperBounds)
 }
 
 // UpperBounds returns the finite bucket upper bounds. The returned
@@ -1234,6 +1623,21 @@ func (h *Histogram) Snapshot() (cumulative []uint64, upperBounds []float64, sum 
 	upperBounds = h.upperBounds
 	sum = math.Float64frombits(h.sumBits.Load())
 	count = h.count.Load()
+	return
+}
+
+// SnapshotWithExemplars is like Snapshot but also returns a copy of the
+// per-bucket exemplar slots (issue #1171). The exemplars slice has the
+// same length as cumulative (one slot per bucket, including +Inf).
+// Buckets with no stored exemplar have a zero-value Exemplar (empty
+// TraceID); the renderer checks TraceID to decide whether to emit the
+// exemplar suffix.
+func (h *Histogram) SnapshotWithExemplars() (cumulative []uint64, upperBounds []float64, sum float64, count uint64, exemplars []Exemplar) {
+	cumulative, upperBounds, sum, count = h.Snapshot()
+	h.exemplarMu.Lock()
+	exemplars = make([]Exemplar, len(h.exemplars))
+	copy(exemplars, h.exemplars)
+	h.exemplarMu.Unlock()
 	return
 }
 

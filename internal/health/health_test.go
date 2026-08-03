@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/testutil"
 )
 
 // flakyServer is an httptest.Server whose /api/tags and /api/chat endpoints
@@ -515,13 +517,10 @@ func TestRecordFailureBackoffCapsAtMax(t *testing.T) {
 // the err field entirely when err is nil (issue #697).
 func TestRecordFailureNilErrOmitsErrField(t *testing.T) {
 	// Redirect the default slog logger into an in-memory buffer so we
-	// can assert on the rendered output, then restore the original at
-	// exit to avoid leaking state into sibling tests.
-	orig := slog.Default()
-	defer slog.SetDefault(orig)
-
+	// can assert on the rendered output. The shared, mutex-serialized
+	// helper restores the original at exit (issue #1138).
 	var buf bytes.Buffer
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	testutil.SetDefault(t, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	srv := newFlakyServer()
 	defer srv.Close()

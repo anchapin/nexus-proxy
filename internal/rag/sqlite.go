@@ -22,11 +22,11 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-// ragSchema is the v2 schema for the few-shot cache table. One row
-// per indexed file; filename is the natural primary key because the
-// file watcher (issue #46) addresses rows by basename. The embedding
-// blob is a gob-encoded []float64 — no third-party serialization
-// dependency needed.
+// ragSchema is the current schema for the few-shot cache table. The
+// composite PRIMARY KEY (filename, chunk_index) supports chunked
+// retrieval (issue #1168): large files are split into overlapping
+// token-sized chunks, each stored as a separate row. chunk_index 0
+// is the whole file (or the first chunk when chunking is active).
 //
 // indexed_at is informational (helps operators see when a row was
 // last refreshed); the authoritative freshness signal is the file's
@@ -37,21 +37,23 @@ import (
 // can detect a changed embedder and refuse to serve stale vectors.
 const ragSchema = `
 CREATE TABLE IF NOT EXISTS rag_examples (
-    filename TEXT PRIMARY KEY,
+    filename TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL DEFAULT 0,
     content TEXT NOT NULL,
     embedding BLOB NOT NULL,
     indexed_at DATETIME NOT NULL,
     embedder_model TEXT NOT NULL DEFAULT '',
     dims INTEGER NOT NULL DEFAULT 0,
-    hnsw_index BLOB
+    hnsw_index BLOB,
+    PRIMARY KEY (filename, chunk_index)
 );
 CREATE INDEX IF NOT EXISTS idx_rag_indexed_at ON rag_examples(indexed_at);
 `
 
 const ragUpsertSQL = `INSERT INTO rag_examples
-    (filename, content, embedding, indexed_at, embedder_model, dims)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(filename) DO UPDATE SET
+    (filename, chunk_index, content, embedding, indexed_at, embedder_model, dims)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(filename, chunk_index) DO UPDATE SET
         content = excluded.content,
         embedding = excluded.embedding,
         indexed_at = excluded.indexed_at,
@@ -60,8 +62,8 @@ const ragUpsertSQL = `INSERT INTO rag_examples
 
 const ragDeleteSQL = `DELETE FROM rag_examples WHERE filename = ?`
 
-const ragSelectAllSQL = `SELECT filename, content, embedding, indexed_at, embedder_model, dims, hnsw_index
-    FROM rag_examples ORDER BY filename`
+const ragSelectAllSQL = `SELECT filename, chunk_index, content, embedding, indexed_at, embedder_model, dims, hnsw_index
+    FROM rag_examples ORDER BY filename, chunk_index`
 
 // ragOpTimeout bounds a single DB op. The table is small and the
 // read is one-shot on boot, so the timeout only guards a
@@ -70,12 +72,53 @@ const ragOpTimeout = 5 * time.Second
 
 const ragSchemaVersionSQL = `CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)`
 
-const currentSchemaVersion = 3
+const currentSchemaVersion = 4
+
+// ragMigrationV4 recreates rag_examples with a composite PRIMARY KEY
+// (filename, chunk_index) for chunked RAG retrieval (issue #1168).
+// SQLite cannot ALTER TABLE to change a PRIMARY KEY, so we use the
+// create-copy-drop-rename dance. This is stored as a function rather
+// than a plain string because it requires multiple Exec calls (the
+// database/sql ExecContext interface only guarantees execution of a
+// single statement per call).
+func ragMigrationV4(ctx context.Context, db *sql.DB) error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS rag_examples_new (
+    filename TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL DEFAULT 0,
+    content TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    indexed_at DATETIME NOT NULL,
+    embedder_model TEXT NOT NULL DEFAULT '',
+    dims INTEGER NOT NULL DEFAULT 0,
+    hnsw_index BLOB,
+    PRIMARY KEY (filename, chunk_index)
+)`,
+		`INSERT INTO rag_examples_new (filename, chunk_index, content, embedding, indexed_at, embedder_model, dims, hnsw_index)
+    SELECT filename, 0, content, embedding, indexed_at, embedder_model, dims, hnsw_index FROM rag_examples`,
+		`DROP TABLE rag_examples`,
+		`ALTER TABLE rag_examples_new RENAME TO rag_examples`,
+		`CREATE INDEX IF NOT EXISTS idx_rag_indexed_at ON rag_examples(indexed_at)`,
+	}
+	for _, s := range stmts {
+		if _, err := db.ExecContext(ctx, s); err != nil {
+			return fmt.Errorf("rag: migrate v4 statement failed: %w", err)
+		}
+	}
+	return nil
+}
+
+// ragMigrationFunc is nil for plain-string migrations (v0–v2); set for
+// migrations that require multiple DDL statements (v3→v4, issue #1168).
+var ragMigrationFuncs = map[int]func(context.Context, *sql.DB) error{
+	3: ragMigrationV4,
+}
 
 var ragMigrations = []string{
 	`ALTER TABLE rag_examples ADD COLUMN embedder_model TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE rag_examples ADD COLUMN dims INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE rag_examples ADD COLUMN hnsw_index BLOB`,
+	``, // v3→v4: handled by ragMigrationV4 function (issue #1168)
 }
 
 // wrapCorruptErr wraps sqlite3 errors with a descriptive message when the
@@ -138,6 +181,17 @@ runMigrations:
 	}
 
 	for i := version; i < currentSchemaVersion; i++ {
+		// Check for a function-based migration first (issue #1168 v3→v4).
+		if fn, ok := ragMigrationFuncs[i]; ok {
+			if err := fn(ctx, db); err != nil {
+				return err
+			}
+			version = i + 1
+			if _, err := db.ExecContext(ctx, "UPDATE schema_version SET version = ?", version); err != nil {
+				return fmt.Errorf("rag: record schema version: %w", err)
+			}
+			continue
+		}
 		migration := ragMigrations[i]
 		const maxRetries = 3
 		var migrationErr error
@@ -347,6 +401,7 @@ func (p *PersistentStore) Load(ctx context.Context) (int, error) {
 	for rows.Next() {
 		var (
 			name        string
+			chunkIndex  int
 			content     string
 			embBlob     []byte
 			indexedAt   time.Time
@@ -354,7 +409,7 @@ func (p *PersistentStore) Load(ctx context.Context) (int, error) {
 			storedDims  int
 			hnswBlob    []byte
 		)
-		if err := rows.Scan(&name, &content, &embBlob, &indexedAt, &storedModel, &storedDims, &hnswBlob); err != nil {
+		if err := rows.Scan(&name, &chunkIndex, &content, &embBlob, &indexedAt, &storedModel, &storedDims, &hnswBlob); err != nil {
 			return 0, fmt.Errorf("rag: scan %q: %w", name, err)
 		}
 		if hnswIndexBlob == nil && len(hnswBlob) > 0 {
@@ -388,9 +443,10 @@ func (p *PersistentStore) Load(ctx context.Context) (int, error) {
 			break
 		}
 		out = append(out, FewShotExample{
-			Filename:  name,
-			Content:   content,
-			Embedding: emb,
+			Filename:   name,
+			ChunkIndex: chunkIndex,
+			Content:    content,
+			Embedding:  emb,
 		})
 		if indexedAt.After(lastIndexedAt) {
 			lastIndexedAt = indexedAt
@@ -458,6 +514,10 @@ func (p *PersistentStore) LoadOrIndex(ctx context.Context, dir string) (int, err
 // logic). When batchSize == 0, each file is embedded individually via
 // Embed.
 //
+// When the embedded Store is configured with WithRecursive(true)
+// (issue #1149), filepath.WalkDir descends into all subdirectories
+// and file paths are stored relative to dir.
+//
 // Security: symlinks are skipped (issue #107) to prevent confidentiality
 // leaks via injected few-shot examples.
 func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
@@ -472,59 +532,23 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 		return nil
 	}
 
-	safeDir, err := resolveDir(dir)
+	_, validFiles, err := collectIndexFiles(dir, p.Store.recursive)
 	if err != nil {
 		return err
 	}
 
-	files, err := os.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("rag: read examples dir %q: %w", dir, err)
-	}
-
-	type fileInfo struct {
-		name    string
-		content string
-	}
-	var validFiles []fileInfo
-
-	for _, f := range files {
-		if f.IsDir() {
-			continue
+	if p.Store.fileFilter != nil {
+		filtered := validFiles[:0]
+		for _, f := range validFiles {
+			if p.Store.fileFilter.ShouldIndex(f.relPath) {
+				filtered = append(filtered, f)
+			} else {
+				slog.Debug("rag: skipping file filtered by extension/pattern (issue #1148)",
+					slog.String("filename", f.relPath),
+				)
+			}
 		}
-		if isSymlink(f) {
-			slog.Warn("rag: skipping symlink in examples dir (issue #107)",
-				slog.String("filename", f.Name()),
-				slog.String("dir", dir),
-			)
-			continue
-		}
-		path := filepath.Join(dir, f.Name())
-		resolved, err := filepath.EvalSymlinks(path)
-		if err != nil {
-			slog.Error("rag: cannot resolve path, skipping",
-				slog.String("filename", f.Name()),
-				slog.Any("err", err),
-			)
-			continue
-		}
-		if !verifyInsideDir(safeDir, resolved) {
-			slog.Warn("rag: skipping file that escapes examples dir (issue #107)",
-				slog.String("filename", f.Name()),
-				slog.String("resolved", resolved),
-				slog.String("base", safeDir),
-			)
-			continue
-		}
-		content, err := os.ReadFile(path)
-		if err != nil {
-			slog.Error("rag read file",
-				slog.String("filename", f.Name()),
-				slog.Any("err", err),
-			)
-			continue
-		}
-		validFiles = append(validFiles, fileInfo{name: f.Name(), content: string(content)})
+		validFiles = filtered
 	}
 
 	if p.Store.batchSize > 0 && len(validFiles) > 0 {
@@ -534,15 +558,26 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 				end = len(validFiles)
 			}
 			batch := validFiles[i:end]
-			texts := make([]string, len(batch))
-			for j, fi := range batch {
-				texts[j] = fi.content
+			// Expand files into chunks (issue #1168).
+			var chunkTexts []string
+			var chunkMeta []struct {
+				name string
+				dir  string
+				idx  int
 			}
-			embs, err := p.embedder.EmbedBatch(ctx, texts)
+			for _, fi := range batch {
+				chunks := chunkFile(fi.content, p.Store.chunkTokens)
+				for _, c := range chunks {
+					chunkTexts = append(chunkTexts, c.Content)
+					chunkMeta = append(chunkMeta, struct {
+						name string
+						dir  string
+						idx  int
+					}{fi.relPath, fi.dir, c.Index})
+				}
+			}
+			embs, err := p.embedder.EmbedBatch(ctx, chunkTexts)
 			if err != nil {
-				// Partial batch: entries were upserted to DB but the HNSW
-				// index was not invalidated via upsertExample. Invalidate it
-				// so Retrieve falls back to brute-force.
 				p.mu.Lock()
 				p.index = nil
 				p.mu.Unlock()
@@ -553,14 +588,16 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 				)
 				continue
 			}
-			for j, fi := range batch {
+			for j := range chunkTexts {
 				if err := p.Upsert(ctx, FewShotExample{
-					Filename:  fi.name,
-					Content:   fi.content,
-					Embedding: embs[j],
+					Filename:   chunkMeta[j].name,
+					Dir:        chunkMeta[j].dir,
+					Content:    chunkTexts[j],
+					Embedding:  embs[j],
+					ChunkIndex: chunkMeta[j].idx,
 				}); err != nil {
 					slog.Warn("rag: embed batch upsert failed",
-						slog.String("filename", fi.name),
+						slog.String("filename", chunkMeta[j].name),
 						slog.Any("err", err),
 					)
 					p.mu.Lock()
@@ -568,31 +605,35 @@ func (p *PersistentStore) IndexDir(ctx context.Context, dir string) error {
 					p.mu.Unlock()
 					continue
 				}
-				slog.Info("rag indexed", slog.String("filename", fi.name))
 			}
 		}
 	} else {
 		for _, fi := range validFiles {
-			emb, err := p.embedder.Embed(ctx, fi.content)
-			if err != nil {
-				slog.Error("rag embed file",
-					slog.String("filename", fi.name),
-					slog.Any("err", err),
-				)
-				continue
+			chunks := chunkFile(fi.content, p.Store.chunkTokens)
+			for _, c := range chunks {
+				emb, err := p.embedder.Embed(ctx, c.Content)
+				if err != nil {
+					slog.Error("rag embed file",
+						slog.String("filename", fi.relPath),
+						slog.Any("err", err),
+					)
+					continue
+				}
+				if err := p.Upsert(ctx, FewShotExample{
+					Filename:   fi.relPath,
+					Dir:        fi.dir,
+					Content:    c.Content,
+					Embedding:  emb,
+					ChunkIndex: c.Index,
+				}); err != nil {
+					slog.Error("rag persist file",
+						slog.String("filename", fi.relPath),
+						slog.Any("err", err),
+					)
+					continue
+				}
 			}
-			if err := p.Upsert(ctx, FewShotExample{
-				Filename:  fi.name,
-				Content:   fi.content,
-				Embedding: emb,
-			}); err != nil {
-				slog.Error("rag persist file",
-					slog.String("filename", fi.name),
-					slog.Any("err", err),
-				)
-				continue
-			}
-			slog.Info("rag indexed", slog.String("filename", fi.name))
+			slog.Info("rag indexed", slog.String("filename", fi.relPath))
 		}
 	}
 
@@ -614,6 +655,11 @@ func (p *PersistentStore) Upsert(ctx context.Context, ex FewShotExample) error {
 	if len(ex.Embedding) == 0 {
 		return fmt.Errorf("rag: empty embedding for %q", ex.Filename)
 	}
+	// Semantic deduplication (issue #1243): skip chunks that are too
+	// similar to already-indexed ones.
+	if p.isDuplicate(ex.Dir, ex.Embedding) {
+		return nil
+	}
 	blob, err := encodeEmbedding(ex.Embedding)
 	if err != nil {
 		return fmt.Errorf("rag: encode embedding %q: %w", ex.Filename, err)
@@ -624,7 +670,7 @@ func (p *PersistentStore) Upsert(ctx context.Context, ex FewShotExample) error {
 
 	indexedAt := time.Now().UTC()
 	if _, err := p.db.ExecContext(cctx, ragUpsertSQL,
-		ex.Filename, ex.Content, blob, indexedAt, p.embedderModel, len(ex.Embedding),
+		ex.Filename, ex.ChunkIndex, ex.Content, blob, indexedAt, p.embedderModel, len(ex.Embedding),
 	); err != nil {
 		return fmt.Errorf("rag: upsert %q: %w", ex.Filename, err)
 	}

@@ -1022,3 +1022,46 @@ func TestRunModelsEndpointAllModelsPresentIsPass(t *testing.T) {
 		t.Errorf("models_endpoint = %s (detail=%s), want pass", got.Status, got.Detail)
 	}
 }
+
+// --- pprof_endpoint tests (issue #1150) -----------------------------------
+
+func TestRunPprofEndpointDisabledIsPass(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.DebugPprofEnabled = false
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkPprofEndpoint)
+	if got.Status != StatusPass {
+		t.Errorf("pprof_endpoint = %s, want pass (disabled)", got.Status)
+	}
+}
+
+func TestRunPprofEndpointLoopbackIsWarn(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.DebugPprofEnabled = true
+	cfg.DebugPprofAPIKey = ""
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkPprofEndpoint)
+	if got.Status != StatusWarn {
+		t.Errorf("pprof_endpoint = %s, want warn (loopback-only)", got.Status)
+	}
+}
+
+func TestRunPprofEndpointAPIKeyIsPass(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.DebugPprofEnabled = true
+	cfg.DebugPprofAPIKey = "debug-secret"
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkPprofEndpoint)
+	if got.Status != StatusPass {
+		t.Errorf("pprof_endpoint = %s, want pass (api-key gated)", got.Status)
+	}
+	if !strings.Contains(got.Detail, "API-key") {
+		t.Errorf("pprof_endpoint detail should mention API-key: %s", got.Detail)
+	}
+}

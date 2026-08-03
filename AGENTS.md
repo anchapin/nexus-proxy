@@ -1,6 +1,7 @@
 # Nexus Proxy — Agent Guide
 
-Hardware-aware AI routing gateway in Go. Intercepts OpenAI-compatible
+Hardware-aware AI routing gateway in Go (module
+`github.com/anchapin/nexus-proxy`). Intercepts OpenAI-compatible
 `/v1/chat/completions`, optimizes prompts (TOON compression, RAG,
 meta-prompting), and routes to local Ollama or a frontier API based
 on complexity.
@@ -17,7 +18,7 @@ make test-race      # race detector — required to merge
 make lint           # golangci-lint v2.12.2
 make fmt            # gofmt -w (in place)
 make bench-baseline # regenerate bench/baseline.txt for benchstat (issue #1186)
-make ci             # vet + build + check + test + test-race + lint + bench-short
+make ci             # vet + build + test + test-race + lint
 ```
 
 `go run ./cmd/nexus` also works. **Go 1.26** (CI pin); `go.mod` declares 1.25.
@@ -25,10 +26,14 @@ make ci             # vet + build + check + test + test-race + lint + bench-shor
 **Coverage floor is 70%** — CI fails if total drops below `COVERAGE_THRESHOLD`.
 Per-package numbers print for visibility; only the total gates.
 
-**CI runs four jobs** (`.github/workflows/ci.yml`): `test` (vet → build →
+**CI runs seven jobs** (`.github/workflows/ci.yml`): `test` (vet → build →
 `go test -race -coverprofile=coverage.txt -covermode=atomic ./...` + coverage
 gate), `bench` (non-blocking `bench-short`, `continue-on-error: true`),
-`lint` (`golangci-lint-action@v9`, golangci-lint **v2.12.2**), and `docker`
+`bench-regression` (benchstat comparison against `bench/baseline.txt`, posts
+PR comment, `continue-on-error: true` — issue #1186), `lint`
+(`golangci-lint-action@v9`, golangci-lint **v2.12.2**), `fuzz` (non-blocking
+Go native fuzz smoke on TOON compression, DSL regex, and RAG similarity —
+issue #1161), and `docker`
 (smoke `make docker-build` — catches Dockerfile↔go.mod Go-version drift,
 issue #541). `make ci` is a local convenience wrapper; CI does not invoke it.
 
@@ -37,8 +42,13 @@ ignore `errcheck` on `fmt.Fprint*` writes intentionally — write errors cannot 
 after headers are committed (issue #276). `resp.Body.Close`, `rows.Close`, `stmt.Close`
 are also excluded in non-critical paths.
 
-**Subcommands** (`cmd/nexus/main.go` dispatches on `os.Args[1]`; no args =
+**Subcommands** (`cmd/nexus/dispatch.go` dispatches on `os.Args[1]`; no args =
 start the proxy):
+- `nexus init` — interactive config wizard (issue #1156). Detects Ollama,
+  validates the frontier key, picks a routing profile preset, and writes
+  `.env` (or `config.yaml` when `NEXUS_CONFIG_FILE` is set).
+  `--non-interactive` writes from `NEXUS_INIT_PROFILE` without prompting.
+  Implementation: `cmd/nexus/init.go`.
 - `nexus check` (alias `nexus doctor`) — boot-time diagnostic suite. Exits
   **0 when every check passes** (warn/skip are fine), **1 when at least one
   fails**. `--json` for machine-readable output. Guarded by
@@ -48,9 +58,6 @@ start the proxy):
 - `nexus config migrate <file>` — rewrite deprecated env-var/YAML keys to
   current names in place (writes a `.bak` backup). Uses the compile-time
   registry in `internal/config/deprecations.go` (issue #1180).
-- `nexus config show` — print resolved config (env + file merged).
-  `--json` for machine-readable output, `--reloadable` for hot-reloadable
-  vars only, `--diff <file>` to compare against a YAML file (issue #1237).
 - `nexus dashboard` — daily savings summary view.
 - `nexus --version` (`-v` / `version`) — build version (`dev` unless
   `-ldflags -X main.version=...` overrides it; Makefile + release.yml set it).
@@ -63,14 +70,16 @@ start the proxy):
 ```
 cmd/nexus/              # main: wires config → middleware → handlers → HTTP server
 internal/
+  audit/               # request/response audit logging
   auth/                 # inbound API-key middleware
   budget/               # 24h rolling frontier spend cap
   circuit/              # local-route cooldown after cascade failure (issue #80)
   concurrencylimit/     # VRAM-aware local-route semaphore
   config/               # Load() (env parsing) + LoadYAML() (file + env override)
   diag/                  # boot-time diagnostics (nexus check / nexus doctor)
+  e2e/                  # end-to-end test helpers
   handlers/             # chat.go + health.go + recover/security/sanitize
-  health/               # Ollama circuit breaker (separate from internal/circuit)
+  health/               # Ollama circuit breaker + frontier health poller (issue #1158)
   ioutils/              # shared io helpers (decompression, etc.)
   judge/                # async LLM-as-a-judge (sampled local completions)
   metrics/              # SQLite metrics store → savings dashboard
@@ -82,7 +91,9 @@ internal/
   rag/                  # PersistentStore (SQLite) + Store + Watcher + embedders
   ratelimit/            # ClientIPResolver + HTTP middleware (NOT in middleware/)
   router/               # Guardrail → DSL → SLM.Decide routing pipeline
+  secrets/              # secret scanning / redaction
   telemetry/            # Recorder interface + JSONLRecorder
+  testutil/             # shared test helpers
   tokenizer/            # tiktoken wrapper (single shared instance)
   tracing/              # W3C trace context + OTLP/JSON exporter
   tracingtest/          # test helpers for the tracing package
@@ -109,10 +120,27 @@ success. Separate from the Ollama health breaker that governs chat routing.
 when > 0, `getSemantic` stops scanning after examining this many entries,
 bounding O(n) cosine similarity to a cap. Default 0 = unlimited.
 
+**Arbiter cache pre-warming** (`NEXUS_CACHE_WARM_ON_BOOT`, default false):
+when true, the proxy queries the SQLite metrics store on boot for recent
+arbiter syntheses still within `NEXUS_ARBITER_CACHE_TTL` and loads them
+into the arbiter cache, cutting cold-start latency (issue #1176).
+`NEXUS_CACHE_WARM_LIMIT` (default 256) caps how many entries are queried.
+Exposes `nexus_cache_warmed_entries` gauge on `/metrics`.
+
 **Models discovery endpoint** (`GET /v1/models`): served when
 `NEXUS_MODELS_ENDPOINT=true` (default). Lists configured local/router/frontier
 models plus cached Ollama `/api/tags` results (TTL: `NEXUS_MODELS_CACHE_TTL`,
 default 5m). Set `NEXUS_MODELS_ENDPOINT=false` to disable entirely.
+
+**Model aliasing** (issue #1184): `NEXUS_MODEL_ALIASES` is a JSON map
+(`{"gpt-4":"anthropic/claude-3-5-sonnet"}`) that translates
+client-requested model names to `"providerName/upstreamModel"`. When a
+request's `model` field matches an alias, the proxy rewrites the body
+model and routes directly to the target provider (bypassing the SLM
+routing pipeline). The `providerName` must match a provider registered
+via `NEXUS_FRONTIER_PROVIDERS`. Aliases are surfaced in
+`GET /v1/models` (owned_by: `"alias"`). `NEXUS_MODEL_ALIASES_STRICT=true`
+rejects unknown models with HTTP 400; default false passes through.
 
 **Distributed tracing config**: `NEXUS_TRACING_ENDPOINT` enables OTLP/JSON export.
 Tune with `NEXUS_TRACING_TIMEOUT` (default 10s), `NEXUS_TRACING_MAX_RETRIES` (3),
@@ -123,12 +151,13 @@ Tune with `NEXUS_TRACING_TIMEOUT` (default 10s), `NEXUS_TRACING_MAX_RETRIES` (3)
 
 ## Routing pipeline
 
-`internal/router`: Guardrail → DSL → SLM.Decide. Every failure defaults
-to **frontier** (safe choice).
+`internal/router`: Guardrail → Budget → DSL → SLM.Decide. Every failure
+defaults to **frontier** (safe choice).
 
 | Trigger | Route |
 | ------- | ----- |
 | `len(prompt)/4 > NEXUS_TOKEN_GUARDRAIL` | `frontier` (VRAM guardrail) |
+| Estimated frontier cost > remaining 24h budget (issue #1163) | `local` (budget down-tier) |
 | Prompt matches `NEXUS_DSL_FUSION_PATTERNS` (default: `architectural design\|system architecture`) | `fusion` |
 | Prompt matches `NEXUS_DSL_FORMATTING_PATTERNS` (default: `css\|format\|docstring\|lint\|typo\|boilerplate\|debug\|fix bug\|git commit\|sql query\|parse json\|validate input\|regex\|api endpoint\|test\|optimize\|readme`) | `local` |
 | Prompt matches `NEXUS_DSL_LOCAL_PATTERNS` (default: `refactor\|security scan\|generate tests\|explain this code\|performance analysis`) | `local` |
@@ -146,12 +175,28 @@ DSL patterns are **comma-separated regexes** (set via env var, not a map).
 
 **SLM decision cache:** `NEXUS_SLM_CACHE_MAX_ENTRIES` + `NEXUS_SLM_CACHE_TTL`
 (default 512 entries / 30s). Set `NEXUS_SLM_CACHE_TTL=0` to disable.
+
+**Conversation context** (issue #1147): the planner prepends a bounded
+summary of prior conversation turns to the prompt for DSL matching, SLM
+calls, and cache keys. This prevents misrouting of terse multi-turn
+follow-ups (e.g. "fix it" inherits "system architecture" from a prior
+turn → fusion). Controlled by `NEXUS_ROUTING_CONTEXT_TURNS` (default 3,
+max 10; 0 disables — byte-for-byte pre-#1147 behaviour) and
+`NEXUS_ROUTING_CONTEXT_CHARS` (default 2000). The guardrail stage uses
+the latest prompt alone so conversation history never inflates the VRAM
+ceiling.
 Semantic dedup via `NEXUS_SLMCACHE_SIMILARITY_THRESHOLD` (range 0..1).
 
 **Fusion progressive delivery** (`NEXUS_FUSION_PROGRESSIVE=true`, default):
 panels race local + frontier, stream the faster as speculative SSE, and
 only invoke the arbiter when Jaccard similarity < `NEXUS_FUSION_AGREEMENT_THRESHOLD`
 (default 0.85).
+
+**Fusion per-member timeouts** (issue #1164): `NEXUS_FUSION_LOCAL_TIMEOUT`
+(default 90s) and `NEXUS_FUSION_FRONTIER_TIMEOUT` (default 30s) give each
+panel member an independent deadline. When either is unset/zero the code
+falls back to `NEXUS_FUSION_TIMEOUT` (default 120s). A boot warning fires
+when `LOCAL_TIMEOUT < FRONTIER_TIMEOUT`.
 
 **Arbiter synthesis cache** (`NEXUS_ARBITER_CACHE_TTL`, default 5m): when > 0, arbiter
 responses are cached keyed by a hash of both panel members' content. Set to 0
@@ -191,18 +236,32 @@ breaker after `NEXUS_HEALTH_BREAKER_THRESHOLD` (default 3) failed probes:
 
 Set `NEXUS_HEALTH_POLL_INTERVAL=0` to disable the poller.
 
+## Frontier provider health probing (issue #1158)
+
+A background poller (`internal/health/frontier.go`) mirrors the Ollama
+health poller for frontier API providers. It periodically sends a
+lightweight probe (`GET <BaseURL>/models`) to each registered provider,
+tracks consecutive failures, and maintains a per-provider circuit
+breaker.
+
+- `NEXUS_FRONTIER_HEALTH_POLL_INTERVAL` (default 60s): poll cadence; 0 disables
+- `NEXUS_FRONTIER_HEALTH_BREAKER_THRESHOLD` (default 3): consecutive failures
+  before a provider's circuit opens
+- `NEXUS_FRONTIER_HEALTH_TIMEOUT` (default 5s): per-probe HTTP timeout
+- The `ProviderSelector` consults the per-provider circuit state via the
+  `providers.HealthChecker` interface to skip providers whose circuit is open
+- Circuit recloses on the next successful probe (same semantics as Ollama breaker)
+- `/healthz` surfaces per-frontier-provider circuit state in the JSON body
+- `/status` includes a `frontier_health` section with per-provider details
+- Prometheus counters: `nexus_frontier_probe_total{provider,result}`,
+  `nexus_frontier_circuit_open_total{provider}`
+
 ## Trusted-proxy client-IP resolution (issue #75)
 
 `internal/ratelimit.ClientIPResolver` is the single source of truth.
 `X-Forwarded-For` / `X-Real-IP` are honoured **only** when the direct
 TCP peer is in `NEXUS_TRUSTED_PROXIES` CIDR allowlist. Empty =
 trust nobody (safe default). **Invalid CIDR fails boot** (not silent).
-
-**Inbound IP allowlist** (`NEXUS_ALLOW_CIDRS`, issue #1240): when set,
-only clients whose IP falls within at least one CIDR are permitted; all
-others receive HTTP 403. For air-gapped/local-only deployments. Empty
-(default) disables. `NEXUS_ALLOW_CIDRS_STRICT` (default false) controls
-whether `/healthz` and `/metrics` are exempt from the allowlist.
 
 ## TOON compression (issue #123)
 
@@ -223,6 +282,12 @@ A second pass handles bare/prose-embedded arrays of ≥2 objects. Set
 full embed if DB is empty). `Watcher` reconciles on mtime+size changes.
 Set `NEXUS_RAG_DB=` to disable persistence (legacy in-memory path).
 
+**Recursive subdirectory indexing** (`NEXUS_RAG_RECURSIVE`, default `false`, issue #1149):
+when `true`, `IndexDir` and the `Watcher` use `filepath.WalkDir` to descend into
+all subdirectories. File paths are stored relative to the root (e.g.
+`internal/handlers/chat.go`) to avoid primary-key collisions when multiple
+directories contain files with the same name. Symlinks are still skipped (issue #107).
+
 **RAG embedder is pluggable** (`NEXUS_EMBEDDER_TYPE`): `ollama` (default),
 `openai`, or `cohere`.
 
@@ -231,15 +296,20 @@ Set `NEXUS_RAG_DB=` to disable persistence (legacy in-memory path).
 Async LLM-as-a-judge samples ~10% of `RouteLocal` completions and scores
 them 1–5 via a frontier endpoint. Disabled when `NEXUS_JUDGE_SAMPLE_RATE <= 0`.
 
-**Adaptive judge sampling** (`NEXUS_JUDGE_ADAPTIVE_ENABLED`, default false, issue #1232):
-when enabled, the sample rate adapts based on historical quality scores —
-high-confidence periods reduce sampling to save frontier calls; low-confidence
-periods increase it to catch regressions early.
-
 **Judge-guided adaptive routing** (`NEXUS_ROUTING_CONFIDENCE_DB`):
 historical scores aggregated by task category feed back to the SLM as a
 confidence signal. Dormant when judge is off — routing is byte-for-byte
 identical to non-adaptive path.
+
+**RAG-vs-judge quality correlation** (issue #1167): each `JudgeScore`
+carries `RAGInjected bool` and `RAGSimilarity float64` populated from
+the chat handler's RAG state. The `Evaluator.SetScoreCallback` hook
+feeds these into Prometheus metrics
+(`nexus_rag_judge_score_sum{injected}` /
+`nexus_rag_judge_score_count{injected}`) so operators can compute the
+average judge score for RAG-injected vs non-injected requests. SQLite
+columns `rag_injected` / `rag_similarity` persist the data for offline
+analysis. Dormant when judge is off.
 
 ## Request body and response guards
 
@@ -265,11 +335,6 @@ Handler: handlers.SecurityHeaders(cfg.TLSEnabled)(handlers.Recover(handlerPanicO
 
 HSTS is only emitted when `cfg.TLSEnabled` is true. Default false: a
 stock plaintext bind must not advertise HSTS.
-
-**Inbound mTLS** (`NEXUS_TLS_CLIENT_CA_FILE`, issue #1241): when set,
-the proxy requires and verifies client certificates using the specified CA
-PEM file. The verified certificate's CN is surfaced via `X-Nexus-Client-CN`
-in logs and audit records. Requires `NEXUS_TLS_ENABLED=true`.
 
 `internal/middleware/security.go` does not exist — do not add it.
 `internal/middleware` is intentionally net/http-free. Any response-header
@@ -307,6 +372,7 @@ flagged regardless of this setting.
 - `nexus_health_circuit_*` — Ollama circuit breaker state transitions
 - `nexus_rag_circuit_*` — RAG embedder circuit breaker state transitions
 - `nexus_upstream_*` — per-route/upstream counters and histograms
+- `nexus_route_budget_downtier_total` — requests down-tiered to local because the frontier budget was exhausted (issue #1163)
 
 See `docs/observability-surface.md` for the full metric reference.
 
@@ -320,6 +386,24 @@ body preview capped at `NEXUS_DEBUG_BODY_BYTES` (default 512).
 **Distributed tracing** (`NEXUS_TRACING_ENDPOINT`): OTLP/JSON exporter.
 See `docs/tracing.example.md` for setup.
 
+**Runtime profiling** (`NEXUS_DEBUG_PPROF_ENABLED`, issue #1150):
+registers `net/http/pprof` and `expvar` under `/debug/pprof/*` and
+`/debug/vars` on the unprotected mux. When `NEXUS_DEBUG_PPROF_API_KEY`
+is set, requests require a matching Bearer token (401 otherwise); when
+empty, only loopback peers are served (403 for non-loopback). Default
+false. `nexus check` reports the exposure mode in `pprof_endpoint`.
+
+## Adaptive cascade timeout (issue #1175)
+
+The cascade per-attempt timeout scales with prompt token count instead of
+a fixed value: `effective = clamp(floor + per1k * tokens/1000, floor, ceiling)`.
+- `NEXUS_CASCADE_TIMEOUT_FLOOR` (default 5s): minimum per-attempt timeout.
+- `NEXUS_CASCADE_TIMEOUT_CEILING` (default 120s): maximum per-attempt timeout.
+- `NEXUS_CASCADE_TIMEOUT_PER_1K_TOKENS` (default 1500ms): additive per-1k
+  estimated prompt tokens. Set `<=0` to disable adaptive scaling and revert to
+  the fixed `NEXUS_CASCADE_TIMEOUT` (default 30s). Prompt tokens are estimated
+  via the shared `internal/tokenizer` (tiktoken cl100k_base).
+
 ## Provider selector (issue #45)
 
 The multi-provider registry picks the cheapest provider based on observed
@@ -328,6 +412,74 @@ latency + cost. Tunable via `NEXUS_SELECTOR_WINDOW` (look-back window),
 `NEXUS_SELECTOR_REFRESH` (recompute cadence), and `NEXUS_PROVIDER_TAIL_WEIGHT`
 (P95 blend factor, range 0–1). When multiple providers are registered via
 `NEXUS_PROVIDERS`, the legacy `NEXUS_FRONTIER_*` vars are ignored.
+
+**Provider configuration surfaces** (issue #1159) — two mutually exclusive
+ways to populate the frontier `ProviderRegistry`, wired in
+`cmd/nexus/server.go` via `providers.LoadProviderRegistry()`:
+1. `NEXUS_PROVIDERS` + per-provider `NEXUS_PROVIDER_<NAME>_*` env vars
+   (richer: priority ordering, input/output cost split, max tokens). Takes
+   precedence when set. Parsing lives in `providers.LoadFromEnv`/`ToConfig`.
+2. `NEXUS_FRONTIER_PROVIDERS` (JSON array) — the `ParseProvidersFromEnv`
+   path. Used as the fallback when `NEXUS_PROVIDERS` is unset.
+
+Setting **both** fails boot with a clear "mutually exclusive" error. When
+neither is set, the config layer's legacy `NEXUS_FRONTIER_*` / `NEXUS_ZAI_*`
+vars apply (the `Config.FrontierProviders()` accessor). A declared
+`NEXUS_PROVIDERS` entry missing a required `NEXUS_PROVIDER_<NAME>_URL` /
+`_MODEL` fails boot with a field-named error.
+
+## Provider adapter interface (issue #1185)
+
+`internal/providers/adapter.go` defines a `ProviderAdapter` that translates
+between the proxy's canonical OpenAI request/response shape and a
+non-OpenAI provider's native API. The proxy's hot path always speaks
+OpenAI internally; the adapter is the single place that knows the
+provider's auth headers, request path, request-body schema, and SSE
+event shape.
+
+- Methods: `AuthHeaders(apiKey)`, `RequestPath(baseURL)`,
+  `TransformRequest(body)`, `NormalizeSSE(io.Reader) io.Reader`.
+- `NewAdapter(type)` resolves the type (default `openai` is a byte-for-byte
+  no-op so the existing OpenAI path is unchanged); unknown types error.
+- Allowed types: `openai`, `anthropic`, `azure`, `gemini`
+  (`providers.ValidAdapterTypes()`).
+- Per-provider selection: `NEXUS_PROVIDER_<NAME>_TYPE` (env) or the
+  `type` field on a YAML `providers:` list entry.
+- The `anthropic` adapter authenticates via `x-api-key` +
+  `anthropic-version`, POSTs to `/v1/messages`, and normalises Anthropic's
+  `content_block_delta` SSE events into OpenAI `chat.completion.chunk`
+  frames.
+
+Config validation rejects an unknown `type` at boot
+(`LoadFromEnv` / `nexus config validate` both enforce the closed set).
+
+## Per-provider cost model (issue #1183)
+
+`NEXUS_COST_USE_OUTPUT_TOKENS` (default `false`) switches the per-request
+cost estimate from the legacy flat input-only rate to a per-provider
+input/output token split. When enabled, `frontierCostEstimate` looks up the
+serving provider via `ProviderRegistry.ByModel(model)` and computes
+`inputTokens*inputRate/1000 + outputTokens*outputRate/1000`, counting output
+tokens with the tiktoken tokenizer. When disabled (default), the estimate is
+byte-for-byte identical to the pre-issue-#1183 single-rate path.
+
+`NEXUS_FRONTIER_PROVIDERS` JSON entries accept `inputCostPer1K` and
+`outputCostPer1K` (the flat `costPer1K` still parses and seeds the input rate
+when the split keys are absent). `ProviderConfig` exposes
+`InputCostPer1KUSD()` / `OutputCostPer1KUSD()`; `CostPer1KUSD()` is retained
+as the selector weight. The metrics row surfaces `input_cost_usd` and
+`output_cost_usd` as distinct SQLite columns.
+
+## Frontier per-provider failover (issue #1157)
+
+When `NEXUS_FRONTIER_FAILOVER=true` (default) and more than one frontier
+provider is registered, the `route=frontier` dispatch wraps in a
+frontier-only cascade: on a retryable failure (5xx, timeout, connection
+reset) the next provider is tried before returning an error. The cascade
+reuses `upstream.Cascade.Run` (streaming) and `Cascade.RunBuffered`
+(non-streaming). `NEXUS_FRONTIER_FAILOVER_MAX_ATTEMPTS` (default 3) caps
+the number of providers tried. Set `NEXUS_FRONTIER_FAILOVER=false` to
+restore single-endpoint behaviour.
 
 ## Adding new env vars
 
@@ -356,7 +508,8 @@ For hot-reloadable knobs add the field to `ReloadHotReloadable()` in
 - `NEXUS_LOG_LEVEL`, `NEXUS_LOG_FORMAT`, `NEXUS_DEBUG`
 - `NEXUS_RATE_LIMIT_RPM`, `NEXUS_RATE_LIMIT_BURST`
 - `NEXUS_AUTH_RATE_LIMIT_RPM`, `NEXUS_AUTH_RATE_LIMIT_BURST`, `NEXUS_AUTH_RATE_LIMIT_WINDOW`
-- `NEXUS_SHUTDOWN_TIMEOUT`
+- `NEXUS_SHUTDOWN_TIMEOUT`, `NEXUS_SERVER_READ_TIMEOUT`
+- `NEXUS_BUDGET_ALERT_THRESHOLD`, `NEXUS_FUSION_AGREEMENT_THRESHOLD`, `NEXUS_TRACING_SAMPLE_RATE`
 - `NEXUS_TRUSTED_PROXIES` (issue #896 — re-parsed without restart)
 Everything else requires a full restart.
 The `env_example_audit_test.go` bidirectional test enforces that every
@@ -367,7 +520,11 @@ hot-reloadable var will fail the test.
 ## Branch conventions
 
 - **`develop`** is the default branch — base for all feature/fix branches
-- **`main`** — only as PR target from `develop` for releases
+- **`main`** — **release-only branch**. Changes land on `main` **only** via a
+  PR merged from `develop` after all CI checks pass and at least one approving
+  review. Direct pushes to `main` are blocked by branch protection (enforce_admins,
+  require_code_owner_reviews, required_status_checks). Never commit directly to
+  `main` — treat it as a read-only release artifact.
 - Naming: `fix/issue-<number>` or `feat/<short-description>`
 - **Conventional Commits:** `feat:`, `fix:`, `docs:`, etc. Reference the
   issue in the subject (e.g. `feat: resolve #123 — …`)
@@ -391,10 +548,30 @@ to record/replay HTTP calls. All tests run in <2s with `-race`.
 **Focused testing:** `go test ./internal/packagename` runs a single package.
 Prefix with `-v` for verbose output.
 
+**E2E integration tests** (issue #1160): `cmd/nexus/integration_test.go`
+exercises the full HTTP → middleware → routing → upstream → response
+pipeline through the real `buildServer` handler stack with mock Ollama
+and mock frontier upstreams. Covers local cascade, frontier stream,
+fusion, SSE streaming, security headers, auth exemption, rate-limit
+scoping, and Ollama degradation (`X-Nexus-Degraded`). Run with
+`go test -run TestE2E ./cmd/nexus/...`.
+
+**Shared handler wiring** (issue #1160): `buildHandler(inner, tlsEnabled,
+panicObs)` in `cmd/nexus/server.go` is the single source of truth for the
+outermost middleware chain (SecurityHeaders → Recover). Both `buildServer`
+(production) and integration tests construct identical wiring through this
+function.
+
 **Pre-commit hook** (`make install-hooks` once after cloning): runs `gofmt -l`
 on staged `.go` files and fails the commit if any need formatting. The hook
 lives in `.githooks/pre-commit`; `make install-hooks` sets `git
 core.hooksPath` to point at it.
+
+**Fuzz tests** (issue #1161): Go native fuzz targets run in CI (`fuzz` job,
+non-blocking). Three targets: `FuzzSerializeToTOON` (`internal/middleware`),
+`FuzzDSLRegex` (`internal/router`), `FuzzSimilarity` (`internal/rag`).
+Run locally: `go test -run='^$' -fuzz=FuzzSerializeToTOON -fuzztime=30s
+./internal/middleware/`.
 
 ## Local-route cooldown (issue #80)
 
@@ -402,15 +579,19 @@ After the cascade detects an Ollama failure and falls back, `circuit.Cooldown`
 arms a short cooldown so subsequent requests skip local and go directly to
 fallback. Set `NEXUS_LOCAL_COOLDOWN=0` to disable (pre-issue-#80 behaviour).
 
-## Additional routing and RAG knobs
+## Newer routing and RAG knobs
 
 Key knobs not covered elsewhere (verify defaults in `.env.example`):
 - **`NEXUS_SLM_CONFIDENCE_THRESHOLD`** (default 0.3): SLM decisions below this bypass DSL/SLM and go to frontier.
-- **`NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT`** (default 0 = unlimited): bounds O(n) cosine scan during semantic dedup in `getSemantic` (issue #933).
+- **`NEXUS_SLM_TOKEN_HINT`** (default true): prepends `[tokens: ~N]` to the prompt fed to the SLM so it has length context for medium-length prompts (500-2000 tokens) that sit in the gray zone between short and the guardrail. Does not affect the guardrail or any other stage; set to false to restore byte-identical pre-issue-#1233 behaviour.
+- **`NEXUS_ROUTING_CONTEXT_TURNS`** (default 3, max 10): prior conversation turns fed to the router for multi-turn context (issue #1147). 0 disables.
+- **`NEXUS_ROUTING_CONTEXT_CHARS`** (default 2000): char cap on the conversation-context window fed to the router.
+- **`NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT`** (default 0): retained for backward compat; fix for issue #1038 makes semantic dedup always scan all entries and exit early only on perfect score=1.0, so this var has no effect.
 - **`NEXUS_RAG_EMBED_CACHE_*`** (size 256, TTL 24h): LRU cache for prompt embeddings — repeat prompts skip Ollama entirely.
 - **`NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT`** (default 5s): max waiter time for concurrent in-flight Embeds; 0 = wait indefinitely (issue #800).
 - **`NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD`** (default 3): consecutive embed failures before RAG circuit trips.
 - **`NEXUS_ARBITER_CACHE_MAX_ENTRIES`** (default 512): LRU cap for arbiter synthesis cache.
+- **`NEXUS_PROBE_NVIDIA_INTERVAL`** (default 0): cadence of the periodic NVIDIA free-VRAM refresh (issue #1178). On NVIDIA-only hosts the AMD sysfs path returns nothing, so without this refresh the VRAM-aware limiter's `FreeVRAMBytes` is frozen at boot. When > 0 (e.g. `5m`), a background goroutine shells out to `nvidia-smi` and republishes the budget so the limiter adapts to model-swap / co-tenant VRAM-grab events. Missing `nvidia-smi` is a silent no-op; 0 = boot-only.
 - **`NEXUS_READINESS_MODE`** (`degraded`|`strict`): `/readyz` returns 503 in `strict` mode when Ollama is degraded or down.
 
 ## `nexus check` exit codes

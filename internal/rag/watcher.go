@@ -3,6 +3,7 @@ package rag
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -36,9 +37,12 @@ type fileSnapshot struct {
 // no internal locking is required. The watcher interacts with the
 // store through thread-safe methods (Upsert / Remove).
 type Watcher struct {
-	store    *PersistentStore
-	dir      string
-	interval time.Duration // fallback poll interval (fsnotify-unavailable cases)
+	store     *PersistentStore
+	dir       string
+	interval  time.Duration // fallback poll interval (fsnotify-unavailable cases)
+	recursive bool          // walk subdirectories during scanOnce (issue #1149)
+
+	fileFilter *FileFilter // optional include/exclude filter (issue #1148)
 
 	mu    sync.Mutex
 	known map[string]fileSnapshot
@@ -70,7 +74,25 @@ func NewWatcher(store *PersistentStore, dir string, interval time.Duration) *Wat
 		stopCh:       make(chan struct{}),
 		doneCh:       make(chan struct{}),
 		newWatcherFn: fsnotify.NewWatcher,
+		fileFilter:   store.Store.fileFilter, // share the store's filter (issue #1148)
 	}
+}
+
+// SetRecursive enables recursive subdirectory walking in scanOnce
+// (issue #1149). When true, filepath.WalkDir descends into all
+// subdirectories and file paths are stored relative to the root.
+// Must be called before Start.
+func (w *Watcher) SetRecursive(r bool) {
+	w.recursive = r
+}
+
+// SetFileFilter sets the include/exclude filter used by scanOnce to skip
+// non-source files (issue #1148). Safe to call before Start. A nil filter
+// allows all files (backward compatible).
+func (w *Watcher) SetFileFilter(f *FileFilter) {
+	w.mu.Lock()
+	w.fileFilter = f
+	w.mu.Unlock()
 }
 
 // Start launches the polling goroutine and returns immediately. The
@@ -124,6 +146,11 @@ func (w *Watcher) run(parent context.Context) {
 			_ = fw.Close()
 			fw = nil
 		} else {
+			// Recursively add subdirectories so changes in nested
+			// directories are detected by fsnotify (issue #1149).
+			if w.recursive {
+				w.addWatchSubdirs(fw)
+			}
 			// Capture the pointer in a local so the deferred func
 			// always sees the original value, even after fw is
 			// set to nil in the channel-closed degradation branch.
@@ -186,6 +213,14 @@ func (w *Watcher) run(parent context.Context) {
 					)
 				}
 			} else if evt.Has(fsnotify.Write) || evt.Has(fsnotify.Create) {
+				// In recursive mode, add newly-created subdirectories
+				// to the fsnotify watcher so future events inside them
+				// are detected (issue #1149).
+				if w.recursive && evt.Has(fsnotify.Create) {
+					if info, statErr := os.Stat(evt.Name); statErr == nil && info.IsDir() {
+						_ = fw.Add(evt.Name)
+					}
+				}
 				if err := w.scanOnce(parent); err != nil && !errors.Is(err, context.Canceled) {
 					slog.Warn("rag: scan failed",
 						slog.String("component", "rag"),
@@ -228,58 +263,124 @@ func (w *Watcher) run(parent context.Context) {
 // scanOnce reads the directory once, diffs against `known`, and
 // applies the delta. Safe to call directly from tests.
 //
+// When w.recursive is true, filepath.WalkDir descends into all
+// subdirectories and file paths are stored relative to the root
+// (issue #1149).
+//
 // Security: symlinks are skipped (issue #107) to prevent confidentiality
 // leaks via injected few-shot examples.
 func (w *Watcher) scanOnce(ctx context.Context) error {
-	files, err := os.ReadDir(w.dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// Directory was removed out from under us; log
-			// and bail out — the next tick (or a future
-			// Create) will reconcile.
-			return nil
-		}
-		return err
+	if _, err := os.Stat(w.dir); err != nil && os.IsNotExist(err) {
+		return nil
 	}
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	seen := make(map[string]struct{}, len(files))
-	for _, f := range files {
-		if f.IsDir() {
-			continue
-		}
-		if isSymlink(f) {
-			slog.Warn("rag: skipping symlink in examples dir (issue #107)",
-				slog.String("component", "rag"),
-				slog.String("filename", f.Name()),
-				slog.String("dir", w.dir),
-			)
-			continue
-		}
-		info, err := f.Info()
+	seen := make(map[string]struct{})
+
+	if w.recursive {
+		err := filepath.WalkDir(w.dir, func(path string, d os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return nil
+			}
+			if d.IsDir() {
+				if isSymlink(d) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if isSymlink(d) {
+				return nil
+			}
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
+			rel, err := filepath.Rel(w.dir, path)
+			if err != nil {
+				return nil
+			}
+			name := filepath.ToSlash(rel)
+			if w.fileFilter != nil && !w.fileFilter.ShouldIndex(name) {
+				slog.Debug("rag: skipping file filtered by extension/pattern (issue #1148)",
+					slog.String("component", "rag"),
+					slog.String("filename", name),
+				)
+				return nil
+			}
+			snap := fileSnapshot{name: name, modTime: info.ModTime(), size: info.Size()}
+			seen[name] = struct{}{}
+
+			prev, exists := w.known[name]
+			if exists && prev.modTime.Equal(snap.modTime) && prev.size == snap.size {
+				return nil
+			}
+
+			if err := w.indexFile(ctx, name); err != nil {
+				slog.Warn("rag: index failed",
+					slog.String("component", "rag"),
+					slog.String("filename", name),
+					slog.Any("err", err),
+				)
+				return nil
+			}
+			w.known[name] = snap
+			return nil
+		})
 		if err != nil {
-			continue
+			return err
 		}
-		name := f.Name()
-		snap := fileSnapshot{name: name, modTime: info.ModTime(), size: info.Size()}
-		seen[name] = struct{}{}
+	} else {
+		files, err := os.ReadDir(w.dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		for _, f := range files {
+			if f.IsDir() {
+				continue
+			}
+			if isSymlink(f) {
+				slog.Warn("rag: skipping symlink in examples dir (issue #107)",
+					slog.String("component", "rag"),
+					slog.String("filename", f.Name()),
+					slog.String("dir", w.dir),
+				)
+				continue
+			}
+			name := f.Name()
+			if w.fileFilter != nil && !w.fileFilter.ShouldIndex(name) {
+				slog.Debug("rag: skipping file filtered by extension/pattern (issue #1148)",
+					slog.String("component", "rag"),
+					slog.String("filename", name),
+				)
+				continue
+			}
+			info, err := f.Info()
+			if err != nil {
+				continue
+			}
+			snap := fileSnapshot{name: name, modTime: info.ModTime(), size: info.Size()}
+			seen[name] = struct{}{}
 
-		prev, exists := w.known[name]
-		if exists && prev.modTime.Equal(snap.modTime) && prev.size == snap.size {
-			continue
-		}
+			prev, exists := w.known[name]
+			if exists && prev.modTime.Equal(snap.modTime) && prev.size == snap.size {
+				continue
+			}
 
-		if err := w.indexFile(ctx, name); err != nil {
-			slog.Warn("rag: index failed",
-				slog.String("component", "rag"),
-				slog.String("filename", name),
-				slog.Any("err", err),
-			)
-			continue // known still holds old snapshot → next poll retries
+			if err := w.indexFile(ctx, name); err != nil {
+				slog.Warn("rag: index failed",
+					slog.String("component", "rag"),
+					slog.String("filename", name),
+					slog.Any("err", err),
+				)
+				continue // known still holds old snapshot → next poll retries
+			}
+			w.known[name] = snap // only update on success
 		}
-		w.known[name] = snap // only update on success
 	}
 
 	// Detect deletions: anything in `known` that wasn't in `seen`
@@ -306,21 +407,69 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 }
 
 // indexFile reads a single file, embeds its content, and upserts it
-// into the persistent store. Pulled out so tests can exercise it
-// without the goroutine.
+// into the persistent store. name is either a bare filename (flat
+// mode) or a forward-slash relative path like "sub/deep.go" (recursive
+// mode). When chunking is enabled on the store (issue #1168), the file
+// is split into overlapping chunks and each chunk is embedded and
+// upserted individually. Old chunks for this filename are removed first
+// so that a file that shrinks (fewer chunks than before) does not leave
+// stale entries behind.
 func (w *Watcher) indexFile(ctx context.Context, name string) error {
 	content, err := os.ReadFile(filepath.Join(w.dir, name))
 	if err != nil {
 		return err
 	}
-	emb, err := w.store.embedder.Embed(ctx, string(content))
-	if err != nil {
-		return err
+	// Clear any existing chunks so stale rows from a previous (larger)
+	// version of the file don't linger (issue #1168).
+	if err := w.store.Remove(ctx, name); err != nil {
+		return fmt.Errorf("rag: remove old chunks for %q: %w", name, err)
 	}
-	return w.store.Upsert(ctx, FewShotExample{
-		Filename:  name,
-		Content:   string(content),
-		Embedding: emb,
+	for _, c := range chunkFile(string(content), w.store.chunkTokens) {
+		emb, err := w.store.embedder.Embed(ctx, c.Content)
+		if err != nil {
+			return err
+		}
+		ex := FewShotExample{
+			Filename:   name,
+			Content:    c.Content,
+			Embedding:  emb,
+			ChunkIndex: c.Index,
+		}
+		if w.recursive {
+			parent := filepath.ToSlash(filepath.Dir(name))
+			if parent != "." {
+				ex.Dir = parent
+			}
+		}
+		if err := w.store.Upsert(ctx, ex); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// addWatchSubdirs recursively adds all subdirectories under w.dir to
+// the fsnotify watcher so events in nested directories are detected
+// (issue #1149). Errors are logged and skipped — a missing subdirectory
+// watch degrades gracefully to the fallback ticker.
+func (w *Watcher) addWatchSubdirs(fw *fsnotify.Watcher) {
+	_ = filepath.WalkDir(w.dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() && path != w.dir {
+			if isSymlink(d) {
+				return filepath.SkipDir
+			}
+			if addErr := fw.Add(path); addErr != nil {
+				slog.Debug("rag: fsnotify add subdir skipped",
+					slog.String("component", "rag"),
+					slog.String("dir", path),
+					slog.Any("err", addErr),
+				)
+			}
+		}
+		return nil
 	})
 }
 

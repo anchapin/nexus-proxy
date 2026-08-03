@@ -87,6 +87,13 @@ type ConfidenceStore interface {
 	// so upstream callers that fail to categorize a prompt are surfaced
 	// rather than silently coercing to CategoryOther (issue #802).
 	LocalConfidence(category string) (float64, error)
+
+	// ComparativeConfidence returns both the local and frontier
+	// confidence fractions for a category (issue #1162). Either value is
+	// NeutralConfidence (0.5) when there is insufficient data for that
+	// route, so callers can distinguish "no data" from "low quality".
+	// An empty category returns an error.
+	ComparativeConfidence(category string) (localConf, frontierConf float64, err error)
 }
 
 // categoryKeywords maps each category to the word-boundary-matched
@@ -94,9 +101,9 @@ type ConfidenceStore interface {
 // prompt matches several categories, so the list runs from most-
 // specific/most-complex (architecture, debugging) to least
 // (documentation) before falling through to "other". Keywords are
-// matched against the Unicode-lowercased prompt using word-boundary
-// matching (containsWord) so that e.g. "test" does not match inside
-// "contest", ensuring consistent routing with the DSL \b...\b patterns.
+// matched against the Unicode-lowercased prompt using \b...\b patterns
+// so that e.g. "test" does not match inside "contest", ensuring
+// consistent routing with the DSL word-boundary patterns.
 var categoryKeywords = []struct {
 	category string
 	keywords []string

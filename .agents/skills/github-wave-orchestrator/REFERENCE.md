@@ -43,20 +43,12 @@ Steps:
    <one-paragraph description of the change>
    EOF
    )"
-<<<<<<< HEAD
-=======
     ```
-    The body must contain exactly one `Closes #N` line. Do NOT include other
-    `#NNNN` references in the body or title — see
-    `docs/orchestration/pr-body-conventions.md` for the rationale.
- 9. Verify closingReferences count is exactly 1:
->>>>>>> a4e71cb (fix: resolve #960 — wave orchestrator silent failure hardening)
-    ```
-    The body must list ALL issues that this PR resolves (issue #961). If the
-    commit also fixes a related issue, add a second `Closes #N` line.
+    The body must list ALL issues that this PR resolves. If the
+    commit also fixes a related issue, add another `Closes #N` line.
     Do NOT include issue numbers in the title — see
     `docs/orchestration/pr-body-conventions.md` for the rationale.
-  9. Verify closingReferences count matches the number of issues this PR resolves:
+ 9. Verify closingReferences count matches the number of issues this PR resolves:
     ```
     bash scripts/check_pr_closing_refs.sh <PR_NUMBER> <COUNT>
     ```
@@ -317,6 +309,74 @@ the label name is used as a fuzzy directory filter.
 If no files can be determined from the issue, mark it as `unknown_deps`.
 Issues with `unknown_deps` are placed in single-issue waves (no parallelism)
 to avoid silent conflicts.
+
+## Collision Strategy
+
+The wave planner's `--collision-strategy` flag controls how the conflict
+graph decides whether two issues conflict. This is the single biggest lever
+for parallelism in Go repos.
+
+```
+node wave-planner.js --collision-strategy {none|go-packages|legacy}
+```
+
+| Mode | Behaviour | When to use |
+|---|---|---|
+| `go-packages` (default) | Two issues conflict only when they touch the **same Go package directory** (e.g. `internal/handlers/`). `*.go` files collapse to their containing dir; non-Go files keep exact-match semantics. **No collision files are auto-injected.** | Default for this repo. Use when issues touch independent packages. |
+| `none` | No auto-injection. Conflicts are derived **solely** from explicit file references extracted from issue text (exact file match). | Maximum parallelism when issue bodies cite precise files and you trust squash-merge isolation. |
+| `legacy` | Injects `HIGH_COLLISION_FILES` (`cmd/nexus/main.go`, `cmd/nexus/main_test.go`) into **every** issue's file list, forcing any pair of issues to share a file and therefore serialize. | Backward-compatible fallback. Use only when two issues are known to edit the same struct/field in a central wiring file. |
+
+### Why `go-packages` is the default for Go repos
+
+1. **Packages compile independently** — a change to `internal/quality/`
+   cannot conflict at the Go level with a change to `internal/budget/`.
+2. **`cmd/nexus/main.go` is rarely touched** by issue fixes — it is the
+   wiring layer, not the implementation.
+3. **Squash-merge isolates changes** — even when two PRs both touch
+   `main.go`, the second rebases cleanly because the edits land in
+   different sections.
+
+### Trade-off: removing collision files risks main.go merge conflicts
+
+The `legacy` strategy existed because gofmt/struct-alignment can silently
+modify `main.go` even when an issue does not mention it. By switching to
+`go-packages` (or `none`), the planner no longer serialises every pair of
+issues on the assumption that both will touch the central wiring file.
+
+**Risk:** if two issues in the same wave genuinely modify the *same*
+struct/field in `main.go` (or any shared file), the second PR may hit a
+merge conflict during squash-merge. The wave orchestrator's [merge conflict
+resolution protocol](#merge-conflict-resolution-protocol) handles this
+automatically (rebase → auto-resolve non-overlapping hunks → escalate if
+truly overlapping), so the cost is a rebase retry, not a silent failure.
+
+**Reward:** for a typical 12-issue batch touching 8 independent `internal/`
+packages, wave count drops from **12 sequential waves (1 issue each, ~60 min)**
+to **~4 waves (3 issues each, ~20 min)** — a **3× speed-up** that saves CI
+minutes and shortens feedback loops.
+
+### Inspecting file derivation (`--dry-run`)
+
+Use `--dry-run` to audit where each issue's file list came from before
+committing to a wave plan. The `file_sources` column labels every file as
+either `explicit` (mentioned in the issue text) or `collision`
+(auto-injected by the `legacy` strategy):
+
+```jsonc
+{
+  "_meta": { "collision_strategy": "go-packages", "mode": "dry-run" },
+  "issues": [{
+    "number": 1,
+    "affected_files": ["internal/handlers/chat.go"],
+    "file_sources": { "internal/handlers/chat.go": "explicit" }
+  }]
+}
+```
+
+Under `go-packages` (default) and `none`, no file is ever labelled
+`collision` — every file is `explicit`. Under `legacy`, the injected
+`HIGH_COLLISION_FILES` appear as `collision`. This makes it immediately
+visible when the legacy heuristic is inflating every issue's file list.
 
 ## Merge Conflict Resolution Protocol
 

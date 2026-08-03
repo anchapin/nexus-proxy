@@ -7,11 +7,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -39,6 +41,57 @@ func IncPanelPanics() { panelPanicsTotal.Add(1) }
 
 // PanelPanicsTotal returns the cumulative panel panic count.
 func PanelPanicsTotal() uint64 { return panelPanicsTotal.Load() }
+
+// Fusion semantic similarity metrics (issue #1244).
+var (
+	// semanticSimilarityTotal counts the number of times semantic
+	// similarity was used for fusion agreement detection.
+	semanticSimilarityTotal atomic.Uint64
+	// semanticSimilaritySum accumulates the cosine similarity scores
+	// so /metrics can report the average. Using float64→uint64 bits
+	// to avoid requiring sync/atomic.LoadFloat64 (Go 1.19+).
+	semanticSimilaritySumBits atomic.Uint64
+	// semanticSimilarityCount is the count of observations that
+	// contributed to semanticSimilaritySumBits.
+	semanticSimilarityCount atomic.Uint64
+	// jaccardSimilarityTotal counts the number of times Jaccard
+	// similarity was used (either mode=jaccard or semantic fallback).
+	jaccardSimilarityTotal atomic.Uint64
+)
+
+// RecordSemanticSimilarity records a semantic similarity observation.
+func RecordSemanticSimilarity(score float64) {
+	semanticSimilarityTotal.Add(1)
+	semanticSimilarityCount.Add(1)
+	for {
+		old := semanticSimilaritySumBits.Load()
+		newBits := math.Float64bits(math.Float64frombits(old) + score)
+		if semanticSimilaritySumBits.CompareAndSwap(old, newBits) {
+			break
+		}
+	}
+}
+
+// SemanticSimilarityTotal returns the count of semantic similarity checks.
+func SemanticSimilarityTotal() uint64 { return semanticSimilarityTotal.Load() }
+
+// SemanticSimilarityAvg returns the average semantic similarity score,
+// or 0 if no observations exist.
+func SemanticSimilarityAvg() float64 {
+	count := semanticSimilarityCount.Load()
+	if count == 0 {
+		return 0
+	}
+	return math.Float64frombits(semanticSimilaritySumBits.Load()) / float64(count)
+}
+
+// RecordJaccardSimilarity records a Jaccard similarity observation.
+func RecordJaccardSimilarity() {
+	jaccardSimilarityTotal.Add(1)
+}
+
+// JaccardSimilarityTotal returns the count of Jaccard similarity checks.
+func JaccardSimilarityTotal() uint64 { return jaccardSimilarityTotal.Load() }
 
 // fusionClientAbortTotal counts client aborts during fusion streaming
 // (issue #1046). Exposed via FusionClientAbortTotal for the /metrics endpoint.
@@ -586,28 +639,11 @@ func (p PanelResult) ErrStr() string {
 }
 
 // Panel runs local and frontier fetches concurrently and waits for both.
-// Each member gets its own timeout (perFetchTimeout) so a slow frontier
-// can't pin the local one.
-//
-// When skipLocal is true the local Ollama fetch is omitted (issue #8
-// graceful-degradation path). The local slot in the arbiter prompt is
-// populated with a synthetic PanelResult whose Err is set to a sentinel
-// error, which formatCandidate renders as
-// "[local failed: ollama unavailable (degraded)]". The arbiter's
-// "synthesize the strongest answer" instruction already copes with one
-// candidate being unavailable, so the synthesis stream still produces a
-// useful reply using only the frontier member.
-//
-// arbiterURL/arbiterKey/arbiterModel identify the synthesis model. The
-// arbiter receives a single user message containing both candidates and
-// streams the synthesized reply via Stream. The arbiter call is bounded
-// by arbiterTimeout (issue #12, NEXUS_ARBITER_TIMEOUT, default 60s) via
-// StreamWithContext so a slow synthesis endpoint cannot block the
-// handler indefinitely — without this the arbiter inherits the shared
-// http.DefaultClient which has no timeout.
-// Panel runs local and frontier fetches concurrently and waits for both.
-// Each member gets its own timeout (perFetchTimeout) so a slow frontier
-// can't pin the local one.
+// Each member gets its own timeout so a slow frontier can't pin the local
+// one (issue #1164). localFetchTimeout bounds the local Ollama goroutine
+// and frontierFetchTimeout bounds the frontier goroutine. When either is
+// zero the caller should pass FusionTimeout as the fallback (backward
+// compatibility with the pre-#1164 shared timeout).
 //
 // When skipLocal is true the local Ollama fetch is omitted (issue #8
 // graceful-degradation path). The local slot in the arbiter prompt is
@@ -650,13 +686,15 @@ func Panel(
 	arbiterURL, arbiterKey, arbiterModel string,
 	body map[string]interface{},
 	latestPrompt string,
-	perFetchTimeout time.Duration,
+	localFetchTimeout time.Duration,
+	frontierFetchTimeout time.Duration,
 	arbiterTimeout time.Duration,
 	skipLocal bool,
 	requestID string,
 	arbiterCache *ArbiterCache,
 	arbiterCacheTTL time.Duration,
 	isFusion bool,
+	simCfg FusionSimilarityConfig,
 ) (outcome PanelOutcome, cacheHit bool, _ error) {
 	results := make(chan PanelResult, 2)
 	if skipLocal {
@@ -678,7 +716,7 @@ func Panel(
 					results <- PanelResult{Source: "local", Err: fmt.Errorf("panic: %v", r)}
 				}
 			}()
-			ctx, cancel := context.WithTimeout(ctx, perFetchTimeout)
+			ctx, cancel := context.WithTimeout(ctx, localFetchTimeout)
 			defer cancel()
 			msg, err := FetchPanel(ctx, client,
 				localBaseURL+"/v1/chat/completions", "", localModel, body)
@@ -696,7 +734,7 @@ func Panel(
 				results <- PanelResult{Source: "frontier", Err: fmt.Errorf("panic: %v", r)}
 			}
 		}()
-		ctx, cancel := context.WithTimeout(ctx, perFetchTimeout)
+		ctx, cancel := context.WithTimeout(ctx, frontierFetchTimeout)
 		defer cancel()
 		msg, err := FetchPanel(ctx, client,
 			frontierURL, frontierKey, frontierModel, body)
@@ -753,7 +791,7 @@ func Panel(
 			cacheHit = true
 			outcome.ArbiterCacheHit = true
 			outcome.ArbiterSkipped = true
-			outcome.Similarity = SimilarityRatio(r1.Content, r2.Content)
+			outcome.Similarity = simCfg.ComputeSimilarity(ctx, r1.Content, r2.Content)
 			outcome.SkipReason = "cache_hit"
 			if isFusion {
 				w.Header().Set("X-Nexus-Fusion-Progressive", "true")
@@ -834,6 +872,11 @@ func Panel(
 	// Cache the synthesis for future identical panel members (issue #232).
 	if arbiterCache != nil && arbiterCacheTTL > 0 && synthesis != "" {
 		arbiterCache.Set(r1.Content, r2.Content, synthesis, arbiterCacheTTL)
+		// Expose the cache key + synthesis so the handler can persist
+		// them for boot-time pre-warming (issue #1176).
+		key := CacheKey(r1.Content, r2.Content)
+		outcome.ArbiterCacheKeyHex = hex.EncodeToString(key[:])
+		outcome.ArbiterSynthesis = synthesis
 	}
 
 	if isFusion {
@@ -894,6 +937,16 @@ type PanelOutcome struct {
 	// or "cache_hit" when the synthesis was served from the arbiter cache.
 	// Empty when ArbiterSkipped is false.
 	SkipReason string
+	// ArbiterCacheKeyHex is the hex-encoded cache key for the synthesis,
+	// populated only when a new synthesis was fetched and cached (issue
+	// #1176). Empty on cache hits, skips, and non-fusion paths. The handler
+	// forwards it to the metrics store so a subsequent boot can pre-warm
+	// the cache without re-computing the key.
+	ArbiterCacheKeyHex string
+	// ArbiterSynthesis is the synthesis text that was cached, populated
+	// alongside ArbiterCacheKeyHex (issue #1176). Empty unless a fresh
+	// synthesis was computed and stored in the cache.
+	ArbiterSynthesis string
 }
 
 // PanelStreaming runs the fusion panel with progressive delivery
@@ -943,13 +996,15 @@ func PanelStreaming(
 	arbiterURL, arbiterKey, arbiterModel string,
 	body map[string]interface{},
 	latestPrompt string,
-	perFetchTimeout time.Duration,
+	localFetchTimeout time.Duration,
+	frontierFetchTimeout time.Duration,
 	arbiterTimeout time.Duration,
 	skipLocal bool,
 	agreementThreshold float64,
 	requestID string,
 	arbiterCache *ArbiterCache,
 	arbiterCacheTTL time.Duration,
+	simCfg FusionSimilarityConfig,
 ) (PanelOutcome, error) {
 	var outcome PanelOutcome
 
@@ -962,15 +1017,17 @@ func PanelStreaming(
 		panelOutcome, cacheHit, err := Panel(ctx, w, client,
 			localBaseURL, localModel, frontierURL, frontierKey, frontierModel,
 			arbiterURL, arbiterKey, arbiterModel,
-			body, latestPrompt, perFetchTimeout, arbiterTimeout,
+			body, latestPrompt, localFetchTimeout, frontierFetchTimeout, arbiterTimeout,
 			skipLocal, requestID, arbiterCache, arbiterCacheTTL,
-			true) // isFusion: set X-Nexus-Fusion-Progressive header (issue #984)
+			true, simCfg) // isFusion + simCfg (issue #984, #1244)
 		if err != nil {
 			return outcome, err
 		}
 		outcome.ArbiterCacheHit = cacheHit
 		outcome.ArbiterSkipped = panelOutcome.ArbiterSkipped
 		outcome.SkipReason = panelOutcome.SkipReason
+		outcome.ArbiterCacheKeyHex = panelOutcome.ArbiterCacheKeyHex
+		outcome.ArbiterSynthesis = panelOutcome.ArbiterSynthesis
 		return outcome, nil
 	}
 
@@ -1001,7 +1058,7 @@ func PanelStreaming(
 					results <- PanelResult{Source: "local", Err: fmt.Errorf("panic: %v", r)}
 				}
 			}()
-			ctxLocal, cancel := context.WithTimeout(gCtx, perFetchTimeout)
+			ctxLocal, cancel := context.WithTimeout(gCtx, localFetchTimeout)
 			cancelLocal = cancel
 			defer cancel()
 			msg, err := FetchPanel(ctxLocal, client,
@@ -1017,7 +1074,7 @@ func PanelStreaming(
 				results <- PanelResult{Source: "frontier", Err: fmt.Errorf("panic: %v", r)}
 			}
 		}()
-		ctxFrontier, cancel := context.WithTimeout(gCtx, perFetchTimeout)
+		ctxFrontier, cancel := context.WithTimeout(gCtx, frontierFetchTimeout)
 		cancelFrontier = cancel
 		defer cancel()
 		msg, err := FetchPanel(ctxFrontier, client,
@@ -1145,13 +1202,14 @@ func PanelStreaming(
 	}
 
 	// Both members succeeded: compare and decide on the arbiter.
-	outcome.Similarity = SimilarityRatio(first.Content, second.Content)
+	outcome.Similarity = simCfg.ComputeSimilarity(ctx, first.Content, second.Content)
 	if outcome.Similarity >= agreementThreshold {
 		outcome.ArbiterSkipped = true
 		outcome.SkipReason = "agreement"
 		slog.Info("fusion agreement, arbiter skipped",
 			slog.String("request_id", requestID),
 			slog.String("source", outcome.Source),
+			slog.String("similarity_mode", string(simCfg.Mode)),
 			slog.Float64("similarity", outcome.Similarity),
 			slog.Float64("threshold", agreementThreshold),
 		)
@@ -1185,6 +1243,7 @@ func PanelStreaming(
 	slog.Info("fusion disagreement, invoking arbiter",
 		slog.String("request_id", requestID),
 		slog.String("first_source", outcome.Source),
+		slog.String("similarity_mode", string(simCfg.Mode)),
 		slog.Float64("similarity", outcome.Similarity),
 		slog.Float64("threshold", agreementThreshold),
 	)

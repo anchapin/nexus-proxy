@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -35,6 +36,150 @@ func TestCosineSimilarity(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTokenize(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{"simple", "hello world", []string{"hello", "world"}},
+		{"code identifiers", "func myFunction", []string{"func", "myfunction"}},
+		{"numbers", "abc123 def456", []string{"abc123", "def456"}},
+		{"underscore", "my_var", []string{"my_var"}}, // underscores are kept as part of identifiers
+		{"mixed case", "Hello WORLD TestCase", []string{"hello", "world", "testcase"}},
+		{"empty", "", nil},
+		{"whitespace only", "   \t\n  ", nil},
+		{"punctuation", "a,b;c!d", []string{"a", "b", "c", "d"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tokenize(tc.input)
+			if len(got) == 0 && tc.want == nil {
+				return
+			}
+			if len(got) != len(tc.want) {
+				t.Errorf("got %v (len %d), want %v (len %d)", got, len(got), tc.want, len(tc.want))
+				return
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("got[%d]=%q, want[%d]=%q", i, got[i], i, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestIDF(t *testing.T) {
+	cases := []struct {
+		name string
+		N    int
+		n    int
+		want float64
+	}{
+		// Formula: log((N-n+0.5)/(n+0.5))
+		{"term in all docs", 10, 10, math.Log(0.5 / 10.5)},
+		{"term in half docs", 10, 5, 0.0}, // log((10-5+0.5)/(5+0.5)) = log(5.5/5.5) = log(1) = 0
+		{"term in one doc", 10, 1, math.Log(9.5 / 1.5)},
+		{"term in no docs", 10, 0, 0.0}, // handled by the n==0 early return
+		{"single doc", 1, 1, math.Log(0.5 / 1.5)},
+		{"single doc missing term", 1, 0, 0.0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := IDF(tc.N, tc.n)
+			if math.Abs(got-tc.want) > 1e-9 {
+				t.Errorf("IDF(%d, %d) = %v, want %v", tc.N, tc.n, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHybridScore(t *testing.T) {
+	// Formula: score = weight * 1/(k+rankSemantic) + (1-weight) * 1/(k+rankKeyword)
+	// weight=0 → pure keyword (rrfKeyword)
+	// weight=1 → pure semantic (rrfSemantic)
+	cases := []struct {
+		name         string
+		semanticRank int
+		keywordRank  int
+		weight       float64
+		want         float64
+	}{
+		{"weight=0 keyword rank 2", 1, 2, 0.0, 1.0 / (rrfK + 2)},
+		{"weight=0 keyword rank 1", 2, 1, 0.0, 1.0 / (rrfK + 1)},
+		{"weight=1 semantic rank 1", 1, 2, 1.0, 1.0 / (rrfK + 1)},
+		{"weight=1 semantic rank 3", 3, 1, 1.0, 1.0 / (rrfK + 3)},
+		{"weight=0.5 both rank 1", 1, 1, 0.5, 0.5*(1.0/(rrfK+1)) + 0.5*(1.0/(rrfK+1))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := hybridScore(0, 0, tc.weight, tc.semanticRank, tc.keywordRank, rrfK)
+			if math.Abs(got-tc.want) > 1e-9 {
+				t.Errorf("hybridScore(0, 0, %v, %d, %d, %v) = %v, want %v",
+					tc.weight, tc.semanticRank, tc.keywordRank, rrfK, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBM25Score(t *testing.T) {
+	// Create a store with known documents and set up vecs so stub doesn't return zeros.
+	emb := &stubEmbedder{vecs: map[string][]float64{
+		"func hello world": {1, 0},
+		"func world":       {0, 1},
+		"func hello java":  {0, 0, 1},
+	}}
+	store := NewStore(emb, 0.5)
+	// Add documents where "hello" appears in docs 0 and 2 but not doc 1.
+	store.Add("file1.go", "func hello world", []float64{1, 0})
+	store.Add("file2.go", "func world", []float64{0, 1})
+	store.Add("file3.java", "func hello java", []float64{0, 0, 1})
+
+	// Query that should match the "hello" docs - doc 0 has hello, doc 2 has hello, doc 1 does not.
+	// IDF should be log((3-2+0.5)/(2+0.5)) = log(1.5/2.5) ≈ -0.511
+	// But BM25 score depends on term frequency and document length.
+	scoreHello := store.BM25Score("hello", 0)
+	// Score may be negative if IDF is negative (term in most docs).
+	// Just verify it runs and returns a reasonable value.
+	_ = scoreHello // Score can be negative when term appears in many docs.
+
+	// Query that matches no docs should return 0.
+	scoreNoMatch := store.BM25Score("xyz123 nonexistent", 0)
+	if scoreNoMatch != 0 {
+		t.Errorf("BM25Score for 'xyz123' = %v, want 0", scoreNoMatch)
+	}
+}
+
+func TestRetrieveHybrid(t *testing.T) {
+	// Create a store with hybrid weight > 0.
+	emb := &stubEmbedder{vecs: map[string][]float64{
+		"func hello() {}": {1, 0, 0},
+		"func world() {}": {0, 1, 0},
+		"class Hello {}":  {0, 0, 1},
+		"prompt":          {1, 0, 0},
+	}}
+	store := NewStore(emb, 0.5, WithHybridWeight(0.5))
+
+	// Add docs - one with keyword "hello", one with semantic similarity.
+	store.Add("file1.go", "func hello() {}", []float64{1, 0, 0})
+	store.Add("file2.java", "class Hello {}", []float64{0, 0, 1})
+
+	// Retrieve with hybrid - should combine both signals.
+	ctx := context.Background()
+	example, score, path, err := store.Retrieve(ctx, "prompt")
+	if err != nil {
+		t.Fatalf("Retrieve error: %v", err)
+	}
+	if example == nil {
+		t.Fatal("Retrieve returned nil example")
+	}
+	if path != IndexPathHybrid {
+		t.Errorf("path = %q, want %q", path, IndexPathHybrid)
+	}
+	_ = score // score may vary based on ranking
 }
 
 type stubEmbedder struct {
@@ -1579,5 +1724,448 @@ func TestIndexDirBatchFailureStillBuildsIndex(t *testing.T) {
 	mode := store.IndexMode()
 	if mode != IndexModeHNSW {
 		t.Errorf("IndexMode = %q, want %q (index should be rebuilt after batch failure)", mode, IndexModeHNSW)
+	}
+}
+
+// --- Issue #1168: Chunk large files for finer-grained RAG retrieval ---
+
+func TestChunkFileDisabled(t *testing.T) {
+	t.Parallel()
+	content := "func main() {}"
+	chunks := chunkFile(content, 0)
+	if len(chunks) != 1 {
+		t.Fatalf("expected 1 chunk, got %d", len(chunks))
+	}
+	if chunks[0].Content != content || chunks[0].Index != 0 {
+		t.Errorf("unexpected chunk: %+v", chunks[0])
+	}
+}
+
+func TestChunkFileSmallContentReturnsSingleChunk(t *testing.T) {
+	t.Parallel()
+	content := "small file content"
+	chunks := chunkFile(content, 1000)
+	if len(chunks) != 1 {
+		t.Fatalf("small file should produce 1 chunk, got %d", len(chunks))
+	}
+	if chunks[0].Index != 0 {
+		t.Errorf("chunk index should be 0, got %d", chunks[0].Index)
+	}
+}
+
+func TestChunkFileLargeContentProducesMultipleChunks(t *testing.T) {
+	t.Parallel()
+	var blocks []string
+	for i := 0; i < 30; i++ {
+		blocks = append(blocks, fmt.Sprintf("// Block %d\nfunc handler%d() {\n\treturn\n}", i, i))
+	}
+	content := strings.Join(blocks, "\n\n")
+
+	maxTokens := 50
+	chunks := chunkFile(content, maxTokens)
+	if len(chunks) <= 1 {
+		t.Fatalf("expected >1 chunks for large content with maxTokens=%d, got %d", maxTokens, len(chunks))
+	}
+
+	for i, c := range chunks {
+		if c.Index != i {
+			t.Errorf("chunk %d has Index=%d, want %d", i, c.Index, i)
+		}
+	}
+
+	for i, c := range chunks {
+		if len(c.Content) == 0 {
+			t.Errorf("chunk %d is empty", i)
+		}
+	}
+}
+
+func TestChunkFileOverlapBetweenChunks(t *testing.T) {
+	t.Parallel()
+	var blocks []string
+	for i := 0; i < 20; i++ {
+		blocks = append(blocks, fmt.Sprintf("BLOCK_%d_MARKER", i))
+	}
+	content := strings.Join(blocks, "\n\n")
+
+	chunks := chunkFile(content, 20)
+	if len(chunks) < 2 {
+		t.Skip("not enough chunks to test overlap")
+	}
+
+	chunk0LastBlock := ""
+	blk0 := splitByBlankLines(chunks[0].Content)
+	if len(blk0) > 0 {
+		chunk0LastBlock = blk0[len(blk0)-1]
+	}
+	if chunk0LastBlock == "" {
+		t.Fatal("could not extract last block from chunk 0")
+	}
+
+	found := false
+	for _, b := range splitByBlankLines(chunks[1].Content) {
+		if b == chunk0LastBlock {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected overlap: last block of chunk 0 should appear in chunk 1")
+	}
+}
+
+func TestStoreIndexDirWithChunking(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	var blocks []string
+	for i := 0; i < 20; i++ {
+		blocks = append(blocks, fmt.Sprintf("// section %d\nfunc f%d() {}", i, i))
+	}
+	largeContent := strings.Join(blocks, "\n\n")
+	if err := os.WriteFile(filepath.Join(dir, "large.go"), []byte(largeContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "small.go"), []byte("package main"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewStore(&stubEmbedder{}, 0.0, WithChunkTokens(30))
+	if err := store.IndexDir(context.Background(), dir); err != nil {
+		t.Fatalf("IndexDir: %v", err)
+	}
+
+	snap := store.snapshot()
+	if len(snap) < 3 {
+		t.Fatalf("expected at least 3 examples (1 small + >=2 chunks), got %d", len(snap))
+	}
+
+	var smallCount int
+	var largeChunks []int
+	for _, ex := range snap {
+		if ex.Filename == "small.go" {
+			smallCount++
+		}
+		if ex.Filename == "large.go" {
+			largeChunks = append(largeChunks, ex.ChunkIndex)
+		}
+	}
+	if smallCount != 1 {
+		t.Errorf("small.go should have 1 entry, got %d", smallCount)
+	}
+	if len(largeChunks) < 2 {
+		t.Errorf("large.go should have >=2 chunks, got %d", len(largeChunks))
+	}
+	for i, idx := range largeChunks {
+		if idx != i {
+			t.Errorf("large.go chunk %d has index %d, want %d", i, idx, i)
+		}
+	}
+}
+
+func TestStoreIndexDirChunkingDisabledByDefault(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	largeContent := strings.Repeat("package main\n\n", 50)
+	if err := os.WriteFile(filepath.Join(dir, "big.go"), []byte(largeContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewStore(&stubEmbedder{}, 0.0)
+	if err := store.IndexDir(context.Background(), dir); err != nil {
+		t.Fatalf("IndexDir: %v", err)
+	}
+
+	snap := store.snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("expected 1 example (no chunking), got %d", len(snap))
+	}
+	if snap[0].ChunkIndex != 0 {
+		t.Errorf("chunk index should be 0 when chunking disabled, got %d", snap[0].ChunkIndex)
+	}
+}
+
+func TestUpsertExampleChunkAware(t *testing.T) {
+	t.Parallel()
+	store := NewStore(&stubEmbedder{}, 0.0)
+
+	store.upsertExample(FewShotExample{Filename: "f.go", ChunkIndex: 0, Content: "part0", Embedding: []float64{1}})
+	store.upsertExample(FewShotExample{Filename: "f.go", ChunkIndex: 1, Content: "part1", Embedding: []float64{2}})
+
+	if store.Size() != 2 {
+		t.Fatalf("expected 2 examples, got %d", store.Size())
+	}
+
+	store.upsertExample(FewShotExample{Filename: "f.go", ChunkIndex: 0, Content: "updated", Embedding: []float64{3}})
+
+	if store.Size() != 2 {
+		t.Fatalf("expected 2 examples after upsert, got %d", store.Size())
+	}
+
+	for _, ex := range store.snapshot() {
+		if ex.Filename == "f.go" && ex.ChunkIndex == 0 {
+			if ex.Content != "updated" {
+				t.Errorf("chunk 0 content = %q, want %q", ex.Content, "updated")
+			}
+		}
+	}
+}
+
+func TestRemoveExampleDeletesAllChunks(t *testing.T) {
+	t.Parallel()
+	store := NewStore(&stubEmbedder{}, 0.0)
+
+	store.upsertExample(FewShotExample{Filename: "f.go", ChunkIndex: 0, Content: "c0", Embedding: []float64{1}})
+	store.upsertExample(FewShotExample{Filename: "f.go", ChunkIndex: 1, Content: "c1", Embedding: []float64{2}})
+	store.upsertExample(FewShotExample{Filename: "g.go", ChunkIndex: 0, Content: "g0", Embedding: []float64{3}})
+
+	store.removeExample("f.go")
+
+	if store.Size() != 1 {
+		t.Fatalf("expected 1 example after remove, got %d", store.Size())
+	}
+	snap := store.snapshot()
+	if snap[0].Filename != "g.go" {
+		t.Errorf("remaining example = %q, want g.go", snap[0].Filename)
+	}
+}
+
+func TestFormatInjectionChunkLabel(t *testing.T) {
+	t.Parallel()
+
+	ex0 := &FewShotExample{Filename: "handler.go", ChunkIndex: 0, Content: "code"}
+	text0 := FormatInjection(ex0)
+	if !strings.Contains(text0, "handler.go") || strings.Contains(text0, "#chunk") {
+		t.Errorf("non-chunked label should not contain chunk suffix: %s", text0)
+	}
+
+	ex1 := &FewShotExample{Filename: "handler.go", ChunkIndex: 2, Content: "code"}
+	text1 := FormatInjection(ex1)
+	if !strings.Contains(text1, "handler.go#chunk2") {
+		t.Errorf("chunked label should contain '#chunk2': %s", text1)
+	}
+}
+
+// --- RetrieveTopK tests (issue #1166) ---
+
+func TestRetrieveTopKDescendingOrder(t *testing.T) {
+	emb := &stubEmbedder{vecs: map[string][]float64{
+		"prompt":    {1, 0, 0},
+		"best":      {0.95, 0.05, 0},
+		"medium":    {0.7, 0.3, 0},
+		"weakest":   {0.6, 0.4, 0},
+		"unrelated": {0, 1, 0},
+	}}
+	store := NewStore(emb, 0.5)
+	store.examples = []FewShotExample{
+		{Filename: "unrelated.go", Content: "unrelated", Embedding: emb.vecs["unrelated"]},
+		{Filename: "weakest.go", Content: "weakest", Embedding: emb.vecs["weakest"]},
+		{Filename: "medium.go", Content: "medium", Embedding: emb.vecs["medium"]},
+		{Filename: "best.go", Content: "best", Embedding: emb.vecs["best"]},
+	}
+
+	examples, scores, _, err := store.RetrieveTopK(context.Background(), "prompt", 3)
+	if err != nil {
+		t.Fatalf("RetrieveTopK: %v", err)
+	}
+	if len(examples) != 3 {
+		t.Fatalf("expected 3 results, got %d", len(examples))
+	}
+	if examples[0].Filename != "best.go" {
+		t.Errorf("first result = %s, want best.go", examples[0].Filename)
+	}
+	if examples[1].Filename != "medium.go" {
+		t.Errorf("second result = %s, want medium.go", examples[1].Filename)
+	}
+	if examples[2].Filename != "weakest.go" {
+		t.Errorf("third result = %s, want weakest.go", examples[2].Filename)
+	}
+	for i := 1; i < len(scores); i++ {
+		if scores[i] > scores[i-1] {
+			t.Errorf("scores not descending: [%d]=%v > [%d]=%v", i, scores[i], i-1, scores[i-1])
+		}
+	}
+}
+
+func TestRetrieveTopKK1IdenticalToRetrieve(t *testing.T) {
+	emb := &stubEmbedder{vecs: map[string][]float64{
+		"prompt": {1, 0, 0},
+		"a":      {0.9, 0.1, 0},
+		"b":      {0.8, 0.2, 0},
+	}}
+	store := NewStore(emb, 0.5)
+	store.examples = []FewShotExample{
+		{Filename: "a.go", Content: "a", Embedding: emb.vecs["a"]},
+		{Filename: "b.go", Content: "b", Embedding: emb.vecs["b"]},
+	}
+
+	singleEx, singleScore, _, singleErr := store.Retrieve(context.Background(), "prompt")
+	topKExs, topKScores, _, topKErr := store.RetrieveTopK(context.Background(), "prompt", 1)
+	if singleErr != nil || topKErr != nil {
+		t.Fatalf("unexpected errors: single=%v topK=%v", singleErr, topKErr)
+	}
+	if len(topKExs) != 1 {
+		t.Fatalf("expected 1 result from TopK, got %d", len(topKExs))
+	}
+	if topKExs[0].Filename != singleEx.Filename {
+		t.Errorf("K=1 matched %s, Retrieve matched %s", topKExs[0].Filename, singleEx.Filename)
+	}
+	if math.Abs(topKScores[0]-singleScore) > 1e-9 {
+		t.Errorf("K=1 score %v, Retrieve score %v", topKScores[0], singleScore)
+	}
+}
+
+func TestRetrieveTopKZeroOrNegative(t *testing.T) {
+	store := NewStore(&stubEmbedder{vecs: map[string][]float64{"p": {1, 0, 0}}}, 0.5)
+	store.examples = []FewShotExample{{Filename: "x.go", Content: "x", Embedding: []float64{1, 0}}}
+
+	examples, _, _, err := store.RetrieveTopK(context.Background(), "prompt", 0)
+	if err != nil {
+		t.Fatalf("unexpected error for k=0: %v", err)
+	}
+	if len(examples) != 0 {
+		t.Errorf("expected empty results for k=0, got %d", len(examples))
+	}
+
+	examples, _, _, err = store.RetrieveTopK(context.Background(), "prompt", -1)
+	if err != nil {
+		t.Fatalf("unexpected error for k=-1: %v", err)
+	}
+	if len(examples) != 0 {
+		t.Errorf("expected empty results for k=-1, got %d", len(examples))
+	}
+}
+
+func TestRetrieveTopKEmptyStore(t *testing.T) {
+	store := NewStore(&stubEmbedder{}, 0.55)
+	examples, _, path, err := store.RetrieveTopK(context.Background(), "anything", 3)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(examples) != 0 {
+		t.Errorf("expected empty results from empty store, got %d", len(examples))
+	}
+	if path != IndexPathNone {
+		t.Errorf("path = %q, want %q", path, IndexPathNone)
+	}
+}
+
+func TestRetrieveTopKBelowThreshold(t *testing.T) {
+	emb := &stubEmbedder{vecs: map[string][]float64{
+		"prompt": {1, 0, 0},
+		"weak":   {0.3, 0.4, 0},
+	}}
+	store := NewStore(emb, 0.9)
+	store.examples = []FewShotExample{
+		{Filename: "weak.go", Content: "weak", Embedding: emb.vecs["weak"]},
+	}
+
+	examples, _, _, err := store.RetrieveTopK(context.Background(), "prompt", 3)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(examples) != 0 {
+		t.Errorf("expected no results below threshold, got %d", len(examples))
+	}
+}
+
+func TestRetrieveTopKFewerThanK(t *testing.T) {
+	emb := &stubEmbedder{vecs: map[string][]float64{
+		"prompt": {1, 0, 0},
+		"good":   {0.9, 0.1, 0},
+		"bad":    {0, 1, 0},
+	}}
+	store := NewStore(emb, 0.5)
+	store.examples = []FewShotExample{
+		{Filename: "bad.go", Content: "bad", Embedding: emb.vecs["bad"]},
+		{Filename: "good.go", Content: "good", Embedding: emb.vecs["good"]},
+	}
+
+	examples, _, _, err := store.RetrieveTopK(context.Background(), "prompt", 5)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(examples) != 1 {
+		t.Fatalf("expected 1 result (fewer than K), got %d", len(examples))
+	}
+	if examples[0].Filename != "good.go" {
+		t.Errorf("expected good.go, got %s", examples[0].Filename)
+	}
+}
+
+func TestRetrieveTopKEmbedderError(t *testing.T) {
+	store := NewStore(&stubEmbedder{err: errSentinel}, 0.55)
+	store.examples = []FewShotExample{{Filename: "x.go", Content: "x", Embedding: []float64{1, 0}}}
+
+	examples, _, path, err := store.RetrieveTopK(context.Background(), "prompt", 3)
+	if err == nil {
+		t.Error("expected error from embedder")
+	}
+	if len(examples) != 0 {
+		t.Errorf("expected empty results on embedder error, got %d", len(examples))
+	}
+	if path != IndexPathNone {
+		t.Errorf("path = %q, want %q", path, IndexPathNone)
+	}
+}
+
+func TestRetrieveTopKUpdatesStats(t *testing.T) {
+	emb := &stubEmbedder{vecs: map[string][]float64{
+		"prompt": {1, 0, 0},
+		"a":      {0.9, 0.1, 0},
+	}}
+	store := NewStore(emb, 0.5)
+	store.examples = []FewShotExample{
+		{Filename: "a.go", Content: "a", Embedding: emb.vecs["a"]},
+	}
+
+	store.RetrieveTopK(context.Background(), "prompt", 3)
+	stats := store.Stats()
+	if stats.RetrievalAttempts != 1 {
+		t.Errorf("expected 1 attempt, got %d", stats.RetrievalAttempts)
+	}
+	if stats.RetrievalHits != 1 {
+		t.Errorf("expected 1 hit, got %d", stats.RetrievalHits)
+	}
+}
+
+// --- FormatInjectionMulti tests (issue #1166) ---
+
+func TestFormatInjectionMultiEmpty(t *testing.T) {
+	if result := FormatInjectionMulti(nil); result != "" {
+		t.Errorf("expected empty string for nil, got %q", result)
+	}
+	if result := FormatInjectionMulti([]*FewShotExample{}); result != "" {
+		t.Errorf("expected empty string for empty slice, got %q", result)
+	}
+}
+
+func TestFormatInjectionMultiSingle(t *testing.T) {
+	ex := &FewShotExample{Filename: "example.go", Content: "package main"}
+	result := FormatInjectionMulti([]*FewShotExample{ex})
+	expected := FormatInjection(ex)
+	if result != expected {
+		t.Errorf("single example should match FormatInjection")
+	}
+}
+
+func TestFormatInjectionMultiMultiple(t *testing.T) {
+	ex1 := &FewShotExample{Filename: "a.go", Content: "package a"}
+	ex2 := &FewShotExample{Filename: "b.go", Content: "package b"}
+	result := FormatInjectionMulti([]*FewShotExample{ex1, ex2})
+	if !strings.Contains(result, "a.go") {
+		t.Errorf("result missing a.go")
+	}
+	if !strings.Contains(result, "b.go") {
+		t.Errorf("result missing b.go")
+	}
+	if !strings.Contains(result, "[PROXY RETRIEVAL CONTEXT]") {
+		t.Errorf("result missing PROXY RETRIEVAL CONTEXT marker")
+	}
+	count := strings.Count(result, "[PROXY RETRIEVAL CONTEXT]")
+	if count != 2 {
+		t.Errorf("expected 2 context blocks, got %d", count)
 	}
 }

@@ -3,12 +3,16 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/anchapin/nexus-proxy/internal/observability"
+	"github.com/anchapin/nexus-proxy/internal/testutil"
 )
 
 // panicHandler returns an http.HandlerFunc that panics with v after
@@ -115,9 +119,7 @@ func TestRecover_NoPanicPassThrough(t *testing.T) {
 // request_id, and the path — the acceptance criterion from the issue.
 func TestRecover_LogsStructuredPanic(t *testing.T) {
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	testutil.SetDefault(t, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	r.Header.Set("X-Request-Id", "req-test-123")
@@ -351,9 +353,7 @@ func TestRedactPanicValue_PartialSecretRedaction(t *testing.T) {
 
 func TestRecover_LogsRedactedPanicWithWarning(t *testing.T) {
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	testutil.SetDefault(t, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	h := Recover(nil)(http.HandlerFunc(panicHandler(t, false, "Bearer sk-12345abcdef")))
@@ -374,9 +374,7 @@ func TestRecover_LogsRedactedPanicWithWarning(t *testing.T) {
 
 func TestRecover_LogsNonRedactedPanicWithError(t *testing.T) {
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	testutil.SetDefault(t, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	h := Recover(nil)(http.HandlerFunc(panicHandler(t, false, "something went wrong")))
@@ -484,6 +482,92 @@ func TestRecover_FlusherResponseWriterUsesSSEPath(t *testing.T) {
 	}
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Errorf("body missing trailing [DONE] sentinel:\n%s", body)
+	}
+}
+
+// failingFlusherResponseWriter is an http.ResponseWriter that implements
+// http.Flusher but fails on Write after a configurable number of bytes
+// have been written. It is used to simulate SSE write failures in the
+// panic recovery path.
+type failingFlusherResponseWriter struct {
+	headers      http.Header
+	code         int
+	written      bool
+	failAfterN   int
+	bytesWritten int
+	flusher      http.Flusher
+}
+
+func newFailingFlusherResponseWriter(failAfterN int) *failingFlusherResponseWriter {
+	return &failingFlusherResponseWriter{
+		headers:    make(http.Header),
+		code:       200,
+		failAfterN: failAfterN,
+	}
+}
+
+func (f *failingFlusherResponseWriter) Header() http.Header { return f.headers }
+func (f *failingFlusherResponseWriter) WriteHeader(code int) {
+	f.code = code
+	f.written = true
+}
+func (f *failingFlusherResponseWriter) Write(b []byte) (int, error) {
+	f.written = true
+	if f.bytesWritten+len(b) > f.failAfterN {
+		f.bytesWritten = f.failAfterN + 1
+		return len(b), errors.New("SSE write failure")
+	}
+	f.bytesWritten += len(b)
+	return len(b), nil
+}
+
+func (f *failingFlusherResponseWriter) Flush() {
+	if f.flusher != nil {
+		f.flusher.Flush()
+	}
+}
+
+func (f *failingFlusherResponseWriter) SetFlusher(flusher http.Flusher) {
+	f.flusher = flusher
+}
+
+// TestRecover_SSEWriteFailureLogsAndIncrementsCounter verifies that when a
+// panic occurs after streaming has begun and the SSE error frame write
+// fails, the error is logged via slog.Error with request_id and
+// component='recovery', and the panic SSE write failures counter is
+// incremented. This is the acceptance criterion from issue #1115.
+func TestRecover_SSEWriteFailureLogsAndIncrementsCounter(t *testing.T) {
+	var logBuf bytes.Buffer
+	testutil.SetDefault(t, slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	var counter uint64
+	observability.SetPanicSSEWriteFailuresCounter(&counter)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: partial\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		panic("stream panic")
+	})
+	h := Recover(nil)(handler)
+
+	fw := newFailingFlusherResponseWriter(5)
+	fw.SetFlusher(http.Flusher(nil))
+	h.ServeHTTP(fw, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, "component=recovery") {
+		t.Errorf("log missing component=recovery:\n%s", logged)
+	}
+	if !strings.Contains(logged, "panic SSE") {
+		t.Errorf("log missing panic SSE error message:\n%s", logged)
+	}
+
+	if counter == 0 {
+		t.Errorf("panicSSEWriteFailures counter = %d, want > 0", counter)
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/config"
 	"github.com/anchapin/nexus-proxy/internal/rag"
 	"github.com/anchapin/nexus-proxy/internal/router"
+	"github.com/anchapin/nexus-proxy/internal/testutil"
 	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
 
@@ -23,9 +24,7 @@ import (
 func captureDebugSlog(t *testing.T) func() ([]map[string]any, string) {
 	t.Helper()
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	testutil.SetDefault(t, slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	return func() ([]map[string]any, string) {
 		raw := buf.String()
 		lines := strings.Split(strings.TrimSpace(raw), "\n")

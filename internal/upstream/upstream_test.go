@@ -522,12 +522,14 @@ func TestPanelArbiterTimeoutBoundsHangingCall(t *testing.T) {
 		arbiterSrv.URL+"/v1/chat/completions", "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, // perFetchTimeout (panel members)
+		5*time.Second, // localFetchTimeout
+		5*time.Second, // frontierFetchTimeout
 		arbiterTO,     // arbiterTimeout
 		false,         // skipLocal
 		"test-request-id",
 		nil, 0*time.Second,
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	elapsed := time.Since(start)
 
@@ -542,6 +544,118 @@ func TestPanelArbiterTimeoutBoundsHangingCall(t *testing.T) {
 	if elapsed > 5*arbiterTO {
 		t.Errorf("Panel took %v with arbiter timeout %v; expected <%v",
 			elapsed, arbiterTO, 5*arbiterTO)
+	}
+}
+
+// TestPanelLocalTimeoutBoundsLocalMember verifies that the local member
+// is bounded by localFetchTimeout, not the frontier timeout (issue #1164).
+// The frontier server responds instantly while the local server blocks.
+// The local fetch must complete within ~localFetchTimeout, not the
+// (larger) frontierFetchTimeout.
+func TestPanelLocalTimeoutBoundsLocalMember(t *testing.T) {
+	localSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+	}))
+	defer localSrv.Close()
+
+	frontierSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"frontier reply"}}]}`)
+	}))
+	defer frontierSrv.Close()
+
+	arbiterSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"synth"}}]}`)
+	}))
+	defer arbiterSrv.Close()
+
+	const localTO = 200 * time.Millisecond
+	start := time.Now()
+	_, _, err := Panel(
+		context.Background(), newSSERW(), http.DefaultClient,
+		localSrv.URL, "local-m",
+		frontierSrv.URL, "", "frontier-m",
+		arbiterSrv.URL+"/v1/chat/completions", "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		localTO,        // localFetchTimeout — short
+		10*time.Second, // frontierFetchTimeout — deliberately large
+		5*time.Second,  // arbiterTimeout
+		false,          // skipLocal
+		"test-request-id",
+		nil, 0*time.Second,
+		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
+	)
+	elapsed := time.Since(start)
+
+	// The arbiter must have received the local error and still synthesized
+	// from the frontier alone. We don't assert on err==nil because Panel
+	// streams the arbiter reply and may return nil.
+	_ = err
+
+	// The local timeout (200ms) must have fired well before the frontier
+	// timeout (10s). Allow generous CI slack.
+	if elapsed > 2*time.Second {
+		t.Errorf("Panel took %v; local timeout %v should have bounded it, not the %v frontier timeout",
+			elapsed, localTO, 10*time.Second)
+	}
+}
+
+// TestPanelFrontierTimeoutBoundsFrontierMember verifies that the frontier
+// member is bounded by frontierFetchTimeout, not the local timeout (issue #1164).
+func TestPanelFrontierTimeoutBoundsFrontierMember(t *testing.T) {
+	localSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local reply"}}]}`)
+	}))
+	defer localSrv.Close()
+
+	frontierSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+	}))
+	defer frontierSrv.Close()
+
+	arbiterSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"synth"}}]}`)
+	}))
+	defer arbiterSrv.Close()
+
+	const frontierTO = 200 * time.Millisecond
+	start := time.Now()
+	_, _, err := Panel(
+		context.Background(), newSSERW(), http.DefaultClient,
+		localSrv.URL, "local-m",
+		frontierSrv.URL, "", "frontier-m",
+		arbiterSrv.URL+"/v1/chat/completions", "", "arbiter-m",
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		10*time.Second, // localFetchTimeout — deliberately large
+		frontierTO,     // frontierFetchTimeout — short
+		5*time.Second,  // arbiterTimeout
+		false,          // skipLocal
+		"test-request-id",
+		nil, 0*time.Second,
+		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
+	)
+	elapsed := time.Since(start)
+
+	_ = err
+
+	if elapsed > 2*time.Second {
+		t.Errorf("Panel took %v; frontier timeout %v should have bounded it, not the %v local timeout",
+			elapsed, frontierTO, 10*time.Second)
 	}
 }
 
@@ -579,12 +693,14 @@ func TestPanelArbiterHappyPathNoRegression(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, // perFetchTimeout
+		5*time.Second, // localFetchTimeout
+		5*time.Second, // frontierFetchTimeout
 		5*time.Second, // arbiterTimeout
 		false,         // skipLocal
 		"test-request-id",
 		nil, 0*time.Second,
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -637,12 +753,14 @@ func TestPanelSkipLocalOmitsLocalFetch(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, // perFetchTimeout
+		5*time.Second, // localFetchTimeout
+		5*time.Second, // frontierFetchTimeout
 		5*time.Second, // arbiterTimeout
 		true,          // skipLocal
 		"test-request-id",
 		nil, 0*time.Second,
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -690,11 +808,12 @@ func TestPanelSkipLocalArbiterPromptHasDegradedMarker(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"the user prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		true, // skipLocal
 		"test-request-id",
 		nil, 0*time.Second,
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -1015,10 +1134,12 @@ func TestPanelArbiterHonorsStreamFlagFalse(t *testing.T) {
 		"test prompt",
 		5*time.Second,
 		5*time.Second,
+		5*time.Second,
 		false, // skipLocal (issue #8)
 		"test-request-id",
 		nil, 0*time.Second,
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -1079,10 +1200,12 @@ func TestPanelArbiterHonorsStreamFlagTrueRegression(t *testing.T) {
 		"test prompt",
 		5*time.Second,
 		5*time.Second,
+		5*time.Second,
 		false, // skipLocal (issue #8)
 		"test-request-id",
 		nil, 0*time.Second,
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -1127,9 +1250,10 @@ func TestPanelForwardsFrontierBearerToken(t *testing.T) {
 		"http://arbiter.local/v1/chat/completions", "sk-arbiter-key", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, "test-request-id", nil, 0*time.Second,
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	); err != nil {
 		t.Fatalf("Panel: %v", err)
 	}
@@ -1180,12 +1304,14 @@ func TestPanelStreamingAgreementSkipsArbiter(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, // perFetchTimeout
+		5*time.Second, // localFetchTimeout
+		5*time.Second, // frontierFetchTimeout
 		5*time.Second, // arbiterTimeout
 		false,         // skipLocal
 		0.85,          // agreementThreshold
 		"test-request-id",
 		nil, 0*time.Second,
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1287,12 +1413,14 @@ func TestPanelStreamingAgreementCancelsSlowMember(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, // perFetchTimeout
+		5*time.Second, // localFetchTimeout
+		5*time.Second, // frontierFetchTimeout
 		5*time.Second, // arbiterTimeout
 		false,         // skipLocal
 		0.85,          // agreementThreshold
 		"testing-"+t.Name()+"-unique",
 		nil, 0*time.Second,
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1324,6 +1452,50 @@ func TestPanelStreamingAgreementCancelsSlowMember(t *testing.T) {
 	body := rw.body.String()
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Errorf("missing [DONE] terminator: %q", body)
+	}
+}
+
+// TestPanelStreamingFrontierTimeoutBoundsFrontierMember verifies that the
+// frontier member in PanelStreaming is bounded by frontierFetchTimeout, not
+// the local timeout (issue #1164).
+func TestPanelStreamingFrontierTimeoutBoundsFrontierMember(t *testing.T) {
+	localSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"local reply"}}]}`)
+	}))
+	defer localSrv.Close()
+
+	frontierSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+	}))
+	defer frontierSrv.Close()
+
+	const frontierTO = 200 * time.Millisecond
+	start := time.Now()
+	_, _ = PanelStreaming(
+		context.Background(), newSSERW(), http.DefaultClient,
+		localSrv.URL, "local-m",
+		frontierSrv.URL, "", "frontier-m",
+		frontierSrv.URL, "", "frontier-m", // arbiter = frontier (won't be reached)
+		map[string]interface{}{"messages": []interface{}{}},
+		"test prompt",
+		10*time.Second, // localFetchTimeout — deliberately large
+		frontierTO,     // frontierFetchTimeout — short
+		5*time.Second,  // arbiterTimeout
+		false,          // skipLocal
+		0.85,           // agreementThreshold
+		"test-request-id",
+		nil, 0*time.Second,
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
+	)
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Errorf("PanelStreaming took %v; frontier timeout %v should have bounded it, not the %v local timeout",
+			elapsed, frontierTO, 10*time.Second)
 	}
 }
 
@@ -1364,10 +1536,12 @@ func TestPanelStreamingDisagreementRunsArbiter(t *testing.T) {
 		"test prompt",
 		5*time.Second,
 		5*time.Second,
+		5*time.Second,
 		false,
 		0.85,
 		"test-request-id",
 		nil, 0*time.Second,
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1451,10 +1625,12 @@ func TestPanelStreamingArbiterCtxFromRequest(t *testing.T) {
 		"test prompt",
 		5*time.Second,
 		5*time.Second,
+		5*time.Second,
 		false,
 		0.85,
 		"test-request-id",
 		nil, 0*time.Second,
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if !observed {
 		t.Fatal("arbiter did not observe request-context cancellation within 250ms; arbiterCtx not derived from request ctx (issue #488)")
@@ -1496,11 +1672,12 @@ func TestPanelStreamingDegradedSkipLocal(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		true, // skipLocal
 		0.85,
 		"test-request-id",
 		nil, 0*time.Second,
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1560,10 +1737,11 @@ func TestPanelStreamingOneMemberFailedSkipsArbiter(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1612,10 +1790,11 @@ func TestPanelStreamingBothMembersFailedSurfacesError(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err == nil {
 		t.Fatal("expected error when both members fail")
@@ -1678,10 +1857,11 @@ func TestPanelStreamingHonorsStreamFalseFallsBackToPanel(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}, "stream": false},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1745,11 +1925,12 @@ func TestPanelStreamingThresholdClamping(t *testing.T) {
 			arbiterURL, "", "arbiter-m",
 			map[string]interface{}{"messages": []interface{}{}},
 			"test prompt",
-			5*time.Second, 5*time.Second,
+			5*time.Second, 5*time.Second, 5*time.Second,
 			false,
 			-1.0, // negative: clamped to 0 → "always skip when both succeed"
 			"test-request-id",
 			nil, 0*time.Second,
+			FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 		)
 		if err != nil {
 			t.Fatalf("PanelStreaming: %v", err)
@@ -1791,11 +1972,12 @@ func TestPanelStreamingThresholdClamping(t *testing.T) {
 			arbiterURL, "", "arbiter-m",
 			map[string]interface{}{"messages": []interface{}{}},
 			"test prompt",
-			5*time.Second, 5*time.Second,
+			5*time.Second, 5*time.Second, 5*time.Second,
 			false,
 			2.0, // >1: clamps to 1 → only identical content skips
 			"test-request-id",
 			nil, 0*time.Second,
+			FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 		)
 		if err != nil {
 			t.Fatalf("PanelStreaming: %v", err)
@@ -1842,10 +2024,11 @@ func TestPanelStreamingSpeculativeSourceIdentified(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -1892,10 +2075,11 @@ func TestPanelStreamingSetsProgressiveHeader(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	); err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
 	}
@@ -1943,10 +2127,11 @@ func TestPanelStreamingToolCallWinnerSkipsArbiter(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85,
 		"test-request-id",
 		nil, 0*time.Second,
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -2082,9 +2267,10 @@ func TestPanelStreamingClientAbortSkipsArbiter(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85, "test-request",
 		nil, 0*time.Second,
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	// Issue #167: client abort is NOT returned as an error — we return nil
 	// so the handler does not render a 502 error page to a disconnected client.
@@ -2140,9 +2326,10 @@ func TestFusionClientAbortTotalIncrementsSpeculative(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85, "test-request",
 		nil, 0*time.Second,
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: got error %v, want nil (client abort)", err)
@@ -2211,9 +2398,10 @@ func TestPanelStreamingForwardsFrontierBearerToken(t *testing.T) {
 		"http://arbiter.local/v1/chat/completions", "sk-arbiter-key", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false, 0.85, "test-request",
 		nil, 0*time.Second,
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("PanelStreaming: %v", err)
@@ -2360,11 +2548,12 @@ func TestPanelCacheHitStream_SetsSSEContentType(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}, "stream": true},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false,
 		"test-request-id",
 		cache, 5*time.Minute,
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("Panel: %v", err)
@@ -2429,11 +2618,12 @@ func TestPanelCacheMissWithExpiredEntry_FallsBackToFetch(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}, "stream": true},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false,
 		"test-request-id",
 		cache, 1*time.Millisecond,
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("Panel: %v", err)
@@ -2487,11 +2677,12 @@ func TestPanelCacheHitNonStream_SetsJSONContentType(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}, "stream": false},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false,
 		"test-request-id",
 		cache, 5*time.Minute,
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("Panel: %v", err)
@@ -2842,10 +3033,12 @@ func TestPanel_MalformedArbiterEmptyChoices_ReturnsError(t *testing.T) {
 		"test prompt",
 		5*time.Second,
 		5*time.Second,
+		5*time.Second,
 		false,
 		"test-request-id",
 		nil, 0*time.Second,
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err == nil {
 		t.Fatalf("Panel: expected error for empty choices, got nil")
@@ -2890,10 +3083,12 @@ func TestPanel_ValidArbiterResponse_ReturnsNoError(t *testing.T) {
 		"test prompt",
 		5*time.Second,
 		5*time.Second,
+		5*time.Second,
 		false,
 		"test-request-id",
 		nil, 0*time.Second,
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("Panel: unexpected error: %v", err)
@@ -2941,11 +3136,12 @@ func TestPanel_CacheHit_ReturnsNoError(t *testing.T) {
 		arbiterURL, "", "arbiter-m",
 		map[string]interface{}{"messages": []interface{}{}, "stream": false},
 		"test prompt",
-		5*time.Second, 5*time.Second,
+		5*time.Second, 5*time.Second, 5*time.Second,
 		false,
 		"test-request-id",
 		cache, 5*time.Minute,
 		false, // isFusion
+		FusionSimilarityConfig{Mode: SimilarityModeJaccard, Embedder: nil},
 	)
 	if err != nil {
 		t.Fatalf("Panel: %v", err)

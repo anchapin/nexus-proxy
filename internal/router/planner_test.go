@@ -62,6 +62,11 @@ func (s *stubConf) LocalConfidence(category string) (float64, error) {
 	return s.value, nil
 }
 
+func (s *stubConf) ComparativeConfidence(category string) (float64, float64, error) {
+	s.queried = append(s.queried, category)
+	return s.value, NeutralConfidence, nil
+}
+
 // formattingPatterns matches the handler's NEXUS_DSL_FORMATTING_PATTERNS default.
 var formattingPatterns = []*regexp.Regexp{regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|debug|fix bug|git commit|sql query|parse json|validate input|regex|api endpoint|test|optimize|readme)\b`)}
 
@@ -83,6 +88,7 @@ func TestDecisionSourceTraceReason(t *testing.T) {
 		{name: "slm error", source: SourceSLMError, want: "slm-error"},
 		{name: "slm no client", source: SourceEscalation, want: "slm-no-client"},
 		{name: "slm low confidence", source: SourceSLMEscalation, want: "slm-low-confidence"},
+		{name: "budget down tier", source: SourceBudgetDownTier, want: "budget-down-tier"},
 	}
 
 	for _, tt := range tests {
@@ -603,6 +609,10 @@ func (s *errorStubConf) LocalConfidence(category string) (float64, error) {
 	return NeutralConfidence, s.err
 }
 
+func (s *errorStubConf) ComparativeConfidence(category string) (float64, float64, error) {
+	return NeutralConfidence, NeutralConfidence, s.err
+}
+
 // TestPlanner_NilConfidenceTaskType verifies issue #441: every decision
 // reaching the SLM stage must have a non-empty TaskType even when no
 // ConfidenceStore is wired. This ensures Prometheus and JSONL telemetry
@@ -954,4 +964,262 @@ func stringOf(b byte, n int) string {
 		buf[i] = b
 	}
 	return string(buf)
+}
+
+// TestPlanner_ConversationContext (issue #1147) verifies that the
+// planner prepends ConversationContext to the prompt for DSL matching,
+// SLM calls, and cache keys — so terse multi-turn follow-ups are routed
+// using the full conversational thread. The guardrail continues to use
+// the latest prompt alone.
+func TestPlanner_ConversationContext(t *testing.T) {
+	basePlanner := func(slm *stubSLM) *Planner {
+		return &Planner{
+			SLM:                slm,
+			FusionPatterns:     fusionPatterns,
+			FormattingRegex:    formattingPatterns,
+			LocalPatternsRegex: localPatterns,
+		}
+	}
+
+	t.Run("dsl matches keyword from prior context not latest prompt", func(t *testing.T) {
+		slm := &stubSLM{route: RouteFrontier}
+		p := basePlanner(slm)
+		// Latest prompt "fix it" matches "fix bug" formatting pattern, but
+		// the prior context reveals an architecture discussion that should
+		// win via fusion precedence.
+		req := PlanRequest{
+			Prompt:              "fix it",
+			ConversationContext: "user: review the system architecture\nassistant: here is my review",
+			GuardrailBudget:     6000,
+			GuardrailSource:     "static-fallback",
+			Context:             context.Background(),
+		}
+		dec := p.Plan(req)
+		if dec.Route != RouteFusion {
+			t.Errorf("Route = %q, want fusion (from context keyword), source=%q", dec.Route, dec.Source)
+		}
+		if dec.Source != SourceDSL {
+			t.Errorf("Source = %q, want %q", dec.Source, SourceDSL)
+		}
+		if slm.calledDecide || slm.calledWithConf {
+			t.Error("SLM should not be called when DSL matches")
+		}
+	})
+
+	t.Run("dsl matches formatting keyword from context alone", func(t *testing.T) {
+		slm := &stubSLM{route: RouteFrontier}
+		p := basePlanner(slm)
+		req := PlanRequest{
+			Prompt:              "do that now",
+			ConversationContext: "user: fix the css for the navbar",
+			GuardrailBudget:     6000,
+			GuardrailSource:     "static-fallback",
+			Context:             context.Background(),
+		}
+		dec := p.Plan(req)
+		if dec.Route != RouteLocal {
+			t.Errorf("Route = %q, want local (css from context)", dec.Route)
+		}
+	})
+
+	t.Run("slm receives combined context plus prompt", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		p := basePlanner(slm)
+		// "now explain line 42" has no DSL match; falls to SLM.
+		req := PlanRequest{
+			Prompt:              "now explain line 42",
+			ConversationContext: "user: review the distributed systems design",
+			GuardrailBudget:     6000,
+			GuardrailSource:     "static-fallback",
+			Context:             context.Background(),
+		}
+		dec := p.Plan(req)
+		if dec.Source != SourceSLM {
+			t.Fatalf("Source = %q, want %q", dec.Source, SourceSLM)
+		}
+		if !slm.calledDecide {
+			t.Fatal("SLM.Decide was not called")
+		}
+		// The SLM must have received the combined text.
+		if slm.lastPrompt == req.Prompt {
+			t.Errorf("SLM received bare prompt; expected context-prepended text")
+		}
+		if slm.lastPrompt == "" {
+			t.Error("SLM received empty prompt")
+		}
+		_ = dec
+	})
+
+	t.Run("guardrail uses latest prompt only not inflated by context", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		p := basePlanner(slm)
+		// Prompt is small (under guardrail), but context is huge. The
+		// guardrail must NOT trip on the context — it uses req.Prompt only.
+		bigContext := stringOf('x', 60000)
+		req := PlanRequest{
+			Prompt:              "fix it",
+			ConversationContext: bigContext,
+			GuardrailBudget:     6000,
+			GuardrailSource:     "static-fallback",
+			Context:             context.Background(),
+		}
+		dec := p.Plan(req)
+		if dec.Source == SourceGuardrail {
+			t.Errorf("guardrail tripped on conversation context — should use latest prompt only")
+		}
+	})
+
+	t.Run("empty context is byte-for-byte identical to current behavior", func(t *testing.T) {
+		slm := &stubSLM{route: RouteLocal}
+		p := basePlanner(slm)
+		req := PlanRequest{
+			Prompt:          "please fix the css",
+			GuardrailBudget: 6000,
+			GuardrailSource: "static-fallback",
+			Context:         context.Background(),
+		}
+		dec := p.Plan(req)
+		if dec.Route != RouteLocal {
+			t.Errorf("Route = %q, want local", dec.Route)
+		}
+		if dec.Source != SourceDSL {
+			t.Errorf("Source = %q, want %q", dec.Source, SourceDSL)
+		}
+		if slm.lastPrompt != "" && slm.lastPrompt != req.Prompt {
+			t.Errorf("SLM prompt = %q, want %q or empty", slm.lastPrompt, req.Prompt)
+		}
+	})
+}
+
+// stubBudget is a deterministic BudgetChecker for planner tests (issue #1163).
+type stubBudget struct {
+	remaining   float64
+	wouldExceed bool
+}
+
+func (s *stubBudget) Remaining() float64       { return s.remaining }
+func (s *stubBudget) WouldExceed(float64) bool { return s.wouldExceed }
+
+// TestPlanner_BudgetDownTier verifies that when the budget checker
+// reports the estimated frontier cost would exceed the remaining
+// budget, the planner down-tiers to RouteLocal with Source
+// SourceBudgetDownTier (issue #1163).
+func TestPlanner_BudgetDownTier(t *testing.T) {
+	slm := &stubSLM{route: RouteFrontier}
+	p := &Planner{
+		SLM:                slm,
+		FusionPatterns:     fusionPatterns,
+		FormattingRegex:    formattingPatterns,
+		LocalPatternsRegex: localPatterns,
+		Budget:             &stubBudget{remaining: 0.01, wouldExceed: true},
+		FrontierCostPer1K:  0.005,
+	}
+	req := PlanRequest{
+		Prompt:          "explain quantum computing in detail", // no DSL match
+		GuardrailBudget: 6000,
+		GuardrailSource: "static-fallback",
+		Context:         context.Background(),
+	}
+	dec := p.Plan(req)
+
+	if dec.Route != RouteLocal {
+		t.Errorf("Route = %q, want local (budget exhausted)", dec.Route)
+	}
+	if dec.Source != SourceBudgetDownTier {
+		t.Errorf("Source = %q, want %q", dec.Source, SourceBudgetDownTier)
+	}
+	if dec.Reason != "budget-exhausted" {
+		t.Errorf("Reason = %q, want budget-exhausted", dec.Reason)
+	}
+	if slm.calledDecide || slm.calledWithConf {
+		t.Error("SLM should not be called when budget down-tiers")
+	}
+}
+
+// TestPlanner_BudgetHealthyNoDownTier verifies that when the budget is
+// healthy, the planner routes normally — no down-tier (issue #1163).
+func TestPlanner_BudgetHealthyNoDownTier(t *testing.T) {
+	slm := &stubSLM{route: RouteFrontier}
+	p := &Planner{
+		SLM:                slm,
+		FusionPatterns:     fusionPatterns,
+		FormattingRegex:    formattingPatterns,
+		LocalPatternsRegex: localPatterns,
+		Budget:             &stubBudget{remaining: 50.0, wouldExceed: false},
+		FrontierCostPer1K:  0.005,
+	}
+	req := PlanRequest{
+		Prompt:          "explain quantum computing in detail",
+		GuardrailBudget: 6000,
+		GuardrailSource: "static-fallback",
+		Context:         context.Background(),
+	}
+	dec := p.Plan(req)
+
+	if dec.Route != RouteFrontier {
+		t.Errorf("Route = %q, want frontier (budget healthy)", dec.Route)
+	}
+	if dec.Source != SourceSLM {
+		t.Errorf("Source = %q, want %q", dec.Source, SourceSLM)
+	}
+}
+
+// TestPlanner_GuardrailPrecedenceOverBudget verifies that the VRAM
+// guardrail takes precedence over the budget check — even when the
+// budget is exhausted, an oversized prompt still routes to frontier
+// (issue #1163).
+func TestPlanner_GuardrailPrecedenceOverBudget(t *testing.T) {
+	slm := &stubSLM{route: RouteLocal}
+	p := &Planner{
+		SLM:                slm,
+		FusionPatterns:     fusionPatterns,
+		FormattingRegex:    formattingPatterns,
+		LocalPatternsRegex: localPatterns,
+		Budget:             &stubBudget{remaining: 0.0, wouldExceed: true},
+		FrontierCostPer1K:  0.005,
+	}
+	req := PlanRequest{
+		// 50000 'a's = 6250 tokens > 6000 guardrail budget.
+		Prompt:          stringOf('a', 50000),
+		GuardrailBudget: 6000,
+		GuardrailSource: "static-fallback",
+		Context:         context.Background(),
+	}
+	dec := p.Plan(req)
+
+	if dec.Route != RouteFrontier {
+		t.Errorf("Route = %q, want frontier (VRAM guardrail wins)", dec.Route)
+	}
+	if dec.Source != SourceGuardrail {
+		t.Errorf("Source = %q, want %q", dec.Source, SourceGuardrail)
+	}
+}
+
+// TestPlanner_NilBudgetCheckerBackwardCompat verifies that when no
+// BudgetChecker is wired, the planner behaves exactly as before
+// (backward compatible) — no budget stage runs (issue #1163).
+func TestPlanner_NilBudgetCheckerBackwardCompat(t *testing.T) {
+	slm := &stubSLM{route: RouteFrontier}
+	p := &Planner{
+		SLM:                slm,
+		FusionPatterns:     fusionPatterns,
+		FormattingRegex:    formattingPatterns,
+		LocalPatternsRegex: localPatterns,
+		Budget:             nil, // disabled
+		FrontierCostPer1K:  0.005,
+	}
+	req := PlanRequest{
+		Prompt:          "explain quantum computing in detail",
+		GuardrailBudget: 6000,
+		GuardrailSource: "static-fallback",
+		Context:         context.Background(),
+	}
+	dec := p.Plan(req)
+
+	if dec.Route != RouteFrontier {
+		t.Errorf("Route = %q, want frontier (nil BudgetChecker)", dec.Route)
+	}
+	if dec.Source != SourceSLM {
+		t.Errorf("Source = %q, want %q", dec.Source, SourceSLM)
+	}
 }

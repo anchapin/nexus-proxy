@@ -44,6 +44,17 @@ import (
 // blocking the response path.
 const bufferedChannelSize = 1024
 
+// BatchConfig controls the drain batching behaviour (issue #1234).
+// When BatchSize > 0 the drain accumulates that many records before
+// committing a transaction. When BatchTimeout > 0 the drain also
+// flushes a partial batch after this duration has elapsed since the
+// last flush. Callback is invoked after every successful COMMIT.
+type BatchConfig struct {
+	Size     int           // default 64; <= 0 means "flush every record"
+	Timeout  time.Duration // default 100ms; <= 0 means "no timeout flush"
+	Callback func()        // invoked after every COMMIT; may be nil
+}
+
 // RecordRequestErrorTimeout bounds how long a Write op waits for a
 // slow disk before the Store reports the failure. Most inserts finish
 // in microseconds against tmpfs; the timeout exists only to bound a
@@ -103,6 +114,13 @@ type Request struct {
 	RAGCacheHit           bool // true when the RAG embedding was served from the embed cache (issue #227)
 	EstimatedCostUSD      float64
 
+	// InputCostUSD / OutputCostUSD split EstimatedCostUSD into the
+	// input-token and output-token components (issue #1183). When the
+	// per-provider split model is disabled the output component is zero
+	// and InputCostUSD equals EstimatedCostUSD.
+	InputCostUSD  float64
+	OutputCostUSD float64
+
 	// BaselineCostUSD is what this request would have cost if sent
 	// to the configured baseline (frontier) provider at the baseline
 	// rate, regardless of the actual route taken (issue #73).
@@ -128,6 +146,28 @@ type Request struct {
 	RouteReason   string
 	SLMConfidence float64
 	SLMTaskType   string
+
+	// Arbiter cache key + synthesis for boot-time pre-warming (issue
+	// #1176). Populated only when a fresh arbiter synthesis was computed
+	// and cached (route=fusion, cache miss, stream=false). Empty on all
+	// other paths so the columns default to '' and add negligible
+	// storage overhead.
+	ArbiterCacheKeyHex string
+	ArbiterSynthesis   string
+
+	// Tenant (issue #1154) is the resolved tenant identifier from
+	// multi-key inbound auth. Empty for the legacy single-key path
+	// or when auth is disabled. Written to a nullable tenant column
+	// in the requests table.
+	Tenant string
+
+	// CacheReadInputTokens / CacheCreationInputTokens track Anthropic
+	// prompt-caching token categories (issue #1245). When the Anthropic
+	// adapter injects cache_control hints, the upstream response includes
+	// usage.cache_read_input_tokens and usage.cache_creation_input_tokens.
+	// These fields let operators measure cache hit rates and cost savings.
+	CacheReadInputTokens     int
+	CacheCreationInputTokens int
 }
 
 // Summary is the per-day roll-up returned by Store.DailySummary.
@@ -147,6 +187,14 @@ type Summary struct {
 	RAGCacheHitCount   int // number of requests whose RAG embedding was served from the embed cache (issue #227)
 	EstimatedCostTotal float64
 
+	// InputCostTotal / OutputCostTotal (issue #1183) roll up the
+	// per-request input_cost_usd and output_cost_usd columns so the
+	// dashboard can surface the input/output cost split. When the split
+	// model is disabled, OutputCostTotal is zero and InputCostTotal
+	// equals EstimatedCostTotal.
+	InputCostTotal  float64
+	OutputCostTotal float64
+
 	// BaselineCostTotal and SavingsTotal roll up the per-request
 	// baseline_cost_usd and savings_usd columns (issue #73).
 	// BaselineCostTotal is the total "would-have-cost at frontier"
@@ -162,11 +210,19 @@ type Summary struct {
 // Store persists per-request metrics. Implementations MUST return
 // promptly from RecordRequest; chat-path latency must never depend on
 // disk I/O timing. Buffered / async implementations are the expected
-// shape — the only synchronous call is DailySummary, which the
-// dashboard invokes explicitly.
+// shape — the only synchronous calls are DailySummary and RangeSummary,
+// which the dashboard invokes explicitly.
 type Store interface {
 	RecordRequest(req Request) error
 	DailySummary(date time.Time) (Summary, error)
+	// RangeSummary collapses every request whose timestamp falls in the
+	// half-open interval [start, end) into a single Summary. The Date
+	// field of the returned Summary is set to the truncated start. This
+	// is the long-horizon counterpart to DailySummary: a single SQL
+	// round-trip replaces N per-day queries for weekly / monthly
+	// rollups (issue #1170). When start is not before end an empty-range
+	// error is returned.
+	RangeSummary(start, end time.Time) (Summary, error)
 	Close() error
 }
 
@@ -187,14 +243,14 @@ var stdLogger Logger = func(format string, args ...any) {
 // directory is created on demand. An empty path is rejected; ":memory:"
 // is allowed for tests. Retention is disabled (pre-#483 behaviour).
 func Open(path string) (Store, error) {
-	return OpenWithRetention(path, 0, stdLogger)
+	return OpenWithRetention(path, 0, stdLogger, BatchConfig{})
 }
 
 // OpenWithLogger is Open with a custom logger. Pass a no-op Logger to
 // silence the package in tests; pass nil to use the default. Retention
 // is disabled.
 func OpenWithLogger(path string, lg Logger) (Store, error) {
-	return OpenWithRetention(path, 0, lg)
+	return OpenWithRetention(path, 0, lg, BatchConfig{})
 }
 
 // OpenWithRetention creates a Store with an optional retention window
@@ -202,7 +258,9 @@ func OpenWithLogger(path string, lg Logger) (Store, error) {
 // rows older than that many days roughly once per hour. retentionDays
 // <= 0 disables retention (identical to OpenWithLogger). The parent
 // directory is created on demand. An empty path is rejected.
-func OpenWithRetention(path string, retentionDays int, lg Logger) (Store, error) {
+// batch controls the drain batching behaviour (issue #1234); pass a
+// zero-value BatchConfig to retain the pre-batch per-record behaviour.
+func OpenWithRetention(path string, retentionDays int, lg Logger, batch BatchConfig) (Store, error) {
 	if path == "" {
 		return nil, fmt.Errorf("metrics: empty path")
 	}
@@ -216,7 +274,7 @@ func OpenWithRetention(path string, retentionDays int, lg Logger) (Store, error)
 			}
 		}
 	}
-	s, err := newSQLiteStore(path, retentionDays, lg)
+	s, err := newSQLiteStore(path, retentionDays, lg, batch)
 	if err != nil {
 		return nil, err
 	}
@@ -238,8 +296,9 @@ type DroppedCounter interface {
 // Compile-time guards: keep the sealed-shape door closed if the SQLite
 // implementation grows.
 var (
-	_ Store          = (*SQLiteStore)(nil)
-	_ DroppedCounter = (*SQLiteStore)(nil)
+	_ Store                  = (*SQLiteStore)(nil)
+	_ DroppedCounter         = (*SQLiteStore)(nil)
+	_ ArbiterSynthesisReader = (*SQLiteStore)(nil)
 )
 
 // closeOnce guards Close against accidental double-close from a

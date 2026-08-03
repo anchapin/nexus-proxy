@@ -77,6 +77,14 @@ func NewArbiterCache(ttl time.Duration, maxEntries int) *ArbiterCache {
 	}
 }
 
+// CacheKey computes the deterministic SHA-256 hash of two panel-member
+// contents. Exported so callers (e.g. the metrics recorder) can compute
+// the same key the cache uses, enabling pre-warming from historical data
+// (issue #1176). See cacheKey for the full algorithm.
+func CacheKey(r1Content, r2Content string) [32]byte {
+	return cacheKey(r1Content, r2Content)
+}
+
 // cacheKey computes a deterministic SHA-256 hash of the two panel-member
 // contents. Each content is hashed independently and the two 32-byte
 // hashes are concatenated in sorted order and re-hashed to produce a
@@ -117,6 +125,9 @@ func canonicalize(h1, h2 *[32]byte) [64]byte {
 // touch moves the given key to the end of the LRU list (most recently used).
 // Caller must hold c.mu.
 func (c *ArbiterCache) touch(key [32]byte) {
+	if _, exists := c.items[key]; !exists {
+		return
+	}
 	for i, k := range c.lru {
 		if k == key {
 			c.lru = append(c.lru[:i], c.lru[i+1:]...)
@@ -278,4 +289,49 @@ func (c *ArbiterCache) MaxEntries() int {
 		return 0
 	}
 	return c.maxEntries
+}
+
+// ArbiterCacheWarmEntry is one row for cache pre-warming (issue #1176).
+// Key is a pre-computed CacheKey hash so the warmer does not need access
+// to the original panel-member contents. WrittenAt is the original cache
+// write timestamp; entries already older than the TTL are skipped.
+type ArbiterCacheWarmEntry struct {
+	Key       [32]byte
+	Synthesis string
+	WrittenAt time.Time
+}
+
+// Warm bulk-loads historical arbiter synthesis entries into the cache
+// (issue #1176). Each entry's WrittenAt is checked against the cache
+// TTL: entries already expired are skipped and counted in skippedStale.
+// Loaded entries are inserted with their original WrittenAt timestamp
+// and the cache's configured TTL, so the normal expiry semantics apply
+// on subsequent Get calls. LRU eviction is honoured: if the cache is at
+// capacity, the least-recently-used entry is evicted per insert.
+//
+// Returns (loaded, skippedStale). A nil cache is a no-op.
+func (c *ArbiterCache) Warm(entries []ArbiterCacheWarmEntry) (loaded, skippedStale int) {
+	if c == nil || len(entries) == 0 {
+		return 0, 0
+	}
+	now := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, e := range entries {
+		if now.Sub(e.WrittenAt) > c.ttl {
+			skippedStale++
+			continue
+		}
+		if c.maxEntries > 0 && len(c.items) >= c.maxEntries {
+			c.evictLru()
+		}
+		c.items[e.Key] = &ArbiterCacheEntry{
+			Synthesis:   e.Synthesis,
+			CachedAt:    e.WrittenAt,
+			TTLDuration: c.ttl,
+		}
+		c.touch(e.Key)
+		loaded++
+	}
+	return loaded, skippedStale
 }

@@ -50,6 +50,11 @@ const (
 	KindTS      Kind = "tsconfig.json"
 )
 
+// droppedEventArgsCap bounds the size of Args stored in the dropped
+// ring so that large tool payloads cannot cause unbounded memory growth.
+// EncodeEvent also uses this limit when truncating args for log lines.
+const droppedEventArgsCap = 200
+
 // AllKinds is the ordered list of supported project markers. The
 // verifier recognises the same set; tests and dashboards use this list
 // to enumerate valid options.
@@ -198,6 +203,9 @@ func newDroppedRing(size int) *droppedRing {
 // Push records one dropped event into the ring buffer.
 func (r *droppedRing) Push(e Event) {
 	pos := r.idx.Add(1) - 1
+	if len(e.Args) > droppedEventArgsCap {
+		e.Args = e.Args[:droppedEventArgsCap]
+	}
 	r.events[pos%int64(r.size)] = e
 }
 
@@ -465,6 +473,10 @@ func (v *ShellVerifier) lookupProject(filePath string) (string, Kind, error) {
 				if err != nil || fi.ModTime().UnixNano() != h.mtime {
 					// Manifest missing or mtime changed — invalidate and rewalk.
 					v.cache.Delete(cacheKey)
+				} else if hasOtherKindAtRoot(h.root, h.kind) {
+					// Another manifest kind appeared at the same root — invalidate
+					// and rewalk so the correct kind is discovered (issue #1124).
+					v.cache.Delete(cacheKey)
 				} else {
 					return h.root, h.kind, nil
 				}
@@ -499,6 +511,26 @@ func (v *ShellVerifier) lookupProject(filePath string) (string, Kind, error) {
 		dir = parent
 	}
 	return "", KindUnknown, nil
+}
+
+// hasOtherKindAtRoot returns true if any recognised project manifest
+// of a *different* kind than `skip` exists in dir. Used to invalidate
+// positive cache entries when a manifest of another kind appears at the
+// same root after cache prime (issue #1124).
+func hasOtherKindAtRoot(dir string, skip Kind) bool {
+	for _, k := range AllKinds {
+		if k == skip {
+			continue
+		}
+		marker := k.Marker()
+		if marker == "" {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // hasAnyManifest returns true if any recognised project manifest
@@ -645,12 +677,10 @@ func EncodeEvent(e Event) string {
 	b.WriteString(e.ToolName)
 	if len(e.Args) > 0 {
 		b.WriteString(" args=")
-		// Truncate to keep log lines readable.
-		const cap = 200
-		if len(e.Args) <= cap {
+		if len(e.Args) <= droppedEventArgsCap {
 			b.Write(e.Args)
 		} else {
-			b.Write(e.Args[:cap])
+			b.Write(e.Args[:droppedEventArgsCap])
 			b.WriteString("...[truncated]")
 		}
 	}
