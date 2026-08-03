@@ -1051,9 +1051,10 @@ func checkModelsEndpointFn(ctx context.Context, cfg config.Config, opts Options)
 // and contains the nexus_build_info metric. This confirms Prometheus can
 // successfully scrape the endpoint.
 //
-// The check always fails (not skip) on any error including timeout and
-// connection refused — if the server is not running the operator needs to
-// know, not silently skip over a broken metrics pipeline.
+// The check skips when the server is not running (connection refused) so that
+// `nexus check` can validate configuration even when the server is down.
+// On other errors (timeout, non-OK status, missing metric) it fails so the
+// operator is alerted to a broken metrics pipeline.
 func checkMetricsEndpointFn(ctx context.Context, cfg config.Config, opts Options) Check {
 	addr := cfg.Addr
 	if addr == "" {
@@ -1077,9 +1078,11 @@ func checkMetricsEndpointFn(ctx context.Context, cfg config.Config, opts Options
 
 	resp, err := opts.HTTPClient.Do(req)
 	if err != nil {
+		// Connection refused: server not running — skip rather than fail
+		// so `nexus check` can validate config even when the server is down.
 		return Check{
 			Name:   checkMetricsEndpoint,
-			Status: StatusFail,
+			Status: StatusSkip,
 			Detail: fmt.Sprintf("cannot reach %s: %v", metricsURL, err),
 		}
 	}

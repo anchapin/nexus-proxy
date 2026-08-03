@@ -1141,7 +1141,7 @@ func TestRunMetricsEndpointReachableWithNexusBuildInfoIsPass(t *testing.T) {
 	}
 }
 
-func TestRunMetricsEndpointUnreachableIsFail(t *testing.T) {
+func TestRunMetricsEndpointUnreachableIsSkip(t *testing.T) {
 	ollama := newOllamaFixture(t)
 	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
 	// Use a closed port so connection is refused.
@@ -1153,8 +1153,8 @@ func TestRunMetricsEndpointUnreachableIsFail(t *testing.T) {
 		Timeout:    200 * time.Millisecond,
 	})
 	got := checkByName(res, checkMetricsEndpoint)
-	if got.Status != StatusFail {
-		t.Errorf("metrics_endpoint = %s (detail=%s), want fail when unreachable", got.Status, got.Detail)
+	if got.Status != StatusSkip {
+		t.Errorf("metrics_endpoint = %s (detail=%s), want skip when unreachable", got.Status, got.Detail)
 	}
 }
 
