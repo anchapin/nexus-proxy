@@ -564,6 +564,12 @@ func checkVRAMProbeFn(ctx context.Context, cfg config.Config, opts Options) Chec
 // is a warning (not a failure) because RAG silently no-ops on an
 // empty store and the proxy still serves traffic; the operator
 // simply will not get the few-shot boost.
+//
+// When the directory exists, we count the entries and compare against
+// DiagRAGMinFiles (issue #1290):
+//   - 0 entries → fail
+//   - 1..(minFiles-1) entries → warn
+//   - ≥ minFiles entries → pass
 func checkRAGDirectoryFn(cfg config.Config) Check {
 	if cfg.ExamplesDir == "" {
 		return Check{
@@ -595,17 +601,29 @@ func checkRAGDirectoryFn(cfg config.Config) Check {
 			Detail: fmt.Sprintf("cannot read %q: %v", cfg.ExamplesDir, err),
 		}
 	}
-	if len(entries) == 0 {
+	n := len(entries)
+	minFiles := cfg.DiagRAGMinFiles
+	if minFiles <= 0 {
+		minFiles = 3 // sensible default
+	}
+	if n == 0 {
+		return Check{
+			Name:   checkRAGDirectory,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("0 files in %q — RAG injection inactive", cfg.ExamplesDir),
+		}
+	}
+	if n < minFiles {
 		return Check{
 			Name:   checkRAGDirectory,
 			Status: StatusWarn,
-			Detail: fmt.Sprintf("%q is empty — RAG injection inactive", cfg.ExamplesDir),
+			Detail: fmt.Sprintf("%d file(s) in %q (below minimum %d)", n, cfg.ExamplesDir, minFiles),
 		}
 	}
 	return Check{
 		Name:   checkRAGDirectory,
 		Status: StatusPass,
-		Detail: fmt.Sprintf("%d file(s) in %q", len(entries), cfg.ExamplesDir),
+		Detail: fmt.Sprintf("%d file(s) in %q", n, cfg.ExamplesDir),
 	}
 }
 

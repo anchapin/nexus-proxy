@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -104,13 +106,20 @@ func TestRunCheckPassesWhenAllGreen(t *testing.T) {
 	tags := `{"models":[{"name":"qwen3-coder:4b"},{"name":"qwen3-coder:8b"},{"name":"nomic-embed-text"}]}`
 	ollama.tags = &tags
 	fr := newCheckFrontierFixture(t, http.StatusOK)
+	examplesDir := t.TempDir()
+	// Create 3 files to meet DiagRAGMinFiles threshold (default 3, issue #1290).
+	for i := 1; i <= 3; i++ {
+		if err := os.WriteFile(filepath.Join(examplesDir, fmt.Sprintf("example%d.txt", i)), []byte("hi"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	t.Setenv("NEXUS_OLLAMA_URL", ollama.Server.URL)
 	t.Setenv("NEXUS_FRONTIER_URL", fr.Server.URL+"/chat/completions")
 	t.Setenv("NEXUS_FRONTIER_API_KEY", "sk-test")
 	t.Setenv("NEXUS_ZAI_API_KEY", "zai-test")
 	t.Setenv("NEXUS_TELEMETRY_PATH", filepath.Join(t.TempDir(), "telem.jsonl"))
 	t.Setenv("NEXUS_METRICS_DB", filepath.Join(t.TempDir(), "metrics.db"))
-	t.Setenv("NEXUS_EXAMPLES_DIR", t.TempDir()) // empty -> warn, not fail
+	t.Setenv("NEXUS_EXAMPLES_DIR", examplesDir)
 	t.Setenv("NEXUS_JUDGE_SAMPLE_RATE", "0")
 	for _, k := range []string{
 		"NEXUS_ROUTING_CONFIDENCE_DB",

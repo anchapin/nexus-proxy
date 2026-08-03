@@ -3,6 +3,7 @@ package diag
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -463,19 +464,22 @@ func TestRunRAGDirectoryEmpty(t *testing.T) {
 
 	res := Run(context.Background(), cfg, withOptions(ollama.URL))
 	got := checkByName(res, checkRAGDirectory)
-	if got.Status != StatusWarn {
-		t.Errorf("rag_directory = %s, want warn", got.Status)
+	if got.Status != StatusFail {
+		t.Errorf("rag_directory = %s, want fail", got.Status)
 	}
-	if !strings.Contains(got.Detail, "empty") {
-		t.Errorf("detail should mention empty: %q", got.Detail)
+	if !strings.Contains(got.Detail, "0 files") {
+		t.Errorf("detail should mention 0 files: %q", got.Detail)
 	}
 }
 
 func TestRunRAGDirectoryPopulated(t *testing.T) {
 	ollama := newOllamaFixture(t)
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "example.txt"), []byte("hi"), 0o644); err != nil {
-		t.Fatal(err)
+	// Create 3 files to meet the minimum threshold (default 3).
+	for i := 1; i <= 3; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("example%d.txt", i)), []byte("hi"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
 	cfg.ExamplesDir = dir
@@ -484,6 +488,83 @@ func TestRunRAGDirectoryPopulated(t *testing.T) {
 	got := checkByName(res, checkRAGDirectory)
 	if got.Status != StatusPass {
 		t.Errorf("rag_directory = %s (detail=%s), want pass", got.Status, got.Detail)
+	}
+}
+
+func TestRunRAGDirectoryOneFileIsWarn(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "example1.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.ExamplesDir = dir
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkRAGDirectory)
+	if got.Status != StatusWarn {
+		t.Errorf("rag_directory = %s, want warn", got.Status)
+	}
+	if !strings.Contains(got.Detail, "1 file") {
+		t.Errorf("detail should mention 1 file: %q", got.Detail)
+	}
+}
+
+func TestRunRAGDirectoryTwoFilesIsWarn(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	dir := t.TempDir()
+	for i := 1; i <= 2; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("example%d.txt", i)), []byte("hi"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.ExamplesDir = dir
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkRAGDirectory)
+	if got.Status != StatusWarn {
+		t.Errorf("rag_directory = %s, want warn", got.Status)
+	}
+	if !strings.Contains(got.Detail, "2 file") {
+		t.Errorf("detail should mention 2 files: %q", got.Detail)
+	}
+}
+
+func TestRunRAGDirectoryCustomMinFiles(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	dir := t.TempDir()
+	// With DiagRAGMinFiles=2, 2 files should pass.
+	for i := 1; i <= 2; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("example%d.txt", i)), []byte("hi"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.ExamplesDir = dir
+	cfg.DiagRAGMinFiles = 2
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkRAGDirectory)
+	if got.Status != StatusPass {
+		t.Errorf("rag_directory = %s (detail=%s), want pass with minFiles=2", got.Status, got.Detail)
+	}
+}
+
+func TestRunRAGDirectoryCustomMinFilesOneFileIsWarn(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "example1.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.ExamplesDir = dir
+	cfg.DiagRAGMinFiles = 2
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkRAGDirectory)
+	if got.Status != StatusWarn {
+		t.Errorf("rag_directory = %s, want warn when below custom minFiles=2", got.Status)
 	}
 }
 
