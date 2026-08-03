@@ -39,10 +39,10 @@ func TestGuardrail(t *testing.T) {
 
 func TestDSL(t *testing.T) {
 	// Use exported default patterns so tests stay in sync with dsl.go defaults.
-	fusionPatterns     := DefaultFusionPatterns
+	fusionPatterns := DefaultFusionPatterns
 	formattingPatterns := DefaultFormattingPatterns
-	localPatterns     := DefaultLocalPatterns
-	unicodePatterns   := DefaultUnicodePatterns
+	localPatterns := DefaultLocalPatterns
+	unicodePatterns := DefaultUnicodePatterns
 	cases := []struct {
 		name    string
 		prompt  string
