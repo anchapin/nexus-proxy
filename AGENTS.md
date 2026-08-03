@@ -548,6 +548,16 @@ var listed in `ReloadHotReloadable()` carries the `# hot-reloadable via
 SIGHUP` annotation in `.env.example` — omitting the annotation from a new
 hot-reloadable var will fail the test.
 
+**Avoid using `API_KEY` in new env var names.** The `generic-api-api-key`
+gitleaks rule (issue #1274) matches on the `API_KEY` substring — struct
+field names like `ProxyAPIKey` and string constants like
+`NEXUS_FRONTIER_API_KEY` trigger false positives. Prefer names like
+`SECRET_KEY`, `AUTH_TOKEN`, or split into `_KEY` / `_TOKEN` / `_SECRET`
+components that don't contain the exact `API_KEY` pattern. Existing
+occurrences are suppressed via `// gitleaks:allow` comments in
+`internal/config/config.go`; new ones must add the same suppression or
+gitleaks will block the PR.
+
 ## Branch conventions
 
 - **`develop`** is the default branch — base for all feature/fix branches
