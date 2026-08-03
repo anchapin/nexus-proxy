@@ -22,6 +22,10 @@ IMPORTANT — Silent Failure Prevention:
 - If you do not output a PR number, the orchestrator will treat your run as FAILED.
 - The orchestrator verifies git log origin/develop..HEAD is non-empty before accepting "done".
 - If your worktree is unchanged after you report done, recovery will be triggered.
+- **CRITICAL: PR CREATION IS MANDATORY.** You MUST run `gh pr create` and verify
+  the PR was created before outputting `PR: {PR_NUMBER}`. Skipping PR creation will
+  trigger the orchestrator's recovery sequence, which creates the PR directly — but
+  this adds overhead and risks incorrect PR metadata. Do NOT skip step 8.
 
 Steps:
 1. Read the full issue: gh issue view {NUMBER}
@@ -29,42 +33,58 @@ Steps:
 3. Analyze what code needs to change
 4. Implement the fix/feature with tests
 5. Run local checks if available (make test-fast, make lint)
- 6. Commit: git add -A && git commit -m "{fix|feat}: resolve #{NUMBER} — {brief description}"
- 7. Push: git push -u origin fix/issue-{NUMBER}-{SLUG} --force-with-lease
-     NOTE: If push fails (e.g., remote branch exists with newer commits), use
-     `git pull --rebase origin develop` first, then push again with --force-with-lease.
- 8. Open PR with an EXPLICIT body (no `--fill` — see PR-body conventions):
-    ```
-    gh pr create --base develop \
-      --title "{fix|feat}: resolve #{NUMBER} — {TITLE}" \
-      --body "$(cat <<'EOF'
+6. Commit: git add -A && git commit -m "{fix|feat}: resolve #{NUMBER} — {brief description}"
+7. Push: git push -u origin fix/issue-{NUMBER}-{SLUG} --force-with-lease
+   NOTE: If push fails (e.g., remote branch exists with newer commits), use
+   `git pull --rebase origin develop` first, then push again with --force-with-lease.
+8. **PR CREATION — MANDATORY STEP. Do NOT skip.**
+   Run this exact command and capture the output:
+   ```
+   gh pr create --base develop \
+     --title "{fix|feat}: resolve #{NUMBER} — {TITLE}" \
+     --body "$(cat <<'EOF'
    Closes #{NUMBER}
 
    <one-paragraph description of the change>
    EOF
    )"
-    ```
-    The body must list ALL issues that this PR resolves. If the
-    commit also fixes a related issue, add another `Closes #N` line.
-    Do NOT include issue numbers in the title — see
-    `docs/orchestration/pr-body-conventions.md` for the rationale.
- 9. Verify closingReferences count matches the number of issues this PR resolves:
-    ```
-    bash scripts/check_pr_closing_refs.sh <PR_NUMBER> <COUNT>
-    ```
-    If the check fails, run `gh pr edit <PR> --body "Closes #N\n\n<minimal body>"`
-    to strip the spurious references, then re-run the check.
+   ```
+   - The body must list ALL issues that this PR resolves. If the
+     commit also fixes a related issue, add another `Closes #N` line.
+   - Do NOT include issue numbers in the title — see
+     `docs/orchestration/pr-body-conventions.md` for the rationale.
+   - **Verify the PR was created**: after `gh pr create` succeeds, run:
+     ```
+     gh pr list --search "fix/issue-{NUMBER}" --json number --jq 'length'
+     ```
+     This must return 1. If it returns 0, the PR creation failed silently —
+     retry `gh pr create` or use `gh pr create --fill` as fallback.
+   - **Capture the PR number** from `gh pr create` output or from:
+     ```
+     gh pr list --search "fix/issue-{NUMBER}" --json number --jq '.[0].number'
+     ```
 
-    NOTE: After this step the orchestrator independently verifies the PR exists.
-    If the sub-agent exits before completing step 7 or 8, the orchestrator's
-    wave-level recovery sequence (see SKILL.md Phase 3c § Recovery) will push
-    the branch and create the PR directly using --force-with-lease.
+9. Verify closingReferences count matches the number of issues this PR resolves:
+   ```
+   bash scripts/check_pr_closing_refs.sh <PR_NUMBER> <COUNT>
+   ```
+   If the check fails, run `gh pr edit <PR> --body "Closes #N\n\n<minimal body>"
+   to strip the spurious references, then re-run the check.
+
+   NOTE: After this step the orchestrator independently verifies the PR exists.
+   If the sub-agent exits before completing step 8, the orchestrator's
+   wave-level recovery sequence (see SKILL.md Phase 3c § Recovery) will push
+   the branch and create the PR directly using --force-with-lease.
 10. **FINAL OUTPUT**: Your last line of output MUST be:
     ```
     PR: {PR_NUMBER}
     ```
     Do NOT say "done", "complete", or anything else after the PR number.
     The orchestrator parses this line to confirm success.
+
+    **IMPORTANT**: The PR number must be REAL and VERIFIED. You must have run
+    `gh pr create` in step 8 and confirmed the PR exists in step 8's verification.
+    Do NOT output a PR number you made up or that came from a failed command.
 
 Rules:
 - Work ONLY in your assigned worktree ({WORKDIR})
@@ -79,6 +99,8 @@ Rules:
 - Follow the repo's AGENTS.md and code style conventions
 - If the issue is unclear, add a comment asking for clarification: gh issue comment {NUMBER} -b "..."
 - Report back: PR number, files changed, any blockers encountered
+- **PR CREATION IS MANDATORY**: You MUST create the PR using `gh pr create` in step 8
+  and verify it exists before reporting completion. Do NOT skip this step.
 ```
 
 ## CI Sub-agent Template
