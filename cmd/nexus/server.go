@@ -388,10 +388,10 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 			Timeout:                cfg.JudgeTimeout,
 			CostPer1K:              cfg.JudgeCostPer1KUSD,
 			BudgetGuard:            budgetGuard,
-			AdaptiveEnabled:         cfg.JudgeAdaptiveEnabled,
-			AdaptiveWindow:          cfg.JudgeAdaptiveWindow,
-			AdaptiveHighConfidence:  cfg.JudgeAdaptiveHighConf,
-			AdaptiveLowConfidence:   cfg.JudgeAdaptiveLowConf,
+			AdaptiveEnabled:        cfg.JudgeAdaptiveEnabled,
+			AdaptiveWindow:         cfg.JudgeAdaptiveWindow,
+			AdaptiveHighConfidence: cfg.JudgeAdaptiveHighConf,
+			AdaptiveLowConfidence:  cfg.JudgeAdaptiveLowConf,
 		}
 		var storage judge.Storage
 		if cfg.JudgeDBEnabled() {

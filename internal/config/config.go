@@ -501,9 +501,9 @@ type Config struct {
 	JudgeCostPer1KUSD       float64       // rough USD/1k-token rate for cost estimates
 	JudgeDBPath             string        // on-disk SQLite database for judge scores; empty disables Detected
 	JudgeAdaptiveEnabled    bool          // enable adaptive sampling based on rolling avg of recent scores (issue #1232)
-	JudgeAdaptiveWindow    time.Duration // look-back period for rolling average of recent scores (issue #1301)
-	JudgeAdaptiveHighConf  float64       // high confidence threshold — decay to min rate when avg > this (issue #1301)
-	JudgeAdaptiveLowConf   float64       // low confidence threshold — increase to max rate when avg < this (issue #1301)
+	JudgeAdaptiveWindow     time.Duration // look-back period for rolling average of recent scores (issue #1301)
+	JudgeAdaptiveHighConf   float64       // high confidence threshold — decay to min rate when avg > this (issue #1301)
+	JudgeAdaptiveLowConf    float64       // low confidence threshold — increase to max rate when avg < this (issue #1301)
 	// edits enqueue a background `cargo check` / `npx tsc` and the
 	// verdict (1 = clean, 0 = fail/timeout) is reported via a
 	// callback to cmd/nexus/main.go. QualityEnabled is true iff
