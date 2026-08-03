@@ -192,8 +192,12 @@ Semantic dedup via `NEXUS_SLMCACHE_SIMILARITY_THRESHOLD` (range 0..1).
 
 **Fusion progressive delivery** (`NEXUS_FUSION_PROGRESSIVE=true`, default):
 panels race local + frontier, stream the faster as speculative SSE, and
-only invoke the arbiter when Jaccard similarity < `NEXUS_FUSION_AGREEMENT_THRESHOLD`
+only invoke the arbiter when agreement similarity < `NEXUS_FUSION_AGREEMENT_THRESHOLD`
 (default 0.85).
+
+**Fusion agreement detection mode** (`NEXUS_FUSION_SIMILARITY_MODE`, default `jaccard`):
+- `jaccard` (default): lexical token overlap — fast, no embedder call needed
+- `semantic`: cosine similarity via the configured `NEXUS_EMBEDDER_TYPE` embedder — more accurate but requires a healthy embedder. Falls back to Jaccard on embedder failure.
 
 **Fusion per-member timeouts** (issue #1164): `NEXUS_FUSION_LOCAL_TIMEOUT`
 (default 90s) and `NEXUS_FUSION_FRONTIER_TIMEOUT` (default 30s) give each
@@ -364,6 +368,14 @@ in logs and audit records. Requires `NEXUS_TLS_ENABLED=true`.
 After `NEXUS_AUTH_RATE_LIMIT_BURST` auth failures from the same client IP
 within the `NEXUS_AUTH_RATE_LIMIT_WINDOW` sliding window, the proxy returns
 429 with `Retry-After`. Disabled when `NEXUS_AUTH_RATE_LIMIT_RPM <= 0`.
+
+## SSRF egress guard (issue #1174)
+
+`NEXUS_EGRESS_BLOCK_PRIVATE=true` (default): the shared HTTP client rejects
+HTTP redirects to private, loopback, and link-local IP addresses — preventing
+server-side request forgery via upstream redirect chains. Set to false to
+disable (not recommended). `NEXUS_EGRESS_ALLOW` is a comma-separated CIDR
+allowlist that overrides the block list (e.g. `127.0.0.0/8` for local Ollama).
 
 **Rate limiting** (`NEXUS_RATE_LIMIT_RPM` / `NEXUS_RATE_LIMIT_BURST`) is
 hot-reloadable and buckets by client IP by default. Set
