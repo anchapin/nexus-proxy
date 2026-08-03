@@ -106,6 +106,7 @@ const (
 	checkProviderRegistry     = "provider_registry"
 	checkMiddlewareChain      = "middleware_chain"
 	checkModelsEndpoint       = "models_endpoint"
+	checkMetricsEndpoint      = "metrics_endpoint"
 	checkPprofEndpoint        = "pprof_endpoint"
 	checkInboundMTLS          = "inbound_mtls" // issue #1241
 )
@@ -149,6 +150,7 @@ func Run(ctx context.Context, cfg config.Config, opts Options) Result {
 	r = append(r, checkProviderRegistryFn())
 	r = append(r, checkMiddlewareChainFn(cfg))
 	r = append(r, checkModelsEndpointFn(ctx, cfg, opts))
+	r = append(r, checkMetricsEndpointFn(ctx, cfg, opts))
 	r = append(r, checkPprofEndpointFn(cfg))
 	r = append(r, checkInboundMTLSFn(cfg))
 	return r
@@ -1043,7 +1045,82 @@ func checkModelsEndpointFn(ctx context.Context, cfg config.Config, opts Options)
 	}
 }
 
-// --- pprof endpoint (issue #1292) ----------------------------------------
+// --- metrics endpoint (issue #1288) ----------------------------------------
+
+// checkMetricsEndpointFn verifies the Nexus /metrics endpoint is reachable
+// and contains the nexus_build_info metric. This confirms Prometheus can
+// successfully scrape the endpoint.
+//
+// The check skips when the server is not running (connection refused) so that
+// `nexus check` can validate configuration even when the server is down.
+// On other errors (timeout, non-OK status, missing metric) it fails so the
+// operator is alerted to a broken metrics pipeline.
+func checkMetricsEndpointFn(ctx context.Context, cfg config.Config, opts Options) Check {
+	addr := cfg.Addr
+	if addr == "" {
+		addr = ":8000"
+	}
+	if strings.HasPrefix(addr, ":") {
+		addr = "localhost" + addr
+	}
+	metricsURL := "http://" + addr + "/metrics"
+
+	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metricsURL, nil)
+	if err != nil {
+		return Check{
+			Name:   checkMetricsEndpoint,
+			Status: StatusFail,
+			Detail: err.Error(),
+		}
+	}
+
+	resp, err := opts.HTTPClient.Do(req)
+	if err != nil {
+		// Connection refused: server not running — skip rather than fail
+		// so `nexus check` can validate config even when the server is down.
+		return Check{
+			Name:   checkMetricsEndpoint,
+			Status: StatusSkip,
+			Detail: fmt.Sprintf("cannot reach %s: %v", metricsURL, err),
+		}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return Check{
+			Name:   checkMetricsEndpoint,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("/metrics returned status %d", resp.StatusCode),
+		}
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB cap
+	if err != nil {
+		return Check{
+			Name:   checkMetricsEndpoint,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("failed to read /metrics response: %v", err),
+		}
+	}
+
+	if !strings.Contains(string(body), "nexus_build_info") {
+		return Check{
+			Name:   checkMetricsEndpoint,
+			Status: StatusFail,
+			Detail: "/metrics response missing nexus_build_info metric",
+		}
+	}
+
+	return Check{
+		Name:   checkMetricsEndpoint,
+		Status: StatusPass,
+		Detail: fmt.Sprintf("/metrics accessible at %s", metricsURL),
+	}
+}
+
+// --- pprof endpoint (issue #1292) -----------------------------------------
 
 // checkPprofEndpointFn reports the exposure mode of the debug pprof +
 // expvar endpoints. When disabled (the default) the check is skipped.

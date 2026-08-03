@@ -138,6 +138,40 @@ func newNexusFixture(t *testing.T) *nexusFixture {
 	return f
 }
 
+// metricsFixture mocks the Nexus /metrics endpoint for diagnostic
+// testing. The zero value serves a minimal valid Prometheus metrics
+// response containing nexus_build_info; set metricsBody to override.
+type metricsFixture struct {
+	*httptest.Server
+	metricsBody atomic.Value // string — Prometheus text format for /metrics
+	status      int          // HTTP status; defaults to 200
+	calls       atomic.Int32
+}
+
+func newMetricsFixture(t *testing.T) *metricsFixture {
+	t.Helper()
+	f := &metricsFixture{status: http.StatusOK}
+	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.calls.Add(1)
+		if r.URL.Path != "/metrics" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		w.WriteHeader(f.status)
+		body, _ := f.metricsBody.Load().(string)
+		if body == "" {
+			// Default: minimal nexus_build_info metric.
+			body = `# HELP nexus_build_info Nexus proxy build information
+# TYPE nexus_build_info gauge
+nexus_build_info{version="dev"} 1`
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(f.Close)
+	return f
+}
+
 // fixtureConfig returns a config.Config pointed at the supplied
 // test servers. Defaults are picked so a happy-path test passes with
 // zero overrides.
@@ -1083,5 +1117,77 @@ func TestRunPprofEndpointAPIKeyIsPass(t *testing.T) {
 	}
 	if !strings.Contains(got.Detail, "API-key") {
 		t.Errorf("pprof_endpoint detail should mention API-key: %s", got.Detail)
+	}
+}
+
+// --- metrics_endpoint tests (issue #1288) ---------------------------------
+
+func TestRunMetricsEndpointReachableWithNexusBuildInfoIsPass(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	metrics := newMetricsFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.Addr = strings.TrimPrefix(metrics.URL, "http://")
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkMetricsEndpoint)
+	if got.Status != StatusPass {
+		t.Errorf("metrics_endpoint = %s (detail=%s), want pass", got.Status, got.Detail)
+	}
+	if !strings.Contains(got.Detail, "/metrics") {
+		t.Errorf("detail should mention /metrics: %s", got.Detail)
+	}
+	if metrics.calls.Load() == 0 {
+		t.Error("/metrics was never called")
+	}
+}
+
+func TestRunMetricsEndpointUnreachableIsSkip(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	// Use a closed port so connection is refused.
+	cfg.Addr = "127.0.0.1:1"
+
+	res := Run(context.Background(), cfg, Options{
+		OllamaURL:  ollama.URL,
+		HTTPClient: &http.Client{Timeout: 200 * time.Millisecond},
+		Timeout:    200 * time.Millisecond,
+	})
+	got := checkByName(res, checkMetricsEndpoint)
+	if got.Status != StatusSkip {
+		t.Errorf("metrics_endpoint = %s (detail=%s), want skip when unreachable", got.Status, got.Detail)
+	}
+}
+
+func TestRunMetricsEndpointReturnsHTTPErrorIsFail(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	metrics := newMetricsFixture(t)
+	metrics.status = http.StatusInternalServerError
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.Addr = strings.TrimPrefix(metrics.URL, "http://")
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkMetricsEndpoint)
+	if got.Status != StatusFail {
+		t.Errorf("metrics_endpoint = %s (detail=%s), want fail on HTTP error", got.Status, got.Detail)
+	}
+}
+
+func TestRunMetricsEndpointMissingNexusBuildInfoIsFail(t *testing.T) {
+	ollama := newOllamaFixture(t)
+	metrics := newMetricsFixture(t)
+	// Return valid Prometheus metrics but no nexus_build_info.
+	metrics.metricsBody.Store(`# HELP nexus_upstream_requests_total Total upstream requests
+# TYPE nexus_upstream_requests_total counter
+nexus_upstream_requests_total{route="local"} 42`)
+	cfg := fixtureConfig(ollama.URL, "https://api.openai.com/v1/chat/completions")
+	cfg.Addr = strings.TrimPrefix(metrics.URL, "http://")
+
+	res := Run(context.Background(), cfg, withOptions(ollama.URL))
+	got := checkByName(res, checkMetricsEndpoint)
+	if got.Status != StatusFail {
+		t.Errorf("metrics_endpoint = %s (detail=%s), want fail when nexus_build_info missing", got.Status, got.Detail)
+	}
+	if !strings.Contains(got.Detail, "nexus_build_info") {
+		t.Errorf("detail should mention missing nexus_build_info: %s", got.Detail)
 	}
 }
