@@ -112,6 +112,10 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total frontier completions sampled for judge evaluation (issue #1162).",
 		typ:  "counter",
 	},
+	"nexus_judge_adaptive_sample_rate": {
+		help: "Current effective adaptive judge sample rate (issue #1232). 0 when adaptive sampling is disabled.",
+		typ:  "gauge",
+	},
 	"nexus_confidence_store_rows_total": {
 		help: "Current number of rows in the routing_outcomes confidence store table (issue #834).",
 		typ:  "gauge",

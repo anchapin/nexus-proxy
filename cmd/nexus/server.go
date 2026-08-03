@@ -388,6 +388,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 			Timeout:            cfg.JudgeTimeout,
 			CostPer1K:          cfg.JudgeCostPer1KUSD,
 			BudgetGuard:        budgetGuard,
+			AdaptiveEnabled:    cfg.JudgeAdaptiveEnabled,
 		}
 		var storage judge.Storage
 		if cfg.JudgeDBEnabled() {
@@ -820,6 +821,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 			}
 			return []observability.GaugeSample{
 				{Name: "nexus_judge_queue_depth", Value: float64(judgeEval.QueueDepth())},
+				{Name: "nexus_judge_adaptive_sample_rate", Value: judgeEval.AdaptiveRate()},
 			}
 		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
