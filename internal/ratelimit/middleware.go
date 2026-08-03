@@ -184,15 +184,15 @@ func NewMiddleware(rpm, burst int, resolver *ClientIPResolver, keyFn func(*http.
 		keyType = "apikey"
 	}
 	m := &Middleware{
-		resolver:              resolver,
-		rpm:                   rpm,
-		burst:                 burst,
-		ttl:                   10 * time.Minute, // reap buckets idle for 10 min
-		stopCh:                make(chan struct{}),
-		buckets:               make(map[string]*bucket),
-		keyFn:                 keyFn,
-		keyType:               keyType,
-		rateLimitHitsTotal:    make(map[string]*uint64),
+		resolver:                 resolver,
+		rpm:                      rpm,
+		burst:                    burst,
+		ttl:                      10 * time.Minute, // reap buckets idle for 10 min
+		stopCh:                   make(chan struct{}),
+		buckets:                  make(map[string]*bucket),
+		keyFn:                    keyFn,
+		keyType:                  keyType,
+		rateLimitHitsTotal:       make(map[string]*uint64),
 		rateLimitRejectionsTotal: 0,
 	}
 	m.reaperWG.Add(1)
