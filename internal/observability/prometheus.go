@@ -354,6 +354,17 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 		"Total proxied requests where no RAG snippet met the similarity threshold.", c.ragMissesTotal.Load())
 	writeCounter(w, "nexus_toon_compressed_total",
 		"Total proxied requests whose JSON-array blocks were TOON-compressed.", c.toonCompressedTotal.Load())
+	// Issue #1312: TOON compression counters by array type.
+	writeCounterLabeled(w, "nexus_toon_compression_fenced_total",
+		"Total fenced ```json [...] ``` blocks compressed (issue #1312).",
+		"direction", []labelSample{
+			{value: "compress", n: c.toonCompressionFencedTotal["compress"].Load()},
+		})
+	writeCounterLabeled(w, "nexus_toon_compression_unfenced_total",
+		"Total bare/embedded [...] arrays compressed when NEXUS_TOON_UNFENCED=true (issue #1312).",
+		"direction", []labelSample{
+			{value: "compress", n: c.toonCompressionUnfencedTotal["compress"].Load()},
+		})
 	writeCounter(w, "nexus_degraded_total",
 		"Total proxied requests that ran in degraded mode (local Ollama unreachable).", c.degradedTotal.Load())
 	writeCounter(w, "nexus_input_tokens_total",
