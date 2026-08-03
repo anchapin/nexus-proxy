@@ -16,10 +16,12 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/ratelimit"
@@ -69,6 +71,59 @@ type Middleware struct {
 
 	mu    sync.Mutex
 	slots map[string]*clientSlot // keyed by client IP
+
+	// nexus_auth_requests_total{mode,result} counter (issue #1305).
+	// mode: "multikey" | "authenticator" | "single"
+	// result: "success" | "invalid" | "missing"
+	authRequestsTotal map[string]*uint64 // keyed by "mode:result"
+}
+
+// incAuthRequest increments the nexus_auth_requests_total counter for the given
+// mode and result. Safe for concurrent use.
+func (m *Middleware) incAuthRequest(mode, result string) {
+	key := mode + ":" + result
+	m.mu.Lock()
+	p, ok := m.authRequestsTotal[key]
+	if !ok {
+		v := uint64(0)
+		p = &v
+		m.authRequestsTotal[key] = p
+	}
+	m.mu.Unlock()
+	atomic.AddUint64(p, 1)
+}
+
+// WritePrometheusMetrics writes the nexus_auth_requests_total counter family
+// to w in Prometheus text exposition format. Safe for concurrent use; nil
+// receivers are a no-op.
+func (m *Middleware) WritePrometheusMetrics(w io.Writer) {
+	if m == nil || m.authRequestsTotal == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Write HELP/TYPE header.
+	//nolint:errcheck // Writer error cannot be handled after partial write.
+	fmt.Fprintf(w, "# HELP nexus_auth_requests_total Authentication requests by mode and result (issue #1305).\n")
+	//nolint:errcheck // Writer error cannot be handled after partial write.
+	fmt.Fprintf(w, "# TYPE nexus_auth_requests_total counter\n")
+
+	// Collect and sort keys for deterministic output.
+	keys := make([]string, 0, len(m.authRequestsTotal))
+	for k := range m.authRequestsTotal {
+		keys = append(keys, k)
+	}
+	for _, k := range keys {
+		parts := strings.SplitN(k, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		mode, result := parts[0], parts[1]
+		v := atomic.LoadUint64(m.authRequestsTotal[k])
+		//nolint:errcheck // Writer error cannot be handled after partial write.
+		fmt.Fprintf(w, "nexus_auth_requests_total{mode=%q,result=%q} %d\n", mode, result, v)
+	}
 }
 
 // NewMiddleware returns a middleware that rejects requests without a
@@ -90,12 +145,13 @@ func NewMiddleware(key string, exempt func(*http.Request) bool, authLimiter *rat
 		resolver = ratelimit.NewClientIPResolver(nil)
 	}
 	return &Middleware{
-		key:         key,
-		exempt:      exempt,
-		authLimiter: authLimiter,
-		observer:    observer,
-		resolver:    resolver,
-		slots:       make(map[string]*clientSlot),
+		key:               key,
+		exempt:            exempt,
+		authLimiter:       authLimiter,
+		observer:          observer,
+		resolver:          resolver,
+		slots:             make(map[string]*clientSlot),
+		authRequestsTotal: make(map[string]*uint64),
 	}
 }
 
@@ -246,6 +302,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			if m.authLimiter != nil && m.authLimiter.Enabled() {
 				m.authLimiter.RecordFailure(clientIP, "missing")
 			}
+			m.incAuthRequest("unknown", "missing")
 			m.renewSlot(clientIP)
 			return
 		}
@@ -276,6 +333,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 				if m.authLimiter != nil && m.authLimiter.Enabled() {
 					m.authLimiter.RecordFailure(clientIP, "invalid")
 				}
+				m.incAuthRequest("multikey", "invalid")
 				m.renewSlot(clientIP)
 				return
 			}
@@ -288,6 +346,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			if m.observer != nil {
 				m.observer.IncAuthAccepted(clientIP)
 			}
+			m.incAuthRequest("multikey", "success")
 			m.renewSlot(clientIP)
 			return
 		}
@@ -310,6 +369,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 				if m.authLimiter != nil && m.authLimiter.Enabled() {
 					m.authLimiter.RecordFailure(clientIP, "invalid")
 				}
+				m.incAuthRequest("authenticator", "invalid")
 				m.renewSlot(clientIP)
 				return
 			}
@@ -320,6 +380,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			if m.observer != nil {
 				m.observer.IncAuthAccepted(clientIP)
 			}
+			m.incAuthRequest("authenticator", "success")
 			m.renewSlot(clientIP)
 			return
 		}
@@ -340,6 +401,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			if m.authLimiter != nil && m.authLimiter.Enabled() {
 				m.authLimiter.RecordFailure(clientIP, "invalid")
 			}
+			m.incAuthRequest("single", "invalid")
 			m.renewSlot(clientIP)
 			return
 		}
@@ -350,6 +412,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		if m.observer != nil {
 			m.observer.IncAuthAccepted(clientIP)
 		}
+		m.incAuthRequest("single", "success")
 		m.renewSlot(clientIP)
 	})
 }
