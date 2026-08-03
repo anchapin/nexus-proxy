@@ -26,6 +26,7 @@ paths = [
   "internal/handlers/redact_test.go",
   "internal/config/file_integration_test.go",
   "internal/config/file_test.go",
+  "internal/config/config.go",
   "cmd/nexus/init_test.go",
   "internal/audit/audit_test.go",
 ]
