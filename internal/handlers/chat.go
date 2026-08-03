@@ -2289,9 +2289,12 @@ func Chat(d Deps) http.Handler {
 					steps = steps[:d.Config.FrontierFailoverMaxAttempts]
 				}
 				fcas := &upstream.Cascade{
-					Steps:            steps,
-					Timeout:          d.Config.CascadeTimeout,
-					MaxResponseBytes: d.Config.EffectiveCascadeMaxResponseBytes(),
+					Steps:              steps,
+					Timeout:            d.Config.CascadeTimeout,
+					TimeoutFloor:       d.Config.CascadeTimeoutFloor,
+					TimeoutCeiling:     d.Config.CascadeTimeoutCeiling,
+					TimeoutPer1kTokens: d.Config.CascadeTimeoutPer1kTokens,
+					MaxResponseBytes:   d.Config.EffectiveCascadeMaxResponseBytes(),
 				}
 
 				var res upstream.CascadeResult

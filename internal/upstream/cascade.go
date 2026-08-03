@@ -240,10 +240,7 @@ func (c *Cascade) RunBuffered(ctx context.Context, w http.ResponseWriter, client
 	if len(c.Steps) == 0 {
 		return CascadeResult{}, errors.New("cascade: no steps configured")
 	}
-	timeout := c.Timeout
-	if timeout <= 0 {
-		timeout = cascadeDefaultTimeout
-	}
+	timeout := c.effectiveTimeout(payload)
 
 	res := CascadeResult{}
 	var lastErr error
