@@ -1043,18 +1043,23 @@ func checkModelsEndpointFn(ctx context.Context, cfg config.Config, opts Options)
 	}
 }
 
-// --- pprof endpoint (issue #1150) -----------------------------------------
+// --- pprof endpoint (issue #1292) ----------------------------------------
 
 // checkPprofEndpointFn reports the exposure mode of the debug pprof +
-// expvar endpoints. When disabled (the default) the check passes
-// silently. When enabled with an API key it passes with a detail line
-// describing the mode. When enabled without a key (loopback-only) it
-// warns the operator that remote access requires setting the key.
+// expvar endpoints. When disabled (the default) the check is skipped.
+// When enabled with an API key it passes because the endpoint is gated.
+// When enabled without a key it passes because the runtime enforces
+// loopback-only access (only 127.0.0.1/::1 peers are served; all others
+// get 403). A warning is issued when NEXUS_TRUSTED_PROXIES is configured
+// AND NEXUS_DEBUG_PPROF_API_KEY is empty, because a reverse-proxy
+// configuration can forward external traffic to the debug endpoints even
+// when the server binds to loopback — the operator should set an API key
+// for defence-in-depth (issue #1292).
 func checkPprofEndpointFn(cfg config.Config) Check {
 	if !cfg.DebugPprofEnabled {
 		return Check{
 			Name:   checkPprofEndpoint,
-			Status: StatusPass,
+			Status: StatusSkip,
 			Detail: "disabled (NEXUS_DEBUG_PPROF_ENABLED=false)",
 		}
 	}
@@ -1065,10 +1070,20 @@ func checkPprofEndpointFn(cfg config.Config) Check {
 			Detail: "enabled, API-key gated (/debug/pprof/*, /debug/vars)",
 		}
 	}
+	// No API key: loopback-only enforced at runtime. Warn only when
+	// trusted proxies are configured — a proxy can forward external traffic
+	// to loopback, bypassing the runtime check.
+	if cfg.TrustedProxiesConfigured() {
+		return Check{
+			Name:   checkPprofEndpoint,
+			Status: StatusWarn,
+			Detail: "enabled, loopback-only — NEXUS_TRUSTED_PROXIES is set; external clients can reach the proxy — set NEXUS_DEBUG_PPROF_API_KEY for defence-in-depth",
+		}
+	}
 	return Check{
 		Name:   checkPprofEndpoint,
-		Status: StatusWarn,
-		Detail: "enabled, loopback-only — set NEXUS_DEBUG_PPROF_API_KEY for remote access",
+		Status: StatusPass,
+		Detail: "enabled, loopback-only (/debug/pprof/*, /debug/vars)",
 	}
 }
 
