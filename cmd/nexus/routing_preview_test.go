@@ -159,9 +159,9 @@ func TestDecisionReason(t *testing.T) {
 // TestFormatDecision tests the decision formatting
 func TestFormatDecision(t *testing.T) {
 	dec := router.Decision{
-		Route:   router.RouteLocal,
-		Source:  router.SourceDSL,
-		Reason:  "refactor",
+		Route:  router.RouteLocal,
+		Source: router.SourceDSL,
+		Reason: "refactor",
 	}
 	result := formatDecision(dec, "dsl:refactor")
 	expected := `ROUTE=local REASON="dsl:refactor"`
