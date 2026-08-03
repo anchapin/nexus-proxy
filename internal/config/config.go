@@ -197,6 +197,19 @@ type Config struct {
 	// the file's base name; matching files are skipped during indexing.
 	RAGExcludePatterns []string // e.g. ["*_test.go", "*.gen.go"]
 
+	// RAG semantic deduplication (issue #1243). When > 0 (e.g. 0.95),
+	// new chunks whose cosine similarity to an existing chunk exceeds the
+	// threshold are skipped at index time. By default dedup is scoped to
+	// the same directory; set RAGDedupCrossDir to allow cross-directory
+	// dedup. A value of 0 (default) disables dedup entirely (backward
+	// compatible).
+	RAGDedupThreshold float64 // NEXUS_RAG_DEDUP_THRESHOLD; 0 = disabled
+	// RAGDedupCrossDir enables cross-directory deduplication (issue #1243).
+	// When false (default), dedup only compares against chunks in the
+	// same directory as the new chunk. When true, compares against all
+	// indexed chunks regardless of directory.
+	RAGDedupCrossDir bool // NEXUS_RAG_DEDUP_CROSS_DIR
+
 	// Routing
 	TokenGuardrail                int           // estimated tokens above this force frontier (6000)
 	SLMTimeout                    time.Duration // Qwen3-Coder routing timeout (8s)
@@ -1162,6 +1175,25 @@ func Load() (Config, error) {
 	// RAG exclude patterns (issue #1148). Comma-separated glob patterns
 	// (e.g. "*_test.go,*.gen.go"). Matching files are skipped.
 	cfg.RAGExcludePatterns = ragpkg.ParseCommaSeparated(getEnvAllowEmpty("NEXUS_RAG_EXCLUDE_PATTERNS", ""))
+
+	// RAG semantic deduplication threshold (issue #1243). Cosine similarity
+	// above which a new chunk is suppressed in favor of an existing one.
+	// 0 (default) disables dedup entirely.
+	dedupThreshold, err := getEnvFloat("NEXUS_RAG_DEDUP_THRESHOLD", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if dedupThreshold < 0 {
+		dedupThreshold = 0
+	}
+	if dedupThreshold > 1 {
+		dedupThreshold = 1
+	}
+	cfg.RAGDedupThreshold = dedupThreshold
+	// RAG cross-directory dedup (issue #1243). When false (default), dedup
+	// only compares against chunks in the same directory. When true,
+	// compares against all indexed chunks regardless of directory.
+	cfg.RAGDedupCrossDir = getEnvBool("NEXUS_RAG_DEDUP_CROSS_DIR", false)
 
 	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
 	if err != nil {

@@ -655,6 +655,11 @@ func (p *PersistentStore) Upsert(ctx context.Context, ex FewShotExample) error {
 	if len(ex.Embedding) == 0 {
 		return fmt.Errorf("rag: empty embedding for %q", ex.Filename)
 	}
+	// Semantic deduplication (issue #1243): skip chunks that are too
+	// similar to already-indexed ones.
+	if p.isDuplicate(ex.Dir, ex.Embedding) {
+		return nil
+	}
 	blob, err := encodeEmbedding(ex.Embedding)
 	if err != nil {
 		return fmt.Errorf("rag: encode embedding %q: %w", ex.Filename, err)

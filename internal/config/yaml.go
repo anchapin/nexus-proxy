@@ -124,6 +124,8 @@ type YAMLConfig struct {
 	RAGMaxInjectionTokens    int     `yaml:"rag_max_injection_tokens"`
 	RAGFileExtensions        string  `yaml:"rag_file_extensions"`
 	RAGExcludePatterns       string  `yaml:"rag_exclude_patterns"`
+	RAGDedupThreshold        float64 `yaml:"rag_dedup_threshold"`
+	RAGDedupCrossDir         bool    `yaml:"rag_dedup_cross_dir"`
 
 	// Routing
 	TokenGuardrail                int     `yaml:"token_guardrail"`
@@ -762,6 +764,23 @@ func LoadYAML(path string) (Config, error) {
 	}
 	if v := os.Getenv("NEXUS_RAG_EXCLUDE_PATTERNS"); v != "" {
 		cfg.RAGExcludePatterns = ragpkg.ParseCommaSeparated(v)
+	}
+	// RAG semantic dedup threshold (issue #1243). 0 = disabled.
+	if v := os.Getenv("NEXUS_RAG_DEDUP_THRESHOLD"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_RAG_DEDUP_THRESHOLD: %w; see .env.example", err)
+		}
+		if f < 0 {
+			f = 0
+		}
+		if f > 1 {
+			f = 1
+		}
+		cfg.RAGDedupThreshold = f
+	}
+	if v := os.Getenv("NEXUS_RAG_DEDUP_CROSS_DIR"); v != "" {
+		cfg.RAGDedupCrossDir = strings.ToLower(v) == "true" || v == "1"
 	}
 
 	// Routing
@@ -1670,6 +1689,8 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		RAGMaxInjectionTokens:         yc.intDefault(yc.RAGMaxInjectionTokens, 4096),
 		RAGFileExtensions:             ragpkg.ParseCommaSeparated(yc.RAGFileExtensions),
 		RAGExcludePatterns:            ragpkg.ParseCommaSeparated(yc.RAGExcludePatterns),
+		RAGDedupThreshold:             yc.floatDefault(yc.RAGDedupThreshold, 0),
+		RAGDedupCrossDir:              yc.boolFieldDefault(yc.RAGDedupCrossDir, false),
 		TokenGuardrail:                yc.intDefault(yc.TokenGuardrail, 6000),
 		SLMTimeout:                    yc.durationDefault(yc.SLMTimeout, 8*time.Second),
 		SLMCacheMaxEntries:            yc.intDefault(yc.SLMCacheMaxEntries, 512),

@@ -222,6 +222,11 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Current consecutive failure count for RAG embedder circuit breakers (issue #886).",
 		typ:  "gauge",
 	},
+	// RAG semantic dedup (issue #1243).
+	"nexus_rag_dedup_skipped_total": {
+		help: "Total number of RAG chunks skipped at index time because they were too similar to existing chunks (issue #1243).",
+		typ:  "counter",
+	},
 	// SLM decision cache gauges (issue #531).
 	"nexus_slm_cache_entries": {
 		help: "Current number of entries in the SLM decision cache (issue #531).",
