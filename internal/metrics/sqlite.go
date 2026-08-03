@@ -190,7 +190,7 @@ type SQLiteStore struct {
 	// transaction when the drain's accumulator reaches this many records.
 	// batchTimeout > 0 flushes a partial batch after this duration.
 	// batchCallback is invoked after every successful COMMIT.
-	batchSize      int
+	batchSize     int
 	batchTimeout  time.Duration
 	batchCallback func()
 
