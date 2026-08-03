@@ -230,6 +230,14 @@ type Collector struct {
 	budgetExceededTotal   atomic.Uint64
 	budgetRecordedUSDBits atomic.Uint64
 
+	// --- Metrics batch counter (issue #1234) ---------------------------
+	//
+	// metricsBatchTotal counts the number of SQLite batch transactions
+	// committed by the metrics store drain goroutine. Each increment
+	// represents one BEGIN...INSERT...COMMIT cycle that flushed N records
+	// (where N is the batch size or the partial-final batch on timeout).
+	metricsBatchTotal atomic.Uint64
+
 	// TLS counters are bumped from main.go via http.Server.ConnState.
 	// Accepted fires on http.StateTLSHandshakeComplete; Rejected
 	// fires when a connection closes before reaching that state.
@@ -773,6 +781,11 @@ func (c *Collector) BudgetRecordedUSD() float64 {
 
 // BudgetExceeded returns the cumulative budget-exceeded count.
 func (c *Collector) BudgetExceeded() uint64 { return c.budgetExceededTotal.Load() }
+
+// IncMetricsBatch increments the batch-transaction counter (issue #1234).
+// Called from the metrics and judge SQLite store drain goroutines whenever
+// a BEGIN...INSERT...COMMIT cycle completes.
+func (c *Collector) IncMetricsBatch() { c.metricsBatchTotal.Add(1) }
 
 // IncTLSAccepted bumps the accepted TLS-handshake counter. Wired
 // from main.go via http.Server.ConnState on

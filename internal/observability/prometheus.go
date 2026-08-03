@@ -434,6 +434,14 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 		"Number of frontier requests rejected by the daily budget gate.",
 		c.budgetExceededTotal.Load())
 
+	// Metrics/Judge SQLite batch transaction counter (issue #1234).
+	// Counts the number of batch transactions committed by the metrics
+	// and judge store drain goroutines. Each increment represents one
+	// BEGIN...INSERT...COMMIT cycle.
+	writeCounter(w, "nexus_metrics_batch_total",
+		"Number of SQLite batch transactions committed by the metrics and judge stores (issue #1234).",
+		c.metricsBatchTotal.Load())
+
 	// TLS handshake counters. Optional: only non-zero when the operator
 	// configured TLS (NEXUS_TLS_CERT + NEXUS_TLS_KEY); otherwise both
 	// samples stay at 0.

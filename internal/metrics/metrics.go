@@ -44,6 +44,17 @@ import (
 // blocking the response path.
 const bufferedChannelSize = 1024
 
+// BatchConfig controls the drain batching behaviour (issue #1234).
+// When BatchSize > 0 the drain accumulates that many records before
+// committing a transaction. When BatchTimeout > 0 the drain also
+// flushes a partial batch after this duration has elapsed since the
+// last flush. Callback is invoked after every successful COMMIT.
+type BatchConfig struct {
+	Size      int           // default 64; <= 0 means "flush every record"
+	Timeout   time.Duration // default 100ms; <= 0 means "no timeout flush"
+	Callback  func()        // invoked after every COMMIT; may be nil
+}
+
 // RecordRequestErrorTimeout bounds how long a Write op waits for a
 // slow disk before the Store reports the failure. Most inserts finish
 // in microseconds against tmpfs; the timeout exists only to bound a
@@ -232,14 +243,14 @@ var stdLogger Logger = func(format string, args ...any) {
 // directory is created on demand. An empty path is rejected; ":memory:"
 // is allowed for tests. Retention is disabled (pre-#483 behaviour).
 func Open(path string) (Store, error) {
-	return OpenWithRetention(path, 0, stdLogger)
+	return OpenWithRetention(path, 0, stdLogger, BatchConfig{})
 }
 
 // OpenWithLogger is Open with a custom logger. Pass a no-op Logger to
 // silence the package in tests; pass nil to use the default. Retention
 // is disabled.
 func OpenWithLogger(path string, lg Logger) (Store, error) {
-	return OpenWithRetention(path, 0, lg)
+	return OpenWithRetention(path, 0, lg, BatchConfig{})
 }
 
 // OpenWithRetention creates a Store with an optional retention window
@@ -247,7 +258,9 @@ func OpenWithLogger(path string, lg Logger) (Store, error) {
 // rows older than that many days roughly once per hour. retentionDays
 // <= 0 disables retention (identical to OpenWithLogger). The parent
 // directory is created on demand. An empty path is rejected.
-func OpenWithRetention(path string, retentionDays int, lg Logger) (Store, error) {
+// batch controls the drain batching behaviour (issue #1234); pass a
+// zero-value BatchConfig to retain the pre-batch per-record behaviour.
+func OpenWithRetention(path string, retentionDays int, lg Logger, batch BatchConfig) (Store, error) {
 	if path == "" {
 		return nil, fmt.Errorf("metrics: empty path")
 	}
@@ -261,7 +274,7 @@ func OpenWithRetention(path string, retentionDays int, lg Logger) (Store, error)
 			}
 		}
 	}
-	s, err := newSQLiteStore(path, retentionDays, lg)
+	s, err := newSQLiteStore(path, retentionDays, lg, batch)
 	if err != nil {
 		return nil, err
 	}

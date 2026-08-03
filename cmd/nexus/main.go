@@ -402,12 +402,19 @@ func buildRecorder(cfg config.Config) telemetry.Recorder {
 //
 // The observer is a tiny adapter from handlers.MetricsEvent to
 // metrics.Request — same pattern as the judge/quality observers.
-func buildMetrics(cfg config.Config) (metrics.Store, handlers.MetricsObserver) {
+// batchCallback is invoked after every committed SQLite transaction
+// in the drain goroutine (issue #1234); pass nil if no callback needed.
+func buildMetrics(cfg config.Config, batchCallback func()) (metrics.Store, handlers.MetricsObserver) {
 	if !cfg.MetricsEnabled() {
 		slog.Info("metrics disabled (NEXUS_METRICS_DB is empty)")
 		return nil, nil
 	}
-	store, err := metrics.OpenWithRetention(cfg.MetricsDBPath, cfg.MetricsRetentionDays, nil)
+	batchCfg := metrics.BatchConfig{
+		Size:     cfg.MetricsBatchSize,
+		Timeout:  cfg.MetricsBatchTimeout,
+		Callback: batchCallback,
+	}
+	store, err := metrics.OpenWithRetention(cfg.MetricsDBPath, cfg.MetricsRetentionDays, nil, batchCfg)
 	if err != nil {
 		slog.Error("metrics open failed, metrics disabled", slog.Any("err", err))
 		return nil, nil
@@ -416,6 +423,7 @@ func buildMetrics(cfg config.Config) (metrics.Store, handlers.MetricsObserver) {
 		slog.Info("metrics recording",
 			slog.String("path", ss.Path()),
 			slog.Int("retention_days", cfg.MetricsRetentionDays),
+			slog.Int("batch_size", cfg.MetricsBatchSize),
 		)
 	}
 	obs := handlers.MetricsObserverFunc(func(e handlers.MetricsEvent) {

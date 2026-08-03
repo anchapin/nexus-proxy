@@ -12,7 +12,7 @@ import (
 // error. The async channel means we don't wait for the drain goroutine;
 // actual persistence across restarts is tested by TestSQLiteStoreOnDisk.
 func TestSQLiteStoreRecord(t *testing.T) {
-	store, err := OpenSQLiteStore(":memory:")
+	store, err := OpenSQLiteStore(":memory:", 0, 0)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStore: %v", err)
 	}
@@ -39,7 +39,7 @@ func TestSQLiteStoreRecord(t *testing.T) {
 func TestSQLiteStoreOnDisk(t *testing.T) {
 	tmp := t.TempDir() + "/judge_test.db"
 
-	store1, err := OpenSQLiteStore(tmp)
+	store1, err := OpenSQLiteStore(tmp, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStore (first): %v", err)
 	}
@@ -59,7 +59,7 @@ func TestSQLiteStoreOnDisk(t *testing.T) {
 	}
 
 	// Reopen the same file path.
-	store2, err := OpenSQLiteStore(tmp)
+	store2, err := OpenSQLiteStore(tmp, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStore (reopen): %v", err)
 	}
@@ -104,7 +104,7 @@ func (s *SQLiteStore) allScores(ctx context.Context) ([]JudgeScore, error) {
 // persisted with score=0 and the error string stored in the error column.
 func TestSQLiteStoreRecordError(t *testing.T) {
 	tmp := t.TempDir() + "/judge_error_test.db"
-	store, err := OpenSQLiteStore(tmp)
+	store, err := OpenSQLiteStore(tmp, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStore: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestSQLiteStoreRecordError(t *testing.T) {
 	}
 
 	// Reopen to verify persistence across restarts.
-	store2, err := OpenSQLiteStore(tmp)
+	store2, err := OpenSQLiteStore(tmp, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStore (reopen): %v", err)
 	}
@@ -154,7 +154,7 @@ var _ Storage = (*SQLiteStore)(nil)
 func TestSQLiteStoreRAGColumns(t *testing.T) {
 	tmp := t.TempDir() + "/judge_rag_test.db"
 
-	store1, err := OpenSQLiteStore(tmp)
+	store1, err := OpenSQLiteStore(tmp, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStore (first): %v", err)
 	}
@@ -179,7 +179,7 @@ func TestSQLiteStoreRAGColumns(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	store2, err := OpenSQLiteStore(tmp)
+	store2, err := OpenSQLiteStore(tmp, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStore (reopen): %v", err)
 	}
@@ -219,7 +219,7 @@ func TestSQLiteStoreRAGColumns(t *testing.T) {
 func TestSQLiteStoreMigrationIdempotent(t *testing.T) {
 	tmp := t.TempDir() + "/judge_migrate_test.db"
 
-	store1, err := OpenSQLiteStore(tmp)
+	store1, err := OpenSQLiteStore(tmp, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStore (first): %v", err)
 	}
@@ -228,14 +228,14 @@ func TestSQLiteStoreMigrationIdempotent(t *testing.T) {
 	}
 
 	// Second open hits the migration on an already-migrated DB.
-	store2, err := OpenSQLiteStore(tmp)
+	store2, err := OpenSQLiteStore(tmp, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStore (second, migration): %v", err)
 	}
 	defer store2.Close()
 
 	// Third open confirms it is still idempotent.
-	store3, err := OpenSQLiteStore(tmp)
+	store3, err := OpenSQLiteStore(tmp, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStore (third): %v", err)
 	}

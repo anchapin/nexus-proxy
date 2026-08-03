@@ -97,7 +97,7 @@ func TestBuildMetrics(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("NEXUS_METRICS_DB", tt.path)
 			cfg, _ := config.Load()
-			store, obs := buildMetrics(cfg)
+			store, obs := buildMetrics(cfg, nil)
 
 			if (store == nil && obs == nil) != tt.expected {
 				t.Errorf("buildMetrics(%q) returns nil = %v, want %v", tt.path, store == nil, tt.expected)

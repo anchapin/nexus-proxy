@@ -358,7 +358,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		}
 		var storage judge.Storage
 		if cfg.JudgeDBEnabled() {
-			jstore, err := judge.OpenSQLiteStore(cfg.JudgeDBPath)
+			jstore, err := judge.OpenSQLiteStore(cfg.JudgeDBPath, cfg.MetricsBatchSize, cfg.MetricsBatchTimeout)
 			if err != nil {
 				slog.Error("judge SQLite store open failed, falling back to in-memory",
 					slog.String("path", cfg.JudgeDBPath),
@@ -514,7 +514,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		})
 	}
 
-	metricsStore, metricsObs := buildMetrics(cfg)
+	metricsStore, metricsObs := buildMetrics(cfg, circuitCollector.IncMetricsBatch)
 	// cacheWarmedEntries is set after the arbiter cache is created below;
 	// declared here so the gauge provider closure can capture it (issue #1176).
 	var cacheWarmedEntries int

@@ -186,6 +186,14 @@ type SQLiteStore struct {
 	ch      chan Request
 	dropped atomicDropped
 
+	// Batch config (issue #1234). batchSize > 0 triggers a committed
+	// transaction when the drain's accumulator reaches this many records.
+	// batchTimeout > 0 flushes a partial batch after this duration.
+	// batchCallback is invoked after every successful COMMIT.
+	batchSize      int
+	batchTimeout  time.Duration
+	batchCallback func()
+
 	// Retention prune goroutine (issue #483). pruneStop is non-nil
 	// only when retentionDays > 0; Close closes it to unblock the
 	// goroutine before wg.Wait.
@@ -206,8 +214,9 @@ type SQLiteStore struct {
 // newSQLiteStore opens the database, creates the schema (idempotent),
 // and starts the background drain goroutine. When retentionDays > 0 a
 // second goroutine periodically DELETEs rows older than the retention
-// window (issue #483).
-func newSQLiteStore(path string, retentionDays int, lg Logger) (*SQLiteStore, error) {
+// window (issue #483). batch controls the drain batching behaviour
+// (issue #1234).
+func newSQLiteStore(path string, retentionDays int, lg Logger, batch BatchConfig) (*SQLiteStore, error) {
 	dsn := buildDSN(path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -247,10 +256,13 @@ func newSQLiteStore(path string, retentionDays int, lg Logger) (*SQLiteStore, er
 	migrateAutoVacuum(context.Background(), db, lg)
 
 	s := &SQLiteStore{
-		db:     db,
-		logger: lg,
-		ch:     make(chan Request, bufferedChannelSize),
-		path:   path,
+		db:            db,
+		logger:        lg,
+		ch:            make(chan Request, bufferedChannelSize),
+		path:          path,
+		batchSize:     batch.Size,
+		batchTimeout:  batch.Timeout,
+		batchCallback: batch.Callback,
 	}
 	s.wg.Add(1)
 	go s.drain()
@@ -398,18 +410,145 @@ func (s *SQLiteStore) RecordRequest(req Request) error {
 // drain is the single writer goroutine. Owning the connection
 // guarantees database/sql never serialises concurrent writes for us
 // (which it would, but with extra context switches).
+//
+// Issue #1234 batch mode: when s.batchSize > 0, drain accumulates
+// records into an in-memory slice and commits BEGIN...INSERT...COMMIT
+// either when the accumulator reaches s.batchSize or when
+// s.batchTimeout elapses since the last commit. This reduces WAL
+// write amplification from per-record fsyncs. A callback is invoked
+// after every successful COMMIT so the metrics collector can increment
+// its batch counter.
 func (s *SQLiteStore) drain() {
 	defer s.wg.Done()
-	for req := range s.ch {
-		s.writeOne(req)
+
+	// batchAcc accumulates records between commits. nil means no active
+	// batch; a non-nil slice means we're accumulating.
+	var batchAcc []Request
+	var batchTimer *time.Timer
+	var batchTimerCh <-chan time.Time
+
+	// flush commits the current batch (if any) and resets the accumulator.
+	// Errors are logged but not returned — the request path already returned.
+	flush := func() {
+		if len(batchAcc) == 0 {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), recordRequestErrorTimeout)
+		defer cancel()
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			s.logger("ERROR: metrics batch begin: %v", err)
+			batchAcc = batchAcc[:0]
+			return
+		}
+		stmt, err := tx.PrepareContext(ctx, insertSQL)
+		if err != nil {
+			s.logger("ERROR: metrics batch prepare: %v", err)
+			_ = tx.Rollback()
+			batchAcc = batchAcc[:0]
+			return
+		}
+		for _, req := range batchAcc {
+			if err := s.insertRow(ctx, stmt, req); err != nil {
+				s.logger("ERROR: metrics batch insert request_id=%s: %v", req.RequestID, err)
+			}
+		}
+		_ = stmt.Close()
+		if err := tx.Commit(); err != nil {
+			s.logger("ERROR: metrics batch commit: %v", err)
+			_ = tx.Rollback()
+			batchAcc = batchAcc[:0]
+			return
+		}
+		if s.batchCallback != nil {
+			s.batchCallback()
+		}
+		batchAcc = batchAcc[:0]
 	}
+
+	// resetTimer stops and nilifies the batch timer so a subsequent
+	// iteration can call resetTimer() to disarm it without a race.
+	resetTimer := func() {
+		if batchTimer != nil {
+			batchTimer.Stop()
+			batchTimer = nil
+			batchTimerCh = nil
+		}
+	}
+
+	for req := range s.ch {
+		if s.batchSize <= 0 {
+			// Pre-batch path: one record per transaction.
+			s.writeOne(req)
+			continue
+		}
+		// BATCH MODE (issue #1234)
+		if batchAcc == nil {
+			// Start a fresh accumulator and arm the timeout.
+			batchAcc = append(batchAcc, req)
+			if s.batchTimeout > 0 {
+				resetTimer()
+				batchTimer = time.NewTimer(s.batchTimeout)
+				batchTimerCh = batchTimer.C
+			}
+			continue
+		}
+		// Accumulate and check batch size.
+		batchAcc = append(batchAcc, req)
+		if len(batchAcc) >= s.batchSize {
+			flush()
+			resetTimer()
+			continue
+		}
+		// Check timeout.
+		if batchTimerCh != nil {
+			select {
+			case <-batchTimerCh:
+				flush()
+				resetTimer()
+			default:
+				// Timer hasn't fired yet; keep accumulating.
+			}
+		}
+	}
+
+	// Drain remaining accumulated records on close.
+	if len(batchAcc) > 0 {
+		flush()
+	}
+	resetTimer()
 }
 
 // writeOne performs the actual INSERT. Errors are logged at WARN
 // rather than returned — the request path already returned by now.
+// Kept for pre-batch callers and tests.
 func (s *SQLiteStore) writeOne(req Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), recordRequestErrorTimeout)
 	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		s.logger("ERROR: metrics begin: %v", err)
+		return
+	}
+	stmt, err := tx.PrepareContext(ctx, insertSQL)
+	if err != nil {
+		s.logger("ERROR: metrics prepare: %v", err)
+		_ = tx.Rollback()
+		return
+	}
+	if err := s.insertRow(ctx, stmt, req); err != nil {
+		s.logger("ERROR: metrics insert request_id=%s: %v", req.RequestID, err)
+	}
+	_ = stmt.Close()
+	if err := tx.Commit(); err != nil {
+		s.logger("ERROR: metrics commit: %v", err)
+	}
+}
+
+// insertRow is a helper that executes a single INSERT using the provided
+// statement and request. It handles the field normalisation (zero-values,
+// boolean conversion) so drain() and writeOne() stay focused.
+func (s *SQLiteStore) insertRow(ctx context.Context, stmt *sql.Stmt, req Request) error {
 	route := req.Route
 	if route == "" {
 		route = string(router.RouteFrontier)
@@ -434,7 +573,7 @@ func (s *SQLiteStore) writeOne(req Request) {
 	if req.FusionArbiterSkipped {
 		fusionArbiterSkipped = 1
 	}
-	_, err := s.db.ExecContext(ctx, insertSQL,
+	_, err := stmt.ExecContext(ctx,
 		ts.UTC(), req.RequestID, route, model,
 		req.InputTokens, req.OutputTokens, req.TOONSavingsTokens, req.TOONCompressionMethod,
 		ragInjected, req.RAGFilename, req.RAGCacheHit, req.EstimatedCostUSD,
@@ -447,9 +586,7 @@ func (s *SQLiteStore) writeOne(req Request) {
 		req.Tenant,
 		req.CacheReadInputTokens, req.CacheCreationInputTokens,
 	)
-	if err != nil {
-		s.logger("ERROR: insert request_id=%s: %v", req.RequestID, err)
-	}
+	return err
 }
 
 // --- Retention pruning (issue #483) ---------------------------------------

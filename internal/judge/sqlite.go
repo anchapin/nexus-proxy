@@ -70,6 +70,10 @@ const recordScoreErrorTimeout = 5 * time.Second
 // Writes are funnelled through a buffered channel and a single
 // background goroutine; the interface is identical to MemoryStorage
 // so swapping is a one-line change in main.go.
+//
+// Issue #1234 batch mode: when batchSize > 0, the drain accumulates
+// records and commits BEGIN...INSERT...COMMIT either when the
+// accumulator reaches batchSize or when batchTimeout elapses.
 type SQLiteStore struct {
 	db   *sql.DB
 	path string // "" for ":memory:"
@@ -78,14 +82,17 @@ type SQLiteStore struct {
 	wg      sync.WaitGroup
 	closed  bool
 	closeMu sync.Mutex
+
+	// Batch config (issue #1234). Same semantics as metrics store.
+	batchSize     int
+	batchTimeout time.Duration
 }
 
 // OpenSQLiteStore opens (or creates) a SQLite database at path and
 // starts the background drain goroutine. Path may be ":memory:" for
-// tests. Returns an error only when the database cannot be opened or
-// the schema cannot be created; callers should log and fall back to
-// MemoryStorage rather than crashing the proxy on a broken judge DB.
-func OpenSQLiteStore(path string) (*SQLiteStore, error) {
+// tests. batchSize and batchTimeout control the drain batching
+// behaviour (issue #1234). Pass 0 for both to use per-record commits.
+func OpenSQLiteStore(path string, batchSize int, batchTimeout time.Duration) (*SQLiteStore, error) {
 	dsn := buildDSN(path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -108,9 +115,11 @@ func OpenSQLiteStore(path string) (*SQLiteStore, error) {
 	}
 
 	s := &SQLiteStore{
-		db:   db,
-		path: path,
-		ch:   make(chan JudgeScore, bufferedChannelSize),
+		db:           db,
+		path:         path,
+		ch:           make(chan JudgeScore, bufferedChannelSize),
+		batchSize:    batchSize,
+		batchTimeout: batchTimeout,
 	}
 	s.wg.Add(1)
 	go s.drain()
@@ -175,11 +184,95 @@ func (s *SQLiteStore) Record(score JudgeScore) error {
 
 // drain is the single writer goroutine. Owning the connection
 // guarantees database/sql never serialises concurrent writes for us.
+//
+// Issue #1234 batch mode: when s.batchSize > 0, drain accumulates
+// records into an in-memory slice and commits BEGIN...INSERT...COMMIT
+// either when the accumulator reaches s.batchSize or when
+// s.batchTimeout elapses since the last commit.
 func (s *SQLiteStore) drain() {
 	defer s.wg.Done()
-	for score := range s.ch {
-		s.writeOne(score)
+
+	var batchAcc []JudgeScore
+	var batchTimer *time.Timer
+	var batchTimerCh <-chan time.Time
+
+	flush := func() {
+		if len(batchAcc) == 0 {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), recordScoreErrorTimeout)
+		defer cancel()
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			slog.Warn("judge batch begin failed", slog.Any("err", err))
+			batchAcc = batchAcc[:0]
+			return
+		}
+		stmt, err := tx.PrepareContext(ctx, insertScoreSQL)
+		if err != nil {
+			slog.Warn("judge batch prepare failed", slog.Any("err", err))
+			_ = tx.Rollback()
+			batchAcc = batchAcc[:0]
+			return
+		}
+		for _, score := range batchAcc {
+			if err := s.insertRow(ctx, stmt, score); err != nil {
+				slog.Warn("judge batch insert failed", slog.String("request_id", score.RequestID), slog.Any("err", err))
+			}
+		}
+		_ = stmt.Close()
+		if err := tx.Commit(); err != nil {
+			slog.Warn("judge batch commit failed", slog.Any("err", err))
+			_ = tx.Rollback()
+			batchAcc = batchAcc[:0]
+			return
+		}
+		batchAcc = batchAcc[:0]
 	}
+
+	resetTimer := func() {
+		if batchTimer != nil {
+			batchTimer.Stop()
+			batchTimer = nil
+			batchTimerCh = nil
+		}
+	}
+
+	for score := range s.ch {
+		if s.batchSize <= 0 {
+			s.writeOne(score)
+			continue
+		}
+		// BATCH MODE (issue #1234)
+		if batchAcc == nil {
+			batchAcc = append(batchAcc, score)
+			if s.batchTimeout > 0 {
+				resetTimer()
+				batchTimer = time.NewTimer(s.batchTimeout)
+				batchTimerCh = batchTimer.C
+			}
+			continue
+		}
+		batchAcc = append(batchAcc, score)
+		if len(batchAcc) >= s.batchSize {
+			flush()
+			resetTimer()
+			continue
+		}
+		if batchTimerCh != nil {
+			select {
+			case <-batchTimerCh:
+				flush()
+				resetTimer()
+			default:
+			}
+		}
+	}
+
+	if len(batchAcc) > 0 {
+		flush()
+	}
+	resetTimer()
 }
 
 // writeOne performs the actual INSERT. Errors are logged rather than
@@ -188,22 +281,41 @@ func (s *SQLiteStore) writeOne(score JudgeScore) {
 	ctx, cancel := context.WithTimeout(context.Background(), recordScoreErrorTimeout)
 	defer cancel()
 
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		slog.Warn("judge begin failed", slog.Any("err", err))
+		return
+	}
+	stmt, err := tx.PrepareContext(ctx, insertScoreSQL)
+	if err != nil {
+		slog.Warn("judge prepare failed", slog.Any("err", err))
+		_ = tx.Rollback()
+		return
+	}
+	if err := s.insertRow(ctx, stmt, score); err != nil {
+		slog.Warn("judge insert failed", slog.String("request_id", score.RequestID), slog.Any("err", err))
+	}
+	_ = stmt.Close()
+	if err := tx.Commit(); err != nil {
+		slog.Warn("judge commit failed", slog.Any("err", err))
+	}
+}
+
+// insertRow executes a single INSERT using the provided statement.
+func (s *SQLiteStore) insertRow(ctx context.Context, stmt *sql.Stmt, score JudgeScore) error {
 	ts := score.Timestamp
 	if ts.IsZero() {
 		ts = time.Now().UTC()
 	}
-
 	errStr := ""
 	if score.Err != nil {
 		errStr = score.Err.Error()
 	}
-
 	ragInjected := 0
 	if score.RAGInjected {
 		ragInjected = 1
 	}
-
-	_, err := s.db.ExecContext(ctx, insertScoreSQL,
+	_, err := stmt.ExecContext(ctx,
 		ts,
 		score.RequestID,
 		score.Score,
@@ -215,11 +327,7 @@ func (s *SQLiteStore) writeOne(score JudgeScore) {
 		ragInjected,
 		score.RAGSimilarity,
 	)
-	if err != nil {
-		// Best-effort: log and continue. Judge scores are
-		// telemetry, not correctness-critical.
-		slog.Warn("judge: insert failed", slog.String("request_id", score.RequestID), slog.Any("err", err))
-	}
+	return err
 }
 
 // Close drains in-flight writes and closes the database. Safe to call
