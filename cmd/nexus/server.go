@@ -379,17 +379,20 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 	stageCollector := observability.NewCollector()
 	if cfg.JudgeEnabled && cfg.JudgeAPIKey != "" {
 		evalCfg := judge.Config{
-			URL:                cfg.JudgeURL,
-			Model:              cfg.JudgeModel,
-			APIKey:             cfg.JudgeAPIKey,
-			SampleRate:         cfg.JudgeSampleRate,
-			FrontierSampleRate: cfg.JudgeFrontierSampleRate,
-			Concurrency:        cfg.JudgeConcurrency,
-			QueueDepth:         cfg.JudgeQueueDepth,
-			Timeout:            cfg.JudgeTimeout,
-			CostPer1K:          cfg.JudgeCostPer1KUSD,
-			BudgetGuard:        budgetGuard,
-			AdaptiveEnabled:    cfg.JudgeAdaptiveEnabled,
+			URL:                    cfg.JudgeURL,
+			Model:                  cfg.JudgeModel,
+			APIKey:                 cfg.JudgeAPIKey,
+			SampleRate:             cfg.JudgeSampleRate,
+			FrontierSampleRate:     cfg.JudgeFrontierSampleRate,
+			Concurrency:            cfg.JudgeConcurrency,
+			QueueDepth:             cfg.JudgeQueueDepth,
+			Timeout:                cfg.JudgeTimeout,
+			CostPer1K:              cfg.JudgeCostPer1KUSD,
+			BudgetGuard:            budgetGuard,
+			AdaptiveEnabled:        cfg.JudgeAdaptiveEnabled,
+			AdaptiveWindow:         cfg.JudgeAdaptiveWindow,
+			AdaptiveHighConfidence: cfg.JudgeAdaptiveHighConf,
+			AdaptiveLowConfidence:  cfg.JudgeAdaptiveLowConf,
 		}
 		var storage judge.Storage
 		if cfg.JudgeDBEnabled() {
