@@ -887,6 +887,9 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		if e.Source == "dsl" {
 			routeCounters.ObserveDSLHit(e.Reason)
 		}
+		if e.Source == "dsl-promoted" {
+			routeCounters.IncDSLPromoted()
+		}
 		if e.DSLMiss {
 			routeCounters.ObserveDSLMiss()
 		}

@@ -105,7 +105,7 @@ type PatternPromoter struct {
 
 	db *sql.DB
 
-	promotedTotal atomic.Uint64 // nexus_route_dsl_promoted_total
+	promotedTotal atomic.Uint64
 
 	lastRecompute time.Time
 	closeOnce     sync.Once
