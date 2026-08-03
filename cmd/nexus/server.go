@@ -360,6 +360,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		})
 		if otelExp != nil {
 			observability.RegisterCollector(circuitCollector)
+			observability.RegisterRouteCounters(routeCounters)
 			observability.RegisterOtelMetricsExporter(otelExp)
 			parts.otelMetricsCloser = otelExp.Close
 			slog.Info("otel metrics exporter wired",
