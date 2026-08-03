@@ -231,6 +231,11 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total number of RAG chunks skipped at index time because they were too similar to existing chunks (issue #1243).",
 		typ:  "counter",
 	},
+	// RAG persistent store document count (issue #1300).
+	"nexus_rag_document_count": {
+		help: "Current number of documents in the RAG persistent store.",
+		typ:  "gauge",
+	},
 	// SLM decision cache gauges (issue #531).
 	"nexus_slm_cache_entries": {
 		help: "Current number of entries in the SLM decision cache (issue #531).",

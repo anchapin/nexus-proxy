@@ -842,6 +842,14 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 				Name: "nexus_cache_warmed_entries", Value: float64(cacheWarmedEntries),
 			}}
 		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			if persistentStore == nil {
+				return nil
+			}
+			return []observability.GaugeSample{
+				{Name: "nexus_rag_document_count", Value: float64(persistentStore.Size())},
+			}
+		}),
 	)
 
 	middleware.Init(cfg.MetaPrompt, cfg.TOONNotice, cfg.TOONUnfenced, cfg.PromptInjectionIsolated())
