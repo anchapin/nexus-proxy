@@ -35,6 +35,8 @@ type YAMLConfig struct {
 	// Logging
 	LogLevel  string `yaml:"log_level"`
 	LogFormat string `yaml:"log_format"`
+	// Startup summary suppression (issue #1236)
+	StartupQuiet bool `yaml:"startup_quiet"`
 
 	// Debug
 	Debug          bool `yaml:"debug"`
@@ -453,6 +455,10 @@ func LoadYAML(path string) (Config, error) {
 	}
 	if v := os.Getenv("NEXUS_LOG_FORMAT"); v != "" {
 		cfg.LogFormat = parseLogFormat(v)
+	}
+	// Startup summary suppression (issue #1236)
+	if v := os.Getenv("NEXUS_STARTUP_QUIET"); v != "" {
+		cfg.StartupQuiet = parseBoolEnvStr(v, false)
 	}
 
 	// Debug
@@ -1817,8 +1823,9 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		PromptInjectionMode: middleware.ParseInjectionMode(yc.PromptInjectionMode),
 		InjectionScanRoles:  yamlRoles,
 
-		LogLevel:  logLevel,
-		LogFormat: parseLogFormat(yc.LogFormat),
+		LogLevel:     logLevel,
+		LogFormat:    parseLogFormat(yc.LogFormat),
+		StartupQuiet: yc.StartupQuiet,
 
 		Debug:          yc.Debug, // defaults to false in toConfig if not set
 		DebugBodyBytes: yc.intDefault(yc.DebugBodyBytes, DefaultDebugBodyBytes),

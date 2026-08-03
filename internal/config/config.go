@@ -613,6 +613,12 @@ type Config struct {
 	LogLevel  slog.Level
 	LogFormat LogFormat
 
+	// StartupQuiet (issue #1236). When true, suppresses the structured
+	// startup summary banner that reports the resolved configuration.
+	// Operators who start the proxy programmatically (init systems,
+	// test harnesses) set this to keep their log output clean.
+	StartupQuiet bool // NEXUS_STARTUP_QUIET
+
 	// Debug request/response tracing (issue #33). Debug is the master
 	// switch: when false (the default) the chat handler takes the
 	// production fast path with zero extra allocations. When true the
@@ -2006,6 +2012,11 @@ func Load() (Config, error) {
 	}
 	cfg.LogLevel = logLevel
 	cfg.LogFormat = parseLogFormat(os.Getenv("NEXUS_LOG_FORMAT"))
+
+	// Startup summary suppression (issue #1236). When true, the structured
+	// startup banner is suppressed. Off by default so operators get the
+	// full resolved configuration overview on every boot.
+	cfg.StartupQuiet = parseBoolEnv("NEXUS_STARTUP_QUIET", false)
 
 	// Debug tracing (issue #33). Off by default so production has
 	// zero overhead. Body preview is bounded by NEXUS_DEBUG_BODY_BYTES

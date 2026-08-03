@@ -1342,6 +1342,55 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 	// publicPathExempt in main.go.
 	handlers.RegisterDebugPprof(mux, cfg)
 
+	// Structured startup summary (issue #1236). A single slog.Info covering
+	// all major subsystems so operators get full resolved configuration visibility
+	// on boot without having to grep or puzzle out individual log lines.
+	if !cfg.StartupQuiet {
+		slog.Info("nexus startup summary",
+			slog.String("version", version),
+			slog.String("addr", cfg.Addr),
+			slog.Bool("tls_enabled", cfg.TLSEnabled),
+			slog.String("local_model", cfg.LocalModel),
+			slog.String("router_model", cfg.RouterModel),
+			slog.String("frontier_model", cfg.FrontierModel),
+			slog.String("middleware_chain", cfg.MiddlewareChain),
+			slog.Bool("rate_limit_enabled", cfg.RateLimitEnabled()),
+			slog.Int("rate_limit_rpm", cfg.RateLimitRPM),
+			slog.Bool("budget_guard_enabled", cfg.BudgetEnabled()),
+			slog.Float64("budget_daily_limit_usd", cfg.BudgetDailyLimit),
+			slog.Int("token_guardrail", cfg.TokenGuardrail),
+			slog.Float64("slm_confidence_threshold", cfg.SLMConfidenceThreshold),
+			slog.Int("dsl_fusion_patterns", len(cfg.DSLFusionPatterns)),
+			slog.Int("dsl_formatting_patterns", len(cfg.DSLFormattingPatterns)),
+			slog.Int("dsl_local_patterns", len(cfg.DSLLocalPatterns)),
+			slog.Int("dsl_unicode_patterns", len(cfg.DSLUnicodePatterns)),
+			slog.Bool("fusion_progressive", cfg.FusionProgressiveDelivery),
+			slog.Float64("fusion_agreement_threshold", cfg.FusionAgreementThreshold),
+			slog.Duration("fusion_local_timeout", cfg.FusionLocalTimeout),
+			slog.Duration("fusion_frontier_timeout", cfg.FusionFrontierTimeout),
+			slog.Bool("judge_enabled", cfg.JudgeEnabled),
+			slog.Float64("judge_sample_rate", cfg.JudgeSampleRate),
+			slog.Bool("rag_enabled", store != nil),
+			slog.String("rag_embedder", string(cfg.EmbedderType)),
+			slog.Float64("rag_threshold", cfg.RAGThreshold),
+			slog.Int("rag_top_k", cfg.RAGTopK),
+			slog.Duration("health_poll_interval", cfg.HealthPollInterval),
+			slog.Int("health_breaker_threshold", cfg.HealthBreakerThreshold),
+			slog.Duration("frontier_health_poll_interval", cfg.FrontierHealthPollInterval),
+			slog.Bool("frontier_failover", cfg.FrontierFailover),
+			slog.Int("frontier_failover_max_attempts", cfg.FrontierFailoverMaxAttempts),
+			slog.Bool("slm_cache_enabled", cfg.SLMCacheEnabled()),
+			slog.Duration("slm_cache_ttl", cfg.SLMCacheTTL),
+			slog.Bool("arbiter_cache_enabled", cfg.ArbiterCacheTTL > 0),
+			slog.Duration("arbiter_cache_ttl", cfg.ArbiterCacheTTL),
+			slog.Bool("auth_enabled", cfg.AuthEnabled()),
+			slog.Bool("models_endpoint_enabled", cfg.ModelsEndpointEnabled),
+			slog.Bool("dashboard_enabled", cfg.DashboardEndpointEnabled),
+			slog.Bool("tracing_enabled", cfg.TracingEndpoint != ""),
+			slog.Float64("tracing_sample_rate", cfg.TracingSampleRate),
+		)
+	}
+
 	slog.Info("starting nexus proxy",
 		slog.String("addr", cfg.Addr),
 		slog.String("local_model", cfg.LocalModel),

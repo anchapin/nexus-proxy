@@ -11,9 +11,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -810,5 +812,55 @@ func TestBuildHandlerPanicRecovery(t *testing.T) {
 	}
 	if panicObs.Load() == 0 {
 		t.Error("panic observer was not called")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Startup summary test (issue #1236)
+// ---------------------------------------------------------------------------
+
+// captureSlogForStartup swaps slog.Default for a JSON handler writing to buf
+// for the duration of fn, then restores the previous default.
+func captureSlogForStartup(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	fn()
+	slog.SetDefault(prev)
+	return buf.String()
+}
+
+// TestE2E_StartupSummary verifies that the structured startup summary banner
+// is emitted when NEXUS_STARTUP_QUIET is not set (issue #1236).
+func TestE2E_StartupSummary(t *testing.T) {
+	// Capture slog output.
+	output := captureSlogForStartup(t, func() {
+		serverTestEnv(t)
+		t.Setenv("NEXUS_STARTUP_QUIET", "false")
+		_, _, cleanup := buildTestServerFromCfg(t)
+		defer cleanup()
+	})
+
+	// Verify the startup summary appears in the captured output.
+	if !strings.Contains(output, "nexus startup summary") {
+		t.Error("startup summary 'nexus startup summary' was not emitted")
+	}
+}
+
+// TestE2E_StartupSummaryQuiet verifies that the startup summary is suppressed
+// when NEXUS_STARTUP_QUIET=true (issue #1236).
+func TestE2E_StartupSummaryQuiet(t *testing.T) {
+	// Capture slog output.
+	output := captureSlogForStartup(t, func() {
+		serverTestEnv(t)
+		t.Setenv("NEXUS_STARTUP_QUIET", "true")
+		_, _, cleanup := buildTestServerFromCfg(t)
+		defer cleanup()
+	})
+
+	// Verify the startup summary does NOT appear in the captured output.
+	if strings.Contains(output, "nexus startup summary") {
+		t.Error("startup summary was emitted despite NEXUS_STARTUP_QUIET=true")
 	}
 }
