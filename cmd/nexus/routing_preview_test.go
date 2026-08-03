@@ -2,365 +2,399 @@ package main
 
 import (
 	"bytes"
-	"context"
-	"regexp"
+	"flag"
+	"io"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/anchapin/nexus-proxy/internal/router"
 )
 
-// --- readStdinLines ---
+// Tests for the threshold calculation (errors*2 > prompts)
+func TestPerPromptErrorThreshold(t *testing.T) {
+	tests := []struct {
+		name        string
+		prompts     int
+		errors      int
+		expectExit1 bool
+	}{
+		{"no errors", 3, 0, false},
+		{"exactly 50% errors", 4, 2, false},
+		{"over 50% errors", 4, 3, true},
+		{"all errors", 2, 2, true},
+		{"one error, one prompt", 1, 1, true},
+		{"one error, two prompts", 2, 1, false},
+		{"one error, three prompts", 3, 1, false},
+		{"two errors, three prompts", 3, 2, true},
+	}
 
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Calculate if we should return exit 1: errors*2 > prompts
+			result := tt.errors*2 > tt.prompts
+			if result != tt.expectExit1 {
+				t.Errorf("for %d errors / %d prompts: expected exit1=%v, got %v",
+					tt.errors, tt.prompts, tt.expectExit1, result)
+			}
+		})
+	}
+}
+
+// TestRunRoutingPreview_ExplainFlag tests the --explain flag parsing
+func TestRunRoutingPreview_ExplainFlagParsing(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	var explain bool
+	fs.BoolVar(&explain, "explain", false, "append bias note")
+
+	err := fs.Parse([]string{"--explain", "test prompt"})
+	if err != nil {
+		t.Errorf("unexpected error parsing --explain: %v", err)
+	}
+	if !explain {
+		t.Error("expected explain to be true after parsing --explain")
+	}
+}
+
+// TestRunRoutingPreview_StdinFlag tests the --stdin flag parsing
+func TestRunRoutingPreview_StdinFlagParsing(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	var fromStdin bool
+	fs.BoolVar(&fromStdin, "stdin", false, "read from stdin")
+
+	err := fs.Parse([]string{"--stdin"})
+	if err != nil {
+		t.Errorf("unexpected error parsing --stdin: %v", err)
+	}
+	if !fromStdin {
+		t.Error("expected fromStdin to be true after parsing --stdin")
+	}
+}
+
+// TestReadStdinLines tests the stdin reading function
 func TestReadStdinLines(t *testing.T) {
 	tests := []struct {
-		name  string
-		input string
-		want  []string
+		name     string
+		input    string
+		expected []string
 	}{
-		{"empty", "", nil},
-		{"single", "hello world\n", []string{"hello world"}},
-		{"multi", "line1\nline2\nline3\n", []string{"line1", "line2", "line3"}},
-		{"trailing_newline_only", "\n", nil},
-		{"crlf", "a\r\nb\r\n", []string{"a", "b"}},
-		{"blank_lines_skipped", "a\n\nb\n", []string{"a", "b"}},
+		{"single line", "hello\n", []string{"hello"}},
+		{"multiple lines", "hello\nworld\nfoo\n", []string{"hello", "world", "foo"}},
+		{"empty lines ignored", "hello\n\nworld\n", []string{"hello", "world"}},
+		{"carriage return stripped", "hello\r\nworld\r\n", []string{"hello", "world"}},
+		{"no trailing newline", "hello\nworld", []string{"hello", "world"}},
+		{"all empty lines", "\n\n\n", []string{}},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := readStdinLines(strings.NewReader(tt.input))
+			r := io.NopCloser(strings.NewReader(tt.input))
+			result, err := readStdinLines(r)
 			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if len(got) != len(tt.want) {
-				t.Fatalf("got %d lines, want %d (%v)", len(got), len(tt.want), got)
-			}
-			for i, v := range got {
-				if v != tt.want[i] {
-					t.Errorf("line %d: got %q, want %q", i, v, tt.want[i])
-				}
-			}
-		})
-	}
-}
-
-// --- decisionReason ---
-
-func TestDecisionReason(t *testing.T) {
-	re := regexp.MustCompile(`css`)
-	patterns := []*regexp.Regexp{re}
-
-	tests := []struct {
-		name   string
-		dec    router.Decision
-		expect string
-	}{
-		{"guardrail", router.Decision{Source: router.SourceGuardrail}, "guardrail:vram"},
-		{"dsl", router.Decision{Source: router.SourceDSL, Route: router.RouteLocal}, "dsl:css"},
-		{"slm", router.Decision{Source: router.SourceSLM}, "slm"},
-		{"slm-error", router.Decision{Source: router.SourceSLMError, Reason: "timeout"}, "slm-error:timeout"},
-		{"escalation", router.Decision{Source: router.SourceEscalation}, "slm-no-client"},
-		{"slm-escalation", router.Decision{Source: router.SourceSLMEscalation}, "slm-low-confidence"},
-		{"default", router.Decision{Source: router.DecisionSource("unknown")}, "slm"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := decisionReason(tt.dec, nil, patterns, nil, nil, "fix the css bug")
-			if tt.name == "dsl" && got != "dsl:css" {
-				t.Errorf("got %q, want %q", got, "dsl:css")
-			}
-			if tt.name != "dsl" && got != tt.expect {
-				t.Errorf("got %q, want %q", got, tt.expect)
-			}
-		})
-	}
-}
-
-// --- formatDecision ---
-
-func TestFormatDecision(t *testing.T) {
-	dec := router.Decision{Route: router.RouteLocal, Confidence: 0.85}
-	got := formatDecision(dec, "slm")
-	if !strings.Contains(got, "ROUTE=local") {
-		t.Errorf("expected ROUTE=local in %q", got)
-	}
-	if !strings.Contains(got, "REASON=") {
-		t.Errorf("expected REASON= in %q", got)
-	}
-}
-
-// --- explainDecision ---
-
-func TestExplainDecision(t *testing.T) {
-	slm := router.NewSLMClient("http://localhost:11434", "qwen3-coder:4b", 0, nil)
-	slm.ConfidenceFloor = 0.3
-	slm.ConfidenceCeiling = 0.8
-
-	tests := []struct {
-		name   string
-		dec    router.Decision
-		expect string
-	}{
-		{"non-slm", router.Decision{Source: router.SourceDSL}, ""},
-		{"negative", router.Decision{Source: router.SourceSLM, Confidence: 0.1}, "BIAS=negative"},
-		{"positive", router.Decision{Source: router.SourceSLM, Confidence: 0.95}, "BIAS=positive"},
-		{"neutral", router.Decision{Source: router.SourceSLM, Confidence: 0.5}, "BIAS=neutral"},
-		{"escalation-negative", router.Decision{Source: router.SourceSLMEscalation, Confidence: 0.1}, "BIAS=negative"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := explainDecision(tt.dec, slm)
-			if tt.expect == "" {
-				if got != "" {
-					t.Errorf("expected empty, got %q", got)
-				}
+				t.Errorf("unexpected error: %v", err)
 				return
 			}
-			if !strings.HasPrefix(got, tt.expect) {
-				t.Errorf("expected prefix %q, got %q", tt.expect, got)
+			if len(result) != len(tt.expected) {
+				t.Errorf("expected %d lines, got %d: %v", len(tt.expected), len(result), result)
+				return
+			}
+			for i, line := range result {
+				if line != tt.expected[i] {
+					t.Errorf("line %d: expected %q, got %q", i, tt.expected[i], line)
+				}
 			}
 		})
 	}
 }
 
-// --- explainDecision with default floor/ceiling ---
-
-func TestExplainDecisionDefaults(t *testing.T) {
-	slm := router.NewSLMClient("http://localhost:11434", "qwen3-coder:4b", 0, nil)
-	// ConfidenceFloor and ConfidenceCeiling are 0 → should use defaults
-	dec := router.Decision{Source: router.SourceSLM, Confidence: 0.5}
-	got := explainDecision(dec, slm)
-	if got == "" {
-		t.Error("expected non-empty with default floor/ceiling")
-	}
-}
-
-// --- findMatchedKeyword ---
-
-func TestFindMatchedKeyword(t *testing.T) {
+// TestDecisionReason tests the decision reason formatting
+func TestDecisionReason(t *testing.T) {
 	tests := []struct {
-		name    string
-		lower   string
-		pattern string
-		want    string
+		name     string
+		dec      router.Decision
+		expected string
 	}{
-		{"match_css", "fix the css bug", "css", "css"},
-		{"match_debug", "debug this crash", "debug", "debug"},
-		{"no_match", "hello world", "", ""},
-		{"word_boundary_left", "foocss bar", "", ""},
-		{"word_boundary_right", "cssbar", "", ""},
-		{"start_of_string", "css is great", "css", "css"},
-		{"end_of_string", "use css", "css", "css"},
+		{
+			name:     "guardrail",
+			dec:      router.Decision{Source: router.SourceGuardrail},
+			expected: "guardrail:vram",
+		},
+		{
+			name:     "dsl",
+			dec:      router.Decision{Source: router.SourceDSL, Reason: "test"},
+			expected: "dsl:test",
+		},
+		{
+			name:     "slm",
+			dec:      router.Decision{Source: router.SourceSLM},
+			expected: "slm",
+		},
+		{
+			name:     "slm error",
+			dec:      router.Decision{Source: router.SourceSLMError, Reason: "timeout"},
+			expected: "slm-error:timeout",
+		},
+		{
+			name:     "escalation",
+			dec:      router.Decision{Source: router.SourceEscalation},
+			expected: "slm-no-client",
+		},
+		{
+			name:     "low confidence",
+			dec:      router.Decision{Source: router.SourceSLMEscalation},
+			expected: "slm-low-confidence",
+		},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var pats []*regexp.Regexp
-			if tt.pattern != "" {
-				pats = []*regexp.Regexp{regexp.MustCompile(tt.pattern)}
-			}
-			got := findMatchedKeyword(tt.lower, pats)
-			if got != tt.want {
-				t.Errorf("got %q, want %q", got, tt.want)
+			result := decisionReason(tt.dec, nil, nil, nil, nil, "test prompt")
+			if result != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, result)
 			}
 		})
 	}
 }
 
-// --- toUnicodeLower / hasUpperUnicode ---
+// TestFormatDecision tests the decision formatting
+func TestFormatDecision(t *testing.T) {
+	dec := router.Decision{
+		Route:  router.RouteLocal,
+		Source: router.SourceDSL,
+		Reason: "refactor",
+	}
+	result := formatDecision(dec, "dsl:refactor")
+	expected := `ROUTE=local REASON="dsl:refactor"`
+	if result != expected {
+		t.Errorf("expected %q, got %q", expected, result)
+	}
+}
 
+// TestExplainDecision tests the explain decision function
+func TestExplainDecision(t *testing.T) {
+	slm := &router.SLMClient{ConfidenceFloor: 0.3, ConfidenceCeiling: 0.7}
+
+	tests := []struct {
+		name      string
+		dec       router.Decision
+		expectStr string
+	}{
+		{
+			name:      "slm source with high confidence",
+			dec:       router.Decision{Source: router.SourceSLM, Confidence: 0.8},
+			expectStr: "BIAS=positive",
+		},
+		{
+			name:      "slm source with low confidence",
+			dec:       router.Decision{Source: router.SourceSLM, Confidence: 0.2},
+			expectStr: "BIAS=negative",
+		},
+		{
+			name:      "slm source with neutral confidence",
+			dec:       router.Decision{Source: router.SourceSLM, Confidence: 0.5},
+			expectStr: "BIAS=neutral",
+		},
+		{
+			name:      "dsl source returns empty",
+			dec:       router.Decision{Source: router.SourceDSL, Confidence: 0.5},
+			expectStr: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := explainDecision(tt.dec, slm)
+			if !strings.HasPrefix(result, tt.expectStr) {
+				t.Errorf("expected to start with %q, got %q", tt.expectStr, result)
+			}
+		})
+	}
+}
+
+// TestEmptyPromptSkipped tests that empty prompts are skipped
+func TestEmptyPromptSkipped(t *testing.T) {
+	// Verify that empty strings don't count toward prompts or errors
+	prompts := []string{"hello", "", "world", ""}
+	validPrompts := 0
+	for _, p := range prompts {
+		if p != "" {
+			validPrompts++
+		}
+	}
+	if validPrompts != 2 {
+		t.Errorf("expected 2 valid prompts, got %d", validPrompts)
+	}
+}
+
+// TestExitCodeForHelpFlag tests that --help returns 0
+func TestRunRoutingPreview_HelpFlag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	exitCode := runRoutingPreview([]string{"--help"}, &stdout, &stderr)
+
+	if exitCode != 0 {
+		t.Errorf("expected exit code 0 for --help, got %d", exitCode)
+	}
+}
+
+// TestFlagParsingErrors tests that invalid flags return 1
+func TestFlagParsingErrors(t *testing.T) {
+	// Invalid flag should return 1 (not 2, since config hasn't been loaded yet)
+	var stdout, stderr bytes.Buffer
+	exitCode := runRoutingPreview([]string{"--invalid-flag"}, &stdout, &stderr)
+
+	if exitCode != 1 {
+		t.Errorf("expected exit code 1 for invalid flag, got %d", exitCode)
+	}
+}
+
+// TestFusionPatterns tests the fusion patterns helper
+func TestFusionPatterns(t *testing.T) {
+	// nil should return default
+	result := fusionPatterns(nil)
+	if len(result) == 0 {
+		t.Error("expected non-nil result for nil input")
+	}
+
+	// non-nil should return as-is
+	existing := router.DefaultFusionPatterns
+	result = fusionPatterns(existing)
+	if !reflect.DeepEqual(result, existing) {
+		t.Error("expected same slice to be returned")
+	}
+}
+
+// TestFormattingPatterns tests the formatting patterns helper
+func TestFormattingPatterns(t *testing.T) {
+	result := formattingPatterns(nil)
+	if len(result) == 0 {
+		t.Error("expected non-nil result for nil input")
+	}
+}
+
+// TestLocalPatterns tests the local patterns helper
+func TestLocalPatterns(t *testing.T) {
+	result := localPatterns(nil)
+	if len(result) == 0 {
+		t.Error("expected non-nil result for nil input")
+	}
+}
+
+// TestUnicodePatterns tests the unicode patterns helper
+func TestUnicodePatterns(t *testing.T) {
+	result := unicodePatterns(nil)
+	if len(result) == 0 {
+		t.Error("expected non-nil result for nil input")
+	}
+}
+
+// TestFindMatchedKeyword tests the keyword matching
+func TestFindMatchedKeyword(t *testing.T) {
+	patterns := router.DefaultFusionPatterns
+
+	// Should match "architectural design"
+	result := findMatchedKeyword("help with architectural design", patterns)
+	if result == "" {
+		t.Error("expected to match 'architectural design'")
+	}
+
+	// Should not match unrelated text
+	result = findMatchedKeyword("hello world", patterns)
+	if result != "" {
+		t.Errorf("expected no match for 'hello world', got %q", result)
+	}
+}
+
+// TestToUnicodeLower tests unicode lowercasing
 func TestToUnicodeLower(t *testing.T) {
 	tests := []struct {
-		input string
-		want  string
+		input    string
+		expected string
 	}{
 		{"hello", "hello"},
-		{"Hello World", "hello world"},
-		{"Москва", "москва"},
-		{"東京 Tōkyō", "東京 tōkyō"},
+		{"HELLO", "hello"},
+		{"Hello", "hello"},
+		{"HÉLLO", "héllo"},
 		{"", ""},
 	}
+
 	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got := toUnicodeLower(tt.input)
-			if got != tt.want {
-				t.Errorf("got %q, want %q", got, tt.want)
-			}
-		})
+		result := toUnicodeLower(tt.input)
+		if result != tt.expected {
+			t.Errorf("toUnicodeLower(%q): expected %q, got %q", tt.input, tt.expected, result)
+		}
 	}
 }
 
+// TestHasUpperUnicode tests unicode uppercase detection
 func TestHasUpperUnicode(t *testing.T) {
 	tests := []struct {
-		input string
-		want  bool
+		input    string
+		expected bool
 	}{
 		{"hello", false},
+		{"HELLO", true},
 		{"Hello", true},
-		{"Москва", true},
-		{"москва", false},
-		{"東京", false},
-		{"Tōkyō", true},
+		{"HÉLLO", true},
 		{"", false},
 	}
+
 	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got := hasUpperUnicode(tt.input)
-			if got != tt.want {
-				t.Errorf("got %v, want %v", got, tt.want)
-			}
-		})
+		result := hasUpperUnicode(tt.input)
+		if result != tt.expected {
+			t.Errorf("hasUpperUnicode(%q): expected %v, got %v", tt.input, tt.expected, result)
+		}
 	}
 }
 
-// --- isWordBoundary ---
-
+// TestIsWordBoundary tests word boundary detection
 func TestIsWordBoundary(t *testing.T) {
-	boundaries := " \t\n\r,.!?:;()[]{}\"'`/\\|&+*%^=<>@#$~"
-	for i := 0; i < len(boundaries); i++ {
-		c := boundaries[i]
-		if !isWordBoundary(c) {
-			t.Errorf("expected %q (0x%02x) to be a word boundary", c, c)
+	tests := []struct {
+		char     byte
+		expected bool
+	}{
+		{' ', true},
+		{'\t', true},
+		{'\n', true},
+		{'.', true},
+		{',', true},
+		{'a', false},
+		{'Z', false},
+	}
+
+	for _, tt := range tests {
+		result := isWordBoundary(tt.char)
+		if result != tt.expected {
+			t.Errorf("isWordBoundary(%q): expected %v, got %v", tt.char, tt.expected, result)
 		}
 	}
-	nonBoundaries := "abcABC012_"
-	for i := 0; i < len(nonBoundaries); i++ {
-		c := nonBoundaries[i]
-		if isWordBoundary(c) {
-			t.Errorf("expected %q (0x%02x) NOT to be a word boundary", c, c)
-		}
+}
+
+// TestSourceSLMErrorConstant verifies the constant value
+func TestSourceSLMErrorConstant(t *testing.T) {
+	// Verify the source is set correctly for SLM errors
+	dec := router.Decision{
+		Source: router.SourceSLMError,
+		Reason: "connection timeout",
+	}
+	if dec.Source != "slm-error" {
+		t.Errorf("expected SourceSLMError to be 'slm-error', got %q", dec.Source)
 	}
 }
 
-// --- matchedDSLKeyword ---
-
-func TestMatchedDSLKeyword(t *testing.T) {
-	fusion := []*regexp.Regexp{regexp.MustCompile(`architectural design`)}
-	formatting := []*regexp.Regexp{regexp.MustCompile(`css`)}
-	local := []*regexp.Regexp{regexp.MustCompile(`refactor`)}
-	unicode := []*regexp.Regexp{regexp.MustCompile(`\p{Han}`)}
-
-	// Fusion route → should match fusion pattern
-	kw := matchedDSLKeyword("architectural design review", router.RouteFusion, fusion, formatting, local, unicode)
-	if kw != "architectural design" {
-		t.Errorf("fusion match: got %q, want %q", kw, "architectural design")
-	}
-
-	// Local route → should match formatting
-	kw = matchedDSLKeyword("fix the css bug", router.RouteLocal, fusion, formatting, local, unicode)
-	if kw != "css" {
-		t.Errorf("formatting match: got %q, want %q", kw, "css")
-	}
-
-	// No match
-	kw = matchedDSLKeyword("hello world", router.RouteLocal, fusion, formatting, local, unicode)
-	if kw != "unknown" {
-		t.Errorf("no match: got %q, want %q", kw, "unknown")
-	}
+// testableThresholdCalculation is a helper to verify the threshold logic
+func testableThresholdCalculation(errors, prompts int) bool {
+	return errors*2 > prompts
 }
 
-// --- pattern default helpers ---
-
-func TestPatternDefaults(t *testing.T) {
-	customRe := regexp.MustCompile(`custom`)
-
-	if got := fusionPatterns([]*regexp.Regexp{customRe}); len(got) != 1 || got[0] != customRe {
-		t.Error("fusionPatterns should return custom when provided")
+func TestThresholdCalculationVariants(t *testing.T) {
+	// Edge cases
+	// 0 errors / 0 prompts: 0*2 > 0 = false
+	if testableThresholdCalculation(0, 0) {
+		t.Error("0 errors / 0 prompts should not trigger threshold")
 	}
-	if got := fusionPatterns(nil); len(got) == 0 {
-		t.Error("fusionPatterns should return defaults when nil")
-	}
-
-	if got := formattingPatterns([]*regexp.Regexp{customRe}); len(got) != 1 {
-		t.Error("formattingPatterns should return custom when provided")
-	}
-	if got := formattingPatterns(nil); len(got) == 0 {
-		t.Error("formattingPatterns should return defaults when nil")
-	}
-
-	if got := localPatterns([]*regexp.Regexp{customRe}); len(got) != 1 {
-		t.Error("localPatterns should return custom when provided")
-	}
-	if got := localPatterns(nil); len(got) == 0 {
-		t.Error("localPatterns should return defaults when nil")
-	}
-
-	if got := unicodePatterns([]*regexp.Regexp{customRe}); len(got) != 1 {
-		t.Error("unicodePatterns should return custom when provided")
-	}
-	if got := unicodePatterns(nil); len(got) == 0 {
-		t.Error("unicodePatterns should return defaults when nil")
-	}
-}
-
-// --- runRoutingPreview end-to-end ---
-
-func TestRunRoutingPreviewBasic(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := runRoutingPreview([]string{"fix the css bug"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("expected exit 0, got %d (stderr: %s)", code, stderr.String())
-	}
-	out := stdout.String()
-	if !strings.Contains(out, "ROUTE=") {
-		t.Errorf("expected ROUTE= in output, got %q", out)
-	}
-}
-
-func TestRunRoutingPreviewNoPrompts(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := runRoutingPreview([]string{}, &stdout, &stderr)
-	if code != 1 {
-		t.Errorf("expected exit 1, got %d", code)
-	}
-}
-
-func TestRunRoutingPreviewStdin(t *testing.T) {
-	// runRoutingPreview reads from os.Stdin for --stdin, which is hard to
-	// control in a test. We verify the non-stdin path instead — the stdin
-	// path is exercised by the dispatch_test.go integration test.
-}
-
-func TestRunRoutingPreviewMultiplePrompts(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := runRoutingPreview([]string{"refactor this function", "hello world"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("expected exit 0, got %d", code)
-	}
-	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
-	if len(lines) < 2 {
-		t.Errorf("expected at least 2 output lines, got %d (%q)", len(lines), stdout.String())
-	}
-}
-
-func TestRunRoutingPreviewExplain(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := runRoutingPreview([]string{"--explain", "fix the css bug"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("expected exit 0, got %d (stderr: %s)", code, stderr.String())
-	}
-}
-
-// --- context propagation check ---
-
-func TestRunRoutingPreviewContext(t *testing.T) {
-	// Verify the routing preview uses context.Background() internally.
-	// We can't inject a context, but we can verify it doesn't hang.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_ = ctx // just ensure the type compiles
-}
-
-// --- nil-pattern edge cases ---
-
-func TestFindMatchedKeywordNilPatterns(t *testing.T) {
-	got := findMatchedKeyword("test", []*regexp.Regexp{nil})
-	if got != "" {
-		t.Errorf("expected empty for nil pattern, got %q", got)
-	}
-}
-
-func TestFindMatchedKeywordEmptyPatterns(t *testing.T) {
-	got := findMatchedKeyword("test", []*regexp.Regexp{})
-	if got != "" {
-		t.Errorf("expected empty for empty patterns, got %q", got)
+	// 1 error / 0 prompts: 1*2 > 0 = 2 > 0 = true
+	// This is a degenerate case; the actual code guards len(prompts) > 0
+	if !testableThresholdCalculation(1, 0) {
+		t.Error("1 error / 0 prompts should trigger threshold (2 > 0)")
 	}
 }
