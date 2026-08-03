@@ -1045,7 +1045,6 @@ func checkModelsEndpointFn(ctx context.Context, cfg config.Config, opts Options)
 	}
 }
 
-<<<<<<< HEAD
 // --- metrics endpoint (issue #1288) ----------------------------------------
 
 // checkMetricsEndpointFn verifies the Nexus /metrics endpoint is reachable
