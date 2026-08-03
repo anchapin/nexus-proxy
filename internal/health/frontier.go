@@ -82,11 +82,33 @@ type tripCallback func(provider string)
 // All mutable fields are atomic so the hot path (IsHealthy) never
 // contends with the poller goroutine.
 type frontierProviderState struct {
-	name         string
-	baseURL      string
-	apiKey       string
+	cfg atomic.Value // stores providerConfig
+
 	healthy      atomic.Bool
 	failureCount atomic.Int32
+}
+
+// providerConfig holds the immutable fields of frontierProviderState.
+// Stored in an atomic.Value so all reads are race-free.
+type providerConfig struct {
+	name    string
+	baseURL string
+	apiKey  string
+}
+
+// name returns the provider name (race-free).
+func (st *frontierProviderState) name() string {
+	return st.cfg.Load().(providerConfig).name
+}
+
+// baseURL returns the provider base URL (race-free).
+func (st *frontierProviderState) baseURL() string {
+	return st.cfg.Load().(providerConfig).baseURL
+}
+
+// apiKey returns the provider API key (race-free).
+func (st *frontierProviderState) apiKey() string {
+	return st.cfg.Load().(providerConfig).apiKey
 }
 
 // FrontierHealth tracks the live status of all configured frontier API
@@ -145,11 +167,12 @@ func NewFrontierHealth(targets []FrontierProbeTarget, pollInterval time.Duration
 		closed:           make(chan struct{}),
 	}
 	for _, t := range targets {
-		st := &frontierProviderState{
+		st := &frontierProviderState{}
+		st.cfg.Store(providerConfig{
 			name:    t.Name,
 			baseURL: strings.TrimRight(t.BaseURL, "/"),
 			apiKey:  t.APIKey,
-		}
+		})
 		st.healthy.Store(true)
 		fh.states[t.Name] = st
 	}
@@ -202,7 +225,7 @@ func (fh *FrontierHealth) UnhealthyProviders() []string {
 	var out []string
 	for _, st := range fh.states {
 		if !st.healthy.Load() {
-			out = append(out, st.name)
+			out = append(out, st.name())
 		}
 	}
 	return out
@@ -219,7 +242,7 @@ func (fh *FrontierHealth) States() []FrontierBreakerState {
 	out := make([]FrontierBreakerState, 0, len(fh.states))
 	for _, st := range fh.states {
 		out = append(out, FrontierBreakerState{
-			Name:         st.name,
+			Name:         st.name(),
 			Healthy:      st.healthy.Load(),
 			FailureCount: st.failureCount.Load(),
 		})
@@ -288,7 +311,7 @@ func (fh *FrontierHealth) probeAll(ctx context.Context) {
 				result = "failure"
 			}
 			if fh.onProbe != nil {
-				fh.onProbe(st.name, result)
+				fh.onProbe(st.name(), result)
 			}
 		}(st)
 	}
@@ -302,14 +325,14 @@ func (fh *FrontierHealth) probeAll(ctx context.Context) {
 // API key is valid but lacks the models:read scope; the provider is
 // still reachable, which is what the circuit breaker guards against.
 func (fh *FrontierHealth) probeOne(ctx context.Context, st *frontierProviderState) error {
-	url := st.baseURL + "/models"
+	url := st.baseURL() + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		fh.recordFailure(st, err)
 		return err
 	}
-	if st.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+st.apiKey)
+	if st.apiKey() != "" {
+		req.Header.Set("Authorization", "Bearer "+st.apiKey())
 	}
 	resp, err := fh.client.Do(req)
 	if err != nil {
@@ -339,7 +362,7 @@ func (fh *FrontierHealth) recordFailure(st *frontierProviderState, probeErr erro
 	if count >= fh.breakerThreshold {
 		if wasHealthy {
 			args := []any{
-				slog.String("provider", st.name),
+				slog.String("provider", st.name()),
 				slog.Int("failures", int(count)),
 				slog.Int("threshold", int(fh.breakerThreshold)),
 			}
@@ -349,14 +372,14 @@ func (fh *FrontierHealth) recordFailure(st *frontierProviderState, probeErr erro
 			slog.Warn("frontier health: circuit opened", args...)
 			st.healthy.Store(false)
 			if fh.onTrip != nil {
-				fh.onTrip(st.name)
+				fh.onTrip(st.name())
 			}
 		}
 		return
 	}
 	if wasHealthy {
 		args := []any{
-			slog.String("provider", st.name),
+			slog.String("provider", st.name()),
 			slog.Int("failures", int(count)),
 			slog.Int("threshold", int(fh.breakerThreshold)),
 		}
@@ -376,7 +399,7 @@ func (fh *FrontierHealth) recordSuccess(st *frontierProviderState) {
 	defer fh.mu.Unlock()
 	if !st.healthy.Swap(true) {
 		slog.Info("frontier health: circuit closed (recovered)",
-			slog.String("provider", st.name),
+			slog.String("provider", st.name()),
 		)
 	}
 	st.failureCount.Store(0)
