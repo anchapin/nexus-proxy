@@ -25,6 +25,7 @@ func runInitInDir(t *testing.T, args []string, stdin string, client *http.Client
 
 // TestInitDispatchRoutes verifies dispatch wires "init" to runInit.
 func TestInitDispatchRoutes(t *testing.T) {
+	t.Setenv("NEXUS_INIT_VERIFY_MODELS", "false")
 	var stdout, stderr bytes.Buffer
 	// --non-interactive with no Ollama running still exits 0 (writes config).
 	dir := t.TempDir()
@@ -43,6 +44,7 @@ func TestInitDispatchRoutes(t *testing.T) {
 func TestInitNonInteractiveWritesEnv(t *testing.T) {
 	t.Setenv("NEXUS_INIT_PROFILE", "local-first")
 	t.Setenv("NEXUS_FRONTIER_API_KEY", "sk-test-123")
+	t.Setenv("NEXUS_INIT_VERIFY_MODELS", "false")
 
 	code, stdout, stderr := runInitInDir(t, []string{"--non-interactive"}, "", nil)
 	if code != 0 {
@@ -78,6 +80,7 @@ func TestInitNonInteractiveWritesEnv(t *testing.T) {
 func TestInitNonInteractiveWritesYAML(t *testing.T) {
 	t.Setenv("NEXUS_CONFIG_FILE", "config.yaml")
 	t.Setenv("NEXUS_INIT_PROFILE", "frontier-default")
+	t.Setenv("NEXUS_INIT_VERIFY_MODELS", "false")
 
 	code, stdout, stderr := runInitInDir(t, []string{"--non-interactive"}, "", nil)
 	if code != 0 {
@@ -111,6 +114,7 @@ func TestInitNonInteractiveWritesYAML(t *testing.T) {
 // TestInitNonInteractiveOutputFlag verifies --output overrides the
 // destination path.
 func TestInitNonInteractiveOutputFlag(t *testing.T) {
+	t.Setenv("NEXUS_INIT_VERIFY_MODELS", "false")
 	custom := filepath.Join(t.TempDir(), "custom.env")
 	code, _, stderr := runInitInDir(t, []string{"--non-interactive", "--output", custom}, "", nil)
 	if code != 0 {
@@ -126,6 +130,7 @@ func TestInitNonInteractiveOutputFlag(t *testing.T) {
 // produce output). Uses a live httptest server that returns 500 to
 // simulate a broken Ollama.
 func TestInitMissingOllama(t *testing.T) {
+	t.Setenv("NEXUS_INIT_VERIFY_MODELS", "false")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -148,6 +153,7 @@ func TestInitMissingOllama(t *testing.T) {
 // TestInitMissingOllamaConnectionError verifies the connection-refused
 // path (no server at all) reports [FAIL] and still writes config.
 func TestInitMissingOllamaConnectionError(t *testing.T) {
+	t.Setenv("NEXUS_INIT_VERIFY_MODELS", "false")
 	// Point at a port that is guaranteed to refuse connections.
 	t.Setenv("NEXUS_OLLAMA_URL", "http://127.0.0.1:1")
 	code, stdout, stderr := runInitInDir(t, []string{"--non-interactive"}, "", &http.Client{})
@@ -194,6 +200,7 @@ func TestInitOllamaReachableAndMissingModels(t *testing.T) {
 // TestInitFrontierKeyAccepted verifies the wizard probes the frontier
 // key and reports [PASS] on a 200 response.
 func TestInitFrontierKeyAccepted(t *testing.T) {
+	t.Setenv("NEXUS_INIT_VERIFY_MODELS", "false")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/tags" {
 			w.Write([]byte(`{"models":[]}`))
@@ -223,6 +230,7 @@ func TestInitFrontierKeyAccepted(t *testing.T) {
 // TestInitFrontierKeyRejected verifies the wizard reports [FAIL] when
 // the endpoint returns 401.
 func TestInitFrontierKeyRejected(t *testing.T) {
+	t.Setenv("NEXUS_INIT_VERIFY_MODELS", "false")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/tags" {
 			w.Write([]byte(`{"models":[]}`))
@@ -247,6 +255,7 @@ func TestInitFrontierKeyRejected(t *testing.T) {
 // TestInitNoFrontierKeySkipsProbe verifies that when no key is set,
 // the wizard skips the frontier probe rather than failing.
 func TestInitNoFrontierKeySkipsProbe(t *testing.T) {
+	t.Setenv("NEXUS_INIT_VERIFY_MODELS", "false")
 	t.Setenv("NEXUS_FRONTIER_API_KEY", "")
 	code, stdout, stderr := runInitInDir(t, []string{"--non-interactive"}, "", nil)
 	if code != 0 {
@@ -289,6 +298,7 @@ func TestInitInteractiveWritesConfig(t *testing.T) {
 // non-interactive mode still writes config (the profile is just a
 // knob preset; an unknown value yields no extra knobs).
 func TestInitProfileValidation(t *testing.T) {
+	t.Setenv("NEXUS_INIT_VERIFY_MODELS", "false")
 	t.Setenv("NEXUS_INIT_PROFILE", "bogus")
 	code, _, stderr := runInitInDir(t, []string{"--non-interactive"}, "", nil)
 	if code != 0 {
@@ -344,6 +354,95 @@ func TestFrontierModelsURL(t *testing.T) {
 		if got := frontierModelsURL(c.in); got != c.want {
 			t.Errorf("frontierModelsURL(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// TestInitVerifyModelsExits0WhenAllAvailable verifies that when all
+// default models are present, the non-interactive path exits 0 after
+// the verification pass.
+func TestInitVerifyModelsExits0WhenAllAvailable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/tags" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// All three default models present.
+		w.Write([]byte(`{"models":[{"name":"qwen3-coder:4b"},{"name":"qwen3-coder:8b"},{"name":"nomic-embed-text"}]}`))
+	}))
+	defer srv.Close()
+	t.Setenv("NEXUS_OLLAMA_URL", srv.URL)
+	t.Setenv("NEXUS_INIT_VERIFY_MODELS", "true")
+
+	code, stdout, stderr := runInitInDir(t, []string{"--non-interactive"}, "", srv.Client())
+	if code != 0 {
+		t.Fatalf("expected exit 0 when all models available, got %d: stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "✓ wrote") {
+		t.Errorf("expected config write confirmation, got: %s", stdout)
+	}
+}
+
+// TestInitVerifyModelsExits1WhenMissing verifies that when
+// NEXUS_INIT_VERIFY_MODELS=true and at least one model is absent,
+// the non-interactive path prints [FAIL] per missing model and exits 1.
+func TestInitVerifyModelsExits1WhenMissing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/tags" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// Only qwen3-coder:8b is present — nomic-embed-text is missing.
+		// qwen3-coder:4b false-positives as present due to modelPresent's
+		// tag-stripping: "qwen3-coder" from qwen3-coder:8b matches
+		// qwen3-coder:4b's stripped form. So only nomic-embed-text fails.
+		w.Write([]byte(`{"models":[{"name":"qwen3-coder:8b"}]}`))
+	}))
+	defer srv.Close()
+	t.Setenv("NEXUS_OLLAMA_URL", srv.URL)
+	t.Setenv("NEXUS_INIT_VERIFY_MODELS", "true")
+
+	code, stdout, stderr := runInitInDir(t, []string{"--non-interactive"}, "", srv.Client())
+	if code != 1 {
+		t.Fatalf("expected exit 1 when models missing, got %d: stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "[FAIL] model nomic-embed-text still unavailable after pull") {
+		t.Errorf("expected [FAIL] for missing model nomic-embed-text, got: %s", stdout)
+	}
+}
+
+// TestInitVerifyModelsSkippedWhenDisabled verifies that when
+// NEXUS_INIT_VERIFY_MODELS=false, the verification pass is skipped
+// and the process exits 0 even when models are absent.
+func TestInitVerifyModelsSkippedWhenDisabled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/tags" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// Empty model list — would fail verification if run.
+		w.Write([]byte(`{"models":[]}`))
+	}))
+	defer srv.Close()
+	t.Setenv("NEXUS_OLLAMA_URL", srv.URL)
+	t.Setenv("NEXUS_INIT_VERIFY_MODELS", "false")
+
+	code, stdout, stderr := runInitInDir(t, []string{"--non-interactive"}, "", srv.Client())
+	if code != 0 {
+		t.Fatalf("expected exit 0 when verification disabled, got %d: stderr=%s", code, stderr)
+	}
+	// Must NOT contain [FAIL] from the verification pass (only from the initial probe).
+	lines := strings.Split(stdout, "\n")
+	var verifyFailLines []string
+	for _, l := range lines {
+		if strings.Contains(l, "[FAIL] model") && strings.Contains(l, "still unavailable after pull") {
+			verifyFailLines = append(verifyFailLines, l)
+		}
+	}
+	if len(verifyFailLines) > 0 {
+		t.Errorf("verification should be skipped; got unexpected [FAIL] lines: %v", verifyFailLines)
 	}
 }
 
