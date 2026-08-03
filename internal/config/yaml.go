@@ -127,7 +127,7 @@ type YAMLConfig struct {
 	RAGExcludePatterns       string  `yaml:"rag_exclude_patterns"`
 	RAGDedupThreshold        float64 `yaml:"rag_dedup_threshold"`
 	RAGDedupCrossDir         bool    `yaml:"rag_dedup_cross_dir"`
-	RAGHybridWeight           float64 `yaml:"rag_hybrid_weight"`
+	RAGHybridWeight          float64 `yaml:"rag_hybrid_weight"`
 	DiagRAGMinFiles          int     `yaml:"diag_rag_min_files"` // issue #1290
 
 	// Routing
@@ -1876,7 +1876,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		RAGExcludePatterns:            ragpkg.ParseCommaSeparated(yc.RAGExcludePatterns),
 		RAGDedupThreshold:             yc.floatDefault(yc.RAGDedupThreshold, 0),
 		RAGDedupCrossDir:              yc.boolFieldDefault(yc.RAGDedupCrossDir, false),
-		DiagRAGMinFiles:              yc.intDefault(yc.DiagRAGMinFiles, 3), // issue #1290
+		DiagRAGMinFiles:               yc.intDefault(yc.DiagRAGMinFiles, 3), // issue #1290
 		TokenGuardrail:                yc.intDefault(yc.TokenGuardrail, 6000),
 		SLMTimeout:                    yc.durationDefault(yc.SLMTimeout, 8*time.Second),
 		SLMCacheMaxEntries:            yc.intDefault(yc.SLMCacheMaxEntries, 512),
