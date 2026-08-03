@@ -939,7 +939,21 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		)
 	}
 
-	mux.Handle("/metrics", routeCounters.Handler())
+	// Combined metrics handler: route counters + auth metrics (issue #1305) + ratelimit metrics (issue #1305).
+	// routeCounters.Handler() writes routing, collector, and gauge metrics.
+	// We append auth and ratelimit metrics after.
+	baseMetricsHandler := routeCounters.Handler()
+	mux.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		baseMetricsHandler.ServeHTTP(w, r)
+		// Write auth metrics (issue #1305).
+		if parts.authMiddleware != nil {
+			parts.authMiddleware.WritePrometheusMetrics(w)
+		}
+		// Write ratelimit metrics (issue #1305).
+		if rateLimiter != nil {
+			rateLimiter.WritePrometheusMetrics(w)
+		}
+	}))
 	slog.Info("metrics endpoint serves prometheus text format",
 		slog.String("path", "/metrics"),
 	)
