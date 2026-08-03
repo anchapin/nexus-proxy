@@ -1510,7 +1510,7 @@ func clientCNMiddleware(next http.Handler) http.Handler {
 // on the first WriteHeader call.
 type clientCNHeaderWriter struct {
 	http.ResponseWriter
-	clientCN string
+	clientCN  string
 	headerSet bool
 }
 
