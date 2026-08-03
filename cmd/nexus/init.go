@@ -200,6 +200,11 @@ func envOrDefault(key, def string) string {
 // probes Ollama and the frontier key so the operator gets actionable
 // feedback in the log, but a probe failure does not abort the write
 // (non-interactive mode must produce a config regardless).
+//
+// When NEXUS_INIT_VERIFY_MODELS is true (the default), a final
+// verification pass confirms all expected default models are present
+// after the config is written. If any model is missing the process
+// exits 1 with a [FAIL] line per missing model.
 func (w *initWizard) runNonInteractive(ans initAnswers, output string) int {
 	fmt.Fprintln(w.stdout, "nexus init — non-interactive mode")
 	fmt.Fprintf(w.stdout, "profile: %s\n", ans.Profile)
@@ -224,6 +229,14 @@ func (w *initWizard) runNonInteractive(ans initAnswers, output string) int {
 		return 1
 	}
 	fmt.Fprintf(w.stdout, "\n✓ wrote %s\n", path)
+
+	// Re-verify model availability after writing the config.
+	if envOrDefault("NEXUS_INIT_VERIFY_MODELS", "true") == "true" {
+		if !w.verifyModels(ans.OllamaURL) {
+			return 1
+		}
+	}
+
 	w.printVerifyHint(path)
 	return 0
 }
@@ -376,6 +389,48 @@ func (w *initWizard) probeOllama(url string, interactive bool) bool {
 		}
 	} else {
 		fmt.Fprintln(w.stdout, "  All default models present.")
+	}
+	return true
+}
+
+// verifyModels queries /api/tags and confirms all expected default
+// models are present. Used after writeConfig in non-interactive mode
+// to ensure the operator has actually pulled the required models before
+// the proxy is started. Returns true when all models are present.
+func (w *initWizard) verifyModels(url string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), w.timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(url, "/")+"/api/tags", nil)
+	if err != nil {
+		fmt.Fprintf(w.stdout, "[FAIL] verify: invalid Ollama URL %q: %v\n", url, err)
+		return false
+	}
+	resp, err := w.client.Do(req)
+	if err != nil {
+		fmt.Fprintf(w.stdout, "[FAIL] verify: cannot reach Ollama at %s: %v\n", url, err)
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 500 {
+		fmt.Fprintf(w.stdout, "[FAIL] verify: Ollama returned status %d\n", resp.StatusCode)
+		return false
+	}
+	available, ok := parseTagsBody(resp.Body)
+	if !ok {
+		fmt.Fprintf(w.stdout, "[FAIL] verify: could not parse /api/tags response\n")
+		return false
+	}
+	missing := []string{}
+	for _, m := range defaultModels {
+		if !modelPresent(m, available) {
+			missing = append(missing, m)
+		}
+	}
+	if len(missing) > 0 {
+		for _, m := range missing {
+			fmt.Fprintf(w.stdout, "[FAIL] model %s still unavailable after pull\n", m)
+		}
+		return false
 	}
 	return true
 }
