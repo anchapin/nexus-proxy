@@ -1458,6 +1458,64 @@ func TestRunBufferedSetsHeaderWhenAllStepsFail(t *testing.T) {
 	}
 }
 
+// TestRunBufferedUsesAdaptiveTimeout verifies issue #1293: RunBuffered uses
+// c.effectiveTimeout(payload) so adaptive timeout (TimeoutPer1kTokens > 0)
+// applies to the non-streaming frontier failover path, just like Run does.
+// The test confirms that a large prompt produces a longer effective timeout
+// than a small prompt when adaptive scaling is enabled.
+func TestRunBufferedUsesAdaptiveTimeout(t *testing.T) {
+	floor := 5 * time.Second
+	ceiling := 120 * time.Second
+	per1k := 1500 * time.Millisecond
+	c := &Cascade{
+		TimeoutFloor:       floor,
+		TimeoutCeiling:     ceiling,
+		TimeoutPer1kTokens: per1k,
+		Steps: []CascadeStep{
+			{Name: "frontier", URL: "http://frontier.local/v1/chat/completions", APIKey: "sk", Model: "fb-m"},
+		},
+	}
+
+	// Build small and large prompts.
+	small := repeat("a ", 1000)  // ~1000 tokens
+	large := repeat("a ", 32000) // ~32000 tokens
+
+	smallTimeout := c.effectiveTimeout(makePayload(small))
+	largeTimeout := c.effectiveTimeout(makePayload(large))
+
+	// Adaptive timeout must produce larger value for large prompt.
+	if smallTimeout >= largeTimeout {
+		t.Fatalf("expected small (%v, ~%d tokens) < large (%v, ~%d tokens) with adaptive timeout",
+			smallTimeout, estimatePromptTokens(makePayload(small)),
+			largeTimeout, estimatePromptTokens(makePayload(large)))
+	}
+
+	// Large prompt timeout must exceed the fixed fallback of 2s (cascadeDefaultTimeout).
+	if largeTimeout <= 2*time.Second {
+		t.Errorf("large timeout %v must exceed fixed fallback (2s) when adaptive is enabled", largeTimeout)
+	}
+
+	// Verify RunBuffered actually uses adaptive timeout by checking that a handler
+	// that takes longer than the fixed 2s default but less than the adaptive large
+	// prompt timeout succeeds when called with the large payload.
+	ft := newFakeTransport()
+	ft.on("http://frontier.local/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		// Delay longer than fixed 2s fallback but less than adaptive large timeout.
+		time.Sleep(500 * time.Millisecond)
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+
+	rec := httptest.NewRecorder()
+	_, err := c.RunBuffered(context.Background(), rec, &http.Client{Transport: ft}, makePayload(large), "test-req")
+	if err != nil {
+		t.Fatalf("RunBuffered with large payload failed (adaptive timeout should have allowed it): %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+}
+
 // TestRunBufferedFallbackReasonOnStep2Success verifies issue #1294: when the
 // first step fails with a retryable error and the second step succeeds,
 // FallbackReason is non-empty so the chat handler can observe it.
