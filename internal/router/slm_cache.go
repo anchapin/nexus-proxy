@@ -119,6 +119,13 @@ type SLMCache struct {
 	// the cache mutex is released so it is safe to call into
 	// observability or logging.
 	onEmbedError func()
+
+	// evictionWG tracks background eviction goroutines so Close can
+	// wait for them to finish before returning (issue #1307).
+	evictionWG sync.WaitGroup
+
+	// closed is set to 1 when Close has been called. Atomic access only.
+	closed atomic.Bool
 }
 
 // cachedDecision pairs a routing decision with its insertion time for
@@ -305,9 +312,13 @@ func (c *SLMCache) Get(ctx context.Context, prompt string) (Route, bool, CacheHi
 	}
 	c.mu.RUnlock()
 
-	if c.staleCleanupThreshold > 0 {
+	if c.staleCleanupThreshold > 0 && !c.closed.Load() {
 		if stale := c.StaleEntries(); stale > c.staleCleanupThreshold {
-			go c.EvictExpired()
+			c.evictionWG.Add(1)
+			go func() {
+				defer c.evictionWG.Done()
+				c.EvictExpired()
+			}()
 		}
 	}
 
@@ -367,12 +378,16 @@ func (c *SLMCache) getSemantic(ctx context.Context, prompt string) (Route, bool,
 	// read path. The goroutine is fire-and-forget — eviction observers run
 	// after the lock is released so re-entrancy is safe.
 	// Only check when maxStale > 0, matching the original O(n) scan guard.
-	if c.maxStale > 0 {
+	if c.maxStale > 0 && !c.closed.Load() {
 		c.mu.RLock()
 		stale := int(c.staleCount.Load())
 		c.mu.RUnlock()
 		if stale > c.maxStale {
-			go c.EvictExpired()
+			c.evictionWG.Add(1)
+			go func() {
+				defer c.evictionWG.Done()
+				c.EvictExpired()
+			}()
 		}
 	}
 
@@ -619,6 +634,23 @@ func (c *SLMCache) SetStaleCleanupThreshold(threshold int) {
 	c.mu.Lock()
 	c.staleCleanupThreshold = threshold
 	c.mu.Unlock()
+}
+
+// Close waits for any in-flight background eviction goroutines to
+// finish, then marks the cache as closed. Subsequent calls to Get/Set
+// will return zero values as if there were no cache.
+//
+// Close is safe to call on a nil receiver or an already-closed cache
+// (no-op). It waits up to the given context's deadline for eviction
+// goroutines to finish; if the context expires first, Close returns
+// ctx.Err() without waiting further (issue #1307).
+func (c *SLMCache) Close(ctx context.Context) error {
+	if c == nil || c.closed.Load() {
+		return nil
+	}
+	c.closed.Store(true)
+	c.evictionWG.Wait()
+	return ctx.Err()
 }
 
 // StaleEntries returns the number of entries that have passed their TTL
