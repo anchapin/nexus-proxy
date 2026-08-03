@@ -3043,6 +3043,14 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 	}
 	next.OIDCJWKSRefresh = jwksRefresh
 
+	// RAG circuit breaker threshold: re-read from env so SIGHUP pushes the
+	// updated threshold into the live RAG embedder circuit breaker.
+	cbThreshold, _ := getEnvInt("NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD", prev.RAGCircuitBreakerThreshold)
+	if cbThreshold < 0 {
+		cbThreshold = 0
+	}
+	next.RAGCircuitBreakerThreshold = cbThreshold
+
 	return next, result
 }
 
@@ -3309,8 +3317,9 @@ var hotReloadableEnvs = map[string]bool{
 	"NEXUS_SERVER_READ_TIMEOUT":        true,
 	"NEXUS_BUDGET_ALERT_THRESHOLD":     true,
 	"NEXUS_FUSION_AGREEMENT_THRESHOLD": true,
-	"NEXUS_TRACING_SAMPLE_RATE":        true,
-	"NEXUS_OIDC_JWKS_REFRESH":          true, // issue #1306
+	"NEXUS_TRACING_SAMPLE_RATE":           true,
+	"NEXUS_OIDC_JWKS_REFRESH":           true, // issue #1306
+	"NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD": true,
 }
 
 // IsHotReloadable returns true when the given env var name (e.g. "NEXUS_RATE_LIMIT_RPM")
