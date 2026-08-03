@@ -54,6 +54,14 @@ linters:
           - errcheck
         text: fmt\.F(print|printf|println)
 
+      # otel_metrics.go uses fmt.Sscanf to parse internally-generated map keys.
+      # Malformed keys indicate a programming error in the key formatter, not a
+      # user-facing I/O error, so the parse result is intentionally ignored.
+      - path: internal/observability/otel_metrics.go
+        linters:
+          - errcheck
+        text: fmt\.Sscanf
+
       # resp.Body.Close and rows.Close ignored in non-critical paths
       # (matches v1 behaviour which excluded these via less-granular rules).
       - path: (.+)\.go$

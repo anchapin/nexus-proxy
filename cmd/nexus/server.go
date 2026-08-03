@@ -55,6 +55,7 @@ type serverParts struct {
 	authLimiter         *ratelimit.AuthLimiter
 	authMiddleware      *auth.Middleware // multi-key auth (issue #1154); nil for single-key
 	exporterCloser      func() error
+	otelMetricsCloser   func() error
 	ipResolver          *ratelimit.ClientIPResolver
 }
 
@@ -344,6 +345,35 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 			slog.Info("frontier health poller disabled (NEXUS_FRONTIER_HEALTH_POLL_INTERVAL=0)")
 		}
 	}
+
+	// OtelMetrics (issue #1238). OTLP/JSON metrics exporter.
+	// Placed after circuitCollector is initialized so the collector
+	// can be registered for slow-path metric readout.
+	if cfg.OtelMetricsEndpoint != "" {
+		otelExp := observability.NewOtelMetricsExporter(observability.OtelMetricsConfig{
+			Endpoint:       cfg.OtelMetricsEndpoint,
+			Interval:       cfg.OtelMetricsInterval,
+			Timeout:        cfg.OtelMetricsTimeout,
+			MaxRetries:     cfg.TracerMaxRetries,
+			RetryBaseDelay: cfg.TracerRetryBaseDelay,
+			MaxRetryDelay:  cfg.TracerRetryMaxDelay,
+		})
+		if otelExp != nil {
+			observability.RegisterCollector(circuitCollector)
+			observability.RegisterOtelMetricsExporter(otelExp)
+			parts.otelMetricsCloser = otelExp.Close
+			slog.Info("otel metrics exporter wired",
+				slog.String("endpoint", cfg.OtelMetricsEndpoint),
+				slog.Duration("interval", cfg.OtelMetricsInterval),
+				slog.Duration("timeout", cfg.OtelMetricsTimeout),
+			)
+		}
+	}
+	addCleanup(func() {
+		if parts.otelMetricsCloser != nil {
+			_ = parts.otelMetricsCloser()
+		}
+	})
 
 	stageCollector := observability.NewCollector()
 	if cfg.JudgeEnabled && cfg.JudgeAPIKey != "" {
@@ -733,6 +763,15 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 			}
 			return []observability.GaugeSample{{
 				Name: "nexus_tracing_batch_size", Value: float64(exp.BatchCap()),
+			}}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			exp := observability.GlobalOtelMetricsExporter()
+			if exp == nil {
+				return nil
+			}
+			return []observability.GaugeSample{{
+				Name: "nexus_otel_metrics_export_failures_total", Value: float64(exp.ExportFailures()),
 			}}
 		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {

@@ -765,6 +765,17 @@ type Config struct {
 	// trace exemplars in the Prometheus exposition (issue #1171).
 	MetricsExemplars bool
 
+	// OtelMetrics (issue #1238). OTLP/JSON metrics exporter.
+	// Endpoint is the full OTLP HTTP URL including /v1/metrics path.
+	// Empty disables metrics export entirely (zero overhead).
+	// Interval is the periodic push cadence (default 60s). Timeout
+	// bounds each POST (default 10s). Shares the same retry/back-off
+	// tunables as tracing (NEXUS_TRACING_MAX_RETRIES etc.) for
+	// consistency.
+	OtelMetricsEndpoint string
+	OtelMetricsInterval time.Duration
+	OtelMetricsTimeout  time.Duration
+
 	// Response-content redaction (issue #1172).
 	RedactEnabled     bool
 	RedactProfile     string
@@ -2308,6 +2319,28 @@ func Load() (Config, error) {
 	// is active (TracingEndpoint set) so operators get exemplars
 	// automatically; explicitly false when tracing is off.
 	cfg.MetricsExemplars = getEnvBool("NEXUS_METRICS_EXEMPLARS", cfg.TracingEndpoint != "")
+
+	// OtelMetrics (issue #1238). OTLP/JSON metrics exporter. Empty
+	// endpoint disables export entirely (zero overhead).
+	cfg.OtelMetricsEndpoint = getEnvAllowEmpty("NEXUS_OTEL_METRICS_ENDPOINT", "")
+
+	otelMetricsInterval, err := getEnvDuration("NEXUS_OTEL_METRICS_INTERVAL", 60*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	if otelMetricsInterval <= 0 {
+		otelMetricsInterval = 60 * time.Second
+	}
+	cfg.OtelMetricsInterval = otelMetricsInterval
+
+	otelMetricsTimeout, err := getEnvDuration("NEXUS_OTEL_METRICS_TIMEOUT", 10*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	if otelMetricsTimeout < 0 {
+		return cfg, configError("NEXUS_OTEL_METRICS_TIMEOUT", "must not be negative", os.Getenv("NEXUS_OTEL_METRICS_TIMEOUT"), DefaultTracingTimeout.String())
+	}
+	cfg.OtelMetricsTimeout = otelMetricsTimeout
 
 	// Response-content redaction (issue #1172).
 	cfg.RedactEnabled = getEnvBool("NEXUS_REDACT_ENABLED", false)
