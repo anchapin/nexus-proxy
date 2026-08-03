@@ -146,7 +146,10 @@ type Config struct {
 	Timeout            time.Duration // per-call judge timeout (default 30s)
 	CostPer1K          float64       // USD per 1k tokens (input+output); default 0.002
 	BudgetGuard        *budget.Guard // optional budget guard to record judge costs
-	AdaptiveEnabled    bool          // enable adaptive sampling based on rolling avg of recent scores (issue #1232)
+	AdaptiveEnabled         bool          // enable adaptive sampling based on rolling avg of recent scores (issue #1232)
+	AdaptiveWindow          time.Duration // look-back period for rolling average of recent scores (issue #1301)
+	AdaptiveHighConfidence  float64       // high confidence threshold — decay to min rate when avg > this (issue #1301)
+	AdaptiveLowConfidence   float64       // low confidence threshold — increase to max rate when avg < this (issue #1301)
 }
 
 // applyDefaults fills zero fields with sane values. It mutates cfg.
@@ -163,6 +166,24 @@ func (c *Config) applyDefaults() {
 	if c.CostPer1K <= 0 {
 		c.CostPer1K = 0.002
 	}
+	if c.AdaptiveWindow <= 0 {
+		c.AdaptiveWindow = 30 * time.Second
+	}
+	if c.AdaptiveHighConfidence <= 0 {
+		c.AdaptiveHighConfidence = 4.0
+	}
+	if c.AdaptiveLowConfidence <= 0 {
+		c.AdaptiveLowConfidence = 3.0
+	}
+}
+
+// adaptiveWindow returns w if positive, else a sensible default (30s).
+// Extracted as a func so it is trivially testable.
+func adaptiveWindow(w time.Duration) time.Duration {
+	if w > 0 {
+		return w
+	}
+	return 30 * time.Second
 }
 
 // Evaluator runs judge calls asynchronously with bounded concurrency.
@@ -264,7 +285,7 @@ func NewEvaluator(cfg Config, client HTTPClient, storage Storage) *Evaluator {
 		rng:              newSeededRand(),
 		closed:           make(chan struct{}),
 		adaptiveRate:     cfg.SampleRate, // initial rate; updated by adaptive logic
-		adaptiveCacheTTL: 30 * time.Second,
+		adaptiveCacheTTL: adaptiveWindow(cfg.AdaptiveWindow),
 	}
 	if cfg.SampleRate <= 0 {
 		// Dormant evaluator: do not start workers.
@@ -360,9 +381,9 @@ func (e *Evaluator) effectiveSampleRate() float64 {
 	if len(scores) == 0 {
 		// No scores yet — fall back to configured rate.
 		rate = e.cfg.SampleRate
-	} else if avg > 4.0 {
+	} else if avg > e.cfg.AdaptiveHighConfidence {
 		rate = 0.01 // high quality → reduce sampling
-	} else if avg < 3.0 {
+	} else if avg < e.cfg.AdaptiveLowConfidence {
 		rate = 0.10 // low quality → increase sampling
 	} else {
 		rate = 0.05 // moderate quality → hold at mid
