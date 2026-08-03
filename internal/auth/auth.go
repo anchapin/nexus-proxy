@@ -174,42 +174,6 @@ func (m *Middleware) renewSlot(ip string) {
 	}
 }
 
-// acquireSlot acquires an auth slot for the given IP. If the IP already has
-// a slot with an open channel (previous auth attempt still in progress),
-// the old channel is closed and a new slot is created. This prevents a slow
-// attacker from holding a slot indefinitely and blocking other IPs (issue #1062).
-func (m *Middleware) acquireSlot(ip string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if slot, ok := m.slots[ip]; ok {
-		select {
-		case <-slot.ch:
-			delete(m.slots, ip)
-		default:
-			close(slot.ch)
-			m.slots[ip] = &clientSlot{ch: make(chan struct{}), lastSeen: time.Now()}
-		}
-	} else {
-		m.slots[ip] = &clientSlot{ch: make(chan struct{}), lastSeen: time.Now()}
-	}
-}
-
-// renewSlot closes the current auth slot for the given IP and creates a new one.
-// Called when auth completes (success or failure) so subsequent requests
-// from the same IP can proceed.
-func (m *Middleware) renewSlot(ip string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if slot, ok := m.slots[ip]; ok {
-		select {
-		case <-slot.ch:
-		default:
-			close(slot.ch)
-		}
-		m.slots[ip] = &clientSlot{ch: make(chan struct{}), lastSeen: time.Now()}
-	}
-}
-
 // Wrap returns an http.Handler that enforces the bearer-token gate.
 // When auth is disabled (empty key) the handler is returned as-is.
 func (m *Middleware) Wrap(next http.Handler) http.Handler {
