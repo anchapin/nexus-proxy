@@ -38,23 +38,11 @@ func TestGuardrail(t *testing.T) {
 }
 
 func TestDSL(t *testing.T) {
-	// Fusion patterns (architecture keywords — issue #305)
-	fusionPatterns := []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\b(architectural design|system architecture)\b`),
-	}
-	// Formatting patterns (simple, non-logic tasks)
-	formattingPatterns := []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\b(css|format|docstring|lint|typo|boilerplate|regex|api endpoint)\b`),
-	}
-	// Local patterns (common coding tasks — issue #230 additions merged with prior #202 entries)
-	localPatterns := []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\b(refactor|security scan|generate tests|explain this code|performance analysis|debug|fix bug|git commit|sql query|parse json|validate input|test|optimize|readme)\b`),
-	}
-	// Unicode patterns (issue #422)
-	unicodePatterns := []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\p{Han}`),    // Chinese characters
-		regexp.MustCompile(`(?i)\p{Arabic}`), // Arabic characters
-	}
+	// Use exported default patterns so tests stay in sync with dsl.go defaults.
+	fusionPatterns := DefaultFusionPatterns
+	formattingPatterns := DefaultFormattingPatterns
+	localPatterns := DefaultLocalPatterns
+	unicodePatterns := DefaultUnicodePatterns
 	cases := []struct {
 		name    string
 		prompt  string
