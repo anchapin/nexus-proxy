@@ -2009,6 +2009,12 @@ func (yc YAMLConfig) validate() error {
 	if yc.FusionAgreementThreshold < 0 || yc.FusionAgreementThreshold > 1 {
 		return configError("fusion_agreement_threshold", "must be in [0,1]", strconv.FormatFloat(yc.FusionAgreementThreshold, 'f', -1, 64), "0.85")
 	}
+	switch yc.FusionSimilarityMode {
+	case "jaccard", "semantic", "":
+		// valid or empty (will be defaulted)
+	default:
+		return configError("fusion_similarity_mode", "must be \"jaccard\" or \"semantic\"", yc.FusionSimilarityMode, "jaccard")
+	}
 	if yc.ProviderTailWeight < 0 || yc.ProviderTailWeight > 1 {
 		return configError("provider_tail_weight", "must be in [0,1]", strconv.FormatFloat(yc.ProviderTailWeight, 'f', -1, 64), "0")
 	}

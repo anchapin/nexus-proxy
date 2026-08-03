@@ -455,6 +455,13 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	writeCounter(w, "nexus_fusion_client_abort_total",
 		"Total client aborts during fusion speculative streaming and arbiter synthesis streaming (issue #1046).", upstream.FusionClientAbortTotal())
 
+	// Fusion similarity mode gauge (issue #1244). Exposes the current
+	// similarity mode and the count of invocations per algorithm.
+	writeCounter(w, "nexus_fusion_jaccard_similarity_total",
+		"Total number of fusion agreement checks using Jaccard similarity (issue #1244).", upstream.JaccardSimilarityTotal())
+	writeCounter(w, "nexus_fusion_semantic_similarity_total",
+		"Total number of fusion agreement checks using semantic (cosine) similarity (issue #1244).", upstream.SemanticSimilarityTotal())
+
 	// Coalesce counters (issue #1155). Hits are requests deduplicated via
 	// singleflight or served from the TTL cache; misses are requests that
 	// actually executed the upstream call.
