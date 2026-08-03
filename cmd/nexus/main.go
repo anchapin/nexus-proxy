@@ -262,6 +262,12 @@ func (b *confidenceBridge) Record(s judge.JudgeScore) error {
 // bridge).
 func (b *confidenceBridge) Close() error { return b.inner.Close() }
 
+// RecentScores delegates to the inner judge storage so the adaptive sampling
+// path (issue #1232) can query scores directly from the SQLite store.
+func (b *confidenceBridge) RecentScores(limit int) ([]int, error) {
+	return b.inner.RecentScores(limit)
+}
+
 // buildRAGStore constructs the RAG store (issue #46). Returns:
 //   - store: the RAGStore the chat handler is wired to (PersistentStore
 //     or in-memory Store, both satisfy the interface);

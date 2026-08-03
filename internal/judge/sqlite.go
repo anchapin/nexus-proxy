@@ -330,6 +330,42 @@ func (s *SQLiteStore) insertRow(ctx context.Context, stmt *sql.Stmt, score Judge
 	return err
 }
 
+// RecentScores implements judge.Storage. It queries the most recent `limit`
+// rows with a non-zero score (i.e., successful evaluations) ordered by
+// timestamp DESC (newest first). Returns a nil slice (not empty) when no
+// records exist.
+func (s *SQLiteStore) RecentScores(limit int) ([]int, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	// Query is direct (no channel) so we can return immediately in tests
+	// and for the adaptive sampling path which runs synchronously.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	query := `
+		SELECT score FROM judge_scores
+		WHERE score > 0
+		ORDER BY timestamp DESC
+		LIMIT ?`
+	rows, err := s.db.QueryContext(ctx, query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("judge recent scores: %w", err)
+	}
+	defer rows.Close()
+	var out []int
+	for rows.Next() {
+		var score int
+		if err := rows.Scan(&score); err != nil {
+			return nil, fmt.Errorf("judge recent scores scan: %w", err)
+		}
+		out = append(out, score)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("judge recent scores rows: %w", err)
+	}
+	return out, nil
+}
+
 // Close drains in-flight writes and closes the database. Safe to call
 // exactly once; subsequent calls are no-ops.
 func (s *SQLiteStore) Close() error {

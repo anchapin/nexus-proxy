@@ -118,6 +118,11 @@ type JudgeScore struct {
 // MemoryStorage satisfies the interface so the wiring is complete.
 type Storage interface {
 	Record(score JudgeScore) error
+	// RecentScores returns the scores of the most recent `limit` JudgeScore
+	// records, in descending chronological order (newest first). Only records
+	// with a non-zero Score (i.e., successful parse) are included.
+	// Used by adaptive sampling (issue #1232) to compute rolling quality average.
+	RecentScores(limit int) ([]int, error)
 	Close() error
 }
 
@@ -141,6 +146,7 @@ type Config struct {
 	Timeout            time.Duration // per-call judge timeout (default 30s)
 	CostPer1K          float64       // USD per 1k tokens (input+output); default 0.002
 	BudgetGuard        *budget.Guard // optional budget guard to record judge costs
+	AdaptiveEnabled    bool          // enable adaptive sampling based on rolling avg of recent scores (issue #1232)
 }
 
 // applyDefaults fills zero fields with sane values. It mutates cfg.
@@ -198,6 +204,20 @@ type Evaluator struct {
 	// JudgeScore; it is invoked synchronously on the worker goroutine,
 	// so keep it cheap (e.g. a handful of atomic increments).
 	onScore func(JudgeScore)
+
+	// adaptiveSampleRate is the current effective sample rate when
+	// adaptive sampling is enabled (issue #1232). It is recomputed
+	// periodically from the rolling average of recent scores.
+	adaptiveMu       sync.Mutex
+	adaptiveRate     float64
+	adaptiveCachedAt time.Time
+	adaptiveCacheTTL time.Duration // how long to cache the adaptive rate
+
+	// onAdaptiveSample is an optional callback invoked whenever the
+	// adaptive sample rate is recomputed. Callers use it to expose
+	// the current rate as a Prometheus gauge
+	// (nexus_judge_adaptive_samples_total, issue #1232).
+	onAdaptiveSample func(float64)
 }
 
 // newSeededRand returns a *rand.Rand seeded from a cryptographic
@@ -237,12 +257,14 @@ func NewEvaluator(cfg Config, client HTTPClient, storage Storage) *Evaluator {
 		storage = noopStorage{}
 	}
 	e := &Evaluator{
-		cfg:     cfg,
-		client:  client,
-		storage: storage,
-		queue:   make(chan Sample, cfg.QueueDepth),
-		rng:     newSeededRand(),
-		closed:  make(chan struct{}),
+		cfg:              cfg,
+		client:           client,
+		storage:          storage,
+		queue:            make(chan Sample, cfg.QueueDepth),
+		rng:              newSeededRand(),
+		closed:           make(chan struct{}),
+		adaptiveRate:     cfg.SampleRate, // initial rate; updated by adaptive logic
+		adaptiveCacheTTL: 30 * time.Second,
 	}
 	if cfg.SampleRate <= 0 {
 		// Dormant evaluator: do not start workers.
@@ -294,7 +316,10 @@ func (e *Evaluator) SetScoreCallback(fn func(JudgeScore)) {
 }
 
 // Sample returns true if a fresh request should be enqueued for judge
-// evaluation, given the configured sample rate. It is the canonical
+// evaluation, given the configured sample rate. When adaptive sampling is
+// enabled (issue #1232), the rate is dynamically adjusted based on the
+// rolling average of recent judge scores: decay to 1% if avg > 4.0,
+// increase to 10% if avg < 3.0, else hold at 5%. It is the canonical
 // "Sample" entry point listed in the issue's acceptance criteria.
 //
 // Sample is safe to call from many goroutines concurrently.
@@ -302,10 +327,72 @@ func (e *Evaluator) Sample() bool {
 	if !e.Enabled() {
 		return false
 	}
+	rate := e.cfg.SampleRate
+	if e.cfg.AdaptiveEnabled {
+		rate = e.effectiveSampleRate()
+	}
 	e.rngMu.Lock()
 	r := e.rng.Float64()
 	e.rngMu.Unlock()
-	return r < e.cfg.SampleRate
+	return r < rate
+}
+
+// effectiveSampleRate returns the current adaptive sample rate, recomputing
+// it from storage if the cache has expired. Thread-safe via adaptiveMu.
+func (e *Evaluator) effectiveSampleRate() float64 {
+	e.adaptiveMu.Lock()
+	defer e.adaptiveMu.Unlock()
+	now := time.Now()
+	if now.Sub(e.adaptiveCachedAt) < e.adaptiveCacheTTL {
+		return e.adaptiveRate
+	}
+	// Cache miss — recompute from storage.
+	scores, err := e.storage.RecentScores(100)
+	var avg float64
+	if err == nil && len(scores) > 0 {
+		sum := 0
+		for _, s := range scores {
+			sum += s
+		}
+		avg = float64(sum) / float64(len(scores))
+	}
+	var rate float64
+	if len(scores) == 0 {
+		// No scores yet — fall back to configured rate.
+		rate = e.cfg.SampleRate
+	} else if avg > 4.0 {
+		rate = 0.01 // high quality → reduce sampling
+	} else if avg < 3.0 {
+		rate = 0.10 // low quality → increase sampling
+	} else {
+		rate = 0.05 // moderate quality → hold at mid
+	}
+	e.adaptiveRate = rate
+	e.adaptiveCachedAt = now
+	if e.onAdaptiveSample != nil {
+		e.onAdaptiveSample(rate)
+	}
+	return rate
+}
+
+// AdaptiveRate returns the current effective adaptive sample rate.
+// Returns cfg.SampleRate when adaptive sampling is disabled.
+func (e *Evaluator) AdaptiveRate() float64 {
+	if !e.cfg.AdaptiveEnabled {
+		return e.cfg.SampleRate
+	}
+	e.adaptiveMu.Lock()
+	rate := e.adaptiveRate
+	e.adaptiveMu.Unlock()
+	return rate
+}
+
+// SetAdaptiveSampleCallback registers an optional callback invoked
+// whenever the adaptive sample rate is recomputed. Callers use it to
+// expose the current rate as a Prometheus gauge
+// (nexus_judge_adaptive_samples_total, issue #1232). Pass nil to clear.
+func (e *Evaluator) SetAdaptiveSampleCallback(fn func(float64)) {
+	e.onAdaptiveSample = fn
 }
 
 // SampleFrontier returns true if a frontier-route completion should be
@@ -655,8 +742,9 @@ func extractContent(body []byte) (string, error) {
 // operator has not wired telemetry yet.
 type noopStorage struct{}
 
-func (noopStorage) Record(JudgeScore) error { return nil }
-func (noopStorage) Close() error            { return nil }
+func (noopStorage) Record(JudgeScore) error         { return nil }
+func (noopStorage) RecentScores(int) ([]int, error) { return nil, nil }
+func (noopStorage) Close() error                    { return nil }
 
 // cleanEveryN is the interval (in inserts) between stale-entry cleanup
 // passes. Every cleanEveryN inserts, entries older than 2*window are deleted
@@ -736,3 +824,30 @@ func (m *MemoryStorage) ScoresSince(t time.Time) []JudgeScore {
 // Close is a no-op for the in-memory store; included to satisfy the
 // Storage interface.
 func (m *MemoryStorage) Close() error { return nil }
+
+// RecentScores implements Storage. Returns the most recent `limit` successful
+// scores in descending chronological order (newest first).
+func (m *MemoryStorage) RecentScores(limit int) ([]int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit <= 0 {
+		return nil, nil
+	}
+	// Collect all non-zero scores. Scores are appended in chronological order
+	// (oldest first), so the newest entries are at the end of the slice.
+	var valid []JudgeScore
+	for _, s := range m.scores {
+		if s.Score > 0 {
+			valid = append(valid, s)
+		}
+	}
+	if len(valid) == 0 {
+		return nil, nil
+	}
+	// Iterate backwards from the newest entries, collecting up to `limit` scores.
+	out := make([]int, 0, limit)
+	for i := len(valid) - 1; i >= 0 && len(out) < limit; i-- {
+		out = append(out, valid[i].Score)
+	}
+	return out, nil
+}

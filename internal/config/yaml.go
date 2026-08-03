@@ -206,6 +206,7 @@ type YAMLConfig struct {
 	JudgeTimeout            string  `yaml:"judge_timeout"`
 	JudgeCostPer1KUSD       float64 `yaml:"judge_cost_per_1k"`
 	JudgeDBPath             string  `yaml:"judge_db_path"`
+	JudgeAdaptiveEnabled    bool    `yaml:"judge_adaptive_enabled"` // issue #1232
 
 	// Routing confidence
 	RoutingConfidenceDB         string  `yaml:"routing_confidence_db"`
@@ -1817,6 +1818,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		JudgeTimeout:            yc.durationDefault(yc.JudgeTimeout, 30*time.Second),
 		JudgeCostPer1KUSD:       yc.floatDefault(yc.JudgeCostPer1KUSD, 0.002),
 		JudgeDBPath:             yc.stringDefault(yc.JudgeDBPath, DefaultJudgeDBPath()),
+		JudgeAdaptiveEnabled:    yc.JudgeAdaptiveEnabled, // issue #1232
 
 		RoutingConfidenceDB:         yc.stringDefault(yc.RoutingConfidenceDB, DefaultRoutingConfidenceDBPath()),
 		RoutingConfidenceFloor:      clampFloat(yc.floatDefault(yc.RoutingConfidenceFloor, 0.4), 0, 1),

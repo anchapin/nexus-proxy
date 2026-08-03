@@ -788,6 +788,19 @@ func (s *stubJudgeStorage) Record(score judge.JudgeScore) error {
 
 func (s *stubJudgeStorage) Close() error { return nil }
 
+func (s *stubJudgeStorage) RecentScores(limit int) ([]int, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	out := make([]int, 0, limit)
+	for i := len(s.calls) - 1; i >= 0 && len(out) < limit; i-- {
+		if s.calls[i].Score > 0 {
+			out = append(out, s.calls[i].Score)
+		}
+	}
+	return out, nil
+}
+
 // stubConfidenceStore is a minimal router.ConfidenceStore implementation
 // for testing confidenceBridge.
 type stubConfidenceStore struct {

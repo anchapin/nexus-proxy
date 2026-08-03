@@ -499,6 +499,7 @@ type Config struct {
 	JudgeTimeout            time.Duration // per-call judge timeout (default 30s)
 	JudgeCostPer1KUSD       float64       // rough USD/1k-token rate for cost estimates
 	JudgeDBPath             string        // on-disk SQLite database for judge scores; empty disables Detected
+	JudgeAdaptiveEnabled    bool          // enable adaptive sampling based on rolling avg of recent scores (issue #1232)
 	// edits enqueue a background `cargo check` / `npx tsc` and the
 	// verdict (1 = clean, 0 = fail/timeout) is reported via a
 	// callback to cmd/nexus/main.go. QualityEnabled is true iff
@@ -2017,6 +2018,12 @@ func Load() (Config, error) {
 	// Empty (the default) uses the in-memory MemoryStorage.
 	cfg.JudgeDBPath = getEnvAllowEmpty("NEXUS_JUDGE_DB", DefaultJudgeDBPath())
 
+	// Judge adaptive sampling (issue #1232). When enabled, the sample
+	// rate is dynamically adjusted based on the rolling average of
+	// recent judge scores: decay to 1% if avg > 4.0, increase to 10%
+	// if avg < 3.0, else hold at 5%.
+	cfg.JudgeAdaptiveEnabled = getEnvBool("NEXUS_JUDGE_ADAPTIVE_ENABLED", false)
+
 	// The judge is "enabled" iff the operator actually configured
 	// sampling above zero. Zero/negative rate keeps the worker pool
 	// dormant even if the env vars are partially populated (a common
@@ -3483,6 +3490,7 @@ var EnvToYAMLKey = map[string]string{
 	"NEXUS_JUDGE_TIMEOUT":                     "judge_timeout",
 	"NEXUS_JUDGE_COST_PER_1K":                 "judge_cost_per_1k",
 	"NEXUS_JUDGE_DB":                          "judge_db",
+	"NEXUS_JUDGE_ADAPTIVE_ENABLED":            "judge_adaptive_enabled",
 	"NEXUS_QUALITY_CONCURRENCY":               "quality_concurrency",
 	"NEXUS_QUALITY_QUEUE":                     "quality_queue",
 	"NEXUS_QUALITY_TIMEOUT":                   "quality_timeout",
@@ -3614,6 +3622,7 @@ var allEnvFields = []envField{
 	{"NEXUS_JUDGE_SAMPLE_RATE", func(c *Config) string { return fmt.Sprintf("%g", c.JudgeSampleRate) }},
 	{"NEXUS_JUDGE_TIMEOUT", func(c *Config) string { return c.JudgeTimeout.String() }},
 	{"NEXUS_JUDGE_URL", func(c *Config) string { return c.JudgeURL }},
+	{"NEXUS_JUDGE_ADAPTIVE_ENABLED", func(c *Config) string { return fmt.Sprintf("%t", c.JudgeAdaptiveEnabled) }},
 	{"NEXUS_LOCAL_COOLDOWN", func(c *Config) string { return c.LocalCooldown.String() }},
 	{"NEXUS_LOCAL_MAX_CONCURRENT", func(c *Config) string { return fmt.Sprintf("%d", c.LocalMaxConcurrent) }},
 	{"NEXUS_LOCAL_MODEL", func(c *Config) string { return c.LocalModel }},
