@@ -641,6 +641,8 @@ func Panel(
 	requestID string,
 	arbiterCache *ArbiterCache,
 	arbiterCacheTTL time.Duration,
+	embedder Embedder,
+	similarityMode string,
 	isFusion bool,
 ) (outcome PanelOutcome, cacheHit bool, _ error) {
 	results := make(chan PanelResult, 2)
@@ -738,7 +740,7 @@ func Panel(
 			cacheHit = true
 			outcome.ArbiterCacheHit = true
 			outcome.ArbiterSkipped = true
-			outcome.Similarity = SimilarityRatio(r1.Content, r2.Content)
+			outcome.Similarity = computeSimilarity(r1.Content, r2.Content, embedder, similarityMode)
 			outcome.SkipReason = "cache_hit"
 			if isFusion {
 				w.Header().Set("X-Nexus-Fusion-Progressive", "true")
@@ -951,6 +953,8 @@ func PanelStreaming(
 	requestID string,
 	arbiterCache *ArbiterCache,
 	arbiterCacheTTL time.Duration,
+	embedder Embedder,
+	similarityMode string,
 ) (PanelOutcome, error) {
 	var outcome PanelOutcome
 
@@ -965,6 +969,7 @@ func PanelStreaming(
 			arbiterURL, arbiterKey, arbiterModel,
 			body, latestPrompt, localFetchTimeout, frontierFetchTimeout, arbiterTimeout,
 			skipLocal, requestID, arbiterCache, arbiterCacheTTL,
+			embedder, similarityMode,
 			true) // isFusion: set X-Nexus-Fusion-Progressive header (issue #984)
 		if err != nil {
 			return outcome, err
@@ -1148,7 +1153,7 @@ func PanelStreaming(
 	}
 
 	// Both members succeeded: compare and decide on the arbiter.
-	outcome.Similarity = SimilarityRatio(first.Content, second.Content)
+	outcome.Similarity = computeSimilarity(first.Content, second.Content, embedder, similarityMode)
 	if outcome.Similarity >= agreementThreshold {
 		outcome.ArbiterSkipped = true
 		outcome.SkipReason = "agreement"

@@ -1022,6 +1022,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		Config:                  cfg,
 		Client:                  httpClient,
 		RAG:                     store,
+		Embedder:                ragEmbed,
 		SLM:                     slm,
 		MiddlewareChain:         mwChain,
 		ContextAwareRAG:         ctxAwareRAG,

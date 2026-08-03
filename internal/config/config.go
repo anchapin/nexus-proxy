@@ -324,6 +324,12 @@ type Config struct {
 	// entirely (negative) or always skip it (>1).
 	FusionProgressiveDelivery bool    // true iff NEXUS_FUSION_PROGRESSIVE is unset or "true" (default true)
 	FusionAgreementThreshold  float64 // Jaccard ratio [0,1] above which arbiter is skipped (default 0.85)
+	// FusionSimilarityMode selects the algorithm used to compute panel-member
+	// agreement in fusion (issue #1244). "jaccard" (default) uses lexical
+	// token-set overlap; "semantic" uses cosine similarity via the RAG
+	// embedder. When "semantic" is selected but the embedder is unavailable,
+	// the computation falls back to Jaccard automatically.
+	FusionSimilarityMode string // NEXUS_FUSION_SIMILARITY_MODE; default "jaccard"
 
 	// Fusion arbiter synthesis cache (issue #232, #773). When ArbiterCacheTTL > 0,
 	// arbiter synthesis responses are cached keyed by SHA-256 of
@@ -1463,6 +1469,15 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.FusionAgreementThreshold = agreementThreshold
+
+	// Fusion similarity mode (issue #1244): "jaccard" (default, lexical) or
+	// "semantic" (cosine similarity via RAG embedder).
+	cfg.FusionSimilarityMode = getEnv("NEXUS_FUSION_SIMILARITY_MODE", "jaccard")
+	if cfg.FusionSimilarityMode != "jaccard" && cfg.FusionSimilarityMode != "semantic" {
+		slog.Warn("invalid NEXUS_FUSION_SIMILARITY_MODE, using jaccard",
+			slog.String("value", cfg.FusionSimilarityMode))
+		cfg.FusionSimilarityMode = "jaccard"
+	}
 
 	// Fusion arbiter synthesis cache (issue #232, #773). NEXUS_ARBITER_CACHE_TTL=0
 	// disables the cache entirely — every disagreement calls the arbiter.

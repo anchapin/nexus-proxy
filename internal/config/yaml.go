@@ -158,6 +158,7 @@ type YAMLConfig struct {
 	// Fusion
 	FusionProgressiveDelivery bool    `yaml:"fusion_progressive_delivery"`
 	FusionAgreementThreshold  float64 `yaml:"fusion_agreement_threshold"`
+	FusionSimilarityMode      string  `yaml:"fusion_similarity_mode"`
 	ArbiterCacheTTL           string  `yaml:"arbiter_cache_ttl"`
 	ArbiterCacheMaxEntries    int     `yaml:"arbiter_cache_max_entries"`
 	CacheWarmOnBoot           bool    `yaml:"cache_warm_on_boot"`
@@ -973,6 +974,12 @@ func LoadYAML(path string) (Config, error) {
 		}
 		cfg.FusionAgreementThreshold = f
 	}
+	if v := os.Getenv("NEXUS_FUSION_SIMILARITY_MODE"); v != "" {
+		if v != "jaccard" && v != "semantic" {
+			return cfg, configError("NEXUS_FUSION_SIMILARITY_MODE", `must be "jaccard" or "semantic"`, v, "jaccard")
+		}
+		cfg.FusionSimilarityMode = v
+	}
 	if v := os.Getenv("NEXUS_ARBITER_CACHE_TTL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -1691,6 +1698,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 
 		FusionProgressiveDelivery: yc.boolFieldDefault(yc.FusionProgressiveDelivery, true),
 		FusionAgreementThreshold:  yc.floatDefault(yc.FusionAgreementThreshold, 0.85),
+		FusionSimilarityMode:      yc.stringDefault(yc.FusionSimilarityMode, "jaccard"),
 		ArbiterCacheTTL:           yc.durationDefault(yc.ArbiterCacheTTL, 5*time.Minute),
 		ArbiterCacheMaxEntries:    yc.intDefault(yc.ArbiterCacheMaxEntries, 512),
 		CacheWarmOnBoot:           yc.CacheWarmOnBoot, // default false (opt-in, issue #1176)

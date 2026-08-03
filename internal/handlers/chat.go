@@ -631,10 +631,11 @@ type LocalLimiter interface {
 // Deps bundles the collaborators the chat handler needs. Wiring them
 // explicitly makes the handler trivial to unit-test with stubs.
 type Deps struct {
-	Config config.Config
-	Client upstream.Client // http.Client satisfies this interface
-	RAG    rag.RAGStore
-	SLM    *router.SLMClient
+	Config   config.Config
+	Client   upstream.Client // http.Client satisfies this interface
+	RAG      rag.RAGStore
+	Embedder rag.Embedder // raw embedder for fusion semantic similarity (issue #1244)
+	SLM      *router.SLMClient
 
 	// MiddlewareChain is the ordered list of registered middleware names
 	// to apply to each request's messages slice (issue #224). The handler
@@ -1887,6 +1888,8 @@ func Chat(d Deps) http.Handler {
 					reqID,
 					d.ArbiterCache,
 					d.Config.ArbiterCacheTTL,
+					upstream.Embedder(d.Embedder), // issue #1244: semantic similarity mode
+					d.Config.FusionSimilarityMode,
 				)
 				fusionArbiterSkipped = outcome.ArbiterSkipped
 				fusionJaccardSimilarity = outcome.Similarity
@@ -1926,6 +1929,8 @@ func Chat(d Deps) http.Handler {
 					reqID,
 					d.ArbiterCache,
 					d.Config.ArbiterCacheTTL,
+					upstream.Embedder(d.Embedder), // issue #1244: semantic similarity mode
+					d.Config.FusionSimilarityMode,
 					false, // isFusion: false when called directly (legacy path, issue #984)
 				)
 				if d.ArbiterCacheObserver != nil {
