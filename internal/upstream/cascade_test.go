@@ -1457,3 +1457,41 @@ func TestRunBufferedSetsHeaderWhenAllStepsFail(t *testing.T) {
 		t.Errorf("X-Nexus-Cascade-Served-By = %q, want frontier", got)
 	}
 }
+
+// TestRunBufferedFallbackReasonOnStep2Success verifies issue #1294: when the
+// first step fails with a retryable error and the second step succeeds,
+// FallbackReason is non-empty so the chat handler can observe it.
+func TestRunBufferedFallbackReasonOnStep2Success(t *testing.T) {
+	ft := newFakeTransport()
+	// First step returns 500 (retryable), second step succeeds.
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(500)
+		_, _ = io.WriteString(w, "internal server error")
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"model":"fb-m","choices":[{"index":0,"message":{"role":"assistant","content":"hello from fallback"},"finish_reason":"stop"}]}`)
+	})
+
+	rec := httptest.NewRecorder()
+	res, err := twoStepCascade().RunBuffered(context.Background(), rec, &http.Client{Transport: ft}, nil, "")
+	if err != nil {
+		t.Fatalf("RunBuffered: %v", err)
+	}
+	if !res.Succeeded {
+		t.Errorf("Succeeded = false, want true")
+	}
+	if res.ServedBy != "frontier" {
+		t.Errorf("ServedBy = %q, want frontier", res.ServedBy)
+	}
+	if res.Attempts != 2 {
+		t.Errorf("Attempts = %d, want 2", res.Attempts)
+	}
+	if res.FallbackReason == "" {
+		t.Error("FallbackReason is empty, want non-empty (http_error from step 1 failure)")
+	}
+	// Verify the fallback reason is the expected http_error label for 500.
+	if res.FallbackReason != "http_error" {
+		t.Errorf("FallbackReason = %q, want http_error", res.FallbackReason)
+	}
+}
