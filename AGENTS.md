@@ -542,6 +542,8 @@ For hot-reloadable knobs add the field to `ReloadHotReloadable()` in
 - `NEXUS_SHUTDOWN_TIMEOUT`, `NEXUS_SERVER_READ_TIMEOUT`
 - `NEXUS_BUDGET_ALERT_THRESHOLD`, `NEXUS_FUSION_AGREEMENT_THRESHOLD`, `NEXUS_TRACING_SAMPLE_RATE`
 - `NEXUS_TRUSTED_PROXIES` (issue #896 — re-parsed without restart)
+- `NEXUS_ALLOW_CIDRS_STRICT` (issue #1240 — controls whether `/healthz`/`/metrics` are exempt from the IP allowlist)
+- `NEXUS_API_KEYS_FILE` (issue #1154 — multi-key auth file path)
 Everything else requires a full restart.
 The `env_example_audit_test.go` bidirectional test enforces that every
 var listed in `ReloadHotReloadable()` carries the `# hot-reloadable via
