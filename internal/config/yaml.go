@@ -2092,14 +2092,20 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 
 	// Trusted proxies
 	if yc.TrustedProxies != "" {
-		parsed, _ := parseTrustedProxies(yc.TrustedProxies)
+		parsed, err := parseTrustedProxies(yc.TrustedProxies)
+		if err != nil {
+			return cfg, fmt.Errorf("config: invalid trusted_proxies entry %q: %w", yc.TrustedProxies, err)
+		}
 		cfg.TrustedProxies = parsed
 		cfg.TrustedProxiesRaw = yc.TrustedProxies
 	}
 
 	// Inbound IP allowlist (issue #1240)
 	if yc.AllowCIDRs != "" {
-		parsed, _ := parseTrustedProxies(yc.AllowCIDRs)
+		parsed, err := parseTrustedProxies(yc.AllowCIDRs)
+		if err != nil {
+			return cfg, fmt.Errorf("config: invalid allow_cidrs entry %q: %w", yc.AllowCIDRs, err)
+		}
 		cfg.AllowCIDRs = parsed
 		cfg.AllowCIDRsRaw = yc.AllowCIDRs
 	}

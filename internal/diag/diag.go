@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -734,6 +735,33 @@ func checkBudgetGuardFn(cfg config.Config) Check {
 	}
 }
 
+// validateCIDRs parses a comma-separated CIDR string and returns an error
+// naming the first invalid entry. Mirrors the validation in config.parseTrustedProxies
+// so that `nexus check` can detect invalid CIDRs before a full boot attempt
+// (issue #1315). A bare IP (no /prefix) is accepted and treated as a host route.
+func validateCIDRs(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(p); err == nil {
+			continue
+		}
+		// Not a CIDR — try a bare IP.
+		if ip := net.ParseIP(p); ip != nil {
+			continue
+		}
+		return fmt.Errorf("invalid entry %q (expected CIDR or IP)", p)
+	}
+	return nil
+}
+
 // --- Rate-limit proxy configuration ---------------------------------------
 
 // checkRateLimitProxyConfigFn checks that when per-client rate limiting
@@ -745,12 +773,27 @@ func checkBudgetGuardFn(cfg config.Config) Check {
 // the proxy uses the direct TCP peer for rate limiting, which is
 // correct but the check warns anyway because the operator may have
 // intended to configure trusted proxies for a layered setup.
+//
+// Invalid CIDRs in NEXUS_TRUSTED_PROXIES fail boot with a clear error
+// (issue #1315). This check validates the raw CIDR syntax so `nexus
+// check` can report CIDR errors before a full boot attempt.
 func checkRateLimitProxyConfigFn(cfg config.Config) Check {
 	if cfg.RateLimitRPM <= 0 {
 		return Check{
 			Name:   checkRateLimitProxyConfig,
 			Status: StatusSkip,
 			Detail: "rate limiting disabled (NEXUS_RATE_LIMIT_RPM <= 0)",
+		}
+	}
+	// Validate CIDR syntax before checking configuration.
+	// This catches malformed entries like "not-a-cidr" or "10.0.0.0/33".
+	if cfg.TrustedProxiesRaw != "" {
+		if err := validateCIDRs(cfg.TrustedProxiesRaw); err != nil {
+			return Check{
+				Name:   checkRateLimitProxyConfig,
+				Status: StatusFail,
+				Detail: fmt.Sprintf("NEXUS_TRUSTED_PROXIES has invalid CIDR: %v", err),
+			}
 		}
 	}
 	if !cfg.TrustedProxiesConfigured() {
@@ -788,7 +831,23 @@ func checkRateLimitProxyConfigFn(cfg config.Config) Check {
 // When AllowCIDRsStrict is false (default), /healthz and /metrics
 // are exempt so K8s probes and Prometheus scrapers work without IP
 // restrictions.
+//
+// Invalid CIDRs in NEXUS_ALLOW_CIDRS fail boot with a clear error
+// (issue #1315). This check validates the raw CIDR syntax so `nexus
+// check` can report CIDR errors before a full boot attempt.
 func checkAllowCIDRsFn(cfg config.Config) Check {
+	// Validate CIDR syntax even when the allowlist is empty but a raw
+	// value was provided — this catches the case where the YAML loader
+	// silently ignored an invalid CIDR (the env path fails boot instead).
+	if cfg.AllowCIDRsRaw != "" {
+		if err := validateCIDRs(cfg.AllowCIDRsRaw); err != nil {
+			return Check{
+				Name:   checkAllowCIDRs,
+				Status: StatusFail,
+				Detail: fmt.Sprintf("NEXUS_ALLOW_CIDRS has invalid CIDR: %v", err),
+			}
+		}
+	}
 	if !cfg.AllowCIDRsConfigured() {
 		return Check{
 			Name:   checkAllowCIDRs,
