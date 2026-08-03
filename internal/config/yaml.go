@@ -782,6 +782,13 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_RAG_DEDUP_CROSS_DIR"); v != "" {
 		cfg.RAGDedupCrossDir = strings.ToLower(v) == "true" || v == "1"
 	}
+	if v := os.Getenv("NEXUS_RAG_HYBRID_WEIGHT"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_RAG_HYBRID_WEIGHT: %w; see .env.example", err)
+		}
+		cfg.RAGHybridWeight = f
+	}
 
 	// Routing
 	if v := os.Getenv("NEXUS_TOKEN_GUARDRAIL"); v != "" {

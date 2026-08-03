@@ -550,6 +550,20 @@ type Store struct {
 	dedupThreshold     float64     // cosine similarity above which new chunks are skipped (0 = disabled, issue #1243)
 	dedupCrossDir      bool        // allow cross-directory dedup; false = same-dir only (issue #1243)
 
+	// Inverted index for BM25 keyword retrieval (issue #1242).
+	// Map: term -> docID -> TF-IDF weight.
+	// Built incrementally during Add() and rebuilt during IndexDir().
+	invertedIndex map[string]map[int]float64
+
+	// avgDL is the average document length (in tokens) across all indexed examples.
+	// Used for BM25 document length normalization.
+	avgDL float64
+
+	// hybridWeight controls the blend between semantic (cosine similarity)
+	// and keyword (BM25) retrieval (issue #1242). 0.0 = pure semantic,
+	// 1.0 = pure keyword. Values between blend both via Reciprocal Rank Fusion.
+	hybridWeight float64
+
 	lastIndexAt               int64
 	retrievalAttempts         uint64
 	retrievalHits             uint64
@@ -608,6 +622,14 @@ func WithDedupThreshold(t float64) StoreOption {
 // candidates for dedup regardless of directory.
 func WithDedupCrossDir(b bool) StoreOption {
 	return func(s *Store) { s.dedupCrossDir = b }
+}
+
+// WithHybridWeight sets the hybrid retrieval weight (issue #1242).
+// 0.0 = pure semantic (backward compatible), 1.0 = pure keyword.
+// Values between blend semantic (cosine similarity) and keyword (BM25)
+// via Reciprocal Rank Fusion.
+func WithHybridWeight(w float64) StoreOption {
+	return func(s *Store) { s.hybridWeight = w }
 }
 
 // indexThreshold is the minimum store size before the HNSW index is used.
@@ -686,6 +708,16 @@ const (
 	// labelled {path="brute_force"} in
 	// nexus_rag_similarity_histogram carry these observations.
 	IndexPathBruteForce IndexPath = "brute_force"
+
+	// IndexPathHybrid means Retrieve combined semantic and keyword scores
+	// via Reciprocal Rank Fusion (issue #1242). The hybrid path is used
+	// when NEXUS_RAG_HYBRID_WEIGHT is between 0 and 1.
+	IndexPathHybrid IndexPath = "hybrid"
+
+	// IndexPathKeyword means Retrieve used pure BM25 scoring without
+	// semantic embeddings (issue #1242). This path is used when
+	// NEXUS_RAG_HYBRID_WEIGHT=1.0 (pure keyword).
+	IndexPathKeyword IndexPath = "keyword"
 )
 
 // IndexMode describes which retrieval path Store.Retrieve will use for
@@ -1193,7 +1225,13 @@ func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, f
 	if useIndex {
 		idx = s.index
 	}
+	hybridWeight := s.hybridWeight
 	s.mu.RUnlock()
+
+	// Hybrid path: blend semantic and keyword scores via RRF (issue #1242).
+	if hybridWeight > 0 {
+		return s.retrieveHybrid(ctx, prompt, promptEmb, examples, useIndex, idx, hybridWeight)
+	}
 
 	if useIndex && idx != nil {
 		// HNSW path: search index for top candidates, then re-rank with exact cosine.
@@ -1241,6 +1279,105 @@ func (s *Store) Retrieve(ctx context.Context, prompt string) (*FewShotExample, f
 	atomic.AddUint64(&s.retrievalMisses, 1)
 	atomic.AddUint64(&s.thresholdMisses, 1)
 	return nil, bestScore, IndexPathBruteForce, nil
+}
+
+// retrieveHybrid performs hybrid retrieval combining semantic and keyword scores
+// via Reciprocal Rank Fusion. Must be called with the store read lock held.
+func (s *Store) retrieveHybrid(ctx context.Context, prompt string, promptEmb []float64, examples []FewShotExample, useIndex bool, idx *HNSWIndex, hybridWeight float64) (*FewShotExample, float64, IndexPath, error) {
+	// Determine search scope: use HNSW candidates if available, otherwise all docs.
+	var candidateIDs []int
+	if useIndex && idx != nil {
+		// Search HNSW for candidates, then re-rank with hybrid scoring.
+		// Use a larger candidate set for hybrid to capture keyword matches.
+		candidateIDs = idx.Search(promptEmb, 20)
+	} else {
+		// Brute-force: score all documents.
+		candidateIDs = make([]int, len(examples))
+		for i := range examples {
+			candidateIDs[i] = i
+		}
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Score all candidates with both semantic and keyword methods.
+	type scored struct {
+		id            int
+		semanticScore float64
+		keywordScore  float64
+	}
+	var candidates []scored
+
+	for _, id := range candidateIDs {
+		if id < 0 || id >= len(examples) {
+			continue
+		}
+		semantic := CosineSimilarity(promptEmb, examples[id].Embedding)
+		keyword := s.BM25Score(prompt, id)
+		candidates = append(candidates, scored{
+			id:            id,
+			semanticScore: semantic,
+			keywordScore:  keyword,
+		})
+	}
+
+	if len(candidates) == 0 {
+		atomic.AddUint64(&s.retrievalMisses, 1)
+		atomic.AddUint64(&s.thresholdMisses, 1)
+		return nil, 0, IndexPathHybrid, nil
+	}
+
+	// Sort by semantic score (descending) to assign semantic ranks.
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].semanticScore > candidates[j].semanticScore
+	})
+	semanticRanks := make([]int, len(candidates))
+	for i := range candidates {
+		semanticRanks[i] = i + 1 // rank: 1 = best
+	}
+
+	// Sort by keyword score (descending) to assign keyword ranks.
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].keywordScore > candidates[j].keywordScore
+	})
+	keywordRanks := make([]int, len(candidates))
+	for i := range candidates {
+		keywordRanks[i] = i + 1 // rank: 1 = best
+	}
+
+	// Compute RRF scores and find the best.
+	var bestIdx int
+	var bestRRFScore float64 = -1
+	for i := range candidates {
+		rrf := hybridScore(0, 0, hybridWeight, semanticRanks[i], keywordRanks[i], rrfK)
+		if rrf > bestRRFScore {
+			bestRRFScore = rrf
+			bestIdx = i
+		}
+	}
+
+	best := &examples[candidates[bestIdx].id]
+	bestSemanticScore := CosineSimilarity(promptEmb, best.Embedding)
+
+	// Determine the index path based on hybrid weight.
+	path := IndexPathHybrid
+	if hybridWeight >= 1.0 {
+		path = IndexPathKeyword
+	} else if hybridWeight <= 0.0 {
+		path = IndexPathHNSW
+		if !useIndex || idx == nil {
+			path = IndexPathBruteForce
+		}
+	}
+
+	if bestSemanticScore > s.ThresholdFor(best.Dir) {
+		atomic.AddUint64(&s.retrievalHits, 1)
+		return best, bestSemanticScore, path, nil
+	}
+	atomic.AddUint64(&s.retrievalMisses, 1)
+	atomic.AddUint64(&s.thresholdMisses, 1)
+	return nil, bestSemanticScore, path, nil
 }
 
 // RetrieveTopK returns up to k examples whose cosine similarity to the
@@ -1389,6 +1526,158 @@ func CosineSimilarity(a, b []float64) float64 {
 	return result
 }
 
+// BM25 parameters (issue #1242).
+const (
+	// k1 controls term frequency saturation — higher values increase the
+	// influence of repeated terms more slowly. Standard BM25 literature
+	// uses k1=1.5.
+	bm25K1 = 1.5
+	// b controls document length normalisation. b=1 fully normalises by
+	// document length, b=0 disables length normalisation. Standard
+	// literature uses b=0.75.
+	bm25B = 0.75
+	// rrfK is the constant used in Reciprocal Rank Fusion to dampen the
+	// contribution of lower-ranked results. Standard RRF uses k=60.
+	rrfK = 60.0
+)
+
+// tokenize splits text into lowercase tokens by whitespace and punctuation.
+// This is a simple, fast tokenizer suitable for code snippets where
+// identifiers (function names, variables) are the primary search targets.
+func tokenize(text string) []string {
+	// Fast path: allocate only what we need.
+	var tokens []string
+	var current strings.Builder
+	current.Grow(len(text))
+
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' {
+			current.WriteByte(c)
+		} else if c == '$' || c == '@' || c == '#' {
+			// Allow these symbols in identifiers (common in code).
+			current.WriteByte(c)
+		} else {
+			if current.Len() > 0 {
+				tokens = append(tokens, current.String())
+				current.Reset()
+			}
+		}
+	}
+	if current.Len() > 0 {
+		tokens = append(tokens, current.String())
+	}
+
+	// Lowercase all tokens.
+	for i := range tokens {
+		tokens[i] = strings.ToLower(tokens[i])
+	}
+	return tokens
+}
+
+// updateInvertedIndex updates the inverted index for a single document.
+// This is called during Add() and IndexDir() to maintain the index incrementally.
+func (s *Store) updateInvertedIndex(docID int, content string) {
+	tokens := tokenize(content)
+	if len(tokens) == 0 {
+		return
+	}
+
+	// Count term frequencies.
+	tf := make(map[string]int)
+	for _, t := range tokens {
+		tf[t]++
+	}
+
+	// Update the inverted index.
+	if s.invertedIndex == nil {
+		s.invertedIndex = make(map[string]map[int]float64)
+	}
+	for term, count := range tf {
+		if s.invertedIndex[term] == nil {
+			s.invertedIndex[term] = make(map[int]float64)
+		}
+		s.invertedIndex[term][docID] = float64(count)
+	}
+
+	// Update average document length.
+	totalTokens := 0
+	for _, ex := range s.examples {
+		totalTokens += len(tokenize(ex.Content))
+	}
+	if len(s.examples) > 0 {
+		s.avgDL = float64(totalTokens) / float64(len(s.examples))
+	}
+}
+
+// IDF computes the inverse document frequency for a term across the document
+// collection. N is the total number of documents, and n is the number of
+// documents containing the term.
+func IDF(N, n int) float64 {
+	if n == 0 {
+		return 0
+	}
+	return math.Log((float64(N-n) + 0.5) / (float64(n) + 0.5))
+}
+
+// BM25Score returns the BM25 score for a query against a document.
+// The query is tokenized the same way documents are, and the score is the
+// sum of IDF-weighted term frequencies with document length normalisation.
+// Returns 0 when the query terms are not in the document or the inverted
+// index has not been built.
+func (s *Store) BM25Score(query string, docID int) float64 {
+	if s.invertedIndex == nil || s.avgDL == 0 {
+		return 0
+	}
+
+	tokens := tokenize(query)
+	if len(tokens) == 0 {
+		return 0
+	}
+
+	N := len(s.examples)
+	if N == 0 {
+		return 0
+	}
+
+	var score float64
+	docLen := float64(len(tokenize(s.examples[docID].Content)))
+
+	for _, term := range tokens {
+		docTF, ok := s.invertedIndex[term][docID]
+		if !ok {
+			continue
+		}
+
+		// Count how many documents contain this term.
+		n := 0
+		for _, docIDs := range s.invertedIndex[term] {
+			if docIDs > 0 {
+				n++
+			}
+		}
+
+		idf := IDF(N, n)
+		// BM25 term frequency component with saturation.
+		tfComponent := docTF * (bm25K1 + 1) / (docTF + bm25K1*(1-bm25B+bm25B*docLen/s.avgDL))
+		score += idf * tfComponent
+	}
+
+	return score
+}
+
+// hybridScore combines semantic and keyword scores via Reciprocal Rank Fusion.
+// semanticScore and keywordScore are already-ranked scores (higher = better).
+// weight is the hybrid weight (0.0 = pure semantic, 1.0 = pure keyword).
+// rankSemantic and rankKeyword are the 1-based ranks in their respective orderings.
+// k is the RRF damping constant (standard is 60).
+func hybridScore(semanticScore, keywordScore float64, weight float64, rankSemantic, rankKeyword int, k float64) float64 {
+	// Reciprocal Rank Fusion: score = w * 1/(k + rank_semantic) + (1-w) * 1/(k + rank_keyword)
+	rrfSemantic := 1.0 / (k + float64(rankSemantic))
+	rrfKeyword := 1.0 / (k + float64(rankKeyword))
+	return weight*rrfSemantic + (1-weight)*rrfKeyword
+}
+
 // FormatInjection returns the standard "[PROXY RETRIEVAL CONTEXT]" block
 // appended to a user message when a high-similarity example is found.
 // When the example is a chunk (ChunkIndex > 0), the label includes the
@@ -1532,6 +1821,8 @@ func (s *Store) Add(filename, content string, embedding []float64) {
 	if s.index != nil {
 		s.index.Add(id, embedding)
 	}
+	// Update inverted index for BM25 retrieval (issue #1242).
+	s.updateInvertedIndex(id, content)
 	s.mu.Unlock()
 	s.markIndexed(time.Now().UTC())
 }
@@ -1606,6 +1897,34 @@ func (s *Store) replace(examples []FewShotExample) {
 	s.examples = examples
 	// Rebuild the HNSW index from the new examples slice.
 	s.rebuildIndex()
+	// Rebuild the inverted index for BM25 retrieval (issue #1242).
+	s.rebuildInvertedIndex()
+}
+
+// rebuildInvertedIndex rebuilds the entire inverted index from the examples slice.
+// Must be called while holding the store lock.
+func (s *Store) rebuildInvertedIndex() {
+	s.invertedIndex = make(map[string]map[int]float64)
+	if len(s.examples) == 0 {
+		s.avgDL = 0
+		return
+	}
+	totalTokens := 0
+	for i, ex := range s.examples {
+		tokens := tokenize(ex.Content)
+		totalTokens += len(tokens)
+		tf := make(map[string]int)
+		for _, t := range tokens {
+			tf[t]++
+		}
+		for term, count := range tf {
+			if s.invertedIndex[term] == nil {
+				s.invertedIndex[term] = make(map[int]float64)
+			}
+			s.invertedIndex[term][i] = float64(count)
+		}
+	}
+	s.avgDL = float64(totalTokens) / float64(len(s.examples))
 }
 
 // restoreIndex sets the HNSW index from a serialized blob produced
