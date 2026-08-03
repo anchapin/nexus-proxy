@@ -243,6 +243,10 @@ type YAMLConfig struct {
 	// MetricsRetentionDays (issue #483) sets a TTL on the requests
 	// table. 0 = disabled (grow without bound). Not hot-reloadable.
 	MetricsRetentionDays int `yaml:"metrics_retention_days"`
+	// MetricsBatchSize (issue #1234): number of records per batched transaction.
+	MetricsBatchSize int `yaml:"metrics_batch_size"`
+	// MetricsBatchTimeout (issue #1234): max delay before flushing a partial batch.
+	MetricsBatchTimeout string `yaml:"metrics_batch_timeout"`
 
 	// OTLP retry/back-off parameters (issue #803).
 	TracerMaxRetries     int    `yaml:"tracer_max_retries"`
@@ -1383,6 +1387,16 @@ func LoadYAML(path string) (Config, error) {
 			cfg.MetricsRetentionDays = n
 		}
 	}
+	if v := os.Getenv("NEXUS_METRICS_BATCH_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.MetricsBatchSize = n
+		}
+	}
+	if v := os.Getenv("NEXUS_METRICS_BATCH_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.MetricsBatchTimeout = d
+		}
+	}
 
 	// OTLP retry/back-off parameters (issue #803).
 	if v := os.Getenv("NEXUS_TRACING_MAX_RETRIES"); v != "" {
@@ -1726,6 +1740,8 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		TelemetryFlushInterval: yc.durationDefault(yc.TelemetryFlushInterval, 5*time.Second),
 		MetricsDBPath:          yc.stringDefault(yc.MetricsDBPath, DefaultMetricsDBPath()),
 		MetricsRetentionDays:   yc.intDefault(yc.MetricsRetentionDays, 0),
+		MetricsBatchSize:       yc.intDefault(yc.MetricsBatchSize, 64),
+		MetricsBatchTimeout:    yc.durationDefault(yc.MetricsBatchTimeout, 100*time.Millisecond),
 
 		// OTLP retry/back-off parameters (issue #803).
 		TracerMaxRetries:     yc.intDefault(yc.TracerMaxRetries, 0),

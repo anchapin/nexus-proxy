@@ -159,6 +159,8 @@ func setAllEnvOverrides(t *testing.T) {
 	t.Setenv("NEXUS_TELEMETRY_FLUSH_INTERVAL", "3s")
 	t.Setenv("NEXUS_METRICS_DB", "/tmp/metrics-env.db")
 	t.Setenv("NEXUS_METRICS_RETENTION_DAYS", "21")
+	t.Setenv("NEXUS_METRICS_BATCH_SIZE", "128")
+	t.Setenv("NEXUS_METRICS_BATCH_TIMEOUT", "50ms")
 	// OTLP retry/back-off (issue #803)
 	t.Setenv("NEXUS_TRACING_MAX_RETRIES", "5")
 	t.Setenv("NEXUS_TRACING_RETRY_BASE_DELAY", "150ms")

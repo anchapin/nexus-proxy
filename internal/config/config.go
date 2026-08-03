@@ -589,6 +589,20 @@ type Config struct {
 	// the prune goroutine lifecycle is bound to the store's lifetime.
 	MetricsRetentionDays int
 
+	// MetricsBatchSize is the number of records that trigger a batched
+	// SQLite transaction in the metrics store drain goroutine (issue #1234).
+	// When the buffer reaches this size, the drain commits a
+	// BEGIN...INSERT...COMMIT transaction. Default 64. BATCH_SIZE=1
+	// reproduces the pre-batch per-record INSERT behaviour.
+	MetricsBatchSize int
+
+	// MetricsBatchTimeout is the maximum delay before a partial batch
+	// is flushed (issue #1234). If the buffer has at least one record
+	// and this duration elapses since the last flush, the drain commits
+	// whatever is in the batch. Default 100ms. Together with
+	// MetricsBatchSize this amortises WAL write amplification under load.
+	MetricsBatchTimeout time.Duration
+
 	// OTLP retry/back-off parameters (issue #803). These tune the
 	// behaviour when the collector returns 5xx errors. The back-off
 	// follows exponential growth: base * 2^(attempt-1) capped at max.
@@ -1047,6 +1061,27 @@ func Load() (Config, error) {
 		retentionDays = 0
 	}
 	cfg.MetricsRetentionDays = retentionDays
+
+	// Metrics batch config (issue #1234). BatchSize defaults to 64;
+	// BatchTimeout defaults to 100ms. Both also apply to the judge
+	// SQLite store.
+	metricsBatchSize, err := getEnvInt("NEXUS_METRICS_BATCH_SIZE", 64)
+	if err != nil {
+		return cfg, err
+	}
+	if metricsBatchSize < 1 {
+		metricsBatchSize = 1
+	}
+	cfg.MetricsBatchSize = metricsBatchSize
+
+	metricsBatchTimeout, err := getEnvDuration("NEXUS_METRICS_BATCH_TIMEOUT", 100*time.Millisecond)
+	if err != nil {
+		return cfg, err
+	}
+	if metricsBatchTimeout <= 0 {
+		metricsBatchTimeout = 100 * time.Millisecond
+	}
+	cfg.MetricsBatchTimeout = metricsBatchTimeout
 
 	// OTLP retry/back-off parameters (issue #803).
 	tracerMaxRetries, err := getEnvInt("NEXUS_TRACING_MAX_RETRIES", 0)
