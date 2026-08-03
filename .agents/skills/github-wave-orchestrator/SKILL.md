@@ -160,9 +160,28 @@ instead of passively waiting for a done signal:
 
    # Step A: verify commit existence (safety net — catches silent failure)
    if ! git log origin/develop..HEAD --oneline | head -1 > /dev/null 2>&1; then
-     echo "RECOVERY: No commits found in worktree. Worktree may be stale."
-     git fetch origin develop
-     git rebase origin/develop || true  # rebase to get latest changes
+      echo "RECOVERY: No commits found in worktree. Worktree may be stale."
+
+      # Preserve uncommitted changes before rebasing (issue #1272)
+      # git rebase discards unstashed changes; stash is safe when clean
+      if [ -n "$(git status --short)" ]; then
+        echo "RECOVERY: Stashing uncommitted changes before rebase."
+        git add -A && git stash push -m "wave-recovery-$(date +%s)"
+      fi
+
+      git fetch origin develop
+      if git rebase origin/develop; then
+        echo "RECOVERY: Rebase succeeded."
+      else
+        echo "RECOVERY: Rebase failed, aborting and restoring stashed changes."
+        git rebase --abort 2>/dev/null || true
+      fi
+
+      # Restore stashed changes if any
+      if git stash list | grep -q "wave-recovery"; then
+        echo "RECOVERY: Restoring stashed changes."
+        git stash pop || echo "WARNING: stash pop failed — manual intervention may be needed"
+      fi
    fi
 
    # Step B: check if branch was pushed
