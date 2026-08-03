@@ -86,6 +86,10 @@ type LatencyEvent struct {
 	TTFTSeconds    float64
 	IsError        bool
 
+	// TOONCompressionMethod records which TOON compression pattern was applied
+	// (issue #1312): "fenced", "nested", "unfenced", or "" (none).
+	TOONCompressionMethod string
+
 	// Trace context for exemplar attachment (issue #1171). Populated
 	// from the root span; empty when tracing is not active.
 	TraceID string
@@ -2550,12 +2554,13 @@ func Chat(d Deps) http.Handler {
 				isErr = true
 			}
 			d.LatencyObserver.ObserveLatency(LatencyEvent{
-				Route:          string(route),
-				LatencySeconds: totalMs / 1000.0,
-				TTFTSeconds:    ttftSecs,
-				IsError:        isErr,
-				TraceID:        traceID,
-				SpanID:         spanID,
+				Route:                 string(route),
+				LatencySeconds:        totalMs / 1000.0,
+				TTFTSeconds:           ttftSecs,
+				IsError:               isErr,
+				TOONCompressionMethod: string(toonCompressionMethod),
+				TraceID:               traceID,
+				SpanID:                spanID,
 			})
 		}
 

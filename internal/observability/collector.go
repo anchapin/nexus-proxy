@@ -105,7 +105,10 @@ type ObservabilityEvent struct {
 	// Routing/optimisation dimensions.
 	RAGInjected    bool // a few-shot snippet was injected into the prompt
 	TOONCompressed bool // JSON-array blocks were TOON-compressed
-	Degraded       bool // local arm was skipped because Ollama was unhealthy
+	// TOONCompressionMethod records which TOON compression pattern was applied
+	// (issue #1312): "fenced", "nested", "unfenced", or "" (none).
+	TOONCompressionMethod string
+	Degraded              bool // local arm was skipped because Ollama was unhealthy
 
 	// Token + cost accounting (cumulative across the process lifetime).
 	InputTokens       int
@@ -159,13 +162,17 @@ type Collector struct {
 	errorsFrontier atomic.Uint64
 	errorsFusion   atomic.Uint64
 
-	ragHitsTotal           atomic.Uint64
-	ragMissesTotal         atomic.Uint64
-	toonCompressedTotal    atomic.Uint64
-	degradedTotal          atomic.Uint64
-	inputTokensTotal       atomic.Uint64
-	outputTokensTotal      atomic.Uint64
-	toonSavingsTokensTotal atomic.Uint64
+	ragHitsTotal        atomic.Uint64
+	ragMissesTotal      atomic.Uint64
+	toonCompressedTotal atomic.Uint64
+	// TOON compression counters by type and direction (issue #1312).
+	// Keyed by direction: "compress" (decompress not yet implemented).
+	toonCompressionFencedTotal   map[string]*atomic.Uint64
+	toonCompressionUnfencedTotal map[string]*atomic.Uint64
+	degradedTotal                atomic.Uint64
+	inputTokensTotal             atomic.Uint64
+	outputTokensTotal            atomic.Uint64
+	toonSavingsTokensTotal       atomic.Uint64
 
 	// estimatedCostUSDBits holds the cumulative USD cost as its
 	// IEEE-754 bit pattern in an atomic.Uint64
@@ -391,6 +398,13 @@ func NewCollector() *Collector {
 			"missing": {},
 			"invalid": {},
 		},
+		// Issue #1312: TOON compression counters keyed by direction.
+		toonCompressionFencedTotal: map[string]*atomic.Uint64{
+			"compress": {},
+		},
+		toonCompressionUnfencedTotal: map[string]*atomic.Uint64{
+			"compress": {},
+		},
 	}
 	// Pre-allocate SLM confidence histograms for each known category
 	// (issue #425). Pre-allocation means ObserveSLMConfidence only
@@ -461,6 +475,22 @@ func (c *Collector) Submit(e ObservabilityEvent) {
 	}
 	if e.TOONCompressed {
 		c.toonCompressedTotal.Add(1)
+	}
+	// Issue #1312: increment fenced vs unfenced counter based on compression method.
+	if e.TOONCompressionMethod != "" {
+		dir := "compress" // direction label; decompress not yet implemented
+		switch e.TOONCompressionMethod {
+		case "fenced":
+			if c.toonCompressionFencedTotal[dir] != nil {
+				c.toonCompressionFencedTotal[dir].Add(1)
+			}
+		case "unfenced":
+			if c.toonCompressionUnfencedTotal[dir] != nil {
+				c.toonCompressionUnfencedTotal[dir].Add(1)
+			}
+			// "nested" is tracked by the existing toonCompressedTotal but does not
+			// get its own fenced/unfenced counter since it is a subset of compression.
+		}
 	}
 	if e.Degraded {
 		c.degradedTotal.Add(1)
