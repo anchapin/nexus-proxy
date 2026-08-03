@@ -30,6 +30,7 @@ type YAMLConfig struct {
 	ShutdownTimeout string `yaml:"shutdown_timeout"`
 	MaxBodyBytes    int    `yaml:"max_body_bytes"`
 	TLSEnabled      bool   `yaml:"tls_enabled"`
+	TLSClientCAFile string `yaml:"tls_client_ca_file"` // issue #1241
 
 	// Logging
 	LogLevel  string `yaml:"log_level"`
@@ -124,6 +125,8 @@ type YAMLConfig struct {
 	RAGMaxInjectionTokens    int     `yaml:"rag_max_injection_tokens"`
 	RAGFileExtensions        string  `yaml:"rag_file_extensions"`
 	RAGExcludePatterns       string  `yaml:"rag_exclude_patterns"`
+	RAGDedupThreshold        float64 `yaml:"rag_dedup_threshold"`
+	RAGDedupCrossDir         bool    `yaml:"rag_dedup_cross_dir"`
 
 	// Routing
 	TokenGuardrail                int     `yaml:"token_guardrail"`
@@ -134,6 +137,7 @@ type YAMLConfig struct {
 	SLMCacheMaxStale              int     `yaml:"slm_cache_max_stale"`               // issue #835
 	SLMCacheStaleCleanupThreshold int     `yaml:"slm_cache_stale_cleanup_threshold"` // issue #1037
 	SLMCacheSemanticScanLimit     int     `yaml:"slm_cache_semantic_scan_limit"`     // issue #933
+	SLMTokenHint                  bool    `yaml:"slm_token_hint"`                    // issue #1233
 	FusionTimeout                 string  `yaml:"fusion_timeout"`
 	FusionLocalTimeout            string  `yaml:"fusion_local_timeout"`    // issue #1164
 	FusionFrontierTimeout         string  `yaml:"fusion_frontier_timeout"` // issue #1164
@@ -202,6 +206,7 @@ type YAMLConfig struct {
 	JudgeTimeout            string  `yaml:"judge_timeout"`
 	JudgeCostPer1KUSD       float64 `yaml:"judge_cost_per_1k"`
 	JudgeDBPath             string  `yaml:"judge_db_path"`
+	JudgeAdaptiveEnabled    bool    `yaml:"judge_adaptive_enabled"` // issue #1232
 
 	// Routing confidence
 	RoutingConfidenceDB         string  `yaml:"routing_confidence_db"`
@@ -240,6 +245,10 @@ type YAMLConfig struct {
 	// MetricsRetentionDays (issue #483) sets a TTL on the requests
 	// table. 0 = disabled (grow without bound). Not hot-reloadable.
 	MetricsRetentionDays int `yaml:"metrics_retention_days"`
+	// MetricsBatchSize (issue #1234): number of records per batched transaction.
+	MetricsBatchSize int `yaml:"metrics_batch_size"`
+	// MetricsBatchTimeout (issue #1234): max delay before flushing a partial batch.
+	MetricsBatchTimeout string `yaml:"metrics_batch_timeout"`
 
 	// OTLP retry/back-off parameters (issue #803).
 	TracerMaxRetries     int    `yaml:"tracer_max_retries"`
@@ -261,6 +270,8 @@ type YAMLConfig struct {
 
 	// Trusted proxies
 	TrustedProxies    string `yaml:"trusted_proxies"`
+	AllowCIDRs        string `yaml:"allow_cidrs"`
+	AllowCIDRsStrict  bool   `yaml:"allow_cidrs_strict"`
 	RateLimitRPM      int    `yaml:"rate_limit_rpm"`
 	RateLimitBurst    int    `yaml:"rate_limit_burst"`
 	RateLimitByAPIKey bool   `yaml:"rate_limit_by_api_key"`
@@ -280,6 +291,11 @@ type YAMLConfig struct {
 
 	// Metrics exemplars (issue #1171)
 	MetricsExemplars *bool `yaml:"metrics_exemplars"`
+
+	// OtelMetrics (issue #1238)
+	OtelMetricsEndpoint string `yaml:"otel_metrics_endpoint"`
+	OtelMetricsInterval string `yaml:"otel_metrics_interval"`
+	OtelMetricsTimeout  string `yaml:"otel_metrics_timeout"`
 
 	// Response-content redaction (issue #1172).
 	RedactEnabled     bool   `yaml:"redact_enabled"`
@@ -435,6 +451,9 @@ func LoadYAML(path string) (Config, error) {
 	}
 	if v := os.Getenv("NEXUS_TLS_ENABLED"); v != "" {
 		cfg.TLSEnabled = parseBoolEnvStr(v, false)
+	}
+	if v := os.Getenv("NEXUS_TLS_CLIENT_CA_FILE"); v != "" {
+		cfg.TLSClientCAFile = v
 	}
 
 	// Logging
@@ -763,6 +782,30 @@ func LoadYAML(path string) (Config, error) {
 	if v := os.Getenv("NEXUS_RAG_EXCLUDE_PATTERNS"); v != "" {
 		cfg.RAGExcludePatterns = ragpkg.ParseCommaSeparated(v)
 	}
+	// RAG semantic dedup threshold (issue #1243). 0 = disabled.
+	if v := os.Getenv("NEXUS_RAG_DEDUP_THRESHOLD"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_RAG_DEDUP_THRESHOLD: %w; see .env.example", err)
+		}
+		if f < 0 {
+			f = 0
+		}
+		if f > 1 {
+			f = 1
+		}
+		cfg.RAGDedupThreshold = f
+	}
+	if v := os.Getenv("NEXUS_RAG_DEDUP_CROSS_DIR"); v != "" {
+		cfg.RAGDedupCrossDir = strings.ToLower(v) == "true" || v == "1"
+	}
+	if v := os.Getenv("NEXUS_RAG_HYBRID_WEIGHT"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_RAG_HYBRID_WEIGHT: %w; see .env.example", err)
+		}
+		cfg.RAGHybridWeight = f
+	}
 
 	// Routing
 	if v := os.Getenv("NEXUS_TOKEN_GUARDRAIL"); v != "" {
@@ -832,6 +875,10 @@ func LoadYAML(path string) (Config, error) {
 			n = 0
 		}
 		cfg.SLMCacheSemanticScanLimit = n
+	}
+	// SLM token hint (issue #1233)
+	if v := os.Getenv("NEXUS_SLM_TOKEN_HINT"); v != "" {
+		cfg.SLMTokenHint = strings.EqualFold(v, "true") || v == "1"
 	}
 	// DSL auto-promotion env overrides (issue #1165)
 	if v := os.Getenv("NEXUS_DSL_PROMOTION_MIN_SAMPLES"); v != "" {
@@ -1346,6 +1393,16 @@ func LoadYAML(path string) (Config, error) {
 			cfg.MetricsRetentionDays = n
 		}
 	}
+	if v := os.Getenv("NEXUS_METRICS_BATCH_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.MetricsBatchSize = n
+		}
+	}
+	if v := os.Getenv("NEXUS_METRICS_BATCH_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.MetricsBatchTimeout = d
+		}
+	}
 
 	// OTLP retry/back-off parameters (issue #803).
 	if v := os.Getenv("NEXUS_TRACING_MAX_RETRIES"); v != "" {
@@ -1409,6 +1466,19 @@ func LoadYAML(path string) (Config, error) {
 			return cfg, err
 		}
 		cfg.TrustedProxies = parsed
+	}
+
+	// Inbound IP allowlist (issue #1240)
+	if v := os.Getenv("NEXUS_ALLOW_CIDRS"); v != "" {
+		cfg.AllowCIDRsRaw = v
+		parsed, err := parseTrustedProxies(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: invalid NEXUS_ALLOW_CIDRS entry: %w", err)
+		}
+		cfg.AllowCIDRs = parsed
+	}
+	if v := os.Getenv("NEXUS_ALLOW_CIDRS_STRICT"); v != "" {
+		cfg.AllowCIDRsStrict = parseBoolEnvStr(v, false)
 	}
 
 	// Rate limit
@@ -1527,6 +1597,31 @@ func LoadYAML(path string) (Config, error) {
 			return cfg, fmt.Errorf("config: NEXUS_METRICS_EXEMPLARS: %w", err)
 		}
 		cfg.MetricsExemplars = b
+	}
+
+	// OtelMetrics (issue #1238)
+	if v := os.Getenv("NEXUS_OTEL_METRICS_ENDPOINT"); v != "" {
+		cfg.OtelMetricsEndpoint = v
+	}
+	if v := os.Getenv("NEXUS_OTEL_METRICS_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_OTEL_METRICS_INTERVAL: %w; see .env.example", err)
+		}
+		if d <= 0 {
+			d = 60 * time.Second
+		}
+		cfg.OtelMetricsInterval = d
+	}
+	if v := os.Getenv("NEXUS_OTEL_METRICS_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_OTEL_METRICS_TIMEOUT: %w; see .env.example", err)
+		}
+		if d < 0 {
+			d = 10 * time.Second
+		}
+		cfg.OtelMetricsTimeout = d
 	}
 
 	// Response-content redaction env overrides (issue #1172).
@@ -1651,6 +1746,8 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		TelemetryFlushInterval: yc.durationDefault(yc.TelemetryFlushInterval, 5*time.Second),
 		MetricsDBPath:          yc.stringDefault(yc.MetricsDBPath, DefaultMetricsDBPath()),
 		MetricsRetentionDays:   yc.intDefault(yc.MetricsRetentionDays, 0),
+		MetricsBatchSize:       yc.intDefault(yc.MetricsBatchSize, 64),
+		MetricsBatchTimeout:    yc.durationDefault(yc.MetricsBatchTimeout, 100*time.Millisecond),
 
 		// OTLP retry/back-off parameters (issue #803).
 		TracerMaxRetries:     yc.intDefault(yc.TracerMaxRetries, 0),
@@ -1670,6 +1767,8 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		RAGMaxInjectionTokens:         yc.intDefault(yc.RAGMaxInjectionTokens, 4096),
 		RAGFileExtensions:             ragpkg.ParseCommaSeparated(yc.RAGFileExtensions),
 		RAGExcludePatterns:            ragpkg.ParseCommaSeparated(yc.RAGExcludePatterns),
+		RAGDedupThreshold:             yc.floatDefault(yc.RAGDedupThreshold, 0),
+		RAGDedupCrossDir:              yc.boolFieldDefault(yc.RAGDedupCrossDir, false),
 		TokenGuardrail:                yc.intDefault(yc.TokenGuardrail, 6000),
 		SLMTimeout:                    yc.durationDefault(yc.SLMTimeout, 8*time.Second),
 		SLMCacheMaxEntries:            yc.intDefault(yc.SLMCacheMaxEntries, 512),
@@ -1678,6 +1777,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		SLMCacheMaxStale:              yc.intDefault(yc.SLMCacheMaxStale, 0),              // issue #835
 		SLMCacheStaleCleanupThreshold: yc.intDefault(yc.SLMCacheStaleCleanupThreshold, 0), // issue #1037
 		SLMCacheSemanticScanLimit:     yc.intDefault(yc.SLMCacheSemanticScanLimit, 0),     // issue #933
+		SLMTokenHint:                  yc.boolFieldDefault(yc.SLMTokenHint, true),         // issue #1233
 		FusionTimeout:                 yc.durationDefault(yc.FusionTimeout, 120*time.Second),
 		FusionLocalTimeout:            yc.durationDefault(yc.FusionLocalTimeout, 90*time.Second),    // issue #1164
 		FusionFrontierTimeout:         yc.durationDefault(yc.FusionFrontierTimeout, 30*time.Second), // issue #1164
@@ -1718,6 +1818,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		JudgeTimeout:            yc.durationDefault(yc.JudgeTimeout, 30*time.Second),
 		JudgeCostPer1KUSD:       yc.floatDefault(yc.JudgeCostPer1KUSD, 0.002),
 		JudgeDBPath:             yc.stringDefault(yc.JudgeDBPath, DefaultJudgeDBPath()),
+		JudgeAdaptiveEnabled:    yc.JudgeAdaptiveEnabled, // issue #1232
 
 		RoutingConfidenceDB:         yc.stringDefault(yc.RoutingConfidenceDB, DefaultRoutingConfidenceDBPath()),
 		RoutingConfidenceFloor:      clampFloat(yc.floatDefault(yc.RoutingConfidenceFloor, 0.4), 0, 1),
@@ -1753,6 +1854,7 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		MaxHeaderBytes:  yc.intDefault(yc.MaxHeaderBytes, DefaultServerMaxHeaderBytes),
 		ShutdownTimeout: yc.durationDefault(yc.ShutdownTimeout, DefaultShutdownTimeout),
 		TLSEnabled:      yc.TLSEnabled,
+		TLSClientCAFile: yc.TLSClientCAFile,
 
 		BudgetDailyLimit:      yc.floatDefault(yc.BudgetDailyLimit, 0),
 		BudgetAlertEnabled:    yc.BudgetAlertEnabled,
@@ -1853,6 +1955,11 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		cfg.MetricsExemplars = tracingEndpoint != ""
 	}
 
+	// OtelMetrics (issue #1238)
+	cfg.OtelMetricsEndpoint = yc.stringDefault(yc.OtelMetricsEndpoint, "")
+	cfg.OtelMetricsInterval = yc.durationDefault(yc.OtelMetricsInterval, 60*time.Second)
+	cfg.OtelMetricsTimeout = yc.durationDefault(yc.OtelMetricsTimeout, 10*time.Second)
+
 	// Warn if yaml had unrecognized injection scan roles (issue #845)
 	// Only warn when unrecognized tokens exist AND the fallback is ["system"] (issue #879).
 	if len(yamlUnrecognized) > 0 && len(yamlRoles) == 1 && yamlRoles[0] == "system" {
@@ -1905,6 +2012,14 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		cfg.TrustedProxies = parsed
 		cfg.TrustedProxiesRaw = yc.TrustedProxies
 	}
+
+	// Inbound IP allowlist (issue #1240)
+	if yc.AllowCIDRs != "" {
+		parsed, _ := parseTrustedProxies(yc.AllowCIDRs)
+		cfg.AllowCIDRs = parsed
+		cfg.AllowCIDRsRaw = yc.AllowCIDRs
+	}
+	cfg.AllowCIDRsStrict = yc.AllowCIDRsStrict
 
 	return cfg, nil
 }

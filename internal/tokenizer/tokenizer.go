@@ -22,13 +22,13 @@ func getCL100KBase() (*tiktoken.Tiktoken, error) {
 	return cl100kBase, cl100kBaseErr
 }
 
-// maxAccurateEncodeLen is the byte length above which CountTokens falls back
+// MaxAccurateEncodeLen is the byte length above which CountTokens falls back
 // to the len(s)/4 heuristic instead of running the full BPE encoder. BPE on
 // very large inputs (e.g. the 48 500-char guardrail test prompt) can take
 // tens of seconds on a CPU-starved CI runner, causing test-suite timeouts.
 // 8 192 chars ≈ 2 048 tokens — well within the range where the heuristic's
 // ~15 % error is acceptable for telemetry and estimation purposes.
-const maxAccurateEncodeLen = 8192
+const MaxAccurateEncodeLen = 8192
 
 // CountTokens returns the number of tokens in s using the cl100k_base
 // encoding (GPT-4 / ChatGPT tokenizer). This is accurate to within ~15%
@@ -42,7 +42,7 @@ func CountTokens(s string) int {
 	if s == "" {
 		return 0
 	}
-	if len(s) > maxAccurateEncodeLen {
+	if len(s) > MaxAccurateEncodeLen {
 		return len(s) / 4
 	}
 	enc, err := getCL100KBase()

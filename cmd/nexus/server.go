@@ -10,6 +10,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -47,12 +49,14 @@ import (
 // needs to hot-reload. It is returned by buildServer so main() can
 // wire the handlers without re-creating the collaborators.
 type serverParts struct {
-	judgeEval      *judge.Evaluator
-	rateLimiter    *ratelimit.Middleware
-	authLimiter    *ratelimit.AuthLimiter
-	authMiddleware *auth.Middleware // multi-key auth (issue #1154); nil for single-key
-	exporterCloser func() error
-	ipResolver     *ratelimit.ClientIPResolver
+	judgeEval           *judge.Evaluator
+	rateLimiter         *ratelimit.Middleware
+	allowlistMiddleware *ratelimit.AllowCIDRsMiddleware // inbound IP allowlist (issue #1240)
+	authLimiter         *ratelimit.AuthLimiter
+	authMiddleware      *auth.Middleware // multi-key auth (issue #1154); nil for single-key
+	exporterCloser      func() error
+	otelMetricsCloser   func() error
+	ipResolver          *ratelimit.ClientIPResolver
 }
 
 // buildServer constructs the fully-wired HTTP server from cfg.
@@ -342,6 +346,35 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		}
 	}
 
+	// OtelMetrics (issue #1238). OTLP/JSON metrics exporter.
+	// Placed after circuitCollector is initialized so the collector
+	// can be registered for slow-path metric readout.
+	if cfg.OtelMetricsEndpoint != "" {
+		otelExp := observability.NewOtelMetricsExporter(observability.OtelMetricsConfig{
+			Endpoint:       cfg.OtelMetricsEndpoint,
+			Interval:       cfg.OtelMetricsInterval,
+			Timeout:        cfg.OtelMetricsTimeout,
+			MaxRetries:     cfg.TracerMaxRetries,
+			RetryBaseDelay: cfg.TracerRetryBaseDelay,
+			MaxRetryDelay:  cfg.TracerRetryMaxDelay,
+		})
+		if otelExp != nil {
+			observability.RegisterCollector(circuitCollector)
+			observability.RegisterOtelMetricsExporter(otelExp)
+			parts.otelMetricsCloser = otelExp.Close
+			slog.Info("otel metrics exporter wired",
+				slog.String("endpoint", cfg.OtelMetricsEndpoint),
+				slog.Duration("interval", cfg.OtelMetricsInterval),
+				slog.Duration("timeout", cfg.OtelMetricsTimeout),
+			)
+		}
+	}
+	addCleanup(func() {
+		if parts.otelMetricsCloser != nil {
+			_ = parts.otelMetricsCloser()
+		}
+	})
+
 	stageCollector := observability.NewCollector()
 	if cfg.JudgeEnabled && cfg.JudgeAPIKey != "" {
 		evalCfg := judge.Config{
@@ -355,10 +388,11 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 			Timeout:            cfg.JudgeTimeout,
 			CostPer1K:          cfg.JudgeCostPer1KUSD,
 			BudgetGuard:        budgetGuard,
+			AdaptiveEnabled:    cfg.JudgeAdaptiveEnabled,
 		}
 		var storage judge.Storage
 		if cfg.JudgeDBEnabled() {
-			jstore, err := judge.OpenSQLiteStore(cfg.JudgeDBPath)
+			jstore, err := judge.OpenSQLiteStore(cfg.JudgeDBPath, cfg.MetricsBatchSize, cfg.MetricsBatchTimeout)
 			if err != nil {
 				slog.Error("judge SQLite store open failed, falling back to in-memory",
 					slog.String("path", cfg.JudgeDBPath),
@@ -514,7 +548,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		})
 	}
 
-	metricsStore, metricsObs := buildMetrics(cfg)
+	metricsStore, metricsObs := buildMetrics(cfg, circuitCollector.IncMetricsBatch)
 	// cacheWarmedEntries is set after the arbiter cache is created below;
 	// declared here so the gauge provider closure can capture it (issue #1176).
 	var cacheWarmedEntries int
@@ -733,6 +767,15 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 			}}
 		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			exp := observability.GlobalOtelMetricsExporter()
+			if exp == nil {
+				return nil
+			}
+			return []observability.GaugeSample{{
+				Name: "nexus_otel_metrics_export_failures_total", Value: float64(exp.ExportFailures()),
+			}}
+		}),
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
 			if localConcLimiter == nil {
 				return nil
 			}
@@ -778,6 +821,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 			}
 			return []observability.GaugeSample{
 				{Name: "nexus_judge_queue_depth", Value: float64(judgeEval.QueueDepth())},
+				{Name: "nexus_judge_adaptive_sample_rate", Value: judgeEval.AdaptiveRate()},
 			}
 		}),
 		observability.GaugeProviderFunc(func() []observability.GaugeSample {
@@ -1177,6 +1221,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 				IndexMode:       store.IndexMode(),
 				IndexGeneration: stats.IndexGeneration,
 				LastIndexAt:     stats.LastIndexAt,
+				DedupSkipped:    stats.DedupSkipped,
 			}
 			status.Embedder.Type = string(cfg.EmbedderType)
 			status.Embedder.Model = cfg.EmbeddingModel
@@ -1339,13 +1384,44 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 	// publicPathExempt in main.go.
 	handlers.RegisterDebugPprof(mux, cfg)
 
+	// Inbound IP allowlist (issue #1240). Applied at mux level before auth.
+	// Exempts /healthz and /metrics by default; NEXUS_ALLOW_CIDRS_STRICT=true
+	// removes the exemption so the allowlist covers all paths.
+	var allowlistMiddleware *ratelimit.AllowCIDRsMiddleware
+	if cfg.AllowCIDRsConfigured() {
+		exempt := func(r *http.Request) bool {
+			if cfg.AllowCIDRsStrict {
+				return false // strict mode: no exemptions
+			}
+			// Default: exempt health and metrics endpoints so K8s probes
+			// and Prometheus scrapers work without IP restrictions.
+			switch r.URL.Path {
+			case "/healthz", "/metrics", "/readyz":
+				return true
+			default:
+				return false
+			}
+		}
+		allowlistMiddleware = ratelimit.NewAllowCIDRsMiddleware(cfg.AllowCIDRs, exempt, parts.ipResolver)
+		parts.allowlistMiddleware = allowlistMiddleware
+		slog.Info("inbound IP allowlist enabled",
+			slog.Int("cidr_count", len(cfg.AllowCIDRs)),
+			slog.Bool("strict", cfg.AllowCIDRsStrict),
+		)
+	}
+
 	slog.Info("starting nexus proxy",
 		slog.String("addr", cfg.Addr),
 		slog.String("local_model", cfg.LocalModel),
 		slog.String("frontier_model", cfg.FrontierModel),
 	)
 
-	var rootHandler http.Handler = mux
+	// Apply allowlist middleware before auth wrapping.
+	handlerForAuth := http.Handler(mux)
+	if allowlistMiddleware != nil {
+		handlerForAuth = allowlistMiddleware.Wrap(handlerForAuth)
+	}
+	var rootHandler http.Handler = handlerForAuth
 	var authLimiter *ratelimit.AuthLimiter
 	if cfg.AuthEnabled() {
 		if cfg.AuthRateLimitEnabled() {
@@ -1428,6 +1504,30 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		MaxHeaderBytes:    cfg.MaxHeaderBytes,
 	}
 
+	// Inbound mTLS client certificate verification (issue #1241).
+	// When TLSClientCAFile is set, load the CA certificate and configure
+	// the server to require and verify client certificates. The verified
+	// certificate's Common Name is surfaced via X-Nexus-Client-CN.
+	// Note: serving TLS requires NEXUS_TLS_CERT_FILE and NEXUS_TLS_KEY_FILE
+	// to also be configured; this wires the client-cert verification only.
+	if cfg.TLSClientCAFile != "" {
+		caCertPEM, err := os.ReadFile(cfg.TLSClientCAFile)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("config: NEXUS_TLS_CLIENT_CA_FILE=%q: %w", cfg.TLSClientCAFile, err)
+		}
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCertPEM) {
+			return nil, nil, nil, fmt.Errorf("config: NEXUS_TLS_CLIENT_CA_FILE=%q: no valid PEM certificates found", cfg.TLSClientCAFile)
+		}
+		srv.TLSConfig = &tls.Config{
+			ClientCAs:  caCertPool,
+			ClientAuth: tls.RequireAndVerifyClientCert,
+		}
+		slog.Info("inbound mTLS configured",
+			slog.String("client_ca_file", cfg.TLSClientCAFile),
+		)
+	}
+
 	return srv, parts, cleanup, nil
 }
 
@@ -1439,7 +1539,60 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 // The panicObs callback is invoked when Recover catches a panic; pass nil for
 // a no-op. tlsEnabled controls HSTS emission (issue #444).
 func buildHandler(inner http.Handler, tlsEnabled bool, panicObs func(string)) http.Handler {
-	return handlers.SecurityHeaders(tlsEnabled)(handlers.Recover(panicObs)(inner))
+	// clientCNMiddleware is the outermost layer that runs for every request.
+	// It extracts the verified client-certificate CN and stamps X-Nexus-Client-CN
+	// on the response when a valid mTLS client cert is present (issue #1241).
+	return clientCNMiddleware(
+		handlers.SecurityHeaders(tlsEnabled)(
+			handlers.Recover(panicObs)(inner),
+		),
+	)
+}
+
+// clientCNMiddleware extracts the verified client certificate Common Name
+// from the TLS connection state and surfaces it on the response as the
+// X-Nexus-Client-CN header (issue #1241). This allows downstream systems
+// (audit logging, request attribution) to identify which mTLS client
+// certificate authenticated the incoming request. The header is only present
+// when a valid client certificate was verified; absent in plain HTTP.
+func clientCNMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var clientCN string
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+			cert := r.TLS.PeerCertificates[0]
+			// Extract CN from Subject.
+			clientCN = cert.Subject.CommonName
+			// Fallback: use the first DNS name if CN is empty.
+			if clientCN == "" && len(cert.DNSNames) > 0 {
+				clientCN = cert.DNSNames[0]
+			}
+		}
+		if clientCN != "" {
+			// Use a ResponseWriter wrapper so the header is set on every response,
+			// including those that never called w.WriteHeader explicitly.
+			w = &clientCNHeaderWriter{
+				ResponseWriter: w,
+				clientCN:       clientCN,
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// clientCNHeaderWriter wraps http.ResponseWriter to inject X-Nexus-Client-CN
+// on the first WriteHeader call.
+type clientCNHeaderWriter struct {
+	http.ResponseWriter
+	clientCN  string
+	headerSet bool
+}
+
+func (rw *clientCNHeaderWriter) WriteHeader(statusCode int) {
+	if !rw.headerSet {
+		rw.Header().Set("X-Nexus-Client-CN", rw.clientCN)
+		rw.headerSet = true
+	}
+	rw.ResponseWriter.WriteHeader(statusCode)
 }
 
 // drainComponents is called from the signal handler to stop async
@@ -1479,6 +1632,15 @@ func (p *serverParts) handleSIGHUP(cfg config.Config) config.Config {
 	}
 	if p.ipResolver != nil {
 		p.ipResolver.SetTrustedProxies(newCfg.TrustedProxies)
+	}
+	// Inbound IP allowlist hot-reload (issue #1240). Re-parse CIDRs and
+	// update the live allowlist middleware without a restart.
+	if p.allowlistMiddleware != nil {
+		p.allowlistMiddleware.SetCIDRs(newCfg.AllowCIDRs)
+		slog.Info("inbound IP allowlist reloaded via SIGHUP",
+			slog.Int("cidr_count", len(newCfg.AllowCIDRs)),
+			slog.Bool("strict", newCfg.AllowCIDRsStrict),
+		)
 	}
 	// Hot-reload multi-key credentials (issue #1154). Re-read the API
 	// keys file so individual keys can be rotated without a restart.

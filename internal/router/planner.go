@@ -16,6 +16,7 @@ package router
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"regexp"
 
@@ -281,6 +282,16 @@ type Planner struct {
 	// nexus_route_dsl_promoted_total counter. When nil the planner
 	// behaves identically to the pre-issue-1165 path.
 	Promoter *PatternPromoter
+
+	// SLMTokenHint enables prepending [tokens: ~N] to the routingText
+	// passed to the SLM (issue #1233). This gives the routing model
+	// a signal about prompt length so it can make better-informed
+	// routing decisions for medium-length prompts (500-2000 tokens)
+	// that sit in the gray zone between short and the guardrail.
+	// When false (or when SLM is nil), routingText is passed to the
+	// SLM without modification — byte-for-byte identical to the
+	// pre-issue-#1233 behaviour.
+	SLMTokenHint bool
 }
 
 // PlanRequest carries the per-request inputs the planner needs. The
@@ -384,6 +395,16 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 	routingText := req.Prompt
 	if req.ConversationContext != "" {
 		routingText = req.ConversationContext + "\n" + req.Prompt
+	}
+
+	// slmPrompt is the text passed to the SLM. When SLMTokenHint is
+	// enabled (issue #1233), prepend [tokens: ~N] so the routing model
+	// has prompt-length context for medium-length prompts that sit in
+	// the gray zone between short and the guardrail. The DSL, cache,
+	// and Categorize all use routingText so they are unaffected.
+	slmPrompt := routingText
+	if p.SLMTokenHint {
+		slmPrompt = fmt.Sprintf("[tokens: ~%d]\n%s", estimatedTokens, routingText)
 	}
 
 	// Stage 2a: Auto-promoted DSL patterns (issue #1165).
@@ -547,7 +568,7 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 			} else {
 				confidence = lConf
 			}
-			dec, err = cmpSLM.DecideWithComparativeConfidence(req.Context, routingText, lConf, fConf)
+			dec, err = cmpSLM.DecideWithComparativeConfidence(req.Context, slmPrompt, lConf, fConf)
 		} else {
 			if conf, cerr := p.Confidence.LocalConfidence(category); cerr != nil {
 				slog.Warn("planner: confidence lookup",
@@ -560,10 +581,10 @@ func (p *Planner) Plan(req PlanRequest) Decision {
 			} else {
 				confidence = conf
 			}
-			dec, err = p.SLM.DecideWithConfidence(req.Context, routingText, confidence)
+			dec, err = p.SLM.DecideWithConfidence(req.Context, slmPrompt, confidence)
 		}
 	} else {
-		dec, err = p.SLM.Decide(req.Context, routingText)
+		dec, err = p.SLM.Decide(req.Context, slmPrompt)
 	}
 	if err != nil {
 		return Decision{

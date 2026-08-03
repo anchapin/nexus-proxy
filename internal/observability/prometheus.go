@@ -112,6 +112,10 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total frontier completions sampled for judge evaluation (issue #1162).",
 		typ:  "counter",
 	},
+	"nexus_judge_adaptive_sample_rate": {
+		help: "Current effective adaptive judge sample rate (issue #1232). 0 when adaptive sampling is disabled.",
+		typ:  "gauge",
+	},
 	"nexus_confidence_store_rows_total": {
 		help: "Current number of rows in the routing_outcomes confidence store table (issue #834).",
 		typ:  "gauge",
@@ -221,6 +225,11 @@ var gaugeMeta = map[string]metricMeta{
 	"nexus_rag_circuit_failure_count": {
 		help: "Current consecutive failure count for RAG embedder circuit breakers (issue #886).",
 		typ:  "gauge",
+	},
+	// RAG semantic dedup (issue #1243).
+	"nexus_rag_dedup_skipped_total": {
+		help: "Total number of RAG chunks skipped at index time because they were too similar to existing chunks (issue #1243).",
+		typ:  "counter",
 	},
 	// SLM decision cache gauges (issue #531).
 	"nexus_slm_cache_entries": {
@@ -433,6 +442,14 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 	writeCounter(w, "nexus_budget_exceeded_total",
 		"Number of frontier requests rejected by the daily budget gate.",
 		c.budgetExceededTotal.Load())
+
+	// Metrics/Judge SQLite batch transaction counter (issue #1234).
+	// Counts the number of batch transactions committed by the metrics
+	// and judge store drain goroutines. Each increment represents one
+	// BEGIN...INSERT...COMMIT cycle.
+	writeCounter(w, "nexus_metrics_batch_total",
+		"Number of SQLite batch transactions committed by the metrics and judge stores (issue #1234).",
+		c.metricsBatchTotal.Load())
 
 	// TLS handshake counters. Optional: only non-zero when the operator
 	// configured TLS (NEXUS_TLS_CERT + NEXUS_TLS_KEY); otherwise both

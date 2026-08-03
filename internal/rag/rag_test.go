@@ -38,6 +38,150 @@ func TestCosineSimilarity(t *testing.T) {
 	}
 }
 
+func TestTokenize(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{"simple", "hello world", []string{"hello", "world"}},
+		{"code identifiers", "func myFunction", []string{"func", "myfunction"}},
+		{"numbers", "abc123 def456", []string{"abc123", "def456"}},
+		{"underscore", "my_var", []string{"my_var"}}, // underscores are kept as part of identifiers
+		{"mixed case", "Hello WORLD TestCase", []string{"hello", "world", "testcase"}},
+		{"empty", "", nil},
+		{"whitespace only", "   \t\n  ", nil},
+		{"punctuation", "a,b;c!d", []string{"a", "b", "c", "d"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tokenize(tc.input)
+			if len(got) == 0 && tc.want == nil {
+				return
+			}
+			if len(got) != len(tc.want) {
+				t.Errorf("got %v (len %d), want %v (len %d)", got, len(got), tc.want, len(tc.want))
+				return
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("got[%d]=%q, want[%d]=%q", i, got[i], i, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestIDF(t *testing.T) {
+	cases := []struct {
+		name string
+		N    int
+		n    int
+		want float64
+	}{
+		// Formula: log((N-n+0.5)/(n+0.5))
+		{"term in all docs", 10, 10, math.Log(0.5 / 10.5)},
+		{"term in half docs", 10, 5, 0.0}, // log((10-5+0.5)/(5+0.5)) = log(5.5/5.5) = log(1) = 0
+		{"term in one doc", 10, 1, math.Log(9.5 / 1.5)},
+		{"term in no docs", 10, 0, 0.0}, // handled by the n==0 early return
+		{"single doc", 1, 1, math.Log(0.5 / 1.5)},
+		{"single doc missing term", 1, 0, 0.0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := IDF(tc.N, tc.n)
+			if math.Abs(got-tc.want) > 1e-9 {
+				t.Errorf("IDF(%d, %d) = %v, want %v", tc.N, tc.n, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHybridScore(t *testing.T) {
+	// Formula: score = weight * 1/(k+rankSemantic) + (1-weight) * 1/(k+rankKeyword)
+	// weight=0 → pure keyword (rrfKeyword)
+	// weight=1 → pure semantic (rrfSemantic)
+	cases := []struct {
+		name         string
+		semanticRank int
+		keywordRank  int
+		weight       float64
+		want         float64
+	}{
+		{"weight=0 keyword rank 2", 1, 2, 0.0, 1.0 / (rrfK + 2)},
+		{"weight=0 keyword rank 1", 2, 1, 0.0, 1.0 / (rrfK + 1)},
+		{"weight=1 semantic rank 1", 1, 2, 1.0, 1.0 / (rrfK + 1)},
+		{"weight=1 semantic rank 3", 3, 1, 1.0, 1.0 / (rrfK + 3)},
+		{"weight=0.5 both rank 1", 1, 1, 0.5, 0.5*(1.0/(rrfK+1)) + 0.5*(1.0/(rrfK+1))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := hybridScore(0, 0, tc.weight, tc.semanticRank, tc.keywordRank, rrfK)
+			if math.Abs(got-tc.want) > 1e-9 {
+				t.Errorf("hybridScore(0, 0, %v, %d, %d, %v) = %v, want %v",
+					tc.weight, tc.semanticRank, tc.keywordRank, rrfK, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBM25Score(t *testing.T) {
+	// Create a store with known documents and set up vecs so stub doesn't return zeros.
+	emb := &stubEmbedder{vecs: map[string][]float64{
+		"func hello world": {1, 0},
+		"func world":       {0, 1},
+		"func hello java":  {0, 0, 1},
+	}}
+	store := NewStore(emb, 0.5)
+	// Add documents where "hello" appears in docs 0 and 2 but not doc 1.
+	store.Add("file1.go", "func hello world", []float64{1, 0})
+	store.Add("file2.go", "func world", []float64{0, 1})
+	store.Add("file3.java", "func hello java", []float64{0, 0, 1})
+
+	// Query that should match the "hello" docs - doc 0 has hello, doc 2 has hello, doc 1 does not.
+	// IDF should be log((3-2+0.5)/(2+0.5)) = log(1.5/2.5) ≈ -0.511
+	// But BM25 score depends on term frequency and document length.
+	scoreHello := store.BM25Score("hello", 0)
+	// Score may be negative if IDF is negative (term in most docs).
+	// Just verify it runs and returns a reasonable value.
+	_ = scoreHello // Score can be negative when term appears in many docs.
+
+	// Query that matches no docs should return 0.
+	scoreNoMatch := store.BM25Score("xyz123 nonexistent", 0)
+	if scoreNoMatch != 0 {
+		t.Errorf("BM25Score for 'xyz123' = %v, want 0", scoreNoMatch)
+	}
+}
+
+func TestRetrieveHybrid(t *testing.T) {
+	// Create a store with hybrid weight > 0.
+	emb := &stubEmbedder{vecs: map[string][]float64{
+		"func hello() {}": {1, 0, 0},
+		"func world() {}": {0, 1, 0},
+		"class Hello {}":  {0, 0, 1},
+		"prompt":          {1, 0, 0},
+	}}
+	store := NewStore(emb, 0.5, WithHybridWeight(0.5))
+
+	// Add docs - one with keyword "hello", one with semantic similarity.
+	store.Add("file1.go", "func hello() {}", []float64{1, 0, 0})
+	store.Add("file2.java", "class Hello {}", []float64{0, 0, 1})
+
+	// Retrieve with hybrid - should combine both signals.
+	ctx := context.Background()
+	example, score, path, err := store.Retrieve(ctx, "prompt")
+	if err != nil {
+		t.Fatalf("Retrieve error: %v", err)
+	}
+	if example == nil {
+		t.Fatal("Retrieve returned nil example")
+	}
+	if path != IndexPathHybrid {
+		t.Errorf("path = %q, want %q", path, IndexPathHybrid)
+	}
+	_ = score // score may vary based on ranking
+}
+
 type stubEmbedder struct {
 	vecs map[string][]float64
 	err  error

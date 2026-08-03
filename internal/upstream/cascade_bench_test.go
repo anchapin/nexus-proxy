@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/anchapin/nexus-proxy/internal/ioutils"
+	"github.com/anchapin/nexus-proxy/internal/tokenizer"
 )
 
 // genCompletionBody builds an OpenAI-compatible chat completion JSON
@@ -143,4 +144,80 @@ func BenchmarkFetchCascadeStepPooled(b *testing.B) {
 			}
 		})
 	}
+}
+
+// BenchmarkEstimatePromptTokensLarge verifies that estimatePromptTokens
+// avoids string allocation for large prompts (>MaxAccurateEncodeLen bytes)
+// by short-circuiting to the byte/4 heuristic before building the
+// concatenated string (issue #1235).
+func BenchmarkEstimatePromptTokensLarge(b *testing.B) {
+	// Build a prompt well above MaxAccurateEncodeLen so the fast path fires.
+	// At ~50 KB the byte/4 heuristic would be used anyway.
+	large := strings.Repeat("this is sample code content for a typical ai response. ", 2000)
+	payload := map[string]interface{}{
+		"model": "test",
+		"messages": []interface{}{
+			map[string]interface{}{"role": "user", "content": large},
+		},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		n := estimatePromptTokens(payload)
+		if n <= 0 {
+			b.Fatal("expected positive token count")
+		}
+	}
+}
+
+// BenchmarkEstimatePromptTokensSmall verifies that small prompts
+// (<=MaxAccurateEncodeLen) still use the full tokenizer path.
+func BenchmarkEstimatePromptTokensSmall(b *testing.B) {
+	small := strings.Repeat("a", 100)
+	payload := map[string]interface{}{
+		"model": "test",
+		"messages": []interface{}{
+			map[string]interface{}{"role": "user", "content": small},
+		},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		n := estimatePromptTokens(payload)
+		if n <= 0 {
+			b.Fatal("expected positive token count")
+		}
+	}
+}
+
+// BenchmarkEstimatePromptTokensAtThreshold verifies behavior just at the
+// MaxAccurateEncodeLen boundary (8192 bytes). The short-circuit should
+// fire for content > 8192 bytes and the accurate path for content <= 8192.
+func BenchmarkEstimatePromptTokensAtThreshold(b *testing.B) {
+	atExact := strings.Repeat("x", tokenizer.MaxAccurateEncodeLen)
+	above := strings.Repeat("x", tokenizer.MaxAccurateEncodeLen+1)
+	payloadAt := map[string]interface{}{
+		"model": "test",
+		"messages": []interface{}{
+			map[string]interface{}{"role": "user", "content": atExact},
+		},
+	}
+	payloadAbove := map[string]interface{}{
+		"model": "test",
+		"messages": []interface{}{
+			map[string]interface{}{"role": "user", "content": above},
+		},
+	}
+	b.Run("at_threshold", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = estimatePromptTokens(payloadAt)
+		}
+	})
+	b.Run("above_threshold", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = estimatePromptTokens(payloadAbove)
+		}
+	})
 }

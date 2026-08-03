@@ -262,6 +262,12 @@ func (b *confidenceBridge) Record(s judge.JudgeScore) error {
 // bridge).
 func (b *confidenceBridge) Close() error { return b.inner.Close() }
 
+// RecentScores delegates to the inner judge storage so the adaptive sampling
+// path (issue #1232) can query scores directly from the SQLite store.
+func (b *confidenceBridge) RecentScores(limit int) ([]int, error) {
+	return b.inner.RecentScores(limit)
+}
+
 // buildRAGStore constructs the RAG store (issue #46). Returns:
 //   - store: the RAGStore the chat handler is wired to (PersistentStore
 //     or in-memory Store, both satisfy the interface);
@@ -296,7 +302,9 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 			rag.WithBatchSize(cfg.RAGBatchSize),
 			rag.WithChunkTokens(cfg.RAGChunkTokens),
 			rag.WithRecursive(cfg.RAGRecursive),
-			rag.WithFileFilter(fileFilter))
+			rag.WithFileFilter(fileFilter),
+			rag.WithDedupThreshold(cfg.RAGDedupThreshold),
+			rag.WithDedupCrossDir(cfg.RAGDedupCrossDir))
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
@@ -307,7 +315,9 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 		rag.WithBatchSize(cfg.RAGBatchSize),
 		rag.WithChunkTokens(cfg.RAGChunkTokens),
 		rag.WithRecursive(cfg.RAGRecursive),
-		rag.WithFileFilter(fileFilter))
+		rag.WithFileFilter(fileFilter),
+		rag.WithDedupThreshold(cfg.RAGDedupThreshold),
+		rag.WithDedupCrossDir(cfg.RAGDedupCrossDir))
 	if err != nil {
 		// Persistence is a best-effort optimisation. Fall back to
 		// the in-memory store so the proxy still serves traffic —
@@ -321,7 +331,9 @@ func buildRAGStore(cfg config.Config, emb rag.Embedder, bootCtx context.Context)
 			rag.WithBatchSize(cfg.RAGBatchSize),
 			rag.WithChunkTokens(cfg.RAGChunkTokens),
 			rag.WithRecursive(cfg.RAGRecursive),
-			rag.WithFileFilter(fileFilter))
+			rag.WithFileFilter(fileFilter),
+			rag.WithDedupThreshold(cfg.RAGDedupThreshold),
+			rag.WithDedupCrossDir(cfg.RAGDedupCrossDir))
 		if err := store.IndexDir(bootCtx, cfg.ExamplesDir); err != nil {
 			slog.Warn("rag index failed", slog.Any("err", err))
 		}
@@ -402,12 +414,19 @@ func buildRecorder(cfg config.Config) telemetry.Recorder {
 //
 // The observer is a tiny adapter from handlers.MetricsEvent to
 // metrics.Request — same pattern as the judge/quality observers.
-func buildMetrics(cfg config.Config) (metrics.Store, handlers.MetricsObserver) {
+// batchCallback is invoked after every committed SQLite transaction
+// in the drain goroutine (issue #1234); pass nil if no callback needed.
+func buildMetrics(cfg config.Config, batchCallback func()) (metrics.Store, handlers.MetricsObserver) {
 	if !cfg.MetricsEnabled() {
 		slog.Info("metrics disabled (NEXUS_METRICS_DB is empty)")
 		return nil, nil
 	}
-	store, err := metrics.OpenWithRetention(cfg.MetricsDBPath, cfg.MetricsRetentionDays, nil)
+	batchCfg := metrics.BatchConfig{
+		Size:     cfg.MetricsBatchSize,
+		Timeout:  cfg.MetricsBatchTimeout,
+		Callback: batchCallback,
+	}
+	store, err := metrics.OpenWithRetention(cfg.MetricsDBPath, cfg.MetricsRetentionDays, nil, batchCfg)
 	if err != nil {
 		slog.Error("metrics open failed, metrics disabled", slog.Any("err", err))
 		return nil, nil
@@ -416,6 +435,7 @@ func buildMetrics(cfg config.Config) (metrics.Store, handlers.MetricsObserver) {
 		slog.Info("metrics recording",
 			slog.String("path", ss.Path()),
 			slog.Int("retention_days", cfg.MetricsRetentionDays),
+			slog.Int("batch_size", cfg.MetricsBatchSize),
 		)
 	}
 	obs := handlers.MetricsObserverFunc(func(e handlers.MetricsEvent) {

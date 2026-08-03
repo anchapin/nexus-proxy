@@ -61,6 +61,14 @@ type Config struct {
 	// posture.
 	TLSEnabled bool // emit HSTS; true when the effective inbound is TLS
 
+	// Inbound mTLS client certificate verification (issue #1241). When
+	// set, the proxy requires and verifies client certificates from
+	// downstream agents using the supplied CA certificate file.
+	// The Common Name of the verified certificate is surfaced in
+	// structured logs and audit records via X-Nexus-Client-CN.
+	// Bearer-token auth remains active as defense-in-depth.
+	TLSClientCAFile string // path to CA cert for client cert verification
+
 	// Graceful shutdown timeout (issue #121). Upper bound on the drain
 	// window the HTTP server observes after SIGTERM/SIGINT — a frontier
 	// SSE stream mid-token or a fusion arbiter call that just opened its
@@ -197,6 +205,23 @@ type Config struct {
 	// the file's base name; matching files are skipped during indexing.
 	RAGExcludePatterns []string // e.g. ["*_test.go", "*.gen.go"]
 
+	// RAG semantic deduplication (issue #1243). When > 0 (e.g. 0.95),
+	// new chunks whose cosine similarity to an existing chunk exceeds the
+	// threshold are skipped at index time. By default dedup is scoped to
+	// the same directory; set RAGDedupCrossDir to allow cross-directory
+	// dedup. A value of 0 (default) disables dedup entirely (backward
+	// compatible).
+	RAGDedupThreshold float64 // NEXUS_RAG_DEDUP_THRESHOLD; 0 = disabled
+	// RAGDedupCrossDir enables cross-directory deduplication (issue #1243).
+	// When false (default), dedup only compares against chunks in the
+	// same directory as the new chunk. When true, compares against all
+	// indexed chunks regardless of directory.
+	RAGDedupCrossDir bool // NEXUS_RAG_DEDUP_CROSS_DIR
+	// RAG hybrid retrieval (issue #1242). When > 0, BM25 keyword scores
+	// are combined with cosine similarity via Reciprocal Rank Fusion.
+	// 0.0 = pure semantic (backward compatible), 1.0 = pure keyword.
+	// Values between 0 and 1 blend both signals; 0.5 is a balanced default.
+	RAGHybridWeight float64 // NEXUS_RAG_HYBRID_WEIGHT
 	// Routing
 	TokenGuardrail                int           // estimated tokens above this force frontier (6000)
 	SLMTimeout                    time.Duration // Qwen3-Coder routing timeout (8s)
@@ -206,6 +231,7 @@ type Config struct {
 	SLMCacheStaleCleanupThreshold int           // Get-triggered eviction threshold; 0 = disabled (issue #1037)
 	SLMCacheSemanticScanLimit     int           // max entries scanned in getSemantic; 0 = unlimited (issue #933)
 	SLMConfidenceThreshold        float64       // hard escalation threshold: local/fusion decisions below this force frontier (default 0.3, issue #301)
+	SLMTokenHint                  bool          // prepend [tokens: ~N] hint to SLM routing prompt (issue #1233)
 	RoutingContextTurns           int           // prior conversation turns fed to the router for multi-turn context (default 3, issue #1147)
 	RoutingContextChars           int           // char cap on the conversation-context window fed to the router (default 2000, issue #1147)
 	FusionTimeout                 time.Duration // per-panel-member fetch timeout (120s), shared fallback
@@ -473,6 +499,7 @@ type Config struct {
 	JudgeTimeout            time.Duration // per-call judge timeout (default 30s)
 	JudgeCostPer1KUSD       float64       // rough USD/1k-token rate for cost estimates
 	JudgeDBPath             string        // on-disk SQLite database for judge scores; empty disables Detected
+	JudgeAdaptiveEnabled    bool          // enable adaptive sampling based on rolling avg of recent scores (issue #1232)
 	// edits enqueue a background `cargo check` / `npx tsc` and the
 	// verdict (1 = clean, 0 = fail/timeout) is reported via a
 	// callback to cmd/nexus/main.go. QualityEnabled is true iff
@@ -564,6 +591,20 @@ type Config struct {
 	// the prune goroutine lifecycle is bound to the store's lifetime.
 	MetricsRetentionDays int
 
+	// MetricsBatchSize is the number of records that trigger a batched
+	// SQLite transaction in the metrics store drain goroutine (issue #1234).
+	// When the buffer reaches this size, the drain commits a
+	// BEGIN...INSERT...COMMIT transaction. Default 64. BATCH_SIZE=1
+	// reproduces the pre-batch per-record INSERT behaviour.
+	MetricsBatchSize int
+
+	// MetricsBatchTimeout is the maximum delay before a partial batch
+	// is flushed (issue #1234). If the buffer has at least one record
+	// and this duration elapses since the last flush, the drain commits
+	// whatever is in the batch. Default 100ms. Together with
+	// MetricsBatchSize this amortises WAL write amplification under load.
+	MetricsBatchTimeout time.Duration
+
 	// OTLP retry/back-off parameters (issue #803). These tune the
 	// behaviour when the collector returns 5xx errors. The back-off
 	// follows exponential growth: base * 2^(attempt-1) capped at max.
@@ -654,6 +695,19 @@ type Config struct {
 	// throttling); <=0 falls back to RateLimitRPM in the limiter.
 	TrustedProxies    []*net.IPNet
 	TrustedProxiesRaw string
+
+	// AllowCIDRs is the inbound IP allowlist sourced from NEXUS_ALLOW_CIDRS.
+	// When non-empty, only clients whose IP falls within at least one CIDR
+	// are permitted; all others receive HTTP 403. When empty (the default),
+	// the allowlist is disabled and all IPs are permitted. This provides
+	// network-layer access control for local-only / air-gapped deployments
+	// (issue #1240). AllowCIDRsRaw preserves the raw source value for
+	// diagnostic display. AllowCIDRsStrict controls whether /healthz and
+	// /metrics are exempt from the allowlist (default: not strict).
+	AllowCIDRs       []*net.IPNet
+	AllowCIDRsRaw    string
+	AllowCIDRsStrict bool // when true, no path is exempt from the allowlist
+
 	RateLimitRPM      int
 	RateLimitBurst    int
 	RateLimitByAPIKey bool // issue #776: bucket on SHA256(IP + ":" + APIKey) when true
@@ -726,6 +780,17 @@ type Config struct {
 	// MetricsExemplars controls whether histogram buckets carry OTLP
 	// trace exemplars in the Prometheus exposition (issue #1171).
 	MetricsExemplars bool
+
+	// OtelMetrics (issue #1238). OTLP/JSON metrics exporter.
+	// Endpoint is the full OTLP HTTP URL including /v1/metrics path.
+	// Empty disables metrics export entirely (zero overhead).
+	// Interval is the periodic push cadence (default 60s). Timeout
+	// bounds each POST (default 10s). Shares the same retry/back-off
+	// tunables as tracing (NEXUS_TRACING_MAX_RETRIES etc.) for
+	// consistency.
+	OtelMetricsEndpoint string
+	OtelMetricsInterval time.Duration
+	OtelMetricsTimeout  time.Duration
 
 	// Response-content redaction (issue #1172).
 	RedactEnabled     bool
@@ -999,6 +1064,27 @@ func Load() (Config, error) {
 	}
 	cfg.MetricsRetentionDays = retentionDays
 
+	// Metrics batch config (issue #1234). BatchSize defaults to 64;
+	// BatchTimeout defaults to 100ms. Both also apply to the judge
+	// SQLite store.
+	metricsBatchSize, err := getEnvInt("NEXUS_METRICS_BATCH_SIZE", 64)
+	if err != nil {
+		return cfg, err
+	}
+	if metricsBatchSize < 1 {
+		metricsBatchSize = 1
+	}
+	cfg.MetricsBatchSize = metricsBatchSize
+
+	metricsBatchTimeout, err := getEnvDuration("NEXUS_METRICS_BATCH_TIMEOUT", 100*time.Millisecond)
+	if err != nil {
+		return cfg, err
+	}
+	if metricsBatchTimeout <= 0 {
+		metricsBatchTimeout = 100 * time.Millisecond
+	}
+	cfg.MetricsBatchTimeout = metricsBatchTimeout
+
 	// OTLP retry/back-off parameters (issue #803).
 	tracerMaxRetries, err := getEnvInt("NEXUS_TRACING_MAX_RETRIES", 0)
 	if err != nil {
@@ -1163,6 +1249,31 @@ func Load() (Config, error) {
 	// (e.g. "*_test.go,*.gen.go"). Matching files are skipped.
 	cfg.RAGExcludePatterns = ragpkg.ParseCommaSeparated(getEnvAllowEmpty("NEXUS_RAG_EXCLUDE_PATTERNS", ""))
 
+	// RAG semantic deduplication threshold (issue #1243). Cosine similarity
+	// above which a new chunk is suppressed in favor of an existing one.
+	// 0 (default) disables dedup entirely.
+	dedupThreshold, err := getEnvFloat("NEXUS_RAG_DEDUP_THRESHOLD", 0)
+	if err != nil {
+		return cfg, err
+	}
+	if dedupThreshold < 0 {
+		dedupThreshold = 0
+	}
+	if dedupThreshold > 1 {
+		dedupThreshold = 1
+	}
+	cfg.RAGDedupThreshold = dedupThreshold
+	// RAG cross-directory dedup (issue #1243). When false (default), dedup
+	// only compares against chunks in the same directory. When true,
+	// compares against all indexed chunks regardless of directory.
+	cfg.RAGDedupCrossDir = getEnvBool("NEXUS_RAG_DEDUP_CROSS_DIR", false)
+	// RAG hybrid BM25 + semantic retrieval (issue #1242). 0.0 = pure semantic,
+	// 1.0 = pure keyword. Default 0.0 preserves byte-for-byte backward compatibility.
+	hybridWeight, err := getEnvFloat("NEXUS_RAG_HYBRID_WEIGHT", 0.0)
+	if err != nil {
+		return cfg, fmt.Errorf("NEXUS_RAG_HYBRID_WEIGHT: %w", err)
+	}
+	cfg.RAGHybridWeight = hybridWeight
 	guardrail, err := getEnvInt("NEXUS_TOKEN_GUARDRAIL", 6000)
 	if err != nil {
 		return cfg, err
@@ -1200,6 +1311,12 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.SLMConfidenceThreshold = slmConfThreshold
+
+	// SLM token hint (issue #1233). When true, prepends [tokens: ~N]
+	// to the routingText passed to the SLM so it can make better-informed
+	// routing decisions for medium-length prompts. Does not affect the
+	// guardrail or any other stage. Default true.
+	cfg.SLMTokenHint = getEnvBool("NEXUS_SLM_TOKEN_HINT", true)
 
 	// Conversation-context window for routing (issue #1147). The handler
 	// assembles a bounded summary of prior turns so the DSL fast-pass and
@@ -1820,6 +1937,12 @@ func Load() (Config, error) {
 	// outer hop is HTTPS and HSTS is safe to advertise.
 	cfg.TLSEnabled = getEnvBool("NEXUS_TLS_ENABLED", false)
 
+	// Inbound mTLS client certificate verification (issue #1241). When
+	// non-empty, the proxy requires and verifies client certificates
+	// from downstream agents using the supplied CA certificate file.
+	// Bearer-token auth remains active as defense-in-depth.
+	cfg.TLSClientCAFile = getEnv("NEXUS_TLS_CLIENT_CA_FILE", "")
+
 	// Graceful shutdown drain window (issue #121). Replaces the prior
 	// hardcoded `const shutdownTimeout = 10 * time.Second` in main.go
 	// so operators can tune the SIGTERM drain to match their longest
@@ -1894,6 +2017,12 @@ func Load() (Config, error) {
 	// written to an on-disk SQLite store that survives restarts.
 	// Empty (the default) uses the in-memory MemoryStorage.
 	cfg.JudgeDBPath = getEnvAllowEmpty("NEXUS_JUDGE_DB", DefaultJudgeDBPath())
+
+	// Judge adaptive sampling (issue #1232). When enabled, the sample
+	// rate is dynamically adjusted based on the rolling average of
+	// recent judge scores: decay to 1% if avg > 4.0, increase to 10%
+	// if avg < 3.0, else hold at 5%.
+	cfg.JudgeAdaptiveEnabled = getEnvBool("NEXUS_JUDGE_ADAPTIVE_ENABLED", false)
 
 	// The judge is "enabled" iff the operator actually configured
 	// sampling above zero. Zero/negative rate keeps the worker pool
@@ -2049,6 +2178,27 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.TrustedProxies = parsed
+
+	// NEXUS_ALLOW_CIDRS is a comma-separated inbound IP allowlist.
+	// When non-empty, only clients whose IP falls within at least one
+	// CIDR are permitted; all others receive HTTP 403. This provides
+	// network-layer access control for local-only deployments (issue #1240).
+	// Invalid CIDRs fail boot with a clear error. A bare IP (no /prefix)
+	// is accepted and treated as a /32 or /128.
+	cfg.AllowCIDRsRaw = strings.TrimSpace(os.Getenv("NEXUS_ALLOW_CIDRS"))
+	if cfg.AllowCIDRsRaw != "" {
+		parsed, err := parseTrustedProxies(cfg.AllowCIDRsRaw)
+		if err != nil {
+			return cfg, fmt.Errorf("config: invalid NEXUS_ALLOW_CIDRS entry %q: %w", cfg.AllowCIDRsRaw, err)
+		}
+		cfg.AllowCIDRs = parsed
+	}
+
+	// NEXUS_ALLOW_CIDRS_STRICT controls whether /healthz and /metrics are
+	// exempt from the inbound allowlist. Default (false) means those
+	// endpoints are always reachable; true removes the exemption so the
+	// allowlist applies to all paths.
+	cfg.AllowCIDRsStrict = getEnvBool("NEXUS_ALLOW_CIDRS_STRICT", false)
 
 	// Rolling 24h frontier spend guard (issue #183, #201). When
 	// BudgetDailyLimit > 0 the guard is active. Alerting is
@@ -2218,6 +2368,28 @@ func Load() (Config, error) {
 	// is active (TracingEndpoint set) so operators get exemplars
 	// automatically; explicitly false when tracing is off.
 	cfg.MetricsExemplars = getEnvBool("NEXUS_METRICS_EXEMPLARS", cfg.TracingEndpoint != "")
+
+	// OtelMetrics (issue #1238). OTLP/JSON metrics exporter. Empty
+	// endpoint disables export entirely (zero overhead).
+	cfg.OtelMetricsEndpoint = getEnvAllowEmpty("NEXUS_OTEL_METRICS_ENDPOINT", "")
+
+	otelMetricsInterval, err := getEnvDuration("NEXUS_OTEL_METRICS_INTERVAL", 60*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	if otelMetricsInterval <= 0 {
+		otelMetricsInterval = 60 * time.Second
+	}
+	cfg.OtelMetricsInterval = otelMetricsInterval
+
+	otelMetricsTimeout, err := getEnvDuration("NEXUS_OTEL_METRICS_TIMEOUT", 10*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	if otelMetricsTimeout < 0 {
+		return cfg, configError("NEXUS_OTEL_METRICS_TIMEOUT", "must not be negative", os.Getenv("NEXUS_OTEL_METRICS_TIMEOUT"), DefaultTracingTimeout.String())
+	}
+	cfg.OtelMetricsTimeout = otelMetricsTimeout
 
 	// Response-content redaction (issue #1172).
 	cfg.RedactEnabled = getEnvBool("NEXUS_REDACT_ENABLED", false)
@@ -2531,6 +2703,10 @@ func (c Config) AuthRateLimitEnabled() bool { return c.AuthRateLimitRPM > 0 }
 // let a single NATed IP exhaust the whole per-client budget.
 func (c Config) TrustedProxiesConfigured() bool { return len(c.TrustedProxies) > 0 }
 
+// AllowCIDRsConfigured reports whether any inbound allowlist CIDRs are set.
+// When true, only clients in the allowlist are permitted; others get 403.
+func (c Config) AllowCIDRsConfigured() bool { return len(c.AllowCIDRs) > 0 }
+
 // IsLoopbackBind reports whether the configured NEXUS_ADDR binds only
 // to a loopback interface. A listen address is considered loopback when
 // its host portion is empty ("", as in ":8000" — binds all interfaces
@@ -2723,7 +2899,25 @@ func ReloadHotReloadable(prev Config) (Config, HotReloadResult) {
 		next.TrustedProxies = parsed
 	}
 
+	// Allow CIDRs: re-parse from env so the SIGHUP handler can push the
+	// updated list into the live allowlister without a restart (issue #1240).
+	next.AllowCIDRsRaw = strings.TrimSpace(os.Getenv("NEXUS_ALLOW_CIDRS"))
+	if parsed, err := parseTrustedProxies(next.AllowCIDRsRaw); err != nil {
+		// Bogus value after boot: add to NeedsRestart so the operator is told
+		// a restart is required instead of silently preserving the previous
+		// value (issue #1055).
+		slog.Warn("invalid NEXUS_ALLOW_CIDRS, restart required to apply change",
+			slog.String("reason", err.Error()))
+		next.AllowCIDRs = prev.AllowCIDRs
+		result.NeedsRestart = append(result.NeedsRestart, "NEXUS_ALLOW_CIDRS")
+	} else {
+		next.AllowCIDRs = parsed
+	}
+
 	// Hot-reloadable settings.
+
+	// AllowCIDRsStrict is hot-reloadable (issue #1240).
+	next.AllowCIDRsStrict = getEnvBool("NEXUS_ALLOW_CIDRS_STRICT", prev.AllowCIDRsStrict)
 
 	// Multi-key auth file (issue #1154): re-read the path so the SIGHUP
 	// handler can reload credentials without a restart.
@@ -3074,3 +3268,522 @@ const (
 
 	defaultTOONNotice = "\n\n[PROXY SYSTEM NOTE]: Data arrays have been compressed using Token-Oriented Object Notation (TOON). The format is `object_name[count]{key1,key2}:\n  val1,val2`. Read the schema header to map the comma-separated rows."
 )
+
+// ConfigField describes a single configuration knob for the `nexus config show`
+// command. Key is the canonical NEXUS_ env var name; Value is the resolved
+// string representation; Source is "env" | "file" | "default";
+// HotReloadable is true when the knob can be changed at runtime via SIGHUP.
+type ConfigField struct {
+	Key           string
+	Value         string
+	Source        string // "env", "file", "default"
+	HotReloadable bool
+}
+
+// hotReloadableEnvs is the set of env vars that ReloadHotReloadable() can
+// re-read at runtime without a restart. Derived from the function body.
+var hotReloadableEnvs = map[string]bool{
+	"NEXUS_TRUSTED_PROXIES":            true,
+	"NEXUS_API_KEYS_FILE":              true,
+	"NEXUS_RATE_LIMIT_RPM":             true,
+	"NEXUS_RATE_LIMIT_BURST":           true,
+	"NEXUS_AUTH_RATE_LIMIT_RPM":        true,
+	"NEXUS_AUTH_RATE_LIMIT_BURST":      true,
+	"NEXUS_AUTH_RATE_LIMIT_WINDOW":     true,
+	"NEXUS_LOG_LEVEL":                  true,
+	"NEXUS_LOG_FORMAT":                 true,
+	"NEXUS_DEBUG":                      true,
+	"NEXUS_SHUTDOWN_TIMEOUT":           true,
+	"NEXUS_SERVER_READ_TIMEOUT":        true,
+	"NEXUS_BUDGET_ALERT_THRESHOLD":     true,
+	"NEXUS_FUSION_AGREEMENT_THRESHOLD": true,
+	"NEXUS_TRACING_SAMPLE_RATE":        true,
+}
+
+// IsHotReloadable returns true when the given env var name (e.g. "NEXUS_RATE_LIMIT_RPM")
+// can be re-read at runtime via SIGHUP without a full restart.
+func IsHotReloadable(envKey string) bool {
+	return hotReloadableEnvs[envKey]
+}
+
+// EnvToYAMLKey maps environment-variable names to their YAMLConfig snake_case
+// equivalents.  Exported so the `nexus config show --diff` command can
+// determine which YAML key corresponds to a given env var.
+var EnvToYAMLKey = map[string]string{
+	"NEXUS_ADDR":                              "addr",
+	"NEXUS_SERVER_READ_TIMEOUT":               "server_read_timeout",
+	"NEXUS_SERVER_WRITE_TIMEOUT":              "server_write_timeout",
+	"NEXUS_SERVER_IDLE_TIMEOUT":               "server_idle_timeout",
+	"NEXUS_SERVER_MAX_HEADER_BYTES":           "server_max_header_bytes",
+	"NEXUS_SHUTDOWN_TIMEOUT":                  "shutdown_timeout",
+	"NEXUS_MAX_BODY_BYTES":                    "max_body_bytes",
+	"NEXUS_TLS_ENABLED":                       "tls_enabled",
+	"NEXUS_LOG_LEVEL":                         "log_level",
+	"NEXUS_LOG_FORMAT":                        "log_format",
+	"NEXUS_DEBUG":                             "debug",
+	"NEXUS_DEBUG_BODY_BYTES":                  "debug_body_bytes",
+	"NEXUS_DEBUG_PPROF_ENABLED":               "debug_pprof_enabled",
+	"NEXUS_DEBUG_PPROF_API_KEY":               "debug_pprof_api_key",
+	"NEXUS_OLLAMA_URL":                        "ollama_url",
+	"NEXUS_ROUTER_MODEL":                      "router_model",
+	"NEXUS_LOCAL_MODEL":                       "local_model",
+	"NEXUS_EMBEDDING_MODEL":                   "embedding_model",
+	"NEXUS_FRONTIER_URL":                      "frontier_url",
+	"NEXUS_FRONTIER_MODEL":                    "frontier_model",
+	"NEXUS_FRONTIER_API_KEY":                  "frontier_api_key",
+	"NEXUS_FRONTIER_COST_PER_1K":              "frontier_cost_per_1k",
+	"NEXUS_ZAI_URL":                           "zai_url",
+	"NEXUS_ZAI_MODEL":                         "zai_model",
+	"NEXUS_ZAI_API_KEY":                       "zai_api_key",
+	"NEXUS_ZAI_COST_PER_1K":                   "zai_cost_per_1k",
+	"NEXUS_PROXY_API_KEY":                     "proxy_api_key",
+	"NEXUS_STATUS_PUBLIC":                     "status_public",
+	"NEXUS_API_KEYS_FILE":                     "api_keys_file",
+	"NEXUS_AUTH_MODE":                         "auth_mode",
+	"NEXUS_OIDC_JWKS_URL":                     "oidc_jwks_url",
+	"NEXUS_OIDC_ISSUER":                       "oidc_issuer",
+	"NEXUS_OIDC_AUDIENCE":                     "oidc_audience",
+	"NEXUS_OIDC_JWKS_REFRESH":                 "oidc_jwks_refresh",
+	"NEXUS_COST_BASELINE_PROVIDER":            "cost_baseline_provider",
+	"NEXUS_COST_BASELINE_MODEL":               "cost_baseline_model",
+	"NEXUS_COST_BASELINE_RATE_PER_1K":         "cost_baseline_rate_per_1k",
+	"NEXUS_COST_USE_OUTPUT_TOKENS":            "cost_use_output_tokens",
+	"NEXUS_ANTHROPIC_CACHE_MIN_SYSTEM_CHARS":  "anthropic_cache_min_system_chars",
+	"NEXUS_AZURE_CONTENT_FILTER_ENABLED":      "azure_content_filter_enabled",
+	"NEXUS_BUDGET_DAILY_LIMIT":                "budget_daily_limit",
+	"NEXUS_BUDGET_ALERT_ENABLED":              "budget_alert_enabled",
+	"NEXUS_BUDGET_ALERT_THRESHOLD":            "budget_alert_threshold",
+	"NEXUS_BUDGET_ALERT_WEBHOOK_URL":          "budget_alert_webhook_url",
+	"NEXUS_SELECTOR_WINDOW":                   "selector_window",
+	"NEXUS_SELECTOR_MIN_SAMPLES":              "selector_min_samples",
+	"NEXUS_SELECTOR_REFRESH":                  "selector_refresh",
+	"NEXUS_PROVIDER_TAIL_WEIGHT":              "provider_tail_weight",
+	"NEXUS_EXAMPLES_DIR":                      "examples_dir",
+	"NEXUS_RAG_THRESHOLD":                     "rag_threshold",
+	"NEXUS_EMBEDDER_TYPE":                     "embedder_type",
+	"NEXUS_EMBEDDER_BASE_URL":                 "embedder_base_url",
+	"NEXUS_COHERE_API_KEY":                    "cohere_api_key",
+	"NEXUS_RAG_DB":                            "rag_db",
+	"NEXUS_RAG_POLL_INTERVAL":                 "rag_poll_interval",
+	"NEXUS_RAG_RECURSIVE":                     "rag_recursive",
+	"NEXUS_RAG_EMBED_CACHE_SIZE":              "rag_embed_cache_size",
+	"NEXUS_RAG_EMBED_CACHE_TTL":               "rag_embed_cache_ttl",
+	"NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT":      "rag_embed_cache_wait_timeout",
+	"NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD":     "rag_circuit_breaker_threshold",
+	"NEXUS_RAG_CIRCUIT_BREAKER_COOLDOWN":      "rag_circuit_breaker_cooldown",
+	"NEXUS_RAG_BATCH_SIZE":                    "rag_batch_size",
+	"NEXUS_RAG_CHUNK_TOKENS":                  "rag_chunk_tokens",
+	"NEXUS_RAG_TOP_K":                         "rag_top_k",
+	"NEXUS_RAG_MAX_INJECTION_TOKENS":          "rag_max_injection_tokens",
+	"NEXUS_RAG_FILE_EXTENSIONS":               "rag_file_extensions",
+	"NEXUS_RAG_EXCLUDE_PATTERNS":              "rag_exclude_patterns",
+	"NEXUS_TOKEN_GUARDRAIL":                   "token_guardrail",
+	"NEXUS_SLM_TIMEOUT":                       "slm_timeout",
+	"NEXUS_SLM_CACHE_MAX_ENTRIES":             "slm_cache_max_entries",
+	"NEXUS_SLMCACHE_SIMILARITY_THRESHOLD":     "slm_cache_similarity_threshold",
+	"NEXUS_SLMCACHE_MAX_STALE":                "slm_cache_max_stale",
+	"NEXUS_SLMCACHE_STALE_CLEANUP_THRESHOLD":  "slm_cache_stale_cleanup_threshold",
+	"NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT":      "slm_cache_semantic_scan_limit",
+	"NEXUS_SLM_CONFIDENCE_THRESHOLD":          "slm_confidence_threshold",
+	"NEXUS_ROUTING_CONTEXT_TURNS":             "routing_context_turns",
+	"NEXUS_ROUTING_CONTEXT_CHARS":             "routing_context_chars",
+	"NEXUS_FUSION_TIMEOUT":                    "fusion_timeout",
+	"NEXUS_FUSION_LOCAL_TIMEOUT":              "fusion_local_timeout",
+	"NEXUS_FUSION_FRONTIER_TIMEOUT":           "fusion_frontier_timeout",
+	"NEXUS_CASCADE_TIMEOUT":                   "cascade_timeout",
+	"NEXUS_CASCADE_TIMEOUT_FLOOR":             "cascade_timeout_floor",
+	"NEXUS_CASCADE_TIMEOUT_CEILING":           "cascade_timeout_ceiling",
+	"NEXUS_CASCADE_TIMEOUT_PER_1K_TOKENS":     "cascade_timeout_per_1k_tokens",
+	"NEXUS_ARBITER_TIMEOUT":                   "arbiter_timeout",
+	"NEXUS_FRONTIER_FAILOVER":                 "frontier_failover",
+	"NEXUS_FRONTIER_FAILOVER_MAX_ATTEMPTS":    "frontier_failover_max_attempts",
+	"NEXUS_COALESCE_ENABLED":                  "coalesce_enabled",
+	"NEXUS_COALESCE_TTL":                      "coalesce_ttl",
+	"NEXUS_COALESCE_MAX_ENTRIES":              "coalesce_max_entries",
+	"NEXUS_DSL_FORMATTING_PATTERNS":           "dsl_formatting_patterns",
+	"NEXUS_DSL_FUSION_PATTERNS":               "dsl_fusion_patterns",
+	"NEXUS_DSL_LOCAL_PATTERNS":                "dsl_local_patterns",
+	"NEXUS_DSL_UNICODE_PATTERNS":              "dsl_unicode_patterns",
+	"NEXUS_DSL_PROMOTION_MIN_SAMPLES":         "dsl_promotion_min_samples",
+	"NEXUS_DSL_PROMOTION_CONFIDENCE":          "dsl_promotion_confidence",
+	"NEXUS_DSL_PROMOTION_INTERVAL":            "dsl_promotion_interval",
+	"NEXUS_FUSION_PROGRESSIVE":                "fusion_progressive",
+	"NEXUS_FUSION_AGREEMENT_THRESHOLD":        "fusion_agreement_threshold",
+	"NEXUS_FUSION_SIMILARITY_MODE":            "fusion_similarity_mode",
+	"NEXUS_ARBITER_CACHE_TTL":                 "arbiter_cache_ttl",
+	"NEXUS_ARBITER_CACHE_MAX_ENTRIES":         "arbiter_cache_max_entries",
+	"NEXUS_CACHE_WARM_ON_BOOT":                "cache_warm_on_boot",
+	"NEXUS_CACHE_WARM_LIMIT":                  "cache_warm_limit",
+	"NEXUS_ROUTING_CONFIDENCE_DB":             "routing_confidence_db",
+	"NEXUS_ROUTING_CONFIDENCE_FLOOR":          "routing_confidence_floor",
+	"NEXUS_ROUTING_CONFIDENCE_CEILING":        "routing_confidence_ceiling",
+	"NEXUS_ROUTING_CONFIDENCE_MIN_SAMPLES":    "routing_confidence_min_samples",
+	"NEXUS_ROUTING_CONFIDENCE_WINDOW":         "routing_confidence_window",
+	"NEXUS_SLM_CACHE_TTL":                     "slm_cache_ttl",
+	"NEXUS_HEALTH_POLL_INTERVAL":              "health_poll_interval",
+	"NEXUS_HEALTH_BREAKER_THRESHOLD":          "health_breaker_threshold",
+	"NEXUS_HEALTH_PROBE_TIMEOUT":              "health_probe_timeout",
+	"NEXUS_FRONTIER_HEALTH_POLL_INTERVAL":     "frontier_health_poll_interval",
+	"NEXUS_FRONTIER_HEALTH_BREAKER_THRESHOLD": "frontier_health_breaker_threshold",
+	"NEXUS_FRONTIER_HEALTH_TIMEOUT":           "frontier_health_timeout",
+	"NEXUS_PROBE_INTERVAL":                    "probe_interval",
+	"NEXUS_PROBE_TIMEOUT":                     "probe_timeout",
+	"NEXUS_PROBE_BYTES_PER_TOKEN":             "probe_bytes_per_token",
+	"NEXUS_PROBE_THERMAL_THRESHOLD":           "probe_thermal_threshold",
+	"NEXUS_PROBE_NVIDIA_INTERVAL":             "probe_nvidia_interval",
+	"NEXUS_LOCAL_MAX_CONCURRENT":              "local_max_concurrent",
+	"NEXUS_LOCAL_VRAM_BYTES_PER_SLOT":         "local_vram_bytes_per_slot",
+	"NEXUS_LOCAL_COOLDOWN":                    "local_cooldown",
+	"NEXUS_METRICS_DB":                        "metrics_db",
+	"NEXUS_METRICS_RETENTION_DAYS":            "metrics_retention_days",
+	"NEXUS_MAX_RESPONSE_BYTES":                "max_response_bytes",
+	"NEXUS_CASCADE_MAX_RESPONSE_BYTES":        "cascade_max_response_bytes",
+	"NEXUS_POOL_BUFFER_MAX_BYTES":             "pool_buffer_max_bytes",
+	"NEXUS_AUTH_RATE_LIMIT_RPM":               "auth_rate_limit_rpm",
+	"NEXUS_AUTH_RATE_LIMIT_BURST":             "auth_rate_limit_burst",
+	"NEXUS_AUTH_RATE_LIMIT_WINDOW":            "auth_rate_limit_window",
+	"NEXUS_TRUSTED_PROXIES":                   "trusted_proxies",
+	"NEXUS_RATE_LIMIT_RPM":                    "rate_limit_rpm",
+	"NEXUS_RATE_LIMIT_BURST":                  "rate_limit_burst",
+	"NEXUS_RATE_LIMIT_BY_API_KEY":             "rate_limit_by_api_key",
+	"NEXUS_READINESS_MODE":                    "readiness_mode",
+	"NEXUS_INIT_PROFILE":                      "init_profile",
+	"NEXUS_TRACING_ENDPOINT":                  "tracing_endpoint",
+	"NEXUS_TRACING_TIMEOUT":                   "tracing_timeout",
+	"NEXUS_TRACING_QUEUE_SIZE":                "tracing_queue_size",
+	"NEXUS_TRACING_BATCH_SIZE":                "tracing_batch_size",
+	"NEXUS_TRACING_SAMPLE_RATE":               "tracing_sample_rate",
+	"NEXUS_LOG_TRACE_ID":                      "log_trace_id",
+	"NEXUS_METRICS_EXEMPLARS":                 "metrics_exemplars",
+	"NEXUS_REDACT_ENABLED":                    "redact_enabled",
+	"NEXUS_REDACT_PROFILE":                    "redact_profile",
+	"NEXUS_REDACT_PATTERNS":                   "redact_patterns",
+	"NEXUS_REDACT_BUFFER_BYTES":               "redact_buffer_bytes",
+	"NEXUS_EGRESS_BLOCK_PRIVATE":              "egress_block_private",
+	"NEXUS_EGRESS_ALLOW":                      "egress_allow",
+	"NEXUS_SECRET_BACKEND":                    "secret_backend",
+	"NEXUS_VAULT_ADDR":                        "vault_addr",
+	"NEXUS_VAULT_TOKEN":                       "vault_token",
+	"NEXUS_VAULT_ROLE":                        "vault_role",
+	"NEXUS_VAULT_PATH":                        "vault_path",
+	"NEXUS_AWSSM_PREFIX":                      "awssm_prefix",
+	"NEXUS_SECRET_REFRESH":                    "secret_refresh",
+	"NEXUS_AUDIT_ENABLED":                     "audit_enabled",
+	"NEXUS_AUDIT_PATH":                        "audit_path",
+	"NEXUS_AUDIT_SYNC":                        "audit_sync",
+	"NEXUS_TELEMETRY_PATH":                    "telemetry_path",
+	"NEXUS_TELEMETRY_MAX_BYTES":               "telemetry_max_bytes",
+	"NEXUS_TELEMETRY_MAX_FILES":               "telemetry_max_files",
+	"NEXUS_TELEMETRY_BUFFER_SIZE":             "telemetry_buffer_size",
+	"NEXUS_TELEMETRY_FLUSH_INTERVAL":          "telemetry_flush_interval",
+	"NEXUS_MODELS_ENDPOINT":                   "models_endpoint",
+	"NEXUS_MODELS_CACHE_TTL":                  "models_cache_ttl",
+	"NEXUS_DASHBOARD_ENDPOINT":                "dashboard_endpoint",
+	"NEXUS_DASHBOARD_PUBLIC":                  "dashboard_public",
+	"NEXUS_JUDGE_URL":                         "judge_url",
+	"NEXUS_JUDGE_MODEL":                       "judge_model",
+	"NEXUS_JUDGE_API_KEY":                     "judge_api_key",
+	"NEXUS_JUDGE_SAMPLE_RATE":                 "judge_sample_rate",
+	"NEXUS_JUDGE_FRONTIER_SAMPLE_RATE":        "judge_frontier_sample_rate",
+	"NEXUS_JUDGE_CONCURRENCY":                 "judge_concurrency",
+	"NEXUS_JUDGE_QUEUE":                       "judge_queue",
+	"NEXUS_JUDGE_TIMEOUT":                     "judge_timeout",
+	"NEXUS_JUDGE_COST_PER_1K":                 "judge_cost_per_1k",
+	"NEXUS_JUDGE_DB":                          "judge_db",
+	"NEXUS_JUDGE_ADAPTIVE_ENABLED":            "judge_adaptive_enabled",
+	"NEXUS_QUALITY_CONCURRENCY":               "quality_concurrency",
+	"NEXUS_QUALITY_QUEUE":                     "quality_queue",
+	"NEXUS_QUALITY_TIMEOUT":                   "quality_timeout",
+	"NEXUS_QUALITY_STDERR_CAP":                "quality_stderr_cap",
+	"NEXUS_QUALITY_DROPPED_RING_SIZE":         "quality_dropped_ring_size",
+	"NEXUS_TOON_UNFENCED":                     "toon_unfenced",
+	"NEXUS_MIDDLEWARE_CHAIN":                  "middleware_chain",
+	"NEXUS_INJECTION_SCAN_ROLES":              "injection_scan_roles",
+	"NEXUS_PROMPT_INJECTION_MODE":             "prompt_injection_mode",
+	"NEXUS_MODEL_ALIASES":                     "model_aliases",
+	"NEXUS_MODEL_ALIASES_STRICT":              "model_aliases_strict",
+}
+
+// injectionModeString returns the canonical env-var string for an InjectionMode.
+func injectionModeString(m middleware.InjectionMode) string {
+	switch m {
+	case middleware.InjectionModeOff:
+		return "off"
+	case middleware.InjectionModeWarn:
+		return "warn"
+	case middleware.InjectionModeStrict:
+		return "strict"
+	default:
+		return "unknown"
+	}
+}
+
+// fieldSource determines whether a given env var resolved from env, file, or default.
+// fileCfg is the YAML config map (nil if no file was loaded).
+func fieldSource(envKey string, fileCfg map[string]string) string {
+	if v, ok := os.LookupEnv(envKey); ok && v != "" {
+		return "env"
+	}
+	if fileCfg != nil {
+		yamlKey := EnvToYAMLKey[envKey]
+		if yamlKey != "" {
+			if v, ok := fileCfg[yamlKey]; ok && v != "" {
+				return "file"
+			}
+		}
+	}
+	return "default"
+}
+
+// envField describes one NEXUS env var with a pointer to the corresponding
+// field in Config and a format function to render the current value as a string.
+type envField struct {
+	envKey   string
+	getValue func(*Config) string
+}
+
+// allEnvFields is the exhaustive list of NEXUS_ env vars surfaced by `nexus config show`.
+// Each entry knows how to read its value from a loaded Config. Fields are ordered
+// alphabetically by env key for deterministic output.
+var allEnvFields = []envField{
+	{"NEXUS_ADDR", func(c *Config) string { return c.Addr }},
+	{"NEXUS_API_KEYS_FILE", func(c *Config) string { return c.APIKeysFile }},
+	{"NEXUS_AUTH_MODE", func(c *Config) string { return c.AuthMode }},
+	{"NEXUS_AUTH_RATE_LIMIT_BURST", func(c *Config) string { return fmt.Sprintf("%d", c.AuthRateLimitBurst) }},
+	{"NEXUS_AUTH_RATE_LIMIT_RPM", func(c *Config) string { return fmt.Sprintf("%d", c.AuthRateLimitRPM) }},
+	{"NEXUS_AUTH_RATE_LIMIT_WINDOW", func(c *Config) string { return c.AuthRateLimitWindow.String() }},
+	{"NEXUS_AUDIT_ENABLED", func(c *Config) string { return fmt.Sprintf("%t", c.AuditEnabled) }},
+	{"NEXUS_AUDIT_PATH", func(c *Config) string { return c.AuditPath }},
+	{"NEXUS_AUDIT_SYNC", func(c *Config) string { return c.AuditSync }},
+	{"NEXUS_AWSSM_PREFIX", func(c *Config) string { return c.AWSSMPrefix }},
+	{"NEXUS_AZURE_CONTENT_FILTER_ENABLED", func(c *Config) string { return fmt.Sprintf("%t", c.AzureContentFilterEnabled) }},
+	{"NEXUS_BUDGET_ALERT_ENABLED", func(c *Config) string { return fmt.Sprintf("%t", c.BudgetAlertEnabled) }},
+	{"NEXUS_BUDGET_ALERT_THRESHOLD", func(c *Config) string { return fmt.Sprintf("%g", c.BudgetAlertThreshold) }},
+	{"NEXUS_BUDGET_ALERT_WEBHOOK_URL", func(c *Config) string { return c.BudgetAlertWebhookURL }},
+	{"NEXUS_BUDGET_DAILY_LIMIT", func(c *Config) string { return fmt.Sprintf("%g", c.BudgetDailyLimit) }},
+	{"NEXUS_CACHE_WARM_LIMIT", func(c *Config) string { return fmt.Sprintf("%d", c.CacheWarmLimit) }},
+	{"NEXUS_CACHE_WARM_ON_BOOT", func(c *Config) string { return fmt.Sprintf("%t", c.CacheWarmOnBoot) }},
+	{"NEXUS_CASCADE_MAX_RESPONSE_BYTES", func(c *Config) string { return fmt.Sprintf("%d", c.CascadeMaxResponseBytes) }},
+	{"NEXUS_CASCADE_TIMEOUT", func(c *Config) string { return c.CascadeTimeout.String() }},
+	{"NEXUS_CASCADE_TIMEOUT_CEILING", func(c *Config) string { return c.CascadeTimeoutCeiling.String() }},
+	{"NEXUS_CASCADE_TIMEOUT_FLOOR", func(c *Config) string { return c.CascadeTimeoutFloor.String() }},
+	{"NEXUS_CASCADE_TIMEOUT_PER_1K_TOKENS", func(c *Config) string { return c.CascadeTimeoutPer1kTokens.String() }},
+	{"NEXUS_COALESCE_ENABLED", func(c *Config) string { return fmt.Sprintf("%t", c.CoalesceEnabled) }},
+	{"NEXUS_COALESCE_MAX_ENTRIES", func(c *Config) string { return fmt.Sprintf("%d", c.CoalesceMaxEntries) }},
+	{"NEXUS_COALESCE_TTL", func(c *Config) string { return c.CoalesceTTL.String() }},
+	{"NEXUS_COST_BASELINE_MODEL", func(c *Config) string { return c.CostBaselineModel }},
+	{"NEXUS_COST_BASELINE_PROVIDER", func(c *Config) string { return c.CostBaselineProvider }},
+	{"NEXUS_COST_BASELINE_RATE_PER_1K", func(c *Config) string { return fmt.Sprintf("%g", c.CostBaselineRatePer1K) }},
+	{"NEXUS_COST_USE_OUTPUT_TOKENS", func(c *Config) string { return fmt.Sprintf("%t", c.CostUseOutputTokens) }},
+	{"NEXUS_DASHBOARD_ENDPOINT", func(c *Config) string { return c.DashboardEndpoint }},
+	{"NEXUS_DASHBOARD_PUBLIC", func(c *Config) string { return fmt.Sprintf("%t", c.DashboardPublic) }},
+	{"NEXUS_DEBUG", func(c *Config) string { return fmt.Sprintf("%t", c.Debug) }},
+	{"NEXUS_DEBUG_BODY_BYTES", func(c *Config) string { return fmt.Sprintf("%d", c.DebugBodyBytes) }},
+	{"NEXUS_DEBUG_PPROF_API_KEY", func(c *Config) string { return c.DebugPprofAPIKey }},
+	{"NEXUS_DEBUG_PPROF_ENABLED", func(c *Config) string { return fmt.Sprintf("%t", c.DebugPprofEnabled) }},
+	{"NEXUS_DSL_FORMATTING_PATTERNS", func(c *Config) string { return regexpStrings(c.DSLFormattingPatterns) }},
+	{"NEXUS_DSL_FUSION_PATTERNS", func(c *Config) string { return regexpStrings(c.DSLFusionPatterns) }},
+	{"NEXUS_DSL_LOCAL_PATTERNS", func(c *Config) string { return regexpStrings(c.DSLLocalPatterns) }},
+	{"NEXUS_DSL_PROMOTION_CONFIDENCE", func(c *Config) string { return fmt.Sprintf("%g", c.DSLPromotionConfidence) }},
+	{"NEXUS_DSL_PROMOTION_INTERVAL", func(c *Config) string { return c.DSLPromotionInterval.String() }},
+	{"NEXUS_DSL_PROMOTION_MIN_SAMPLES", func(c *Config) string { return fmt.Sprintf("%d", c.DSLPromotionMinSamples) }},
+	{"NEXUS_DSL_UNICODE_PATTERNS", func(c *Config) string { return regexpStrings(c.DSLUnicodePatterns) }},
+	{"NEXUS_EGRESS_ALLOW", func(c *Config) string { return c.EgressAllowCIDRs }},
+	{"NEXUS_EGRESS_BLOCK_PRIVATE", func(c *Config) string { return fmt.Sprintf("%t", c.EgressGuardEnabled) }},
+	{"NEXUS_EMBEDDER_BASE_URL", func(c *Config) string { return c.EmbedderBaseURL }},
+	{"NEXUS_EMBEDDER_TYPE", func(c *Config) string { return string(c.EmbedderType) }},
+	{"NEXUS_EXAMPLES_DIR", func(c *Config) string { return c.ExamplesDir }},
+	{"NEXUS_FRONTIER_API_KEY", func(c *Config) string { return redact(c.FrontierKey) }},
+	{"NEXUS_FRONTIER_COST_PER_1K", func(c *Config) string { return fmt.Sprintf("%g", c.FrontierCostPer1K) }},
+	{"NEXUS_FRONTIER_FAILOVER", func(c *Config) string { return fmt.Sprintf("%t", c.FrontierFailover) }},
+	{"NEXUS_FRONTIER_FAILOVER_MAX_ATTEMPTS", func(c *Config) string { return fmt.Sprintf("%d", c.FrontierFailoverMaxAttempts) }},
+	{"NEXUS_FRONTIER_HEALTH_BREAKER_THRESHOLD", func(c *Config) string { return fmt.Sprintf("%d", c.FrontierHealthBreakerThreshold) }},
+	{"NEXUS_FRONTIER_HEALTH_POLL_INTERVAL", func(c *Config) string { return c.FrontierHealthPollInterval.String() }},
+	{"NEXUS_FRONTIER_HEALTH_TIMEOUT", func(c *Config) string { return c.FrontierHealthTimeout.String() }},
+	{"NEXUS_FRONTIER_MODEL", func(c *Config) string { return c.FrontierModel }},
+	{"NEXUS_FRONTIER_URL", func(c *Config) string { return c.FrontierURL }},
+	{"NEXUS_FUSION_AGREEMENT_THRESHOLD", func(c *Config) string { return fmt.Sprintf("%g", c.FusionAgreementThreshold) }},
+	{"NEXUS_FUSION_FRONTIER_TIMEOUT", func(c *Config) string { return c.FusionFrontierTimeout.String() }},
+	{"NEXUS_FUSION_LOCAL_TIMEOUT", func(c *Config) string { return c.FusionLocalTimeout.String() }},
+	{"NEXUS_FUSION_PROGRESSIVE", func(c *Config) string { return fmt.Sprintf("%t", c.FusionProgressiveDelivery) }},
+	{"NEXUS_FUSION_SIMILARITY_MODE", func(c *Config) string { return c.FusionSimilarityMode }},
+	{"NEXUS_FUSION_TIMEOUT", func(c *Config) string { return c.FusionTimeout.String() }},
+	{"NEXUS_HEALTH_BREAKER_THRESHOLD", func(c *Config) string { return fmt.Sprintf("%d", c.HealthBreakerThreshold) }},
+	{"NEXUS_HEALTH_POLL_INTERVAL", func(c *Config) string { return c.HealthPollInterval.String() }},
+	{"NEXUS_HEALTH_PROBE_TIMEOUT", func(c *Config) string { return c.HealthProbeTimeout.String() }},
+	{"NEXUS_INJECTION_SCAN_ROLES", func(c *Config) string { return strings.Join(c.InjectionScanRoles, ",") }},
+	{"NEXUS_JUDGE_API_KEY", func(c *Config) string { return redact(c.JudgeAPIKey) }},
+	{"NEXUS_JUDGE_COST_PER_1K", func(c *Config) string { return fmt.Sprintf("%g", c.JudgeCostPer1KUSD) }},
+	{"NEXUS_JUDGE_CONCURRENCY", func(c *Config) string { return fmt.Sprintf("%d", c.JudgeConcurrency) }},
+	{"NEXUS_JUDGE_DB", func(c *Config) string { return c.JudgeDBPath }},
+	{"NEXUS_JUDGE_FRONTIER_SAMPLE_RATE", func(c *Config) string { return fmt.Sprintf("%g", c.JudgeFrontierSampleRate) }},
+	{"NEXUS_JUDGE_MODEL", func(c *Config) string { return c.JudgeModel }},
+	{"NEXUS_JUDGE_QUEUE", func(c *Config) string { return fmt.Sprintf("%d", c.JudgeQueueDepth) }},
+	{"NEXUS_JUDGE_SAMPLE_RATE", func(c *Config) string { return fmt.Sprintf("%g", c.JudgeSampleRate) }},
+	{"NEXUS_JUDGE_TIMEOUT", func(c *Config) string { return c.JudgeTimeout.String() }},
+	{"NEXUS_JUDGE_URL", func(c *Config) string { return c.JudgeURL }},
+	{"NEXUS_JUDGE_ADAPTIVE_ENABLED", func(c *Config) string { return fmt.Sprintf("%t", c.JudgeAdaptiveEnabled) }},
+	{"NEXUS_LOCAL_COOLDOWN", func(c *Config) string { return c.LocalCooldown.String() }},
+	{"NEXUS_LOCAL_MAX_CONCURRENT", func(c *Config) string { return fmt.Sprintf("%d", c.LocalMaxConcurrent) }},
+	{"NEXUS_LOCAL_MODEL", func(c *Config) string { return c.LocalModel }},
+	{"NEXUS_LOCAL_VRAM_BYTES_PER_SLOT", func(c *Config) string { return fmt.Sprintf("%d", c.LocalVRAMBytesPerSlot) }},
+	{"NEXUS_LOG_FORMAT", func(c *Config) string { return c.LogFormat.String() }},
+	{"NEXUS_LOG_LEVEL", func(c *Config) string { return c.LogLevel.String() }},
+	{"NEXUS_LOG_TRACE_ID", func(c *Config) string { return fmt.Sprintf("%t", c.LogTraceID) }},
+	{"NEXUS_MAX_BODY_BYTES", func(c *Config) string { return fmt.Sprintf("%d", c.MaxBodyBytes) }},
+	{"NEXUS_MAX_RESPONSE_BYTES", func(c *Config) string { return fmt.Sprintf("%d", c.MaxResponseBytes) }},
+	{"NEXUS_METRICS_DB", func(c *Config) string { return c.MetricsDBPath }},
+	{"NEXUS_METRICS_EXEMPLARS", func(c *Config) string { return fmt.Sprintf("%t", c.MetricsExemplars) }},
+	{"NEXUS_METRICS_RETENTION_DAYS", func(c *Config) string { return fmt.Sprintf("%d", c.MetricsRetentionDays) }},
+	{"NEXUS_MIDDLEWARE_CHAIN", func(c *Config) string { return c.MiddlewareChain }},
+	{"NEXUS_MODELS_CACHE_TTL", func(c *Config) string { return c.ModelsCacheTTL.String() }},
+	{"NEXUS_MODELS_ENDPOINT", func(c *Config) string { return fmt.Sprintf("%t", c.ModelsEndpointEnabled) }},
+	{"NEXUS_OIDC_AUDIENCE", func(c *Config) string { return c.OIDCAudience }},
+	{"NEXUS_OIDC_ISSUER", func(c *Config) string { return c.OIDCIssuer }},
+	{"NEXUS_OIDC_JWKS_REFRESH", func(c *Config) string { return c.OIDCJWKSRefresh.String() }},
+	{"NEXUS_OIDC_JWKS_URL", func(c *Config) string { return c.OIDCJWKSURL }},
+	{"NEXUS_OLLAMA_URL", func(c *Config) string { return c.OllamaURL }},
+	{"NEXUS_POOL_BUFFER_MAX_BYTES", func(c *Config) string { return fmt.Sprintf("%d", c.PoolBufferMaxBytes) }},
+	{"NEXUS_PROBE_BYTES_PER_TOKEN", func(c *Config) string { return fmt.Sprintf("%d", c.ProbeBytesPerToken) }},
+	{"NEXUS_PROBE_INTERVAL", func(c *Config) string { return c.ProbePollInterval.String() }},
+	{"NEXUS_PROBE_NVIDIA_INTERVAL", func(c *Config) string { return c.ProbeNVIDIAInterval.String() }},
+	{"NEXUS_PROBE_THERMAL_THRESHOLD", func(c *Config) string { return fmt.Sprintf("%d", c.ProbeThermalThreshold) }},
+	{"NEXUS_PROBE_TIMEOUT", func(c *Config) string { return c.ProbeTimeout.String() }},
+	{"NEXUS_PROMPT_INJECTION_MODE", func(c *Config) string { return injectionModeString(c.PromptInjectionMode) }},
+	{"NEXUS_PROVIDER_TAIL_WEIGHT", func(c *Config) string { return fmt.Sprintf("%g", c.ProviderTailWeight) }},
+	{"NEXUS_PROXY_API_KEY", func(c *Config) string { return redact(c.ProxyAPIKey) }},
+	{"NEXUS_RAG_BATCH_SIZE", func(c *Config) string { return fmt.Sprintf("%d", c.RAGBatchSize) }},
+	{"NEXUS_RAG_CHUNK_TOKENS", func(c *Config) string { return fmt.Sprintf("%d", c.RAGChunkTokens) }},
+	{"NEXUS_RAG_CIRCUIT_BREAKER_COOLDOWN", func(c *Config) string { return c.RAGCircuitBreakerCooldown.String() }},
+	{"NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD", func(c *Config) string { return fmt.Sprintf("%d", c.RAGCircuitBreakerThreshold) }},
+	{"NEXUS_RAG_DB", func(c *Config) string { return c.RAGDBPath }},
+	{"NEXUS_RAG_EMBED_CACHE_SIZE", func(c *Config) string { return fmt.Sprintf("%d", c.RAGEmbedCacheSize) }},
+	{"NEXUS_RAG_EMBED_CACHE_TTL", func(c *Config) string { return c.RAGEmbedCacheTTL.String() }},
+	{"NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT", func(c *Config) string { return c.RAGEmbedCacheWaitTimeout.String() }},
+	{"NEXUS_RAG_EXCLUDE_PATTERNS", func(c *Config) string { return strings.Join(c.RAGExcludePatterns, ",") }},
+	{"NEXUS_RAG_FILE_EXTENSIONS", func(c *Config) string { return strings.Join(c.RAGFileExtensions, ",") }},
+	{"NEXUS_RAG_MAX_INJECTION_TOKENS", func(c *Config) string { return fmt.Sprintf("%d", c.RAGMaxInjectionTokens) }},
+	{"NEXUS_RAG_POLL_INTERVAL", func(c *Config) string { return c.RAGPollInterval.String() }},
+	{"NEXUS_RAG_RECURSIVE", func(c *Config) string { return fmt.Sprintf("%t", c.RAGRecursive) }},
+	{"NEXUS_RAG_THRESHOLD", func(c *Config) string { return fmt.Sprintf("%g", c.RAGThreshold) }},
+	{"NEXUS_RAG_TOP_K", func(c *Config) string { return fmt.Sprintf("%d", c.RAGTopK) }},
+	{"NEXUS_RATE_LIMIT_BURST", func(c *Config) string { return fmt.Sprintf("%d", c.RateLimitBurst) }},
+	{"NEXUS_RATE_LIMIT_BY_API_KEY", func(c *Config) string { return fmt.Sprintf("%t", c.RateLimitByAPIKey) }},
+	{"NEXUS_RATE_LIMIT_RPM", func(c *Config) string { return fmt.Sprintf("%d", c.RateLimitRPM) }},
+	{"NEXUS_READINESS_MODE", func(c *Config) string { return c.ReadinessMode }},
+	{"NEXUS_REDACT_BUFFER_BYTES", func(c *Config) string { return fmt.Sprintf("%d", c.RedactBufferBytes) }},
+	{"NEXUS_REDACT_ENABLED", func(c *Config) string { return fmt.Sprintf("%t", c.RedactEnabled) }},
+	{"NEXUS_REDACT_PATTERNS", func(c *Config) string { return c.RedactPatternsRaw }},
+	{"NEXUS_REDACT_PROFILE", func(c *Config) string { return c.RedactProfile }},
+	{"NEXUS_ROUTING_CONFIDENCE_CEILING", func(c *Config) string { return fmt.Sprintf("%g", c.RoutingConfidenceCeiling) }},
+	{"NEXUS_ROUTING_CONFIDENCE_DB", func(c *Config) string { return c.RoutingConfidenceDB }},
+	{"NEXUS_ROUTING_CONFIDENCE_FLOOR", func(c *Config) string { return fmt.Sprintf("%g", c.RoutingConfidenceFloor) }},
+	{"NEXUS_ROUTING_CONFIDENCE_MIN_SAMPLES", func(c *Config) string { return fmt.Sprintf("%d", c.RoutingConfidenceMinSamples) }},
+	{"NEXUS_ROUTING_CONFIDENCE_WINDOW", func(c *Config) string { return c.RoutingConfidenceWindow.String() }},
+	{"NEXUS_SECRET_BACKEND", func(c *Config) string { return c.SecretBackend }},
+	{"NEXUS_SECRET_REFRESH", func(c *Config) string { return c.SecretRefresh.String() }},
+	{"NEXUS_SELECTOR_MIN_SAMPLES", func(c *Config) string { return fmt.Sprintf("%d", c.SelectorMinSamples) }},
+	{"NEXUS_SELECTOR_REFRESH", func(c *Config) string { return c.SelectorRefreshInterval.String() }},
+	{"NEXUS_SELECTOR_WINDOW", func(c *Config) string { return c.SelectorWindow.String() }},
+	{"NEXUS_SERVER_IDLE_TIMEOUT", func(c *Config) string { return c.IdleTimeout.String() }},
+	{"NEXUS_SERVER_MAX_HEADER_BYTES", func(c *Config) string { return fmt.Sprintf("%d", c.MaxHeaderBytes) }},
+	{"NEXUS_SERVER_READ_TIMEOUT", func(c *Config) string { return c.ReadTimeout.String() }},
+	{"NEXUS_SERVER_WRITE_TIMEOUT", func(c *Config) string { return c.WriteTimeout.String() }},
+	{"NEXUS_SHUTDOWN_TIMEOUT", func(c *Config) string { return c.ShutdownTimeout.String() }},
+	{"NEXUS_SLM_CACHE_MAX_ENTRIES", func(c *Config) string { return fmt.Sprintf("%d", c.SLMCacheMaxEntries) }},
+	{"NEXUS_SLMCACHE_MAX_STALE", func(c *Config) string { return fmt.Sprintf("%d", c.SLMCacheMaxStale) }},
+	{"NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT", func(c *Config) string { return fmt.Sprintf("%d", c.SLMCacheSemanticScanLimit) }},
+	{"NEXUS_SLMCACHE_SIMILARITY_THRESHOLD", func(c *Config) string { return fmt.Sprintf("%g", c.SLMCacheSemanticThreshold) }},
+	{"NEXUS_SLMCACHE_STALE_CLEANUP_THRESHOLD", func(c *Config) string { return fmt.Sprintf("%d", c.SLMCacheStaleCleanupThreshold) }},
+	{"NEXUS_SLM_CACHE_TTL", func(c *Config) string { return c.SLMCacheTTL.String() }},
+	{"NEXUS_SLM_CONFIDENCE_THRESHOLD", func(c *Config) string { return fmt.Sprintf("%g", c.SLMConfidenceThreshold) }},
+	{"NEXUS_SLM_TIMEOUT", func(c *Config) string { return c.SLMTimeout.String() }},
+	{"NEXUS_STATUS_PUBLIC", func(c *Config) string { return fmt.Sprintf("%t", c.StatusPublic) }},
+	{"NEXUS_TELEMETRY_BUFFER_SIZE", func(c *Config) string { return fmt.Sprintf("%d", c.TelemetryBufferSize) }},
+	{"NEXUS_TELEMETRY_FLUSH_INTERVAL", func(c *Config) string { return c.TelemetryFlushInterval.String() }},
+	{"NEXUS_TELEMETRY_MAX_BYTES", func(c *Config) string { return fmt.Sprintf("%d", c.TelemetryMaxBytes) }},
+	{"NEXUS_TELEMETRY_MAX_FILES", func(c *Config) string { return fmt.Sprintf("%d", c.TelemetryMaxFiles) }},
+	{"NEXUS_TELEMETRY_PATH", func(c *Config) string { return c.TelemetryPath }},
+	{"NEXUS_TLS_ENABLED", func(c *Config) string { return fmt.Sprintf("%t", c.TLSEnabled) }},
+	{"NEXUS_TOKEN_GUARDRAIL", func(c *Config) string { return fmt.Sprintf("%d", c.TokenGuardrail) }},
+	{"NEXUS_TOON_UNFENCED", func(c *Config) string { return fmt.Sprintf("%t", c.TOONUnfenced) }},
+	{"NEXUS_TRACING_BATCH_SIZE", func(c *Config) string { return fmt.Sprintf("%d", c.TracingBatchSize) }},
+	{"NEXUS_TRACING_ENDPOINT", func(c *Config) string { return c.TracingEndpoint }},
+	{"NEXUS_TRACING_QUEUE_SIZE", func(c *Config) string { return fmt.Sprintf("%d", c.TracingQueueSize) }},
+	{"NEXUS_TRACING_SAMPLE_RATE", func(c *Config) string { return fmt.Sprintf("%g", c.TracingSampleRate) }},
+	{"NEXUS_TRACING_TIMEOUT", func(c *Config) string { return c.TracingTimeout.String() }},
+	{"NEXUS_TRUSTED_PROXIES", func(c *Config) string { return c.TrustedProxiesRaw }},
+	{"NEXUS_VAULT_ADDR", func(c *Config) string { return c.VaultAddr }},
+	{"NEXUS_VAULT_PATH", func(c *Config) string { return c.VaultPath }},
+	{"NEXUS_VAULT_ROLE", func(c *Config) string { return c.VaultRole }},
+	{"NEXUS_VAULT_TOKEN", func(c *Config) string { return redact(c.VaultToken) }},
+	{"NEXUS_ZAI_API_KEY", func(c *Config) string { return redact(c.ZAIKey) }},
+	{"NEXUS_ZAI_COST_PER_1K", func(c *Config) string { return fmt.Sprintf("%g", c.ZAICostPer1K) }},
+	{"NEXUS_ZAI_MODEL", func(c *Config) string { return c.ZAIModel }},
+	{"NEXUS_ZAI_URL", func(c *Config) string { return c.ZAIURL }},
+	// Model aliases is a JSON map - show it as a single string
+	{"NEXUS_MODEL_ALIASES", func(c *Config) string {
+		if c.ModelAliases == nil {
+			return ""
+		}
+		b, _ := json.Marshal(c.ModelAliases)
+		return string(b)
+	}},
+	{"NEXUS_MODEL_ALIASES_STRICT", func(c *Config) string { return fmt.Sprintf("%t", c.ModelAliasesStrict) }},
+	{"NEXUS_ANTHROPIC_CACHE_MIN_SYSTEM_CHARS", func(c *Config) string { return fmt.Sprintf("%d", c.AnthropicCacheMinSystemChars) }},
+	{"NEXUS_ARBITER_CACHE_MAX_ENTRIES", func(c *Config) string { return fmt.Sprintf("%d", c.ArbiterCacheMaxEntries) }},
+	{"NEXUS_ARBITER_CACHE_TTL", func(c *Config) string { return c.ArbiterCacheTTL.String() }},
+	{"NEXUS_ARBITER_TIMEOUT", func(c *Config) string { return c.ArbiterTimeout.String() }},
+	{"NEXUS_COHERE_API_KEY", func(c *Config) string { return redact(c.CohereAPIKey) }},
+	{"NEXUS_EMBEDDING_MODEL", func(c *Config) string { return c.EmbeddingModel }},
+	{"NEXUS_INIT_PROFILE", func(c *Config) string { return c.InitProfile }},
+	{"NEXUS_QUALITY_CONCURRENCY", func(c *Config) string { return fmt.Sprintf("%d", c.QualityConcurrency) }},
+	{"NEXUS_QUALITY_DROPPED_RING_SIZE", func(c *Config) string { return fmt.Sprintf("%d", c.QualityDroppedRingSize) }},
+	{"NEXUS_QUALITY_QUEUE", func(c *Config) string { return fmt.Sprintf("%d", c.QualityQueueDepth) }},
+	{"NEXUS_QUALITY_STDERR_CAP", func(c *Config) string { return fmt.Sprintf("%d", c.QualityStderrCap) }},
+	{"NEXUS_QUALITY_TIMEOUT", func(c *Config) string { return c.QualityTimeout.String() }},
+	{"NEXUS_ROUTING_CONTEXT_CHARS", func(c *Config) string { return fmt.Sprintf("%d", c.RoutingContextChars) }},
+	{"NEXUS_ROUTING_CONTEXT_TURNS", func(c *Config) string { return fmt.Sprintf("%d", c.RoutingContextTurns) }},
+}
+
+// regexpStrings renders a []*regexp.Regexp slice as a comma-separated string
+// of the strings matched (one pattern per entry).
+func regexpStrings(re []*regexp.Regexp) string {
+	if len(re) == 0 {
+		return ""
+	}
+	var parts []string
+	for _, r := range re {
+		parts = append(parts, r.String())
+	}
+	return strings.Join(parts, ",")
+}
+
+// redact returns the input string with all but the first and last 4 chars
+// replaced by "●", unless the string is shorter than 8 chars in which case
+// it returns "●●●●●●●●".
+func redact(s string) string {
+	if len(s) <= 8 {
+		return "●●●●●●●●"
+	}
+	if len(s) <= 12 {
+		return s[:4] + strings.Repeat("●", len(s)-4)
+	}
+	return s[:4] + strings.Repeat("●", len(s)-8) + s[len(s)-4:]
+}
+
+// ShowFields returns all resolved configuration fields with their sources
+// and hot-reload status. fileCfg is the raw YAML config map (nil if no file
+// was loaded). The returned slice is sorted alphabetically by env var name.
+func (c *Config) ShowFields(fileCfg map[string]string) []ConfigField {
+	var fields []ConfigField
+	for _, f := range allEnvFields {
+		fields = append(fields, ConfigField{
+			Key:           f.envKey,
+			Value:         f.getValue(c),
+			Source:        fieldSource(f.envKey, fileCfg),
+			HotReloadable: IsHotReloadable(f.envKey),
+		})
+	}
+	return fields
+}

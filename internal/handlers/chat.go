@@ -1570,6 +1570,7 @@ func Chat(d Deps) http.Handler {
 			Budget:               d.BudgetChecker,
 			FrontierCostPer1K:    d.Config.FrontierCostPer1K,
 			Promoter:             d.Promoter,
+			SLMTokenHint:         d.Config.SLMTokenHint,
 		}
 		if d.Config.SLMConfidenceThreshold > 0 && d.Confidence == nil {
 			slog.Warn("planner: ConfidenceThreshold set but no ConfidenceStore — threshold disabled")
