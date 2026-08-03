@@ -68,6 +68,12 @@ Steps:
 
 Rules:
 - Work ONLY in your assigned worktree ({WORKDIR})
+- **CRITICAL: The main repository checkout at `/home/alex/AI/nexus-proxy` is OFF-LIMITS.**
+  Do NOT run `cd /home/alex/AI/nexus-proxy` or any git commands there. All git operations
+  must run inside your worktree (`../worktrees/issue-{NUMBER}-{SLUG}`). Running git in the
+  main repo corrupts the orchestrator's `develop` checkout and breaks subsequent waves.
+  If you need to verify something in the main repo, use `git -C /home/alex/AI/nexus-proxy`
+  (read-only) or `git -C /home/alex/AI/nexus-proxy branch --show-current` to check branch state.
 - Do NOT modify files outside the scope of this issue
 - Include tests for the fix/feature if the repo has a test suite
 - Follow the repo's AGENTS.md and code style conventions

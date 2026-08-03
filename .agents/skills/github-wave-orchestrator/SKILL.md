@@ -83,6 +83,28 @@ git worktree add ../worktrees/issue-{N}-{slug} -b fix/issue-{N}-{slug} develop
 
 ### 3b. Spawn Implementation Sub-agents
 
+**Pre-flight check — main repo branch sanity (issue #1275):**
+
+Before spawning any sub-agent, verify the main repo checkout is clean and on `develop`:
+```bash
+cd /home/alex/AI/nexus-proxy
+if [ "$(git branch --show-current)" != "develop" ]; then
+  echo "WARNING: Main repo is on branch '$(git branch --show-current)', not 'develop'." >&2
+  echo "This indicates a previous sub-agent ran git commands in the main repo." >&2
+  echo "Please manually reset: cd /home/alex/AI/nexus-proxy && git checkout develop && git reset --hard origin/develop" >&2
+  exit 1
+fi
+if [ -n "$(git status --porcelain)" ]; then
+  echo "WARNING: Main repo has uncommitted changes." >&2
+  git status --short >&2
+  exit 1
+fi
+echo "Pre-flight OK: main repo on develop, no uncommitted changes"
+```
+
+If the check fails, stop and report to the user — do NOT spawn sub-agents
+until the main repo is restored.
+
 Spawn one Task sub-agent per issue using the prompt template in
 [REFERENCE.md — Implementation Sub-agent Template](REFERENCE.md#implementation-sub-agent-template).
 
@@ -116,8 +138,21 @@ instead of passively waiting for a done signal:
      ```bash
      gh pr list --search "fix/issue-{N}" --json number,title,state --jq '.[] | select(.state=="OPEN") | .number'
      ```
-     - **PR found** → record PR number in wave-state.json, move to next issue
-     - **Heartbeat timeout (60s) or PR NOT found** → enter recovery sequence below
+    - **PR found** → record PR number in wave-state.json, move to next issue
+      - **Heartbeat timeout (60s) or PR NOT found** → enter recovery sequence below
+
+   **Post-subagent main-repo sanity check (issue #1275):**
+   After each sub-agent reports done (or after recovery), immediately verify the main
+   repo is still on `develop`:
+   ```bash
+   MAIN_BRANCH=$(git -C /home/alex/AI/nexus-proxy branch --show-current)
+   if [ "$MAIN_BRANCH" != "develop" ]; then
+     echo "WARNING: Main repo is now on branch '$MAIN_BRANCH', not 'develop'." >&2
+     echo "Sub-agent may have run git commands outside the worktree." >&2
+     echo "Please inspect and reset: cd /home/alex/AI/nexus-proxy && git checkout develop && git reset --hard origin/develop" >&2
+     # Do not exit — the PR may still be valid; log and continue
+   fi
+   ```
 
 3. **Recovery sequence** (when commit check fails, PR missing, or heartbeat timeout):
    ```bash
