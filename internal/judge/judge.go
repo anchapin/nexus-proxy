@@ -136,20 +136,20 @@ type HTTPClient interface {
 // NewEvaluator so callers can construct an evaluator from a partial
 // config without exploding.
 type Config struct {
-	URL                string        // frontier endpoint for judge calls
-	Model              string        // judge model name
-	APIKey             string        // bearer token; empty = no Authorization header
-	SampleRate         float64       // 0..1; <=0 disables sampling (local route)
-	FrontierSampleRate float64       // 0..1; fraction of frontier completions to judge (issue #1162)
-	Concurrency        int           // max parallel judge calls (default 2)
-	QueueDepth         int           // buffered channel size (default 64)
-	Timeout            time.Duration // per-call judge timeout (default 30s)
-	CostPer1K          float64       // USD per 1k tokens (input+output); default 0.002
-	BudgetGuard        *budget.Guard // optional budget guard to record judge costs
-	AdaptiveEnabled         bool          // enable adaptive sampling based on rolling avg of recent scores (issue #1232)
-	AdaptiveWindow          time.Duration // look-back period for rolling average of recent scores (issue #1301)
-	AdaptiveHighConfidence  float64       // high confidence threshold — decay to min rate when avg > this (issue #1301)
-	AdaptiveLowConfidence   float64       // low confidence threshold — increase to max rate when avg < this (issue #1301)
+	URL                    string        // frontier endpoint for judge calls
+	Model                  string        // judge model name
+	APIKey                 string        // bearer token; empty = no Authorization header
+	SampleRate             float64       // 0..1; <=0 disables sampling (local route)
+	FrontierSampleRate     float64       // 0..1; fraction of frontier completions to judge (issue #1162)
+	Concurrency            int           // max parallel judge calls (default 2)
+	QueueDepth             int           // buffered channel size (default 64)
+	Timeout                time.Duration // per-call judge timeout (default 30s)
+	CostPer1K              float64       // USD per 1k tokens (input+output); default 0.002
+	BudgetGuard            *budget.Guard // optional budget guard to record judge costs
+	AdaptiveEnabled        bool          // enable adaptive sampling based on rolling avg of recent scores (issue #1232)
+	AdaptiveWindow         time.Duration // look-back period for rolling average of recent scores (issue #1301)
+	AdaptiveHighConfidence float64       // high confidence threshold — decay to min rate when avg > this (issue #1301)
+	AdaptiveLowConfidence  float64       // low confidence threshold — increase to max rate when avg < this (issue #1301)
 }
 
 // applyDefaults fills zero fields with sane values. It mutates cfg.
