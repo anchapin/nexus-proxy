@@ -97,7 +97,21 @@ Rules:
 - Do NOT modify files outside the scope of this issue
 - Include tests for the fix/feature if the repo has a test suite
 - Follow the repo's AGENTS.md and code style conventions
-- **Avoid iterative Read calls for finding insertion points (issue #1273).** When searching for a symbol or section in a file larger than ~500 lines, first use `grep -n "SYMBOL" file.go` or `rg -n "SYMBOL" file.go` to find the exact line number, then use Read with that line number to view context. Do NOT use repeated Read calls with different offsets to "search" for a location — this causes infinite loops in large files.
+- **Avoid iterative Read calls for finding insertion points (issues #1273, #1286).**
+  When searching for a symbol or section in a file **larger than 400 lines**:
+  1. First use `rg -n "PATTERN" file.go | head -20` to find line numbers
+  2. Then use `Read` with the specific offset/limit range around the target line
+  3. Do NOT use repeated Read calls with different offsets to "search" for a location — this causes infinite loops in large files.
+
+  **Good examples:**
+  - ✅ `rg -n "func (d *metricsStore) drain" internal/metrics/sqlite.go | head -5`
+  - ✅ `rg -n "type.*Handler" internal/handlers/chat.go | head -20`
+
+  **Bad examples (do NOT do these):**
+  - ❌ `Read internal/metrics/sqlite.go offset=820 limit=30` repeated 20 times
+  - ❌ Calling Read with sequential offsets (100, 200, 300...) hoping to find the right section
+
+  **Loop detection:** If you find yourself calling Read with the same offset 3+ times, stop — use `rg` or `grep` instead.
 - If the issue is unclear, add a comment asking for clarification: gh issue comment {NUMBER} -b "..."
 - Report back: PR number, files changed, any blockers encountered
 - **PR CREATION IS MANDATORY**: You MUST create the PR using `gh pr create` in step 8
