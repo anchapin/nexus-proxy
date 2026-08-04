@@ -42,11 +42,13 @@ func NewVaultResolver(cfg BackendConfig) (Resolver, error) {
 		return nil, fmt.Errorf("secrets: NEXUS_VAULT_ADDR is required when backend=vault")
 	}
 
+	httpClient := cfg.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 10 * time.Second}
+	}
 	client, err := api.NewClient(&api.Config{
-		Address: cfg.VaultAddr,
-		HttpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		Address:    cfg.VaultAddr,
+		HttpClient: httpClient,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("secrets: vault client init: %w", err)

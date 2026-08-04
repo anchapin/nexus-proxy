@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"sync/atomic"
 	"time"
@@ -36,6 +37,7 @@ type BackendConfig struct {
 	VaultRole   string // Kubernetes auth role (requires in-cluster deployment)
 	VaultPath   string // KV engine mount path (default "secret")
 	AWSSMPrefix string // logical-name prefix for SM secret IDs
+	HTTPClient  *http.Client
 }
 
 // NewResolver creates the Resolver selected by cfg.Backend.

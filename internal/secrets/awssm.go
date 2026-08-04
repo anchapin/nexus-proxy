@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager/types"
@@ -31,11 +32,19 @@ type AWSSMSResolver struct {
 
 // NewAWSSMSResolver creates a Resolver backed by AWS Secrets Manager.
 // It uses the default AWS credential chain (env vars → shared creds →
-// EC2/ECS role). Fail-closed: if the SDK client cannot be initialised,
+// EC2/ECS role). When cfg.HTTPClient is provided (recommended), the
+// client is guarded by EgressGuard to prevent SSRF to private IP ranges
+// (issue #1411). Fail-closed: if the SDK client cannot be initialised,
 // NewAWSSMSResolver returns an error.
 func NewAWSSMSResolver(cfg BackendConfig) (Resolver, error) {
 	ctx := context.Background()
-	awsCfg, err := awscfg.LoadDefaultConfig(ctx)
+	var awsCfg aws.Config
+	var err error
+	if cfg.HTTPClient != nil {
+		awsCfg, err = awscfg.LoadDefaultConfig(ctx, awscfg.WithHTTPClient(cfg.HTTPClient))
+	} else {
+		awsCfg, err = awscfg.LoadDefaultConfig(ctx)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("secrets: aws config: %w", err)
 	}

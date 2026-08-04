@@ -31,6 +31,7 @@ import (
 	"github.com/anchapin/nexus-proxy/internal/secrets"
 	"github.com/anchapin/nexus-proxy/internal/telemetry"
 	"github.com/anchapin/nexus-proxy/internal/tracing"
+	"github.com/anchapin/nexus-proxy/internal/transport"
 )
 
 const (
@@ -83,6 +84,7 @@ func main() {
 	// External secret-manager resolution (issue #1173). When a non-env
 	// backend is configured, resolve API keys from Vault / AWS SM before
 	// proceeding. Fail-closed: unreachable backend aborts boot.
+	guardedHTTPClient, _ := transport.NewFromEnv()
 	if cfg.SecretBackend != "" && cfg.SecretBackend != "env" {
 		resolver, err := secrets.NewResolver(secrets.BackendConfig{
 			Backend:     cfg.SecretBackend,
@@ -91,6 +93,7 @@ func main() {
 			VaultRole:   cfg.VaultRole,
 			VaultPath:   cfg.VaultPath,
 			AWSSMPrefix: cfg.AWSSMPrefix,
+			HTTPClient:  guardedHTTPClient,
 		})
 		if err != nil {
 			log.Fatalf("secrets: %v", err)
@@ -136,7 +139,7 @@ func main() {
 	}
 	slog.SetDefault(logger)
 
-	srv, parts, cleanup, err := buildServer(cfg, startTime)
+	srv, parts, cleanup, err := buildServer(cfg, startTime, guardedHTTPClient)
 	if err != nil {
 		log.Fatalf("server: %v", err)
 	}
