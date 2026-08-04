@@ -3,6 +3,7 @@ package providers
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -570,6 +571,285 @@ func TestGeminiAdapterAuthAndPath(t *testing.T) {
 	full := "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:streamGenerateContent"
 	if got := a.RequestPath(full); got != full {
 		t.Errorf("RequestPath(full) = %q, want %q", got, full)
+	}
+}
+
+// TestGeminiAdapterTransformRequest verifies the TransformRequest method
+// correctly maps OpenAI chat-completions requests to Gemini GenerateContent format.
+func TestGeminiAdapterTransformRequest(t *testing.T) {
+	a, _ := NewAdapter(AdapterTypeGemini)
+
+	temp := 0.7
+	req := map[string]any{
+		"model":       "gemini-2.0-flash",
+		"stream":      true,
+		"temperature": temp,
+		"max_tokens":  256,
+		"messages": []map[string]any{
+			{"role": "system", "content": "You are a helpful assistant."},
+			{"role": "user", "content": "Hello"},
+			{"role": "assistant", "content": "Hi there"},
+		},
+	}
+	body, _ := json.Marshal(req)
+
+	out, err := a.TransformRequest(body)
+	if err != nil {
+		t.Fatalf("TransformRequest: %v", err)
+	}
+
+	var got geminiRequest
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal transformed body: %v", err)
+	}
+
+	if len(got.Contents) != 2 {
+		t.Fatalf("len(Contents) = %d, want 2 (system hoisted)", len(got.Contents))
+	}
+	if got.Contents[0].Role != "user" || len(got.Contents[0].Parts) != 1 || got.Contents[0].Parts[0].Text != "Hello" {
+		t.Errorf("Contents[0] = %+v", got.Contents[0])
+	}
+	if got.Contents[1].Role != "assistant" || len(got.Contents[1].Parts) != 1 || got.Contents[1].Parts[0].Text != "Hi there" {
+		t.Errorf("Contents[1] = %+v", got.Contents[1])
+	}
+
+	// System instruction should be hoisted.
+	if got.SystemInstruction == nil || len(got.SystemInstruction.Parts) != 1 {
+		t.Fatalf("SystemInstruction = %v, want non-nil with 1 part", got.SystemInstruction)
+	}
+	if got.SystemInstruction.Parts[0].Text != "You are a helpful assistant." {
+		t.Errorf("SystemInstruction.Parts[0].Text = %q, want %q", got.SystemInstruction.Parts[0].Text, "You are a helpful assistant.")
+	}
+
+	// GenerationConfig.
+	if got.GenerationConfig == nil {
+		t.Fatalf("GenerationConfig = nil, want non-nil")
+	}
+	if *got.GenerationConfig.Temperature != temp {
+		t.Errorf("Temperature = %v, want %v", *got.GenerationConfig.Temperature, temp)
+	}
+	if got.GenerationConfig.MaxOutputTokens == nil || *got.GenerationConfig.MaxOutputTokens != 256 {
+		t.Errorf("MaxOutputTokens = %v, want 256", got.GenerationConfig.MaxOutputTokens)
+	}
+}
+
+// TestGeminiAdapterTransformRequestMultiTurn verifies multi-turn conversation
+// mapping to Gemini Contents array.
+func TestGeminiAdapterTransformRequestMultiTurn(t *testing.T) {
+	a, _ := NewAdapter(AdapterTypeGemini)
+
+	req := map[string]any{
+		"model": "gemini-pro",
+		"messages": []map[string]any{
+			{"role": "user", "content": "First message"},
+			{"role": "assistant", "content": "First response"},
+			{"role": "user", "content": "Second message"},
+		},
+	}
+	body, _ := json.Marshal(req)
+
+	out, err := a.TransformRequest(body)
+	if err != nil {
+		t.Fatalf("TransformRequest: %v", err)
+	}
+
+	var got geminiRequest
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal transformed body: %v", err)
+	}
+
+	if len(got.Contents) != 3 {
+		t.Fatalf("len(Contents) = %d, want 3", len(got.Contents))
+	}
+	if got.Contents[0].Role != "user" || got.Contents[0].Parts[0].Text != "First message" {
+		t.Errorf("Contents[0] = %+v", got.Contents[0])
+	}
+	if got.Contents[1].Role != "assistant" || got.Contents[1].Parts[0].Text != "First response" {
+		t.Errorf("Contents[1] = %+v", got.Contents[1])
+	}
+	if got.Contents[2].Role != "user" || got.Contents[2].Parts[0].Text != "Second message" {
+		t.Errorf("Contents[2] = %+v", got.Contents[2])
+	}
+}
+
+// TestGeminiAdapterTransformRequestMaxCompletionTokens verifies that
+// max_completion_tokens (OpenAI SDK alternative) is also mapped.
+func TestGeminiAdapterTransformRequestMaxCompletionTokens(t *testing.T) {
+	a, _ := NewAdapter(AdapterTypeGemini)
+
+	req := map[string]any{
+		"model":                 "gemini-2.0-flash",
+		"max_completion_tokens": 512,
+		"messages": []map[string]any{
+			{"role": "user", "content": "Hello"},
+		},
+	}
+	body, _ := json.Marshal(req)
+
+	out, err := a.TransformRequest(body)
+	if err != nil {
+		t.Fatalf("TransformRequest: %v", err)
+	}
+
+	var got geminiRequest
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal transformed body: %v", err)
+	}
+
+	if got.GenerationConfig == nil || got.GenerationConfig.MaxOutputTokens == nil || *got.GenerationConfig.MaxOutputTokens != 512 {
+		t.Errorf("MaxOutputTokens = %v, want 512", got.GenerationConfig.MaxOutputTokens)
+	}
+}
+
+// TestGeminiAdapterTransformRequestInvalidJSON ensures malformed input
+// returns a descriptive error.
+func TestGeminiAdapterTransformRequestInvalidJSON(t *testing.T) {
+	a, _ := NewAdapter(AdapterTypeGemini)
+	_, err := a.TransformRequest([]byte("{not json"))
+	if err == nil {
+		t.Fatal("expected error for malformed JSON, got nil")
+	}
+	if !strings.Contains(err.Error(), "gemini adapter") {
+		t.Errorf("error should be prefixed with 'gemini adapter': %v", err)
+	}
+}
+
+// TestGeminiNormalizeSSE runs a realistic Gemini SSE stream through the
+// adapter's NormalizeSSE and asserts the output is canonical OpenAI
+// chat.completion.chunk frames ending in [DONE].
+func TestGeminiNormalizeSSE(t *testing.T) {
+	a, _ := NewAdapter(AdapterTypeGemini)
+
+	geminiStream := strings.Join([]string{
+		`data: {"candidates": [{"content": {"parts": [{"text": "Hello"}]}}]}`,
+		`data: {"candidates": [{"content": {"parts": [{"text": ", world"}]}}]}`,
+		`data: {"candidates": [{"finishReason": "STOP"}]}`,
+		"",
+	}, "\n")
+
+	r := a.NormalizeSSE(strings.NewReader(geminiStream))
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	outStr := string(out)
+
+	var contentText strings.Builder
+	var sawFinish bool
+	dataLines := 0
+	for _, line := range strings.Split(outStr, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			continue
+		}
+		dataLines++
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			t.Fatalf("output frame is not valid JSON: %v\nline: %s", err, line)
+		}
+		if obj, _ := chunk["object"].(string); obj != "chat.completion.chunk" {
+			t.Errorf("object = %q, want chat.completion.chunk", obj)
+		}
+		choices, ok := chunk["choices"].([]any)
+		if !ok || len(choices) != 1 {
+			t.Fatalf("choices len = %d, want 1", len(choices))
+		}
+		choice, _ := choices[0].(map[string]any)
+		delta, _ := choice["delta"].(map[string]any)
+		if txt, ok := delta["content"].(string); ok && txt != "" {
+			contentText.WriteString(txt)
+		}
+		if fr, ok := choice["finish_reason"]; ok && fr != nil {
+			sawFinish = true
+			if fr != "stop" {
+				t.Errorf("finish_reason = %v, want stop", fr)
+			}
+		}
+	}
+
+	if got := contentText.String(); got != "Hello, world" {
+		t.Errorf("reassembled content = %q, want %q", got, "Hello, world")
+	}
+	if !sawFinish {
+		t.Error("never saw finish_reason in output")
+	}
+	if dataLines < 2 {
+		t.Errorf("dataLines = %d, want at least 2 content frames", dataLines)
+	}
+}
+
+// TestGeminiNormalizeSSEFinishReasonMapping verifies that Gemini finish
+// reasons are mapped to the correct OpenAI finish_reasons.
+func TestGeminiNormalizeSSEFinishReasonMapping(t *testing.T) {
+	a, _ := NewAdapter(AdapterTypeGemini)
+
+	cases := []struct {
+		geminiFR string
+		openAIFR string
+	}{
+		{"STOP", "stop"},
+		{"MAX_TOKENS", "length"},
+		{"SAFETY", "content_filter"},
+		{"RECITATION", "content_filter"},
+		{"BLOCKLIST", "content_filter"},
+		{"OTHER", "stop"},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.geminiFR, func(t *testing.T) {
+			stream := fmt.Sprintf(`data: {"candidates": [{"content": {"parts": [{"text": "hi"}]}}]}
+data: {"candidates": [{"finishReason": "%s"}]}
+`, tc.geminiFR)
+
+			out, _ := io.ReadAll(a.NormalizeSSE(strings.NewReader(stream)))
+			outStr := string(out)
+
+			var gotFR string
+			for _, line := range strings.Split(outStr, "\n") {
+				if !strings.HasPrefix(line, "data: ") {
+					continue
+				}
+				payload := strings.TrimPrefix(line, "data: ")
+				if payload == "[DONE]" || payload == "" {
+					continue
+				}
+				var chunk map[string]any
+				if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+					continue
+				}
+				choices, ok := chunk["choices"].([]any)
+				if !ok || len(choices) == 0 {
+					continue
+				}
+				choice, ok := choices[0].(map[string]any)
+				if !ok {
+					continue
+				}
+				if fr, ok := choice["finish_reason"].(string); ok {
+					gotFR = fr
+				}
+			}
+			if gotFR != tc.openAIFR {
+				t.Errorf("finish_reason = %q, want %q", gotFR, tc.openAIFR)
+			}
+		})
+	}
+}
+
+// TestGeminiNormalizeSSEEmptyStream ensures an empty upstream stream
+// produces no output (no crash, no frames).
+func TestGeminiNormalizeSSEEmptyStream(t *testing.T) {
+	a, _ := NewAdapter(AdapterTypeGemini)
+	out, err := io.ReadAll(a.NormalizeSSE(strings.NewReader("")))
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if len(out) != 0 {
+		t.Errorf("empty stream produced %d bytes, want 0", len(out))
 	}
 }
 
