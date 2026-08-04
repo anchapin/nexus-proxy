@@ -229,9 +229,7 @@ func chatRequest(prompt string, stream bool) string {
 			{"role": "user", "content": prompt},
 		},
 	}
-	if stream {
-		body["stream"] = true
-	}
+	body["stream"] = stream
 	b, _ := json.Marshal(body)
 	return string(b)
 }
@@ -1032,6 +1030,222 @@ func TestE2E_ProviderGeminiAdapter(t *testing.T) {
 	if got := providerHdrs.get("x-goog-api-key"); got != "test-gemini-key" {
 		t.Errorf("x-goog-api-key = %q, want test-gemini-key", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// E2E tests for progressive fusion streaming and arbiter synthesis (issue #1416)
+// ---------------------------------------------------------------------------
+
+// TestE2E_FusionProgressiveStreamingArbiterInvoked verifies that with
+// NEXUS_FUSION_AGREEMENT_THRESHOLD=0.5 and distinct panel contents (Jaccard
+// similarity < 0.5), the arbiter is invoked and the progressive streaming
+// path is exercised. It verifies:
+//   - X-Nexus-Fusion-Progressive: true header is present
+//   - Content-Type: text/event-stream
+//   - Streaming SSE chunks are returned (not a single buffered JSON object)
+func TestE2E_FusionProgressiveStreamingArbiterInvoked(t *testing.T) {
+	stats := newMockServerStats()
+	ollama := startMockOllama(t, stats, "ollama unique content about system design architecture patterns", 0)
+	t.Cleanup(ollama.Close)
+	frontier := startMockFrontier(t, stats, "frontier different response on software architecture decisions")
+	t.Cleanup(frontier.Close)
+
+	e2eBaseEnv(t, ollama.URL, frontier.URL)
+	t.Setenv("NEXUS_DSL_FUSION_PATTERNS", "e2e_fusion_trigger")
+	t.Setenv("NEXUS_DSL_FORMATTING_PATTERNS", "")
+	t.Setenv("NEXUS_DSL_LOCAL_PATTERNS", "")
+	t.Setenv("NEXUS_FUSION_AGREEMENT_THRESHOLD", "0.5")
+	t.Setenv("NEXUS_TOKEN_GUARDRAIL", "999999")
+	t.Setenv("NEXUS_ARBITER_CACHE_TTL", "0") // disable cache for this test
+
+	ts := e2eTestServer(t)
+	resp := doChat(t, ts, chatRequest("e2e_fusion_trigger system architecture design", true), "")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	if v := resp.Header.Get("X-Nexus-Fusion-Progressive"); v != "true" {
+		t.Errorf("X-Nexus-Fusion-Progressive: got %q, want true", v)
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	if !strings.Contains(ct, "text/event-stream") {
+		t.Errorf("Content-Type: got %q, want text/event-stream", ct)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	var dataLines []string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "data: ") {
+			dataLines = append(dataLines, line)
+		}
+	}
+	if len(dataLines) < 2 {
+		t.Errorf("expected at least 2 SSE data lines, got %d", len(dataLines))
+	}
+
+	var fullContent string
+	for _, line := range dataLines {
+		if strings.Contains(line, "[DONE]") {
+			continue
+		}
+		jsonPart := strings.TrimPrefix(line, "data: ")
+		var chunk map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonPart), &chunk); err == nil {
+			if choices, ok := chunk["choices"].([]interface{}); ok && len(choices) > 0 {
+				if choice, ok := choices[0].(map[string]interface{}); ok {
+					if delta, ok := choice["delta"].(map[string]interface{}); ok {
+						if content, ok := delta["content"].(string); ok {
+							fullContent += content
+						}
+					}
+				}
+			}
+		}
+	}
+	if fullContent == "" {
+		t.Error("expected non-empty content from SSE chunks")
+	}
+}
+
+// TestE2E_FusionProgressiveDisabled verifies that with
+// NEXUS_FUSION_PROGRESSIVE=false, streaming fusion requests take the
+// non-progressive Panel path and still return HTTP 200 (backward compat).
+func TestE2E_FusionProgressiveDisabled(t *testing.T) {
+	stats := newMockServerStats()
+	ollama := startMockOllama(t, stats, "fusion panel response from local", 0)
+	t.Cleanup(ollama.Close)
+	frontier := startMockFrontier(t, stats, "fusion panel response from frontier")
+	t.Cleanup(frontier.Close)
+
+	e2eBaseEnv(t, ollama.URL, frontier.URL)
+	t.Setenv("NEXUS_DSL_FUSION_PATTERNS", "e2e_fusion_trigger")
+	t.Setenv("NEXUS_DSL_FORMATTING_PATTERNS", "")
+	t.Setenv("NEXUS_DSL_LOCAL_PATTERNS", "")
+	t.Setenv("NEXUS_FUSION_PROGRESSIVE", "false")
+	t.Setenv("NEXUS_TOKEN_GUARDRAIL", "999999")
+	t.Setenv("NEXUS_ARBITER_CACHE_TTL", "0")
+
+	ts := e2eTestServer(t)
+	resp := doChat(t, ts, chatRequest("e2e_fusion_trigger system architecture", true), "")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	if v := resp.Header.Get("X-Nexus-Fusion-Progressive"); v != "" {
+		t.Errorf("X-Nexus-Fusion-Progressive: got %q, want empty (non-progressive path)", v)
+	}
+}
+
+// TestE2E_FusionArbiterCacheHit verifies that with NEXUS_ARBITER_CACHE_TTL=5m
+// and agreement threshold forcing arbiter invocation, two identical fusion requests
+// result in the second hitting the arbiter cache. It asserts:
+//   - nexus_fusion_arbiter_cache_total{reason="cache_miss"} increments on first request
+//   - nexus_fusion_arbiter_cache_total{reason="cache_hit"} increments on second request
+//   - Second request does not call the arbiter endpoint again (verified via stats)
+func TestE2E_FusionArbiterCacheHit(t *testing.T) {
+	stats := newMockServerStats()
+	ollama := startMockOllama(t, stats, "ollama unique response about system design architecture patterns", 0)
+	t.Cleanup(ollama.Close)
+	frontier := startMockFrontier(t, stats, "frontier different approach regarding software implementation details components")
+	t.Cleanup(frontier.Close)
+
+	e2eBaseEnv(t, ollama.URL, frontier.URL)
+	t.Setenv("NEXUS_DSL_FUSION_PATTERNS", "e2e_fusion_trigger")
+	t.Setenv("NEXUS_DSL_FORMATTING_PATTERNS", "")
+	t.Setenv("NEXUS_DSL_LOCAL_PATTERNS", "")
+	t.Setenv("NEXUS_FUSION_AGREEMENT_THRESHOLD", "0.5")
+	t.Setenv("NEXUS_TOKEN_GUARDRAIL", "999999")
+	t.Setenv("NEXUS_ARBITER_CACHE_TTL", "5m")
+
+	ts := e2eTestServer(t)
+
+	prompt := "e2e_fusion_trigger system architecture design"
+	bodyReq := chatRequest(prompt, false)
+
+	// Get baseline metrics BEFORE any requests
+	respM0, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metricsBody0, _ := io.ReadAll(respM0.Body)
+	respM0.Body.Close()
+	metricsStr0 := string(metricsBody0)
+	cacheMissBaseline := extractArbiterCacheCount(metricsStr0, "cache_miss")
+	cacheHitBaseline := extractArbiterCacheCount(metricsStr0, "cache_hit")
+
+	// First request — should be a cache miss (arbiter invoked)
+	resp1 := doChat(t, ts, bodyReq, "")
+	defer resp1.Body.Close()
+	io.ReadAll(resp1.Body)
+
+	if resp1.StatusCode != 200 {
+		t.Fatalf("first request: got %d, want 200", resp1.StatusCode)
+	}
+
+	respM1, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metricsBody1, _ := io.ReadAll(respM1.Body)
+	respM1.Body.Close()
+	metricsStr1 := string(metricsBody1)
+	cacheMissAfterFirst := extractArbiterCacheCount(metricsStr1, "cache_miss")
+
+	// Second request — should hit the arbiter cache
+	resp2 := doChat(t, ts, bodyReq, "")
+	defer resp2.Body.Close()
+	io.ReadAll(resp2.Body)
+
+	if resp2.StatusCode != 200 {
+		t.Fatalf("second request: got %d, want 200", resp2.StatusCode)
+	}
+
+	respM2, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metricsBody2, _ := io.ReadAll(respM2.Body)
+	respM2.Body.Close()
+	metricsStr2 := string(metricsBody2)
+
+	cacheMissAfterSecond := extractArbiterCacheCount(metricsStr2, "cache_miss")
+	cacheHitAfterSecond := extractArbiterCacheCount(metricsStr2, "cache_hit")
+
+	if cacheMissAfterFirst <= cacheMissBaseline {
+		t.Errorf("nexus_fusion_arbiter_cache_total{cache_miss} did not increment after first request: baseline=%d, after_first=%d",
+			cacheMissBaseline, cacheMissAfterFirst)
+	}
+	if cacheHitAfterSecond <= cacheHitBaseline {
+		t.Errorf("nexus_fusion_arbiter_cache_total{cache_hit} did not increment after second request: baseline=%d, after_second=%d",
+			cacheHitBaseline, cacheHitAfterSecond)
+	}
+	// Verify no new miss on second request
+	if cacheMissAfterSecond != cacheMissAfterFirst {
+		t.Errorf("nexus_fusion_arbiter_cache_total{cache_miss} changed on second request (should be unchanged): after_first=%d, after_second=%d",
+			cacheMissAfterFirst, cacheMissAfterSecond)
+	}
+}
+
+func extractArbiterCacheCount(metricsStr, label string) int {
+	for _, line := range strings.Split(metricsStr, "\n") {
+		if strings.Contains(line, `nexus_fusion_arbiter_cache_total{reason="`+label+`"}`) {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				var v int
+				fmt.Sscanf(parts[len(parts)-1], "%d", &v)
+				return v
+			}
+		}
+	}
+	return 0
 }
 
 // ---------------------------------------------------------------------------

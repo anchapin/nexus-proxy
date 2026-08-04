@@ -1007,13 +1007,17 @@ func PanelStreaming(
 	simCfg FusionSimilarityConfig,
 ) (PanelOutcome, error) {
 	var outcome PanelOutcome
+	slog.Debug("PanelStreaming ENTRY", slog.Any("body_stream", body["stream"]))
 
 	// Non-streaming fallback. The handler should already have routed
 	// stream=false to Panel directly, but we double-check here so the
 	// contract is enforced at the function boundary: a caller that
 	// hands PanelStreaming a stream=false body gets the existing
 	// JSON-object response shape (issue #10).
+	streamVal, streamOk := body["stream"].(bool)
+	slog.Debug("PanelStreaming: body stream check", slog.Any("streamVal", streamVal), slog.Bool("streamOk", streamOk))
 	if s, ok := body["stream"].(bool); ok && !s {
+		slog.Debug("PanelStreaming: delegating to Panel (stream=false)")
 		panelOutcome, cacheHit, err := Panel(ctx, w, client,
 			localBaseURL, localModel, frontierURL, frontierKey, frontierModel,
 			arbiterURL, arbiterKey, arbiterModel,
@@ -1398,13 +1402,27 @@ func streamPanelResultAsSSE(w http.ResponseWriter, r PanelResult) error {
 	return nil
 }
 
+// writtenChecker is implemented by the panicRecorder in handlers/recover.go.
+// It is used to detect whether PanelStreaming has already committed SSE
+// headers before streamCachedArbiterSynthesis attempts to set them again.
+// We define this as a local interface rather than importing handlers to
+// avoid a circular dependency.
+type writtenChecker interface {
+	Written() bool
+}
+
 // streamCachedArbiterSynthesis streams a cached arbiter synthesis text as
 // SSE chunks (issue #232). This mimics the output of StreamWithContext
 // for the arbiter, but serves from cache instead. The synthesis is
 // streamed as a single delta chunk followed by [DONE]. This function
 // sets SSE headers and commits WriteHeader itself (issue #532) so it
 // is safe to call from any code path that has not yet written headers.
+// If the panicRecorder has already marked headers as written (e.g. by a
+// prior speculative SSE write from PanelStreaming), this skips the
+// redundant WriteHeader call to avoid "superfluous response.WriteHeader"
+// errors (issue #1416).
 func streamCachedArbiterSynthesis(w http.ResponseWriter, synthesis any) error {
+	slog.Info("streamCachedArbiterSynthesis called")
 	content, ok := synthesis.(string)
 	if !ok {
 		return fmt.Errorf("fusion: cached synthesis is not a string: %T", synthesis)
@@ -1429,7 +1447,15 @@ func streamCachedArbiterSynthesis(w http.ResponseWriter, synthesis any) error {
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
+	if wc, ok := w.(writtenChecker); ok && wc.Written() {
+		slog.Debug("fusion: streamCachedArbiterSynthesis skipping WriteHeader (headers already committed)")
+	} else {
+		slog.Debug("fusion: streamCachedArbiterSynthesis calling WriteHeader", slog.Any("writtenChecker_ok", ok))
+		if ok {
+			slog.Debug("fusion: streamCachedArbiterSynthesis Written()", slog.Bool("written", wc.Written()))
+		}
+		w.WriteHeader(http.StatusOK)
+	}
 	if _, err := w.Write([]byte("data: ")); err != nil {
 		if IsClientAbort(err) {
 			return ErrClientAbort
@@ -1460,6 +1486,7 @@ func streamCachedArbiterSynthesis(w http.ResponseWriter, synthesis any) error {
 // from cache instead. The model name is passed as modelName so the
 // response has the correct model field.
 func writeCachedArbiterJSON(w http.ResponseWriter, synthesis, modelName string) error {
+	slog.Info("writeCachedArbiterJSON called", slog.Any("synthesis_len", len(synthesis)))
 	resp := map[string]interface{}{
 		"object": "chat.completion",
 		"model":  modelName,
@@ -1479,7 +1506,15 @@ func writeCachedArbiterJSON(w http.ResponseWriter, synthesis, modelName string) 
 		return fmt.Errorf("fusion: marshal cached arbiter JSON: %w", err)
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
+	if wc, ok := w.(writtenChecker); ok && wc.Written() {
+		slog.Debug("fusion: writeCachedArbiterJSON skipping WriteHeader (headers already committed)")
+	} else {
+		slog.Debug("fusion: writeCachedArbiterJSON calling WriteHeader", slog.Any("writtenChecker_ok", ok))
+		if ok {
+			slog.Debug("fusion: writtenChecker.Written()", slog.Bool("written", wc.Written()))
+		}
+		w.WriteHeader(http.StatusOK)
+	}
 	_, werr := w.Write(b)
 	return werr
 }

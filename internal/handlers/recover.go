@@ -223,6 +223,8 @@ type panicRecorder struct {
 func (p *panicRecorder) WriteHeader(code int) {
 	if !p.headerWritten {
 		p.headerWritten = true
+	} else {
+		slog.Warn("panicRecorder.WriteHeader: DOUBLE CALL DETECTED", slog.Int("code", code), slog.String("stack", string(debug.Stack())))
 	}
 	p.ResponseWriter.WriteHeader(code)
 }
@@ -238,6 +240,12 @@ func (p *panicRecorder) Write(b []byte) (int, error) {
 	}
 	return p.ResponseWriter.Write(b)
 }
+
+// Written returns true if headers (or body) have already been committed
+// to the client. Used by streamCachedArbiterSynthesis to detect whether
+// PanelStreaming has already committed SSE headers before attempting to set
+// them again (issue #1416).
+func (p *panicRecorder) Written() bool { return p.headerWritten }
 
 // Flush delegates to the stored flusher. If the underlying writer does not
 // implement http.Flusher, this is a no-op and the SSE panic path will use
