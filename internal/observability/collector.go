@@ -711,8 +711,8 @@ func (c *Collector) IncAuthAccepted(clientIP string) {
 	if _, ok := c.authAccepted[clientIP]; !ok {
 		c.authAccepted[clientIP] = &atomic.Uint64{}
 	}
-	c.authMu.Unlock()
 	c.authAccepted[clientIP].Add(1)
+	c.authMu.Unlock()
 }
 
 // IncAuthRejectedInvalid records a request that presented a
@@ -723,8 +723,8 @@ func (c *Collector) IncAuthRejectedInvalid(clientIP string) {
 	if _, ok := c.authRejectedInvalid[clientIP]; !ok {
 		c.authRejectedInvalid[clientIP] = &atomic.Uint64{}
 	}
-	c.authMu.Unlock()
 	c.authRejectedInvalid[clientIP].Add(1)
+	c.authMu.Unlock()
 }
 
 // IncAuthRejectedMissing records a request that presented no
@@ -735,8 +735,8 @@ func (c *Collector) IncAuthRejectedMissing(clientIP string) {
 	if _, ok := c.authRejectedMissing[clientIP]; !ok {
 		c.authRejectedMissing[clientIP] = &atomic.Uint64{}
 	}
-	c.authMu.Unlock()
 	c.authRejectedMissing[clientIP].Add(1)
+	c.authMu.Unlock()
 }
 
 // IncAuthReaperEvictions records one reaper eviction of an idle IP
