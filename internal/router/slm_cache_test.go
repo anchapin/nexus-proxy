@@ -2,11 +2,14 @@ package router
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestSLMCache_GetSet(t *testing.T) {
@@ -2110,5 +2113,151 @@ func TestSLMCache_DimMismatch_StatsReporting(t *testing.T) {
 	}
 	if stats.LRUEvictions != 0 {
 		t.Errorf("LRUEvictions = %d, want 0", stats.LRUEvictions)
+	}
+}
+
+func TestSLMCache_Warm_PopulatesAndServes(t *testing.T) {
+	c := NewSLMCache(time.Hour, 0)
+	now := time.Now()
+	entries := []SLMCacheWarmEntry{
+		{Prompt: "write a function", Route: RouteLocal, Timestamp: now},
+		{Prompt: "explain this code", Route: RouteFrontier, Timestamp: now},
+	}
+	loaded, skipped := c.Warm(entries)
+	if loaded != 2 {
+		t.Errorf("loaded = %d, want 2", loaded)
+	}
+	if skipped != 0 {
+		t.Errorf("skipped = %d, want 0", skipped)
+	}
+	ctx := context.Background()
+	got, ok, kind := c.Get(ctx, "write a function")
+	if !ok || got != RouteLocal || kind != CacheHitExact {
+		t.Errorf("write a function: got (%v, %v, %v), want (RouteLocal, true, CacheHitExact)", got, ok, kind)
+	}
+	got, ok, kind = c.Get(ctx, "explain this code")
+	if !ok || got != RouteFrontier || kind != CacheHitExact {
+		t.Errorf("explain this code: got (%v, %v, %v), want (RouteFrontier, true, CacheHitExact)", got, ok, kind)
+	}
+}
+
+func TestSLMCache_Warm_SkipsStale(t *testing.T) {
+	c := NewSLMCache(time.Hour, 0)
+	now := time.Now()
+	entries := []SLMCacheWarmEntry{
+		{Prompt: "fresh entry", Route: RouteLocal, Timestamp: now},
+		{Prompt: "stale entry", Route: RouteFrontier, Timestamp: now.Add(-2 * time.Hour)},
+	}
+	loaded, skipped := c.Warm(entries)
+	if loaded != 1 {
+		t.Errorf("loaded = %d, want 1", loaded)
+	}
+	if skipped != 1 {
+		t.Errorf("skipped = %d, want 1", skipped)
+	}
+	ctx := context.Background()
+	got, ok, _ := c.Get(ctx, "fresh entry")
+	if !ok || got != RouteLocal {
+		t.Errorf("fresh entry: got (%v, %v, _), want (RouteLocal, true, _)", got, ok)
+	}
+	got, ok, _ = c.Get(ctx, "stale entry")
+	if ok || got != "" {
+		t.Errorf("stale entry: got (%v, %v, _), want (\"\", false, _)", got, ok)
+	}
+}
+
+func TestSLMCache_Warm_NilCache(t *testing.T) {
+	var c *SLMCache
+	loaded, skipped := c.Warm(nil)
+	if loaded != 0 || skipped != 0 {
+		t.Errorf("nil cache: got (%d, %d), want (0, 0)", loaded, skipped)
+	}
+}
+
+func TestSLMCache_Warm_RespectsMaxEntries(t *testing.T) {
+	c := NewSLMCache(time.Hour, 2)
+	now := time.Now()
+	entries := []SLMCacheWarmEntry{
+		{Prompt: "first", Route: RouteLocal, Timestamp: now},
+		{Prompt: "second", Route: RouteFrontier, Timestamp: now},
+		{Prompt: "third", Route: RouteLocal, Timestamp: now},
+	}
+	loaded, skipped := c.Warm(entries)
+	if loaded != 3 {
+		t.Errorf("loaded = %d, want 3", loaded)
+	}
+	if skipped != 0 {
+		t.Errorf("skipped = %d, want 0", skipped)
+	}
+	if c.Len() != 2 {
+		t.Errorf("Len = %d, want 2 (max entries)", c.Len())
+	}
+}
+
+func TestSLMCache_PreWarmFromSQLite_EmptyDB(t *testing.T) {
+	c := NewSLMCache(time.Hour, 0)
+	tmp := t.TempDir() + "/empty.db"
+	db, err := sql.Open("sqlite", "file:"+tmp)
+	if err != nil {
+		t.Fatalf("open temp db: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE routing_outcomes(id INTEGER PRIMARY KEY, category TEXT NOT NULL, route TEXT NOT NULL, score INTEGER NOT NULL, timestamp DATETIME NOT NULL)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	err = c.PreWarmFromSQLite(tmp, 512)
+	if err != nil {
+		t.Fatalf("PreWarmFromSQLite on empty db: %v", err)
+	}
+	if c.Len() != 0 {
+		t.Errorf("Len = %d, want 0", c.Len())
+	}
+}
+
+func TestSLMCache_PreWarmFromSQLite_NilReceiver(t *testing.T) {
+	var c *SLMCache
+	err := c.PreWarmFromSQLite("/nonexistent/path/db.db", 512)
+	if err != nil {
+		t.Fatalf("PreWarmFromSQLite on nil receiver: %v", err)
+	}
+}
+
+func TestSLMCache_PreWarmFromSQLite_ZeroMaxEntries(t *testing.T) {
+	c := NewSLMCache(time.Hour, 0)
+	err := c.PreWarmFromSQLite("/some/path.db", 0)
+	if err != nil {
+		t.Fatalf("PreWarmFromSQLite with maxEntries=0: %v", err)
+	}
+}
+
+func TestSLMCache_PreWarmFromSQLite_LoadsEntries(t *testing.T) {
+	tmp := t.TempDir() + "/test.db"
+	db, err := sql.Open("sqlite", "file:"+tmp)
+	if err != nil {
+		t.Fatalf("open temp db: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE routing_outcomes(id INTEGER PRIMARY KEY, category TEXT NOT NULL, route TEXT NOT NULL, score INTEGER NOT NULL, timestamp DATETIME NOT NULL)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := db.Exec(`INSERT INTO routing_outcomes (category, route, score, timestamp) VALUES (?, ?, ?, ?)`, "write a function", "local", 0, now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("insert row: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO routing_outcomes (category, route, score, timestamp) VALUES (?, ?, ?, ?)`, "explain this code", "frontier", 0, now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("insert row: %v", err)
+	}
+	c := NewSLMCache(time.Hour, 0)
+	if err := c.PreWarmFromSQLite(tmp, 512); err != nil {
+		t.Fatalf("PreWarmFromSQLite: %v", err)
+	}
+	ctx := context.Background()
+	got, ok, kind := c.Get(ctx, "write a function")
+	if !ok || got != RouteLocal || kind != CacheHitExact {
+		t.Errorf("write a function: got (%v, %v, %v), want (RouteLocal, true, CacheHitExact)", got, ok, kind)
+	}
+	got, ok, kind = c.Get(ctx, "explain this code")
+	if !ok || got != RouteFrontier || kind != CacheHitExact {
+		t.Errorf("explain this code: got (%v, %v, %v), want (RouteFrontier, true, CacheHitExact)", got, ok, kind)
 	}
 }
