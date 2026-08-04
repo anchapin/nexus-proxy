@@ -81,6 +81,37 @@ For each issue in the current wave:
 git worktree add ../worktrees/issue-{N}-{slug} -b fix/issue-{N}-{slug} develop
 ```
 
+### 3a2. Worktree Branch Sanity (issue #1357)
+
+**Before spawning any sub-agent**, verify the worktree branch is cleanly based on `origin/develop` with no diverged commits:
+
+```bash
+cd ../worktrees/issue-{N}-{slug}
+
+# Check 1: branch must not have diverged from origin/develop
+if ! git merge-base --is-ancestor HEAD origin/develop && ! git merge-base --is-ancestor origin/develop HEAD; then
+  echo "ERROR: branch has diverged from origin/develop (worktree: issue-{N}-{slug})" >&2
+  echo "This indicates stray commits from a prior wave. Resetting branch." >&2
+  git fetch origin develop
+  git reset --hard origin/develop
+fi
+
+# Check 2: branch must not be ahead of origin/develop (would indicate prior sub-agent push)
+AHEAD=$(git log origin/develop..HEAD --oneline 2>/dev/null | wc -l)
+if [ "$AHEAD" -gt 0 ]; then
+  echo "WARNING: worktree branch is $AHEAD commit(s) ahead of origin/develop (worktree: issue-{N}-{slug})." >&2
+  echo "Resetting to origin/develop to prevent stray commit accumulation." >&2
+  git fetch origin develop
+  git reset --hard origin/develop
+fi
+
+echo "Worktree sanity OK: issue-{N}-{slug} is clean on origin/develop"
+```
+
+If the reset removes uncommitted changes, they are stashed first (safe because the
+worktree is otherwise empty at this point). This check prevents a worktree that
+carried a stray commit from a prior wave from polluting a new wave's branch.
+
 ### 3b. Spawn Implementation Sub-agents
 
 **Pre-flight check — main repo branch sanity (issue #1275):**
@@ -124,15 +155,23 @@ instead of passively waiting for a done signal:
 2. **Sub-agent done signal with heartbeat**:
    When a sub-agent reports "done":
    - **Step A: Capture the done signal and start a 60s heartbeat timer**
-   - **Step B: Immediately verify commit existence** (before any other action):
-     ```bash
-     cd ../worktrees/issue-{N}-{slug}
-     if ! git log origin/develop..HEAD --oneline | head -1 > /dev/null 2>&1; then
-       # No new commits — sub-agent reported done without committing
-       echo "WARNING: Sub-agent reported done but no commits found. Entering recovery."
-       enter_recovery_sequence
-     fi
-     ```
+   - **Step B: Immediately verify commit count** (before any other action):
+      ```bash
+      cd ../worktrees/issue-{N}-{slug}
+      COMMITS=$(git log origin/develop..HEAD --oneline 2>/dev/null | wc -l)
+      if [ "$COMMITS" -eq 0 ]; then
+        # No new commits — sub-agent reported done without committing
+        echo "WARNING: Sub-agent reported done but no commits found. Entering recovery."
+        enter_recovery_sequence
+      elif [ "$COMMITS" -ne 1 ]; then
+        # More than 1 commit — stray commits from prior wave (issue #1357)
+        echo "WARNING: Sub-agent reported done but found $COMMITS commits (expected 1)." >&2
+        echo "Stray commits may have accumulated from a prior wave. Resetting to origin/develop." >&2
+        git fetch origin develop
+        git reset --hard origin/develop
+        enter_recovery_sequence
+      fi
+      ```
    - **Step C: PR verification loop** (while heartbeat timer is active):
      Poll every 10s for up to 60s:
      ```bash
@@ -158,31 +197,51 @@ instead of passively waiting for a done signal:
    ```bash
    cd ../worktrees/issue-{N}-{slug}
 
-    # Step A: verify commit existence (safety net — catches silent failure)
-    if ! git log origin/develop..HEAD --oneline | head -1 > /dev/null 2>&1; then
-       echo "RECOVERY: No commits found in worktree. Worktree may be stale."
+     # Step A: verify commit count (safety net — catches silent failure and stray commits, issue #1357)
+     COMMITS=$(git log origin/develop..HEAD --oneline 2>/dev/null | wc -l)
+     if [ "$COMMITS" -eq 0 ]; then
+        echo "RECOVERY: No commits found in worktree. Worktree may be stale."
 
-       # Preserve uncommitted changes before rebasing (issue #1272)
-       # git rebase discards unstashed changes; stash is safe when clean
-       if [ -n "$(git status --short)" ]; then
-         echo "RECOVERY: Stashing uncommitted changes before rebase."
-         git add -A && git stash push -m "wave-recovery-$(date +%s)"
-       fi
+        # Preserve uncommitted changes before rebasing (issue #1272)
+        # git rebase discards unstashed changes; stash is safe when clean
+        if [ -n "$(git status --short)" ]; then
+          echo "RECOVERY: Stashing uncommitted changes before rebase."
+          git add -A && git stash push -m "wave-recovery-$(date +%s)"
+        fi
 
-       git fetch origin develop
-       if git rebase origin/develop; then
-         echo "RECOVERY: Rebase succeeded."
-       else
-         echo "RECOVERY: Rebase failed, aborting and restoring stashed changes."
-         git rebase --abort 2>/dev/null || true
-       fi
+        git fetch origin develop
+        if git rebase origin/develop; then
+          echo "RECOVERY: Rebase succeeded."
+        else
+          echo "RECOVERY: Rebase failed, aborting and restoring stashed changes."
+          git rebase --abort 2>/dev/null || true
+        fi
 
-       # Restore stashed changes if any
-       if git stash list | grep -q "wave-recovery"; then
-         echo "RECOVERY: Restoring stashed changes."
-         git stash pop || echo "WARNING: stash pop failed — manual intervention may be needed"
-       fi
-    fi
+        # Restore stashed changes if any
+        if git stash list | grep -q "wave-recovery"; then
+          echo "RECOVERY: Restoring stashed changes."
+          git stash pop || echo "WARNING: stash pop failed — manual intervention may be needed"
+        fi
+     elif [ "$COMMITS" -gt 1 ]; then
+        # More than 1 commit — stray commits from prior wave (issue #1357)
+        echo "RECOVERY: Found $COMMITS commits in worktree (expected 1). Stray commits detected." >&2
+
+        # Preserve uncommitted changes before hard reset
+        if [ -n "$(git status --short)" ]; then
+          echo "RECOVERY: Stashing uncommitted changes before reset."
+          git add -A && git stash push -m "wave-recovery-stray-$(date +%s)"
+        fi
+
+        git fetch origin develop
+        git reset --hard origin/develop
+        echo "RECOVERY: Branch reset to origin/develop. Stray commits discarded."
+
+        # Restore stashed changes if any
+        if git stash list | grep -q "wave-recovery"; then
+          echo "RECOVERY: Restoring stashed changes."
+          git stash pop || echo "WARNING: stash pop failed — manual intervention may be needed"
+        fi
+     fi
 
     # Step A2: detect and recover stray commits on origin/develop (issue #1284)
     STRAY=$(git -C /home/alex/AI/nexus-proxy log --oneline origin/develop | grep "fix/issue-{N}-{slug}" | head -1)
