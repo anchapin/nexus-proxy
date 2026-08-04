@@ -8,7 +8,7 @@
 // net/http — internal/middleware is intentionally net/http-free.
 //
 // Profiles:
-//   - secrets: bearer tokens (sk-…, AKIA…, ghp_…, xoxb-…, AIza…),
+//   - secrets: bearer tokens (sk-…, AKIA…, ASI…, ghp_…, xoxb-…, AIza…),
 //     PEM private-key blocks.
 //   - pii: credit-card numbers (Luhn-validated), US SSNs, email.
 //   - custom: operator-supplied regexes from NEXUS_REDACT_PATTERNS.
@@ -72,6 +72,7 @@ var (
 	secretsPatterns = []compiledPattern{
 		{re: regexp.MustCompile(`sk-[a-zA-Z0-9]{20,}`)},
 		{re: regexp.MustCompile(`AKIA[0-9A-Z]{16}`)},
+		{re: regexp.MustCompile(`ASI[A-Za-z0-9]{16,}`)},
 		{re: regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{36,}`)},
 		{re: regexp.MustCompile(`xox[baprs]-[A-Za-z0-9-]{10,}`)},
 		{re: regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`)},

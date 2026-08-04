@@ -68,6 +68,52 @@ func TestRedactGoogleAPIKey(t *testing.T) {
 	}
 }
 
+func TestRedactAWSTempCredentials(t *testing.T) {
+	r, rec := newTestRedactor(secretsPatterns, t)
+	// ASI prefix with 16+ base62 chars — AWS STS session tokens.
+	token := "ASIARTZZXZABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"
+	r.Write([]byte(`{"AccessKeyId":"` + token + `"}`))
+	r.Flush()
+	body := rec.Body.String()
+	if strings.Contains(body, token) {
+		t.Errorf("ASI token not redacted: %s", body)
+	}
+	if !strings.Contains(body, "[REDACTED]") {
+		t.Errorf("expected [REDACTED] placeholder")
+	}
+	if r.Substitutions() != 1 {
+		t.Errorf("expected 1 substitution, got %d", r.Substitutions())
+	}
+}
+
+func TestRedactAWSTempCredentialsSplitAcrossChunks(t *testing.T) {
+	// ASI tokens are single-line, so they drain on every Flush() unlike
+	// PEM blocks (holdingForMultiline only suppresses flush for PEM).
+	// This test verifies that two consecutive writes accumulate in the
+	// buffer and the full ASI token spanning both chunks is redacted.
+	r, rec := newTestRedactor(secretsPatterns, t)
+	chunk1 := `data: {"choices":[{"delta":{"content":"token: ASIARTZZXZABCDE`
+	chunk2 := `FGHIJKLMNOPQRSTUVWXYZ1234567890abcdef more
+"}}]}`
+
+	// Write chunk1 (partial token, no flush yet).
+	r.Write([]byte(chunk1))
+	// Write chunk2 and flush — buffer now has both chunks.
+	r.Write([]byte(chunk2))
+	r.Flush()
+
+	body := rec.Body.String()
+	if strings.Contains(body, "ASIARTZZXZ") {
+		t.Errorf("ASI token not redacted after multi-chunk write: %s", body)
+	}
+	if !strings.Contains(body, "[REDACTED]") {
+		t.Errorf("expected [REDACTED] placeholder")
+	}
+	if !strings.Contains(body, "more") {
+		t.Errorf("text after token should be preserved")
+	}
+}
+
 func TestRedactPrivateKeyFull(t *testing.T) {
 	r, rec := newTestRedactor(secretsPatterns, t)
 	key := `-----BEGIN PRIVATE KEY-----
