@@ -350,6 +350,23 @@ The span/metric attribute pairing is:
 Span attributes use the same values as the Prometheus labels so
 cross-referencing is trivial.
 
+## OTLP metrics export (`internal/observability`)
+
+The OTLP/JSON metrics exporter (`internal/observability/otel_metrics.go`,
+issue #1238) POSTs metric snapshots to the configured collector endpoint
+on a fixed interval. When the collector is unreachable or returns an error,
+the failure is recorded so operators can detect when their observability
+pipeline itself is broken:
+
+| Metric | Backing source | Meaning |
+|--------|----------------|---------|
+| `nexus_otel_metrics_export_failures_total` | `OtelMetricsExporter.ExportFailures()` | Cumulative count of export batches that failed to POST (HTTP 4xx/5xx, timeout, or transport error). Each failure means one periodic export cycle dropped its payload — the proxy continues operating without the observability data. |
+
+**Distinguishing from tracing:** `nexus_tracing_flush_failures_total` counts
+trace batch POST failures; `nexus_otel_metrics_export_failures_total` counts
+metrics export failures. The two are independent pipelines and have independent
+failure signals.
+
 ## Concurrency / VRAM
 
 The VRAM-aware local-route concurrency limiter (`internal/concurrencylimit`,
