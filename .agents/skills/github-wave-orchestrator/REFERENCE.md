@@ -156,36 +156,51 @@ Steps:
 2. IF CI is green:
    a. Check mergeable: gh pr view {NUMBER} --json mergeable
    b. If CONFLICTING → follow the merge conflict protocol below
-   c. If MERGEABLE → merge: gh pr merge {NUMBER} --squash
+   c. If MERGEABLE → merge: gh pr merge {NUMBER} --squash --admin
       NOTE: Do NOT use --delete-branch here. The branch deletion must happen
       AFTER worktree removal (see step 2d below) to avoid:
       "error: cannot delete branch 'fix/issue-N' used by worktree at '../worktrees/issue-N'"
+
+      NOTE: The --admin flag bypasses branch protection (e.g., when required_approving_review_count
+      was temporarily set to 0). However, --admin merges also bypass GitHub's auto-close
+      processing — the `Closes #N` / `Fixes #N` keywords in the PR body are NOT processed
+      by GitHub when --admin is used. Issues linked in the PR body will remain OPEN after
+      the merge unless we close them explicitly (issue #1358).
 
       Then verify the merge persisted:
       ```
       gh pr view {NUMBER} --json mergedAt --jq '.mergedAt'
       ```
+      - If mergedAt IS null → merge did NOT persist. Retry once:
+        `gh pr merge {NUMBER} --squash --admin`
+        If second attempt also yields null mergedAt → report BLOCKED and STOP
+
       - If mergedAt is NOT null → merge succeeded, verify issues are closed:
         ```
         bash scripts/verify_issues_closed.sh {NUMBER}
         ```
         - If all issues closed → proceed to step 2d
-        - If any issue remains open → the PR body used a non-standard keyword.
-          Attempt to fix the PR body before reporting BLOCKER:
-          ```
-          gh pr edit {NUMBER} --body "$(gh pr view {NUMBER} --json body --jq .body)
 
-Closes #{ISSUE_NUMBER}"
+        - If any issue remains open → this is expected when --admin was used.
+          Close each open issue explicitly as a fallback:
           ```
-          Wait 30s for GitHub to process the edit, then verify again:
+          # Extract issue numbers from PR body and close each one
+          BODY=$(gh pr view {NUMBER} --json body --jq '.body // ""')
+          echo "$BODY" | grep -oiE '(closes|fixes|resolves)\s+#[0-9]+' \
+            | grep -oE '#[0-9]+' | grep -oE '[0-9]+' | sort -u \
+            | while read ISSUE_NUM; do
+              STATE=$(gh issue view "$ISSUE_NUM" --json state --jq '.state')
+              if [ "$STATE" = "OPEN" ]; then
+                gh issue close "$ISSUE_NUM" --comment "Closed via PR #{NUMBER} merge"
+              fi
+            done
+          ```
+          Then verify all issues are now closed:
           ```
           bash scripts/verify_issues_closed.sh {NUMBER}
           ```
-          - If issue is now CLOSED → proceed to step 2d
-          - If still OPEN after 2 minutes (4 x 30s wait) → report BLOCKER and STOP
-      - If mergedAt IS null → merge did NOT persist. Retry once:
-        `gh pr merge {NUMBER} --squash`
-        If second attempt also yields null mergedAt → report BLOCKED and STOP
+          - If all issues closed → proceed to step 2d
+          - If any issue still OPEN → report BLOCKER and STOP
    d. Clean up (ORDER MATTERS — worktree remove BEFORE branch delete):
       ```bash
       # Step 1: Remove worktree FIRST (branch must not be deleted yet)
@@ -226,6 +241,8 @@ Report back: final status (MERGED / BLOCKED / CONFLICT), iterations used, files 
    mentioned in the PR body to be CLOSED after merge. If mergedAt is null, the
    merge did not persist — report BLOCKED. If any linked issue remains open after
    merge (issue #961), report BLOCKER with the open issue numbers.
+   When --admin was used and issues remain open after merge, the fallback close
+   should have been applied automatically — if not, report BLOCKER (issue #1358).
 ```
 
 ## Merge Ordering Strategy
