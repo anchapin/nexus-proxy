@@ -78,6 +78,11 @@ type probeCallback func(provider, result string)
 // nexus_frontier_circuit_open_total counter.
 type tripCallback func(provider string)
 
+// recoveryCallback is invoked when a provider's circuit transitions from
+// open to closed so the observability layer can increment its
+// nexus_frontier_circuit_close_total counter (issue #1412).
+type recoveryCallback func(provider string)
+
 // frontierProviderState holds the live circuit state for one provider.
 // All mutable fields are atomic so the hot path (IsHealthy) never
 // contends with the poller goroutine.
@@ -127,8 +132,9 @@ type FrontierHealth struct {
 	states  map[string]*frontierProviderState
 	targets []FrontierProbeTarget
 
-	onProbe probeCallback
-	onTrip  tripCallback
+	onProbe    probeCallback
+	onTrip     tripCallback
+	onRecovery recoveryCallback
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -191,6 +197,14 @@ func (fh *FrontierHealth) SetProbeCallback(cb probeCallback) {
 // increment nexus_frontier_circuit_open_total. Must be called before Run.
 func (fh *FrontierHealth) SetTripCallback(cb tripCallback) {
 	fh.onTrip = cb
+}
+
+// SetRecoveryCallback installs a callback invoked when a provider's circuit
+// transitions from open to closed. Used by the observability layer to
+// increment nexus_frontier_circuit_close_total (issue #1412). Must be
+// called before Run.
+func (fh *FrontierHealth) SetRecoveryCallback(cb recoveryCallback) {
+	fh.onRecovery = cb
 }
 
 // IsHealthy reports whether the named provider's circuit is closed
@@ -398,9 +412,13 @@ func (fh *FrontierHealth) recordSuccess(st *frontierProviderState) {
 	fh.mu.Lock()
 	defer fh.mu.Unlock()
 	if !st.healthy.Swap(true) {
+		// Circuit was open, now closed — transition fire.
 		slog.Info("frontier health: circuit closed (recovered)",
 			slog.String("provider", st.name()),
 		)
+		if fh.onRecovery != nil {
+			fh.onRecovery(st.name())
+		}
 	}
 	st.failureCount.Store(0)
 }

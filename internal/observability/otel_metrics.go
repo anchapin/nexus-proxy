@@ -776,6 +776,15 @@ func CollectMetricSnapshot() []MetricSnapshot {
 			Sum:    float64(cnt),
 		})
 	}
+	frontierCircuitClose := collectorSlow.FrontierCircuitCloseTotals()
+	for provider, cnt := range frontierCircuitClose {
+		out = append(out, MetricSnapshot{
+			Name:   "nexus_frontier_circuit_close_total",
+			Type:   MetricTypeCounter,
+			Labels: map[string]string{"provider": provider},
+			Sum:    float64(cnt),
+		})
+	}
 
 	// Confidence errors
 	out = append(out, MetricSnapshot{
