@@ -461,3 +461,32 @@ func TestProfileKnobs(t *testing.T) {
 		t.Errorf("unknown profile should yield nil knobs, got %v", v)
 	}
 }
+
+// TestProbeOllama_ParseError verifies that probeOllama returns false and
+// emits a [WARN] line when parseTagsBody fails (malformed JSON), while
+// still preserving the earlier [PASS] from the HTTP reachability check.
+func TestProbeOllama_ParseError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/tags" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{invalid json`)) // malformed — parseTagsBody will fail
+	}))
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	wiz := newInitWizard(&stdout, &stderr, strings.NewReader(""), srv.Client(), 0)
+	ok := wiz.probeOllama(srv.URL, true)
+
+	if ok {
+		t.Errorf("probeOllama returned true, want false on parse failure")
+	}
+	if !strings.Contains(stdout.String(), "[PASS] Ollama reachable") {
+		t.Errorf("stdout should contain [PASS] Ollama reachable, got: %s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "[WARN]") {
+		t.Errorf("stdout should contain [WARN] for parse failure, got: %s", stdout.String())
+	}
+}
