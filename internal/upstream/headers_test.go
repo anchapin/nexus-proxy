@@ -49,7 +49,7 @@ func TestCopyAllowedHeadersDropsLeaks(t *testing.T) {
 		"Server":                []string{"cloudfront"},
 		"Set-Cookie":            []string{"session=abc; HttpOnly"},
 		"Via":                   []string{"1.1 proxy"},
-		"X-Ratelimit-Remaining":  []string{"0"},
+		"X-Ratelimit-Remaining": []string{"0"},
 	}
 	dst := http.Header{}
 	copyAllowedHeaders(dst, src)
