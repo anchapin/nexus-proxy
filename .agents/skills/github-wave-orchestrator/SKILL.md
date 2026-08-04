@@ -159,6 +159,39 @@ echo "Pre-flight OK: main repo on develop, no uncommitted changes"
 If the check fails, stop and report to the user — do NOT spawn sub-agents
 until the main repo is restored.
 
+### 3b2. Orchestrator Skill File Exclusion (issue #1394)
+
+**Before spawning a sub-agent for any issue**, check whether the issue's affected
+files include `.agents/skills/` or its subdirectories. Issues that touch the
+orchestrator's own skill files must NOT be handled by a sub-agent — the
+orchestrator cannot responsibly modify its own infrastructure as part of its
+execution.
+
+This check uses the same file-derivation logic as the wave planner:
+
+```bash
+# Check if issue #{N} touches .agents/skills/
+# (applies the same heuristics as wave-planner.js file extraction)
+ISSUE_BODY=$(gh issue view {N} --json body --jq '.body // ""')
+if echo "$ISSUE_BODY" | grep -qE '\.agents/skills/|"\.agents/skills/"|`\.agents/skills/`'; then
+  echo "ESCALATE: issue #{N} touches .agents/skills/ — orchestrator skill files must not be modified by wave sub-agents"
+  echo "Marking issue #{N} as escalated in wave-state.json"
+  # Record as escalated — these issues require manual orchestration maintenance
+fi
+```
+
+If the issue body does not explicitly mention `.agents/skills/`, also check the
+file list produced by the wave planner's `--dry-run` mode (if available) or fall
+back to label-based detection: if any label matches `area:orchestrator`,
+`component:wave-orchestrator`, or `module:.agents`, treat as skill-file-touching.
+
+**Escalation response**: Mark the issue as `escalated` in wave-state.json and
+report to the user that this issue requires manual handling outside the wave
+orchestrator. The user should either handle it directly or create a separate
+orchestrator-maintenance workflow that does NOT use the wave orchestrator.
+
+### 3c. Spawn Implementation Sub-agents
+
 Spawn one Task sub-agent per issue using the prompt template in
 [REFERENCE.md — Implementation Sub-agent Template](REFERENCE.md#implementation-sub-agent-template).
 

@@ -116,6 +116,13 @@ Rules:
   If you need to verify something in the main repo, use `git -C /home/alex/AI/nexus-proxy`
   (read-only) or `git -C /home/alex/AI/nexus-proxy branch --show-current` to check branch state.
 - Do NOT modify files outside the scope of this issue
+- **CRITICAL: `.agents/skills/` is OFF-LIMITS (issue #1394).**
+  The wave orchestrator's own skill files (`.agents/skills/`) must NOT be modified
+  by wave sub-agents — this is a self-referential anti-pattern. If the issue's
+  scope appears to include `.agents/skills/`, STOP immediately and report:
+  "ESCALATE: issue #{NUMBER} requires orchestrator skill file modification — this
+  must be handled by direct commit outside the wave orchestrator workflow."
+  The orchestrator will mark this issue as escalated in wave-state.json.
 - Include tests for the fix/feature if the repo has a test suite
 - Follow the repo's AGENTS.md and code style conventions
 - **Avoid iterative Read calls for finding insertion points (issues #1273, #1286).**
