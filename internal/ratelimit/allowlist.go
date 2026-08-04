@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+
+	"github.com/anchapin/nexus-proxy/internal/tracing"
 )
 
 // AllowCIDRsMiddleware is an http.Handler that enforces an inbound IP
@@ -75,6 +77,15 @@ func (m *AllowCIDRsMiddleware) Wrap(next http.Handler) http.Handler {
 		// Resolve the client IP using the trusted-proxy-aware resolver.
 		ip := m.resolver.Resolve(r)
 
+		var span *tracing.Span
+		if tracing.Enabled() {
+			r2, s := tracing.StartSpanFromContext(r.Context(), "ratelimit.allowlist.check")
+			span = s
+			r = r.WithContext(r2)
+			defer span.End()
+			span.SetAttr("client_ip", ip)
+		}
+
 		// Check if the resolved IP is in any allowed CIDR.
 		if !m.anyAllowed(ip) {
 			slog.Warn("ip allowlist blocked request",
@@ -82,12 +93,18 @@ func (m *AllowCIDRsMiddleware) Wrap(next http.Handler) http.Handler {
 				slog.String("remote", r.RemoteAddr),
 				slog.String("path", r.URL.Path),
 			)
+			if span != nil {
+				span.SetAttr("allowlist.matched", false)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusForbidden)
 			_ = jsonError(w, "access denied: client IP not in allowlist")
 			return
 		}
 
+		if span != nil {
+			span.SetAttr("allowlist.matched", true)
+		}
 		next.ServeHTTP(w, r)
 	})
 }
