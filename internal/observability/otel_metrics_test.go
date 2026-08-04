@@ -382,9 +382,9 @@ func TestCollectMetricSnapshotIncludesAllSevenMissingMetrics(t *testing.T) {
 	})
 
 	RegisterTracingExporter(mockTracingExporter{
-		dropped:        100,
-		flushFailures:  7,
-		queueDepth:     42,
+		dropped:       100,
+		flushFailures: 7,
+		queueDepth:    42,
 	})
 
 	snapshot := CollectMetricSnapshot()
@@ -480,6 +480,6 @@ type mockTracingExporter struct {
 	queueDepth    int
 }
 
-func (m mockTracingExporter) Dropped() uint64      { return m.dropped }
+func (m mockTracingExporter) Dropped() uint64       { return m.dropped }
 func (m mockTracingExporter) FlushFailures() uint64 { return m.flushFailures }
 func (m mockTracingExporter) QueueDepth() int       { return m.queueDepth }

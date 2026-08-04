@@ -1082,8 +1082,8 @@ func CollectMetricSnapshot() []MetricSnapshot {
 		Sum:  float64(tracingFlushFailures),
 	})
 	out = append(out, MetricSnapshot{
-		Name: "nexus_tracing_queue_depth",
-		Type: MetricTypeGauge,
+		Name:  "nexus_tracing_queue_depth",
+		Type:  MetricTypeGauge,
 		Value: float64(tracingQueueDepth),
 	})
 
