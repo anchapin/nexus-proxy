@@ -27,6 +27,7 @@ type AllowCIDRsMiddleware struct {
 	cidrs    []*net.IPNet
 	exempt   func(*http.Request) bool // returns true for exempt paths
 	resolver *ClientIPResolver
+	OnBlock  func() // called when a request is blocked (issue #1361)
 }
 
 // NewAllowCIDRsMiddleware constructs an allowlist middleware. A nil or
@@ -95,6 +96,9 @@ func (m *AllowCIDRsMiddleware) Wrap(next http.Handler) http.Handler {
 			)
 			if span != nil {
 				span.SetAttr("allowlist.matched", false)
+			}
+			if m.OnBlock != nil {
+				m.OnBlock()
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusForbidden)

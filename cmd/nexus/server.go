@@ -1457,6 +1457,9 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 			}
 		}
 		allowlistMiddleware = ratelimit.NewAllowCIDRsMiddleware(cfg.AllowCIDRs, exempt, parts.ipResolver)
+		allowlistMiddleware.OnBlock = func() {
+			circuitCollector.IncIPAllowlistBlocked()
+		}
 		parts.allowlistMiddleware = allowlistMiddleware
 		slog.Info("inbound IP allowlist enabled",
 			slog.Int("cidr_count", len(cfg.AllowCIDRs)),

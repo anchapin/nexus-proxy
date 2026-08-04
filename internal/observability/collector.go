@@ -230,6 +230,9 @@ type Collector struct {
 	rateLimitRejectedGlobal    atomic.Uint64
 	rateLimitRejectedPerClient atomic.Uint64
 
+	// IP allowlist blocked counter (issue #1361).
+	ipAllowlistBlockedTotal atomic.Uint64
+
 	// Budget counters track daily frontier spend (issue #38).
 	// Exceeded is bumped when the gate rejects; RecordedUSD is the
 	// running sum (float, lock-free via the bits trick) of amounts
@@ -740,6 +743,9 @@ func (c *Collector) IncAuthReaperEvictions() { c.authReaperEvictions.Add(1) }
 // reason is "missing" or "invalid", indicating which auth failure type
 // accumulated to the burst threshold.
 func (c *Collector) IncAuthBlocked(reason string) { c.authBlockedTotal[reason].Add(1) }
+
+// IncIPAllowlistBlocked records one IP allowlist block event (issue #1361).
+func (c *Collector) IncIPAllowlistBlocked() { c.ipAllowlistBlockedTotal.Add(1) }
 
 // AuthAuthenticatedClients returns the cumulative count of accepted
 // authentications across all client IPs. The /metrics renderer exposes
