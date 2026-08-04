@@ -23,7 +23,7 @@ paths = [
 # Per-line false positives in internal/config/config.go are also suppressed
 # with inline // gitleaks:allow comments (issue #1274).
 [[allowlists]]
-description = "False positive files for generic-api-key rule"
+description = "False positive files for generic-api-key and private-key rules"
 paths = [
   "internal/handlers/chat.go",
   "internal/handlers/recover_test.go",
@@ -33,6 +33,7 @@ paths = [
   "internal/config/config.go",
   "cmd/nexus/init_test.go",
   "internal/audit/audit_test.go",
+  "cmd/nexus/integration_test.go",
 ]
 
 # Historical commits with false positives - skip entire commits
