@@ -16,15 +16,23 @@ paths = [
 ]
 
 # False positive: generic-api-key rule triggers on float64 type declarations
-# in function signatures and on NEXUS_FRONTIER_API_KEY in test code.
-# These are not real secrets. (issue #313)
+# in function signatures and on struct field names like ProxyAPIKey (issue #313)
+# and env var key strings like NEXUS_FRONTIER_API_KEY (issue #1274).
+# These are not real secrets — the struct field name and env var key are not
+# secret values. Actual secret values are read from env vars at runtime only.
+# Per-line false positives in internal/config/config.go are also suppressed
+# with inline // gitleaks:allow comments (issue #1274).
 [[allowlists]]
 description = "False positive files for generic-api-key rule"
 paths = [
   "internal/handlers/chat.go",
   "internal/handlers/recover_test.go",
+  "internal/handlers/redact_test.go",
   "internal/config/file_integration_test.go",
   "internal/config/file_test.go",
+  "internal/config/config.go",
+  "cmd/nexus/init_test.go",
+  "internal/audit/audit_test.go",
 ]
 
 # Historical commits with false positives - skip entire commits
