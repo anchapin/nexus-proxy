@@ -36,6 +36,7 @@ snake_case naming.
 | `nexus_local_cooldown_triggers_total` | counter | *(none)* | 1 | `routemetrics.go` (issue #530) |
 | `nexus_requests_rejected_total` | counter | `reason` | 4 | `routemetrics.go` |
 | `nexus_cascade_fallback_total` | counter | `reason` | 6 (`timeout`, `transport_error`, `rate_limited`, `http_error`, `malformed_toolcall`, `malformed_response`) | `routemetrics.go` |
+| `nexus_upstream_response_truncated_total` | counter | *(none)* | 1 | `routemetrics.go` (issue #365) |
 | `nexus_rag_retrieval_total` | counter | `hit`, `reason` (miss only) | 1 + 3 = 4 | `routemetrics.go` |
 | `nexus_judge_dropped_total` | counter | *(none)* | 1 | `routemetrics.go` |
 | `nexus_rag_judge_score_sum` | counter | `injected` | 2 (`true`, `false`) | `prometheus.go` (issue #1167) |

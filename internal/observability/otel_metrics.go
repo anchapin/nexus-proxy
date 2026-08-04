@@ -19,6 +19,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/ioutils"
 )
 
 // OtelMetricsServiceName is stamped as service.name on every metric
@@ -401,6 +403,13 @@ func CollectMetricSnapshot() []MetricSnapshot {
 		Name: "nexus_degraded_total",
 		Type: MetricTypeCounter,
 		Sum:  float64(collectorSlow.Degraded()),
+	})
+
+	// Upstream response truncation (issue #365)
+	out = append(out, MetricSnapshot{
+		Name: "nexus_upstream_response_truncated_total",
+		Type: MetricTypeCounter,
+		Sum:  float64(ioutils.ReadAllTruncatedCounter()),
 	})
 
 	// Auth counters
