@@ -45,8 +45,8 @@ type Watcher struct {
 
 	fileFilter *FileFilter // optional include/exclude filter (issue #1148)
 
-	mu       sync.Mutex
-	known    map[string]fileSnapshot
+	mu        sync.Mutex
+	known     map[string]fileSnapshot
 	knownDirs map[string]struct{} // directories tracked for rename detection (issue #1410)
 
 	stopCh       chan struct{}
