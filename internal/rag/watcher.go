@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -44,8 +45,9 @@ type Watcher struct {
 
 	fileFilter *FileFilter // optional include/exclude filter (issue #1148)
 
-	mu    sync.Mutex
-	known map[string]fileSnapshot
+	mu       sync.Mutex
+	known    map[string]fileSnapshot
+	knownDirs map[string]struct{} // directories tracked for rename detection (issue #1410)
 
 	stopCh       chan struct{}
 	doneCh       chan struct{}
@@ -71,6 +73,7 @@ func NewWatcher(store *PersistentStore, dir string, interval time.Duration) *Wat
 		dir:          dir,
 		interval:     interval,
 		known:        make(map[string]fileSnapshot),
+		knownDirs:    make(map[string]struct{}),
 		stopCh:       make(chan struct{}),
 		doneCh:       make(chan struct{}),
 		newWatcherFn: fsnotify.NewWatcher,
@@ -277,7 +280,8 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	seen := make(map[string]struct{})
+	seen := make(map[string]fileSnapshot)
+	seenDirs := make(map[string]struct{})
 
 	if w.recursive {
 		err := filepath.WalkDir(w.dir, func(path string, d os.DirEntry, walkErr error) error {
@@ -287,6 +291,14 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 			if d.IsDir() {
 				if isSymlink(d) {
 					return filepath.SkipDir
+				}
+				rel, relErr := filepath.Rel(w.dir, path)
+				if relErr != nil {
+					return nil
+				}
+				dirName := filepath.ToSlash(rel)
+				if dirName != "." {
+					seenDirs[dirName] = struct{}{}
 				}
 				return nil
 			}
@@ -310,22 +322,7 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 				return nil
 			}
 			snap := fileSnapshot{name: name, modTime: info.ModTime(), size: info.Size()}
-			seen[name] = struct{}{}
-
-			prev, exists := w.known[name]
-			if exists && prev.modTime.Equal(snap.modTime) && prev.size == snap.size {
-				return nil
-			}
-
-			if err := w.indexFile(ctx, name); err != nil {
-				slog.Warn("rag: index failed",
-					slog.String("component", "rag"),
-					slog.String("filename", name),
-					slog.Any("err", err),
-				)
-				return nil
-			}
-			w.known[name] = snap
+			seen[name] = snap
 			return nil
 		})
 		if err != nil {
@@ -364,45 +361,129 @@ func (w *Watcher) scanOnce(ctx context.Context) error {
 				continue
 			}
 			snap := fileSnapshot{name: name, modTime: info.ModTime(), size: info.Size()}
-			seen[name] = struct{}{}
-
-			prev, exists := w.known[name]
-			if exists && prev.modTime.Equal(snap.modTime) && prev.size == snap.size {
-				continue
-			}
-
-			if err := w.indexFile(ctx, name); err != nil {
-				slog.Warn("rag: index failed",
-					slog.String("component", "rag"),
-					slog.String("filename", name),
-					slog.Any("err", err),
-				)
-				continue // known still holds old snapshot → next poll retries
-			}
-			w.known[name] = snap // only update on success
+			seen[name] = snap
 		}
 	}
 
 	// Detect deletions: anything in `known` that wasn't in `seen`
 	// has been removed from the directory.
+	// Also detect renames: if a file was deleted but a file with matching
+	// mtime+size exists at a new path, update the path in known instead
+	// of treating it as delete+create (issue #1410).
+	// Sort known keys for deterministic processing order to avoid inconsistent
+	// matching when multiple files share the same mtime+size.
+	var knownKeys []string
 	for name := range w.known {
-		if _, ok := seen[name]; ok {
+		knownKeys = append(knownKeys, name)
+	}
+	sort.Strings(knownKeys)
+
+	for _, oldName := range knownKeys {
+		snap := w.known[oldName]
+		if _, ok := seen[oldName]; ok {
 			continue
 		}
-		if err := w.store.Remove(ctx, name); err != nil {
+		// This file was not seen in the current scan - it was deleted or renamed.
+		// Look for a matching file in seen (same basename + mtime+size).
+		// Basename matching prevents cross-file false positives (e.g., a.go and b.go
+		// with same mtime+size should not match each other's renamed paths).
+		oldBase := filepath.Base(oldName)
+		var newName string
+		for seenName, seenSnap := range seen {
+			if filepath.Base(seenName) != oldBase {
+				continue
+			}
+			if seenSnap.modTime.Equal(snap.modTime) && seenSnap.size == snap.size {
+				newName = seenName
+				break
+			}
+		}
+		if newName != "" {
+			// Rename detected: move store entries to the new path without re-embedding.
+			// This avoids re-embedding when mtime+size are unchanged (issue #1410).
+			// If the destination already has entries (collision), fall back to
+			// remove+reindex which correctly handles the content difference.
+			if err := w.store.MoveFile(ctx, oldName, newName); err != nil {
+				slog.Warn("rag: move file failed, falling back to remove+reindex",
+					slog.String("component", "rag"),
+					slog.String("old", oldName),
+					slog.String("new", newName),
+					slog.Any("err", err),
+				)
+				// Fall back: remove old, reindex at new (re-embedding)
+				if rmErr := w.store.Remove(ctx, oldName); rmErr != nil {
+					slog.Warn("rag: remove failed",
+						slog.String("component", "rag"),
+						slog.String("filename", oldName),
+						slog.Any("err", rmErr),
+					)
+				}
+				delete(w.known, oldName)
+				w.known[newName] = snap
+				if idxErr := w.indexFile(ctx, newName); idxErr != nil {
+					slog.Warn("rag: index failed",
+						slog.String("component", "rag"),
+						slog.String("filename", newName),
+						slog.Any("err", idxErr),
+					)
+				}
+				continue
+			}
+			delete(w.known, oldName)
+			w.known[newName] = snap
+			slog.Info("rag: file renamed (same content)",
+				slog.String("component", "rag"),
+				slog.String("old", oldName),
+				slog.String("new", newName),
+			)
+			continue
+		}
+		if err := w.store.Remove(ctx, oldName); err != nil {
 			slog.Warn("rag: remove failed",
+				slog.String("component", "rag"),
+				slog.String("filename", oldName),
+				slog.Any("err", err),
+			)
+			continue
+		}
+		delete(w.known, oldName)
+		slog.Info("rag: removed",
+			slog.String("component", "rag"),
+			slog.String("filename", oldName),
+		)
+	}
+
+	// Detect directory deletions: anything in `knownDirs` that wasn't
+	// in `seenDirs` has been removed.
+	for dirName := range w.knownDirs {
+		if _, ok := seenDirs[dirName]; ok {
+			continue
+		}
+		delete(w.knownDirs, dirName)
+		slog.Info("rag: directory removed",
+			slog.String("component", "rag"),
+			slog.String("dir", dirName),
+		)
+	}
+
+	// Second pass: index new or changed files.
+	// By this point, rename detection has already updated known with new paths.
+	for name, snap := range seen {
+		prev, exists := w.known[name]
+		if exists && prev.modTime.Equal(snap.modTime) && prev.size == snap.size {
+			continue
+		}
+		if err := w.indexFile(ctx, name); err != nil {
+			slog.Warn("rag: index failed",
 				slog.String("component", "rag"),
 				slog.String("filename", name),
 				slog.Any("err", err),
 			)
 			continue
 		}
-		delete(w.known, name)
-		slog.Info("rag: removed",
-			slog.String("component", "rag"),
-			slog.String("filename", name),
-		)
+		w.known[name] = snap
 	}
+
 	return nil
 }
 

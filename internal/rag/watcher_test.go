@@ -810,3 +810,125 @@ func TestStoreIndexDirRecursive(t *testing.T) {
 		t.Fatalf("expected 2 examples, got %d", store.Size())
 	}
 }
+
+func TestWatcherRecursiveDirectoryRenameNoReindex(t *testing.T) {
+	// When a directory is renamed (foo/ → bar/), files under it should
+	// not be re-embedded if their mtime+size are unchanged (issue #1410).
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	content := []byte("same content, same mtime")
+	if err := os.WriteFile(filepath.Join(sub, "file.go"), content, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ps, emb := newWatcherStore(t)
+
+	w := NewWatcher(ps, dir, time.Hour)
+	w.SetRecursive(true)
+
+	// First scan: index the file.
+	if err := w.scanOnce(context.Background()); err != nil {
+		t.Fatalf("scanOnce #1: %v", err)
+	}
+	if ps.Size() != 1 {
+		t.Fatalf("expected 1 file after first scan, got %d", ps.Size())
+	}
+	callsAfterFirst := len(emb.Called())
+	if callsAfterFirst != 1 {
+		t.Fatalf("expected 1 embedder call, got %d", callsAfterFirst)
+	}
+
+	// Rename the directory: sub/ → renamed/
+	// Use os.Rename which preserves mtime.
+	renamed := filepath.Join(dir, "renamed")
+	if err := os.Rename(sub, renamed); err != nil {
+		t.Fatalf("rename sub to renamed: %v", err)
+	}
+
+	// Second scan: should detect rename and update path, not re-embed.
+	if err := w.scanOnce(context.Background()); err != nil {
+		t.Fatalf("scanOnce #2: %v", err)
+	}
+	if ps.Size() != 1 {
+		t.Fatalf("expected 1 file after rename scan, got %d", ps.Size())
+	}
+
+	// The store should have the file at the new path.
+	snaps := ps.Snapshot()
+	if len(snaps) != 1 || snaps[0].Filename != "renamed/file.go" {
+		t.Errorf("expected filename renamed/file.go, got %+v", snaps)
+	}
+
+	// Embedder should NOT have been called again (same mtime+size = rename, not change).
+	callsAfterSecond := len(emb.Called())
+	if callsAfterSecond != callsAfterFirst {
+		t.Errorf("embedder was called again after directory rename: calls=%d, before=%d",
+			callsAfterSecond, callsAfterFirst)
+	}
+}
+
+func TestWatcherRecursiveDirectoryRenameWithModify(t *testing.T) {
+	// When a directory is renamed AND a file is modified, only the modified
+	// file should be re-embedded (issue #1410).
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Two files with different content.
+	if err := os.WriteFile(filepath.Join(sub, "a.go"), []byte("content a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "b.go"), []byte("content b"), 0o644); err != nil {
+		t.Fatalf("write b.go: %v", err)
+	}
+	ps, emb := newWatcherStore(t)
+
+	w := NewWatcher(ps, dir, time.Hour)
+	w.SetRecursive(true)
+
+	// First scan.
+	if err := w.scanOnce(context.Background()); err != nil {
+		t.Fatalf("scanOnce #1: %v", err)
+	}
+	if ps.Size() != 2 {
+		t.Fatalf("expected 2 files, got %d", ps.Size())
+	}
+	callsAfterFirst := len(emb.Called())
+
+	// Rename the directory and modify one file.
+	renamed := filepath.Join(dir, "renamed")
+	if err := os.Rename(sub, renamed); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(renamed, "a.go"), []byte("content a MODIFIED"), 0o644); err != nil {
+		t.Fatalf("modify a.go: %v", err)
+	}
+
+	// Second scan: a.go should be re-embedded, b.go should just be renamed.
+	if err := w.scanOnce(context.Background()); err != nil {
+		t.Fatalf("scanOnce #2: %v", err)
+	}
+	if ps.Size() != 2 {
+		t.Fatalf("expected 2 files after rename+modify, got %d", ps.Size())
+	}
+
+	snaps := ps.Snapshot()
+	names := make(map[string]bool, len(snaps))
+	for _, s := range snaps {
+		names[s.Filename] = true
+	}
+	if !names["renamed/a.go"] || !names["renamed/b.go"] {
+		t.Errorf("expected renamed/a.go and renamed/b.go, got %v", names)
+	}
+
+	// Only one additional embedder call (for a.go, which was modified).
+	callsAfterSecond := len(emb.Called())
+	if callsAfterSecond != callsAfterFirst+1 {
+		t.Errorf("expected 1 additional embedder call, got %d (calls: %d, before: %d)",
+			callsAfterSecond-callsAfterFirst, callsAfterSecond, callsAfterFirst)
+	}
+}
