@@ -105,6 +105,59 @@ test("filters out closed issues", async () => {
   if (plan._meta.filtered_closed !== 1) throw new Error(`Expected 1 filtered, got ${plan._meta.filtered_closed}`);
 });
 
+test("filters out issues already resolved in body text", async () => {
+  const issues = [
+    { number: 1, title: "Open", body: "internal/file1.go", state: "open", labels: [] },
+    { number: 2, title: "Already resolved", body: "This is already resolved in develop via #232", state: "open", labels: [] },
+    { number: 3, title: "Fixed in develop", body: "Fixed in develop by commit abc123", state: "open", labels: [] },
+  ];
+
+  const { stdout } = await runPlanner({ issues });
+  const plan = JSON.parse(stdout);
+
+  if (plan.total_issues !== 1) throw new Error(`Expected 1 issue after filter, got ${plan.total_issues}`);
+  if (plan._meta.filtered_already_resolved !== 2) {
+    throw new Error(`Expected 2 already-resolved filtered, got ${plan._meta.filtered_already_resolved}`);
+  }
+});
+
+test("filters out issues with resolved labels", async () => {
+  const issues = [
+    { number: 1, title: "Open", body: "internal/file1.go", state: "open", labels: [] },
+    { number: 2, title: "Wontfix", body: "Some issue", state: "open", labels: [{ name: "wontfix" }] },
+    { number: 3, title: "Duplicate", body: "Another issue", state: "open", labels: [{ name: "duplicate" }] },
+    { number: 4, title: "Resolved label", body: "Yet another", state: "open", labels: [{ name: "resolved" }] },
+  ];
+
+  const { stdout } = await runPlanner({ issues });
+  const plan = JSON.parse(stdout);
+
+  if (plan.total_issues !== 1) throw new Error(`Expected 1 issue after filter, got ${plan.total_issues}`);
+  if (plan._meta.filtered_already_resolved !== 3) {
+    throw new Error(`Expected 3 already-resolved filtered, got ${plan._meta.filtered_already_resolved}`);
+  }
+});
+
+test("dry-run shows already_resolved list", async () => {
+  const issues = [
+    { number: 1, title: "Open", body: "internal/file1.go", state: "open", labels: [] },
+    { number: 2, title: "Already resolved", body: "Already resolved in develop", state: "open", labels: [] },
+  ];
+
+  const { stdout } = await runPlannerDryRun({ issues });
+  const result = JSON.parse(stdout);
+
+  if (result._meta.filtered_already_resolved !== 1) {
+    throw new Error(`Expected 1 filtered_already_resolved, got ${result._meta.filtered_already_resolved}`);
+  }
+  if (!result.already_resolved || result.already_resolved.length !== 1) {
+    throw new Error("Expected already_resolved array with 1 issue");
+  }
+  if (result.already_resolved[0].number !== 2) {
+    throw new Error("Already-resolved issue #2 should be in the list");
+  }
+});
+
 test("returns empty plan for empty input", async () => {
   const { stdout } = await runPlanner([]);
   const plan = JSON.parse(stdout);

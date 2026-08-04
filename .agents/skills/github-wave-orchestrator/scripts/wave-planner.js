@@ -1,8 +1,20 @@
 #!/usr/bin/env node
 
+const { execSync } = require("child_process");
 const fs = require("fs");
 
 const MAX_PER_WAVE = 3;
+
+// Patterns that indicate an issue is already resolved in develop.
+const RESOLVED_PATTERNS = [
+  /already\s+resolved/i,
+  /fixed\s+in\s+develop/i,
+  /resolved\s+in\s+develop/i,
+  /resolved\s+by\s+#[0-9]+/i,
+  /no\s+code\s+change\s+needed/i,
+  /nothing\s+to\s+do/i,
+  /wontfix/i,
+];
 
 // Files that are frequently touched by gofmt/struct-alignment even when not
 // explicitly mentioned in issue text. Only injected under the `legacy`
@@ -145,6 +157,65 @@ function extractModuleRefs(text) {
   }
 
   return [...modules];
+}
+
+// ---------------------------------------------------------------------------
+// Already-resolved detection
+// ---------------------------------------------------------------------------
+
+// Returns true if the issue body mentions it is already resolved, or if the
+// develop branch already contains a commit referencing this issue number.
+// The git check is opt-in via WAVE_PLANNER_CHECK_GIT_HISTORY to avoid false
+// positives in test environments where issue numbers may collide with real
+// commit messages.
+function isAlreadyResolved(issue) {
+  const body = issue.body || "";
+  const title = issue.title || "";
+  const fullText = `${title}\n${body}`;
+
+  // 1. Lightweight text-pattern check on the issue itself.
+  for (const pat of RESOLVED_PATTERNS) {
+    if (pat.test(fullText)) {
+      return true;
+    }
+  }
+
+  // 2. Check labels for "wontfix" / "resolved" / "duplicate".
+  const labels = (issue.labels || []).map((l) =>
+    typeof l === "string" ? l.toLowerCase() : (l.name || "").toLowerCase()
+  );
+  const resolvedLabels = [
+    "wontfix",
+    "resolved",
+    "duplicate",
+    "already-resolved",
+    "no-change-required",
+  ];
+  if (labels.some((l) => resolvedLabels.includes(l))) {
+    return true;
+  }
+
+  // 3. Git-based check: only run if WAVE_PLANNER_CHECK_GIT_HISTORY is set.
+  // Looks for explicit resolution patterns like "fix #N", "close #N", "resolve #N".
+  // This avoids false positives from issue numbers appearing in non-resolution contexts.
+  if (process.env.WAVE_PLANNER_CHECK_GIT_HISTORY === "1") {
+    try {
+      // Use extended regex: matches "fix #1", "closes #1", "resolve #1", etc.
+      // The pattern requires the keyword before #N, so bare "#1" won't match.
+      const n = issue.number;
+      const gitOut = execSync(
+        `git -c grep.patternType=extended log --oneline -n 100 --grep="(fix|close|resolve|closes|resolves|fixed|resolved)\\s#${n}($|[^0-9])" origin/develop 2>/dev/null`,
+        { cwd: process.cwd(), timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }
+      );
+      if (gitOut && gitOut.toString().includes(`#${n}`)) {
+        return true;
+      }
+    } catch (_) {
+      // git log returns non-zero when no matches found — not an error.
+    }
+  }
+
+  return false;
 }
 
 function analyzeIssue(issue, collisionStrategy) {
@@ -309,8 +380,9 @@ Options:
   --help, -h                    Show this help message.
 
 Reads JSON from stdin or a file (accepts raw array or {issues: [...]} wrapper).
-Filters out already-closed issues, groups remaining issues by file-conflict
-graph, and outputs up to MAX_PER_WAVE (=3) issues per wave.
+Filters out already-closed issues and issues already resolved in develop
+(body patterns, labels, or git history), groups remaining issues by
+file-conflict graph, and outputs up to MAX_PER_WAVE (=3) issues per wave.
 
 Examples:
   # Plan waves for all open issues (go-packages strategy, default)
@@ -334,19 +406,32 @@ function main() {
   const input = readInput(opts.file);
   let issues = Array.isArray(input) ? input : input.issues || [];
   // Filter out already-closed issues
-  const before = issues.length;
+  const beforeClosed = issues.length;
   issues = issues.filter((iss) => {
     const state = typeof iss.state === "string" ? iss.state : "open";
     return state.toLowerCase() !== "closed";
   });
-  const filtered = before - issues.length;
+  const filteredClosed = beforeClosed - issues.length;
+
+  // Filter out already-resolved issues (body patterns, labels, or git history).
+  const beforeResolved = issues.length;
+  const resolvedIssues = [];
+  issues = issues.filter((iss) => {
+    if (isAlreadyResolved(iss)) {
+      resolvedIssues.push(iss);
+      return false;
+    }
+    return true;
+  });
+  const filteredAlreadyResolved = beforeResolved - issues.length;
 
   if (opts.dryRun) {
     // --dry-run: output affected_files analysis without generating wave plans.
     const analyzed = issues.map((iss) => analyzeIssue(iss, opts.collisionStrategy));
     const dryRunResult = {
       _meta: {
-        filtered_closed: filtered,
+        filtered_closed: filteredClosed,
+        filtered_already_resolved: filteredAlreadyResolved,
         mode: "dry-run",
         collision_strategy: opts.collisionStrategy,
         total_issues: analyzed.length,
@@ -358,6 +443,11 @@ function main() {
         file_sources: a.file_sources,
         has_known_deps: a.has_known_deps,
       })),
+      // Include resolved issues so the caller can see why they were skipped.
+      already_resolved: resolvedIssues.map((iss) => ({
+        number: iss.number,
+        title: iss.title,
+      })),
     };
     console.log(JSON.stringify(dryRunResult, null, 2));
     return;
@@ -365,7 +455,8 @@ function main() {
 
   const plan = planWaves(issues, opts.collisionStrategy);
   plan._meta = {
-    filtered_closed: filtered,
+    filtered_closed: filteredClosed,
+    filtered_already_resolved: filteredAlreadyResolved,
     collision_strategy: opts.collisionStrategy,
   };
   console.log(JSON.stringify(plan, null, 2));
