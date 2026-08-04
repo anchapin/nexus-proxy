@@ -20,6 +20,7 @@ make lint           # golangci-lint v2.12.2
 make fmt            # gofmt -w (in place)
 make bench-baseline # regenerate bench/baseline.txt (-count=10 -benchtime=100ms; issue #1186)
 make ci             # vet + build + check + test + test-race + lint + bench-short
+make install-hooks  # run once after cloning — sets git hooksPath to .githooks/
 ```
 
 `go run ./cmd/nexus` also works. **Go 1.26** (CI pin); `go.mod` declares 1.25.
@@ -653,10 +654,9 @@ outermost middleware chain (SecurityHeaders → Recover). Both `buildServer`
 (production) and integration tests construct identical wiring through this
 function.
 
-**Pre-commit hook** (`make install-hooks` once after cloning): runs `gofmt -l`
-on staged `.go` files and fails the commit if any need formatting. The hook
-lives in `.githooks/pre-commit`; `make install-hooks` sets `git
-core.hooksPath` to point at it.
+**Pre-commit hook**: lives in `.githooks/pre-commit`. Runs `gofmt -l` on staged
+`.go` files and fails the commit if any need formatting. Install once with
+`make install-hooks` (sets `git core.hooksPath`). Run `make fmt` to fix.
 
 **`make check`** — builds `./bin/nexus` then runs the boot-time diagnostic
 suite (`nexus check --json`). Network-dependent checks (Ollama, frontier) skip
@@ -692,6 +692,7 @@ Key knobs not covered elsewhere (verify defaults in `.env.example`):
 - **`NEXUS_RAG_EMBED_CACHE_WAIT_TIMEOUT`** (default 5s): max waiter time for concurrent in-flight Embeds; 0 = wait indefinitely (issue #800).
 - **`NEXUS_RAG_CIRCUIT_BREAKER_THRESHOLD`** (default 3): consecutive embed failures before RAG circuit trips.
 - **`NEXUS_ARBITER_CACHE_MAX_ENTRIES`** (default 512): LRU cap for arbiter synthesis cache.
+- **`NEXUS_POOL_BUFFER_MAX_BYTES`** (default 1 MiB): caps pooled response-body buffer size. Buffers that grew beyond this are discarded rather than returned to the `sync.Pool`, so a single huge response cannot pin pool memory (issue #1177). Set to 0 to disable pooling entirely.
 - **`NEXUS_PROBE_INTERVAL`** (default 60s): cadence of the periodic VRAM probe that drives the concurrency limiter. Set to `0` to disable polling entirely (boot snapshot only). `NEXUS_PROBE_TIMEOUT` (default 5s) is the per-probe deadline. `NEXUS_PROBE_BYTES_PER_TOKEN` (default 256 KiB) converts free VRAM to a safe context-token budget. `NEXUS_PROBE_THERMAL_THRESHOLD` (default 90 °C) trips the breaker when GPU junction temp exceeds this.
 - **`NEXUS_PROBE_NVIDIA_INTERVAL`** (default 0): cadence of the periodic NVIDIA free-VRAM refresh (issue #1178). On NVIDIA-only hosts the AMD sysfs path returns nothing, so without this refresh the VRAM-aware limiter's `FreeVRAMBytes` is frozen at boot. When > 0 (e.g. `5m`), a background goroutine shells out to `nvidia-smi` and republishes the budget so the limiter adapts to model-swap / co-tenant VRAM-grab events. Missing `nvidia-smi` is a silent no-op; 0 = boot-only.
 - **`NEXUS_READINESS_MODE`** (`degraded`|`strict`): `/readyz` returns 503 in `strict` mode when Ollama is degraded or down.
