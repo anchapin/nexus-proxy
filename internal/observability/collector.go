@@ -349,9 +349,12 @@ type Collector struct {
 	// Prometheus renderer can emit a labelled counter family.
 	// frontierCircuitOpenTotal records the cumulative count of
 	// circuit-open transitions per provider.
-	frontierHealthMu         sync.RWMutex
-	frontierProbeTotal       map[string]*atomic.Uint64 // keyed by "provider|result"
-	frontierCircuitOpenTotal map[string]*atomic.Uint64 // keyed by provider
+	// frontierCircuitCloseTotal records the cumulative count of
+	// circuit-close (recovery) transitions per provider (issue #1412).
+	frontierHealthMu          sync.RWMutex
+	frontierProbeTotal        map[string]*atomic.Uint64 // keyed by "provider|result"
+	frontierCircuitOpenTotal  map[string]*atomic.Uint64 // keyed by provider
+	frontierCircuitCloseTotal map[string]*atomic.Uint64 // keyed by provider
 
 	// --- SLO error budget tracking (issue #1239) ------------------------
 	//
@@ -1165,6 +1168,36 @@ func (c *Collector) FrontierCircuitOpenTotals() map[string]uint64 {
 	defer c.frontierHealthMu.RUnlock()
 	out := make(map[string]uint64, len(c.frontierCircuitOpenTotal))
 	for k, v := range c.frontierCircuitOpenTotal {
+		out[k] = v.Load()
+	}
+	return out
+}
+
+// IncFrontierCircuitClose increments the circuit-close (recovery) counter
+// for the given provider. Called from the frontier health poller when a
+// provider's circuit transitions from open to closed (issue #1412).
+func (c *Collector) IncFrontierCircuitClose(provider string) {
+	if provider == "" {
+		return
+	}
+	c.frontierHealthMu.Lock()
+	defer c.frontierHealthMu.Unlock()
+	if c.frontierCircuitCloseTotal == nil {
+		c.frontierCircuitCloseTotal = make(map[string]*atomic.Uint64)
+	}
+	if c.frontierCircuitCloseTotal[provider] == nil {
+		c.frontierCircuitCloseTotal[provider] = new(atomic.Uint64)
+	}
+	c.frontierCircuitCloseTotal[provider].Add(1)
+}
+
+// FrontierCircuitCloseTotals returns the cumulative circuit-close counts
+// keyed by provider. Used by the Prometheus renderer (issue #1412).
+func (c *Collector) FrontierCircuitCloseTotals() map[string]uint64 {
+	c.frontierHealthMu.RLock()
+	defer c.frontierHealthMu.RUnlock()
+	out := make(map[string]uint64, len(c.frontierCircuitCloseTotal))
+	for k, v := range c.frontierCircuitCloseTotal {
 		out[k] = v.Load()
 	}
 	return out

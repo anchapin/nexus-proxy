@@ -334,6 +334,9 @@ func buildServer(cfg config.Config, startTime time.Time, guardedHTTPClient *http
 			frontierHealthPoller.SetTripCallback(func(provider string) {
 				circuitCollector.IncFrontierCircuitOpen(provider)
 			})
+			frontierHealthPoller.SetRecoveryCallback(func(provider string) {
+				circuitCollector.IncFrontierCircuitClose(provider)
+			})
 			go frontierHealthPoller.Run(bgCtx)
 			addCleanup(func() {
 				if err := frontierHealthPoller.Close(); err != nil {

@@ -317,6 +317,10 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Total frontier provider circuit-open transitions (issue #1158).",
 		typ:  "counter",
 	},
+	"nexus_frontier_circuit_close_total": {
+		help: "Total frontier provider circuit-close (recovery) transitions (issue #1412).",
+		typ:  "counter",
+	},
 	// SLO error budget remaining (issue #1239). One gauge per SLO,
 	// labelled by slo name. Values in [0, 1]: 1 = full budget, 0 = exhausted.
 	"nexus_slo_error_budget_remaining": {
@@ -633,6 +637,17 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 		}
 		writeCounterLabeled(w, "nexus_frontier_circuit_open_total",
 			"Total frontier provider circuit-open transitions (issue #1158).",
+			"provider", samples)
+	}
+
+	// Frontier provider circuit-close (recovery) counter (issue #1412).
+	if closes := c.FrontierCircuitCloseTotals(); len(closes) > 0 {
+		samples := make([]labelSample, 0, len(closes))
+		for provider, count := range closes {
+			samples = append(samples, labelSample{value: provider, n: count})
+		}
+		writeCounterLabeled(w, "nexus_frontier_circuit_close_total",
+			"Total frontier provider circuit-close (recovery) transitions (issue #1412).",
 			"provider", samples)
 	}
 

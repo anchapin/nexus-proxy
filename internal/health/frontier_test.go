@@ -137,7 +137,8 @@ func TestFrontierHealth_BreakerTrips(t *testing.T) {
 }
 
 // TestFrontierHealth_BreakerRecloses verifies that after the circuit
-// opens, a successful probe closes it again.
+// opens, a successful probe closes it again and the recovery callback
+// fires exactly once (issue #1412).
 func TestFrontierHealth_BreakerRecloses(t *testing.T) {
 	t.Parallel()
 	statusCode := http.StatusBadGateway
@@ -146,10 +147,17 @@ func TestFrontierHealth_BreakerRecloses(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	var recoverCount atomic.Int32
 	fh := NewFrontierHealth(
 		[]FrontierProbeTarget{{Name: "flaky", BaseURL: srv.URL}},
 		time.Hour, 2, 2*time.Second, srv.Client(),
 	)
+	fh.SetRecoveryCallback(func(provider string) {
+		if provider != "flaky" {
+			t.Errorf("unexpected provider %q", provider)
+		}
+		recoverCount.Add(1)
+	})
 
 	ctx := context.Background()
 	// Trip the breaker.
@@ -158,12 +166,18 @@ func TestFrontierHealth_BreakerRecloses(t *testing.T) {
 	if fh.IsHealthy("flaky") {
 		t.Fatal("should be unhealthy after 2 failures")
 	}
+	if got := recoverCount.Load(); got != 0 {
+		t.Fatalf("expected 0 recovery callbacks before recovery, got %d", got)
+	}
 
 	// Recover.
 	statusCode = http.StatusOK
 	fh.probeAll(ctx)
 	if !fh.IsHealthy("flaky") {
 		t.Fatal("should be healthy again after successful probe")
+	}
+	if got := recoverCount.Load(); got != 1 {
+		t.Fatalf("expected 1 recovery callback, got %d", got)
 	}
 
 	states := fh.States()
