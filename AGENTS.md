@@ -191,6 +191,21 @@ the latest prompt alone so conversation history never inflates the VRAM
 ceiling.
 Semantic dedup via `NEXUS_SLMCACHE_SIMILARITY_THRESHOLD` (range 0..1).
 
+**SLM cache stale eviction** (`NEXUS_SLMCACHE_MAX_STALE`, issue #835): when set,
+`getSemantic` spawns a background eviction goroutine when stale entries exceed this
+count. `NEXUS_SLMCACHE_STALE_CLEANUP_THRESHOLD` (issue #1037): when > 0 and
+`StaleEntries() > threshold`, `Get` itself triggers eviction, preventing stale
+entries from accumulating in read-heavy workloads where `Set` is called infrequently.
+Both default 0 (disabled).
+
+**DSL auto-promotion** (issue #1165): the `PatternPromoter` periodically scans
+historical SLM routing decisions and promotes frequently-routed n-gram patterns
+into the DSL fast-pass, eliminating SLM latency for predictable routing patterns.
+Disable by setting all three to 0:
+- `NEXUS_DSL_PROMOTION_MIN_SAMPLES` (default 20): n-gram must appear in this many SLM decisions
+- `NEXUS_DSL_PROMOTION_CONFIDENCE` (default 0.90): fraction that must agree on the dominant route
+- `NEXUS_DSL_PROMOTION_INTERVAL` (default 1h): recompute cadence
+
 **Fusion progressive delivery** (`NEXUS_FUSION_PROGRESSIVE=true`, default):
 panels race local + frontier, stream the faster as speculative SSE, and
 only invoke the arbiter when agreement similarity < `NEXUS_FUSION_AGREEMENT_THRESHOLD`
@@ -209,6 +224,13 @@ when `LOCAL_TIMEOUT < FRONTIER_TIMEOUT`.
 **Arbiter synthesis cache** (`NEXUS_ARBITER_CACHE_TTL`, default 5m): when > 0, arbiter
 responses are cached keyed by a hash of both panel members' content. Set to 0
 to disable — every disagreement triggers a fresh frontier call.
+
+**Request coalescing** (issue #1155): duplicate concurrent non-streaming cascade requests
+are deduplicated via `singleflight` — one upstream call instead of N. Key is
+`sha256(method + model + serialized_body)`. Only non-streaming cascade is coalesced;
+streaming bypasses. Disabled by default — set `NEXUS_COALESCE_ENABLED=true` to enable.
+TTL (`NEXUS_COALESCE_TTL`, default 250ms) bounds the dedup window; LRU cap
+(`NEXUS_COALESCE_MAX_ENTRIES`, default 512) bounds memory.
 
 ## Middleware order (do not reorder)
 
@@ -364,11 +386,31 @@ the proxy requires and verifies client certificates using the specified CA
 PEM file. The verified certificate's CN is surfaced via `X-Nexus-Client-CN`
 in logs and audit records. Requires `NEXUS_TLS_ENABLED=true`.
 
+## Response content redaction (issue #1172)
+
+`NEXUS_REDACT_ENABLED=true` enables scanning of upstream responses for
+sensitive patterns, replacing matches with `[REDACTED]`. Profiles:
+- `secrets` — bearer tokens, PEM private keys
+- `pii` — credit cards, SSNs, email addresses
+- `custom` — comma-separated Go regexes via `NEXUS_REDACT_PATTERNS`
+- `off` (default) — no redaction, byte-for-byte passthrough
+
 ## Auth brute-force protection (issue #296)
 
 After `NEXUS_AUTH_RATE_LIMIT_BURST` auth failures from the same client IP
 within the `NEXUS_AUTH_RATE_LIMIT_WINDOW` sliding window, the proxy returns
 429 with `Retry-After`. Disabled when `NEXUS_AUTH_RATE_LIMIT_RPM <= 0`.
+
+## External secret-manager integration (issue #1173)
+
+Pluggable credential resolution from HashiCorp Vault or AWS Secrets Manager,
+with fallback to environment variables. When `NEXUS_SECRET_BACKEND=env` (default),
+behaviour is byte-for-byte identical to pre-#1173. Set to `vault` or `awssm`
+to resolve API keys from the external store. An unreachable backend causes boot
+to fail (fail-closed). Individual secrets not found fall back to env vars,
+allowing mixed configurations during migration. `NEXUS_SECRET_REFRESH=0` (default)
+means no background refresh; set > 0 to periodically re-resolve and atomic-swap
+live values without restart.
 
 ## SSRF egress guard (issue #1174)
 
@@ -424,6 +466,11 @@ registers `net/http/pprof` and `expvar` under `/debug/pprof/*` and
 is set, requests require a matching Bearer token (401 otherwise); when
 empty, only loopback peers are served (403 for non-loopback). Default
 false. `nexus check` reports the exposure mode in `pprof_endpoint`.
+
+**OTEL metrics export** (`NEXUS_OTEL_METRICS_ENDPOINT`): when set, the proxy
+pushes `nexus_*` metrics to this endpoint as OTLP protobuf (Sum, Histogram,
+Gauge) on `NEXUS_OTEL_METRICS_INTERVAL` (default 60s). Shares retry/back-off
+config with the tracing exporter. Leave empty to disable (zero overhead).
 
 ## Adaptive cascade timeout (issue #1175)
 
@@ -622,6 +669,10 @@ non-blocking). Three targets: `FuzzSerializeToTOON` (`internal/middleware`),
 `FuzzDSLRegex` (`internal/router`), `FuzzSimilarity` (`internal/rag`).
 Run locally: `go test -run='^$' -fuzz=FuzzSerializeToTOON -fuzztime=30s
 ./internal/middleware/`.
+
+**Prometheus rule validation**: `make check-rules` validates shipped
+`deploy/prometheus/recording-rules.yaml` and `alerts.yaml` with `promtool`.
+Fails CI if promtool is not on `PATH` (rather than silently skipping).
 
 ## Local-route cooldown (issue #80)
 
