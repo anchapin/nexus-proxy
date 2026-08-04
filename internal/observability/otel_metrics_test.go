@@ -252,3 +252,83 @@ func TestOtelMetricsExporterExportFailureIncrementsCorrectly(t *testing.T) {
 		t.Errorf("expected failures to increment from %d to %d, got %d", beforeFailures, beforeFailures+1, afterFailures)
 	}
 }
+
+func TestCollectMetricSnapshotRateLimitMetrics(t *testing.T) {
+	collector := NewCollector()
+	RegisterCollector(collector)
+
+	collector.IncRateLimit("global", true)
+	collector.IncRateLimit("global", true)
+	collector.IncRateLimit("global", false)
+	collector.IncRateLimit("per_client", true)
+	collector.IncRateLimit("per_client", false)
+	collector.IncRateLimit("per_client", false)
+
+	snapshot := CollectMetricSnapshot()
+
+	var allowedGlobal, allowedPerClient, rejectedGlobal, rejectedPerClient float64
+	var allowedGlobalScope, allowedPerClientScope, rejectedGlobalScope, rejectedPerClientScope string
+	var allowedFound, rejectedFound bool
+
+	for _, m := range snapshot {
+		if m.Name == "nexus_rate_limit_allowed_total" {
+			allowedFound = true
+			if scope, ok := m.Labels["scope"]; ok {
+				switch scope {
+				case "global":
+					allowedGlobal = m.Sum
+					allowedGlobalScope = scope
+				case "per_client":
+					allowedPerClient = m.Sum
+					allowedPerClientScope = scope
+				}
+			}
+		}
+		if m.Name == "nexus_rate_limit_rejected_total" {
+			rejectedFound = true
+			if scope, ok := m.Labels["scope"]; ok {
+				switch scope {
+				case "global":
+					rejectedGlobal = m.Sum
+					rejectedGlobalScope = scope
+				case "per_client":
+					rejectedPerClient = m.Sum
+					rejectedPerClientScope = scope
+				}
+			}
+		}
+	}
+
+	if !allowedFound {
+		t.Error("expected nexus_rate_limit_allowed_total in snapshot")
+	}
+	if !rejectedFound {
+		t.Error("expected nexus_rate_limit_rejected_total in snapshot")
+	}
+
+	if allowedGlobal != 2 {
+		t.Errorf("expected nexus_rate_limit_allowed_total{scope=global} = 2, got %v", allowedGlobal)
+	}
+	if allowedPerClient != 1 {
+		t.Errorf("expected nexus_rate_limit_allowed_total{scope=per_client} = 1, got %v", allowedPerClient)
+	}
+	if rejectedGlobal != 1 {
+		t.Errorf("expected nexus_rate_limit_rejected_total{scope=global} = 1, got %v", rejectedGlobal)
+	}
+	if rejectedPerClient != 2 {
+		t.Errorf("expected nexus_rate_limit_rejected_total{scope=per_client} = 2, got %v", rejectedPerClient)
+	}
+
+	if allowedGlobalScope != "global" {
+		t.Errorf("expected allowed metric scope 'global', got %q", allowedGlobalScope)
+	}
+	if allowedPerClientScope != "per_client" {
+		t.Errorf("expected allowed metric scope 'per_client', got %q", allowedPerClientScope)
+	}
+	if rejectedGlobalScope != "global" {
+		t.Errorf("expected rejected metric scope 'global', got %q", rejectedGlobalScope)
+	}
+	if rejectedPerClientScope != "per_client" {
+		t.Errorf("expected rejected metric scope 'per_client', got %q", rejectedPerClientScope)
+	}
+}

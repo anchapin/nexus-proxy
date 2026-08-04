@@ -430,18 +430,32 @@ func CollectMetricSnapshot() []MetricSnapshot {
 		})
 	}
 
-	// Rate limit counters
+	// Rate limit counters — emitted as two metric families to match the
+	// Prometheus exposition (nexus_rate_limit_allowed_total and
+	// nexus_rate_limit_rejected_total, each with a scope label).
 	out = append(out, MetricSnapshot{
-		Name:   "nexus_rate_limit_total",
+		Name:   "nexus_rate_limit_allowed_total",
 		Type:   MetricTypeCounter,
-		Labels: map[string]string{"scope": "global", "outcome": "allowed"},
+		Labels: map[string]string{"scope": "global"},
 		Sum:    float64(collectorSlow.RateLimitAllowedGlobal()),
 	})
 	out = append(out, MetricSnapshot{
-		Name:   "nexus_rate_limit_total",
+		Name:   "nexus_rate_limit_allowed_total",
 		Type:   MetricTypeCounter,
-		Labels: map[string]string{"scope": "global", "outcome": "rejected"},
+		Labels: map[string]string{"scope": "per_client"},
+		Sum:    float64(collectorSlow.RateLimitAllowedPerClient()),
+	})
+	out = append(out, MetricSnapshot{
+		Name:   "nexus_rate_limit_rejected_total",
+		Type:   MetricTypeCounter,
+		Labels: map[string]string{"scope": "global"},
 		Sum:    float64(collectorSlow.RateLimitRejectedGlobal()),
+	})
+	out = append(out, MetricSnapshot{
+		Name:   "nexus_rate_limit_rejected_total",
+		Type:   MetricTypeCounter,
+		Labels: map[string]string{"scope": "per_client"},
+		Sum:    float64(collectorSlow.RateLimitRejectedPerClient()),
 	})
 
 	// Budget counters
@@ -1326,6 +1340,22 @@ func (c *Collector) RateLimitRejectedGlobal() uint64 {
 		return 0
 	}
 	return c.rateLimitRejectedGlobal.Load()
+}
+
+// RateLimitAllowedPerClient returns the cumulative per-client rate-limit-allowed count.
+func (c *Collector) RateLimitAllowedPerClient() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.rateLimitAllowedPerClient.Load()
+}
+
+// RateLimitRejectedPerClient returns the cumulative per-client rate-limit-rejected count.
+func (c *Collector) RateLimitRejectedPerClient() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.rateLimitRejectedPerClient.Load()
 }
 
 // StageRAG returns the RAG pipeline stage histogram.
