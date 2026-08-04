@@ -1599,12 +1599,25 @@ func Chat(d Deps) http.Handler {
 			route = router.RouteFrontier
 		}
 
-		// Record SLM routing decisions for pattern promotion analysis
-		// (issue #1165). Only SourceSLM decisions are recorded —
-		// guardrail, DSL, and promoted decisions bypass the SLM and
-		// are not useful for promotion.
-		if d.Promoter != nil && decision.Source == router.SourceSLM {
+		// Record routing decisions for pattern promotion analysis
+		// (issue #1165) and confidence store tracking (issue #1404).
+		// SourceSLM and SourceDSL decisions are recorded — guardrail
+		// and promoted decisions bypass both the SLM and the need for
+		// promotion tracking since they are already determined by
+		// external signals.
+		if d.Promoter != nil && (decision.Source == router.SourceSLM || decision.Source == router.SourceDSL) {
 			d.Promoter.RecordDecision(latestPrompt, route)
+		}
+
+		// Record DSL decisions to the confidence store for statistical
+		// tracking (issue #1404). DSL decisions don't receive judge
+		// scores since they bypass the judge sampling, so we use a
+		// neutral score (DefaultSuccessScore = 3) to record the
+		// category/route for historical analysis.
+		if d.Confidence != nil && decision.Source == router.SourceDSL {
+			if err := d.Confidence.RecordOutcome(decision.TaskType, route, router.DefaultSuccessScore); err != nil {
+				slog.Debug("confidence store record outcome failed", slog.String("err", err.Error()))
+			}
 		}
 
 		// Surface route-decision metadata on the response and via the
