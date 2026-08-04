@@ -380,17 +380,18 @@ func TestEgressGuardGauges(t *testing.T) {
 		if !ok {
 			t.Error("expected labels to have 'reason' key")
 		}
-		if reason == "redirect" {
+		switch reason {
+		case "redirect":
 			redirectSeen = true
 			if s.Value != 0 {
 				t.Errorf("expected redirect count=0 initially, got %f", s.Value)
 			}
-		} else if reason == "dial" {
+		case "dial":
 			dialSeen = true
 			if s.Value != 0 {
 				t.Errorf("expected dial count=0 initially, got %f", s.Value)
 			}
-		} else {
+		default:
 			t.Errorf("unexpected reason label value: %s", reason)
 		}
 	}
@@ -419,9 +420,10 @@ func TestEgressGuardGaugesAfterBlocks(t *testing.T) {
 		if !ok {
 			continue
 		}
-		if reason == "redirect" {
+		switch reason {
+		case "redirect":
 			redirectCount = s.Value
-		} else if reason == "dial" {
+		case "dial":
 			dialCount = s.Value
 		}
 	}
