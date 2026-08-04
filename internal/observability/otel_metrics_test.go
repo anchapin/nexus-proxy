@@ -1,11 +1,14 @@
 package observability
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/anchapin/nexus-proxy/internal/ioutils"
 )
 
 func TestOtelMetricsExporterExportFailureCounter(t *testing.T) {
@@ -330,5 +333,36 @@ func TestCollectMetricSnapshotRateLimitMetrics(t *testing.T) {
 	}
 	if rejectedPerClientScope != "per_client" {
 		t.Errorf("expected rejected metric scope 'per_client', got %q", rejectedPerClientScope)
+	}
+}
+
+func TestCollectMetricSnapshotIncludesTruncatedCounter(t *testing.T) {
+	collector := NewCollector()
+	RegisterCollector(collector)
+
+	before := ioutils.ReadAllTruncatedCounter()
+
+	_, _ = ioutils.ReadAllLimited(bytes.NewReader(bytes.Repeat([]byte("x"), 1024)), 512)
+
+	if got := ioutils.ReadAllTruncatedCounter(); got != before+1 {
+		t.Fatalf("expected truncation counter to increment: before=%d, got=%d", before, got)
+	}
+
+	snapshot := CollectMetricSnapshot()
+	found := false
+	for _, m := range snapshot {
+		if m.Name == "nexus_upstream_response_truncated_total" {
+			found = true
+			if m.Type != MetricTypeCounter {
+				t.Errorf("expected counter type, got %s", m.Type)
+			}
+			if m.Sum != float64(before+1) {
+				t.Errorf("expected sum=%f, got %f", float64(before+1), m.Sum)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("expected nexus_upstream_response_truncated_total in snapshot")
 	}
 }
