@@ -374,7 +374,8 @@ func (w *initWizard) probeOllama(url string, interactive bool) bool {
 	}
 	available, ok := parseTagsBody(resp.Body)
 	if !ok {
-		return true
+		fmt.Fprintf(w.stdout, "[WARN] could not parse /api/tags response — model list unavailable\n")
+		return false
 	}
 	missing := []string{}
 	for _, m := range defaultModels {
