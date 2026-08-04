@@ -568,6 +568,11 @@ func RenderPrometheus(w io.Writer, c *Collector, providers ...GaugeProvider) {
 			{value: "invalid", n: c.authBlockedTotal["invalid"].Load()},
 		})
 
+	// IP allowlist blocked counter (issue #1361).
+	writeCounter(w, "nexus_ip_allowlist_blocked_total",
+		"Total requests rejected because the client IP was not in the configured IP allowlist (issue #1361).",
+		c.ipAllowlistBlockedTotal.Load())
+
 	// Confidence store error counter (issue #927).
 	writeCounter(w, "nexus_confidence_errors_total",
 		"Total LocalConfidence errors in the planner where the SQLite confidence store returned an error (DB locked, query failed, etc.).",

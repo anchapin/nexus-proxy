@@ -129,6 +129,45 @@ func TestAllowCIDRsMiddleware_AllowHasSpanAttributes(t *testing.T) {
 	}
 }
 
+// TestAllowCIDRsMiddleware_OnBlockCallback verifies that the OnBlock
+// callback is invoked exactly once when a request is rejected (issue #1361).
+func TestAllowCIDRsMiddleware_OnBlockCallback(t *testing.T) {
+	resolver := NewClientIPResolver(nil)
+	cidrs := []*net.IPNet{parseCIDR(t, "192.168.1.0/24")}
+	m := NewAllowCIDRsMiddleware(cidrs, nil, resolver)
+
+	var blockCount int
+	m.OnBlock = func() {
+		blockCount++
+	}
+
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("rejected request should not reach handler")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1234" // not in 192.168.1.0/24
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", rec.Code)
+	}
+	if blockCount != 1 {
+		t.Errorf("expected OnBlock to be called once, got %d", blockCount)
+	}
+
+	// Second rejected request should call OnBlock again.
+	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	req2.RemoteAddr = "10.0.0.2:1234" // still not in 192.168.1.0/24
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+
+	if blockCount != 2 {
+		t.Errorf("expected OnBlock to be called twice, got %d", blockCount)
+	}
+}
+
 // TestAllowCIDRsMiddleware_DisabledCreatesNoSpan verifies that when the
 // allowlist is disabled (no CIDRs), no tracing span is created even
 // when a global exporter is registered (issue #1365).
