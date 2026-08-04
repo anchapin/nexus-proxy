@@ -1022,6 +1022,13 @@ func CollectMetricSnapshot() []MetricSnapshot {
 		}
 	}
 
+	// nexus_upstream_response_truncated_total (issue #1366)
+	out = append(out, MetricSnapshot{
+		Name: "nexus_upstream_response_truncated_total",
+		Type: MetricTypeCounter,
+		Sum:  float64(collectorSlow.TruncatedTotal()),
+	})
+
 	// OTLP metrics export self-monitoring (issue #1313)
 	if exp := GlobalOtelMetricsExporter(); exp != nil {
 		out = append(out, MetricSnapshot{
@@ -1405,4 +1412,12 @@ func (c *Collector) StageUpstream() *Histogram {
 		return nil
 	}
 	return c.stageUpstream
+}
+
+// TruncatedTotal returns the cumulative upstream response truncation count.
+func (c *Collector) TruncatedTotal() uint64 {
+	if c == nil {
+		return 0
+	}
+	return ioutils.ReadAllTruncatedCounter()
 }
