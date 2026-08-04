@@ -25,11 +25,15 @@ const defaultMaxResponseBytes = 64 << 20 // 64 MiB
 // CascadeStep is one member of a Cascade: a single model endpoint the
 // runner will try in order. Name is a short identifier used in logs and
 // the telemetry route_attempted field (e.g. "local", "frontier", "zai").
+// AuthHeaders supplements (or overrides) the default Bearer authorization
+// set by doFetchCascadeStep: when non-nil, these headers are merged into
+// the outgoing request with higher precedence for keys they set.
 type CascadeStep struct {
-	Name   string
-	URL    string
-	APIKey string
-	Model  string
+	Name        string
+	URL         string
+	APIKey      string
+	Model       string
+	AuthHeaders http.Header // optional; see doFetchCascadeStep
 }
 
 // Cascade runs an ordered list of steps and falls back to the next one on
@@ -506,8 +510,18 @@ func (c *Cascade) doFetchCascadeStep(ctx context.Context, client Client, step Ca
 		return AssistantMessage{}, "", nil, newCascadeErr(false, "", "build request: %v", rErr)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// Merge step-specific auth headers (issue #1185). Step.AuthHeaders
+	// supplements or overrides the default Bearer header for providers
+	// that use non-Bearer auth (e.g. x-api-key for Anthropic).
 	if step.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+step.APIKey)
+	}
+	if step.AuthHeaders != nil {
+		for k, vals := range step.AuthHeaders {
+			for _, v := range vals {
+				req.Header.Add(k, v)
+			}
+		}
 	}
 	// Propagate W3C trace context for distributed correlation (issue #299).
 	if tp := tracing.TraceparentFromContext(ctx); tp != "" {

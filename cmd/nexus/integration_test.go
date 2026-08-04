@@ -812,3 +812,224 @@ func TestBuildHandlerPanicRecovery(t *testing.T) {
 		t.Error("panic observer was not called")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// E2E tests for provider adapters (issue #1185, #1419)
+// ---------------------------------------------------------------------------
+
+// mockProviderHeaders records headers received by a mock provider server.
+type mockProviderHeaders struct {
+	mu   sync.Mutex
+	data map[string][]string
+	path string
+}
+
+func newMockProviderHeaders() *mockProviderHeaders {
+	return &mockProviderHeaders{data: make(map[string][]string)}
+}
+
+func (h *mockProviderHeaders) get(k string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// Use case-insensitive lookup since HTTP headers are case-insensitive
+	if vals, ok := h.data[k]; ok && len(vals) > 0 {
+		return vals[0]
+	}
+	// Also check with canonical Go header casing
+	canonical := http.CanonicalHeaderKey(k)
+	if vals, ok := h.data[canonical]; ok && len(vals) > 0 {
+		return vals[0]
+	}
+	return ""
+}
+
+func (h *mockProviderHeaders) requestPath() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.path
+}
+
+func startMockAnthropic(t *testing.T, hdrs *mockProviderHeaders, content string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hdrs.mu.Lock()
+		hdrs.path = r.URL.Path
+		for k, vals := range r.Header {
+			hdrs.data[k] = append(hdrs.data[k], vals...)
+		}
+		hdrs.mu.Unlock()
+
+		// Check if streaming was requested
+		var reqBody map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err == nil {
+			if stream, ok := reqBody["stream"].(bool); ok && stream {
+				// Send SSE for streaming requests
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"%s\"}}]}\n\n", content)
+				fmt.Fprint(w, "data: [DONE]\n\n")
+				return
+			}
+		}
+		// Send JSON for non-streaming requests (OpenAI non-streaming format)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		resp := map[string]interface{}{
+			"id":      "chatcmpl-random",
+			"object":  "chat.completion",
+			"created": time.Now().Unix(),
+			"model":   "claude-3-5-sonnet-20241022",
+			"choices": []map[string]interface{}{
+				{
+					"index":         0,
+					"message":       map[string]interface{}{"role": "assistant", "content": content},
+					"finish_reason": "stop",
+				},
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+}
+
+func startMockGemini(t *testing.T, hdrs *mockProviderHeaders, content string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hdrs.mu.Lock()
+		hdrs.path = r.URL.Path
+		for k, vals := range r.Header {
+			hdrs.data[k] = append(hdrs.data[k], vals...)
+		}
+		hdrs.mu.Unlock()
+
+		// Check if streaming was requested
+		var reqBody map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err == nil {
+			if stream, ok := reqBody["stream"].(bool); ok && stream {
+				// Send SSE for streaming requests (OpenAI format for cascade)
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"%s\"}}]}\n\n", content)
+				fmt.Fprint(w, "data: [DONE]\n\n")
+				return
+			}
+		}
+		// Send OpenAI JSON for non-streaming requests
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		resp := map[string]interface{}{
+			"id":      "chatcmpl-random",
+			"object":  "chat.completion",
+			"created": time.Now().Unix(),
+			"model":   "gemini-pro",
+			"choices": []map[string]interface{}{
+				{
+					"index":         0,
+					"message":       map[string]interface{}{"role": "assistant", "content": content},
+					"finish_reason": "stop",
+				},
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+}
+
+// TestE2E_ProviderAnthropicAdapter verifies that when an Anthropic provider
+// is configured, the proxy sends requests to /v1/messages (not
+// /v1/chat/completions), includes the correct x-api-key and anthropic-version
+// headers, and the response is valid OpenAI SSE.
+func TestE2E_ProviderAnthropicAdapter(t *testing.T) {
+	providerHdrs := newMockProviderHeaders()
+	mockAnthropic := startMockAnthropic(t, providerHdrs, "anthropic response from claude")
+	t.Cleanup(mockAnthropic.Close)
+
+	ollamaStats := newMockServerStats()
+	ollama := startMockOllama(t, ollamaStats, "unused", 0)
+	t.Cleanup(ollama.Close)
+
+	e2eBaseEnv(t, ollama.URL, mockAnthropic.URL)
+	// Force frontier routing via guardrail.
+	t.Setenv("NEXUS_TOKEN_GUARDRAIL", "1")
+	// Configure Anthropic provider via NEXUS_PROVIDERS.
+	t.Setenv("NEXUS_PROVIDERS", "anthropicProvider")
+	t.Setenv("NEXUS_PROVIDER_ANTHROPICPROVIDER_URL", mockAnthropic.URL)
+	t.Setenv("NEXUS_PROVIDER_ANTHROPICPROVIDER_MODEL", "claude-3-5-sonnet-20241022")
+	t.Setenv("NEXUS_PROVIDER_ANTHROPICPROVIDER_API_KEY", "sk-ant-test-key")
+	t.Setenv("NEXUS_PROVIDER_ANTHROPICPROVIDER_TYPE", "anthropic")
+	// Disable frontier health polling.
+	t.Setenv("NEXUS_FRONTIER_HEALTH_POLL_INTERVAL", "0")
+
+	ts := e2eTestServer(t)
+	resp := doChat(t, ts, chatRequest("anthropic adapter test prompt", false), "")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	// Verify request hit /v1/messages (not /v1/chat/completions).
+	if path := providerHdrs.requestPath(); path != "/v1/messages" {
+		t.Errorf("request path = %q, want /v1/messages", path)
+	}
+
+	// Verify Anthropic auth headers were received.
+	if got := providerHdrs.get("x-api-key"); got != "sk-ant-test-key" {
+		t.Errorf("x-api-key = %q, want sk-ant-test-key", got)
+	}
+	if got := providerHdrs.get("anthropic-version"); got == "" {
+		t.Error("anthropic-version header is missing")
+	}
+
+	// Verify response is valid OpenAI SSE with chat.completion.chunk events.
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	if !strings.Contains(bodyStr, "chat.completion.chunk") {
+		t.Errorf("response does not contain chat.completion.chunk; got: %s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "anthropic response from claude") {
+		t.Errorf("response does not contain expected content; got: %s", bodyStr)
+	}
+}
+
+// TestE2E_ProviderGeminiAdapter verifies that when a Gemini provider
+// is configured, the proxy sends requests to the correct Gemini path
+// and includes the x-goog-api-key header.
+func TestE2E_ProviderGeminiAdapter(t *testing.T) {
+	providerHdrs := newMockProviderHeaders()
+	mockGemini := startMockGemini(t, providerHdrs, "gemini response")
+	t.Cleanup(mockGemini.Close)
+
+	ollamaStats := newMockServerStats()
+	ollama := startMockOllama(t, ollamaStats, "unused", 0)
+	t.Cleanup(ollama.Close)
+
+	e2eBaseEnv(t, ollama.URL, mockGemini.URL)
+	// Force frontier routing via guardrail.
+	t.Setenv("NEXUS_TOKEN_GUARDRAIL", "1")
+	// Configure Gemini provider via NEXUS_PROVIDERS.
+	t.Setenv("NEXUS_PROVIDERS", "geminiProvider")
+	t.Setenv("NEXUS_PROVIDER_GEMINIPROVIDER_URL", mockGemini.URL+"/v1beta/models/gemini-pro")
+	t.Setenv("NEXUS_PROVIDER_GEMINIPROVIDER_MODEL", "gemini-pro")
+	t.Setenv("NEXUS_PROVIDER_GEMINIPROVIDER_API_KEY", "test-gemini-key")
+	t.Setenv("NEXUS_PROVIDER_GEMINIPROVIDER_TYPE", "gemini")
+	// Disable frontier health polling.
+	t.Setenv("NEXUS_FRONTIER_HEALTH_POLL_INTERVAL", "0")
+
+	ts := e2eTestServer(t)
+	resp := doChat(t, ts, chatRequest("gemini adapter test prompt", false), "")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	// Verify request path contains :streamGenerateContent (Gemini streaming endpoint).
+	if path := providerHdrs.requestPath(); !strings.Contains(path, ":streamGenerateContent") {
+		t.Errorf("request path = %q, want :streamGenerateContent suffix", path)
+	}
+
+	// Verify Gemini auth header was received.
+	if got := providerHdrs.get("x-goog-api-key"); got != "test-gemini-key" {
+		t.Errorf("x-goog-api-key = %q, want test-gemini-key", got)
+	}
+}

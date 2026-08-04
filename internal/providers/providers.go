@@ -279,6 +279,7 @@ func (p Provider) ToConfig() ProviderConfig {
 		BaseURLVal:                     strings.TrimRight(p.URL, "/"),
 		ModelVal:                       p.Model,
 		APIKeyVal:                      p.APIKey,
+		AdapterTypeVal:                 p.Type,
 		CostPer1KVal:                   p.InputCostPer1K,
 		InputCostPer1KVal:              p.InputCostPer1K,
 		OutputCostPer1KVal:             p.OutputCostPer1K,

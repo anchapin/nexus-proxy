@@ -25,6 +25,9 @@ type ProviderV2 interface {
 	Model() string
 	// APIKey returns the bearer token. May be empty for local endpoints.
 	APIKey() string
+	// AdapterType returns the provider adapter type (issue #1185).
+	// Empty means "openai" (the default no-op adapter).
+	AdapterType() string
 	// CostPer1KUSD returns the USD cost per 1k input tokens, used
 	// by the router.ProviderSelector as a cost weight.
 	//
@@ -77,6 +80,7 @@ type ProviderConfig struct {
 	BaseURLVal                     string
 	ModelVal                       string
 	APIKeyVal                      string
+	AdapterTypeVal                 string  // issue #1185 — "" means openai (default)
 	CostPer1KVal                   float64 // flat rate — selector weight / legacy
 	InputCostPer1KVal              float64 // USD per 1k input tokens (issue #1183)
 	OutputCostPer1KVal             float64 // USD per 1k output tokens (issue #1183)
@@ -88,6 +92,7 @@ func (p ProviderConfig) Name() string                        { return p.NameVal 
 func (p ProviderConfig) BaseURL() string                     { return p.BaseURLVal }
 func (p ProviderConfig) Model() string                       { return p.ModelVal }
 func (p ProviderConfig) APIKey() string                      { return p.APIKeyVal }
+func (p ProviderConfig) AdapterType() string                 { return p.AdapterTypeVal }
 func (p ProviderConfig) CostPer1KUSD() float64               { return p.CostPer1KVal }
 func (p ProviderConfig) InputCostPer1KUSD() float64          { return p.InputCostPer1KVal }
 func (p ProviderConfig) OutputCostPer1KUSD() float64         { return p.OutputCostPer1KVal }

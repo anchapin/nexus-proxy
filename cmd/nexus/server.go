@@ -537,6 +537,8 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 			slog.Int("providers", providerRegistry.Len()),
 			slog.String("names", fmt.Sprintf("%v", providerRegistry.ProviderNames())),
 		)
+	} else {
+		slog.Warn("frontier provider registry is nil")
 	}
 
 	if ragWatcher != nil {

@@ -198,7 +198,13 @@ func (openAIAdapter) AuthHeaders(apiKey string) http.Header {
 	return h
 }
 
-func (openAIAdapter) RequestPath(baseURL string) string { return baseURL }
+func (openAIAdapter) RequestPath(baseURL string) string {
+	baseURL = strings.TrimRight(baseURL, "/")
+	if strings.HasSuffix(baseURL, "/v1/chat/completions") {
+		return baseURL
+	}
+	return baseURL + "/v1/chat/completions"
+}
 
 func (openAIAdapter) TransformRequest(body []byte) ([]byte, error) { return body, nil }
 
