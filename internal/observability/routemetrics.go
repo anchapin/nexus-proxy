@@ -574,6 +574,16 @@ func (rc *RouteCounters) IncDSLPromoted() {
 	atomic.AddUint64(rc.dslPromoted, 1)
 }
 
+// DSLPromoted returns the cumulative count of n-gram patterns auto-promoted
+// to the DSL fast-pass by the PatternPromoter (issue #1297). Used by
+// CollectMetricSnapshot for OTLP export.
+func (rc *RouteCounters) DSLPromoted() uint64 {
+	if rc == nil || rc.dslPromoted == nil {
+		return 0
+	}
+	return atomic.LoadUint64(rc.dslPromoted)
+}
+
 // slmCacheEvictionSlot returns the *uint64 for the SLM cache eviction
 // reason label, creating it if absent. Same lock-then-atomic pattern
 // as reasonSlot: the mutex guards the map mutation only, the increment
