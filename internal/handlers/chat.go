@@ -1615,7 +1615,9 @@ func Chat(d Deps) http.Handler {
 		// neutral score (DefaultSuccessScore = 3) to record the
 		// category/route for historical analysis.
 		if d.Confidence != nil && decision.Source == router.SourceDSL {
-			d.Confidence.RecordOutcome(decision.TaskType, route, router.DefaultSuccessScore)
+			if err := d.Confidence.RecordOutcome(decision.TaskType, route, router.DefaultSuccessScore); err != nil {
+				slog.Debug("confidence store record outcome failed", slog.String("err", err.Error()))
+			}
 		}
 
 		// Surface route-decision metadata on the response and via the
