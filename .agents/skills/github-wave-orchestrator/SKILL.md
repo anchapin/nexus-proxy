@@ -26,6 +26,22 @@ monitors CI, merges PRs, then proceeds to the next wave.
 
 ## Phase 0: Pre-flight
 
+**Pre-session stale worktree cleanup (issue #1396):**
+
+Remove all worktrees whose branches no longer exist on origin — these are leftovers from aborted or interrupted prior sessions:
+```bash
+git fetch origin
+for wt in ../worktrees/issue-*; do
+  [ -d "$wt" ] || continue
+  branch=$(git -C "$wt" branch --show-current 2>/dev/null)
+  if [ -n "$branch" ] && ! git branch --list "origin/$branch" > /dev/null 2>&1; then
+    echo "Removing stale worktree: $wt (branch $branch)"
+    git worktree remove "$wt"
+  fi
+done
+git remote prune origin
+```
+
 ```bash
 gh auth status                              # Must be authenticated
 git fetch origin develop                    # Base branch must be current
@@ -382,7 +398,10 @@ sub-agent reports BLOCKER and stops instead of proceeding.
 ### 4d. Wait
 
 Monitor until ALL PRs in the wave are merged (or escalated).
-Then clean up worktrees: `git worktree prune`
+Then clean up worktrees:
+```bash
+git worktree prune && git remote prune origin
+```
 
 ## Phase 5: Next Wave
 
