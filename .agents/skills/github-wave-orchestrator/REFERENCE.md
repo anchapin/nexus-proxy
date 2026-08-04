@@ -156,7 +156,19 @@ Steps:
         bash scripts/verify_issues_closed.sh {NUMBER}
         ```
         - If all issues closed → proceed to step 2d
-        - If any issue remains open → report BLOCKER and STOP
+        - If any issue remains open → the PR body used a non-standard keyword.
+          Attempt to fix the PR body before reporting BLOCKER:
+          ```
+          gh pr edit {NUMBER} --body "$(gh pr view {NUMBER} --json body --jq .body)
+
+Closes #{ISSUE_NUMBER}"
+          ```
+          Wait 30s for GitHub to process the edit, then verify again:
+          ```
+          bash scripts/verify_issues_closed.sh {NUMBER}
+          ```
+          - If issue is now CLOSED → proceed to step 2d
+          - If still OPEN after 2 minutes (4 x 30s wait) → report BLOCKER and STOP
       - If mergedAt IS null → merge did NOT persist. Retry once:
         `gh pr merge {NUMBER} --squash`
         If second attempt also yields null mergedAt → report BLOCKED and STOP
