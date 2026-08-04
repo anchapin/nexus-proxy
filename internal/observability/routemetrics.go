@@ -41,6 +41,12 @@ const (
 	bucketNone   = "none" // guardrail / DSL / non-SLM sources
 )
 
+// CascadeFallbackLatencyBuckets are the histogram bucket upper bounds (in
+// seconds) for cascade fallback latency (issue #1362). They span 250 ms
+// through 30 s — operators can see whether fallbacks are fast (network
+// flap) or slow (genuine timeout) to help tune NEXUS_CASCADE_TIMEOUT.
+var CascadeFallbackLatencyBuckets = []float64{0.25, 0.5, 1, 2.5, 5, 10, 30}
+
 // panicSSEWriteFailuresCounter is a package-level counter for SSE error frame
 // write failures in the panic recovery path (issue #1115). It is set by
 // SetPanicSSEWriteFailuresCounter and incremented by
@@ -175,9 +181,12 @@ type RouteCounters struct {
 	rRAGHits                 *uint64 // single unlabelled hit counter (issue #486)
 	rRAGMisses               map[string]*uint64
 	cascadeFallbacks         map[string]*uint64
-	arbiterCache             map[string]*uint64 // "hit" | "miss"
-	arbiterCacheEvictions    map[string]*uint64 // "lru" (issue #798)
-	slmEscalations           map[string]*uint64 // reason label for issue #301
+	// cascadeFallbackLatency tracks per-(reason, route) histograms for
+	// cascade fallback latency (issue #1362). Key is reason + "|" + route.
+	cascadeFallbackLatency map[string]*Histogram
+	arbiterCache           map[string]*uint64 // "hit" | "miss"
+	arbiterCacheEvictions  map[string]*uint64 // "lru" (issue #798)
+	slmEscalations         map[string]*uint64 // reason label for issue #301
 
 	judgeQueueOverflow   uint64 // atomic; use atomic.AddUint64/atomic.LoadUint64
 	qualityQueueOverflow uint64 // atomic; use atomic.AddUint64/atomic.LoadUint64
@@ -261,6 +270,7 @@ func NewRouteCounters() *RouteCounters {
 		rRAGHits:                 &ragHits,
 		rRAGMisses:               make(map[string]*uint64),
 		cascadeFallbacks:         make(map[string]*uint64),
+		cascadeFallbackLatency:   make(map[string]*Histogram),
 		arbiterCache:             make(map[string]*uint64),
 		arbiterCacheEvictions:    make(map[string]*uint64),
 		slmEscalations:           make(map[string]*uint64),
@@ -591,6 +601,57 @@ func (rc *RouteCounters) ObserveCascadeFallback(reason string) {
 		return
 	}
 	atomic.AddUint64(rc.cascadeFallbackSlot(reason), 1)
+}
+
+// ObserveCascadeFallbackLatency records the latency of a cascade fallback
+// event (issue #1362). reason and route identify the histogram bucket;
+// latency is the elapsed seconds in the step that triggered the fallback.
+// The method is safe for concurrent use and never blocks; nil receivers
+// are a no-op.
+func (rc *RouteCounters) ObserveCascadeFallbackLatency(reason, route string, latency float64) {
+	if rc == nil || reason == "" || latency <= 0 {
+		return
+	}
+	key := reason + "|" + route
+	rc.mu.Lock()
+	h, ok := rc.cascadeFallbackLatency[key]
+	if !ok || h == nil {
+		h = NewHistogram(CascadeFallbackLatencyBuckets)
+		rc.cascadeFallbackLatency[key] = h
+	}
+	rc.mu.Unlock()
+	h.Observe(latency)
+}
+
+// CascadeFallbackLatencySnapshot returns a map of histogram snapshots keyed
+// by "reason|route". Used by CollectMetricSnapshot for OTLP export.
+func (rc *RouteCounters) CascadeFallbackLatencySnapshot() map[string]histogramSnapshot {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make(map[string]histogramSnapshot, len(rc.cascadeFallbackLatency))
+	for k, h := range rc.cascadeFallbackLatency {
+		if h == nil {
+			continue
+		}
+		cum, bounds, sum, count := h.Snapshot()
+		out[k] = histogramSnapshot{
+			Cumulative:  cum,
+			UpperBounds: bounds,
+			Sum:         sum,
+			Count:       count,
+		}
+	}
+	return out
+}
+
+type histogramSnapshot struct {
+	Cumulative  []uint64
+	UpperBounds []float64
+	Sum         float64
+	Count       uint64
 }
 
 // ObserveArbiterCacheHit records an arbiter cache lookup result
@@ -1356,6 +1417,12 @@ func (rc *RouteCounters) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		total += n
 	}
+	// Cascade fallback latency histogram (issue #1362).
+	if n, err := writeCascadeFallbackLatencyHistogram(w, rc.cascadeFallbackLatency); err != nil {
+		return total, err
+	} else {
+		total += n
+	}
 	if n, err := writeRejectionSeries(w, "nexus_fusion_arbiter_cache_total",
 		"Fusion arbiter synthesis cache hits and misses (issue #232).",
 		rc.arbiterCache); err != nil {
@@ -1867,6 +1934,70 @@ func labelValue(k counterKey, label string) string {
 	default:
 		return ""
 	}
+}
+
+// writeCascadeFallbackLatencyHistogram emits the
+// nexus_cascade_fallback_duration_seconds histogram family (issue #1362).
+// Each histogram is keyed by "reason|route" and carries the reason and
+// route labels. Output is sorted by reason then route for deterministic
+// scrape diffs.
+func writeCascadeFallbackLatencyHistogram(w io.Writer, histograms map[string]*Histogram) (int64, error) {
+	var total int64
+	n, err := fmt.Fprintf(w, "# HELP nexus_cascade_fallback_duration_seconds Cascade fallback latency partitioned by reason and route (issue #1362).\n# TYPE nexus_cascade_fallback_duration_seconds histogram\n")
+	if err != nil {
+		return total, err
+	}
+	total += int64(n)
+	if len(histograms) == 0 {
+		return total, nil
+	}
+	// Collect and sort keys for deterministic output.
+	keys := make([]string, 0, len(histograms))
+	for k := range histograms {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		h := histograms[key]
+		if h == nil {
+			continue
+		}
+		// Split key into reason and route.
+		reason := key
+		route := ""
+		if idx := strings.Index(key, "|"); idx >= 0 {
+			reason = key[:idx]
+			route = key[idx+1:]
+		}
+		cum, upperBounds, sum, count := h.Snapshot()
+		for i, ub := range upperBounds {
+			n, err := fmt.Fprintf(w, "nexus_cascade_fallback_duration_seconds_bucket{reason=%q,route=%q,le=%q} %d\n",
+				reason, route, formatFloat(ub), cum[i])
+			if err != nil {
+				return total, err
+			}
+			total += int64(n)
+		}
+		n, err = fmt.Fprintf(w, "nexus_cascade_fallback_duration_seconds_bucket{reason=%q,route=%q,le=%q} %d\n",
+			reason, route, "+Inf", cum[len(upperBounds)])
+		if err != nil {
+			return total, err
+		}
+		total += int64(n)
+		n, err = fmt.Fprintf(w, "nexus_cascade_fallback_duration_seconds_sum{reason=%q,route=%q} %s\n",
+			reason, route, formatFloat(sum))
+		if err != nil {
+			return total, err
+		}
+		total += int64(n)
+		n, err = fmt.Fprintf(w, "nexus_cascade_fallback_duration_seconds_count{reason=%q,route=%q} %d\n",
+			reason, route, count)
+		if err != nil {
+			return total, err
+		}
+		total += int64(n)
+	}
+	return total, nil
 }
 
 // sanitizeLabel escapes characters that are invalid in Prometheus

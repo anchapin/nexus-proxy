@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -916,6 +917,37 @@ func CollectMetricSnapshot() []MetricSnapshot {
 				Type:   MetricTypeCounter,
 				Labels: map[string]string{"reason": reason},
 				Sum:    float64(cnt),
+			})
+		}
+
+		// nexus_cascade_fallback_duration_seconds{reason,route} histogram (issue #1362)
+		for key, snap := range routeCountersSlow.CascadeFallbackLatencySnapshot() {
+			reason := key
+			route := ""
+			if idx := strings.Index(key, "|"); idx >= 0 {
+				reason = key[:idx]
+				route = key[idx+1:]
+			}
+			var buckets []HistogramBucket
+			var running uint64
+			for i, ub := range snap.UpperBounds {
+				running += snap.Cumulative[i]
+				buckets = append(buckets, HistogramBucket{
+					UpperBound: ub,
+					Count:      running,
+				})
+			}
+			buckets = append(buckets, HistogramBucket{
+				UpperBound: math.Inf(1),
+				Count:      snap.Count,
+			})
+			out = append(out, MetricSnapshot{
+				Name:             "nexus_cascade_fallback_duration_seconds",
+				Type:             MetricTypeHistogram,
+				Labels:           map[string]string{"reason": reason, "route": route},
+				HistogramBuckets: buckets,
+				HistogramSum:     snap.Sum,
+				HistogramCount:   snap.Count,
 			})
 		}
 

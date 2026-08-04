@@ -36,6 +36,7 @@ snake_case naming.
 | `nexus_local_cooldown_triggers_total` | counter | *(none)* | 1 | `routemetrics.go` (issue #530) |
 | `nexus_requests_rejected_total` | counter | `reason` | 4 | `routemetrics.go` |
 | `nexus_cascade_fallback_total` | counter | `reason` | 6 (`timeout`, `transport_error`, `rate_limited`, `http_error`, `malformed_toolcall`, `malformed_response`) | `routemetrics.go` |
+| `nexus_cascade_fallback_duration_seconds` | histogram | `reason`, `route` | 7 × 3 = 21 (`timeout\|local`, `timeout\|frontier`, `transport_error\|local`, …) | `routemetrics.go` (issue #1362) |
 | `nexus_upstream_response_truncated_total` | counter | *(none)* | 1 | `routemetrics.go` (issue #365) |
 | `nexus_rag_retrieval_total` | counter | `hit`, `reason` (miss only) | 1 + 3 = 4 | `routemetrics.go` |
 | `nexus_judge_dropped_total` | counter | *(none)* | 1 | `routemetrics.go` |
@@ -170,6 +171,21 @@ extended in #497, #534):
 > returns invalid responses (`malformed_response`) — these have
 > completely different remediations. Update any PromQL/JSON-stat panels
 > that keyed on the old three-value closed set.
+
+The `nexus_cascade_fallback_duration_seconds` histogram (issue #1362) tracks
+the elapsed time spent in the cascade step that triggered a fallback. It carries
+two labels:
+
+- `reason`: same closed set as `nexus_cascade_fallback_total` (`timeout`,
+  `transport_error`, `rate_limited`, `http_error`, `malformed_toolcall`,
+  `malformed_response`)
+- `route`: the name of the step that failed and triggered the fallback
+  (e.g., `local`, `frontier`, `zai`)
+
+Bucket boundaries (seconds): `0.25, 0.5, 1, 2.5, 5, 10, 30`. These let operators
+distinguish fast failures (network flap, sub-second timeout) from slow failures
+(genuine Ollama hang). Operators can compute p50/p95/p99 from the cumulative
+bucket counts.
 
 #### `injected`
 

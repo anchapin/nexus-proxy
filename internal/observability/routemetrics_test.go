@@ -574,6 +574,87 @@ func TestObserveCascadeFallbackDeterministicOrder(t *testing.T) {
 	}
 }
 
+// TestObserveCascadeFallbackLatencyNilSafe verifies that nil receivers are safe.
+func TestObserveCascadeFallbackLatencyNilSafe(t *testing.T) {
+	var rc *RouteCounters
+	rc.ObserveCascadeFallbackLatency("timeout", "local", 1.5)
+	n, err := rc.WriteTo(&strings.Builder{})
+	if err != nil || n != 0 {
+		t.Errorf("nil WriteTo should return (0, nil), got (%d, %v)", n, err)
+	}
+}
+
+// TestObserveCascadeFallbackLatencyBasic verifies the histogram emits correct bucket lines.
+func TestObserveCascadeFallbackLatencyBasic(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveCascadeFallbackLatency("timeout", "local", 1.5)
+	rc.ObserveCascadeFallbackLatency("timeout", "local", 0.3)
+	rc.ObserveCascadeFallbackLatency("transport_error", "frontier", 5.0)
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+
+	// Verify histogram family header.
+	if !strings.Contains(out, "nexus_cascade_fallback_duration_seconds") {
+		t.Errorf("output missing histogram family:\n%s", out)
+	}
+	if !strings.Contains(out, "# TYPE nexus_cascade_fallback_duration_seconds histogram") {
+		t.Errorf("output missing histogram TYPE line:\n%s", out)
+	}
+
+	// Verify timeout|local buckets (1.5s lands in le=2.5 bucket)
+	for _, le := range []string{"0.25", "0.5", "1", "2.5"} {
+		if !strings.Contains(out, `reason="timeout",route="local",le="`+le) {
+			t.Errorf("output missing bucket le=%s for timeout|local:\n%s", le, out)
+		}
+	}
+
+	// Verify _sum and _count for timeout|local
+	if !strings.Contains(out, `reason="timeout",route="local"}`) {
+		t.Errorf("output missing timeout|local metric lines:\n%s", out)
+	}
+
+	// Verify transport_error|frontier
+	if !strings.Contains(out, `reason="transport_error",route="frontier"`) {
+		t.Errorf("output missing transport_error|frontier:\n%s", out)
+	}
+}
+
+// TestObserveCascadeFallbackLatencyEmptyReason verifies that empty reason is a no-op.
+func TestObserveCascadeFallbackLatencyEmptyReason(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveCascadeFallbackLatency("", "local", 1.5)
+	rc.ObserveCascadeFallbackLatency("timeout", "local", 1.5)
+
+	var sb strings.Builder
+	if _, err := rc.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := sb.String()
+	// Should only have timeout|local, not an empty reason entry
+	if strings.Contains(out, `reason="",route="local"`) {
+		t.Errorf("empty reason should not appear in output:\n%s", out)
+	}
+}
+
+// TestObserveCascadeFallbackLatencyDeterministicOrder verifies sorted output.
+func TestObserveCascadeFallbackLatencyDeterministicOrder(t *testing.T) {
+	rc := NewRouteCounters()
+	rc.ObserveCascadeFallbackLatency("transport_error", "frontier", 5.0)
+	rc.ObserveCascadeFallbackLatency("timeout", "local", 1.5)
+	rc.ObserveCascadeFallbackLatency("timeout", "frontier", 2.0)
+
+	var first, second strings.Builder
+	_, _ = rc.WriteTo(&first)
+	_, _ = rc.WriteTo(&second)
+	if first.String() != second.String() {
+		t.Errorf("cascade fallback latency output not deterministic between scrapes")
+	}
+}
+
 // TestQueueOverflowCounters exercises the issue #226 overflow counters
 // and verifies they appear in the Prometheus exposition with the correct
 // HELP/TYPE lines and zero-value output when not incremented.
