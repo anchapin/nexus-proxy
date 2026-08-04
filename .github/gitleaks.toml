@@ -35,6 +35,14 @@ paths = [
   "internal/audit/audit_test.go",
 ]
 
+# E2E integration tests contain mock API key strings (sk-, ghp_, AKIA*)
+# for testing the response redaction pipeline. These are test fixtures only.
+[[allowlists]]
+description = "E2E integration test file with mock API key test data"
+paths = [
+  "cmd/nexus/integration_test.go",
+]
+
 # Historical commits with false positives - skip entire commits
 [[allowlists]]
 description = "Historical commits with placeholder test values"
