@@ -915,6 +915,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 	})
 	cascadeFallbackObs := handlers.CascadeFallbackObserverFunc(func(e handlers.CascadeFallbackEvent) {
 		routeCounters.ObserveCascadeFallback(e.Reason)
+		routeCounters.ObserveCascadeFallbackLatency(e.Reason, e.Route, e.Latency)
 	})
 	var arbiterCacheObserver func(bool)
 	if cfg.ArbiterCacheTTL > 0 {

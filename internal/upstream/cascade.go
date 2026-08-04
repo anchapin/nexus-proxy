@@ -86,6 +86,17 @@ type CascadeResult struct {
 	// fallback occurred (cascade succeeded on first step or all steps
 	// failed without retryable errors).
 	FallbackReason string
+	// FallbackLatency is the elapsed time in seconds spent in the step
+	// that triggered a fallback (issue #1362). It is set whenever a
+	// retryable step failure causes a fallback. Zero when no fallback
+	// occurred. This allows operators to distinguish primary latency
+	// from fallback latency in the cascade.
+	FallbackLatency float64
+	// FallbackRoute is the Name of the step that triggered the fallback
+	// (issue #1362). For example, "local" when the local Ollama step
+	// timed out and the cascade fell back to frontier. Empty when no
+	// fallback occurred.
+	FallbackRoute string
 }
 
 // cascadeDefaultTimeout is the per-attempt timeout used when Cascade.Timeout
@@ -173,9 +184,11 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 		res.Attempts = i + 1
 		res.RouteAttempted = joinStepNames(c.Steps[:i+1])
 
+		stepStart := time.Now()
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		msg, servedModel, _, err := c.fetchCascadeStep(ctx, client, step, payload)
 		cancel()
+		elapsed := time.Since(stepStart).Seconds()
 		if err == nil {
 			slog.Info("cascade served",
 				slog.String("request_id", requestID),
@@ -209,6 +222,8 @@ func (c *Cascade) Run(ctx context.Context, w http.ResponseWriter, client Client,
 		// counter so operators can observe cascade fallback rates.
 		if retry {
 			res.FallbackReason = CascadeFallbackReason(err)
+			res.FallbackLatency = elapsed
+			res.FallbackRoute = step.Name
 		}
 		slog.Warn("cascade step failed",
 			slog.String("request_id", requestID),
@@ -248,9 +263,11 @@ func (c *Cascade) RunBuffered(ctx context.Context, w http.ResponseWriter, client
 		res.Attempts = i + 1
 		res.RouteAttempted = joinStepNames(c.Steps[:i+1])
 
+		stepStart := time.Now()
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		_, _, rawBody, err := c.fetchCascadeStep(ctx, client, step, payload)
 		cancel()
+		elapsed := time.Since(stepStart).Seconds()
 		if err == nil {
 			slog.Info("frontier cascade served (buffered)",
 				slog.String("request_id", requestID),
@@ -273,6 +290,8 @@ func (c *Cascade) RunBuffered(ctx context.Context, w http.ResponseWriter, client
 		retry := classifyFailure(err)
 		if retry {
 			res.FallbackReason = CascadeFallbackReason(err)
+			res.FallbackLatency = elapsed
+			res.FallbackRoute = step.Name
 		}
 		slog.Warn("frontier cascade step failed",
 			slog.String("request_id", requestID),

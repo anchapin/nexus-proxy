@@ -416,7 +416,9 @@ func (f RAGObserverFunc) ObserveRAG(e RAGEvent) { f(e) }
 // "transport_error", "malformed_toolcall", or "malformed_response".
 type CascadeFallbackEvent struct {
 	RequestID string
-	Reason    string // "timeout", "transport_error", "malformed_toolcall", or "malformed_response"
+	Reason    string  // "timeout", "transport_error", "malformed_toolcall", or "malformed_response"
+	Latency   float64 // elapsed seconds in the step that triggered the fallback (issue #1362)
+	Route     string  // name of the step that triggered the fallback (issue #1362)
 }
 
 // CascadeFallbackObserver is the hook invoked when the cascade falls back
@@ -2099,6 +2101,8 @@ func Chat(d Deps) http.Handler {
 					d.CascadeFallbackObserver.ObserveCascadeFallback(CascadeFallbackEvent{
 						RequestID: reqID,
 						Reason:    res.FallbackReason,
+						Latency:   res.FallbackLatency,
+						Route:     res.FallbackRoute,
 					})
 				}
 				// Issue #80: arm the local-route cooldown when the
@@ -2308,6 +2312,8 @@ func Chat(d Deps) http.Handler {
 					d.CascadeFallbackObserver.ObserveCascadeFallback(CascadeFallbackEvent{
 						RequestID: reqID,
 						Reason:    res.FallbackReason,
+						Latency:   res.FallbackLatency,
+						Route:     res.FallbackRoute,
 					})
 				}
 				if upErr != nil {
