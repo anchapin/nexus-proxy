@@ -126,6 +126,81 @@ type Storage interface {
 	Close() error
 }
 
+// JudgeDashboardStore is the subset of judge.Storage that the dashboard
+// needs to surface RAG quality metrics. Implemented by SQLiteStore.
+type JudgeDashboardStore interface {
+	Storage
+	// RAGQuality returns aggregated RAG quality metrics for the given time range.
+	RAGQuality(from, to time.Time) (RAGQualitySummary, error)
+}
+
+// RAGQualitySummary holds RAG quality metrics from the judge store.
+// Used by the dashboard to surface judge-assessed quality scores
+// partitioned by whether RAG context was injected (issue #1407).
+type RAGQualitySummary struct {
+	Date time.Time
+
+	// JudgeCount is the total number of judge evaluations in the period.
+	JudgeCount int
+	// JudgeScoreSum is the sum of all judge scores (1-5 scale).
+	JudgeScoreSum float64
+	// JudgeScoreCount is the number of scores included in JudgeScoreSum
+	// (scores with parse failures are excluded).
+	JudgeScoreCount int
+
+	// RAGInjectedCount is the number of judged requests where RAG was injected.
+	RAGInjectedCount int
+	// RAGInjectedScoreSum is the sum of judge scores for RAG-injected requests.
+	RAGInjectedScoreSum float64
+	// RAGInjectedScoreCount is the count of valid scores for RAG-injected requests.
+	RAGInjectedScoreCount int
+	// RAGInjectedSimilaritySum is the sum of cosine similarities for RAG-injected requests.
+	RAGInjectedSimilaritySum float64
+
+	// NonRAGInjectedCount is the number of judged requests where RAG was NOT injected.
+	NonRAGInjectedCount int
+	// NonRAGInjectedScoreSum is the sum of judge scores for non-RAG-injected requests.
+	NonRAGInjectedScoreSum float64
+	// NonRAGInjectedScoreCount is the count of valid scores for non-RAG-injected requests.
+	NonRAGInjectedScoreCount int
+}
+
+// AvgJudgeScore returns the average judge score across all evaluated requests.
+// Returns 0 if no valid scores.
+func (r RAGQualitySummary) AvgJudgeScore() float64 {
+	if r.JudgeScoreCount == 0 {
+		return 0
+	}
+	return r.JudgeScoreSum / float64(r.JudgeScoreCount)
+}
+
+// AvgJudgeScoreInjected returns the average judge score for RAG-injected requests.
+// Returns 0 if no valid scores.
+func (r RAGQualitySummary) AvgJudgeScoreInjected() float64 {
+	if r.RAGInjectedScoreCount == 0 {
+		return 0
+	}
+	return r.RAGInjectedScoreSum / float64(r.RAGInjectedScoreCount)
+}
+
+// AvgJudgeScoreNonInjected returns the average judge score for non-RAG-injected requests.
+// Returns 0 if no valid scores.
+func (r RAGQualitySummary) AvgJudgeScoreNonInjected() float64 {
+	if r.NonRAGInjectedScoreCount == 0 {
+		return 0
+	}
+	return r.NonRAGInjectedScoreSum / float64(r.NonRAGInjectedScoreCount)
+}
+
+// AvgSimilarity returns the average cosine similarity for RAG-injected requests.
+// Returns 0 if no RAG-injected requests were evaluated.
+func (r RAGQualitySummary) AvgSimilarity() float64 {
+	if r.RAGInjectedCount == 0 {
+		return 0
+	}
+	return r.RAGInjectedSimilaritySum / float64(r.RAGInjectedCount)
+}
+
 // HTTPClient is the minimal HTTP capability the judge needs. *http.Client
 // satisfies it; tests can pass any compatible fake.
 type HTTPClient interface {
@@ -871,4 +946,37 @@ func (m *MemoryStorage) RecentScores(limit int) ([]int, error) {
 		out = append(out, valid[i].Score)
 	}
 	return out, nil
+}
+
+// RAGQuality implements JudgeDashboardStore.
+func (m *MemoryStorage) RAGQuality(from, to time.Time) (RAGQualitySummary, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var sum RAGQualitySummary
+	sum.Date = from.UTC().Truncate(24 * time.Hour)
+	for _, s := range m.scores {
+		if s.Timestamp.Before(from) || !s.Timestamp.Before(to) {
+			continue
+		}
+		sum.JudgeCount++
+		if s.Score > 0 {
+			sum.JudgeScoreSum += float64(s.Score)
+			sum.JudgeScoreCount++
+		}
+		if s.RAGInjected {
+			sum.RAGInjectedCount++
+			sum.RAGInjectedSimilaritySum += s.RAGSimilarity
+			if s.Score > 0 {
+				sum.RAGInjectedScoreSum += float64(s.Score)
+				sum.RAGInjectedScoreCount++
+			}
+		} else {
+			sum.NonRAGInjectedCount++
+			if s.Score > 0 {
+				sum.NonRAGInjectedScoreSum += float64(s.Score)
+				sum.NonRAGInjectedScoreCount++
+			}
+		}
+	}
+	return sum, nil
 }

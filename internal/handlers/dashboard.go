@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/anchapin/nexus-proxy/internal/judge"
 	"github.com/anchapin/nexus-proxy/internal/metrics"
 )
 
@@ -63,6 +64,12 @@ type DashboardDeps struct {
 	// Now is the injectable clock; nil → time.Now. Used so tests can
 	// pin "today" without touching the system clock.
 	Now func() time.Time
+	// JudgeEnabled indicates whether judge evaluation is active.
+	// When false, the RAG quality section shows "judge disabled".
+	JudgeEnabled bool
+	// JudgeStore supplies judge quality metrics. May be nil when
+	// JudgeEnabled is false, or when judge metrics are unavailable.
+	JudgeStore judge.JudgeDashboardStore
 }
 
 // dashboardDayRow is one row of the per-day table in the rendered page.
@@ -89,6 +96,7 @@ type dashboardTotals struct {
 	TOONSavedTokens   int     `json:"toon_saved_tokens"`
 	TOONSavingsUSD    float64 `json:"toon_savings_usd"`
 	RoutingSavingsUSD float64 `json:"routing_savings_usd"`
+	RAGInjected       int     `json:"rag_injected"`
 	Errors            int     `json:"errors"`
 }
 
@@ -101,6 +109,20 @@ type dashboardModel struct {
 	Days       []dashboardDayRow
 	Generated  string
 	HasData    bool
+	RAG        ragQuality `json:"rag_quality,omitempty"`
+}
+
+// ragQuality holds RAG quality metrics for the dashboard.
+type ragQuality struct {
+	JudgeEnabled bool `json:"judge_enabled"`
+	// InjectionRate is the percentage (0-100) of requests that received RAG injection.
+	InjectionRate float64 `json:"injection_rate"`
+	// AvgJudgeScoreInjected is the average judge score for RAG-injected requests.
+	AvgJudgeScoreInjected float64 `json:"avg_judge_score_injected"`
+	// AvgJudgeScoreNonInjected is the average judge score for non-RAG-injected requests.
+	AvgJudgeScoreNonInjected float64 `json:"avg_judge_score_non_injected"`
+	// AvgSimilarity is the average cosine similarity for RAG-injected requests.
+	AvgSimilarity float64 `json:"avg_similarity"`
 }
 
 // dashboardRangeLink is one entry in the range-picker nav.
@@ -108,6 +130,57 @@ type dashboardRangeLink struct {
 	Key    string
 	Label  string
 	Active bool
+}
+
+// computeRAGQuality computes RAG quality metrics for the given window.
+// It aggregates judge scores and similarity from the judge store, and
+// combines with request counts from the metrics store to compute injection rate.
+func computeRAGQuality(deps DashboardDeps, totalRequests, ragInjected int, today time.Time, days int) ragQuality {
+	rag := ragQuality{JudgeEnabled: deps.JudgeEnabled}
+
+	if !deps.JudgeEnabled || deps.JudgeStore == nil {
+		return rag
+	}
+
+	// Aggregate judge data across the window.
+	var ragInjectedScoreSum, nonRAGInjectedScoreSum float64
+	var ragInjectedScoreCount, nonRAGInjectedScoreCount int
+	var similaritySum float64
+
+	for i := days - 1; i >= 0; i-- {
+		day := today.AddDate(0, 0, -i)
+		nextDay := day.AddDate(0, 0, 1)
+		sum, err := deps.JudgeStore.RAGQuality(day, nextDay)
+		if err != nil {
+			slog.Warn("dashboard: judge quality query failed",
+				slog.String("date", day.Format("2006-01-02")),
+				slog.Any("err", err),
+			)
+			continue
+		}
+		ragInjectedScoreSum += sum.RAGInjectedScoreSum
+		ragInjectedScoreCount += sum.RAGInjectedScoreCount
+		nonRAGInjectedScoreSum += sum.NonRAGInjectedScoreSum
+		nonRAGInjectedScoreCount += sum.NonRAGInjectedScoreCount
+		similaritySum += sum.RAGInjectedSimilaritySum
+	}
+
+	// Compute injection rate based on total requests (from metrics store).
+	if totalRequests > 0 {
+		rag.InjectionRate = roundTo(float64(ragInjected)/float64(totalRequests)*100, 1)
+	}
+
+	if ragInjectedScoreCount > 0 {
+		rag.AvgJudgeScoreInjected = roundTo(ragInjectedScoreSum/float64(ragInjectedScoreCount), 2)
+	}
+	if nonRAGInjectedScoreCount > 0 {
+		rag.AvgJudgeScoreNonInjected = roundTo(nonRAGInjectedScoreSum/float64(nonRAGInjectedScoreCount), 2)
+	}
+	if ragInjected > 0 {
+		rag.AvgSimilarity = roundTo(similaritySum/float64(ragInjected), 3)
+	}
+
+	return rag
 }
 
 // Dashboard returns an http.HandlerFunc that serves the built-in web
@@ -178,10 +251,14 @@ func Dashboard(deps DashboardDeps) http.HandlerFunc {
 			tot.TOONSavedTokens += s.TOONSavingsTokens
 			tot.TOONSavingsUSD += toonUSD
 			tot.RoutingSavingsUSD += s.SavingsTotal
+			tot.RAGInjected += s.RAGInjectedCount
 			tot.Errors += s.ErrorCount
 		}
 		tot.TOONSavingsUSD = roundTo(tot.TOONSavingsUSD, 4)
 		tot.RoutingSavingsUSD = roundTo(tot.RoutingSavingsUSD, 4)
+
+		// Compute RAG quality metrics if judge is enabled and store is available.
+		rag := computeRAGQuality(deps, tot.Requests, tot.RAGInjected, today, days)
 
 		model := dashboardModel{
 			RangeKey:   rangeKey,
@@ -191,6 +268,7 @@ func Dashboard(deps DashboardDeps) http.HandlerFunc {
 			Days:       rows,
 			Generated:  now().UTC().Format(time.RFC3339),
 			HasData:    hasData,
+			RAG:        rag,
 		}
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -334,16 +412,21 @@ func DashboardJSON(deps DashboardDeps) http.HandlerFunc {
 			tot.TOONSavedTokens += s.TOONSavingsTokens
 			tot.TOONSavingsUSD += toonUSD
 			tot.RoutingSavingsUSD += s.SavingsTotal
+			tot.RAGInjected += s.RAGInjectedCount
 			tot.Errors += s.ErrorCount
 		}
 		tot.TOONSavingsUSD = roundTo(tot.TOONSavingsUSD, 4)
 		tot.RoutingSavingsUSD = roundTo(tot.RoutingSavingsUSD, 4)
+
+		rag := computeRAGQuality(deps, tot.Requests, tot.RAGInjected, today, days)
+
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"range":     rangeKey,
-			"totals":    tot,
-			"days":      rows,
-			"generated": now().UTC().Format(time.RFC3339),
+			"range":       rangeKey,
+			"totals":      tot,
+			"days":        rows,
+			"generated":   now().UTC().Format(time.RFC3339),
+			"rag_quality": rag,
 		})
 	}
 }
@@ -429,6 +512,18 @@ const dashboardHTML = `<!DOCTYPE html>
     <div class="card"><div class="k">Routing savings</div><div class="v">${{printf "%.4f" .Totals.RoutingSavingsUSD}}</div></div>
     <div class="card"><div class="k">Errors</div><div class="v">{{.Totals.Errors}}</div></div>
   </section>
+  {{if .RAG.JudgeEnabled}}
+  <section class="cards">
+    <div class="card"><div class="k">RAG injection</div><div class="v">{{printf "%.1f" .RAG.InjectionRate}}<small>%</small></div></div>
+    <div class="card"><div class="k">Judge score (RAG)</div><div class="v">{{printf "%.2f" .RAG.AvgJudgeScoreInjected}}</div></div>
+    <div class="card"><div class="k">Judge score (no RAG)</div><div class="v">{{printf "%.2f" .RAG.AvgJudgeScoreNonInjected}}</div></div>
+    <div class="card"><div class="k">Avg similarity</div><div class="v">{{printf "%.3f" .RAG.AvgSimilarity}}</div></div>
+  </section>
+  {{else}}
+  <section class="cards">
+    <div class="card"><div class="k">RAG quality</div><div class="v"><small>judge disabled</small></div></div>
+  </section>
+  {{end}}
   <table>
     <thead><tr><th>Date</th><th>Total</th><th class="l">Local</th><th class="f">Frontier</th><th class="s">Fusion</th><th>Tokens</th><th>TOON</th><th>$$ Saved</th><th>Status</th></tr></thead>
     <tbody>
