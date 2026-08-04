@@ -2048,11 +2048,14 @@ func Chat(d Deps) http.Handler {
 					})
 				}
 				for _, p := range d.Providers.All() {
+					adapter, _ := providers.NewAdapter(p.AdapterType())
+					baseURL := strings.TrimRight(p.BaseURL(), "/")
 					steps = append(steps, upstream.CascadeStep{
-						Name:   p.Name(),
-						URL:    strings.TrimRight(p.BaseURL(), "/") + "/v1/chat/completions",
-						Model:  p.Model(),
-						APIKey: p.APIKey(),
+						Name:        p.Name(),
+						URL:        adapter.RequestPath(baseURL),
+						Model:      p.Model(),
+						APIKey:     p.APIKey(),
+						AuthHeaders: adapter.AuthHeaders(p.APIKey()),
 					})
 				}
 				cas = &upstream.Cascade{
@@ -2262,6 +2265,15 @@ func Chat(d Deps) http.Handler {
 			} else {
 				model = d.Config.FrontierModel
 			}
+			// If providers are configured, use the first one as the frontier
+			// target (issue #1185). Use the adapter to build the correct
+			// request path and auth headers for non-OpenAI providers.
+			if d.Providers != nil && d.Providers.Len() > 0 {
+				p := d.Providers.All()[0]
+				adapter, _ := providers.NewAdapter(p.AdapterType())
+				frontierURL = adapter.RequestPath(strings.TrimRight(p.BaseURL(), "/"))
+				frontierKey = p.APIKey()
+			}
 			// Budget guard: check before frontier dispatch (issue #220).
 			if d.SpendGuard != nil && frontierCost > 0 && d.SpendGuard.Check(r.Context(), frontierCost) {
 				slog.Warn("budget exhausted, rejecting frontier request",
@@ -2278,15 +2290,19 @@ func Chat(d Deps) http.Handler {
 			// wrap the dispatch in a frontier-only cascade so a retryable
 			// failure (5xx, timeout, connection reset) advances to the
 			// next provider before returning an error to the client.
-			if d.Config.FrontierFailover && d.Providers != nil && d.Providers.Len() > 1 {
+			// Issue #1185: use the provider's adapter to build correct
+			// request path and auth headers for non-OpenAI providers.
+			if d.Providers != nil && d.Providers.Len() > 0 {
 				allProviders := d.Providers.All()
 				steps := make([]upstream.CascadeStep, 0, len(allProviders))
 				for _, p := range allProviders {
+					adapter, _ := providers.NewAdapter(p.AdapterType())
 					steps = append(steps, upstream.CascadeStep{
-						Name:   p.Name(),
-						URL:    strings.TrimRight(p.BaseURL(), "/") + "/v1/chat/completions",
-						Model:  p.Model(),
-						APIKey: p.APIKey(),
+						Name:        p.Name(),
+						URL:        adapter.RequestPath(strings.TrimRight(p.BaseURL(), "/")),
+						Model:      p.Model(),
+						APIKey:     p.APIKey(),
+						AuthHeaders: adapter.AuthHeaders(p.APIKey()),
 					})
 				}
 				if d.Config.FrontierFailoverMaxAttempts < len(steps) {
