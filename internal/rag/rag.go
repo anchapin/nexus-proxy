@@ -2032,6 +2032,20 @@ func (s *Store) removeExample(filename string) {
 	atomic.AddInt64(&s.generation, 1)
 }
 
+func (s *Store) moveExample(src, dst string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.examples {
+		if s.examples[i].Filename == src {
+			s.examples[i].Filename = dst
+		}
+	}
+	if s.index != nil {
+		s.index = nil
+	}
+	atomic.AddInt64(&s.generation, 1)
+}
+
 // snapshot returns a defensive copy of the examples slice. Used by
 // tests and by the file watcher to compare state without holding
 // the lock across an Embed call.

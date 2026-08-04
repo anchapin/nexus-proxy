@@ -62,6 +62,8 @@ const ragUpsertSQL = `INSERT INTO rag_examples
 
 const ragDeleteSQL = `DELETE FROM rag_examples WHERE filename = ?`
 
+const ragMoveSQL = `UPDATE rag_examples SET filename = ? WHERE filename = ?`
+
 const ragSelectAllSQL = `SELECT filename, chunk_index, content, embedding, indexed_at, embedder_model, dims, hnsw_index
     FROM rag_examples ORDER BY filename, chunk_index`
 
@@ -698,6 +700,27 @@ func (p *PersistentStore) Remove(ctx context.Context, filename string) error {
 		return fmt.Errorf("rag: delete %q: %w", filename, err)
 	}
 	p.removeExample(filename)
+	return nil
+}
+
+// MoveFile updates all examples with src filename to have dst filename,
+// without re-embedding. The HNSW index is invalidated after the move.
+// Used by the watcher to handle directory renames (issue #1410).
+func (p *PersistentStore) MoveFile(ctx context.Context, src, dst string) error {
+	if p == nil || p.db == nil {
+		return errors.New("rag: persistent store not opened")
+	}
+	if src == "" || dst == "" {
+		return errors.New("rag: empty src or dst for move")
+	}
+
+	cctx, cancel := context.WithTimeout(ctx, ragOpTimeout)
+	defer cancel()
+
+	if _, err := p.db.ExecContext(cctx, ragMoveSQL, dst, src); err != nil {
+		return fmt.Errorf("rag: move %q → %q: %w", src, dst, err)
+	}
+	p.moveExample(src, dst)
 	return nil
 }
 
