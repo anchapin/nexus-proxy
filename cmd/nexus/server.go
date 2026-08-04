@@ -503,6 +503,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 	})
 
 	recorder := buildRecorder(cfg)
+	observability.RegisterTelemetryRecorder(recorder)
 	addCleanup(func() {
 		if err := recorder.Close(); err != nil {
 			slog.Error("telemetry close", slog.Any("err", err))
@@ -517,6 +518,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		})
 		if exp != nil {
 			tracing.RegisterExporter(exp)
+			observability.RegisterTracingExporter(exp)
 			slog.Info("tracing exporter started",
 				slog.String("endpoint", endpoint),
 				slog.Duration("timeout", cfg.TracingTimeout),
