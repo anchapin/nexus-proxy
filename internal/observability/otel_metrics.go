@@ -942,9 +942,9 @@ func CollectMetricSnapshot() []MetricSnapshot {
 				Count:      snap.Count,
 			})
 			out = append(out, MetricSnapshot{
-				Name:   "nexus_cascade_fallback_duration_seconds",
-				Type:   MetricTypeHistogram,
-				Labels: map[string]string{"reason": reason, "route": route},
+				Name:             "nexus_cascade_fallback_duration_seconds",
+				Type:             MetricTypeHistogram,
+				Labels:           map[string]string{"reason": reason, "route": route},
 				HistogramBuckets: buckets,
 				HistogramSum:     snap.Sum,
 				HistogramCount:   snap.Count,

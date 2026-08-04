@@ -183,10 +183,10 @@ type RouteCounters struct {
 	cascadeFallbacks         map[string]*uint64
 	// cascadeFallbackLatency tracks per-(reason, route) histograms for
 	// cascade fallback latency (issue #1362). Key is reason + "|" + route.
-	cascadeFallbackLatency   map[string]*Histogram
-	arbiterCache             map[string]*uint64 // "hit" | "miss"
-	arbiterCacheEvictions    map[string]*uint64 // "lru" (issue #798)
-	slmEscalations           map[string]*uint64 // reason label for issue #301
+	cascadeFallbackLatency map[string]*Histogram
+	arbiterCache           map[string]*uint64 // "hit" | "miss"
+	arbiterCacheEvictions  map[string]*uint64 // "lru" (issue #798)
+	slmEscalations         map[string]*uint64 // reason label for issue #301
 
 	judgeQueueOverflow   uint64 // atomic; use atomic.AddUint64/atomic.LoadUint64
 	qualityQueueOverflow uint64 // atomic; use atomic.AddUint64/atomic.LoadUint64
@@ -638,7 +638,7 @@ func (rc *RouteCounters) CascadeFallbackLatencySnapshot() map[string]histogramSn
 		}
 		cum, bounds, sum, count := h.Snapshot()
 		out[k] = histogramSnapshot{
-			Cumulative: cum,
+			Cumulative:  cum,
 			UpperBounds: bounds,
 			Sum:         sum,
 			Count:       count,
