@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anchapin/nexus-proxy/internal/judge"
 	"github.com/anchapin/nexus-proxy/internal/metrics"
 )
 
@@ -37,12 +39,12 @@ func twoDayStore() *fakeDashboardStore {
 			today.Format("2006-01-02"): {
 				Date: today, RequestCount: 10, LocalCount: 6, FrontierCount: 3, FusionCount: 1,
 				TotalInputTokens: 1200, TOONSavingsTokens: 400, SavingsTotal: 0.05,
-				ErrorCount: 0,
+				RAGInjectedCount: 3, ErrorCount: 0,
 			},
 			yesterday.Format("2006-01-02"): {
 				Date: yesterday, RequestCount: 5, LocalCount: 2, FrontierCount: 2, FusionCount: 1,
 				TotalInputTokens: 800, TOONSavingsTokens: 200, SavingsTotal: 0.02,
-				ErrorCount: 1,
+				RAGInjectedCount: 1, ErrorCount: 1,
 			},
 		},
 	}
@@ -216,6 +218,191 @@ func (errStore) DailySummary(time.Time) (metrics.Summary, error) {
 }
 
 var errFake = errors.New("boom")
+
+// fakeJudgeStore is an in-memory JudgeDashboardStore for dashboard
+// RAG quality tests. It returns fixed RAGQualitySummary values.
+type fakeJudgeStore struct {
+	byDay map[string]judge.RAGQualitySummary
+}
+
+func (f *fakeJudgeStore) Record(judge.JudgeScore) error {
+	return nil
+}
+
+func (f *fakeJudgeStore) RecentScores(limit int) ([]int, error) {
+	return nil, nil
+}
+
+func (f *fakeJudgeStore) Close() error {
+	return nil
+}
+
+func (f *fakeJudgeStore) RAGQuality(from, to time.Time) (judge.RAGQualitySummary, error) {
+	key := from.UTC().Truncate(24 * time.Hour).Format("2006-01-02")
+	return f.byDay[key], nil
+}
+
+// TestDashboardRAGDisabled shows "judge disabled" when JudgeEnabled is false.
+func TestDashboardRAGDisabled(t *testing.T) {
+	h := Dashboard(DashboardDeps{
+		Store:        twoDayStore(),
+		CostPer1K:    0.002,
+		Now:          fixedClock,
+		JudgeEnabled: false,
+		JudgeStore:   nil,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/dashboard?range=24h", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "judge disabled") {
+		t.Errorf("RAG quality section should show 'judge disabled'; snippet: %q", snippet(body))
+	}
+}
+
+// TestDashboardRAGEnabled shows RAG quality metrics when judge is enabled.
+func TestDashboardRAGEnabled(t *testing.T) {
+	today := fixedTime.UTC().Truncate(24 * time.Hour)
+	store := &fakeJudgeStore{
+		byDay: map[string]judge.RAGQualitySummary{
+			today.Format("2006-01-02"): {
+				JudgeCount:             5,
+				RAGInjectedCount:       3,
+				RAGInjectedScoreSum:    13.0, // scores: 5, 4, 4
+				RAGInjectedScoreCount:  3,
+				RAGInjectedSimilaritySum: 2.73, // similarities: 0.91, 0.92, 0.90
+				NonRAGInjectedCount:   2,
+				NonRAGInjectedScoreSum: 7.0, // scores: 4, 3
+				NonRAGInjectedScoreCount: 2,
+			},
+		},
+	}
+	h := Dashboard(DashboardDeps{
+		Store:        twoDayStore(),
+		CostPer1K:    0.002,
+		Now:          fixedClock,
+		JudgeEnabled: true,
+		JudgeStore:   store,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/dashboard?range=24h", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	body := rr.Body.String()
+
+	// Injection rate: 3 out of 10 = 30%
+	if !strings.Contains(body, "30.0<small>%</small>") {
+		t.Errorf("injection rate 30.0%% missing; snippet: %q", snippet(body))
+	}
+	// Avg judge score RAG: 13/3 = 4.33
+	if !strings.Contains(body, "4.33") {
+		t.Errorf("avg judge score RAG 4.33 missing; snippet: %q", snippet(body))
+	}
+	// Avg judge score non-RAG: 7/2 = 3.50
+	if !strings.Contains(body, "3.50") {
+		t.Errorf("avg judge score non-RAG 3.50 missing; snippet: %q", snippet(body))
+	}
+	// Avg similarity: 2.73/3 = 0.91
+	if !strings.Contains(body, "0.910") {
+		t.Errorf("avg similarity 0.910 missing; snippet: %q", snippet(body))
+	}
+}
+
+// TestDashboardJSONRAGQuality verifies the JSON output includes RAG quality fields.
+func TestDashboardJSONRAGQuality(t *testing.T) {
+	today := fixedTime.UTC().Truncate(24 * time.Hour)
+	store := &fakeJudgeStore{
+		byDay: map[string]judge.RAGQualitySummary{
+			today.Format("2006-01-02"): {
+				JudgeCount:               4,
+				RAGInjectedCount:         2,
+				RAGInjectedScoreSum:      8.0,
+				RAGInjectedScoreCount:    2,
+				RAGInjectedSimilaritySum: 1.84,
+				NonRAGInjectedCount:     2,
+				NonRAGInjectedScoreSum:  6.0,
+				NonRAGInjectedScoreCount: 2,
+			},
+		},
+	}
+	h := DashboardJSON(DashboardDeps{
+		Store:        twoDayStore(),
+		CostPer1K:    0.002,
+		Now:          fixedClock,
+		JudgeEnabled: true,
+		JudgeStore:   store,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/dashboard?range=24h&format=json", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	body := rr.Body.String()
+
+	var out map[string]any
+	if err := json.Unmarshal([]byte(body), &out); err != nil {
+		t.Fatalf("JSON parse error: %v", err)
+	}
+
+	rag, ok := out["rag_quality"].(map[string]any)
+	if !ok {
+		t.Fatal("rag_quality field missing from JSON")
+	}
+	if got, want := rag["judge_enabled"].(bool), true; got != want {
+		t.Errorf("judge_enabled = %v, want %v", got, want)
+	}
+	if got, want := rag["injection_rate"].(float64), 30.0; got != want {
+		t.Errorf("injection_rate = %v, want %v", got, want)
+	}
+	if got, want := rag["avg_judge_score_injected"].(float64), 4.0; got != want {
+		t.Errorf("avg_judge_score_injected = %v, want %v", got, want)
+	}
+}
+
+// TestDashboardJSONRAGDisabled verifies the JSON output shows judge disabled.
+func TestDashboardJSONRAGDisabled(t *testing.T) {
+	h := DashboardJSON(DashboardDeps{
+		Store:        twoDayStore(),
+		CostPer1K:    0.002,
+		Now:          fixedClock,
+		JudgeEnabled: false,
+		JudgeStore:   nil,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/dashboard?range=24h&format=json", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	body := rr.Body.String()
+
+	var out map[string]any
+	if err := json.Unmarshal([]byte(body), &out); err != nil {
+		t.Fatalf("JSON parse error: %v", err)
+	}
+
+	rag, ok := out["rag_quality"].(map[string]any)
+	if !ok {
+		t.Fatal("rag_quality field missing from JSON")
+	}
+	if got, want := rag["judge_enabled"].(bool), false; got != want {
+		t.Errorf("judge_enabled = %v, want %v", got, want)
+	}
+}
 
 // snippet returns the first 200 chars of body for compact assertion
 // failure messages.

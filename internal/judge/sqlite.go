@@ -366,6 +366,45 @@ func (s *SQLiteStore) RecentScores(limit int) ([]int, error) {
 	return out, nil
 }
 
+// ragQualitySQL aggregates judge scores and RAG similarity for the dashboard.
+// Only rows with score > 0 (successful parse) are included in score averages.
+const ragQualitySQL = `
+SELECT
+    COUNT(*),
+    COALESCE(SUM(score), 0),
+    COALESCE(SUM(CASE WHEN rag_injected = 1 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN rag_injected = 1 AND score > 0 THEN score ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN rag_injected = 1 AND score > 0 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN rag_injected = 1 THEN rag_similarity ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN rag_injected = 0 AND score > 0 THEN score ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN rag_injected = 0 AND score > 0 THEN 1 ELSE 0 END), 0)
+FROM judge_scores
+WHERE timestamp >= ? AND timestamp < ?`
+
+// RAGQuality implements JudgeDashboardStore. It returns aggregated RAG quality
+// metrics for the given half-open time range [from, to).
+func (s *SQLiteStore) RAGQuality(from, to time.Time) (RAGQualitySummary, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), recordScoreErrorTimeout)
+	defer cancel()
+
+	row := s.db.QueryRowContext(ctx, ragQualitySQL, from.UTC(), to.UTC())
+	var sum RAGQualitySummary
+	sum.Date = from.UTC().Truncate(24 * time.Hour)
+	if err := row.Scan(
+		&sum.JudgeCount,
+		&sum.JudgeScoreSum,
+		&sum.RAGInjectedCount,
+		&sum.RAGInjectedScoreSum,
+		&sum.RAGInjectedScoreCount,
+		&sum.RAGInjectedSimilaritySum,
+		&sum.NonRAGInjectedScoreSum,
+		&sum.NonRAGInjectedScoreCount,
+	); err != nil {
+		return RAGQualitySummary{}, fmt.Errorf("judge rag quality: %w", err)
+	}
+	return sum, nil
+}
+
 // Close drains in-flight writes and closes the database. Safe to call
 // exactly once; subsequent calls are no-ops.
 func (s *SQLiteStore) Close() error {
