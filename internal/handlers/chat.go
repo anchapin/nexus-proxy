@@ -2264,7 +2264,7 @@ func Chat(d Deps) http.Handler {
 				frontierKey = aliasTarget.APIKey
 			} else {
 				model = d.Config.FrontierModel
-				if d.Providers != nil && d.Providers.Len() > 0 {
+				if d.Config.FrontierFailover && d.Providers != nil && d.Providers.Len() > 0 {
 					p := d.Providers.All()[0]
 					adapter, _ := providers.NewAdapter(p.AdapterType())
 					frontierURL = adapter.RequestPath(strings.TrimRight(p.BaseURL(), "/"))
@@ -2283,13 +2283,12 @@ func Chat(d Deps) http.Handler {
 				break
 			}
 			// Issue #1157: per-provider failover for route=frontier. When
-			// enabled and more than one frontier provider is registered,
-			// wrap the dispatch in a frontier-only cascade so a retryable
-			// failure (5xx, timeout, connection reset) advances to the
-			// next provider before returning an error to the client.
+			// enabled, wrap the dispatch in a frontier-only cascade so a retryable
+			// failure (5xx, timeout, connection reset) advances to the next
+			// provider before returning an error to the client.
 			// Issue #1185: use the provider's adapter to build correct
 			// request path and auth headers for non-OpenAI providers.
-			if d.Providers != nil && d.Providers.Len() > 0 {
+			if d.Config.FrontierFailover && d.Providers != nil && d.Providers.Len() > 0 {
 				allProviders := d.Providers.All()
 				steps := make([]upstream.CascadeStep, 0, len(allProviders))
 				for _, p := range allProviders {
@@ -2302,7 +2301,7 @@ func Chat(d Deps) http.Handler {
 						AuthHeaders: adapter.AuthHeaders(p.APIKey()),
 					})
 				}
-				if d.Config.FrontierFailoverMaxAttempts < len(steps) {
+				if d.Config.FrontierFailoverMaxAttempts > 0 && d.Config.FrontierFailoverMaxAttempts < len(steps) {
 					steps = steps[:d.Config.FrontierFailoverMaxAttempts]
 				}
 				fcas := &upstream.Cascade{

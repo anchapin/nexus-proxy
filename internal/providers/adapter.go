@@ -718,6 +718,35 @@ func (n *azureContentFilterNormalizer) rewriteContentFilter(line string) (string
 // a model-scoped streamGenerateContent path.
 type geminiAdapter struct{}
 
+// geminiPart represents a single content part in Gemini's request or response.
+type geminiPart struct {
+	Text string `json:"text,omitempty"`
+}
+
+// geminiContent represents a single turn in a Gemini conversation.
+type geminiContent struct {
+	Role  string       `json:"role,omitempty"`
+	Parts []geminiPart `json:"parts"`
+}
+
+// geminiSystemInstruction wraps system instructions in Gemini's required format.
+type geminiSystemInstruction struct {
+	Parts []geminiPart `json:"parts"`
+}
+
+// geminiGenerationConfig wraps Gemini's generation parameters.
+type geminiGenerationConfig struct {
+	Temperature     *float64 `json:"temperature,omitempty"`
+	MaxOutputTokens *int     `json:"maxOutputTokens,omitempty"`
+}
+
+// geminiRequest is the Gemini GenerateContent request shape.
+type geminiRequest struct {
+	Contents          []geminiContent          `json:"contents,omitempty"`
+	SystemInstruction *geminiSystemInstruction `json:"systemInstruction,omitempty"`
+	GenerationConfig  *geminiGenerationConfig  `json:"generationConfig,omitempty"`
+}
+
 func (geminiAdapter) Type() string { return AdapterTypeGemini }
 
 // AuthHeaders returns the x-goog-api-key header.
@@ -743,13 +772,220 @@ func (geminiAdapter) RequestPath(baseURL string) string {
 	return strings.TrimRight(baseURL, "/") + ":streamGenerateContent"
 }
 
-// TransformRequest is a no-op for now: Gemini's native schema differs
-// significantly from OpenAI's and a faithful translation is tracked
-// separately. The adapter is registered so operators can select
-// type=gemini for auth + path while the request body translation lands
-// incrementally. The body is passed through unchanged so an
-// OpenAI-compatible Gemini gateway still works.
-func (geminiAdapter) TransformRequest(body []byte) ([]byte, error) { return body, nil }
+// TransformRequest translates the canonical OpenAI chat-completions
+// request body into the Gemini GenerateContent shape. System messages are
+// hoisted into the top-level system_instruction field; user and assistant
+// messages are converted into Gemini Content arrays with role and parts.
+func (geminiAdapter) TransformRequest(body []byte) ([]byte, error) {
+	var req openAIRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, fmt.Errorf("gemini adapter: parse request: %w", err)
+	}
 
-// NormalizeSSE is a no-op (see TransformRequest note).
-func (geminiAdapter) NormalizeSSE(r io.Reader) io.Reader { return r }
+	out := geminiRequest{}
+	maxTok := req.MaxTokens
+	if maxTok == 0 {
+		maxTok = req.MaxCompletionTokens
+	}
+	if maxTok > 0 || req.Temperature != nil {
+		out.GenerationConfig = &geminiGenerationConfig{}
+		if maxTok > 0 {
+			out.GenerationConfig.MaxOutputTokens = &maxTok
+		}
+		if req.Temperature != nil {
+			out.GenerationConfig.Temperature = req.Temperature
+		}
+	}
+
+	var sysParts []string
+	for _, m := range req.Messages {
+		text := stringContent(m.Content)
+		if strings.EqualFold(m.Role, "system") {
+			if text != "" {
+				sysParts = append(sysParts, text)
+			}
+			continue
+		}
+		role := m.Role
+		if role == "" {
+			role = "user"
+		}
+		out.Contents = append(out.Contents, geminiContent{
+			Role:  role,
+			Parts: []geminiPart{{Text: text}},
+		})
+	}
+	if len(sysParts) > 0 {
+		out.SystemInstruction = &geminiSystemInstruction{
+			Parts: make([]geminiPart, len(sysParts)),
+		}
+		for i, p := range sysParts {
+			out.SystemInstruction.Parts[i] = geminiPart{Text: p}
+		}
+	}
+
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		return nil, fmt.Errorf("gemini adapter: marshal request: %w", err)
+	}
+	return encoded, nil
+}
+
+// geminiSSENormalizer reads Gemini SSE line-by-line and writes OpenAI
+// chat.completion.chunk frames to an internal pipe. Gemini SSE format:
+//
+//	data: {"candidates": [{"content": {"parts": [{"text": "..."}]}}]}
+//	data: {"candidates": [{"finishReason": "STOP"}]}
+func (geminiAdapter) NormalizeSSE(r io.Reader) io.Reader {
+	return &geminiSSENormalizer{
+		source:  bufio.NewReader(r),
+		chunkID: fmt.Sprintf("chatcmpl-nexus-%d", time.Now().UnixNano()),
+		created: time.Now().Unix(),
+	}
+}
+
+// geminiSSENormalizer implements the same pipe-pattern as anthropicSSENormalizer.
+type geminiSSENormalizer struct {
+	source  *bufio.Reader
+	chunkID string
+	created int64
+	model   string
+
+	pr   *io.PipeReader
+	pw   *io.PipeWriter
+	once bool
+}
+
+func (n *geminiSSENormalizer) start() {
+	n.pr, n.pw = io.Pipe()
+	go n.convert()
+}
+
+// Read implements io.Reader. It blocks until the converter goroutine
+// starts the pipe, then streams data as it becomes available.
+func (n *geminiSSENormalizer) Read(p []byte) (int, error) {
+	if !n.once {
+		n.once = true
+		n.start()
+	}
+	return n.pr.Read(p)
+}
+
+// convert reads the Gemini stream and writes OpenAI SSE frames.
+func (n *geminiSSENormalizer) convert() {
+	defer func() { _ = n.pw.Close() }()
+	finishReason := "stop"
+	emitted := false
+	for {
+		line, err := n.source.ReadString('\n')
+		if line != "" {
+			if frame, ok := n.translateLine(line, &finishReason); ok {
+				if _, werr := io.WriteString(n.pw, frame); werr != nil {
+					return
+				}
+				emitted = true
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return
+		}
+	}
+	if emitted {
+		final := n.finalChunk(finishReason)
+		if _, werr := io.WriteString(n.pw, final); werr != nil {
+			return
+		}
+	}
+}
+
+// translateLine converts a single Gemini SSE line to an OpenAI chunk.
+// Returns the OpenAI SSE frame and true if a frame was emitted.
+func (n *geminiSSENormalizer) translateLine(line string, finishReason *string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "data:") {
+		return "", false
+	}
+	trimmed = strings.TrimPrefix(trimmed, "data:")
+	trimmed = strings.TrimSpace(trimmed)
+	if trimmed == "" || trimmed == "[DONE]" {
+		return "", false
+	}
+
+	// Try to extract text delta.
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		return "", false
+	}
+
+	// Check for finishReason.
+	if candidates, ok := raw["candidates"].([]any); ok && len(candidates) > 0 {
+		if cand, ok := candidates[0].(map[string]any); ok {
+			if fr, ok := cand["finishReason"].(string); ok {
+				*finishReason = n.mapFinishReason(fr)
+			}
+			// Extract text from content.parts[0].text
+			if content, ok := cand["content"].(map[string]any); ok {
+				if parts, ok := content["parts"].([]any); ok && len(parts) > 0 {
+					if part, ok := parts[0].(map[string]any); ok {
+						if text, ok := part["text"].(string); ok && text != "" {
+							chunk := n.textChunk(text)
+							return chunk, true
+						}
+					}
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+// mapFinishReason converts Gemini finish reasons to OpenAI finish_reasons.
+func (n *geminiSSENormalizer) mapFinishReason(fr string) string {
+	switch fr {
+	case "STOP":
+		return "stop"
+	case "MAX_TOKENS":
+		return "length"
+	case "SAFETY", "RECITATION", "BLOCKLIST":
+		return "content_filter"
+	default:
+		return "stop"
+	}
+}
+
+// textChunk emits an OpenAI chat.completion.chunk SSE frame with text content.
+func (n *geminiSSENormalizer) textChunk(text string) string {
+	frame := map[string]any{
+		"id":      n.chunkID,
+		"object":  "chat.completion.chunk",
+		"created": n.created,
+		"model":   n.model,
+		"choices": []map[string]any{{
+			"index":         0,
+			"delta":         map[string]any{"content": text},
+			"finish_reason": nil,
+		}},
+	}
+	data, _ := json.Marshal(frame)
+	return fmt.Sprintf("data: %s\n\n", string(data))
+}
+
+// finalChunk emits the terminating OpenAI SSE frame with finish_reason.
+func (n *geminiSSENormalizer) finalChunk(finishReason string) string {
+	frame := map[string]any{
+		"id":      n.chunkID,
+		"object":  "chat.completion.chunk",
+		"created": n.created,
+		"model":   n.model,
+		"choices": []map[string]any{{
+			"index":         0,
+			"delta":         map[string]any{},
+			"finish_reason": finishReason,
+		}},
+	}
+	data, _ := json.Marshal(frame)
+	return fmt.Sprintf("data: %s\n\ndata: [DONE]\n\n", string(data))
+}
