@@ -17,7 +17,8 @@ make test           # unit tests
 make test-race      # race detector — required to merge
 make lint           # golangci-lint v2.12.2
 make fmt            # gofmt -w (in place)
-make bench-baseline # regenerate bench/baseline.txt for benchstat (issue #1186)
+make check          # build + boot-time diagnostics (nexus check --json)
+make bench-baseline # regenerate bench/baseline.txt (-count=10 -benchtime=100ms; issue #1186)
 make ci             # vet + build + check + test + test-race + lint + bench-short
 ```
 
@@ -573,7 +574,7 @@ gitleaks will block the PR.
   issue in the subject (e.g. `feat: resolve #123 — …`)
 - **PR body must link the issue** with `Fixes #N` / `Closes #N` /
   `Resolves #N`. Run `scripts/check_pr_closing_refs.sh <PR_NUMBER> <EXPECTED_COUNT>`
-  to verify the link count is exact before merging.
+  to verify the link count is exact before merging (e.g. `scripts/check_pr_closing_refs.sh 42 1`).
 
 ## Logging
 
@@ -609,6 +610,12 @@ function.
 on staged `.go` files and fails the commit if any need formatting. The hook
 lives in `.githooks/pre-commit`; `make install-hooks` sets `git
 core.hooksPath` to point at it.
+
+**`make check`** — builds `./bin/nexus` then runs the boot-time diagnostic
+suite (`nexus check --json`). Network-dependent checks (Ollama, frontier) skip
+rather than fail when services are absent, so this is safe to run in CI
+without external deps. Equivalent to running `./bin/nexus check` after a
+prior `make build`.
 
 **Fuzz tests** (issue #1161): Go native fuzz targets run in CI (`fuzz` job,
 non-blocking). Three targets: `FuzzSerializeToTOON` (`internal/middleware`),
