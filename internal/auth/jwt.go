@@ -29,6 +29,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -106,6 +107,13 @@ type JWTAuthenticator struct {
 func NewJWTAuthenticator(cfg JWKSConfig) (*JWTAuthenticator, error) {
 	if cfg.JWKSURL == "" {
 		return nil, errors.New("jwt: JWKSURL is required")
+	}
+	u, err := url.Parse(cfg.JWKSURL)
+	if err != nil {
+		return nil, fmt.Errorf("jwt: parse JWKS URL: %w", err)
+	}
+	if u.Scheme != "https" {
+		return nil, errors.New("jwt: JWKS URL must use https scheme")
 	}
 	if cfg.RefreshInterval <= 0 {
 		cfg.RefreshInterval = DefaultJWKSRefreshInterval
