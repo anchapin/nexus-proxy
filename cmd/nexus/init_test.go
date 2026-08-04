@@ -490,3 +490,67 @@ func TestProbeOllama_ParseError(t *testing.T) {
 		t.Errorf("stdout should contain [WARN] for parse failure, got: %s", stdout.String())
 	}
 }
+
+// TestInitNonInteractiveIncludesExamplesDir verifies that --non-interactive
+// mode writes NEXUS_EXAMPLES_DIR to the .env file.
+func TestInitNonInteractiveIncludesExamplesDir(t *testing.T) {
+	t.Setenv("NEXUS_INIT_VERIFY_MODELS", "false")
+	t.Setenv("NEXUS_EXAMPLES_DIR", "/custom/examples")
+
+	code, _, stderr := runInitInDir(t, []string{"--non-interactive"}, "", nil)
+	if code != 0 {
+		t.Fatalf("exit %d, stderr=%s", code, stderr)
+	}
+	data, err := os.ReadFile(".env")
+	if err != nil {
+		t.Fatalf("read .env: %v", err)
+	}
+	body := string(data)
+	if !strings.Contains(body, "NEXUS_EXAMPLES_DIR=/custom/examples") {
+		t.Errorf(".env should contain NEXUS_EXAMPLES_DIR=/custom/examples, got: %s", body)
+	}
+}
+
+// TestInitNonInteractiveExamplesDirDefault verifies that when
+// NEXUS_EXAMPLES_DIR is not set, the non-interactive path writes the
+// default ./few_shot_examples.
+func TestInitNonInteractiveExamplesDirDefault(t *testing.T) {
+	t.Setenv("NEXUS_INIT_VERIFY_MODELS", "false")
+	t.Setenv("NEXUS_EXAMPLES_DIR", "") // ensure unset
+
+	code, _, stderr := runInitInDir(t, []string{"--non-interactive"}, "", nil)
+	if code != 0 {
+		t.Fatalf("exit %d, stderr=%s", code, stderr)
+	}
+	data, err := os.ReadFile(".env")
+	if err != nil {
+		t.Fatalf("read .env: %v", err)
+	}
+	body := string(data)
+	if !strings.Contains(body, "NEXUS_EXAMPLES_DIR=./few_shot_examples") {
+		t.Errorf(".env should contain NEXUS_EXAMPLES_DIR=./few_shot_examples, got: %s", body)
+	}
+}
+
+// TestInitNonInteractiveYAMLIncludesExamplesDir verifies that when
+// NEXUS_CONFIG_FILE points to a .yaml path, the wizard writes
+// examples_dir to config.yaml (non-interactive).
+func TestInitNonInteractiveYAMLIncludesExamplesDir(t *testing.T) {
+	t.Setenv("NEXUS_CONFIG_FILE", "config.yaml")
+	t.Setenv("NEXUS_INIT_PROFILE", "frontier-default")
+	t.Setenv("NEXUS_EXAMPLES_DIR", "/custom/rag")
+	t.Setenv("NEXUS_INIT_VERIFY_MODELS", "false")
+
+	code, _, stderr := runInitInDir(t, []string{"--non-interactive"}, "", nil)
+	if code != 0 {
+		t.Fatalf("exit %d, stderr=%s", code, stderr)
+	}
+	data, err := os.ReadFile("config.yaml")
+	if err != nil {
+		t.Fatalf("read config.yaml: %v", err)
+	}
+	body := string(data)
+	if !strings.Contains(body, `examples_dir: "/custom/rag"`) {
+		t.Errorf("config.yaml should contain examples_dir, got: %s", body)
+	}
+}

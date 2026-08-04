@@ -70,6 +70,10 @@ func writeEnvConfig(path string, ans initAnswers) error {
 	}
 	b.WriteString("\n")
 
+	b.WriteString("# --- RAG -------------------------------------------------------------------\n")
+	fmt.Fprintf(&b, "NEXUS_EXAMPLES_DIR=%s\n", ans.ExamplesDir)
+	b.WriteString("\n")
+
 	return os.WriteFile(path, []byte(b.String()), 0o600)
 }
 
@@ -105,6 +109,10 @@ func writeYAMLConfig(path string, ans initAnswers) error {
 			fmt.Fprintf(&b, "%s: %s\n", yamlKey, val)
 		}
 	}
+	b.WriteString("\n")
+
+	b.WriteString("# --- RAG -------------------------------------------------------------------\n")
+	fmt.Fprintf(&b, "examples_dir: %q\n", ans.ExamplesDir)
 	b.WriteString("\n")
 
 	return os.WriteFile(path, []byte(b.String()), 0o644)
