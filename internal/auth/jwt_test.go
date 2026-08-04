@@ -3,12 +3,14 @@ package auth
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,8 +31,8 @@ type jwksTestEnv struct {
 }
 
 // newJWTCTestEnv creates a test JWKS server backed by a freshly generated
-// 2048-bit RSA key. The server serves the key set as JSON. A JWTAuthenticator
-// is constructed against the server URL and returned ready for use.
+// 2048-bit RSA key. The server serves the key set as JSON over HTTPS.
+// A JWTAuthenticator is constructed against the server URL and returned ready for use.
 func newJWTCTestEnv(t *testing.T, issuer, audience string) *jwksTestEnv {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -61,14 +63,21 @@ func newJWTCTestEnv(t *testing.T, issuer, audience string) *jwksTestEnv {
 		w.Write(env.keySet)
 	})
 
-	env.server = httptest.NewServer(mux)
+	env.server = httptest.NewTLSServer(mux)
 	t.Cleanup(env.server.Close)
+
+	tlsClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
 
 	auth, err := NewJWTAuthenticator(JWKSConfig{
 		JWKSURL:         env.server.URL + "/.well-known/jwks.json",
 		Issuer:          issuer,
 		Audience:        audience,
 		RefreshInterval: 1 * time.Hour,
+		HTTPClient:      tlsClient,
 	})
 	if err != nil {
 		t.Fatalf("NewJWTAuthenticator: %v", err)
@@ -252,14 +261,17 @@ func TestJWTRejectsAlgNone(t *testing.T) {
 }
 
 func TestJWTFailClosedOnFetchError(t *testing.T) {
-	// JWKS server that returns 500.
-	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	broken := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer broken.Close()
 
+	tlsClient := &http.Client{
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+	}
 	_, err := NewJWTAuthenticator(JWKSConfig{
-		JWKSURL: broken.URL + "/keys",
+		JWKSURL:    broken.URL + "/keys",
+		HTTPClient: tlsClient,
 	})
 	if err == nil {
 		t.Error("expected boot failure when JWKS is unreachable, got nil")
@@ -267,14 +279,18 @@ func TestJWTFailClosedOnFetchError(t *testing.T) {
 }
 
 func TestJWTFailClosedOnEmptyKeySet(t *testing.T) {
-	empty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	empty := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"keys":[]}`))
 	}))
 	defer empty.Close()
 
+	tlsClient := &http.Client{
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+	}
 	_, err := NewJWTAuthenticator(JWKSConfig{
-		JWKSURL: empty.URL + "/keys",
+		JWKSURL:    empty.URL + "/keys",
+		HTTPClient: tlsClient,
 	})
 	if err == nil {
 		t.Error("expected boot failure when JWKS is empty, got nil")
@@ -299,6 +315,30 @@ func TestJWTRequiresJWKSURL(t *testing.T) {
 	_, err := NewJWTAuthenticator(JWKSConfig{})
 	if err == nil {
 		t.Error("expected error when JWKSURL is empty, got nil")
+	}
+}
+
+func TestJWTRejectsHTTPURL(t *testing.T) {
+	_, err := NewJWTAuthenticator(JWKSConfig{
+		JWKSURL: "http://example.com/keys",
+	})
+	if err == nil {
+		t.Error("expected error when JWKSURL uses http, got nil")
+	}
+	if !strings.Contains(err.Error(), "https") {
+		t.Errorf("expected error to mention https, got: %v", err)
+	}
+}
+
+func TestJWTRejectsFileURL(t *testing.T) {
+	_, err := NewJWTAuthenticator(JWKSConfig{
+		JWKSURL: "file:///etc/passwd",
+	})
+	if err == nil {
+		t.Error("expected error when JWKSURL uses file scheme, got nil")
+	}
+	if !strings.Contains(err.Error(), "https") {
+		t.Errorf("expected error to mention https, got: %v", err)
 	}
 }
 
