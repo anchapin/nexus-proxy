@@ -63,7 +63,7 @@ type serverParts struct {
 // It returns the server, parts for signal handling, a cleanup function
 // (which must be called on shutdown to release resources), and any
 // boot error. The cleanup function closes resources in reverse order.
-func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverParts, func(), error) {
+func buildServer(cfg config.Config, startTime time.Time, guardedHTTPClient *http.Client) (*http.Server, *serverParts, func(), error) {
 	parts := &serverParts{}
 
 	// Configure the response-body buffer pool retention cap (issue #1177).
@@ -120,7 +120,14 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		}
 	})
 
-	httpClient, egressGuard := transport.NewFromEnv()
+	var httpClient *http.Client
+	var egressGuard *transport.EgressGuard
+	if guardedHTTPClient != nil {
+		httpClient = guardedHTTPClient
+		_, egressGuard = transport.NewFromEnv()
+	} else {
+		httpClient, egressGuard = transport.NewFromEnv()
+	}
 
 	emb, err := rag.NewEmbedder(cfg.EmbedderType, cfg.EmbedderBaseURL, cfg.EmbeddingModel, cfg.FrontierKey, httpClient,
 		rag.BreakerConfig{Threshold: cfg.RAGCircuitBreakerThreshold, Cooldown: cfg.RAGCircuitBreakerCooldown})

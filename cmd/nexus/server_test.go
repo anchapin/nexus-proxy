@@ -50,7 +50,7 @@ func buildTestServerFromCfg(t *testing.T) (*http.Server, *serverParts, func()) {
 	if err != nil {
 		t.Fatalf("config.Load: %v", err)
 	}
-	srv, parts, cleanup, err := buildServer(cfg, time.Now())
+	srv, parts, cleanup, err := buildServer(cfg, time.Now(), nil)
 	if err != nil {
 		t.Fatalf("buildServer: %v", err)
 	}
