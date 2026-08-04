@@ -363,6 +363,84 @@ func TestEgressGuardIntegrationRedirectAllowed(t *testing.T) {
 	}
 }
 
+func TestEgressGuardGauges(t *testing.T) {
+	g := NewEgressGuard(true, nil)
+
+	samples := g.Gauges()
+	if len(samples) != 2 {
+		t.Fatalf("expected 2 samples, got %d", len(samples))
+	}
+
+	redirectSeen, dialSeen := false, false
+	for _, s := range samples {
+		if s.Name != "nexus_egress_blocked_total" {
+			t.Errorf("expected name nexus_egress_blocked_total, got %s", s.Name)
+		}
+		reason, ok := s.Labels["reason"]
+		if !ok {
+			t.Error("expected labels to have 'reason' key")
+		}
+		if reason == "redirect" {
+			redirectSeen = true
+			if s.Value != 0 {
+				t.Errorf("expected redirect count=0 initially, got %f", s.Value)
+			}
+		} else if reason == "dial" {
+			dialSeen = true
+			if s.Value != 0 {
+				t.Errorf("expected dial count=0 initially, got %f", s.Value)
+			}
+		} else {
+			t.Errorf("unexpected reason label value: %s", reason)
+		}
+	}
+	if !redirectSeen {
+		t.Error("expected redirect sample")
+	}
+	if !dialSeen {
+		t.Error("expected dial sample")
+	}
+}
+
+func TestEgressGuardGaugesAfterBlocks(t *testing.T) {
+	g := NewEgressGuard(true, nil)
+
+	g.DialControl(context.Background(), "tcp4", "10.0.0.1:11434")
+	g.DialControl(context.Background(), "tcp4", "192.168.1.1:8080")
+	g.CheckRedirect(mustParseReq(t, "GET", "http://169.254.169.254/"), []*http.Request{})
+
+	samples := g.Gauges()
+	redirectCount, dialCount := 0.0, 0.0
+	for _, s := range samples {
+		if s.Name != "nexus_egress_blocked_total" {
+			continue
+		}
+		reason, ok := s.Labels["reason"]
+		if !ok {
+			continue
+		}
+		if reason == "redirect" {
+			redirectCount = s.Value
+		} else if reason == "dial" {
+			dialCount = s.Value
+		}
+	}
+	if redirectCount != 1 {
+		t.Errorf("expected redirect count=1, got %f", redirectCount)
+	}
+	if dialCount != 2 {
+		t.Errorf("expected dial count=2, got %f", dialCount)
+	}
+}
+
+func TestEgressGuardGaugesNil(t *testing.T) {
+	var g *EgressGuard
+	samples := g.Gauges()
+	if samples != nil {
+		t.Errorf("expected nil gauges for nil guard, got %v", samples)
+	}
+}
+
 // mustParseReq is a test helper that creates an *http.Request for the
 // given method and URL, panicking on bad URLs.
 func mustParseReq(t *testing.T, method, raw string) *http.Request {

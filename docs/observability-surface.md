@@ -43,11 +43,12 @@ snake_case naming.
 | `nexus_fusion_client_abort_total` | counter | *(none)* | 1 | `prometheus.go` (issue #1046) |
 | `nexus_frontier_probe_total` | counter | `provider`, `result` | 2 × N providers | `collector.go` (issue #1158) |
 | `nexus_frontier_circuit_open_total` | counter | `provider` | N providers | `collector.go` (issue #1158) |
+| `nexus_egress_blocked_total` | counter | `reason` | 2 (`redirect`, `dial`) | `egressguard.go` (issue #1363) |
 | `nexus_rate_limit_bucket_utilization` | histogram | `bucket_id` | dynamic (≤ concurrent client IPs) | `prometheus.go` (issue #746) |
 | `nexus_build_info` | gauge | `version`, `commit`, `go_version` | 1 | `prometheus.go` (issue #529) |
 | `nexus_slo_error_budget_remaining` | gauge | `slo` | 3 (`availability`, `local_latency_p99`, `ttft_p95`) | `collector.go` (issue #1239) |
 
-**Maximum theoretical series**: 24 + 96 + 8 + 2 + 1 + 2 + 1 + 1 + 4 + 6 + 4 + 1 + 2 + 2 + 1 + 1 + 1 = 161 series.
+**Maximum theoretical series**: 24 + 96 + 8 + 2 + 1 + 2 + 1 + 1 + 4 + 6 + 4 + 1 + 2 + 2 + 1 + 1 + 1 + 2 = 163 series.
 
 > **Note (issue #486):** `nexus_rag_retrieval_total` previously carried
 > a `filename` label whose value was the raw RAG source filename, which

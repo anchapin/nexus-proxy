@@ -145,10 +145,12 @@ func New(cfg Config) *http.Client {
 }
 
 // NewFromEnv reads NEXUS_HTTP_* knobs from the environment and returns
-// a configured *http.Client. It is a convenience wrapper around New
-// for packages that need a client without taking a full Config.
-func NewFromEnv() *http.Client {
-	return New(loadConfigFromEnv())
+// a configured *http.Client alongside its EgressGuard for metrics access.
+// It is a convenience wrapper around New for packages that need a client
+// without taking a full Config.
+func NewFromEnv() (*http.Client, *EgressGuard) {
+	cfg := loadConfigFromEnv()
+	return New(cfg), cfg.EgressGuard
 }
 
 // hasClientCert reports whether ClientCertFile and ClientKeyFile are both set.
