@@ -95,6 +95,7 @@ type initAnswers struct {
 	EmbeddingModel string
 	ProxyAPIKey    string
 	Profile        string
+	ExamplesDir    string
 }
 
 // initWizard bundles the injectable dependencies so runInit can be
@@ -184,6 +185,7 @@ func defaultAnswers() initAnswers {
 		EmbeddingModel: envOrDefault("NEXUS_EMBEDDING_MODEL", "nomic-embed-text"),
 		ProxyAPIKey:    os.Getenv("NEXUS_PROXY_API_KEY"),
 		Profile:        envOrDefault("NEXUS_INIT_PROFILE", profileFusionBalanced),
+		ExamplesDir:    envOrDefault("NEXUS_EXAMPLES_DIR", "./few_shot_examples"),
 	}
 }
 
@@ -292,7 +294,32 @@ func (w *initWizard) runInteractive(ans initAnswers, output string) int {
 	ans.ProxyAPIKey = w.promptSecret("Proxy API key (Enter to disable auth)")
 	fmt.Fprintln(w.stdout)
 
-	// Step 6: Write output.
+	// Step 6: RAG — examples directory.
+	fmt.Fprintln(w.stdout, "Step 6: RAG examples directory")
+	fmt.Fprintln(w.stdout, "----------------------------")
+	cwd, _ := os.Getwd()
+	fmt.Fprintln(w.stdout, "  Code snippets in this directory are injected into prompts via")
+	fmt.Fprintln(w.stdout, "  retrieval-augmented generation (RAG). The directory is scanned")
+	fmt.Fprintln(w.stdout, "  recursively; each file becomes a candidate for few-shot injection.")
+	fmt.Fprintln(w.stdout)
+	ans.ExamplesDir = w.prompt("Examples directory", cwd)
+	if ans.ExamplesDir == "" {
+		ans.ExamplesDir = "./few_shot_examples"
+	}
+	if _, err := os.Stat(ans.ExamplesDir); os.IsNotExist(err) {
+		fmt.Fprintf(w.stdout, "  Directory %q does not exist.\n", ans.ExamplesDir)
+		create := w.prompt("Create it now?", "yes")
+		if strings.TrimSpace(create) == "yes" || strings.TrimSpace(create) == "y" {
+			if err := os.MkdirAll(ans.ExamplesDir, 0o755); err != nil {
+				fmt.Fprintf(w.stderr, "  could not create %s: %v\n", ans.ExamplesDir, err)
+			} else {
+				fmt.Fprintf(w.stdout, "  Created %q\n", ans.ExamplesDir)
+			}
+		}
+	}
+	fmt.Fprintln(w.stdout)
+
+	// Step 7: Write output.
 	path, err := w.resolveOutputPath(output)
 	if err != nil {
 		fmt.Fprintf(w.stderr, "nexus init: %v\n", err)
