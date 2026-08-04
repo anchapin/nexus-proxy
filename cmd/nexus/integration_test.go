@@ -955,7 +955,7 @@ func TestE2E_ProviderAnthropicAdapter(t *testing.T) {
 	t.Setenv("NEXUS_FRONTIER_HEALTH_POLL_INTERVAL", "0")
 
 	ts := e2eTestServer(t)
-	resp := doChat(t, ts, chatRequest("anthropic adapter test prompt", false), "")
+	resp := doChat(t, ts, chatRequest("anthropic adapter test prompt", true), "")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
@@ -1117,7 +1117,7 @@ func TestE2E_RedactionSecretsProfile(t *testing.T) {
 	t.Setenv("NEXUS_REDACT_PROFILE", "secrets")
 
 	ts := e2eTestServer(t)
-	resp := doChat(t, ts, chatRequest("show me my API key", false), "")
+	resp := doChat(t, ts, chatRequest("show me my API key", true), "")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
@@ -1205,7 +1205,7 @@ func TestE2E_RedactionPIIProfile(t *testing.T) {
 	t.Setenv("NEXUS_REDACT_PROFILE", "pii")
 
 	ts := e2eTestServer(t)
-	resp := doChat(t, ts, chatRequest("what card did I use", false), "")
+	resp := doChat(t, ts, chatRequest("what card did I use", true), "")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
