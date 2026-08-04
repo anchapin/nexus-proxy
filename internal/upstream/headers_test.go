@@ -11,6 +11,7 @@ import (
 // TestHeaderAllowed verifies the allowlist logic directly (issue #39):
 // Content-Type and Cache-Control pass; X-Nexus-* passes by prefix;
 // Server, Set-Cookie, Via, and X-RateLimit-* are dropped.
+// Retry-After is forwarded so clients can retry after 429 (issue #1409).
 func TestHeaderAllowed(t *testing.T) {
 	cases := []struct {
 		name string
@@ -18,6 +19,7 @@ func TestHeaderAllowed(t *testing.T) {
 	}{
 		{"Content-Type", true},
 		{"Cache-Control", true},
+		{"Retry-After", true},
 		{"X-Nexus-Degraded", true},
 		{"X-Nexus-Overflow", true},
 		{"X-Nexus-Ratelimit-Remaining", true},
@@ -37,10 +39,12 @@ func TestHeaderAllowed(t *testing.T) {
 
 // TestCopyAllowedHeadersDropsLeaks asserts the helper copies only
 // allowlisted headers and leaves the rest behind (issue #39).
+// Retry-After is included to verify passthrough for 429 responses (issue #1409).
 func TestCopyAllowedHeadersDropsLeaks(t *testing.T) {
 	src := http.Header{
 		"Content-Type":          []string{"text/event-stream"},
 		"Cache-Control":         []string{"no-cache"},
+		"Retry-After":           []string{"30"},
 		"X-Nexus-Degraded":      []string{"true"},
 		"Server":                []string{"cloudfront"},
 		"Set-Cookie":            []string{"session=abc; HttpOnly"},
@@ -55,6 +59,9 @@ func TestCopyAllowedHeadersDropsLeaks(t *testing.T) {
 	}
 	if got := dst.Get("Cache-Control"); got != "no-cache" {
 		t.Errorf("Cache-Control = %q, want no-cache", got)
+	}
+	if got := dst.Get("Retry-After"); got != "30" {
+		t.Errorf("Retry-After = %q, want 30", got)
 	}
 	if got := dst.Get("X-Nexus-Degraded"); got != "true" {
 		t.Errorf("X-Nexus-Degraded = %q, want true", got)
