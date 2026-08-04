@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/ioutils"
+	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
 
 func TestOtelMetricsExporterExportFailureCounter(t *testing.T) {
@@ -483,3 +484,63 @@ type mockTracingExporter struct {
 func (m mockTracingExporter) Dropped() uint64       { return m.dropped }
 func (m mockTracingExporter) FlushFailures() uint64 { return m.flushFailures }
 func (m mockTracingExporter) QueueDepth() int       { return m.queueDepth }
+
+// TestCollectMetricSnapshotIncludesCoalescingFusionDSLCounters verifies that
+// the coalescing, fusion, and DSL-promoted counters added in issue #1414
+// are present in the OTLP CollectMetricSnapshot output.
+func TestCollectMetricSnapshotIncludesCoalescingFusionDSLCounters(t *testing.T) {
+	collector := NewCollector()
+	RegisterCollector(collector)
+
+	rc := NewRouteCounters()
+	RegisterRouteCounters(rc)
+
+	upstream.ResetCoalesceCountersForTest()
+
+	snapshot := CollectMetricSnapshot()
+
+	found := make(map[string]bool)
+	for _, m := range snapshot {
+		found[m.Name] = true
+	}
+
+	// Coalescing counters (issue #1414)
+	if !found["nexus_coalesce_hits_total"] {
+		t.Error("expected nexus_coalesce_hits_total in snapshot")
+	}
+	if !found["nexus_coalesce_misses_total"] {
+		t.Error("expected nexus_coalesce_misses_total in snapshot")
+	}
+
+	// Fusion counters (issue #1414)
+	if !found["nexus_fusion_client_abort_total"] {
+		t.Error("expected nexus_fusion_client_abort_total in snapshot")
+	}
+	if !found["nexus_fusion_jaccard_similarity_total"] {
+		t.Error("expected nexus_fusion_jaccard_similarity_total in snapshot")
+	}
+	if !found["nexus_fusion_semantic_similarity_total"] {
+		t.Error("expected nexus_fusion_semantic_similarity_total in snapshot")
+	}
+	if !found["nexus_panel_panics_total"] {
+		t.Error("expected nexus_panel_panics_total in snapshot")
+	}
+
+	// DSL promoted counter (issue #1414)
+	if !found["nexus_route_dsl_promoted_total"] {
+		t.Error("expected nexus_route_dsl_promoted_total in snapshot")
+	}
+
+	// Verify counter types are correct (all should be MetricTypeCounter)
+	for _, m := range snapshot {
+		switch m.Name {
+		case "nexus_coalesce_hits_total", "nexus_coalesce_misses_total",
+			"nexus_fusion_client_abort_total", "nexus_fusion_jaccard_similarity_total",
+			"nexus_fusion_semantic_similarity_total", "nexus_panel_panics_total",
+			"nexus_route_dsl_promoted_total":
+			if m.Type != MetricTypeCounter {
+				t.Errorf("expected %s to be MetricTypeCounter, got %s", m.Name, m.Type)
+			}
+		}
+	}
+}

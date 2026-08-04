@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/anchapin/nexus-proxy/internal/ioutils"
+	"github.com/anchapin/nexus-proxy/internal/upstream"
 )
 
 // OtelMetricsServiceName is stamped as service.name on every metric
@@ -985,11 +986,29 @@ func CollectMetricSnapshot() []MetricSnapshot {
 			Sum:  float64(routeCountersSlow.QualityQueueOverflow()),
 		})
 
-		// nexus_panel_panics_total
+		// nexus_panel_panics_total (issue #1414 — upstream PanelPanicsTotal
+		// mirrors prometheus.go so both renderers agree on the count)
 		out = append(out, MetricSnapshot{
 			Name: "nexus_panel_panics_total",
 			Type: MetricTypeCounter,
-			Sum:  float64(routeCountersSlow.PanelPanics()),
+			Sum:  float64(upstream.PanelPanicsTotal()),
+		})
+
+		// Fusion counters (issue #1414)
+		out = append(out, MetricSnapshot{
+			Name: "nexus_fusion_client_abort_total",
+			Type: MetricTypeCounter,
+			Sum:  float64(upstream.FusionClientAbortTotal()),
+		})
+		out = append(out, MetricSnapshot{
+			Name: "nexus_fusion_jaccard_similarity_total",
+			Type: MetricTypeCounter,
+			Sum:  float64(upstream.JaccardSimilarityTotal()),
+		})
+		out = append(out, MetricSnapshot{
+			Name: "nexus_fusion_semantic_similarity_total",
+			Type: MetricTypeCounter,
+			Sum:  float64(upstream.SemanticSimilarityTotal()),
 		})
 
 		// nexus_prompt_injection_hits_total{mode}
@@ -1043,6 +1062,13 @@ func CollectMetricSnapshot() []MetricSnapshot {
 			Sum:  float64(routeCountersSlow.DSLMisses()),
 		})
 
+		// nexus_route_dsl_promoted_total (issue #1414)
+		out = append(out, MetricSnapshot{
+			Name: "nexus_route_dsl_promoted_total",
+			Type: MetricTypeCounter,
+			Sum:  float64(routeCountersSlow.DSLPromoted()),
+		})
+
 		// nexus_redacted_total{profile}
 		for profile, cnt := range routeCountersSlow.RedactedSnapshot() {
 			out = append(out, MetricSnapshot{
@@ -1059,6 +1085,20 @@ func CollectMetricSnapshot() []MetricSnapshot {
 		Name: "nexus_upstream_response_truncated_total",
 		Type: MetricTypeCounter,
 		Sum:  float64(collectorSlow.TruncatedTotal()),
+	})
+
+	// Coalescing counters (issue #1414). These track request deduplication
+	// via singleflight or TTL cache — hits are served from cache/dedup;
+	// misses execute the full upstream call.
+	out = append(out, MetricSnapshot{
+		Name: "nexus_coalesce_hits_total",
+		Type: MetricTypeCounter,
+		Sum:  float64(upstream.CoalesceHitsTotal()),
+	})
+	out = append(out, MetricSnapshot{
+		Name: "nexus_coalesce_misses_total",
+		Type: MetricTypeCounter,
+		Sum:  float64(upstream.CoalesceMissesTotal()),
 	})
 
 	// OTLP metrics export self-monitoring (issue #1313)
