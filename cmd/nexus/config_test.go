@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/anchapin/nexus-proxy/internal/config"
 )
 
 func TestRunConfigValidate(t *testing.T) {
@@ -239,5 +241,76 @@ func TestRunConfigMigrateHelpShownInUsage(t *testing.T) {
 	out := stdout.String() + stderr.String()
 	if !strings.Contains(out, "migrate") {
 		t.Errorf("usage should document migrate subcommand:\n%s", out)
+	}
+}
+
+func TestDiffFields_UnknownYAMLKey(t *testing.T) {
+	knownField := config.ConfigField{
+		Key:    "NEXUS_ADDR",
+		Value:  "localhost:8080",
+		Source: "env",
+	}
+	unknownField := config.ConfigField{
+		Key:    "NEXUS_UNKNOWN_FIELD",
+		Value:  "some-value",
+		Source: "env",
+	}
+
+	diffFileCfg := map[string]string{
+		"addr": "localhost:9090",
+	}
+
+	got := diffFields([]config.ConfigField{knownField, unknownField}, diffFileCfg)
+
+	if len(got) != 2 {
+		t.Fatalf("diffFields returned %d fields, want 2", len(got))
+	}
+
+	if got[0].Key != "NEXUS_ADDR" {
+		t.Errorf("first field key = %q, want NEXUS_ADDR", got[0].Key)
+	}
+	if got[0].Source != "env" {
+		t.Errorf("first field source = %q, want env", got[0].Source)
+	}
+
+	if got[1].Key != "NEXUS_UNKNOWN_FIELD" {
+		t.Errorf("second field key = %q, want NEXUS_UNKNOWN_FIELD", got[1].Key)
+	}
+	if got[1].Source != "<env-only>" {
+		t.Errorf("second field source = %q, want <env-only>", got[1].Source)
+	}
+}
+
+func TestDiffFields_KnownYAMLKeyMatching(t *testing.T) {
+	field := config.ConfigField{
+		Key:    "NEXUS_ADDR",
+		Value:  "localhost:8080",
+		Source: "env",
+	}
+
+	diffFileCfg := map[string]string{
+		"addr": "localhost:8080",
+	}
+
+	got := diffFields([]config.ConfigField{field}, diffFileCfg)
+
+	if len(got) != 0 {
+		t.Errorf("diffFields returned %d fields, want 0 (values match)", len(got))
+	}
+}
+
+func TestDiffFields_KnownYAMLKeyNotInDiffFile(t *testing.T) {
+	field := config.ConfigField{
+		Key:    "NEXUS_ADDR",
+		Value:  "localhost:8080",
+		Source: "default",
+	}
+
+	diffFileCfg := map[string]string{}
+
+	got := diffFields([]config.ConfigField{field}, diffFileCfg)
+
+	if len(got) != 0 {
+		t.Errorf("diffFields returned %d fields, want 0 (key not in diff file)", len(got))
 	}
 }

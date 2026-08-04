@@ -26,7 +26,7 @@ const configUsage = `nexus config — configuration file operations.
 Usage:
   nexus config validate <file>
   nexus config migrate <file>
-  nexus config show [flags]
+  nexus config show [--diff <file>] [flags]
 
 Commands:
   validate <file>   Parse and validate a YAML config file, then print a
@@ -294,11 +294,16 @@ func configFilePath() string {
 
 // diffFields returns only the fields whose resolved value differs from the
 // corresponding value in the diff file (map[string]string from LoadFile).
+// Fields with no EnvToYAMLKey mapping are included with Source "<env-only>".
 func diffFields(fields []config.ConfigField, diffFileCfg map[string]string) []config.ConfigField {
 	var out []config.ConfigField
 	for _, f := range fields {
 		yamlKey := config.EnvToYAMLKey[f.Key]
 		if yamlKey == "" {
+			// No YAML key mapping — include with "<env-only>" source so the
+			// operator can see the discrepancy instead of silent omission.
+			f.Source = "<env-only>"
+			out = append(out, f)
 			continue
 		}
 		diffVal, ok := diffFileCfg[yamlKey]
