@@ -3,14 +3,15 @@ package observability
 import (
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func TestOtelMetricsExporterExportFailureCounter(t *testing.T) {
-	var requestCount int
+	var requestCount atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
+		requestCount.Add(1)
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer server.Close()
@@ -42,7 +43,7 @@ func TestOtelMetricsExporterExportFailureCounter(t *testing.T) {
 	if afterFailures <= 0 {
 		t.Errorf("expected export failures to be > 0 after failed export, got %d", afterFailures)
 	}
-	if requestCount == 0 {
+	if requestCount.Load() == 0 {
 		t.Error("expected at least one request to the test server")
 	}
 }
@@ -82,9 +83,9 @@ func TestOtelMetricsExporterExportFailureCounterOnClose(t *testing.T) {
 }
 
 func TestOtelMetricsExporterExportSuccessNoCounterIncrement(t *testing.T) {
-	requestCount := 0
+	var requestCount atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
+		requestCount.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
@@ -111,15 +112,15 @@ func TestOtelMetricsExporterExportSuccessNoCounterIncrement(t *testing.T) {
 	if afterSuccess != 0 {
 		t.Errorf("expected 0 failures after successful export, got %d", afterSuccess)
 	}
-	if requestCount == 0 {
+	if requestCount.Load() == 0 {
 		t.Error("expected at least one request to the test server")
 	}
 }
 
 func TestOtelMetricsExporterExportFailureIncrementsByOne(t *testing.T) {
-	failCount := 0
+	var failCount atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		failCount++
+		failCount.Add(1)
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer server.Close()
@@ -146,7 +147,7 @@ func TestOtelMetricsExporterExportFailureIncrementsByOne(t *testing.T) {
 	if failures == 0 {
 		t.Fatal("expected export failures to be incremented")
 	}
-	if failCount == 0 {
+	if failCount.Load() == 0 {
 		t.Fatal("expected server to have received requests")
 	}
 }
