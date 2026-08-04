@@ -161,11 +161,14 @@ Steps:
       AFTER worktree removal (see step 2d below) to avoid:
       "error: cannot delete branch 'fix/issue-N' used by worktree at '../worktrees/issue-N'"
 
-      NOTE: The --admin flag bypasses branch protection (e.g., when required_approving_review_count
-      was temporarily set to 0). However, --admin merges also bypass GitHub's auto-close
-      processing — the `Closes #N` / `Fixes #N` keywords in the PR body are NOT processed
-      by GitHub when --admin is used. Issues linked in the PR body will remain OPEN after
-      the merge unless we close them explicitly (issue #1358).
+       NOTE: The --admin flag bypasses branch protection that has already been configured.
+       For solo maintainers, branch protection must be set to `required_approving_review_count: 0`
+       BEFORE wave orchestration begins (see SKILL.md › Branch protection requirements, issue #1356).
+       The orchestrator does NOT dynamically modify branch protection as part of the merge workflow.
+
+       However, --admin merges bypass GitHub's auto-close processing — the `Closes #N` / `Fixes #N`
+       keywords in the PR body are NOT processed by GitHub when --admin is used. Issues linked in
+       the PR body will remain OPEN after the merge unless we close them explicitly (issue #1358).
 
       Then verify the merge persisted:
       ```

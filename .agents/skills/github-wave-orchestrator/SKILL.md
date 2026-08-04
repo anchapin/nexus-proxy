@@ -45,6 +45,29 @@ done
 
 If any check fails, stop and report to the user.
 
+**Branch protection requirements (issue #1356):**
+
+The wave orchestrator uses `gh pr merge --admin` to bypass branch protection.
+For solo maintainers or repos where `required_approving_review_count > 0` and
+no collaborators are available to review, the following branch protection
+settings MUST be adjusted BEFORE wave orchestration begins:
+
+```bash
+# Verify current branch protection on the target branch (typically main)
+gh api repos/{owner}/{repo}/branches/main/protection --jq '.required_approving_review_count,.require_last_push_approval'
+```
+
+If `required_approving_review_count > 0` and no collaborators can provide reviews,
+set it to 0 before running wave orchestration. This is an operational security
+policy change that should be intentional and persistent — the orchestrator does
+NOT dynamically modify branch protection as part of the merge workflow.
+
+**The orchestrator will FAIL to merge PRs to protected branches when:**
+- `required_approving_review_count: 1` (or higher) and no other collaborators can review
+- `require_last_push_approval: true` and the PR author is the only collaborator
+
+Adjust branch protection in GitHub → Settings → Branches before starting wave orchestration.
+
 ## Phase 1: Discovery
 
 ```bash
