@@ -1980,6 +1980,17 @@ func Chat(d Deps) http.Handler {
 				// Budget guard: record after successful fusion frontier leg (issue #220).
 				d.SpendGuard.Record(r.Context(), frontierCost, "frontier")
 			}
+			// Issue #1162 + #1403: submit fusion arbiter synthesis to the judge
+			// observer so it can be sampled and scored against the baseline.
+			if d.JudgeObserver != nil && fusionArbiterSynthesis != "" {
+				d.JudgeObserver.Submit(LocalCompletion{
+					RequestID:   reqID,
+					Instruction: latestPrompt,
+					Output:      fusionArbiterSynthesis,
+					LocalModel:  d.Config.FrontierModel,
+					Route:       string(route),
+				})
+			}
 			model = d.Config.FrontierModel
 			if rootSpan, ok := tracing.RootSpanFromContext(r.Context()); ok {
 				rootSpan.SetAttr("ai.model", model)
