@@ -323,6 +323,11 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Remaining error budget fraction (0..1) for the named SLO (issue #1239). 1 = full budget, 0 = exhausted. Label slo is one of: availability, local_latency_p99, ttft_p95.",
 		typ:  "gauge",
 	},
+	// Egress blocked counter (issue #1363).
+	"nexus_egress_blocked_total": {
+		help: "Total outbound requests blocked by the SSRF egress guard (issue #1363). Label reason is one of: redirect, dial.",
+		typ:  "counter",
+	},
 }
 
 // RenderPrometheus writes the full /metrics body in Prometheus

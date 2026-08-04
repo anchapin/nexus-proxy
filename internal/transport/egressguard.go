@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+
+	"github.com/anchapin/nexus-proxy/internal/observability"
 )
 
 // blockedReasons are the label values for the nexus_egress_blocked_total
@@ -52,6 +54,11 @@ type EgressGuard struct {
 	// but the counter itself is a single scalar — callers that need
 	// per-reason breakdowns should read it alongside their own label.
 	BlockedCount atomic.Int64
+
+	// blockedTotal is a per-reason counter map that backs the
+	// nexus_egress_blocked_total Prometheus counter. Keyed by reason:
+	// "redirect" or "dial".
+	blockedTotal map[string]*atomic.Uint64
 }
 
 // NewEgressGuard constructs an EgressGuard from the operator config.
@@ -60,7 +67,13 @@ type EgressGuard struct {
 // the block list; invalid entries are silently skipped with a warning
 // so a typo cannot prevent the proxy from starting.
 func NewEgressGuard(enabled bool, allowedCIDRs []string) *EgressGuard {
-	g := &EgressGuard{enabled: enabled}
+	g := &EgressGuard{
+		enabled: enabled,
+		blockedTotal: map[string]*atomic.Uint64{
+			reasonRedirect: {},
+			reasonDial:     {},
+		},
+	}
 	for _, cidr := range allowedCIDRs {
 		cidr = strings.TrimSpace(cidr)
 		if cidr == "" {
@@ -97,6 +110,7 @@ func (g *EgressGuard) CheckRedirect(req *http.Request, via []*http.Request) erro
 	}
 	if g.isHostBlocked(host) {
 		g.BlockedCount.Add(1)
+		g.blockedTotal[reasonRedirect].Add(1)
 		slog.Warn("egress guard: blocked redirect to private address",
 			slog.String("host", host),
 			slog.String("url", req.URL.String()),
@@ -127,6 +141,7 @@ func (g *EgressGuard) DialControl(ctx context.Context, network, address string) 
 	}
 	if g.isIPBlocked(ip) {
 		g.BlockedCount.Add(1)
+		g.blockedTotal[reasonDial].Add(1)
 		slog.Warn("egress guard: blocked dial to private address",
 			slog.String("ip", ip.String()),
 			slog.String("port", port),
@@ -217,6 +232,18 @@ func (g *EgressGuard) Enabled() bool { return g.enabled }
 // http.Client.CheckRedirect without a method-value closure.
 func (g *EgressGuard) CheckRedirectFunc() func(*http.Request, []*http.Request) error {
 	return g.CheckRedirect
+}
+
+// Gauges implements observability.GaugeProvider. It returns live blocked
+// attempt counts labelled by reason ("redirect" or "dial").
+func (g *EgressGuard) Gauges() []observability.GaugeSample {
+	if g == nil {
+		return nil
+	}
+	return []observability.GaugeSample{
+		{Name: "nexus_egress_blocked_total", Labels: map[string]string{"reason": reasonRedirect}, Value: float64(g.blockedTotal[reasonRedirect].Load())},
+		{Name: "nexus_egress_blocked_total", Labels: map[string]string{"reason": reasonDial}, Value: float64(g.blockedTotal[reasonDial].Load())},
+	}
 }
 
 // parseAllowedCIDRs splits a comma-separated string into individual CIDR

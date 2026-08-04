@@ -120,7 +120,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		}
 	})
 
-	httpClient := transport.NewFromEnv()
+	httpClient, egressGuard := transport.NewFromEnv()
 
 	emb, err := rag.NewEmbedder(cfg.EmbedderType, cfg.EmbedderBaseURL, cfg.EmbeddingModel, cfg.FrontierKey, httpClient,
 		rag.BreakerConfig{Threshold: cfg.RAGCircuitBreakerThreshold, Cooldown: cfg.RAGCircuitBreakerCooldown})
@@ -856,6 +856,13 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 			return []observability.GaugeSample{
 				{Name: "nexus_rag_document_count", Value: float64(persistentStore.Size())},
 			}
+		}),
+		// Egress blocked counter (issue #1363).
+		observability.GaugeProviderFunc(func() []observability.GaugeSample {
+			if egressGuard == nil {
+				return nil
+			}
+			return egressGuard.Gauges()
 		}),
 	)
 

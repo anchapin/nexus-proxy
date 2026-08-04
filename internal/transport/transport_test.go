@@ -74,7 +74,7 @@ func TestNewFromEnv_Overrides(t *testing.T) {
 	os.Setenv("NEXUS_HTTP_DIAL_CONTEXT_TIMEOUT", "10s")
 	os.Setenv("NEXUS_HTTP_RESPONSE_HEADER_TIMEOUT", "15s")
 
-	client := NewFromEnv()
+	client, _ := NewFromEnv()
 	tr := client.Transport.(*http.Transport)
 
 	if tr.MaxIdleConnsPerHost != 25 {
@@ -102,7 +102,7 @@ func TestNewFromEnv_InvalidValuesFallBackToDefaults(t *testing.T) {
 	os.Setenv("NEXUS_HTTP_MAX_IDLE_CONNS_PER_HOST", "not-an-int")
 	os.Setenv("NEXUS_HTTP_IDLE_CONN_TIMEOUT", "not-a-duration")
 
-	client := NewFromEnv()
+	client, _ := NewFromEnv()
 	tr := client.Transport.(*http.Transport)
 
 	if tr.MaxIdleConnsPerHost != DefaultMaxIdleConnsPerHost {
@@ -357,7 +357,7 @@ func TestNewFromEnv_ReadsEnvVars(t *testing.T) {
 	os.Setenv("NEXUS_HTTP_MAX_IDLE_CONNS_PER_HOST", "200")
 	os.Setenv("NEXUS_HTTP_MAX_CONNS_PER_HOST", "400")
 
-	client := NewFromEnv()
+	client, _ := NewFromEnv()
 	tr := client.Transport.(*http.Transport)
 
 	if tr.MaxIdleConnsPerHost != 200 {
