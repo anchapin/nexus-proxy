@@ -127,9 +127,12 @@ func IsClientAbort(err error) bool {
 // instrumentation headers (X-Nexus-Degraded, X-Nexus-Overflow,
 // X-Nexus-Cascade-Served-By, X-Nexus-RateLimit-*) pass through regardless
 // of which subsystem set them.
+//
+// Retry-After is forwarded so clients know when to retry after a 429 (issue #1409).
 var allowedHeaders = map[string]struct{}{
 	"Content-Type":  {},
 	"Cache-Control": {},
+	"Retry-After":   {},
 }
 
 // headerAllowed reports whether name should be forwarded to the client.
