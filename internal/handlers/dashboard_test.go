@@ -271,13 +271,13 @@ func TestDashboardRAGEnabled(t *testing.T) {
 	store := &fakeJudgeStore{
 		byDay: map[string]judge.RAGQualitySummary{
 			today.Format("2006-01-02"): {
-				JudgeCount:             5,
-				RAGInjectedCount:       3,
-				RAGInjectedScoreSum:    13.0, // scores: 5, 4, 4
-				RAGInjectedScoreCount:  3,
+				JudgeCount:               5,
+				RAGInjectedCount:         3,
+				RAGInjectedScoreSum:      13.0, // scores: 5, 4, 4
+				RAGInjectedScoreCount:    3,
 				RAGInjectedSimilaritySum: 2.73, // similarities: 0.91, 0.92, 0.90
-				NonRAGInjectedCount:   2,
-				NonRAGInjectedScoreSum: 7.0, // scores: 4, 3
+				NonRAGInjectedCount:      2,
+				NonRAGInjectedScoreSum:   7.0, // scores: 4, 3
 				NonRAGInjectedScoreCount: 2,
 			},
 		},
@@ -328,8 +328,8 @@ func TestDashboardJSONRAGQuality(t *testing.T) {
 				RAGInjectedScoreSum:      8.0,
 				RAGInjectedScoreCount:    2,
 				RAGInjectedSimilaritySum: 1.84,
-				NonRAGInjectedCount:     2,
-				NonRAGInjectedScoreSum:  6.0,
+				NonRAGInjectedCount:      2,
+				NonRAGInjectedScoreSum:   6.0,
 				NonRAGInjectedScoreCount: 2,
 			},
 		},

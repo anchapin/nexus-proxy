@@ -422,10 +422,10 @@ func DashboardJSON(deps DashboardDeps) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"range":     rangeKey,
-			"totals":    tot,
-			"days":      rows,
-			"generated": now().UTC().Format(time.RFC3339),
+			"range":       rangeKey,
+			"totals":      tot,
+			"days":        rows,
+			"generated":   now().UTC().Format(time.RFC3339),
 			"rag_quality": rag,
 		})
 	}
