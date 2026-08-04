@@ -61,6 +61,8 @@ const (
 	CategoryArchitecture  = "architecture"
 	CategoryBoilerplate   = "boilerplate"
 	CategoryDocumentation = "documentation"
+	CategoryDevOps        = "devops"
+	CategoryConversation  = "conversation"
 	CategoryOther         = "other"
 )
 
@@ -146,6 +148,17 @@ var categoryKeywords = []struct {
 	{CategoryDocumentation, []string{
 		"docstring", "documentation", "document ", "readme", "comment",
 		"explain", "javadoc", "godoc", "changelog",
+	}},
+	{CategoryDevOps, []string{
+		"kubernetes", "k8s", "docker", "dockerfile", "container",
+		"ci/cd", "github action", "gitlab ci", "jenkins", "helm",
+		"terraform", "ansible", "puppet", "chef", "vault", "argocd",
+		"flux", "istio", "envoy", "ingress", "service mesh",
+		"deploy", "deployment", "rollback", "canary", "blue-green",
+	}},
+	{CategoryConversation, []string{
+		"continue", "keep going", "same topic", "follow up", "previous",
+		"earlier", "as before", "still on", "building on", "extending",
 	}},
 }
 
