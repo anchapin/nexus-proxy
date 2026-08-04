@@ -1033,3 +1033,263 @@ func TestE2E_ProviderGeminiAdapter(t *testing.T) {
 		t.Errorf("x-goog-api-key = %q, want test-gemini-key", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// E2E tests for response redaction pipeline (issue #1418)
+// ---------------------------------------------------------------------------
+
+// startMockFrontierStreamingPEM returns an httptest.Server that responds with
+// a streaming SSE response whose content is split across two SSE data frames.
+// part1 is sent in the first frame (with flush), then part2 is sent before
+// [DONE]. This is used to verify that the redaction rolling buffer does not
+// leak a partial PEM block on chunk boundaries.
+func startMockFrontierStreamingPEM(t *testing.T, stats *mockServerStats, part1, part2 string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stats.inc(r.URL.Path)
+		body, _ := io.ReadAll(r.Body)
+		var parsed map[string]interface{}
+		_ = json.Unmarshal(body, &parsed)
+
+		stream := false
+		if s, ok := parsed["stream"].(bool); ok {
+			stream = s
+		}
+		if !stream {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			resp := map[string]interface{}{
+				"model": "frontier-model",
+				"choices": []map[string]interface{}{
+					{
+						"index":         0,
+						"message":       map[string]interface{}{"role": "assistant", "content": part1 + part2},
+						"finish_reason": "stop",
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		flusher, _ := w.(http.Flusher)
+
+		// Chunk 1 — first half of PEM key; flush immediately so the
+		// redactor's rolling buffer sees -----BEGIN without -----END yet.
+		fmt.Fprintf(w, "data: %s\n\n", mustJSON(map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{"index": 0, "delta": map[string]interface{}{"content": part1}, "finish_reason": nil},
+			},
+		}))
+		if flusher != nil {
+			flusher.Flush()
+		}
+
+		// Chunk 2 — rest of PEM key + stop.
+		fmt.Fprintf(w, "data: %s\n\n", mustJSON(map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{"index": 0, "delta": map[string]interface{}{"content": part2}, "finish_reason": "stop"},
+			},
+		}))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+}
+
+// TestE2E_RedactionSecretsProfile verifies that with NEXUS_REDACT_ENABLED=true
+// and NEXUS_REDACT_PROFILE=secrets, bearer tokens (sk-, ghp_, AKIA*) returned
+// by the frontier upstream are replaced with [REDACTED] in the client response.
+func TestE2E_RedactionSecretsProfile(t *testing.T) {
+	stats := newMockServerStats()
+	ollama := startMockOllama(t, stats, "unused", 0)
+	t.Cleanup(ollama.Close)
+	frontier := startMockFrontier(t, stats, "Your API key is sk-abc12345defghijklmnop and token ghp_abcdefghijklmnopqrstuvwxyz1234567890")
+	t.Cleanup(frontier.Close)
+
+	e2eBaseEnv(t, ollama.URL, frontier.URL)
+	t.Setenv("NEXUS_TOKEN_GUARDRAIL", "1")
+	t.Setenv("NEXUS_REDACT_ENABLED", "true")
+	t.Setenv("NEXUS_REDACT_PROFILE", "secrets")
+
+	ts := e2eTestServer(t)
+	resp := doChat(t, ts, chatRequest("show me my API key", false), "")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	// Tokens must be redacted.
+	if strings.Contains(bodyStr, "sk-abc12345defghijklmnop") {
+		t.Error("sk- token was NOT redacted in response")
+	}
+	if strings.Contains(bodyStr, "ghp_abcdefghijklmnopqrstuvwxyz1234567890") {
+		t.Error("ghp_ token was NOT redacted in response")
+	}
+	// Placeholder must appear.
+	if !strings.Contains(bodyStr, "[REDACTED]") {
+		t.Error("expected [REDACTED] placeholder in response")
+	}
+
+	// nexus_redacted_total metric must increment.
+	respM, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer respM.Body.Close()
+	metricsBody, _ := io.ReadAll(respM.Body)
+	metricsStr := string(metricsBody)
+	if !strings.Contains(metricsStr, `nexus_redacted_total{profile="secrets"}`) {
+		t.Errorf("nexus_redacted_total metric missing or incorrect; got: %s", metricsStr)
+	}
+}
+
+// TestE2E_RedactionDisabledIsNoop verifies that with redaction disabled
+// (default), the same token-bearing frontier response is byte-for-byte
+// identical at the client — proving the feature is truly opt-in.
+func TestE2E_RedactionDisabledIsNoop(t *testing.T) {
+	stats := newMockServerStats()
+	ollama := startMockOllama(t, stats, "unused", 0)
+	t.Cleanup(ollama.Close)
+	frontier := startMockFrontier(t, stats, "secret token sk-abc12345defghijklmnop here")
+	t.Cleanup(frontier.Close)
+
+	e2eBaseEnv(t, ollama.URL, frontier.URL)
+	t.Setenv("NEXUS_TOKEN_GUARDRAIL", "1")
+	// NEXUS_REDACT_ENABLED is NOT set — redaction must be off.
+
+	ts := e2eTestServer(t)
+	resp := doChat(t, ts, chatRequest("show token", false), "")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	// Token must appear verbatim — no redaction.
+	if !strings.Contains(bodyStr, "sk-abc12345defghijklmnop") {
+		t.Error("token was incorrectly redacted even though redaction is disabled")
+	}
+	// No [REDACTED] should appear.
+	if strings.Contains(bodyStr, "[REDACTED]") {
+		t.Error("[REDACTED] appeared in response when redaction is disabled")
+	}
+}
+
+// TestE2E_RedactionPIIProfile verifies that with NEXUS_REDACT_PROFILE=pii,
+// a Luhn-validated credit card number in the upstream response is redacted.
+func TestE2E_RedactionPIIProfile(t *testing.T) {
+	stats := newMockServerStats()
+	ollama := startMockOllama(t, stats, "unused", 0)
+	t.Cleanup(ollama.Close)
+	// 4111111111111111 passes Luhn (Visa test number).
+	frontier := startMockFrontier(t, stats, "Card number is 4111111111111111 and SSN 123-45-6789")
+	t.Cleanup(frontier.Close)
+
+	e2eBaseEnv(t, ollama.URL, frontier.URL)
+	t.Setenv("NEXUS_TOKEN_GUARDRAIL", "1")
+	t.Setenv("NEXUS_REDACT_ENABLED", "true")
+	t.Setenv("NEXUS_REDACT_PROFILE", "pii")
+
+	ts := e2eTestServer(t)
+	resp := doChat(t, ts, chatRequest("what card did I use", false), "")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	// Credit card must be redacted (passes Luhn).
+	if strings.Contains(bodyStr, "4111111111111111") {
+		t.Error("credit card number was NOT redacted")
+	}
+	// SSN must be redacted.
+	if strings.Contains(bodyStr, "123-45-6789") {
+		t.Error("SSN was NOT redacted")
+	}
+	if !strings.Contains(bodyStr, "[REDACTED]") {
+		t.Error("expected [REDACTED] placeholder in response")
+	}
+}
+
+// TestE2E_RedactionStreamingPEMCrossChunk verifies that a PEM private key
+// split across two SSE chunks is not partially leaked on the chunk boundary.
+// The redactor must suppress the first flush until the full PEM block is seen.
+func TestE2E_RedactionStreamingPEMCrossChunk(t *testing.T) {
+	stats := newMockServerStats()
+	ollama := startMockOllama(t, stats, "unused", 0)
+	t.Cleanup(ollama.Close)
+
+	mockFrontier := startMockFrontierStreamingPEM(t, stats,
+		"-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq",
+		"\nhkiG9w0BAQEFAASCAn8wggJ7AgEAAoGBAL\n-----END PRIVATE KEY-----\n")
+	t.Cleanup(mockFrontier.Close)
+
+	e2eBaseEnv(t, ollama.URL, mockFrontier.URL)
+	t.Setenv("NEXUS_TOKEN_GUARDRAIL", "1")
+	t.Setenv("NEXUS_REDACT_ENABLED", "true")
+	t.Setenv("NEXUS_REDACT_PROFILE", "secrets")
+	t.Setenv("NEXUS_REDACT_BUFFER_BYTES", "4096")
+
+	ts := e2eTestServer(t)
+	resp := doChat(t, ts, chatRequest("give me the private key", true), "")
+	defer resp.Body.Close()
+
+	rawBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("got %d, want 200; body: %s", resp.StatusCode, string(rawBody))
+	}
+
+	// SSE lines are newline-separated. Extract content from each data frame.
+	var fullBody string
+	for _, line := range strings.Split(string(rawBody), "\n") {
+		if strings.HasPrefix(line, "data: ") && !strings.Contains(line, "[DONE]") {
+			jsonPart := strings.TrimPrefix(line, "data: ")
+			var chunk map[string]interface{}
+			if err := json.Unmarshal([]byte(jsonPart), &chunk); err == nil {
+				if choices, ok := chunk["choices"].([]interface{}); ok && len(choices) > 0 {
+					if choice, ok := choices[0].(map[string]interface{}); ok {
+						if delta, ok := choice["delta"].(map[string]interface{}); ok {
+							if c, ok := delta["content"].(string); ok {
+								fullBody += c
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// The full PEM key must be redacted.
+	if strings.Contains(fullBody, "MIIEvQIBADANBgkq") || strings.Contains(fullBody, "hkiG9w0BAQEFAASCAn8wggJ7AgEAAoGBAL") {
+		t.Error("PEM key content was NOT redacted in streaming response")
+	}
+	// No partial key material should appear without the full block being complete.
+	// If we see the BEGIN marker but not END, that's a partial leak.
+	if strings.Contains(fullBody, "-----BEGIN PRIVATE KEY-----") && !strings.Contains(fullBody, "-----END PRIVATE KEY-----") {
+		t.Error("partial PEM BEGIN marker leaked without END marker")
+	}
+	// [REDACTED] must appear (the entire PEM block replaced).
+	if !strings.Contains(fullBody, "[REDACTED]") {
+		t.Errorf("expected [REDACTED] placeholder for PEM block in streaming response; fullBody=%q", fullBody)
+	}
+}
