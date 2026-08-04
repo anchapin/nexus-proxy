@@ -34,6 +34,20 @@ IMPORTANT — Silent Failure Prevention:
  1. Read the full issue: gh issue view {NUMBER}
  2. Read the issue comments for additional context: gh issue view {NUMBER} --comments
  3. Analyze what code needs to change
+
+ GUARD — Worktree Verification (mandatory before any git commit):
+ Before running git add -A && git commit, verify you are inside the correct worktree:
+ a. Run: git rev-parse --show-toplevel
+    - If the path does NOT end with "worktrees/issue-{NUMBER}-{slug}", you are in the WRONG directory.
+      Do NOT commit. Stop and report: "ERROR: working directory is {path}, expected {WORKDIR}"
+ b. Run: git worktree list
+    - Confirm your worktree branch is listed and has the correct path
+ c. Run: git branch --show-current
+    - Confirm it matches "fix/issue-{NUMBER}-{slug}"
+ d. Run: git remote -v
+    - Confirm origin points to anchapin/nexus-proxy
+ If any guard check fails, DO NOT proceed with git add/commit. Report the failure.
+
  4. Implement the fix/feature with tests
  5. Run local checks if available (make test-fast, make lint)
  6. Commit: git add -A && git commit -m "{fix|feat}: resolve #{NUMBER} — {brief description}"

@@ -158,33 +158,42 @@ instead of passively waiting for a done signal:
    ```bash
    cd ../worktrees/issue-{N}-{slug}
 
-   # Step A: verify commit existence (safety net — catches silent failure)
-   if ! git log origin/develop..HEAD --oneline | head -1 > /dev/null 2>&1; then
-      echo "RECOVERY: No commits found in worktree. Worktree may be stale."
+    # Step A: verify commit existence (safety net — catches silent failure)
+    if ! git log origin/develop..HEAD --oneline | head -1 > /dev/null 2>&1; then
+       echo "RECOVERY: No commits found in worktree. Worktree may be stale."
 
-      # Preserve uncommitted changes before rebasing (issue #1272)
-      # git rebase discards unstashed changes; stash is safe when clean
-      if [ -n "$(git status --short)" ]; then
-        echo "RECOVERY: Stashing uncommitted changes before rebase."
-        git add -A && git stash push -m "wave-recovery-$(date +%s)"
-      fi
+       # Preserve uncommitted changes before rebasing (issue #1272)
+       # git rebase discards unstashed changes; stash is safe when clean
+       if [ -n "$(git status --short)" ]; then
+         echo "RECOVERY: Stashing uncommitted changes before rebase."
+         git add -A && git stash push -m "wave-recovery-$(date +%s)"
+       fi
 
-      git fetch origin develop
-      if git rebase origin/develop; then
-        echo "RECOVERY: Rebase succeeded."
-      else
-        echo "RECOVERY: Rebase failed, aborting and restoring stashed changes."
-        git rebase --abort 2>/dev/null || true
-      fi
+       git fetch origin develop
+       if git rebase origin/develop; then
+         echo "RECOVERY: Rebase succeeded."
+       else
+         echo "RECOVERY: Rebase failed, aborting and restoring stashed changes."
+         git rebase --abort 2>/dev/null || true
+       fi
 
-      # Restore stashed changes if any
-      if git stash list | grep -q "wave-recovery"; then
-        echo "RECOVERY: Restoring stashed changes."
-        git stash pop || echo "WARNING: stash pop failed — manual intervention may be needed"
-      fi
-   fi
+       # Restore stashed changes if any
+       if git stash list | grep -q "wave-recovery"; then
+         echo "RECOVERY: Restoring stashed changes."
+         git stash pop || echo "WARNING: stash pop failed — manual intervention may be needed"
+       fi
+    fi
 
-   # Step B: check if branch was pushed
+    # Step A2: detect and recover stray commits on origin/develop (issue #1284)
+    STRAY=$(git -C /home/alex/AI/nexus-proxy log --oneline origin/develop | grep "fix/issue-{N}-{slug}" | head -1)
+    if [ -n "$STRAY" ]; then
+      echo "RECOVERY: Found stray commit on origin/develop for issue #{N}. Cherry-picking into worktree."
+      SHA=$(echo "$STRAY" | awk '{print $1}')
+      git cherry-pick $SHA
+      git -C /home/alex/AI/nexus-proxy reset --hard origin/develop
+    fi
+
+    # Step B: check if branch was pushed
    git fetch origin
    if git branch --list origin/fix/issue-{N}-{slug} > /dev/null 2>&1; then
      # Branch exists remotely — PR was not created
