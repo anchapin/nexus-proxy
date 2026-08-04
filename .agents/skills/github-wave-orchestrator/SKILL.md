@@ -403,6 +403,27 @@ Then clean up worktrees:
 git worktree prune && git remote prune origin
 ```
 
+### 4e. Main Checkout Sync (issue #1395)
+
+After each wave completes (all PRs merged or escalated), sync the main checkout
+to keep it current with `origin/develop` before the next wave:
+
+```bash
+cd /home/alex/AI/nexus-proxy
+
+# Verify we are on develop before resetting (safety check — issue #1275)
+if [ "$(git branch --show-current)" != "develop" ]; then
+  echo "WARNING: Main checkout is on '$(git branch --show-current)', not 'develop'." >&2
+  echo "Skipping sync to avoid losing work on a different branch." >&2
+else
+  if git fetch origin develop && git reset --hard origin/develop; then
+    echo "Main checkout synced to origin/develop"
+  else
+    echo "WARNING: Failed to sync main checkout to origin/develop" >&2
+  fi
+fi
+```
+
 ## Phase 5: Next Wave
 
 Repeat Phase 3–4 for the next wave.
