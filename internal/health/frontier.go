@@ -132,8 +132,8 @@ type FrontierHealth struct {
 	states  map[string]*frontierProviderState
 	targets []FrontierProbeTarget
 
-	onProbe   probeCallback
-	onTrip    tripCallback
+	onProbe    probeCallback
+	onTrip     tripCallback
 	onRecovery recoveryCallback
 
 	closeOnce sync.Once
