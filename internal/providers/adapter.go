@@ -199,7 +199,11 @@ func (openAIAdapter) AuthHeaders(apiKey string) http.Header {
 }
 
 func (openAIAdapter) RequestPath(baseURL string) string {
-	return strings.TrimRight(baseURL, "/") + "/v1/chat/completions"
+	baseURL = strings.TrimRight(baseURL, "/")
+	if strings.HasSuffix(baseURL, "/v1/chat/completions") {
+		return baseURL
+	}
+	return baseURL + "/v1/chat/completions"
 }
 
 func (openAIAdapter) TransformRequest(body []byte) ([]byte, error) { return body, nil }

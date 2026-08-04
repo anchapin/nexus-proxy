@@ -2264,15 +2264,12 @@ func Chat(d Deps) http.Handler {
 				frontierKey = aliasTarget.APIKey
 			} else {
 				model = d.Config.FrontierModel
-			}
-			// If providers are configured, use the first one as the frontier
-			// target (issue #1185). Use the adapter to build the correct
-			// request path and auth headers for non-OpenAI providers.
-			if d.Providers != nil && d.Providers.Len() > 0 {
-				p := d.Providers.All()[0]
-				adapter, _ := providers.NewAdapter(p.AdapterType())
-				frontierURL = adapter.RequestPath(strings.TrimRight(p.BaseURL(), "/"))
-				frontierKey = p.APIKey()
+				if d.Providers != nil && d.Providers.Len() > 0 {
+					p := d.Providers.All()[0]
+					adapter, _ := providers.NewAdapter(p.AdapterType())
+					frontierURL = adapter.RequestPath(strings.TrimRight(p.BaseURL(), "/"))
+					frontierKey = p.APIKey()
+				}
 			}
 			// Budget guard: check before frontier dispatch (issue #220).
 			if d.SpendGuard != nil && frontierCost > 0 && d.SpendGuard.Check(r.Context(), frontierCost) {
