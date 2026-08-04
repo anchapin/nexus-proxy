@@ -366,3 +366,120 @@ func TestCollectMetricSnapshotIncludesTruncatedCounter(t *testing.T) {
 		t.Error("expected nexus_upstream_response_truncated_total in snapshot")
 	}
 }
+
+func TestCollectMetricSnapshotIncludesAllSevenMissingMetrics(t *testing.T) {
+	collector := NewCollector()
+	RegisterCollector(collector)
+
+	collector.IncAuthBlocked("missing")
+	collector.IncAuthBlocked("missing")
+	collector.IncAuthBlocked("invalid")
+
+	RegisterTelemetryRecorder(mockTelemetryRecorder{
+		dropped:     10,
+		rotations:   5,
+		writeErrors: 2,
+	})
+
+	RegisterTracingExporter(mockTracingExporter{
+		dropped:        100,
+		flushFailures:  7,
+		queueDepth:     42,
+	})
+
+	snapshot := CollectMetricSnapshot()
+
+	found := make(map[string]bool)
+	for _, m := range snapshot {
+		found[m.Name] = true
+	}
+
+	// Auth limiter blocked (issue #831/#937)
+	if !found["nexus_auth_limiter_blocked_total"] {
+		t.Error("expected nexus_auth_limiter_blocked_total in snapshot")
+	}
+
+	// Telemetry counters (issue #1360)
+	if !found["nexus_telemetry_dropped_total"] {
+		t.Error("expected nexus_telemetry_dropped_total in snapshot")
+	}
+	if !found["nexus_telemetry_rotations_total"] {
+		t.Error("expected nexus_telemetry_rotations_total in snapshot")
+	}
+	if !found["nexus_telemetry_write_errors_total"] {
+		t.Error("expected nexus_telemetry_write_errors_total in snapshot")
+	}
+
+	// Tracing counters and gauge (issue #1360)
+	if !found["nexus_tracing_dropped_total"] {
+		t.Error("expected nexus_tracing_dropped_total in snapshot")
+	}
+	if !found["nexus_tracing_flush_failures_total"] {
+		t.Error("expected nexus_tracing_flush_failures_total in snapshot")
+	}
+	if !found["nexus_tracing_queue_depth"] {
+		t.Error("expected nexus_tracing_queue_depth in snapshot")
+	}
+
+	// Verify specific values
+	for _, m := range snapshot {
+		switch m.Name {
+		case "nexus_auth_limiter_blocked_total":
+			if m.Labels["reason"] == "missing" && m.Sum != 2 {
+				t.Errorf("expected nexus_auth_limiter_blocked_total{reason=missing} = 2, got %v", m.Sum)
+			}
+			if m.Labels["reason"] == "invalid" && m.Sum != 1 {
+				t.Errorf("expected nexus_auth_limiter_blocked_total{reason=invalid} = 1, got %v", m.Sum)
+			}
+		case "nexus_telemetry_dropped_total":
+			if m.Sum != 10 {
+				t.Errorf("expected nexus_telemetry_dropped_total = 10, got %v", m.Sum)
+			}
+		case "nexus_telemetry_rotations_total":
+			if m.Sum != 5 {
+				t.Errorf("expected nexus_telemetry_rotations_total = 5, got %v", m.Sum)
+			}
+		case "nexus_telemetry_write_errors_total":
+			if m.Sum != 2 {
+				t.Errorf("expected nexus_telemetry_write_errors_total = 2, got %v", m.Sum)
+			}
+		case "nexus_tracing_dropped_total":
+			if m.Sum != 100 {
+				t.Errorf("expected nexus_tracing_dropped_total = 100, got %v", m.Sum)
+			}
+		case "nexus_tracing_flush_failures_total":
+			if m.Sum != 7 {
+				t.Errorf("expected nexus_tracing_flush_failures_total = 7, got %v", m.Sum)
+			}
+		case "nexus_tracing_queue_depth":
+			if m.Value != 42 {
+				t.Errorf("expected nexus_tracing_queue_depth = 42, got %v", m.Value)
+			}
+			if m.Type != MetricTypeGauge {
+				t.Errorf("expected nexus_tracing_queue_depth to be a gauge, got %v", m.Type)
+			}
+		}
+	}
+}
+
+// mockTelemetryRecorder implements the extended recorder interface for testing.
+type mockTelemetryRecorder struct {
+	dropped     uint64
+	rotations   uint64
+	writeErrors uint64
+}
+
+func (m mockTelemetryRecorder) Dropped() uint64     { return m.dropped }
+func (m mockTelemetryRecorder) Rotations() uint64   { return m.rotations }
+func (m mockTelemetryRecorder) WriteErrors() uint64 { return m.writeErrors }
+
+// mockTracingExporter implements the extended exporter interface for testing.
+type mockTracingExporter struct {
+	dropped       uint64
+	flushFailures uint64
+	queueDepth    int
+}
+
+func (m mockTracingExporter) Dropped() uint64      { return m.dropped }
+func (m mockTracingExporter) FlushFailures() uint64 { return m.flushFailures }
+func (m mockTracingExporter) QueueDepth() int       { return m.queueDepth }

@@ -1038,6 +1038,55 @@ func CollectMetricSnapshot() []MetricSnapshot {
 		})
 	}
 
+	// Auth limiter blocked counter (issue #831/#937). Keyed by reason:
+	// "missing" (no Authorization header) or "invalid" (malformed key).
+	for reason, cnt := range collectorSlow.authBlockedTotal {
+		out = append(out, MetricSnapshot{
+			Name:   "nexus_auth_limiter_blocked_total",
+			Type:   MetricTypeCounter,
+			Labels: map[string]string{"reason": reason},
+			Sum:    float64(cnt.Load()),
+		})
+	}
+
+	// Telemetry recorder counters (issue #1360). Only emitted when a
+	// recorder is registered (telemetry is optional).
+	dropped, rotations, writeErrors := GlobalTelemetryRecorder()
+	out = append(out, MetricSnapshot{
+		Name: "nexus_telemetry_dropped_total",
+		Type: MetricTypeCounter,
+		Sum:  float64(dropped),
+	})
+	out = append(out, MetricSnapshot{
+		Name: "nexus_telemetry_rotations_total",
+		Type: MetricTypeCounter,
+		Sum:  float64(rotations),
+	})
+	out = append(out, MetricSnapshot{
+		Name: "nexus_telemetry_write_errors_total",
+		Type: MetricTypeCounter,
+		Sum:  float64(writeErrors),
+	})
+
+	// Tracing exporter counters and gauge (issue #1360). Only emitted when
+	// a tracing exporter is registered (tracing is optional).
+	tracingDropped, tracingFlushFailures, tracingQueueDepth := GlobalTracingExporter()
+	out = append(out, MetricSnapshot{
+		Name: "nexus_tracing_dropped_total",
+		Type: MetricTypeCounter,
+		Sum:  float64(tracingDropped),
+	})
+	out = append(out, MetricSnapshot{
+		Name: "nexus_tracing_flush_failures_total",
+		Type: MetricTypeCounter,
+		Sum:  float64(tracingFlushFailures),
+	})
+	out = append(out, MetricSnapshot{
+		Name: "nexus_tracing_queue_depth",
+		Type: MetricTypeGauge,
+		Value: float64(tracingQueueDepth),
+	})
+
 	return out
 }
 
@@ -1260,6 +1309,68 @@ func RegisterCollector(c *Collector) {
 // export. Called once from server.go during boot.
 func RegisterRouteCounters(rc *RouteCounters) {
 	routeCountersSlow = rc
+}
+
+// globalTelemetryRecorder holds the currently registered telemetry recorder
+// so CollectMetricSnapshot can read dropped/rotations/write errors without
+// threading the recorder through separately. Stored as any to avoid an import
+// cycle with the telemetry package; the type assertion happens in the getter.
+var globalTelemetryRecorder atomic.Value // stores any
+
+// RegisterTelemetryRecorder registers the global telemetry recorder for OTLP
+// metric export. Called once from server.go during boot. The recorder must
+// implement Dropped(), Rotations(), and WriteErrors() methods.
+func RegisterTelemetryRecorder(r any) {
+	if r != nil {
+		globalTelemetryRecorder.Store(r)
+	}
+}
+
+// GlobalTelemetryRecorder returns the globally registered telemetry recorder's
+// dropped/rotations/write errors, or zeros if none is configured or if the
+// recorder does not implement the extended interface.
+func GlobalTelemetryRecorder() (dropped, rotations, writeErrors uint64) {
+	if v := globalTelemetryRecorder.Load(); v != nil {
+		if rec, ok := v.(interface {
+			Dropped() uint64
+			Rotations() uint64
+			WriteErrors() uint64
+		}); ok {
+			return rec.Dropped(), rec.Rotations(), rec.WriteErrors()
+		}
+	}
+	return 0, 0, 0
+}
+
+// globalTracingExporter holds the currently registered tracing exporter so
+// CollectMetricSnapshot can read dropped/flush failures/queue depth without
+// threading the exporter through separately. Stored as any to avoid importing
+// the tracing package; the type assertion happens in the getter.
+var globalTracingExporter atomic.Value // stores any
+
+// RegisterTracingExporter registers the global tracing exporter for OTLP
+// metric export. Called once from server.go during boot. The exporter must
+// implement Dropped(), FlushFailures(), and QueueDepth() methods.
+func RegisterTracingExporter(e any) {
+	if e != nil {
+		globalTracingExporter.Store(e)
+	}
+}
+
+// GlobalTracingExporter returns the globally registered tracing exporter's
+// dropped/flush failures/queue depth, or zeros if none is configured or if
+// the exporter does not implement the required interface.
+func GlobalTracingExporter() (dropped, flushFailures uint64, queueDepth int) {
+	if v := globalTracingExporter.Load(); v != nil {
+		if exp, ok := v.(interface {
+			Dropped() uint64
+			FlushFailures() uint64
+			QueueDepth() int
+		}); ok {
+			return exp.Dropped(), exp.FlushFailures(), exp.QueueDepth()
+		}
+	}
+	return 0, 0, 0
 }
 
 // InputTokensTotal returns the cumulative input token count.
