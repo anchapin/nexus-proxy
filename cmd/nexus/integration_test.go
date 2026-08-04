@@ -819,9 +819,9 @@ func TestBuildHandlerPanicRecovery(t *testing.T) {
 
 // mockProviderHeaders records headers received by a mock provider server.
 type mockProviderHeaders struct {
-	mu    sync.Mutex
-	data  map[string][]string
-	path  string
+	mu   sync.Mutex
+	data map[string][]string
+	path string
 }
 
 func newMockProviderHeaders() *mockProviderHeaders {
@@ -841,12 +841,6 @@ func (h *mockProviderHeaders) get(k string) string {
 		return vals[0]
 	}
 	return ""
-}
-
-func (h *mockProviderHeaders) set(k, v string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.data[k] = append(h.data[k], v)
 }
 
 func (h *mockProviderHeaders) requestPath() string {
@@ -886,8 +880,8 @@ func startMockAnthropic(t *testing.T, hdrs *mockProviderHeaders, content string)
 			"model":   "claude-3-5-sonnet-20241022",
 			"choices": []map[string]interface{}{
 				{
-					"index":        0,
-					"message":     map[string]interface{}{"role": "assistant", "content": content},
+					"index":         0,
+					"message":       map[string]interface{}{"role": "assistant", "content": content},
 					"finish_reason": "stop",
 				},
 			},
@@ -927,8 +921,8 @@ func startMockGemini(t *testing.T, hdrs *mockProviderHeaders, content string) *h
 			"model":   "gemini-pro",
 			"choices": []map[string]interface{}{
 				{
-					"index":        0,
-					"message":     map[string]interface{}{"role": "assistant", "content": content},
+					"index":         0,
+					"message":       map[string]interface{}{"role": "assistant", "content": content},
 					"finish_reason": "stop",
 				},
 			},

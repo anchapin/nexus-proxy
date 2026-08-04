@@ -2052,9 +2052,9 @@ func Chat(d Deps) http.Handler {
 					baseURL := strings.TrimRight(p.BaseURL(), "/")
 					steps = append(steps, upstream.CascadeStep{
 						Name:        p.Name(),
-						URL:        adapter.RequestPath(baseURL),
-						Model:      p.Model(),
-						APIKey:     p.APIKey(),
+						URL:         adapter.RequestPath(baseURL),
+						Model:       p.Model(),
+						APIKey:      p.APIKey(),
 						AuthHeaders: adapter.AuthHeaders(p.APIKey()),
 					})
 				}
@@ -2299,9 +2299,9 @@ func Chat(d Deps) http.Handler {
 					adapter, _ := providers.NewAdapter(p.AdapterType())
 					steps = append(steps, upstream.CascadeStep{
 						Name:        p.Name(),
-						URL:        adapter.RequestPath(strings.TrimRight(p.BaseURL(), "/")),
-						Model:      p.Model(),
-						APIKey:     p.APIKey(),
+						URL:         adapter.RequestPath(strings.TrimRight(p.BaseURL(), "/")),
+						Model:       p.Model(),
+						APIKey:      p.APIKey(),
 						AuthHeaders: adapter.AuthHeaders(p.APIKey()),
 					})
 				}
