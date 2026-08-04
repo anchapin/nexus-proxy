@@ -1553,3 +1553,177 @@ func TestRunBufferedFallbackReasonOnStep2Success(t *testing.T) {
 		t.Errorf("FallbackReason = %q, want http_error", res.FallbackReason)
 	}
 }
+
+// --- Issue #1415: Retry-After header handling tests --------------------------------
+
+// TestCascadeRetryAfterHandlingMissingHeader verifies that a 429 response without
+// a Retry-After header causes immediate fallback (no delay) — backward compatible
+// with pre-issue behavior.
+func TestCascadeRetryAfterHandlingMissingHeader(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(429)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"error":"rate limited"}`)
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+
+	start := time.Now()
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.ServedBy != "frontier" {
+		t.Errorf("ServedBy = %q, want frontier", res.ServedBy)
+	}
+	// No delay should have occurred (immediate fallback).
+	if elapsed > 200*time.Millisecond {
+		t.Errorf("fallback took %v, expected <200ms (no Retry-After delay)", elapsed)
+	}
+}
+
+// TestCascadeRetryAfterHandlingIntegerSeconds verifies that a 429 response with
+// Retry-After: <seconds> causes the cascade to wait that duration before
+// falling back to the next step.
+func TestCascadeRetryAfterHandlingIntegerSeconds(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "1") // 1 second
+		w.WriteHeader(429)
+		_, _ = io.WriteString(w, `{"error":"rate limited"}`)
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+
+	start := time.Now()
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.ServedBy != "frontier" {
+		t.Errorf("ServedBy = %q, want frontier", res.ServedBy)
+	}
+	// Should have waited at least 1 second due to Retry-After header.
+	if elapsed < 900*time.Millisecond {
+		t.Errorf("fallback took %v, expected >=900ms (Retry-After: 1s delay)", elapsed)
+	}
+}
+
+// TestCascadeRetryAfterHandlingHTTPDate verifies that a 429 response with
+// Retry-After: <HTTP-date> causes the cascade to wait until that absolute time.
+func TestCascadeRetryAfterHandlingHTTPDate(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		// Retry-After 2 seconds in the future.
+		future := time.Now().Add(2 * time.Second).Format(time.RFC1123)
+		w.Header().Set("Retry-After", future)
+		w.WriteHeader(429)
+		_, _ = io.WriteString(w, `{"error":"rate limited"}`)
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+
+	start := time.Now()
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.ServedBy != "frontier" {
+		t.Errorf("ServedBy = %q, want frontier", res.ServedBy)
+	}
+	// Should have waited at least ~2 seconds due to Retry-After HTTP-date.
+	if elapsed < 1500*time.Millisecond {
+		t.Errorf("fallback took %v, expected >=1.5s (Retry-After HTTP-date delay)", elapsed)
+	}
+}
+
+// TestCascadeRetryAfterHandlingInvalidValue verifies that invalid Retry-After
+// values are logged at debug level and treated as no header (immediate retry).
+func TestCascadeRetryAfterHandlingInvalidValue(t *testing.T) {
+	ft := newFakeTransport()
+	ft.on("http://primary.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "not-a-number")
+		w.WriteHeader(429)
+		_, _ = io.WriteString(w, `{"error":"rate limited"}`)
+	})
+	ft.on("http://fallback.local/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, chatBody200)
+	})
+
+	start := time.Now()
+	res, err := twoStepCascade().Run(context.Background(), newSSERW(), &http.Client{Transport: ft}, nil, "")
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.ServedBy != "frontier" {
+		t.Errorf("ServedBy = %q, want frontier", res.ServedBy)
+	}
+	// Invalid Retry-After should be treated as no header → immediate fallback.
+	if elapsed > 200*time.Millisecond {
+		t.Errorf("fallback took %v, expected <200ms (invalid Retry-After treated as missing)", elapsed)
+	}
+}
+
+// TestParseRetryAfterUnit tests the parseRetryAfter function directly.
+func TestParseRetryAfterUnit(t *testing.T) {
+	// Helper to check delay with tolerance.
+	// Note: we use generous tolerances because test execution itself takes time
+	// between formatting the future date and parsing it.
+	check := func(name, value string, wantMin, wantMax time.Duration) {
+		t.Run(name, func(t *testing.T) {
+			got := parseRetryAfter(value)
+			if got < wantMin || got > wantMax {
+				t.Errorf("parseRetryAfter(%q) = %v, want between %v and %v", value, got, wantMin, wantMax)
+			}
+		})
+	}
+
+	// Empty and whitespace-only → 0.
+	check("empty string", "", 0, 0)
+	check("whitespace only", "   ", 0, 0)
+
+	// Integer seconds.
+	check("0 seconds", "0", 0, 0)
+	check("1 second", "1", 900*time.Millisecond, 1500*time.Millisecond)
+	check("5 seconds", "5", 4900*time.Millisecond, 6000*time.Millisecond)
+	check("120 seconds", "120", 119000*time.Millisecond, 130000*time.Millisecond)
+
+	// RFC 1123 HTTP-date (most widely used) — add generous buffer for test timing.
+	// Format in UTC to avoid timezone mismatches when parsed.
+	future1s := time.Now().UTC().Add(2 * time.Second).Format(time.RFC1123)
+	check("RFC1123 ~2s in future", future1s, 1500*time.Millisecond, 3000*time.Millisecond)
+
+	// RFC 850 (HTTP-date variant, with 2-digit year).
+	future2s := time.Now().UTC().Add(2 * time.Second).Format(time.RFC850)
+	check("RFC850 ~2s in future", future2s, 1500*time.Millisecond, 3000*time.Millisecond)
+
+	// ANSIC format — add buffer for test timing.
+	future3s := time.Now().UTC().Add(2 * time.Second).Format(time.ANSIC)
+	check("ANSIC ~2s in future", future3s, 1500*time.Millisecond, 3000*time.Millisecond)
+
+	// Past date → 0 (delay cannot be negative).
+	past := time.Now().Add(-10 * time.Second).Format(time.RFC1123)
+	check("past RFC1123 date", past, 0, 50*time.Millisecond)
+
+	// Invalid values → 0.
+	check("invalid not-a-number", "not-a-number", 0, 0)
+	check("invalid negative", "-5", 0, 0)
+	check("invalid garbage", "abc123", 0, 0)
+	check("invalid float", "1.5", 0, 0)
+}

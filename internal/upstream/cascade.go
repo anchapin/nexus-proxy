@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -539,6 +540,13 @@ func (c *Cascade) doFetchCascadeStep(ctx context.Context, client Client, step Ca
 	}
 
 	if resp.StatusCode == http.StatusTooManyRequests {
+		if delay := parseRetryAfter(resp.Header.Get("Retry-After")); delay > 0 {
+			slog.Debug("cascade hit 429, honoring Retry-After",
+				slog.Duration("delay", delay),
+				slog.String("step", step.Name),
+			)
+			time.Sleep(delay)
+		}
 		return AssistantMessage{}, "", nil, newCascadeErr(true, "rate_limited", "status %d: %s", resp.StatusCode, truncateForLog(respBody, 200))
 	}
 	if ShouldRetry(resp.StatusCode, nil) {
@@ -807,4 +815,51 @@ func truncateForLog(b []byte, max int) string {
 		return string(b)
 	}
 	return string(b[:max-len(truncateSuffix)]) + truncateSuffix
+}
+
+// parseRetryAfter parses the Retry-After header value per RFC 9110 §10.2.3.
+// It returns the delay duration if the header is present and valid, or 0 if
+// the header is missing, empty, or malformed. The header may be an
+// integer (seconds) or an HTTP-date (e.g., "Wed, 21 Oct 2015 07:28:00 GMT").
+func parseRetryAfter(value string) time.Duration {
+	if value == "" {
+		return 0
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+
+	// Try integer seconds first (most common format).
+	if secs, err := strconv.Atoi(value); err == nil && secs >= 0 {
+		if secs == 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+
+	// Try HTTP-date format: try RFC 1123 first (most widely used),
+	// then RFC 850, then ANSI C's asctime().
+	// Use UTC for both t and now to avoid timezone mismatches (ANSIC
+	// parses as UTC with no timezone info).
+	nowUTC := time.Now().UTC()
+	for _, layout := range []string{
+		time.RFC1123,
+		time.RFC850,
+		time.ANSIC,
+	} {
+		if t, err := time.Parse(layout, value); err == nil {
+			delay := t.UTC().Sub(nowUTC)
+			if delay < 0 {
+				delay = 0
+			}
+			return delay
+		}
+	}
+
+	// Malformed — log at debug and treat as no header.
+	slog.Debug("cascade: malformed Retry-After header, ignoring",
+		slog.String("value", value),
+	)
+	return 0
 }
