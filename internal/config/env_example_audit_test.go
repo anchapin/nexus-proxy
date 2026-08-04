@@ -32,7 +32,9 @@ func TestEnvExampleCoverage(t *testing.T) {
 	// the tracing package (whose NEXUS_TRACING_ENDPOINT is referenced in
 	// its package docs). Without these, the reverse-direction check
 	// (issue #478) would false-positive on vars consumed outside the
-	// parser. See AGENTS.md "Adding new env vars".
+	// parser. See AGENTS.md "Adding new env vars". cmd/nexus/init.go is
+	// included so that init-specific vars (e.g. NEXUS_INIT_VERIFY_MODELS)
+	// are covered by the audit (issue #1364).
 	srcFiles := []string{
 		filepath.Join(repoRoot, "internal", "config", "config.go"),
 		filepath.Join(repoRoot, "internal", "config", "yaml.go"),
@@ -42,6 +44,7 @@ func TestEnvExampleCoverage(t *testing.T) {
 		filepath.Join(repoRoot, "internal", "quality", "quality.go"),
 		filepath.Join(repoRoot, "internal", "tracing", "tracing.go"),
 		filepath.Join(repoRoot, "internal", "tracing", "exporter.go"),
+		filepath.Join(repoRoot, "cmd", "nexus", "init.go"),
 	}
 
 	// Match NEXUS_ followed by at least two word chars (not ending with
