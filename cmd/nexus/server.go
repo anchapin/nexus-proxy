@@ -556,6 +556,9 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 	// cacheWarmedEntries is set after the arbiter cache is created below;
 	// declared here so the gauge provider closure can capture it (issue #1176).
 	var cacheWarmedEntries int
+	// slmCacheWarmedEntries is set after the SLM cache is created below;
+	// declared here so the gauge provider closure can capture it (issue #1370).
+	var slmCacheWarmedEntries int
 	addCleanup(func() {
 		if metricsStore != nil {
 			if err := metricsStore.Close(); err != nil {
@@ -1026,6 +1029,18 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 		slmCache.SetMaxStale(cfg.SLMCacheMaxStale)
 		slmCache.SetStaleCleanupThreshold(cfg.SLMCacheStaleCleanupThreshold)
 		slmCache.SetMaxScanEntries(cfg.SLMCacheSemanticScanLimit)
+		// Boot-time pre-warming from historical SQLite routing decisions (issue #1370).
+		// Only fires when explicitly opted in and a routing confidence DB is configured.
+		if cfg.SLMCacheWarmOnBoot && cfg.SLMCacheWarmLimit > 0 && cfg.RoutingConfidenceDB != "" {
+			if err := slmCache.PreWarmFromSQLite(cfg.RoutingConfidenceDB, cfg.SLMCacheWarmLimit); err != nil {
+				slog.Warn("slm cache pre-warm failed, starting cold",
+					slog.Any("err", err),
+					slog.String("source", "sqlite"),
+				)
+			} else {
+				slmCacheWarmedEntries = slmCache.Len()
+			}
+		}
 	} else {
 		slog.Info("slm decision cache disabled (NEXUS_SLMCACHE_TTL<=0)")
 	}
@@ -1039,6 +1054,7 @@ func buildServer(cfg config.Config, startTime time.Time) (*http.Server, *serverP
 				{Name: "nexus_slm_cache_entries", Value: float64(slmCache.Len())},
 				{Name: "nexus_slm_cache_max_entries", Value: float64(slmCache.MaxEntries())},
 				{Name: "nexus_slm_cache_stale_entries", Value: float64(slmCache.Stale())},
+				{Name: "nexus_slm_cache_warmed_entries", Value: float64(slmCacheWarmedEntries)},
 			}
 		}),
 	)

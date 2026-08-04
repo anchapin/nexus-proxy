@@ -139,6 +139,8 @@ type YAMLConfig struct {
 	SLMCacheMaxStale              int     `yaml:"slm_cache_max_stale"`               // issue #835
 	SLMCacheStaleCleanupThreshold int     `yaml:"slm_cache_stale_cleanup_threshold"` // issue #1037
 	SLMCacheSemanticScanLimit     int     `yaml:"slm_cache_semantic_scan_limit"`     // issue #933
+	SLMCacheWarmOnBoot            bool    `yaml:"slm_cache_warm_on_boot"`            // issue #1370
+	SLMCacheWarmLimit             int     `yaml:"slm_cache_warm_limit"`              // issue #1370
 	SLMTokenHint                  bool    `yaml:"slm_token_hint"`                    // issue #1233
 	FusionTimeout                 string  `yaml:"fusion_timeout"`
 	FusionLocalTimeout            string  `yaml:"fusion_local_timeout"`    // issue #1164
@@ -889,6 +891,24 @@ func LoadYAML(path string) (Config, error) {
 			n = 0
 		}
 		cfg.SLMCacheSemanticScanLimit = n
+	}
+	// SLM cache boot-time pre-warming (issue #1370)
+	if v := os.Getenv("NEXUS_SLM_CACHE_WARM_ON_BOOT"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_SLM_CACHE_WARM_ON_BOOT: %w", err)
+		}
+		cfg.SLMCacheWarmOnBoot = b
+	}
+	if v := os.Getenv("NEXUS_SLM_CACHE_WARM_LIMIT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("config: NEXUS_SLM_CACHE_WARM_LIMIT: %w", err)
+		}
+		if n < 0 {
+			n = 0
+		}
+		cfg.SLMCacheWarmLimit = n
 	}
 	// SLM token hint (issue #1233)
 	if v := os.Getenv("NEXUS_SLM_TOKEN_HINT"); v != "" {
@@ -1885,6 +1905,8 @@ func (yc YAMLConfig) toConfig() (Config, error) {
 		SLMCacheMaxStale:              yc.intDefault(yc.SLMCacheMaxStale, 0),              // issue #835
 		SLMCacheStaleCleanupThreshold: yc.intDefault(yc.SLMCacheStaleCleanupThreshold, 0), // issue #1037
 		SLMCacheSemanticScanLimit:     yc.intDefault(yc.SLMCacheSemanticScanLimit, 0),     // issue #933
+		SLMCacheWarmOnBoot:            yc.boolFieldDefault(yc.SLMCacheWarmOnBoot, false),  // issue #1370
+		SLMCacheWarmLimit:             yc.intDefault(yc.SLMCacheWarmLimit, 512),           // issue #1370
 		SLMTokenHint:                  yc.boolFieldDefault(yc.SLMTokenHint, true),         // issue #1233
 		FusionTimeout:                 yc.durationDefault(yc.FusionTimeout, 120*time.Second),
 		FusionLocalTimeout:            yc.durationDefault(yc.FusionLocalTimeout, 90*time.Second),    // issue #1164

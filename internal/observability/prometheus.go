@@ -264,6 +264,11 @@ var gaugeMeta = map[string]metricMeta{
 		help: "Number of entries loaded into the arbiter cache from historical SQLite metrics during boot-time pre-warming (issue #1176). 0 when pre-warming is disabled or no data was found.",
 		typ:  "gauge",
 	},
+	// SLM cache pre-warming gauge (issue #1370). Set once at boot.
+	"nexus_slm_cache_warmed_entries": {
+		help: "Number of entries loaded into the SLM cache from historical SQLite routing decisions during boot-time pre-warming (issue #1370). 0 when pre-warming is disabled or no data was found.",
+		typ:  "gauge",
+	},
 	// Per-route latency percentile gauges (issue #774). Computed from a
 	// sliding window ring buffer per route (local/frontier/fusion).
 	// Values are in seconds (ms → s conversion at render time).

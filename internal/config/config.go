@@ -237,18 +237,24 @@ type Config struct {
 	SLMCacheMaxStale              int           // max stale entries before proactive eviction (0 = disabled, issue #835)
 	SLMCacheStaleCleanupThreshold int           // Get-triggered eviction threshold; 0 = disabled (issue #1037)
 	SLMCacheSemanticScanLimit     int           // max entries scanned in getSemantic; 0 = unlimited (issue #933)
-	SLMConfidenceThreshold        float64       // hard escalation threshold: local/fusion decisions below this force frontier (default 0.3, issue #301)
-	SLMTokenHint                  bool          // prepend [tokens: ~N] hint to SLM routing prompt (issue #1233)
-	RoutingContextTurns           int           // prior conversation turns fed to the router for multi-turn context (default 3, issue #1147)
-	RoutingContextChars           int           // char cap on the conversation-context window fed to the router (default 2000, issue #1147)
-	FusionTimeout                 time.Duration // per-panel-member fetch timeout (120s), shared fallback
-	FusionLocalTimeout            time.Duration // per-panel-member timeout for the local Ollama member (90s, issue #1164)
-	FusionFrontierTimeout         time.Duration // per-panel-member timeout for the frontier API member (30s, issue #1164)
-	CascadeTimeout                time.Duration // per-attempt timeout for cascade fallback (30s)
-	CascadeTimeoutFloor           time.Duration // adaptive floor: minimum per-attempt timeout (5s, issue #1175)
-	CascadeTimeoutCeiling         time.Duration // adaptive ceiling: maximum per-attempt timeout (120s, issue #1175)
-	CascadeTimeoutPer1kTokens     time.Duration // additive per-1k prompt tokens; <=0 disables adaptive (1500ms, issue #1175)
-	ArbiterTimeout                time.Duration // per-call timeout for the fusion arbiter stream (60s)
+	// SLM cache boot-time pre-warming (issue #1370). When SLMCacheWarmOnBoot
+	// is true, the boot sequence queries the SQLite routing confidence store
+	// for recent prompt → route decisions and loads them into the SLM cache,
+	// cutting cold-start latency. SLMCacheWarmLimit caps entries queried.
+	SLMCacheWarmOnBoot        bool          // NEXUS_SLM_CACHE_WARM_ON_BOOT; default false (opt-in)
+	SLMCacheWarmLimit         int           // NEXUS_SLM_CACHE_WARM_LIMIT; default 512
+	SLMConfidenceThreshold    float64       // hard escalation threshold: local/fusion decisions below this force frontier (default 0.3, issue #301)
+	SLMTokenHint              bool          // prepend [tokens: ~N] hint to SLM routing prompt (issue #1233)
+	RoutingContextTurns       int           // prior conversation turns fed to the router for multi-turn context (default 3, issue #1147)
+	RoutingContextChars       int           // char cap on the conversation-context window fed to the router (default 2000, issue #1147)
+	FusionTimeout             time.Duration // per-panel-member fetch timeout (120s), shared fallback
+	FusionLocalTimeout        time.Duration // per-panel-member timeout for the local Ollama member (90s, issue #1164)
+	FusionFrontierTimeout     time.Duration // per-panel-member timeout for the frontier API member (30s, issue #1164)
+	CascadeTimeout            time.Duration // per-attempt timeout for cascade fallback (30s)
+	CascadeTimeoutFloor       time.Duration // adaptive floor: minimum per-attempt timeout (5s, issue #1175)
+	CascadeTimeoutCeiling     time.Duration // adaptive ceiling: maximum per-attempt timeout (120s, issue #1175)
+	CascadeTimeoutPer1kTokens time.Duration // additive per-1k prompt tokens; <=0 disables adaptive (1500ms, issue #1175)
+	ArbiterTimeout            time.Duration // per-call timeout for the fusion arbiter stream (60s)
 
 	// Frontier per-provider failover (issue #1157). When true and more
 	// than one frontier provider is registered, the route=frontier
@@ -1754,6 +1760,21 @@ func Load() (Config, error) {
 		slmCacheSemanticScanLimit = 0
 	}
 	cfg.SLMCacheSemanticScanLimit = slmCacheSemanticScanLimit
+
+	// SLM cache boot-time pre-warming (issue #1370). Opt-in: default is
+	// false so boot is byte-for-byte identical to pre-#1370 behaviour.
+	// When true, the boot sequence queries the SQLite routing confidence
+	// store for recent prompt → route decisions within the cache TTL window.
+	cfg.SLMCacheWarmOnBoot = getEnvBool("NEXUS_SLM_CACHE_WARM_ON_BOOT", false)
+
+	slmCacheWarmLimit, err := getEnvInt("NEXUS_SLM_CACHE_WARM_LIMIT", 512)
+	if err != nil {
+		return cfg, err
+	}
+	if slmCacheWarmLimit < 0 {
+		slmCacheWarmLimit = 0
+	}
+	cfg.SLMCacheWarmLimit = slmCacheWarmLimit
 
 	// Ollama health poller (issue #8). Defaults: 30s poll cadence,
 	// 3-failure breaker, 5s per-probe HTTP timeout. Set
@@ -3448,6 +3469,8 @@ var EnvToYAMLKey = map[string]string{
 	"NEXUS_SLMCACHE_MAX_STALE":                "slm_cache_max_stale",
 	"NEXUS_SLMCACHE_STALE_CLEANUP_THRESHOLD":  "slm_cache_stale_cleanup_threshold",
 	"NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT":      "slm_cache_semantic_scan_limit",
+	"NEXUS_SLM_CACHE_WARM_ON_BOOT":            "slm_cache_warm_on_boot",
+	"NEXUS_SLM_CACHE_WARM_LIMIT":              "slm_cache_warm_limit",
 	"NEXUS_SLM_CONFIDENCE_THRESHOLD":          "slm_confidence_threshold",
 	"NEXUS_ROUTING_CONTEXT_TURNS":             "routing_context_turns",
 	"NEXUS_ROUTING_CONTEXT_CHARS":             "routing_context_chars",
@@ -3764,6 +3787,8 @@ var allEnvFields = []envField{
 	{"NEXUS_SLMCACHE_SEMANTIC_SCAN_LIMIT", func(c *Config) string { return fmt.Sprintf("%d", c.SLMCacheSemanticScanLimit) }},
 	{"NEXUS_SLMCACHE_SIMILARITY_THRESHOLD", func(c *Config) string { return fmt.Sprintf("%g", c.SLMCacheSemanticThreshold) }},
 	{"NEXUS_SLMCACHE_STALE_CLEANUP_THRESHOLD", func(c *Config) string { return fmt.Sprintf("%d", c.SLMCacheStaleCleanupThreshold) }},
+	{"NEXUS_SLM_CACHE_WARM_ON_BOOT", func(c *Config) string { return fmt.Sprintf("%t", c.SLMCacheWarmOnBoot) }},
+	{"NEXUS_SLM_CACHE_WARM_LIMIT", func(c *Config) string { return fmt.Sprintf("%d", c.SLMCacheWarmLimit) }},
 	{"NEXUS_SLM_CACHE_TTL", func(c *Config) string { return c.SLMCacheTTL.String() }},
 	{"NEXUS_SLM_CONFIDENCE_THRESHOLD", func(c *Config) string { return fmt.Sprintf("%g", c.SLMConfidenceThreshold) }},
 	{"NEXUS_SLM_TIMEOUT", func(c *Config) string { return c.SLMTimeout.String() }},

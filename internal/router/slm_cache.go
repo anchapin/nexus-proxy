@@ -3,11 +3,16 @@ package router
 import (
 	"container/heap"
 	"context"
+	"database/sql"
+	"fmt"
+	"log/slog"
 	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 // Eviction reason labels for the bounded Prometheus
@@ -777,6 +782,165 @@ func (c *SLMCache) MaxEntries() int {
 		return 0
 	}
 	return c.maxEntries
+}
+
+// SLMCacheWarmEntry is one row for SLM cache pre-warming (issue #1370).
+// Prompt is the cache key; Route is the routing decision to restore;
+// Timestamp is the original cache write time; entries older than the TTL
+// are skipped during Warm.
+type SLMCacheWarmEntry struct {
+	Prompt    string
+	Route     Route
+	Timestamp time.Time
+}
+
+// Warm bulk-loads historical SLM routing decision entries into the cache
+// (issue #1370). Each entry's Timestamp is checked against the cache TTL:
+// entries already expired are skipped and counted in skippedStale. Loaded
+// entries are inserted with their original Timestamp so normal expiry
+// semantics apply on subsequent Get calls. LRU eviction is honoured: if
+// the cache is at capacity, the least-recently-used entry is evicted per
+// insert.
+//
+// Returns (loaded, skippedStale). A nil cache is a no-op.
+func (c *SLMCache) Warm(entries []SLMCacheWarmEntry) (loaded, skippedStale int) {
+	if c == nil || len(entries) == 0 {
+		return 0, 0
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, e := range entries {
+		if now.Sub(e.Timestamp) > c.ttl {
+			skippedStale++
+			continue
+		}
+		if c.maxEntries > 0 && len(c.entries) >= c.maxEntries {
+			c.evictExpiredLocked()
+			if len(c.entries) >= c.maxEntries {
+				c.evictLruLocked()
+			}
+		}
+		c.entries[e.Prompt] = cachedDecision{
+			Route: e.Route,
+			stamp: e.Timestamp,
+			emb:   nil,
+		}
+		c.expiry = append(c.expiry, e.Prompt)
+		c.staleCount.Add(1)
+		loaded++
+	}
+	c.sortExpiry()
+	return loaded, skippedStale
+}
+
+// evictExpiredLocked is like evictExpired but caller must hold c.mu.
+func (c *SLMCache) evictExpiredLocked() {
+	now := time.Now()
+	var keep []string
+	removed := 0
+	for _, key := range c.expiry {
+		entry, ok := c.entries[key]
+		if !ok {
+			continue
+		}
+		if now.Sub(entry.stamp) > c.ttl {
+			delete(c.entries, key)
+			removed++
+		} else {
+			keep = append(keep, key)
+		}
+	}
+	c.expiry = keep
+	c.sortExpiry()
+	if removed > 0 {
+		atomic.AddUint64(&c.ttlEvictions, uint64(removed))
+		c.staleCount.Add(-int64(removed))
+	}
+}
+
+// evictLruLocked is like evictLru but caller must hold c.mu.
+func (c *SLMCache) evictLruLocked() {
+	if len(c.expiry) == 0 {
+		return
+	}
+	lruKey := c.expiry[0]
+	delete(c.entries, lruKey)
+	c.expiry = c.expiry[1:]
+	atomic.AddUint64(&c.lruEvictions, 1)
+}
+
+const preWarmFromSQLiteTimeout = 10 * time.Second
+
+const preWarmFromSQLiteQuery = `
+	SELECT category, route, timestamp
+	FROM routing_outcomes
+	WHERE timestamp > ?
+	ORDER BY timestamp DESC
+	LIMIT ?`
+
+// PreWarmFromSQLite pre-warms the SLM cache from historical routing
+// decisions stored in the SQLite routing confidence database (issue #1370).
+// It queries the routing_outcomes table for entries newer than (now - TTL)
+// and loads them into the cache via Warm. Entries already older than the
+// TTL are skipped. CacheWarmLimit caps the number of entries queried.
+//
+// A nil receiver is a no-op (returns nil). Errors opening or querying the
+// database are returned but are non-fatal — the proxy starts without a warm
+// cache even if pre-warm fails.
+func (c *SLMCache) PreWarmFromSQLite(dbPath string, maxEntries int) error {
+	if c == nil {
+		return nil
+	}
+	if maxEntries <= 0 {
+		return nil
+	}
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?mode=rwc")
+	if err != nil {
+		return fmt.Errorf("slm cache pre-warm: open %q: %w", dbPath, err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.Ping(); err != nil {
+		return fmt.Errorf("slm cache pre-warm: ping %q: %w", dbPath, err)
+	}
+	since := time.Now().Add(-c.ttl)
+	ctx, cancel := context.WithTimeout(context.Background(), preWarmFromSQLiteTimeout)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, preWarmFromSQLiteQuery, since.UTC(), maxEntries)
+	if err != nil {
+		return fmt.Errorf("slm cache pre-warm: query %q: %w", dbPath, err)
+	}
+	defer rows.Close()
+	var entries []SLMCacheWarmEntry
+	for rows.Next() {
+		var prompt, routeStr string
+		var tsStr string
+		if err := rows.Scan(&prompt, &routeStr, &tsStr); err != nil {
+			return fmt.Errorf("slm cache pre-warm: scan: %w", err)
+		}
+		ts, err := time.Parse(time.RFC3339Nano, tsStr)
+		if err != nil {
+			ts, _ = time.Parse(time.RFC3339, tsStr)
+		}
+		entries = append(entries, SLMCacheWarmEntry{
+			Prompt:    prompt,
+			Route:     Route(routeStr),
+			Timestamp: ts,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("slm cache pre-warm: rows: %w", err)
+	}
+	loaded, skipped := c.Warm(entries)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	slog.Info("slm cache warmed",
+		slog.Int("loaded", loaded),
+		slog.Int("skipped_stale", skipped),
+		slog.String("source", "sqlite"),
+		slog.Int("max_entries", maxEntries),
+	)
+	return nil
 }
 
 // cosineSimilarity returns the cosine of the angle between a and b.
