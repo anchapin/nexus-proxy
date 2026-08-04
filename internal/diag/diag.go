@@ -103,6 +103,7 @@ const (
 	checkBudgetGuard          = "budget_guard"
 	checkRateLimitProxyConfig = "rate_limit_proxy_config"
 	checkAllowCIDRs           = "allow_cidrs"
+	checkEgressAllowCIDRs     = "egress_allow_cidrs"
 	checkProviderRegistry     = "provider_registry"
 	checkMiddlewareChain      = "middleware_chain"
 	checkModelsEndpoint       = "models_endpoint"
@@ -147,6 +148,7 @@ func Run(ctx context.Context, cfg config.Config, opts Options) Result {
 	r = append(r, checkBudgetGuardFn(cfg))
 	r = append(r, checkRateLimitProxyConfigFn(cfg))
 	r = append(r, checkAllowCIDRsFn(cfg))
+	r = append(r, checkEgressAllowCIDRsFn(cfg))
 	r = append(r, checkProviderRegistryFn())
 	r = append(r, checkMiddlewareChainFn(cfg))
 	r = append(r, checkModelsEndpointFn(ctx, cfg, opts))
@@ -888,6 +890,33 @@ func checkAllowCIDRsFn(cfg config.Config) Check {
 		Name:   checkAllowCIDRs,
 		Status: StatusPass,
 		Detail: detail,
+	}
+}
+
+// --- Egress allow CIDRs (issue #1413) ------------------------------------
+
+// checkEgressAllowCIDRsFn validates that NEXUS_EGRESS_ALLOW contains only
+// valid CIDR notation. Invalid entries cause a hard boot error (fail-closed),
+// consistent with NEXUS_TRUSTED_PROXIES behaviour.
+func checkEgressAllowCIDRsFn(cfg config.Config) Check {
+	if cfg.EgressAllowCIDRs == "" {
+		return Check{
+			Name:   checkEgressAllowCIDRs,
+			Status: StatusSkip,
+			Detail: "NEXUS_EGRESS_ALLOW not set (using defaults)",
+		}
+	}
+	if err := validateCIDRs(cfg.EgressAllowCIDRs); err != nil {
+		return Check{
+			Name:   checkEgressAllowCIDRs,
+			Status: StatusFail,
+			Detail: fmt.Sprintf("NEXUS_EGRESS_ALLOW has invalid CIDR: %v", err),
+		}
+	}
+	return Check{
+		Name:   checkEgressAllowCIDRs,
+		Status: StatusPass,
+		Detail: fmt.Sprintf("NEXUS_EGRESS_ALLOW: %s", cfg.EgressAllowCIDRs),
 	}
 }
 

@@ -1015,6 +1015,22 @@ func TestTrustedProxies_InvalidFailsBoot(t *testing.T) {
 	}
 }
 
+func TestEgressAllowCIDRs_InvalidFailsBoot(t *testing.T) {
+	cases := []string{
+		"not-a-cidr",
+		"10.0.0.0/8,garbage,192.168.0.0/16",
+		"10.0.0.0/999",
+	}
+	for _, c := range cases {
+		t.Run(c, func(t *testing.T) {
+			t.Setenv("NEXUS_EGRESS_ALLOW", c)
+			if _, err := Load(); err == nil {
+				t.Errorf("expected boot error for %q", c)
+			}
+		})
+	}
+}
+
 func TestRateLimit_Overrides(t *testing.T) {
 	t.Setenv("NEXUS_RATE_LIMIT_RPM", "120")
 	t.Setenv("NEXUS_RATE_LIMIT_BURST", "30")

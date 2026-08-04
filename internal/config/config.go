@@ -2525,6 +2525,9 @@ func (c Config) Validate() error {
 	default:
 		return fmt.Errorf("config: NEXUS_AUTH_MODE value %q is not recognised; want \"static\", \"jwt\", or \"both\"", c.AuthMode)
 	}
+	if err := validateEgressAllowCIDRs(c.EgressAllowCIDRs); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -2846,6 +2849,29 @@ func parseTrustedProxies(raw string) ([]*net.IPNet, error) {
 		return nil, fmt.Errorf("config: invalid NEXUS_TRUSTED_PROXIES entry %q (expected CIDR or IP); see .env.example", p)
 	}
 	return out, nil
+}
+
+// validateEgressAllowCIDRs checks that every entry in the comma-separated
+// NEXUS_EGRESS_ALLOW value is a valid CIDR notation string (e.g. "10.0.0.0/8"
+// or "192.168.1.0/24"). Empty input is accepted (no allowlist override).
+// Invalid entries cause Load() to return an error, making the behaviour
+// consistent with NEXUS_TRUSTED_PROXIES (issue #1413).
+func validateEgressAllowCIDRs(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(p); err != nil {
+			return fmt.Errorf("config: NEXUS_EGRESS_ALLOW: invalid entry %q", p)
+		}
+	}
+	return nil
 }
 
 // RoutingConfidenceEnabled reports whether the judge-guided adaptive
